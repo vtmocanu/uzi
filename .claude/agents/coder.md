@@ -76,8 +76,10 @@ whole-files: true}`, so only findings your branch introduces block — and
 `whole-files` means **pre-existing findings in a file you merely touched block
 too**. That is the flag working, not a bug, and it is the adoption cost you will
 meet first. `task lint:api:all` / `lint:controller:all` print the unfiltered
-backlog (107 and 5 as of 2026-08-02); they are reported, never gating, and are
-not in `task gate`. If a lint target dies with `origin/main is unresolvable`,
+backlog; they are reported, never gating, and are not in `task gate` — though
+they still **exit nonzero** whenever they report anything. **Run one rather than
+quoting a number from here**: this block sits two slots below a `format` slot
+whose whole comment is about a tally that read 26, then 25, then 19, then 16. If a lint target dies with `origin/main is unresolvable`,
 run `git fetch origin main` — **do not read the backlog it would otherwise
 print as your branch's findings.** And if a Go lint target prints
 `Error: parallel golangci-lint is running`, a sibling worktree holds the

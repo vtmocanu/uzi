@@ -1090,9 +1090,11 @@ which previously prescribed only the fail-open form.
       Amended rather than worked around, per the rule this document applies to
       itself. Three reasons, measured at golangci-lint 2.12.2 / go1.26.5
       darwin/arm64 **with `--max-issues-per-linter=0 --max-same-issues=0`**: it is
-      **1178 findings in `api`** uncapped (929 of them in `_test.go`), which is 90%
-      of the combined backlog; **all 21 non-test findings were read by hand and none
-      is a defect** — CLI subcommand names, JSON field names, and the
+      **1178 findings in `api`** uncapped (931 of them in `_test.go`, 247 not), which
+      is 90%
+      of the combined backlog; **the 21 non-test findings visible in the capped run
+      were read by hand, plus a 1-in-20 re-sample across all 86 non-test files, and
+      none is a defect** — CLI subcommand names, JSON field names, and the
       `queued → claimed → running` run-state vocabulary this PRD's own Architecture
       section documents, which is a goconst finding at every switch arm; and
       **`--whole-files` makes its blast radius 86 non-test files in `api` alone**, so
@@ -1107,9 +1109,54 @@ which previously prescribed only the fail-open form.
       the default `--max-issues-per-linter` is 50 and goconst reported exactly 50,
       which is the tell nobody looks at because 50 is a plausible number. The two cap
       flags are not redundant — on the shipped config `api` reads **56 capped against
-      107 uncapped** (`--max-same-issues` takes errcheck 36→79, `--max-issues-per-linter`
-      takes staticcheck 13→21), while `controller` reads **5 either way**. The smaller
-      module agreeing exactly is the camouflage.)*
+      107 uncapped**, while `controller` reads **5 either way**. The smaller
+      module agreeing exactly is the camouflage.*
+
+      *🔴 **THE TWO FLAGS COMPOSE IN ORDER; NEITHER "OWNS" A LINTER**, and the
+      difference decides whether one of them looks droppable. Isolation matrix on the
+      shipped config, `cache clean` before each cell:*
+
+      ```
+      --new-from-merge-base=                            56   errcheck 36  staticcheck 13
+      + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
+      + --max-same-issues=0                             78   errcheck 50  staticcheck 21
+      both                                             107   errcheck 79  staticcheck 21
+      ```
+
+      *`--max-same-issues` folds duplicate **messages** first; `--max-issues-per-linter`
+      then truncates the survivors at 50. So with `goconst` off nothing exceeds 50 until
+      the fold is lifted, which makes **`--max-issues-per-linter=0` alone a complete
+      no-op** — and the per-linter flag's real effect is **errcheck 50→79**, visible only
+      after the other flag has fired. **That is why checking it the obvious way is a
+      trap**: run cell two, see 56→56, conclude the flag does nothing, delete it, and
+      errcheck reads **50** forever — which is exactly the plausible-looking number this
+      section exists to warn about.*
+
+      *(This PRD and `Taskfile.yml` both previously read "`--max-same-issues` takes
+      errcheck 36→79, `--max-issues-per-linter` takes staticcheck 13→21". **Both halves
+      were false** and both came from a 2-cell measurement that cannot separate the
+      flags. Refuted and re-derived independently four times — reviewer, lead,
+      fact-checker, and the tester, which retracted its own earlier endorsement after
+      running the 2×2 itself. Recorded at length because the wrong version propagated
+      out of a Taskfile comment into a PRD carry-forward before anyone re-measured: a
+      comment is a citation source, so an unsupported figure in one does not stay
+      there.)*
+
+      *🔴 **AND `issues.uniq-by-line` DEFAULTS TO `true`, DEDUPPING ACROSS LINTERS**, so
+      any single linter's count depends on which others are enabled: the 107 above
+      becomes 108 with `--uniq-by-line=false` (staticcheck 21→22). One finding today,
+      recorded for **M4 and M5**, which add linters — this is how a staticcheck finding
+      disappears from an "unfiltered" total without anyone touching staticcheck.*
+
+      *🔴 **NAME THE POPULATION OR THE goconst FIGURES WILL NOT RECONCILE.** Two records
+      quote a string literal containing a newline, so each wraps across two output lines.
+      `1178` is the tool's own tally, `1176` is the well-formed single-line records (the
+      denominator behind Amendment 3's "395 distinct strings over 1176 sites"), and a
+      `(goconst)$`-anchored grep also returns 1178 **by coincidence** — counting the two
+      pathless continuations while missing the two headers that lost their suffix. Split
+      the wrong one and the non-test bucket reads 249 across 87 files. Both wrapped
+      records are in `_test.go`, so **247 across 86** is correct either way. This cost
+      three people a wrong figure.)*
 
       **`govet` is also deliberately NOT in the golangci-lint set**, and it owes its
       justification for the opposite reason: `task vet:api` / `vet:controller`

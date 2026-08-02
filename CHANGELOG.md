@@ -39,7 +39,12 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   oxlint, configured so `react-hooks/rules-of-hooks` actually runs, which the
   default severity tier does not reach. The 16 pre-existing TypeScript findings
   were fixed rather than baselined. Part of PRD #103. Developer-facing only: no
-  change to how uzi behaves. See
+  change to how uzi behaves. **Existing checkouts need
+  `npm install --ignore-scripts` in *both* `web/` and `agent/` before
+  `task gate:web` / `task gate:agent` will run** — oxlint is a new devDependency
+  and the lint step fails closed with `oxlint: command not found` until it is
+  installed. `--ignore-scripts` matters in `agent/`: without it, `agent-browser`'s
+  postinstall rewrites the host's `agent-browser` binary. See
   [docs/dev-conventions.md](docs/dev-conventions.md).
 
 ### Fixed

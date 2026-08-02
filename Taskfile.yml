@@ -102,7 +102,16 @@
 # RUNS, and python's code was reported as task's. Reporting-failure form (1) in
 # CLAUDE.md's gate-status entry, committed inside a note about exit codes.)
 #
-# NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
+# NO DEPENDENCY INSTALL STEP, DELIBERATELY - WITH ONE EXCEPTION SINCE PRD #103 M3,
+# NAMED HERE BECAUSE AN UNQUALIFIED CLAIM IS WORSE THAN A QUALIFIED ONE.
+# `lint:api` / `lint:controller` invoke `go run …golangci-lint@v2.12.2`, which on a
+# cold cache FETCHES AND BUILDS that tool's whole dependency tree - 51.6s measured,
+# recorded beside the target. It is a pinned, sumdb-verified, module-scoped fetch
+# that writes nothing to either go.mod (the same shape as validate:api's
+# `sqlc@v1.30.0`), so it does not install a PROJECT dependency and nothing below
+# changes. But "installs nothing" is now false as stated, and a reader trusting it
+# will be surprised by a 51.6s first run. Everything else still holds:
+# no `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
@@ -485,7 +494,15 @@ tasks:
       # `--max-same-issues` folds duplicate MESSAGES first; `--max-issues-per-linter`
       # then truncates the survivors at 50. So on this config `--max-issues-per-
       # linter=0` ALONE IS A COMPLETE NO-OP - nothing exceeds 50 until the fold is
-      # lifted - and errcheck only clears 50 once the other flag has fired.
+      # lifted - and the per-linter flag's real effect here is ERRCHECK 50 -> 79,
+      # which exists only after the other flag has fired. Cite that pair, not
+      # 36 -> 79: no single flag produces 36 -> 79.
+      #
+      # AND `issues.uniq-by-line` DEFAULTS TO TRUE, DEDUPPING ACROSS LINTERS, so a
+      # single linter's count depends on which OTHERS are enabled: 107 becomes 108
+      # with `--uniq-by-line=false` (staticcheck 21 -> 22). One finding today, noted
+      # for M4/M5 because they add linters - this is how a staticcheck finding
+      # vanishes from an "unfiltered" total with nobody touching staticcheck.
       #
       # 🔴 WHICH MAKES THE OBVIOUS "IS THE SECOND FLAG LOAD-BEARING?" CHECK A TRAP.
       # Add `--max-issues-per-linter=0` on its own, see 56 -> 56, conclude it does
@@ -505,6 +522,36 @@ tasks:
       #
       # No `origin/main` pre-flight here, deliberately: this target does not use
       # the ref, so the guard would fail a run that is not exposed to the hazard.
+      #
+      # 🔴 `cache clean` FIRST, AND IT IS NOT HYGIENE - WITHOUT IT THIS TARGET
+      # REPORTS ANOTHER WORKTREE'S FINDINGS AS THIS ONE'S. golangci-lint's result
+      # cache is HOST-GLOBAL (~/Library/Caches/golangci-lint), shared by every
+      # sibling worktree of this bare clone exactly like the Go build cache. A warm
+      # entry from worktree B replays B's ABSOLUTE paths, and this target has no
+      # diff processor to drop them, so they are simply ADDED to the report.
+      # Measured 2026-08-02, with a validator's throwaway worktree warm in the
+      # cache: this target printed 120 findings, EVERY ONE carrying a path like
+      # `../../../../../../../../private/tmp/.../wt-r3/api/internal/...`; after
+      # `cache clean` it printed 107, all repo-root-relative. The recorded backlog
+      # figure is the 107.
+      #
+      # NOTE THE DIRECTION, because the documented version of this trap is the
+      # OPPOSITE one: a poisoned cache makes the RATCHETED target go falsely GREEN
+      # (the diff processor cannot match a foreign path against `git diff` and
+      # drops everything), while it makes THIS target falsely LOUD. Same cache, two
+      # inverted symptoms, and the quiet one is the dangerous half.
+      #
+      # IN THE RECIPE RATHER THAN IN A DOC, on purpose: this is a RECORDING target
+      # whose entire output is a number somebody writes down, so "remember to clean
+      # first" is the kind of discipline this repo removes rather than relies on.
+      # THE COST IS REAL AND SHARED: the cache is host-global, so this clears it for
+      # every concurrent agent and worktree too, and the next `lint:api` runs cold
+      # (~6-8s). That is why the clean lives HERE and NOT on `lint:api` /
+      # `lint:controller`, which run in the gate and on every MR.
+      #
+      # THE TELL, if you ever see this target's output without the clean: any path
+      # containing `../`. A `../` in a finding is an invalid run, not a finding.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
   test:api:
@@ -619,13 +666,15 @@ tasks:
     dir: controller
     cmds:
       # Exits nonzero whenever it reports anything, exactly like lint:api:all -
-      # read that target's first paragraph before wrapping either.
+      # read that target's first paragraph before wrapping either, and its
+      # `cache clean` paragraph before deleting the line below as redundant.
       #
       # See lint:api:all for why the empty `--new-from-merge-base=` is the only
       # spelling that clears the config's ratchet, and why both cap flags are
       # required. THIS is the module where the caps make no difference (5 either
       # way) - which is exactly why a "do the caps matter?" check must be run
       # against `api`, not here.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
   test:controller:

@@ -70,9 +70,37 @@ Not everything is a target. A single-test run, `sqlc generate`, the compose
 stack, `./e2e/run-e2e.sh` and `./scripts/smoke.sh` are not gate recipes and stay
 written out as commands in `CLAUDE.md`.
 
-The Taskfile installs nothing — no `npm ci`, no `go mod download`. Your
-`node_modules` and module cache are expected to exist; CI does that in its
-`before_script`.
+The Taskfile installs no *project* dependencies — no `npm ci`, no
+`go mod download`. Your `node_modules` and module cache are expected to exist; CI
+does that in its `before_script`.
+
+**One exception since PRD #103 M3, and it is why that sentence is now qualified:**
+`task lint:api` and `task lint:controller` invoke
+`go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`, which on a
+cold cache fetches and builds that tool's dependency tree. Measured at **51.6s
+cold, then under 2s warm**. It is pinned and sumdb-verified and writes nothing to
+either `go.mod`, so it changes no dependency of yours — but the first run is slow
+and that is expected, not a hang.
+
+**🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3, YOU
+MUST INSTALL IN BOTH npm PACKAGES.** oxlint is a new devDependency, and the lint
+step fails closed with `oxlint: command not found` until it is present — in a
+package you may not have touched. Run it in **both** `web/` and `agent/`:
+
+```sh
+npm install --ignore-scripts
+```
+
+**`--ignore-scripts` is not optional in `agent/`.** That package depends on
+`agent-browser`, whose `postinstall` rewrites `/opt/homebrew/bin/agent-browser` to
+point inside whatever `node_modules` just installed it, breaking the CLI host-wide
+for every other session and every other worktree — `CLAUDE.md` documents the
+breakage and the `brew unlink` / `brew link --overwrite` repair. The flag is
+already settled for this repo with its own measurements (`agent/src/js-deps.ts`,
+PRD #121), including that **a repo `.npmrc` setting `ignore-scripts=false` does not
+override the CLI flag**. The cost, stated honestly: it also skips *other* packages'
+legitimate build steps, so if something later fails for want of a native binary,
+reinstall that package normally or symlink `node_modules` from a sibling worktree.
 
 **The format check is `task fmt-check`** (`gofmt -l` over both Go modules, added
 by PRD #103 M2). It is a composite, and it is the per-module `fmt-check:api` and

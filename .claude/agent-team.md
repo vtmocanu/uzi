@@ -1347,6 +1347,24 @@ lint           task lint           # composite, all four components (M5 will app
                                    # status carefully -- records a red gate over
                                    # code that is fine. THE ONLY DISCRIMINATOR IS
                                    # THE MESSAGE TEXT. Read it.
+                                   # 🔴 THE SAME HOST-GLOBAL DIRECTORY HOLDS A
+                                   # RESULT CACHE THAT REPLAYS OTHER WORKTREES'
+                                   # FINDINGS, AND IT LIES IN BOTH DIRECTIONS.
+                                   # Warm entries from a sibling worktree carry ITS
+                                   # absolute paths: the RATCHETED targets then go
+                                   # falsely GREEN (the diff processor cannot match
+                                   # a foreign path and drops everything) while the
+                                   # `:all` targets go falsely LOUD. Measured
+                                   # 2026-08-02: `task lint:api:all` printed 120
+                                   # findings, every one pathed into another
+                                   # worktree, against 107 after a cache clean.
+                                   # THE TELL IS A `../` IN A FINDING'S PATH --
+                                   # that is an invalid run, not a finding. The
+                                   # `:all` targets now `cache clean` themselves;
+                                   # the gate targets deliberately do NOT (it would
+                                   # clear the cache for every concurrent agent), so
+                                   # if you are calibrating, or chasing a surprising
+                                   # green, clean first and re-run.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
                                    # still runs inside gate:api / gate:controller as
                                    # its OWN unratcheted step and is deliberately NOT
