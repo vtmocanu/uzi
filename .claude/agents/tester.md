@@ -386,8 +386,11 @@ cold budget was not re-measured.
 
 Instead run the component gates for what the diff touched — re-measured post-M3 on the
 126s run, each with its lint step included: **`task gate:api` 51.8s,
-`gate:controller` 6.5s, `gate:web` 18.3s, `gate:agent` 25.9s**. (They replace a pre-M3
-sample of 43-66s / ~10s / 23s / 34s, which overlaps them.) Scoping to the touched
+`gate:controller` 6.5s, `gate:web` 18.3s, `gate:agent` 25.9s**. 🔴 **SINGLE SAMPLES
+FROM THE FASTEST OF THE THREE RUNS, AND THEY SCALE WITH IT** — the total above ships
+as a range and these do not, so read them as the bottom of one: scaled to the 213s
+run, `gate:api` lands near 87s. Take your own sample if you need a budget rather than
+an indication. (They replace a pre-M3 sample of 43-66s / ~10s / 23s / 34s.) Scoping to the touched
 component is already what the generic body above asks of you; these targets are how you
 do it here. Reserve the
 full `task gate` for a release or a cross-component change, and coordinate with the

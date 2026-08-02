@@ -1125,9 +1125,15 @@ which previously prescribed only the fail-open form.
       itself. Three reasons, measured at golangci-lint 2.12.2 / go1.26.5
       darwin/arm64 **with `--max-issues-per-linter=0 --max-same-issues=0`**: it is
       **1178 findings in `api`** uncapped (931 of them in `_test.go`, 247 not), which
-      is 90%
-      of the combined backlog; **the 21 non-test findings visible in the capped run
-      were read by hand, plus a 1-in-20 re-sample across all 86 non-test files, and
+      is **91.5%**
+      of the combined backlog (goconst 1178 + controller's 33 = 1211, against a
+      non-goconst backlog of api 107 + controller 5 = 112; re-derived on the
+      **shipped** enable set — the "90%" this previously read was computed on the
+      design-wave set, whose non-goconst backlog was 134, and it was the one figure
+      in the block nobody re-took when the enable set changed);
+      **the 21 non-test findings visible in the capped run
+      *across both modules* were read by hand, plus a 1-in-20 re-sample across all 86
+      non-test files in `api`, and
       none is a defect** — CLI subcommand names, JSON field names, and the
       `queued → claimed → running` run-state vocabulary this PRD's own Architecture
       section documents, which is a goconst finding at every switch arm; and

@@ -1428,11 +1428,15 @@ exactly that inference. The 8m31s cold budget was NOT re-measured; lint adds rou
 and 0.1s of npm work to it, which does not change how it should be read.
 
 **So scope it.** A change touching one component runs `task gate:<component>` and
-gets a complete answer in well under a minute — re-measured post-M3 on the **126s**
-run specifically: **api 51.8s, controller 6.5s, web 18.3s, agent 25.9s**, every one
-of them with its lint step included. (The pre-M3 sample these replace read api
-43-66s, controller ~10s, web 23s, agent 34s; the two sets overlap, which is the
-point.) That is what per-component gates are FOR (PRD #103
+gets a complete answer in well under a minute. Re-measured post-M3, each with its
+lint step included: **api 51.8s, controller 6.5s, web 18.3s, agent 25.9s** — but
+🔴 **THESE ARE SINGLE SAMPLES FROM THE 126s RUN, WHICH IS THE FASTEST OF THE THREE,
+AND THEY SCALE WITH IT.** The total above ships as a range and these do not, so read
+them as the bottom of one: scaled to the 213s run, `gate:api` lands near 87s. If you
+need a per-component budget rather than an indication, take your own sample on your
+own machine — that is cheaper than any figure recorded here, which is the general
+case for every timing in this block. (The pre-M3 samples these replace read api
+43-66s, controller ~10s, web 23s, agent 34s.) That is what per-component gates are FOR (PRD #103
 Decision 2), and nothing else here tells a cold-starting teammate to prefer them.
 Reach for the full `task gate` before a release or when a change crosses components,
 and coordinate with the lead the way you would for e2e.

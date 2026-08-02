@@ -62,7 +62,16 @@ linters:
   #   increasing order of weight, measured 2026-08-02 at golangci-lint 2.12.2 /
   #   go1.26.5 darwin/arm64 with `--max-issues-per-linter=0 --max-same-issues=0`:
   #     1. SCALE. Uncapped it is 1178 findings in `api` (931 in _test.go, 247 not)
-  #        and 33 in `controller` — 90% of the combined backlog. Every figure
+  #        and 33 in `controller` (24 _test.go / 9 not) — 91.5% of the combined
+  #        backlog, re-derived on the SHIPPED enable set rather than inherited:
+  #        goconst 1178 + 33 = 1211 against a non-goconst backlog of api 107 +
+  #        controller 5 = 112, so 1211/1323. (This clause read "90%" until
+  #        2026-08-02, a figure computed on the DESIGN-WAVE enable set, whose
+  #        non-goconst backlog was 134. It was the one number in this block nobody
+  #        re-took when the enable set changed, sitting beside four that were
+  #        re-taken. The argument is unaffected — goconst dominates either way —
+  #        and `controller 33` was itself inherited until it was measured here.)
+  #        Every figure
   #        quoted for it during design was a CAP READING: the default
   #        --max-issues-per-linter is 50 and goconst reported exactly 50, which is
   #        the tell nobody looks at because 50 is a plausible number.
@@ -81,9 +90,14 @@ linters:
   #        A hand-split of the wrong one puts the two wrapped records in the
   #        non-test bucket and reports 249 across 87 files. Both wrapped records are
   #        in _test.go, so the non-test figures are 247 across 86 either way.
-  #     2. NO SIGNAL. The 21 non-test findings VISIBLE IN THE CAPPED RUN were read
-  #        by hand, plus a 1-in-20 re-sample across all 86 non-test files; none is a
-  #        defect. (Stated as sample-plus-sample rather than as a census: `21` is a
+  #     2. NO SIGNAL. The 21 non-test findings VISIBLE IN THE CAPPED RUN ACROSS BOTH
+  #        MODULES were read by hand, plus a 1-in-20 re-sample across all 86 non-test
+  #        files in `api`; none is a defect. (🔴 "ACROSS BOTH MODULES" IS THE ONLY
+  #        FIGURE IN THIS BLOCK WHOSE SCOPE IS NOT api-ONLY, which is why it now says
+  #        so: 1178, 931, 247 and 86 are all `api`, and a reader who carries that
+  #        scope onto `21` gets the api capped non-test count, which is a much
+  #        smaller number. Stated in the one paragraph that is about naming your
+  #        denominator. Stated as sample-plus-sample rather than as a census: `21` is a
   #        CAP-ERA count and the uncapped non-test population is 247, so "all 21
   #        non-test findings" asserted a census nobody performed - inside the
   #        paragraph that exists because cap-era numbers were wrong. The ruling is
