@@ -16116,7 +16116,7 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
   declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
   path hook only JAILS writes to the worktree rather than denying them
-  (`guardrails.ts:757`). `architect.md:35` compounds it by offering "a SendMessage design
+  (`guardrails.ts:757`). `architect.md:37` compounds it by offering "a SendMessage design
   summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
   `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
   unavailable, naming `SendMessage` as the case — so that role's remaining options are both
@@ -16149,33 +16149,64 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   read-only validators together in one wave`, and **all 14 pins stayed green** (control:
   mutating one pinned phrase reds exactly 1 of 14, so the harness does discriminate). Those
   14 are therefore kept **unedited** — the pinned clause excludes the prefix, so rewording
-  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds eight pins no single
-  sentence can satisfy for both meanings. Every fold ran with all three `TestLead*` tests
-  present as `=== RUN` (so no fold was a compile error reading as silence), the template
-  restored from a `cp` backup rather than `git checkout --`, and, after three agents
-  collided in the shared worktree during the findings round, in a **throwaway detached
-  worktree** rather than the branch's own tree.
-- **DELETION AND RELOCATION ARE DIFFERENT INSTRUMENTS, AND THE FIRST ROUND USED ONLY ONE OF
+  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds eight. Every fold ran
+  with all three `TestLead*` tests present as `=== RUN` (so no fold was a compile error
+  reading as silence), the template restored from a `cp` backup rather than
+  `git checkout --`, and, from round two on, in a **throwaway detached worktree** rather
+  than the branch's own tree, after three agents collided in the shared one.
+- **DELETION AND RELOCATION ARE DIFFERENT INSTRUMENTS, AND ROUND ONE USED ONLY ONE OF
   THEM.** The coder's per-behaviour sentence deletions, the reviewer's word-level
   weakenings and the auditor's seven mutants are all **presence** mutations. None can
   produce the disconfirming answer, because a clause moved into the other wave's bullet is
-  still present character-for-character: measured by the tester on the first pin set,
-  relocating the citation clause or the no-write clause into the post-implementation bullet
-  and deleting the plan-turn sentence left the plan-turn constraint gone from the template
-  and **all 20 pins green at exit 0**. Three separate controls agreeing was three readings
-  of one instrument. That is this issue's own defect one level in: the old pins were blind
-  to *which wave fans out*, the first new set was blind to *which wave a constraint binds
-  to*.
-  **The second round folded both classes, and relocation found three MORE blind pins than
-  the findings round had named** (the artifact clause, the revise-turn clause, and — in the
-  inverse direction, moved out of its bullet into the plan paragraph — the
-  post-implementation ordering itself), each of which had passed its deletion fold. Every
-  case now quotes enough context to name its wave. Final control, 14 folds: 8 deletions and
-  6 relocations, every one red, `rc=1`. Two deletions redden two cases each, because the
-  spans are deliberately **not** pairwise disjoint — two anchors are the tail of the
-  preceding case, which is exactly what buys relocation-detection. **A one-fold-one-red
-  table is a weaker result than it looks; disjointness was the property that had to be
-  given up to get this.**
+  still present character-for-character: measured by the tester, relocating the citation
+  clause or the no-write clause into the post-implementation bullet and deleting the
+  plan-turn sentence left the plan-turn constraint gone from the template and **all 20 pins
+  green at exit 0**. Three separate controls agreeing was three readings of one instrument.
+  That is this issue's own defect one level in: the old pins were blind to *which wave fans
+  out*, the first new set was blind to *which wave a constraint binds to*.
+  **It then took three rounds to finish anchoring, and the reason is structural rather than
+  careless: it is a per-phrase property applied by hand with nothing checking it was
+  applied**, and each round the phrase nobody re-checked was the one that was missed.
+  Counting in **phrases**, seven needed anchoring across the three rounds. The rule is now
+  enforced instead of asserted — each case carries an `anchor` field naming the turn it
+  binds to, and the test asserts the anchor is inside the phrase, that no phrase contains
+  another, that each matches exactly once, and that none swallows a phrase from the 14-set.
+  That last one is not hypothetical: round two's ordering pin had swallowed `send all
+  allocated read-only validators together in one wave` whole, silently retiring it.
+- **What anchoring buys is SEMANTIC, and the relocation control has to be read accordingly.**
+  An anchored phrase relocated into the other bullet stays green **and that is correct** —
+  the phrase names its own turn, so the behaviour travels with the sentence and nothing is
+  lost. The blind case is the unanchored one, where the pin stays green and the behaviour
+  does not travel. The discriminating fold is therefore not "relocate it" but "revert the
+  original site to the un-anchored wording": measured, all three formerly-blind pins red on
+  that fold, while the relocate-the-whole-anchored-phrase control is green.
+  Two corrections to how this was written down before, both of which had reached this
+  section: the earlier claim that **overlapping spans buy relocation-detection is false** —
+  `strings.Contains` is per-occurrence, so two overlapping pins can be satisfied by two
+  different occurrences and the overlap never forced contiguity at all; it only ever
+  detected deletion, which the pins already did. The spans are now pairwise disjoint and
+  audited to be. And a borrowed prefix costs a **measured false positive**: one benign
+  clarifying sentence inserted between two pinned sentences reddened a pin with both
+  behaviours fully intact.
+- **THE INSTRUMENT HAS A FLOOR, AND ANCHORING DID NOT RAISE IT: no substring-presence set
+  can detect an INSERTION.** `strings.Contains` is monotone under insertion — adding text
+  can only turn a false into a true. Measured: a paragraph inserted above this one calling
+  the whole thing "an optional pre-flight … skip it entirely and call `submit_plan`
+  straight away" neutralises every behaviour with **all pins byte-intact, `rc=0`**. This is
+  a property of the instrument, not of the phrase choices, so no anchoring, widening or
+  region-scoping closes it, and the obvious patch — a negative assertion on the inserted
+  wording — is the vacuous-negative trap this repo already documents. Recorded so that
+  "anchoring closed relocation" is never read as "the pins are now sufficient": insertion
+  is caught by reading the diff, by nothing here.
+  **Region-scoping** (assert each phrase against its region of the template rather than the
+  whole flattened body) closes relocation by construction and lets every phrase shrink, and
+  it is deliberately a **follow-up, not part of this change** — user/lead decision on the
+  tester's own recommendation. Its correctness rests on a three-clause boundary guard that
+  has had exactly one evaluation, its author's, which is the control-written-from-inside
+  problem that produced this whole task; and its naive `strings.Cut` form is *strictly
+  worse than what ships here*, since a missing boundary silently turns seven plan-turn
+  assertions into whole-body assertions while one unrelated loud red draws the eye
+  elsewhere.
 - **Reach: correct, fully gated, merged — and INERT on every install that has booted once.**
   `queries/agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING`,
   and `store/agent_templates_builtins.go` states it in prose: an existing row, builtin or
@@ -16204,8 +16235,14 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —
   a ceiling of 24 planning turns, each of which would otherwise carry a full wave, against a
   **non-resetting** 2h `RUN_TIMEOUT`, since `started_at` is `COALESCE`d once and never
-  re-stamped (`queries/runtime.sql:647`). One clause bounds it and is right on the merits
-  anyway: on a revise turn, re-cite only the mechanisms the revision changed.
+  re-stamped (`queries/runtime.sql:647`). The bounding clause therefore has to name **any
+  re-planning turn**, not a revise turn: there are two distinct re-entry paths, and they
+  are the two factors above — `buildRevisePlanPrompt` (`sdk-executor.ts:804`) for a
+  rejected plan, and `buildPlanAfterAnswerPrompt` (`:1215`, inside `drivePlanningTurn`)
+  for an answered question. A clause naming only revisions removes the ×4 and leaves the
+  ×6, taking the ceiling from 24 to about 6 rather than to 1, so "one clause bounds it"
+  was an over-claim on the first version of this sentence and the clause was widened to
+  match.
 - **`docs/agent-templates.md` was the fifth file, and the run brief missed it.** Its
   `:58-61` restated the post-implementation-only ordering and its frontmatter is
   `audience: user`, so it renders in-app at `/docs/agent-templates`: shipping without it
