@@ -154,6 +154,84 @@ pastes that block into every validator dispatch.
 - Commit locally on `fix/197-lead-design-critique-wave`. Never touch `main`, never push.
 - Prose edits here are claims about code. Re-derive at the moment you assert.
 
+## Round 3 findings (2026-08-02, at `bade5648`) — fix these, then re-gate
+
+Full detail in the round-3 reports. **1 Blocking, 7 Should-fix.** Every claim below
+re-derived by the lead.
+
+**B3 (BLOCKING) — three pins are STILL relocation-blind: P3, P5, P8.** None carries a
+turn anchor inside its own phrase. Measured: relocating each into the diff bullet leaves
+**22/22 pins green**. R2 is the sharpest — the plan turn reverts to *exactly* the
+un-relayed wording P5 exists to reject, and P5 stays green. Control that makes this a
+finding: relocating an *anchored* pin (P6) also stays green, but the behaviour travels
+with the sentence, so nothing is lost. Anchored-relocated is fine; unanchored-relocated
+is blind. **Anchor P3, P5 and P8 the way P1/P2/P4/P6 already are.**
+
+**S7 — shorten P7 to `On a revise turn, re-cite only the mechanisms your revision
+changed`.** It already self-anchors, so its borrowed prefix buys nothing and costs two
+**measured false positives**: inserting one benign clarifying sentence between P6 and P7
+reds P7 with both behaviours fully intact.
+
+**S8 — the overlap never bought what it was bought for.** `strings.Contains` is
+per-occurrence, so two overlapping pins can be satisfied by two *different* occurrences —
+the overlap does not force contiguity and only ever detected deletion, which the pins
+already had. Say this where the comment currently claims otherwise.
+
+**S9 — `D2 ⊂ P1`, undeclared.** Verified exact: `send all allocated read-only validators
+together in one wave` is a strict substring of P1's phrase, so D2 can never red alone and
+the 14-set's one-assertion-per-behaviour property is broken for it. Accept and note, or
+narrow P1.
+
+**S10 — the test comment is wrong in three ways**, in a comment about accuracy:
+(a) *"every case below quotes enough context to name its wave"* — false for P3, P5, P8;
+(b) *"deleting either anchor sentence reddens two cases rather than one"* — the long
+dispatch sentence reds **four** (P4's tail, P5, P6, P7's head all live in it). The
+comment describes *span overlap*; a reader meets *sentence co-tenancy*, and sentence
+granularity is how anyone folds prose. State a per-sentence expectation instead: 2 for the
+`submit_plan` sentence, 4 for the dispatch sentence, 1 for every other, and *any other
+multiplicity is a bug, not this trade*; (c) *"Measured on four separate phrases"* vs the
+lead's "five pins wide" — different units, neither states which. Record the unit rather
+than harmonising.
+
+**S11 — document the INSERTION limit, and do not patch it.** A pure insertion (zero
+deletion lines) declaring the paragraph *"an optional pre-flight… skip it entirely and
+call `submit_plan` straight away"* neutralises the whole behaviour with **22/22 pins
+byte-intact**. This is a property of the instrument, not a bad pin choice:
+`strings.Contains` is **monotone under insertion**, so no substring-presence set of any
+size or anchoring quality can ever detect an addition. The obvious patch — a negative
+assertion — is the vacuous-negative trap and would be worse. Region-scoping does **not**
+close it either (measured). Say so plainly, or "anchoring closed relocation" will read as
+"the problem is closed".
+
+**S12 — `specs/ai.md` cites `architect.md:35`; the sentence is at `:37`.** Third citation
+defect of the run and the **first in a shipped file**. Substance holds.
+
+**S13 — §467's "one clause bounds it" over-claims.** The clause names *revise turns*
+only, and there are two distinct re-entry paths: `buildRevisePlanPrompt`
+(`sdk-executor.ts:804`) and `buildPlanAfterAnswerPrompt` (`:1215`, inside
+`drivePlanningTurn`). So it removes the ×4 revise factor and leaves the ×6 question
+factor: the ceiling goes 24 → ~6, not → 1. Either widen the clause to *"on any
+re-planning turn"* (also right on the merits) or correct §467.
+
+**S14 — `docs/agent-templates.md:132-134` contradicts itself.** It still tells users Reset
+is *"the only path"* while `:144-145` offers the hand-merge, and §467 now **knowingly**
+records that the hand-merge exists. Pre-existing, but now knowingly wrong. One word:
+*"the only automatic path"*.
+
+**Lead's error, for the record:** I told the fact-checker the hand-merge sentence moved to
+`:138-139`. It moved **down**, not up — `480c1b02:138` → `60bf036f:143` → `bade5648:144`.
+The coder said it first and I relayed it without running the one command that checks it.
+
+**Region-scoping is a FOLLOW-UP, not part of this change.** Decided on the tester's
+measured recommendation, not on scheduling. It closes relocation 3-for-3 with anchors
+removed and shrinks every phrase — but its correctness rests entirely on a three-clause
+guard that has had exactly one evaluation, its own author's, which is the
+control-written-from-inside problem that created this whole task. The naive form
+(`strings.Cut`) is **strictly worse than what ships today**: a missing boundary makes the
+before-region the *entire body* (seven assertions silently revert to whole-body semantics)
+while the after-region is empty (one loud red). One correct-looking red naming the bullet
+case, concealing seven disarmed assertions.
+
 ## Amendments
 
 ### 2026-08-02 — design wave settled. THE DESIGN IS NOW FROZEN.
