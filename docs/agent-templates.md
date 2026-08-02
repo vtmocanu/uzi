@@ -55,10 +55,15 @@ The lead can dispatch more than one subagent in the same turn when their
 work doesn't overlap, instead of always waiting for one to finish before
 starting the next:
 
-- **Read-only validators fan out together.** After an implementation unit
-  lands, the lead sends every allocated read-only subagent (`reviewer`,
-  `auditor`, `tester`, `fact-checker` — whichever the run allocated) in one
-  wave rather than one at a time.
+- **Read-only validators fan out together, twice.** The lead sends every
+  allocated read-only subagent (`reviewer`, `auditor`, `tester`,
+  `fact-checker` — whichever the run allocated) in one wave rather than one at
+  a time: first over the **plan**, before it reaches you at the approval gate,
+  and again over the **diff** once an implementation unit lands. The plan-time
+  wave is what backs up the plan's claims — for every mechanism the plan
+  asserts, it names the file and quotes the line — so what you approve has
+  already been read against the code. It only reports; nothing in the
+  repository is changed before you approve.
 - **Coders fan out only for genuinely independent units.** The lead
   parallelizes implementation work only when the plan splits it into pieces
   that share no Go package, no TypeScript project, and no file (including

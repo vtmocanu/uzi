@@ -172,6 +172,47 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 	}
 }
 
+// TestLeadPlanCritiquePhrases pins the plan-time half of the lead's dispatch
+// contract (issue #197): the plan must cite the code it asserts, and the wave
+// that produces those citations runs before `submit_plan`, reads the plan text
+// rather than a diff, and writes nothing.
+//
+// It is a SEPARATE case set from TestLeadParallelDispatchPhrases on purpose.
+// The ordering this issue changed was entirely unpinned — `after an
+// implementation unit lands` appeared nowhere in this file — so a mutant that
+// deleted the post-implementation ordering and replaced it with a plan-time
+// wave kept all 14 of those pins green by reusing the one clause they share
+// (`send all allocated read-only validators together in one wave`), which is
+// deliberately prefix-agnostic. The pins below are written so that no single
+// sentence can satisfy both meanings: the first case fixes the wave that
+// happens AFTER implementation, the rest fix the one that happens BEFORE
+// `submit_plan`, and deleting any one of them from the template reddens its
+// own case alone.
+func TestLeadPlanCritiquePhrases(t *testing.T) {
+	lead, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("lead builtin missing")
+	}
+	body := flatten(string(Render(lead)))
+
+	cases := []struct {
+		behavior string
+		phrase   string
+	}{
+		{"post-implementation wave is retained and is a REPEAT", "fans out again after an implementation unit lands"},
+		{"the citation property is anchored on submit_plan", "Before you call `submit_plan`, make the plan carry its own evidence"},
+		{"every asserted mechanism is cited by file and line", "for every mechanism it asserts, name the file that implements it and quote the line"},
+		{"the plan-turn wave reviews the plan text, not a diff", "the artifact under review is the plan text, not a diff"},
+		{"the plan-turn wave is report-only", "must not change anything in the worktree"},
+		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(body, c.phrase) {
+			t.Errorf("lead template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+}
+
 // TestCoderParallelModeContract pins the coder's parallel-mode contract (PRD #43
 // M1): the hard file-scope boundary, stop-and-report on out-of-scope or shared
 // files, no commit in parallel mode, and gate only what it exclusively owns.
