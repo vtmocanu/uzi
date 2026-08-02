@@ -68,7 +68,17 @@ Same prefix **and** same image, so **neither `--filter name=uzi-` nor `--filter 
 
 1. **Name throwaways OUTSIDE the `uzi-` namespace** (`cdr-*`, `aud-*`, `vm-rev-*`). This is the load-bearing rule: it removes the failure mode instead of relying on discipline.
 2. **Tear down only your own container, by exact name.** Never a `uzi-*` glob, never `docker compose down` from a worktree. This is the weaker rule — "be careful with globs" fails the moment someone reaches for one under time pressure, which is why (1) exists.
-3. **If you see a container you did not create, leave it.** Also applies to processes: a stray `run-e2e.sh` or `run-store-it.sh` may belong to another session. Verify ownership (shell-snapshot path, redirected log path, cwd) before killing anything — a worker refusing to kill an unowned process is behaving correctly, not obstructing.
+3. **If you see a container you did not create, leave it.** Also applies to processes: a stray `run-e2e.sh` or `run-store-it.sh` may belong to another session. Verify ownership before killing anything — a worker refusing to kill an unowned process is behaving correctly, not obstructing.
+
+   **🔴 BUT VERIFY IT WITH THE REDIRECTED LOG PATH ALONE. THIS RULE USED TO NAME THREE SIGNALS — "shell-snapshot path, redirected log path, cwd" — AND ON AN AGENT TEAM TWO OF THE THREE RETURN A CLEAN, CONFIDENT, WRONG ANSWER.** Measured 2026-08-02 during PRD #103 M3, while several agents were working in one worktree:
+
+   - **Shell-snapshot path: SHARED, and it is per-CLI-SESSION rather than per-agent** — which is the non-obvious half and the reason it looks like an identity. Every process in one capture, across three different agents, sourced the identical `snapshot-zsh-1785689779598-39rq5l.sh`; the coder confirmed first-hand that its own shell sourced that same file. **Had anyone trusted this signal, it would have attributed an unowned process to whichever agent they checked first.** It is not weak evidence, it is *anti*-evidence: it manufactures a match between any two agents in the session.
+   - **cwd: SHARED.** Agents routinely run in each other's worktrees — a reviewer, an auditor, a fact-checker and a tester all working in the coder's tree is the normal shape of a validation wave, not an anomaly — and the scratchpad is team-wide, not per-agent. In the measured case cwd pointed at the worktree's owner for a process that belonged to someone else.
+   - **Redirected log path: still carries information**, but only when the writer chose a distinctive name. A generic `out.log` tells you nothing.
+
+   **SO: IF YOU CANNOT ATTRIBUTE A PROCESS, LEAVE IT.** That is the whole fallback and it needs no signal at all. The cost of leaving a stray process is a little CPU; the cost of killing another agent's mid-flight measurement is its result, silently, with the owner told nothing.
+
+   *(The story below is a correct past-tense record of a case where this rule worked and is deliberately unchanged. What changed is that two of the three signals it named have since been measured on a running agent team and do not discriminate — the rule would not do that work today. Found by M3's own tester while trying to settle a process-attribution question, and corrected here rather than filed, because a wrong safety rule about killing other agents' work is not a thing to ship a quality-gates milestone alongside.)*
 
 Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — inside the namespace rule (1) says to avoid. It is PID-unique and tears itself down by exact name, so it is safe to run; but it means rule (2) is what holds the line there, for everyone.
 
