@@ -60,7 +60,13 @@ Two secondary gaps:
   `ARCHITECTURE.md:128` all hard-code "ten" / "nine subagents". *(Line cite
   replaced with a string cite 2026-08-02, PRD #103: `CLAUDE.md`'s content had
   moved past `:117` before this correction and keeps moving as later PRDs edit
-  it — cite the bullet, not a line.)*
+  it — cite the bullet, not a line.)* *(Second correction, same date and PRD:
+  this bullet's own claim is now stale too, not just its citations —
+  `docs/agent-templates.md:30` currently reads "uzi seeds eleven builtin
+  templates" and `ARCHITECTURE.md` nearby reads "Eleven builtin roles", neither
+  the "ten" / "nine" this bullet says they hard-code. Same rule as the Roster
+  correction above: noted, not fixed here — #85's owner re-derives the actual
+  gap against current text before resuming this PRD.)*
 
 ## Solution Overview
 
