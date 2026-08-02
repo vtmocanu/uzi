@@ -129,9 +129,10 @@ uzi version, your customization is gone, not folded into the new body.
 That's also why a shipped change to a builtin's prompt doesn't reach you
 automatically: it seeds into a fresh database on first boot, but an
 already-seeded row is never silently overwritten (that's what keeps your
-customizations durable across every other upgrade). Reset is the only path
-that pulls in a newer builtin body for an existing deployment, and it's
-all-or-nothing.
+customizations durable across every other upgrade). Reset is the only
+automatic path that pulls in a newer builtin body for an existing deployment,
+and it's all-or-nothing — the alternative is pasting the new body in by hand,
+below.
 
 To pick up a new builtin body without losing your own edits:
 

@@ -187,31 +187,50 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 // happens AFTER implementation; the rest fix the one that happens BEFORE
 // `submit_plan`, so no single sentence can satisfy both meanings.
 //
-// Two properties of this set are load-bearing and were both found the hard way,
-// by folds a deletion-only control cannot produce:
+// Three properties of this set are load-bearing, all three found by folds that a
+// deletion-only control cannot produce:
 //
-//  1. A phrase with no anchor to a wave is RELOCATION-BLIND. Deleting a clause
-//     is not the only way to lose it: move it into the other wave's bullet and
-//     every pin naming only the clause stays green while the behaviour is gone
-//     from the turn it bound. Measured on four separate phrases here, each of
-//     which passed a deletion control and then failed a relocation one. So every
-//     case below quotes enough context to name its wave — the ordering case
-//     carries the bullet's own opening, the plan-turn cases carry `Before you
-//     call submit_plan`, `over the plan in the same turn`, `an edit made during
-//     the plan turn`, or the sentence they follow.
-//     Consequence, deliberate and not an oversight: the spans are NOT pairwise
-//     disjoint. Two anchors are the tail of the previous case (the citation
-//     phrase carries `make the plan carry its own evidence:`, the revise phrase
-//     carries `is a change nobody saw when approving it.`), so deleting either
-//     anchor sentence reddens two cases rather than one. Relocation is what the
-//     overlap buys, and it is worth more here than a clean one-fold-one-red
-//     table.
+//  1. A phrase that does not NAME ITS OWN TURN is relocation-blind. Deleting a
+//     clause is not the only way to lose it: move it into the other wave's bullet
+//     and a pin quoting only the clause stays green while the behaviour is gone
+//     from the turn it bound. Seven phrases (not seven pins — the unit here is
+//     the quoted phrase) failed this across two rounds, each after passing its
+//     own deletion fold. The fix is semantic, not length: every phrase below
+//     carries a token that states which turn it binds — `after an implementation
+//     unit lands`, `submit_plan`, `the plan text`, `before the plan is approved`,
+//     `during the plan turn`, `re-planning turn`, `the plan you produced`. A
+//     phrase carrying its turn survives relocation with the behaviour intact,
+//     which is why an anchored pin staying green under relocation is correct
+//     rather than blind.
+//     The `anchor` field is that token, and the audit below asserts it is
+//     actually inside the phrase. Two rounds of hand-checking missed a
+//     freshly-anchored phrase each time; this is a manual property with nothing
+//     enforcing it, so it is enforced here.
 //  2. A constraint the lead must TRANSMIT has to be pinned as a transmission.
 //     A subagent's system prompt is its own template body and the lead cannot
 //     alter it, so the dispatch prompt is the only channel; `architect` and
 //     `tester` both ship with `Edit, Write`. The pin is therefore on `tell each
-//     of them the wave must not change anything`, which the un-relayed wording
-//     (`That wave must not change anything in the worktree`) does not satisfy.
+//     of them …`, which the un-relayed wording (`That wave must not change
+//     anything in the worktree`) does not satisfy.
+//  3. NONE OF THIS DETECTS AN INSERTION, and no amount of it ever will.
+//     `strings.Contains` is monotone under insertion: adding text can only turn
+//     a false into a true, never the reverse. So a paragraph inserted above this
+//     one declaring the whole thing optional — "skip it and call `submit_plan`
+//     straight away" — neutralises every behaviour here with all pins byte-intact.
+//     That is a property of substring-presence as an instrument, not a bad choice
+//     of phrases, and no anchoring, widening or region-scoping closes it. The
+//     obvious patch, a negative assertion on the inserted wording, is the
+//     vacuous-negative trap (it guards a string nothing renders). Anchoring
+//     closed RELOCATION; insertion stays open and is caught by reading the diff.
+//
+// Deleting a whole sentence reddens every case living in that sentence, and
+// sentence granularity is how anyone actually folds prose: measured, 2 for the
+// `submit_plan` sentence, 3 for the long dispatch sentence, 1 for each of the
+// other three. Any other multiplicity is a bug, not this trade.
+// The spans themselves are pairwise disjoint and each occurs exactly once
+// — both audited below, because `strings.Contains` is per-occurrence and two pins
+// satisfied by two different occurrences of overlapping text prove less than they
+// appear to.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
@@ -222,19 +241,66 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	cases := []struct {
 		behavior string
 		phrase   string
+		// anchor names the turn the behavior binds to and MUST appear inside
+		// phrase — see property 1 above.
+		anchor string
 	}{
-		{"post-implementation wave is retained and is a REPEAT", "Read-only work fans out again after an implementation unit lands: send all allocated read-only validators together in one wave"},
-		{"the citation property is anchored on submit_plan", "Before you call `submit_plan`, make the plan carry its own evidence"},
-		{"every asserted mechanism is cited by file and line", "make the plan carry its own evidence: for every mechanism it asserts, name the file that implements it and quote the line"},
-		{"the plan-turn wave reviews the plan text, not a diff", "over the plan in the same turn. Say in each dispatch that the artifact under review is the plan text, not a diff"},
-		{"the no-write rule is RELAYED to each dispatched validator", "tell each of them the wave must not change anything in the worktree"},
-		{"the no-write rule binds the PLAN TURN specifically", "an edit made during the plan turn is a change nobody saw when approving it"},
-		{"a revise turn re-cites only what the revision changed", "is a change nobody saw when approving it. On a revise turn, re-cite only the mechanisms your revision changed"},
-		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
+		{"post-implementation wave is retained and is a REPEAT",
+			"Read-only work fans out again after an implementation unit lands",
+			"after an implementation unit lands"},
+		{"the citation property is due before submit_plan",
+			"Before you call `submit_plan`, make the plan carry its own evidence",
+			"submit_plan"},
+		{"every asserted mechanism is cited by file and line",
+			"`submit_plan`, make the plan carry its own evidence: for every mechanism it asserts, name the file that implements it and quote the line",
+			"submit_plan"},
+		{"the wave reviews the plan text, not a diff",
+			"the artifact under review is the plan text, not a diff",
+			"the plan text"},
+		{"the no-write rule is RELAYED to each dispatched validator",
+			"tell each of them the wave must not change anything in the worktree before the plan is approved",
+			"before the plan is approved"},
+		{"the no-write rule binds the PLAN TURN specifically",
+			"an edit made during the plan turn is a change nobody saw when approving it",
+			"during the plan turn"},
+		{"re-planning re-cites only what changed",
+			"On any re-planning turn, re-cite only the mechanisms that changed",
+			"re-planning turn"},
+		{"the bar is a property of the plan, never of the issue text",
+			"follows from the plan you produced — how many mechanisms it asserts — never as a judgement about the issue text",
+			"the plan you produced"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(body, c.phrase) {
 			t.Errorf("lead template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+
+	// Audit, not a behavior pin: these assert properties OF THE CASE TABLE, so
+	// they fail on a badly-written pin rather than on a changed template.
+	for _, c := range cases {
+		if !strings.Contains(c.phrase, c.anchor) {
+			t.Errorf("pin %q is unanchored: phrase %q does not contain its turn anchor %q",
+				c.behavior, c.phrase, c.anchor)
+		}
+		if n := strings.Count(body, c.phrase); n > 1 {
+			t.Errorf("pin %q matches %d occurrences; a per-occurrence match cannot say which one satisfied it", c.behavior, n)
+		}
+	}
+	for i, a := range cases {
+		for j, b := range cases {
+			if i != j && strings.Contains(a.phrase, b.phrase) {
+				t.Errorf("pin %q contains pin %q, so the contained one can never fail alone", a.behavior, b.behavior)
+			}
+		}
+	}
+	// The 14 pins in TestLeadParallelDispatchPhrases are a separate set and must
+	// stay independently falsifiable: an earlier version of the first case here
+	// swallowed `send all allocated read-only validators together in one wave`
+	// whole, which silently retired that pin.
+	for _, c := range cases {
+		if strings.Contains(c.phrase, "send all allocated read-only validators together in one wave") {
+			t.Errorf("pin %q contains a TestLeadParallelDispatchPhrases phrase, retiring it", c.behavior)
 		}
 	}
 }
