@@ -194,14 +194,15 @@ the human at the gate — which is the gap the issue opens with.
 prompt is **phase-agnostic** — the lead reads the identical sentence in both turns —
 so relative wording ("before the implementer") is unresolvable there. `submit_plan`
 is phase-self-locating, is already named in `LEAD_GUARDRAIL_APPEND` (`prompt.ts:44`),
-and all three plan kinds end with it (`:559`, `:783`, `:908`). `lead.md` reaches both
+and all three plan kinds end with it (`:559`, `:783`, and `:907`/`:913` for ci_fix).
+`lead.md` reaches both
 phases by construction (`sdk-executor.ts:492-495`, and `:899-905` rebuilds the system
 prompt from the same `assembled.leadSystemPrompt`). A `prompt.ts` line would state it
 twice and pull `gate:agent` in for no new capability.
 
 **D4 — the dispatch must say the artifact is the PLAN TEXT, not a diff.** Mandatory,
-not flavour. `reviewer.md:43-44`, `auditor.md:36-37` and `tester.md:8`/`:20-21` each
-instruct their agent to report a missing diff and await re-delegation. Dispatched on
+not flavour. `reviewer.md:43-44`, `auditor.md:36-37` and **`tester.md:89-90`** each
+instruct their agent to surface the gap and await re-delegation. Dispatched on
 a plan without this, the wave returns bounce-backs instead of citations and is worse
 than no wave. Fixing those three bodies is the wrong lever — it triples scope and puts
 three more pin sets in play.
