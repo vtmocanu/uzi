@@ -174,7 +174,16 @@ function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
     // num_turns: when the SDK frame omits a field it lands as undefined and
     // JSON-serialization drops it, so nothing surfaces on the wire. These result
     // totals are CUMULATIVE-across-resume (PRD #40 Decision 3 verdict b), so the
-    // server rollup takes them latest-wins per (run_id, model), never a sum.
+    // server never sums the snapshots for one model: UpsertRunUsage merges with
+    // GREATEST per (run_id, session_id, model) — NOT latest-wins, so a re-delivered
+    // earlier frame cannot regress the row — and run_usage_totals then takes MAX
+    // across that model's sessions before SUMming ACROSS models.
+    //
+    // Corrected 2026-08-02 (issue #195): this said "latest-wins per (run_id, model),
+    // never a sum", which was wrong on all three counts — the merge is GREATEST, the
+    // write key includes session_id, and the run total IS a sum across models. Only
+    // `usage` is read by anything else; `modelUsage` is the field every rollup and,
+    // since #195, the run page itself fold from.
     return [
       {
         kind: "status",

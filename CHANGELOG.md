@@ -4,6 +4,20 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+### Fixed
+
+- **The run page's token counts were low, by 2.5x on output and up to 229x on
+  input, and now match the board.** The run page read one field of each result
+  frame while every rollup surface (the board, `uzi run list`, `GET /api/usage`,
+  the admin totals) read another, and on the current Anthropic SDK those two
+  fields no longer agree. Cost was low too, by whatever a model that dropped out
+  of the run's last frame had spent. Both surfaces now fold the same field, per
+  model, and a recorded fixture from a real run pins them to each other from both
+  sides so they cannot drift apart again (issue #195). This also unblocks the
+  live cost estimate in PRD #194.
+
 ## [0.13.0] - 2026-07-29
 
 ### Added
