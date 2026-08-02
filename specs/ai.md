@@ -15748,9 +15748,13 @@ must reproduce, most of which are invisible in a passing run.
   **passes**. That is why the retirement of the directory-wide-`gofmt -w` standing rule is
   **conditional on the tree**: on any tree carrying M2's reformat there is nothing left to
   sweep, and on an un-rebased branch `gofmt -l ./api` is still non-empty and the hazard is
-  exactly as live as before (measured on five live branches). A claim true of one tree,
-  written as a claim about the repo, is the defect this milestone corrected twice in its own
-  documentation.
+  exactly as live as before. Measured 2026-08-02 by extracting each branch's `api/` with
+  `git archive` into a temp dir: non-empty on **every local branch but two**, and the sample
+  was all of them. No count is recorded, deliberately — it moves with every commit and the
+  shape is the point. *(This bullet first said "five live branches", taken from the branches
+  that happened to have worktrees. True, and an understatement by several-fold that reads as
+  an enumeration.)* A claim true of one tree, written as a claim about the repo, is the defect
+  this milestone corrected twice in its own documentation.
 - **Never a root-scoped `gofmt -l .`; the composite COMPOSES the two per-module targets.** A
   repo-root walk descends into dot-directories, and CI's `.go_job` puts `GOPATH` and `GOCACHE`
   under `$CI_PROJECT_DIR` and runs `go mod download` before any script line — so a root-scoped
@@ -15784,14 +15788,23 @@ must reproduce, most of which are invisible in a passing run.
   followed by `gofmt -l` under the other empty both ways. Phrase any future restatement as
   *"measured equal at these two versions"*; *"gofmt is stable across patch releases"* is not
   something the toolchain promises, and a digest bump re-opens the question.
-- **A `gofmt -w` sweep is semantically inert but NOT whitespace-only.** Three non-whitespace
-  changes across the reformatted files, the notable one being **gofmt inserting a bare `//`
+- **A `gofmt -w` sweep is semantically inert but NOT whitespace-only — and any count of "how
+  many non-whitespace changes" is a property of the INSTRUMENT, so this file states one with
+  its instrument attached.** Three reproduce and all three are correct answers to different
+  questions: `git diff -w --ignore-blank-lines` says **3 files** changed other than in
+  whitespace *runs*; a whole-file whitespace-strip hash says **2** changed in non-whitespace
+  *bytes*; a `go/scanner` token stream with semicolons normalised says **0** changed
+  *semantically*. The figure this document means is the second: **two non-whitespace edits**,
+  plus a third file where a one-line anonymous struct expands to three and changes **no
+  non-whitespace byte at all** — the braces, the field and the tag already existed, so only
+  newlines and indentation were inserted. The notable edit is **gofmt inserting a bare `//`
   line into a doc comment** (Go 1.19+ doc-comment handling terminating a bulleted list) — which
   landed in the PAT scrubber's rationale block, the single most alarming place for a comment
   edit inside a commit claiming inertness. The scrubber's pattern literals are byte-identical,
-  so what it strips cannot change. The durable half is that *"pure gofmt"* does not imply
+  so what it strips cannot change. Two durable halves: *"pure gofmt"* does not imply
   *"comments untouched"*, and predicting the diff costs a sentence where not predicting it
-  costs a review round.
+  costs a review round; and the question anyone actually has of a reformat — *is it inert?* —
+  is answered only by the token stream, which is the instrument nobody reaches for first.
 - **CHANGELOG coverage is a gate with a tag-time fuse, and M2 disarmed one that M1 had lit.**
   `publish:assert-changelog` is tag-only and sits in `*publish_needs`, so it blocks every image
   and chart push; it requires any first-parent merge touching a *shipping* path (which includes
