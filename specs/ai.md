@@ -16125,6 +16125,19 @@ running the tool and every one of which has a quieter failure on the other side.
   space is rejected — and anyone who can open an MR chooses the target branch, so
   `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen string with live
   metacharacters. Never interpolated, quoted even where it is a constant.
+- **ONE ROOT `.golangci.yml` SERVES BOTH MODULES BY WALK-UP, AND THE PER-MODULE `dir:` ON EACH
+  TARGET IS FORCED RATHER THAN STYLISTIC.** From the repo root the tool cannot run at all:
+  `directory prefix . does not contain main module or its selected dependencies`. Two
+  properties a rebuild must not lose, both re-derived here rather than relayed. **Config
+  resolution picks the NEAREST file and does not merge**, so a per-module `.golangci.yml` would
+  shadow the root one entirely — verified by planting an empty one in `api/`, watching
+  `config path` resolve to it, and watching resolution walk back up to `../.golangci.yml` once
+  it was removed. And the config must be reached **by walk-up, not by an absolute `--config`
+  path**: passed absolutely from outside the tree, findings print with six levels of `../`,
+  which destroys the names-the-file property the format gate was built for. The control that
+  makes the walk-up claim mean something is that before this file existed, the same command
+  from both module directories printed `No config file detected` — so nothing stray was being
+  picked up from outside the repo.
 - **Two linters are OFF, each carrying a one-line justification in the file (git-manager's
   convention, adopted here), and the two reasons are opposites worth keeping distinct.**
   `govet` is disabled because `vet:api` / `vet:controller` already run `go vet ./...`
@@ -16133,10 +16146,12 @@ running the tool and every one of which has a quieter failure on the other side.
   default, which is precisely the premise ("the tool enables it by default") that will
   motivate re-adding it — the answer is that the check is not missing, it is elsewhere and
   stricter. `goconst` is disabled on evidence: measured 2026-08-02 at golangci-lint 2.12.2 /
-  go1.26.5 darwin/arm64 **with both cap flags cleared**, it is 1178 findings in `api` — 90% of
-  the combined backlog — of which 247 are outside `_test.go`, spread over 86 files; a hand
-  read of the non-test findings visible in the capped run plus a 1-in-20 re-sample across all
-  86 found no defect, only CLI subcommand names, JSON field names and the
+  go1.26.5 darwin/arm64 **with both cap flags cleared**, it is 1178 findings in `api` and 33 in
+  `controller` — **1211 of 1323 combined, 91.5%**, on the shipped enable set — of which 247 are
+  outside `_test.go` in `api`, spread over 86 files; the non-test findings visible in the
+  capped run **across both modules** were read by hand, plus a 1-in-20 re-sample across all 86
+  non-test files **in `api`**, and none is a defect — only CLI subcommand names, JSON field
+  names and the
   `queued → claimed → running` run-state vocabulary, which is a goconst finding at every
   switch arm. **The decisive argument is `whole-files`**, not the count: with a blast radius of
   86 non-test files, touching any one of them for any reason would demand extracting
@@ -16416,3 +16431,13 @@ the same runner.
   red, never false green), and the correct response is to re-run rather than to report a red
   gate; on a bare clone with many sibling worktrees and agents running concurrently by design,
   the collision is normal rather than exceptional.
+- **That flattening is GENERAL, not a property of the lock, which is the durable half.** The
+  pinned `go run` collapses **every** distinct golangci-lint status onto its own exit 1,
+  printing the real one only as text. Re-derived on a second, unrelated status: invoked from
+  the repo root, golangci-lint exits **7** (`directory prefix . does not contain main module`)
+  and the observed exit is **1**, with `exit status 7` as output. So the tool's status codes —
+  3 for a lock collision, 7 for a wrong working directory, 1 for findings — are **not
+  observable through this repo's shipped invocation at all**, and any rule keyed on them is
+  keyed on something no caller can read. This is the price of the delivery choice in §468 and
+  is worth paying; what it costs is that the *message text* is the only channel, for every
+  golangci-lint failure mode, not just the one this list names.
