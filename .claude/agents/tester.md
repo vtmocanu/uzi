@@ -211,9 +211,13 @@ insurance against a future slow test, not as a fix for a current hang.
 
 `-count=1` on the two Go test targets is part of the gate, not a habit: Go's test cache
 hashes only files INSIDE the module root, and this repo reads test inputs across
-module boundaries in both directions (`fixtures/judge-fidelity/` at the repo root
-by `api/internal/workersvc`, and the api's goldens by `controller/`). Without it a
-fixture-only edit leaves the gate printing `ok (cached)` having run nothing.
+module boundaries in both directions — **three such reads, not one**:
+`fixtures/judge-fidelity/` and `fixtures/run-usage/` at the repo root, both by
+`api/internal/workersvc` (so that package's flag is doubly load-bearing);
+`fixtures/run-usage/` again from the other side of the same contract by
+`web/src/lib/runUsageContract.test.ts`; and the api's goldens by `controller/`.
+Without it a fixture-only edit leaves the gate printing `ok (cached)` having run
+nothing.
 **The control is a mutation, not an absence: gut the fixture and confirm the gate
 reddens.** Do not substitute "no `(cached)` lines appeared" — that is satisfied by
 passing the flag at all, and it was measured PASSING in the exact broken
