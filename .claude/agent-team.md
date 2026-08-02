@@ -116,9 +116,11 @@ message had that exact shape:
 - *"All 7 `gitleaks:allow` directives are unmoved."* The substantive half is true
   and was the point. The count is not. Measured at `b0d8bf72`: **9 occurrences
   across 7 files** repo-wide, **6 across 5 Go files** under `api/`. So `7` is a
-  real number under some scope, mislabelled as an occurrence count — **and which
-  scope is NOT established, because two of them yield 7**: repo-wide *files*, and
-  *occurrences* restricted to `.go`/`.yml`. The message does not say, and it
+  real number under some scope, mislabelled as **repo-wide** — **and which scope
+  is NOT established, because two of them yield 7**: repo-wide *files*, and
+  *occurrences* restricted to `.go`/`.yml`. *(This clause said "mislabelled as an
+  occurrence count", which holds only under the first candidate — the one the
+  same sentence declines to choose. "Repo-wide" is true under both.)* The message does not say, and it
   cannot be recovered. **Each successive correction was also wrong**: *"no scope
   yields 7"* (false, twice, by two people), then *"so `7` is the repo-wide file
   count"* (one of two candidates, asserted as fact — **written into this very
@@ -317,9 +319,11 @@ decides where the next person spends their time. Re-derive those too.
     No figure is recorded, deliberately: it moves with every commit and the shape is the point.
     **Re-measure your own branch; do not infer it from `main`** — which, note, does not yet
     contain the reformat either. *(Two earlier versions of this clause carried figures and both
-    were wrong in the same direction. The first said "five live branches", written from the five
-    that happened to have worktrees; the second said "every branch sampled except two", which is
-    accurate and still invites the reader to treat a snapshot as a fact. A number here is a
+    were wrong in the same direction. The first said "five live branches", from a sample
+    narrower than the population — **how much narrower is not recoverable, and the obvious
+    explanation is false**: there are 18 worktrees here, not five. The second said "every branch
+    sampled except two", which is accurate and still invites the reader to treat a snapshot as a
+    fact. A number here is a
     liability regardless of whether it is correct — the clause immediately after it says numbers
     move, and the fix is to have none rather than a better one.)*
   - **The new gate does NOT cover this case, and the obvious reading of it is wrong.** `fmt-check`
