@@ -21,19 +21,21 @@
 #    repo's gates deliberately read `fixtures/judge-fidelity/{cases,expected}.json`
 #    at the repo root and `api/internal/hostedsvc/testdata/` from outside the
 #    module under test, so a `sources:` glob over one module cannot see them
-#    change. `.task/` is gitignored (`.gitignore:42`), so CI would always run cold
+#    change. `.task/` is gitignored (its own entry in `.gitignore`), so CI would
+#    always run cold
 #    while a contributor's `task gate` silently skipped. If some future target
 #    must carry `sources:` for an unrelated reason, it also carries `method: none`.
 #
 # 2. NO `dotenv:`. Task loads the named env files into EVERY target's
-#    environment. `.env` is gitignored (`.gitignore:2`) and root `CLAUDE.md`
+#    environment. `.env` is gitignored (its own entry in `.gitignore`) and root
+#    `CLAUDE.md`
 #    spends a section on compose ranking shell environment above `--env-file`, so
 #    a `dotenv: ['.env']` here would silently inject a developer's real secrets
 #    into every gate target - including whatever a future milestone adds.
 #
 # 3. NO `includes:` AT ALL, and the sharp edge is the remote form specifically.
 #    Task 3.x can include a taskfile over https, which is unpinned remote code
-#    executing inside the gate. `.gitignore:41` already carries a "Task
+#    executing inside the gate. `.gitignore` already carries a "Task
 #    remote-include cache" comment, so the mechanism is one line from being
 #    invited back. The self-contained rule above is the style reason; this is the
 #    security one.

@@ -107,7 +107,7 @@ either form. In parallel mode, the shared files to stop-and-report on here
 `.env.example`, `Taskfile.yml` and `.gitlab-ci.yml` (every PRD #103 milestone appends to
 both), and **`web/package.json` / `agent/package.json`** — the lead does one consolidated
 edit after the parallel units land. The two `package.json` files are a three-way and a
-two-way contention in PRD #103 alone (M3 ESLint devDeps, M4 knip, M6 `@vitest/coverage-v8`),
+two-way contention in PRD #103 alone (M3 oxlint devDeps, M4 knip, M6 `@vitest/coverage-v8`),
 npm's `devDependencies` ordering makes a conflict likely rather than possible, and a
 teammate may have symlinked `node_modules` from a sibling worktree on the strength of the
 lockfiles being identical, which your edit breaks. Report before touching either.

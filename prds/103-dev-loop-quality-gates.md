@@ -77,12 +77,12 @@ accumulated, 11 in `ARCHITECTURE.md` alone, and it runs in `validate:web` and in
 *sources*** — they are valid link *targets* today, but nothing checks the links
 they themselves contain. No secret scanner — a gap uzi already
 documents to itself in `.claude/agents/auditor.md`: "CI (`.gitlab-ci.yml`)
-runs validate/test/build across api/web/agent but has NO secret scanner
-(gitleaks/trufflehog)." No `govulncheck`, no `npm audit`.
+runs validate/test/build across api/controller/web/agent but has NO secret
+scanner (gitleaks/trufflehog)." No `govulncheck`, no `npm audit`.
 
 **5. There is no coverage signal.**
 
-No `-coverprofile`, no `vitest --coverage`, no codecov. `.gitignore:66` carries
+No `-coverprofile`, no `vitest --coverage`, no codecov. `.gitignore` carries
 a vestigial `coverage.out` entry pointing at tooling that does not exist.
 
 **`-race` is NOT part of this problem for `api`, and the previous version of
@@ -211,7 +211,8 @@ both Go gates. Three aggravations specific to this repo:
   reading `api/internal/hostedsvc/testdata/`. The `test:api` and
   `test:controller` jobs each carry a long comment block on exactly this. Run 3 above is that
   shape reproduced in miniature.
-- **`.task/` is gitignored** (`.gitignore:42`, already present — nothing to add).
+- **`.task/` is gitignored** (its own `.gitignore` entry, already present —
+  nothing to add).
   So CI always runs cold and always executes, while the contributor's `task gate`
   silently skips. That is divergence in the worst direction, and it makes Success
   Criterion 1 false in practice while reporting green.
@@ -540,9 +541,16 @@ banned counts for a reason that turns out to apply verbatim to line anchors here
 and the role files, so every line number this PRD cited into them moved** — and
 M2 through M6 each edit them again. The set is therefore `.gitlab-ci.yml`,
 `Taskfile.yml`, `.claude/agent-team.md`, `.claude/agents/*.md`, `CLAUDE.md`,
-`web/vite.config.ts`, `web/scripts/check-docs.mjs`, and both `package.json` files.
-Cite the **job name** (`test:api`, `validate:web`), the **section or slot name**,
-or an **exact quoted string**.
+`.gitignore`, `web/vite.config.ts`, `web/scripts/check-docs.mjs`, and both
+`package.json` files. Cite the **job name** (`test:api`, `validate:web`), the
+**section or slot name**, an **entry** (`coverage.out`, `.task/`), or an
+**exact quoted string**.
+
+*`.gitignore` was added to this set on the review pass that followed: M6 edits
+it, and this document cited `.gitignore:66` three times and `:42` twice — M6's
+own sentence citing `:66` in the same breath as the edit that invalidates it,
+which is the identical shape the paragraph below describes. Its entries are
+unique literals, so an entry cite greps where the anchor rots.*
 
 **The first version of this decision was FALSE IN THE DOCUMENT THAT STATED IT.**
 It said "no `.gitlab-ci.yml` line number appears in this PRD" while six remained,
@@ -659,8 +667,8 @@ which previously prescribed only the fail-open form.
       - `.gitlab-ci.yml`
       - `CLAUDE.md` §Commands — **command lines only**, see the scoping note
         below
-      - `.claude/agent-team.md` — the "Quality gates" paste-block at
-        `:1082-1110`, per Decision 9. (The `:143` "Lint command: none dedicated"
+      - `.claude/agent-team.md` — the `## Quality gates` paste-block, per
+        Decision 9. (The `:143` "Lint command: none dedicated"
         line this PRD used to cite **no longer exists**; it went in `027a4b88`.)
         Its closing line already says *"Every gap above is what PRD #103 exists
         to close; re-derive this block when its milestones land"*.
@@ -940,7 +948,7 @@ which previously prescribed only the fail-open form.
       **Markdown link checking: extend `web/scripts/check-docs.mjs`, do not add
       a second checker.** It already validates relative-link existence and
       link-text-path correctness for `docs/`, `ARCHITECTURE.md`, `README.md`,
-      `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list at `:161`. The
+      `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list. The
       gap is `prds/` and `adr/` as link *sources*. Adding them to that list is a
       small change; a parallel checker would have different semantics and would
       have to rediscover why the existing one is gated on `fullCheckout` (the
@@ -1000,7 +1008,7 @@ which previously prescribed only the fail-open form.
       and works on the pinned `vitest ^2.1.9`, but it is deprecated from
       Vitest 3 in favour of the projects/workspace config, so it buys a
       migration later.) Removes the
-      vestigial `coverage.out` line from `.gitignore:66` or makes it real.
+      vestigial `coverage.out` line from `.gitignore` or makes it real.
 
 ## Parallelization
 
@@ -1106,16 +1114,16 @@ Three exceptions where "append at the end" is not enough:
   instead is the `lint           none (gap)` slot line in the paste-block and its
   duplicate in `.claude/agents/tester.md`'s slot table.
 - `.claude/agents/auditor.md`'s security-scan slot: "CI (`.gitlab-ci.yml`) runs
-  validate/test/build across api/web/agent but has NO secret scanner
+  validate/test/build across api/controller/web/agent but has NO secret scanner
   (gitleaks/trufflehog)" — corrected in M5. It already reads "PRD #103 M5 adds
   them", so the edit is to make the present tense true, not to add a pointer.
 - `CLAUDE.md` §Commands: the hand-typed recipes are replaced by `task`
   invocations in M1 — **command lines only**. Every measured-evidence paragraph
   around them stays verbatim; see M1's scoping note. The prose about e2e being
   deliberately out of CI stays true and is not touched.
-- `.gitignore:66`: the `coverage.out` entry currently refers to tooling that
+- `.gitignore`: the `coverage.out` entry currently refers to tooling that
   does not exist — M6 either makes it real or removes it. (`.task/` is already
-  present at `:42`; nothing to add, and adding it is not the work.)
+  present; nothing to add, and adding it is not the work.)
 - `docs/dev-conventions.md` (`audience: contributor`) currently covers only
   the `glab` bot scripting and the `UZI_E2E_BOT_*` vars, and says nothing
   about lint/format/test policy. M1 adds the gate; each later milestone adds

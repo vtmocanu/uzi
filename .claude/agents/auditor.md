@@ -61,7 +61,7 @@ belongs here too.
 ## For this repo (uzi)
 
 Security-scan slot: `none (gap)`. Private GitLab repo; CI (`.gitlab-ci.yml`) runs
-validate/test/build across api/web/agent but has NO secret scanner
+validate/test/build across api/controller/web/agent but has NO secret scanner
 (gitleaks/trufflehog), no `govulncheck` and no `npm audit`. PRD #103 M5 adds them,
 so the absence is already recorded — treat this as a `noted` gap and audit by
 reading, not by reporting the gap again. Hot spots: secrets reach processes via
