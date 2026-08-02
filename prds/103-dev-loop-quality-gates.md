@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: Draft (created 2026-07-21)
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154); M2-M6 open
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -680,23 +680,33 @@ which previously prescribed only the fail-open form.
 
 **Phase 1 — enabling work (blocks everything else)**
 
-- [ ] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
+- [x] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
 
-      > **STATUS 2026-08-02: implemented and validated, NOT merged. The box stays
-      > unchecked deliberately** — a tick would tell tomorrow's reader this landed,
-      > and nothing is pushed. Branch `feature/prd-103-dev-loop-quality-gates`.
-      > *(A tip SHA and a commit count are deliberately not pinned here: this
-      > line sits inside the tree it points into, so any value written here is
-      > wrong the moment the branch gains another commit — the exact failure
-      > Decision 11 names. Read `git log` on the branch for the current tip.)*
+      > **STATUS 2026-08-02: MERGED.** MR
+      > [!154](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/154),
+      > merge commit `d4c6ac8a` on `main`. The box is now ticked for the reason it
+      > was previously left unticked: this landed.
       >
-      > **Four validators reported: no blocking findings on the code.** The
-      > Taskfile, the CI rewire and the supply chain all passed. The three blocking
-      > findings were documentation, two of them in this file, and all three are
-      > fixed: Decision 11 was false in its own document (six live
-      > `.gitlab-ci.yml` anchors, one of them M1's own flag table); every copy
-      > of the provenance command lacked `--oneline`; and `CLAUDE.md` carried a
-      > standing unqualified SHA citation.
+      > **The one risk nothing local could test is resolved.** M1's stated main
+      > hazard was that "a `task`-install or PATH failure reds CI having changed no
+      > check at all" — the checks are unchanged, but every job's invocation is not.
+      > Pipeline #20241 at `d95bc9b8`: **15 of 15 jobs succeeded, none skipped**,
+      > including all nine `.task_setup` inheritors across four toolchain images.
+      > And the runner did not merely install — `test:api`'s job log carries
+      > `task: [test:api] go test -race -count=1 ./...`, so the sha256-pinned fetch
+      > produced a working `task` that echoed the command with both load-bearing
+      > flags intact. Read the echo, not the exit code: that line is the whole
+      > milestone's thesis observed in the one place local runs cannot reach.
+      >
+      > **No blocking findings on the code, at any point, across two review waves.**
+      > The Taskfile, the CI rewire and the supply chain all passed. Every blocking
+      > finding either wave produced was documentation, most of them in this file.
+      > *(The earlier wave's three are recorded in `7a716900`; "four validators"
+      > appeared here as an uncheckable head-count and is replaced by that commit,
+      > which is checkable.)* The second wave added: Decision 3's corrected count
+      > carrying the wrong population's gloss, Decision 10 citing as its exemplar
+      > the one decision that failed its rule, and a `--test-timeout` justification
+      > that turned out to be refuted in **seven** files.
       >
       > **The gate's liveness is proven, not asserted.** The tester's four-arm
       > control came back conclusive, and **arm B is the one that matters: it
@@ -714,7 +724,26 @@ which previously prescribed only the fail-open form.
       > (`agent/test/batcher-poison.test.ts`) is filed separately and remains open
       > as issue #198 (and #162, an older issue naming the same file).
       >
-      > **The re-check wave is done.** What remains is the push and the MR.
+      > **Acceptance controls: all four component gates ship with the mutation
+      > that proves them live**, which is more than M1's own criterion asked for
+      > (it specified the `gate:api` fixture control alone). `gate:api` twice, by
+      > two agents at two SHAs, deliberately using different fixture cases so the
+      > second run cross-checked the first rather than repeating it — byte-identical
+      > failure messages. `gate:controller` on **both** cross-module read paths,
+      > since `internal/protocol` and `internal/preset` read different goldens from
+      > different packages and reddening one says nothing about the other.
+      > `gate:web` and `gate:agent` by a broken assertion each, which proves the
+      > target reaches the real suite and nothing about those suites' own quality.
+      >
+      > **Not proven, recorded so green controls do not imply coverage they lack:**
+      > `check-docs:web` and the two `typecheck:*` targets ran green in every arm
+      > but were never mutated, so only `test:*` has a control; and the `gate:web` /
+      > `gate:agent` arms broke *test* assertions, which says nothing about whether
+      > those suites are bound to shipped code.
+      >
+      > **What remains for this PRD: M2 through M6.** They were always separate
+      > MRs and are unaffected by this one beyond now having a Taskfile to hang
+      > targets off.
 
       root `Taskfile.yml` with `gate`, `gate:api`, `gate:controller`,
       `gate:web`, `gate:agent`, plus only the individual targets that have
