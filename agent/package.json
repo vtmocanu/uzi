@@ -7,6 +7,7 @@
   "main": "src/main.ts",
   "scripts": {
     "start": "tsx src/main.ts",
+    "lint": "oxlint --config .oxlintrc.json -D correctness src test",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test --test-timeout=30000 test/*.test.ts"
   },
@@ -18,6 +19,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "oxlint": "1.76.0",
     "typescript": "^5.7.2"
   }
 }

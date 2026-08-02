@@ -182,15 +182,24 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - check-docs, typecheck, test
+    desc: web - lint, check-docs, typecheck, test
     cmds:
+      # lint FIRST here, which is the MIRROR IMAGE of the Go gates above and is
+      # deliberate rather than inconsistent (PRD #103 M3). oxlint is measured at
+      # ~0.06s, two orders of magnitude cheaper than anything else in this gate,
+      # and unlike golangci-lint it is NOT type-aware - so it has no ordering
+      # dependency on a build and nothing is gained by deferring it. Same reason
+      # M2 put fmt-check first in gate:api.
+      - task: lint:web
       - task: check-docs:web
       - task: typecheck:web
       - task: test:web
 
   gate:agent:
-    desc: agent - typecheck, test
+    desc: agent - lint, typecheck, test
     cmds:
+      # lint first, same reason as gate:web (~0.05s here).
+      - task: lint:agent
       - task: typecheck:agent
       - task: test:agent
 
@@ -221,10 +230,12 @@ tasks:
     # ALL FOUR components today, and PRD #103 M5 appends `lint:shell` and
     # `lint:yaml` to this same list. Fail-fast for the same reason every other
     # composed target here is.
-    desc: lint both Go modules (the npm half lands with the oxlint config)
+    desc: lint all four components today (extensible - M5 appends shell and YAML)
     cmds:
       - task: lint:api
       - task: lint:controller
+      - task: lint:web
+      - task: lint:agent
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
@@ -571,6 +582,41 @@ tasks:
       - go test -count=1 ./...
 
   # ------------------------------------------------------------- web (npm) ----
+  lint:web:
+    desc: oxlint over web/src (correctness + react-hooks/rules-of-hooks)
+    dir: web
+    cmds:
+      # DELEGATES TO package.json's `lint` SCRIPT, as this file's header requires
+      # of every npm target: a target that reimplements the command drops whatever
+      # flags the script encodes, SILENTLY. Here that is not hypothetical - the
+      # script carries BOTH halves of this gate's severity, and each is a documented
+      # silent-no-op if dropped:
+      #
+      #   --config .oxlintrc.json   oxlint WALKS UP for .oxlintrc.json, so without
+      #                             an explicit --config a stray root config would
+      #                             silently govern both packages; and with the file
+      #                             renamed or deleted, a bare `oxlint src` reverts
+      #                             to the WARNING tier and exits 0 on a real
+      #                             violation, while --config exits 1 with
+      #                             `Failed to parse config … NotFound`.
+      #   -D correctness            🔴 `oxlint src` EXITS 0 WHILE REPORTING
+      #                             FINDINGS. correctness defaults to WARNING
+      #                             severity and warnings do not set the exit code,
+      #                             so a target without this flag is a lint job that
+      #                             CAN NEVER FAIL. Measured: the bare invocation
+      #                             exits 0 on web's 6 findings.
+      #
+      # AND THIS FLAG IS NOT THE GUARD FOR `rules-of-hooks`, which is what this
+      # milestone exists for: that rule is `pedantic`, not `correctness`, so
+      # `-D correctness` cannot reach it. Its severity is promoted at RULE level in
+      # web/.oxlintrc.json. Read that file; Task's echo shows only `npm run lint`,
+      # so neither of these lives anywhere the echo can protect.
+      #
+      # NEVER A BARE `npx oxlint`: npx FETCHES FROM THE NETWORK when the dep is
+      # missing, which a gate may not do. `npm run` puts node_modules/.bin on PATH
+      # and fails closed with `command not found` instead.
+      - npm run lint
+
   check-docs:web:
     desc: docs frontmatter + relative-link lint
     dir: web
@@ -593,6 +639,22 @@ tasks:
       - npm test
 
   # ----------------------------------------------------------- agent (npm) ----
+  lint:agent:
+    desc: oxlint over agent/src and agent/test (correctness tier)
+    dir: agent
+    cmds:
+      # Delegates to package.json's `lint` script for the same reasons lint:web
+      # does - read that target's comment, both flags are load-bearing there too.
+      # One difference worth knowing before you copy this: agent/.oxlintrc.json
+      # does NOT list the `react` plugin, because this package has no React. Its
+      # findings come from the unicorn/typescript/oxc defaults, which that file
+      # re-lists because `plugins` REPLACES the default list rather than extending
+      # it.
+      #
+      # Scoped `src test` rather than `src`: unlike web/, this package's tests live
+      # OUTSIDE src/, and 7 of its 10 baseline findings are in test/.
+      - npm run lint
+
   typecheck:agent:
     desc: tsc --noEmit over agent
     dir: agent
