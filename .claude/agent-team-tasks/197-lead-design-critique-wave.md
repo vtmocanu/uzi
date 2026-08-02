@@ -152,4 +152,137 @@ pastes that block into every validator dispatch.
 
 ## Amendments
 
-- *(none yet)*
+### 2026-08-02 — design wave settled. THE DESIGN IS NOW FROZEN.
+
+Reviewer, architect and auditor all reported at `f4736c4b`. The lead re-derived
+every load-bearing claim below on its own tree before writing it here. Where a
+section above contradicts this one, **this one wins**.
+
+#### Corrections to what this brief said before
+
+- **`delegatesLine` has FOUR call sites, not two.** `prompt.ts:546`
+  (`buildPlanPrompt`, issue kind), `:621` (`buildImplementPrompt`), `:778`
+  (`buildSelfImprovePlanPrompt`), `:901` (`buildCIFixPlanPrompt`).
+  `buildRevisePlanPrompt` (`:664`) does not call it. So there are **three plan
+  prompts, one per run kind** — an instruction anchored on "the issue" or "before
+  the coder" reads wrong in the `ci_fix` and `self_improve` plan turns.
+- **Scope was four files; it is five.** See D9.
+
+#### Frozen decisions
+
+**D1 — placement: the PLAN turn.** Not on the issue's argument, on a mechanical
+asymmetry: the two phases do not have the same roster. The plan turn runs with the
+user's full own roster (`sdk-executor.ts:495` `agents: assembled.subagents`,
+guard `:512` `preToolUse(ownSubagentNames)`). Implement turns are **rebuilt** at the
+gate boundary from the human's selection (`:901` `agents: selectedSubagents`, `:906`
+`preToolUse(selectedNames)`), and the code's own comment records that **an absent
+selection resolves to `repo`** when a roster was detected. So in the first implement
+turn the critique agents **may not exist**. Second reason, same direction: a
+repo-sourced roster cannot reach the plan turn at all, so a plan-time wave always
+runs uzi's own reviewed builtins.
+
+**D2 — rule shape: a PROPERTY OF THE PLAN, not a procedural step.** User decision,
+2026-08-02. The plan must name the file and quote the line for every mechanism it
+asserts; the read-only wave is the *means* of getting those citations, not a
+separate ritual. Rejected: "for anything beyond a small fix, dispatch a wave", whose
+skip is graded by the same lead whose plan is being critiqued. The property makes
+cost scale with the number of mechanisms asserted (a one-line change asserts one and
+costs nothing extra, with **no rule skipped**), and makes a deficient plan legible to
+the human at the gate — which is the gap the issue opens with.
+
+**D3 — anchor on `submit_plan`. `lead.md` alone; NO `prompt.ts` change.** The system
+prompt is **phase-agnostic** — the lead reads the identical sentence in both turns —
+so relative wording ("before the implementer") is unresolvable there. `submit_plan`
+is phase-self-locating, is already named in `LEAD_GUARDRAIL_APPEND` (`prompt.ts:44`),
+and all three plan kinds end with it (`:559`, `:783`, `:908`). `lead.md` reaches both
+phases by construction (`sdk-executor.ts:492-495`, and `:899-905` rebuilds the system
+prompt from the same `assembled.leadSystemPrompt`). A `prompt.ts` line would state it
+twice and pull `gate:agent` in for no new capability.
+
+**D4 — the dispatch must say the artifact is the PLAN TEXT, not a diff.** Mandatory,
+not flavour. `reviewer.md:43-44`, `auditor.md:36-37` and `tester.md:8`/`:20-21` each
+instruct their agent to report a missing diff and await re-delegation. Dispatched on
+a plan without this, the wave returns bounce-backs instead of citations and is worse
+than no wave. Fixing those three bodies is the wrong lever — it triples scope and puts
+three more pin sets in play.
+
+**D5 — the wave is REPORT-ONLY in the plan turn; it must not modify the worktree.**
+`architect.md:4` and `tester.md:4` both carry `Edit, Write`; `agents.ts:110` honours a
+template's `tools` list verbatim, and the path guard (`guardrails.ts:756-759`) only
+**jails** writes to the worktree, it does not deny them. A plan-turn write is an
+uncommitted change the human never saw at the gate, which the first implement commit
+then sweeps in. This weakens no guardrail layer — it weakens the **approval gate**.
+
+**D6 — state the bar over THE PLAN, never over the issue.** `buildPlanPrompt` carries
+only `issueTitle` and `issueDescription`, which `UNTRUSTED_FRAME` (`prompt.ts:18-23`)
+declares attacker-controlled; there is no label or effort field. A predicate like
+"beyond a small fix" is therefore computed from hostile text. Phrase any bar as a
+property of the plan the lead itself produced.
+
+**D7 — the pins must discriminate; adding one is NOT sufficient.** Measured by the
+auditor and re-derived by the lead: `always fans out`, `after an implementation unit
+lands` and `Read-only work` each appear **0 times** in `render_test.go`. The ordering
+this issue is about is **entirely unpinned**. The auditor's mutant deleted the
+post-implementation ordering, replaced it with a plan-time wave reusing the pinned
+clause, and **all 14 pins stayed green** (control: mutating one pinned phrase reds
+exactly 1 of 14, so the harness discriminates).
+
+So: keep all 14 existing pins **unedited** — the pinned clause `"send all allocated
+read-only validators together in one wave"` excludes the `after an implementation unit
+lands,` prefix, so rewording the prefix keeps it true. Then add pins that **one
+sentence cannot satisfy for both meanings**: a distinct pin on the retained
+post-implementation ordering, and distinct pins on the plan-time citation property.
+Write them so deleting either behaviour reds its own case on its own.
+
+**D8 — structure: a short separate paragraph, not a sixth bullet.** The existing
+bullet list encodes one contract, *what fans out in parallel*. The citation property is
+a different axis (*what the plan must contain before `submit_plan`*), and mixing them
+in one list is what let the auditor's mutant reuse a single clause for both meanings.
+
+**D9 — scope is FIVE files, and the gate widens.**
+
+1. `api/internal/agenttmpl/builtins/lead.md`
+2. `api/internal/agenttmpl/render_test.go`
+3. **`docs/agent-templates.md`** — NEW. `:58-61` restates the post-implementation-only
+   ordering, and its frontmatter is `audience: user`, so it **renders in-app** at
+   `/docs/agent-templates`. Ship without it and uzi's own shipped docs tell users the
+   opposite of what its lead does. Found independently by reviewer, architect and
+   auditor; it was the brief's own item 6 and the brief missed it.
+4. `CHANGELOG.md` — see D11.
+5. `specs/ai.md` — see D10.
+
+Gate: **`task gate:api` AND `task gate:web`** (the doc edit runs under
+`check-docs:web`). Not `task gate`.
+
+**D10 — `specs/ai.md` must supersede §190 BY NUMBER.** `specs/ai.md:5145-5149` (§190)
+states the old ordering in the present tense. The file is append-only, so a new section
+that does not name §190 as superseded leaves two present-tense contradicting contracts
+in the ledger.
+
+**D11 — `CHANGELOG.md` must carry an OPERATOR note, because the fix does not reach
+existing installs.** `agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <>
+'user' DO NOTHING` and `agent_templates_builtins.go:29-33` states it: *"an existing row
+(builtin or admin-edited) is never overwritten."* `docs/agent-templates.md:122` tells
+users the same. So the patch is correct, fully gated, merged — and inert on
+dev-cluster and on every stack that has booted once. The only recovery is the
+admin-only, per-template, verbatim **Reset to default**. The changelog line must say
+operators need to reset the `lead` template; the MR description must state the reach
+limitation.
+
+#### Explicitly OUT of scope — filed separately, do not fold in
+
+- Builtin prompt updates have no propagation mechanism (the D11 gap). This is the real
+  fix and it is a schema + reconcile + UI change with a policy question about
+  overriding admin customizations. User decision 2026-08-02: ship #197 small and file
+  this.
+- `builtins/*.md` carry no `version:` field (0 of 11, verified three times) — the
+  missing half of any propagation story.
+- `architect.md:4` declares `Edit, Write` and also `SendMessage, TaskUpdate, TaskList,
+  TaskGet`, **none of which exist in a uzi run**. Pre-existing; D5 contains it for now.
+- Whether #85 grows a second track for the orchestration half.
+
+#### Standing, unchanged
+
+No amends after a SHA is dispatched for review. Report the tip SHA at the top of every
+report. Commit locally on `fix/197-lead-design-critique-wave`; never push, never touch
+`main`.
