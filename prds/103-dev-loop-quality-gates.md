@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 implemented 2026-08-02 on `feature/prd-103-m3-m6` but NOT MERGED and NOT YET PIPELINE-TESTED** (see its status block); M4-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 implemented 2026-08-02 on `feature/prd-103-m3-m6` but NOT MERGED and NOT YET PIPELINE-TESTED** (see their status blocks); M5-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -397,6 +397,42 @@ file.**
 
 The first run of each tool on a codebase this size will produce a large
 finding list, and blocking the gate until that list is zero is not an option.
+
+> **🔴 AMENDED 2026-08-02 (M4). THE PREMISE IN THE SENTENCE ABOVE IS
+> EMPIRICALLY FALSE FOR `deadcode` HERE, AND THE `--max-issues` MECHANISM IN
+> THE TABLE BELOW DOES NOT EXIST AS DESCRIBED.** Both were measured
+> independently by two agents during M4's design wave, at two tool versions,
+> agreeing (`probes/prd-103-m4-architect.txt`, `probes/prd-103-m4-reviewer.txt`).
+>
+> **(a) `deadcode` produces ONE finding, not a large list.** `deadcode -test
+> ./...` reports **1** on `api` and **0** on `controller` — the api finding
+> being `HookManager.SettingsPath`, a one-line exported wrapper with zero
+> callers. So the ratchet this decision budgets for was guarding a population
+> of one. M4 **deleted** the function and shipped **empty** baselines gating at
+> zero, which is strictly stronger than gate-on-new and disposes of the
+> baseline-rot and position-anchor problems (Decision 11) rather than managing
+> them. *The wrapper still ships*, for a reason this decision does not name:
+> `deadcode` exits 0 whether it finds 0, 1 or 44 dead functions, and rc=1 only
+> on a load error where stdout is **0 bytes** — so a naive additions-only diff
+> reads a module that does not compile as clean and passes green.
+>
+> **(b) `--max-issues` IS INERT FOR A WARN TIER, so knip's row below is wrong
+> where it says "plus `--max-issues` as an issue budget".** It counts
+> **error-severity issues only**. Measured: every rule at `warn` with
+> `--max-issues 0` exits **0** with 24 findings printed. The two mechanisms do
+> not compose — severity staging and the budget apply to disjoint populations,
+> and a warn-tier issue type therefore has no budget and no gate at all. The
+> same claim appears in the M4 milestone bullet and in Success Criterion 2;
+> both are corrected in place. The real options for gating unused exports
+> before the burn-down finishes are a diff-wrapper, promoting `exports` to
+> `error` with an `ignore` list, or accepting a reported-only tier. **M4 shipped
+> the third**, and filed the burn-down as a follow-up issue with its counts
+> (web 22, agent 53, 2026-08-02) so that "a warning nobody must act on" does not
+> become the end state by default.
+>
+> Nothing here changes the decision's shape: the mechanism is still different
+> for every tool, and that is still the point.
+
 An earlier draft of this decision said each tool lands with "a committed
 baseline capturing today's findings". **That was wrong for four of the five
 tools** (verified against current upstream docs, 2026-07-21), and the
@@ -406,8 +442,8 @@ intuitive one and it will be re-proposed otherwise:
 | Tool | Baseline file? | Actual ratchet mechanism |
 |---|---|---|
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
-| `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
-| `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
+| `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. ~~Plus `--max-issues` as an issue budget~~ — **struck 2026-08-02, see the amendment above: `--max-issues` counts error-severity issues only and is inert for a warn tier** — and workspace scoping. |
+| `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. **And the wrapper's real load-bearing job is the exit code, not the diff: `deadcode` exits 0 on any number of findings and 1 only on a load error, where stdout is empty** (amendment above). |
 | `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified on a **37-warning corpus** — not the correctness-tier debt below; see the TypeScript paragraph below for what that corpus was and was not. **Errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. |
 | `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
@@ -423,7 +459,16 @@ one. Two consequences worth pricing in now:
   too, or findings that are not on a changed line are skipped.
 - **`deadcode` needs a small committed wrapper** (~20 lines: run, sort, diff
   against `.deadcode-baseline`, fail on additions). That is real work M4 must
-  budget, not a flag.
+  budget, not a flag. *(M4 shipped it as `scripts/deadcode-gate.sh`, and a
+  script rather than an inline Taskfile recipe because M5 adds shellcheck over
+  `git ls-files '*.sh'`: a script gets linted, an inline `cmds:` string gets
+  nothing. Its baseline key is **position-free** — deadcode's `-f` template,
+  keyed on (import path, function name) — because the default output is
+  `path:line:col:` and one inserted comment line above a baselined symbol turns
+  it into a spurious addition **and** removal, which Decision 11 bans. Both
+  sides are sorted under `LC_ALL=C`: the tool's output is stable across runs but
+  ordered by (file, **line number**) within a package, so `sort` is not
+  idempotent on it.)*
 
 **The TypeScript half is REWRITTEN, because the mechanism it named does not exist
 in the tool this PRD now uses.** *(Amended 2026-08-02 with Decision 8.)* ESLint's
@@ -1163,7 +1208,10 @@ which previously prescribed only the fail-open form.
       > deliberately stays `none (gap, noted 2026-07-26)` with a clause naming
       > `unused`'s **partial** coverage — it finds unused unexported symbols within
       > a package and does not do `deadcode`'s cross-package reachability, nor
-      > anything about unused TS exports. M4 still owns that slot.
+      > anything about unused TS exports. M4 still owns that slot. *(M4 has since
+      > closed it, on this same branch, and found that **five** tracked files
+      > assert that slot rather than the two this paragraph counts — see M4's
+      > status block.)*
       >
       > **Deviations from this document, all recorded in place rather than worked
       > around**: `goconst` is OFF (Decision 4's enable list amended — measured at
@@ -1340,7 +1388,7 @@ which previously prescribed only the fail-open form.
       trap above, output and exit status are independent here, and a first run
       reporting nothing is indistinguishable from a linter that is not wired up.
 
-- [ ] **M4 — Dead code detection**: `golang.org/x/tools/cmd/deadcode -test
+- [x] **M4 — Dead code detection**: `golang.org/x/tools/cmd/deadcode -test
       ./...` per Go module (invoked via `go run` with a pinned version, the
       way `sqlc` already is at `v1.30.0` — git-manager's dependence on a
       preinstalled global binary is a trap worth not copying), plus `knip`
@@ -1352,7 +1400,44 @@ which previously prescribed only the fail-open form.
       on additions — and writing it is part of this milestone, not a flag to
       pass. `knip` uses severity staging (`rules: { exports: "warn", files:
       "error", … }`), promoting each issue type to `error` as it reaches
-      zero, with `--max-issues` as a regression budget in the meantime.
+      zero, ~~with `--max-issues` as a regression budget in the meantime~~.
+
+      > **🔴 AMENDED 2026-08-02, IMPLEMENTED. See the amendment on Decision 4
+      > for the measurements.** Two claims in the paragraph above are false and
+      > one is a mis-sized budget:
+      >
+      > - **`--max-issues` is inert for a warn tier** (it counts error-severity
+      >   issues only), so it is struck rather than merely qualified. What
+      >   shipped: `exports`/`types`/`nsExports`/`nsTypes`/`enumMembers`/
+      >   `namespaceMembers` at `warn` — **reported on every run, gating
+      >   nothing** — with `files`/`dependencies`/`devDependencies`/`unlisted`/
+      >   `binaries`/`unresolved`/`duplicates` and the catalog pair at `error`,
+      >   gating at zero. The export burn-down (web 22, agent 53) is a
+      >   **follow-up issue**, not this milestone.
+      > - **The wrapper was not the milestone.** `deadcode -test ./...` finds 1
+      >   in `api` and 0 in `controller`. The function was deleted, both
+      >   baselines ship **empty**, and both Go modules gate at **zero**. The
+      >   wrapper (`scripts/deadcode-gate.sh`) survives for the **exit code**:
+      >   deadcode exits 0 on any number of findings and 1 only on a load error
+      >   with an empty stdout, so an additions-only diff passes green on a
+      >   module that does not compile.
+      >
+      > Shipped: five targets under a `deadcode:` prefix (`deadcode:api`,
+      > `:controller`, `:web`, `:agent`, plus the `deadcode` aggregator), each
+      > wired into its `gate:<component>`; two reported-never-gating companions
+      > (`deadcode:api:all`, `deadcode:controller:all`) running **without**
+      > `-test`, because `-test` makes a production-dead function invisible the
+      > moment a test calls it and `unused` misses it too — 44 and 4 findings of
+      > that class today. **Zero new CI jobs**: the targets hang off `lint:api`,
+      > `lint:controller`, `validate:web` and `validate:agent`, so `.gate_needs`
+      > and `.publish_needs` stay at 12 and 14 with their two-element delta
+      > intact (verified by parsing, not grepping).
+      >
+      > `deadcode` is pinned at **v0.48.0**; v0.38.0 was measured independently
+      > on the same tree and gave identical counts. `knip` is **6.31.0**.
+      > The package pattern must stay the **module root** — only `main` packages
+      > are call-graph roots, so `./internal/...` inflates `api` from 1 to 86
+      > findings at rc=0, silently.
 
       **Calibration**: the first run must be checked against a symbol known
       to be dead, so that "no findings" is distinguishable from "tool not
@@ -1370,6 +1455,47 @@ which previously prescribed only the fail-open form.
       (Cited by content anchor rather than line number on purpose: the arms were
       at `:87` and `:492` when this PRD was written and are at `:97` and `:594`
       today. The claim held throughout; only the citation rotted.)
+
+      > **STATUS — M4 IMPLEMENTED 2026-08-02 on `feature/prd-103-m3-m6`. NOT
+      > MERGED, NOT YET PIPELINE-TESTED.** Same standing as M3's block above:
+      > every figure below is from a local run, and no MR pipeline has executed
+      > any of it. Calibration transcript:
+      > `probes/prd-103-m4-calibration.txt`; design-wave evidence:
+      > `probes/prd-103-m4-{architect,reviewer}.txt`.
+      >
+      > **Success Criterion 8 is met, six arms**, each with the four-property bar
+      > (non-zero exit, the finding's **identity** in the output, a
+      > repo-relative path, green on restore verified with `git status`):
+      > an exported dead Go function (`deadcode:api` exit 1 naming it, while
+      > `lint:api` says "0 issues." on the same tree); an unused TS **file**
+      > (`deadcode:web` exit 1 naming it); the mistyped-rule-name control, three
+      > cells one character apart; a module that does not compile (**exit 2**,
+      > the instrument-broken status, closing the fail-open hole); a stale
+      > baseline entry (exit 1); and the position-free key surviving a line
+      > shift **with a control showing the default positional output moved
+      > 452 → 453 across the same two trees**. Restores were `cp`-based, never
+      > `git checkout --`.
+      >
+      > **Success Criterion 4 is met for this slot in FIVE files, not the three
+      > M4's brief listed.** The two it missed are the two already missed once:
+      > `.claude/agents/reviewer.md` (which M3 had to correct on this exact
+      > point) and `.claude/agents/coder.md` (which phrases the claim differently
+      > from every other copy — the shape that defeats a literal grep).
+      > `api/internal/agenttmpl/builtins/reviewer.md` was deliberately not
+      > touched.
+      >
+      > **Deviations from this document, recorded rather than worked around**:
+      > the wrapper is not the milestone and both baselines ship empty (see the
+      > amendment above); `--max-issues` is struck; `knip.jsonc` rather than
+      > `knip.json`, so every suppression carries its reason inline; one extra
+      > target pair (`deadcode:*:all`) that this bullet does not ask for,
+      > because `-test` hides the write-it/test-it/never-wire-it class from the
+      > gating invocation entirely.
+      >
+      > **What is deliberately NOT met**: gate-on-new for unused TS exports.
+      > That tier is `warn` and gates nothing; the burn-down is a follow-up issue
+      > carrying its counts (web 22, agent 53, 2026-08-02) so Decision 3's "a
+      > warning nobody must act on" does not become the end state by default.
 
 - [ ] **M5 — The long tail: shell, YAML, secrets, vulns**:
 
@@ -1529,10 +1655,27 @@ Three exceptions where "append at the end" is not enough:
    are the exception and reach this bar last**: knip's staging sets
    `exports: "warn"`, and warn-severity issues do not count toward its error
    total, so a new unused export gates nothing until that type is burned down
-   to zero and promoted to `error`. (`--max-issues` is a fixed budget, not a
-   ratchet — fix one old finding, add one new, still under budget.) If
+   to zero and promoted to `error`. ~~(`--max-issues` is a fixed budget, not a
+   ratchet — fix one old finding, add one new, still under budget.)~~ If
    gate-on-new is wanted for exports before the burn-down finishes, knip needs
    the same diff-wrapper M4 writes for `deadcode`.
+
+   > **Amended 2026-08-02 (M4).** The struck parenthetical **understated the
+   > problem**: `--max-issues` is not a weak ratchet for the warn tier, it is
+   > **inert** for it — measured, it counts error-severity issues only and exits
+   > 0 with every warn finding printed. So the sentence before it is right for a
+   > stronger reason than it gave. **The criterion's dead-Go-function half is
+   > now MET and demonstrated** (`probes/prd-103-m4-calibration.txt`): an
+   > exported dead function gives `task lint:api` "0 issues." and
+   > `task deadcode:api` a nonzero exit naming the symbol. The **unused-TS-export
+   > half is deliberately NOT met** and is tracked as a follow-up issue with its
+   > counts, rather than closed by a mechanism that does not work.
+   >
+   > One thing the criterion does not say and should: **the Go arm must use an
+   > EXPORTED symbol.** golangci-lint `unused` catches an unexported one and
+   > runs earlier in `gate:api`, so the gate fail-fasts at lint and `deadcode`
+   > never executes — a calibration built that way demonstrates M3's check while
+   > claiming to demonstrate M4's. Measured both ways in-repo.
 3. **Gate *recipes* are defined once, in `Taskfile.yml`.** `CLAUDE.md`
    §Commands, the `.claude/agent-team.md` paste-block and the
    `.claude/agents/*` tails name `task` targets and never restate a command
