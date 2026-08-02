@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154); M2-M6 open
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155); M3-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -923,7 +923,86 @@ which previously prescribed only the fail-open form.
 
 **Phase 2 — the four independent tracks (any order, after M1)**
 
-- [ ] **M2 — Formatting: drift cleared and gated, one MR**: commit one is a
+- [x] **M2 — Formatting: drift cleared and gated, one MR**:
+
+      > **STATUS 2026-08-02: MERGED.** MR
+      > [!155](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/155),
+      > merge commit `3824e89d`. **`gofmt -l ./api ./controller` on `main` is now
+      > empty — Success Criterion 7 is met**, and it is the first criterion in this
+      > PRD to close.
+      >
+      > **The gate is proven live in CI, not only locally.** Pipeline #20248 at
+      > `d60ceaac`: **15 of 15 jobs succeeded, none skipped**. Read the echo rather
+      > than the exit code, per M1's own lesson — `validate:api` and
+      > `validate:controller` both logged
+      > `task: [fmt-check:api] out="$(gofmt -l .)" || exit 2; …` as their FIRST
+      > script line, so the shipped recipe with its guard intact ran on the runner
+      > under go1.26.4, which is the one place local runs cannot reach.
+      >
+      > **This PRD prescribed a recipe that fails OPEN, and M2 corrects it in
+      > place.** `test -z "$(gofmt -l .)"` gates on the output correctly and exits
+      > **0** on a Go file that does not parse: `gofmt` exits 2 and writes to
+      > stderr, so the substitution captures nothing and `test -z` is trivially
+      > true. Reproduced independently four times. The shipped form carries
+      > `|| exit 2` so the property is intrinsic to the recipe rather than
+      > inherited from Task's errexit, and `2` rather than `1` so gofmt's
+      > parse-failure status stays distinguishable from drift — `task`'s own code
+      > is 201 for both. **The fail-open window is exactly a tree with no other
+      > drift**, because gofmt still lists the other misformatted files while
+      > erroring on the unparseable one: clearing the drift is what arms the hole,
+      > so this milestone's own success is the precondition for that failure mode.
+      >
+      > **M1 had left a live tag-time failure and this MR defuses it.** `d4c6ac8a`
+      > touches `docs/dev-conventions.md`, which `is_shipping()` matches, cites
+      > `103`, and never touched `CHANGELOG.md` — while `[Unreleased]` carried no
+      > `#103`. The next `v*` tag would have failed `publish:assert-changelog`,
+      > which sits in `*publish_needs` and therefore blocks every image and chart
+      > push. Verified fixed by running the script over the merged range.
+      >
+      > **Known limitation, and it is this PRD's problem now**: that script is
+      > satisfied when **any one** number a merge cites appears in the release
+      > section. `#103` is now present, and M3-M6 all cite 103 — so each can merge
+      > with no CHANGELOG entry and the gate stays green. No per-milestone token
+      > exists, so it cannot be fixed with a better predicate. **Each of M3-M6 owns
+      > its own `[Unreleased]` line as part of its definition of done.**
+      >
+      > **Acceptance controls (Success Criterion 8): the gate reddens and names the
+      > file**, proven by the tester in its own worktree with its own paths rather
+      > than by the implementer — rc=201 printing `internal/tsprobe/drift_probe.go`
+      > (module-relative, as `dir:` implies), green on restore verified with
+      > `git status`. Also proven fail-closed on a non-parsing file (rc=201,
+      > `exit status 2`), free of fingerprinting with the detector calibrated first
+      > against a `sources:`-carrying target that does skip, and module-scoped
+      > against a constructed tree where a root-scoped `gofmt -l .` really does
+      > list `.go/pkg/mod/…` and `.gocache/…`.
+      >
+      > **Commit 1 is semantically inert, measured three ways by three agents**:
+      > `gofmt -w` re-applied to the parent reproduces it exactly; a `go/scanner`
+      > pass over all 510 `.go` files under `api/` reports 0 differ; and the api and
+      > controller gates produce identical named per-test result sets at both SHAs
+      > (2925 + 175 lines, plus 257 from the live-DB sweep to reach the one
+      > reformatted file the ordinary gate skips). **It is not whitespace-only** —
+      > gofmt inserts a bare `//` into `ci_fix.go`'s `snapshotSecretPatterns` doc
+      > comment, the PAT scrubber's rationale block. No pattern literal changed.
+      >
+      > **R6 confirmed by execution**: `sqlc generate` after commit 1 is a no-op,
+      > and verified as an *executed* one — 29 of 29 `*.sql.go` newer than a marker
+      > afterwards, since a run that never executed produces the same empty diff.
+      > `gofmt -l internal/store` after regeneration is also empty, so sqlc
+      > v1.30.0's output is itself gofmt-clean and the latent deadlock noted under
+      > Parallelization is confirmed not-true-today.
+      >
+      > **What this milestone actually cost, recorded because it is the useful
+      > part**: 19 commits, of which **two do the work**. The `fmt-check` recipe has
+      > been byte-identical since the third, `.gitlab-ci.yml` untouched since the
+      > second. Four validators, seven review rounds, **zero behavioural defects** —
+      > every finding was a false or unsupported *claim* about code that was already
+      > correct. The dominant failure shape had a name by the end: a sound
+      > conclusion accumulating supporting evidence that nobody checks, precisely
+      > because the conclusion is agreed. It is recorded in
+      > `.claude/agent-team.md`.
+
+      commit one is a
       pure `gofmt -w ./api` over the drifted files (**list measured at
       implementation time — no count appears here, per Decision 10**); commit
       two adds `task fmt-check` (`gofmt -l` on both Go modules, non-empty output
