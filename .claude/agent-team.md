@@ -1365,6 +1365,17 @@ lint           task lint           # composite, all four components (M5 will app
                                    # clear the cache for every concurrent agent), so
                                    # if you are calibrating, or chasing a surprising
                                    # green, clean first and re-run.
+                                   # 🔴 AND CLEAN **AFTER** DELETING A THROWAWAY
+                                   # WORKTREE, NOT ONLY BEFORE AN ARM. The cached
+                                   # paths OUTLIVE THE TREE. Cleaning before your
+                                   # own run protects YOU; it does nothing for
+                                   # whoever runs next, and a finding pathed into a
+                                   # directory that NO LONGER EXISTS is worse than
+                                   # one pointing at a live sibling, because nobody
+                                   # can go look at it. That is exactly how the 120
+                                   # above happened: a validator built a throwaway
+                                   # worktree for a cache probe, removed it, and
+                                   # left the entries behind.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
                                    # still runs inside gate:api / gate:controller as
                                    # its OWN unratcheted step and is deliberately NOT

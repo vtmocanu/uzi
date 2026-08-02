@@ -275,6 +275,17 @@ lint           task lint           # composite, all four components (M5 will app
                                    # the gate targets deliberately do NOT, so clean
                                    # first before every calibration arm and assert
                                    # the finding path is repo-root-relative.
+                                   # 🔴 AND CLEAN **AFTER** DELETING A THROWAWAY
+                                   # WORKTREE, NOT ONLY BEFORE AN ARM -- this one
+                                   # is YOURS to keep, since building and removing
+                                   # probe worktrees is a tester's normal day. The
+                                   # cached paths OUTLIVE THE TREE. Cleaning before
+                                   # your own run protects YOU and does nothing for
+                                   # whoever runs next, and a finding pathed into a
+                                   # directory that NO LONGER EXISTS is worse than
+                                   # one pointing at a live sibling, because nobody
+                                   # can go look at it. That is exactly how the 120
+                                   # above happened.
                                    # Observed live during M3's own audit, from a
                                    # sibling worktree.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
