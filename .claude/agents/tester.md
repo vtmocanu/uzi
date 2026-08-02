@@ -204,8 +204,10 @@ under `-race` and only 2/3 without it. **`-p 1`** belongs to `./e2e/run-store-it
 (a script, not a target): the two live-DB packages share one database and, run
 concurrently, race goose into "relation already exists" and TRUNCATE each other's
 fixtures. **`--test-timeout=30000`** lives in `agent/package.json`'s `test` script,
-which `task test:agent` invokes — node's own default is NO timeout, so a hand-rolled
-`node --test` hangs where the gate fails.
+which `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
+`node --test` does not reproduce a hang today (measured, node v26.4.0: identical
+pass/fail counts to `npm test`); the cap is still live and worth carrying as
+insurance against a future slow test, not as a fix for a current hang.
 
 `-count=1` on the two Go test targets is part of the gate, not a habit: Go's test cache
 hashes only files INSIDE the module root, and this repo reads test inputs across

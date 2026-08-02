@@ -1223,8 +1223,11 @@ the output of any run you make:
   live-DB packages share one database and, run concurrently, race goose into
   "relation already exists" and TRUNCATE each other's fixtures. Both observed.
 - **`--test-timeout=30000`** inside `agent/package.json`'s `test` script, which
-  `task test:agent` invokes — node's own default is NO timeout, so a hand-rolled
-  `node --test` HANGS where the gate fails.
+  `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
+  `node --test` does not reproduce a hang today (measured, node v26.4.0:
+  identical pass/fail counts to `npm test`); the cap is still live and worth
+  carrying as insurance against a future slow test, not as a fix for a current
+  hang.
 
 **`-count=1` on the two Go test targets is part of the gate, not decoration — without it a
 green can mean the suite never ran.** Go's test cache hashes only files inside the

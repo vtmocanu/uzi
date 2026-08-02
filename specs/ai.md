@@ -15626,8 +15626,11 @@ changing nothing.
 - **npm targets delegate to the existing `package.json` script and must keep doing so.** A target
   written `npm test` inherits whatever flags the script encodes; one that reimplements the command
   drops them **silently**. The live instance is `test:agent`, where `--test-timeout=30000` lives in
-  the script and node's own default is *no* timeout — a spelled-out `node --import tsx --test`
-  hangs where the gate fails.
+  the script and node's own default is *no* timeout. *(Corrected 2026-08-02, hours after this
+  section was written: a spelled-out `node --import tsx --test` does not reproduce a hang on node
+  v26.4.0 — measured identical to `npm test`. The cap stays live regardless — a 3s test body under
+  `--test-timeout=1000` is cancelled — so delegating is insurance against a future slow test, not a
+  fix for a present hang.)*
 - **CI must PROVIDE each tool, and anything fetched at job time is version- and sha256-pinned.**
   "Provide" means a digest-pinned image, a pinned `go run …@vX.Y.Z`, an npm devDependency, or a
   pinned `before_script` install — never devbox. **The checksum is a literal at its use site, not a

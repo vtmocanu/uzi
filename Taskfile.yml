@@ -92,8 +92,11 @@
 # written `npm test` inherits whatever flags `package.json` already encodes; a
 # target that reimplements the command drops them SILENTLY. The live instance is
 # `test:agent`: `agent/package.json`'s test script carries `--test-timeout=30000`
-# and node's own default is NO timeout, so a spelled-out `node --import tsx --test`
-# hangs where the gate fails. This is the same "a future simplify-the-gate edit"
+# and node's own default is NO timeout. On node v26.4.0 a spelled-out `node
+# --import tsx --test` does not actually hang (measured: identical pass/fail
+# counts to `npm test`) -- the cap is insurance against a future slow test, not
+# a fix for a current one, and a target that reimplements the command still
+# drops the flag silently either way. This is the same "a future simplify-the-gate edit"
 # hazard as `-race`/`-count=1`, arriving through `package.json` instead of
 # `.gitlab-ci.yml`. Before wrapping any npm script, read it for flags first; if you
 # must spell out the underlying command, re-add every flag the script carried and
