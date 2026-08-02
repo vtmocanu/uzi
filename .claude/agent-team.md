@@ -115,24 +115,43 @@ message had that exact shape:
   was right.
 - *"All 7 `gitleaks:allow` directives are unmoved."* The substantive half is true
   and was the point. The count is not. Measured at `b0d8bf72`: **9 occurrences
-  across 7 files** repo-wide, **6 across 5 Go files** under `api/`. **So `7` is
-  the repo-wide FILE count, reported as a directive count** — and note the first
-  two attempts to correct it, by two different people, both asserted *"no scope
-  yields 7"*, which is itself false and was accepted twice. **The corroborating
-  clause was wrong, its correction was wrong, the correction of that correction
-  was wrong — and the conclusion they all decorated (nothing moved) was right at
-  every layer.** Each layer was checked only against the layer below it, never
-  against the repo, because everyone already agreed on the point. This bullet is
-  the entry's own thesis landing on the entry.
-  *(Anchored to a SHA on purpose. Writing this bullet ADDED an occurrence to the
-  repo — the count read 10 across 8 files the moment it was recorded, and moves
-  again with the next quotation. A count of a population that includes the
-  document counting it is stale before it is committed; `CLAUDE.md` has the same
-  trap on its `grep -c '^--- PASS'` tally.)*
+  across 7 files** repo-wide, **6 across 5 Go files** under `api/`. So `7` is a
+  real number under some scope, mislabelled as an occurrence count — **and which
+  scope is NOT established, because two of them yield 7**: repo-wide *files*, and
+  *occurrences* restricted to `.go`/`.yml`. The message does not say, and it
+  cannot be recovered. **Each successive correction was also wrong**: *"no scope
+  yields 7"* (false, twice, by two people), then *"so `7` is the repo-wide file
+  count"* (one of two candidates, asserted as fact — **written into this very
+  bullet, by the author of this entry, on a claim handed over by the person who
+  had just described the pattern**). **The corroborating clause was wrong at
+  every layer and the conclusion it decorated — nothing moved — was right at
+  every layer.** Each layer was checked against the layer below it and never
+  against the repo, because everyone already agreed on the point. The strongest
+  form of the point is that it caught the people writing it down.
+  *(Anchored to a SHA on purpose. Writing this bullet ADDED occurrences to the
+  repo: **10 across 8 files immediately before it existed (`21979bf9`), 11 across
+  9 once committed (`9476973c`)**, and it moves again with the next quotation.
+  Both readings of "when it was recorded" are needed, because a sentence about
+  counts going stale before commit must not itself be ambiguous about which side
+  of the commit it means. A count of a population that includes the document
+  counting it is stale before it is committed; `CLAUDE.md` has the same trap on
+  its `grep -c '^--- PASS'` tally.)*
 - *"Three non-whitespace changes."* The conclusion — commit 1 is semantically
   inert — is true and independently confirmed by a token-stream pass. The
   enumeration bolted onto it is imprecise: one of the three changes **zero**
   non-whitespace bytes.
+- **A fourth, and it was sitting in the same delta while this entry was being
+  written.** Two sites said a malformed `Taskfile.yml` exits `1` and that "every
+  target vanishes at once, so the symptom does not resemble the edit that caused
+  it". The conclusions those support are sound with **no** evidence at all —
+  *"parse this file after touching it"*, and *"`!= 0` covers two distinct
+  meanings"*, which is true because there genuinely are two. Everything else was
+  support, and **all of it was wrong**: the code is `109`, and the second half
+  inverts the truth, since `task` names the file and the line you just edited.
+  Corrected in `5680ab6d`. **The entry predicted an instance that already existed
+  three files away** — which is the difference between a lesson and a
+  demonstration, and the reason this bullet is here rather than a caveat on the
+  sentence above.
 
 **And the sharpest instance is this entry's own first draft.** Handing the lesson
 over, the coder wrote that both of its errors were *"decorative evidence attached
@@ -294,11 +313,15 @@ decides where the next person spends their time. Re-derive those too.
     drift is gone, so there is nothing left to sweep and the rule has no subject.
   - **Still fully live on a branch that has not rebased past it.** Measured 2026-08-02 with
     `git archive <branch> api | tar -x` into a temp dir (no sibling worktree touched), `gofmt -l`
-    was non-empty on **every local branch sampled except two** — and the sample was all of them.
-    Counts are deliberately not recorded: they move with every commit and the shape is the point.
-    **Re-measure your own branch; do not infer it from `main`.** *(This first read "five live
-    branches", written from the five that had worktrees. True, and it understates by roughly 5x
-    while reading as an enumeration — one clause before a sentence about numbers moving.)*
+    was non-empty on **nearly every local branch**, most of them carrying MORE drift than `main`.
+    No figure is recorded, deliberately: it moves with every commit and the shape is the point.
+    **Re-measure your own branch; do not infer it from `main`** — which, note, does not yet
+    contain the reformat either. *(Two earlier versions of this clause carried figures and both
+    were wrong in the same direction. The first said "five live branches", written from the five
+    that happened to have worktrees; the second said "every branch sampled except two", which is
+    accurate and still invites the reader to treat a snapshot as a fact. A number here is a
+    liability regardless of whether it is correct — the clause immediately after it says numbers
+    move, and the fix is to have none rather than a better one.)*
   - **The new gate does NOT cover this case, and the obvious reading of it is wrong.** `fmt-check`
     detects DRIFT; the hazard here is a SWEEP, and a swept tree is gofmt-clean, so the gate is
     green by construction. It was never the drift's existence that hurt — it was foreign files
