@@ -1,0 +1,105 @@
+// knip configuration for `web` (PRD #103 M4). This is the `dead code` gate slot's
+// npm half; the Go half is `scripts/deadcode-gate.sh`. Run it as `task deadcode:web`.
+//
+// JSONC, NOT JSON, DELIBERATELY. knip resolves `knip.jsonc` natively (verified
+// against 6.31.0's own `dist/constants.js`), and every suppression below needs a
+// REASON next to it -- an `ignore` entry with no stated reason is indistinguishable
+// from a mistake, and this repo has paid for suppressions nobody could evaluate.
+//
+// EVERY FLAG LIVES HERE, SO THE npm SCRIPT IS A BARE `knip`. Two reasons. The
+// Taskfile header requires npm targets to delegate to the package.json script, and a
+// script carrying flags is one edit away from silently dropping them; and
+// `web/package.json` is a documented three-way contention point across PRD #103's
+// milestones, so the smallest possible line there is the one least likely to
+// conflict.
+//
+// 🔴 `knip --fix` MODIFIES FILES IN THE REPO (it deletes `export` keywords and can
+// delete whole files with --allow-remove-files). It must never appear in a gate
+// target, a package.json script, or CI. Nothing in the gate may be a fixing variant.
+{
+  // ---- SUPPRESSIONS. Three day-one findings, each verified against the tree. ----
+
+  // `public/theme-preinit.js` is loaded by `web/index.html` as
+  // `<script src="/theme-preinit.js">`. Vite copies `public/` verbatim and the
+  // reference is a URL rather than an import, so knip cannot resolve it and reports
+  // the file as unused. It is an EXTERNAL file specifically so nginx's CSP can stay
+  // `script-src 'self'` with no `'unsafe-inline'` (PRD #21, and `web/nginx.conf`'s
+  // own comment says so). Acting on the finding would break pre-paint theming in
+  // every nginx-served build AND the CSP rationale, in one edit.
+  "ignore": ["public/**"],
+
+  // `scripts/gen-favicon-png.mjs` is a hand-run generator (its own header says
+  // `node web/scripts/gen-favicon-png.mjs`), so it is an ENTRY POINT that happens to
+  // be invoked by a human rather than by a build. Declared as `entry` and not
+  // `ignore` on purpose: an entry keeps its imports and its own dependencies in
+  // scope, where an ignore would silently drop everything it reaches.
+  //
+  // Note `scripts/check-docs.mjs` needs no such line: knip's package.json-scripts
+  // plugin reaches it through the `check-docs` npm script. The discriminator is
+  // "reachable from a package.json script", not "is a script".
+  //
+  // 🔴 THIS LIST DOES NOT REPLACE THE VITE/VITEST ENTRIES. knip's plugins contribute
+  // their own (`index.html` -> `src/main.tsx`, `vite.config.ts`, the test files), and
+  // those are additive to this. Verified by measurement, not by assumption: with this
+  // key present the report is unchanged except for the one file it removes.
+  "entry": ["scripts/gen-favicon-png.mjs"],
+
+  // ---- SEVERITY STAGING (PRD #103 Decision 4, Success Criterion 2). ------------
+  //
+  // ALL SEVENTEEN RULE NAMES ARE LISTED, including the ones that would land on
+  // knip's own default. A rule left out is a severity decided by a default the
+  // reader cannot see -- and the failure mode here is silent: a MISTYPED rule name
+  // prints `WARNING: Ignored unknown issue type "..."` among the findings and does
+  // NOT change the exit code. `--treat-config-hints-as-errors` does not cover it
+  // either. The names below were taken from `node_modules/knip/schema.json`
+  // (`.properties.rules.properties`), not from memory.
+  //
+  // 🔴 `warn` MEANS "REPORTED, GATES NOTHING", AND `--max-issues` CANNOT RECOVER IT.
+  // Measured twice independently: with every rule at `warn`, `--max-issues 0` exits
+  // 0 with 24 findings printed. --max-issues counts ERROR-severity issues only, so
+  // for a warn tier it is inert. PRD #103 Decision 4 and M4's brief both offered it
+  // as "a regression budget meanwhile"; it is not one, and the PRD is amended to say
+  // so. The export tier therefore genuinely gates nothing until it is burned down
+  // and promoted -- tracked as a follow-up issue, not left implicit.
+  "rules": {
+    // ERROR: zero findings today, so these gate at zero from day one.
+    "files": "error",
+    "dependencies": "error",
+    "devDependencies": "error",
+    "optionalPeerDependencies": "error",
+    "unlisted": "error",
+    "binaries": "error",
+    "unresolved": "error",
+    "duplicates": "error",
+    "catalog": "error",
+    "catalogReferences": "error",
+
+    // OFF, and this is the one entry that is a scope decision rather than a debt
+    // decision. `cycles` (circular imports) is not part of knip's default report and
+    // enabling it is a separate call with its own burn-down; M4 is dead code, not
+    // module-graph hygiene. Explicit rather than omitted so nobody reads its absence
+    // as an oversight.
+    "cycles": "off",
+
+    // WARN: reported in full, gates nothing. This is the debt tier.
+    "exports": "warn",
+    "types": "warn",
+    "nsExports": "warn",
+    "nsTypes": "warn",
+    "enumMembers": "warn",
+    "namespaceMembers": "warn"
+  },
+
+  // 🔴 OFF BY DEFAULT, AND THAT DEFAULT IS A REAL HOLE HERE. Without this, an unused
+  // export in an ENTRY file is never reported at all -- and web's entry set includes
+  // `src/main.tsx`, the vite config, and the docs/mock loaders. Turning it on makes
+  // the warn tier honest about the size of the debt instead of hiding part of it.
+  "includeEntryExports": true,
+
+  // 🔴 WITHOUT THESE TWO, A CONFIG THAT HAS STOPPED MATCHING DEGRADES SILENTLY TO
+  // "no findings". If the `entry` glob above stops resolving, or a `tags` hint goes
+  // stale, knip prints a hint and still exits 0 -- a green gate over a config that
+  // is no longer doing anything, which is this repo's signature failure shape.
+  "treatConfigHintsAsErrors": true,
+  "treatTagHintsAsErrors": true
+}

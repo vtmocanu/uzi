@@ -1,0 +1,57 @@
+// knip configuration for `agent` (PRD #103 M4), the worker runtime. This is the
+// `dead code` gate slot's npm half here; run it as `task deadcode:agent`.
+//
+// 🔴 READ `web/knip.jsonc` FIRST. It carries the full rationale for the severity
+// staging, for listing all seventeen rule names, for `includeEntryExports`, for the
+// two `treat*HintsAsErrors` keys, and for keeping every flag in this file rather than
+// in the npm script. Those reasons are identical for both packages and are NOT
+// restated here, so the two configs cannot drift apart on them. Only what is
+// SPECIFIC to `agent` is explained below.
+//
+// 🔴 `knip --fix` MODIFIES FILES IN THE REPO. Never in a gate target, a package.json
+// script, or CI.
+{
+  // ---- THE ONE SUPPRESSION, AND IT IS A HIGH-CONSEQUENCE ONE. ------------------
+  //
+  // `agent-browser` is a real, required dependency that knip cannot see, because it
+  // is resolved BY PATH AT RUNTIME rather than by any import. `agent/bin/agent-browser`
+  // is a shim reading
+  //   REAL="${AGENT_BROWSER_SHIM_TARGET:-/app/node_modules/.bin/agent-browser}"
+  // and both `src/sdk-env.ts` and `src/runner-uid.ts` reason about PATH resolution
+  // between `node_modules/.bin` and that baked shim (PRD #87 M1, issue #120);
+  // `test/runner-uid.test.ts` asserts the resolution. Removing the dependency to
+  // satisfy knip would remove the actual browser CLI from the worker image while
+  // every test that does not exercise the image kept passing.
+  //
+  // `ignoreDependencies` and not `ignore`: the package stays in scope for the
+  // `unlisted`/`binaries` rules, so a *different* mistake about it is still caught.
+  "ignoreDependencies": ["agent-browser"],
+
+  // ---- SEVERITY STAGING -- see web/knip.jsonc for why every name is listed. -----
+  "rules": {
+    "files": "error",
+    "dependencies": "error",
+    "devDependencies": "error",
+    "optionalPeerDependencies": "error",
+    "unlisted": "error",
+    "binaries": "error",
+    "unresolved": "error",
+    "duplicates": "error",
+    "catalog": "error",
+    "catalogReferences": "error",
+
+    "cycles": "off",
+
+    "exports": "warn",
+    "types": "warn",
+    "nsExports": "warn",
+    "nsTypes": "warn",
+    "enumMembers": "warn",
+    "namespaceMembers": "warn"
+  },
+
+  "includeEntryExports": true,
+
+  "treatConfigHintsAsErrors": true,
+  "treatTagHintsAsErrors": true
+}

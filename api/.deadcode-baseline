@@ -1,0 +1,42 @@
+# deadcode baseline for the `api` Go module (PRD #103 M4).
+#
+# 🔴 THIS FILE IS EMPTY OF ENTRIES AND THAT IS THE DESIGN, NOT AN OVERSIGHT.
+# `deadcode -test ./...` reported exactly ONE finding on this module when M4
+# landed (2026-08-02, measured at v0.38.0 and v0.48.0 by three parties, all
+# agreeing): `HookManager.SettingsPath`, a one-line exported wrapper over the
+# unexported `settingsPath()` in the same file, with zero callers. M4 DELETED it
+# rather than baselining it, so the gate holds this module at ZERO. That is
+# strictly stronger than gate-on-new, and it removes the baseline-rot problem
+# instead of managing it.
+#
+# ADDING A LINE HERE IS A DELIBERATE SUPPRESSION AND OWES A REASON IN A COMMENT
+# DIRECTLY ABOVE IT. The routine fix for a deadcode finding is to DELETE the
+# function. Two known cases where a suppression is legitimate:
+#   - `//go:linkname`: deadcode does not understand it (its own doc says so), so
+#     a function reached only that way is a false positive.
+#   - a platform-gated file (see the portability note below).
+# `scripts/deadcode-gate.sh` treats an entry that is NO LONGER REPORTED as a
+# failure, so a suppression cannot outlive the finding it covers.
+#
+# FORMAT: one entry per line, TAB-separated:
+#     <package import path>\t<function name>
+# Position-free ON PURPOSE (PRD #103 Decision 11). deadcode's default output is
+# `path:line:col: unreachable func: Name`, and one inserted comment line above a
+# baselined symbol moves it -- so a baseline built from raw output reports a
+# spurious addition AND a spurious removal on any unrelated edit. Comment lines
+# (`#`) and blank lines are stripped before comparison; no import path and no Go
+# identifier can contain `#`.
+#
+# REGENERATE WITH (by hand -- deliberately NOT a Taskfile target, because a
+# fixing variant of a gate is a target testers are told to refuse):
+#     ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0 --write
+# It re-runs the same producer the gate uses and keeps this header, so the
+# regeneration command cannot drift from the checking command.
+#
+# PORTABILITY: laptop and CI agree today. darwin/arm64 and linux/amd64 give
+# byte-identical results for this module (measured 2026-08-02). THAT IS A
+# PROPERTY OF THIS REPO, NOT OF THE TOOL -- deadcode's own doc says the analysis
+# is valid for a single GOOS/GOARCH/-tags configuration, and it holds here only
+# because no non-test `.go` file in either Go module carries a `//go:build`
+# constraint. Add one and this stops holding; the entry it produces would be
+# platform-specific and the baseline would differ between laptop and CI.

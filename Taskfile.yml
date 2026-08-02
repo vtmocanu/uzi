@@ -162,7 +162,7 @@ tasks:
       - task: gate:agent
 
   gate:api:
-    desc: api - fmt-check, vet, build, lint, test
+    desc: api - fmt-check, vet, build, lint, deadcode, test
     cmds:
       # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
       # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
@@ -178,20 +178,34 @@ tasks:
       # for the same defect. BEFORE test because it is seconds against test:api's
       # -race run.
       - task: lint:api
+      # deadcode AFTER lint, and the ordering has a CALIBRATION consequence that
+      # is not obvious from the cost (PRD #103 M4). golangci-lint's `unused`
+      # reports unused UNEXPORTED symbols; deadcode reports unreachable functions
+      # whether exported or not. So an unexported dead function reddens `lint:api`
+      # first and THIS TARGET NEVER RUNS - anyone calibrating the dead-code slot
+      # with one demonstrates M3's linter while believing they demonstrated M4's.
+      # Measured 2026-08-02: on a two-function scratch module, `unused` reports
+      # only the unexported one and deadcode reports both. Calibrate with an
+      # EXPORTED symbol. (After build, for the same reason lint is: deadcode
+      # loads and type-checks packages, and on a tree that does not compile it
+      # exits 1 with a load error rather than a build error.)
+      - task: deadcode:api
       - task: test:api
 
   gate:controller:
-    desc: controller - fmt-check, vet, build, lint, test
+    desc: controller - fmt-check, vet, build, lint, deadcode, test
     cmds:
       - task: fmt-check:controller
       - task: vet:controller
       - task: build:controller
-      # Same ordering and the same reason as gate:api above.
+      # Same ordering and the same reasons as gate:api above, including why
+      # deadcode sits after lint.
       - task: lint:controller
+      - task: deadcode:controller
       - task: test:controller
 
   gate:web:
-    desc: web - lint, check-docs, typecheck, test
+    desc: web - lint, deadcode, check-docs, typecheck, test
     cmds:
       # lint FIRST here, which is the MIRROR IMAGE of the Go gates above and is
       # deliberate rather than inconsistent (PRD #103 M3). oxlint is measured at
@@ -200,15 +214,22 @@ tasks:
       # dependency on a build and nothing is gained by deferring it. Same reason
       # M2 put fmt-check first in gate:api.
       - task: lint:web
+      # knip SECOND, on the same cheap-first principle: 244ms measured, against
+      # ~5s for typecheck and ~10s for vitest. It has no ordering dependency on
+      # a build or a typecheck either - knip 6 resolves with oxc-resolver and
+      # does not run tsc.
+      - task: deadcode:web
       - task: check-docs:web
       - task: typecheck:web
       - task: test:web
 
   gate:agent:
-    desc: agent - lint, typecheck, test
+    desc: agent - lint, deadcode, typecheck, test
     cmds:
       # lint first, same reason as gate:web (~0.05s here).
       - task: lint:agent
+      # knip second, same reason as gate:web (152ms here).
+      - task: deadcode:agent
       - task: typecheck:agent
       - task: test:agent
 
@@ -245,6 +266,30 @@ tasks:
       - task: lint:controller
       - task: lint:web
       - task: lint:agent
+
+  deadcode:
+    # ONE SLOT, ONE PREFIX, FOUR COMPONENTS (PRD #103 M4). The npm half is knip
+    # rather than `deadcode`, and `deadcode:web` is therefore slightly imprecise -
+    # knip also reports unused FILES and unused DEPENDENCIES. That is the same
+    # imprecision `lint:web` already carries (oxlint is not golangci-lint), and it
+    # is preferred to a second prefix: the `dead code` row of the paste-block in
+    # `.claude/agent-team.md` is ONE line, and a `knip:web` target would split one
+    # slot across two prefixes for a reader who has to type both.
+    #
+    # WHAT THIS SLOT DOES NOT COVER, stated here because the alternative is a slot
+    # implying coverage it lacks: DEAD BRANCHES. `deadcode` finds unreachable
+    # FUNCTIONS and knip finds unused EXPORTS/FILES/DEPS; neither can see a `case`
+    # arm that nothing reaches inside a live function. The known live example is
+    # PRD #99's legacy `case "Task":` arms in `web/src/components/RunEvent.tsx`,
+    # still present, and NOT a valid probe for this slot for exactly that reason -
+    # it would produce a clean "no findings" from a working tool. Dead branches
+    # stay the reviewer's job.
+    desc: dead-code detection across all four components (deadcode + knip)
+    cmds:
+      - task: deadcode:api
+      - task: deadcode:controller
+      - task: deadcode:web
+      - task: deadcode:agent
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
@@ -568,6 +613,75 @@ tasks:
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
+  deadcode:api:
+    desc: api - unreachable functions, gated against api/.deadcode-baseline (EMPTY)
+    cmds:
+      # 🔴 A SCRIPT, NOT AN INLINE RECIPE, AND THE ARGUMENT IS M5's. PRD #103 M5
+      # adds `shellcheck` over `git ls-files '*.sh'`, so a committed script gets
+      # LINTED and an inline Taskfile recipe gets nothing - yamllint checks YAML,
+      # not shell embedded in a `cmds:` string. Precedent in this repo:
+      # `scripts/assert-chart-render.sh`, invoked from the `helm_chart` job.
+      #
+      # 🔴 AND THE WRAPPER IS NOT ABOUT THE BASELINE. Both baselines ship EMPTY
+      # (see api/.deadcode-baseline's header). It exists because `deadcode` EXITS
+      # 0 WHETHER IT FINDS 0, 1 OR 44 DEAD FUNCTIONS - rc=1 only on a load error,
+      # and on that path stdout is 0 BYTES, so a naive additions-only diff reads
+      # a non-compiling module as clean and passes GREEN. The script reads rc
+      # before it reads output. Read its header before editing this target.
+      #
+      # THE PIN IS AN ARGUMENT RATHER THAN A SCRIPT DEFAULT, so this file's echo
+      # still shows it. The header calls that echo the mechanism by which a
+      # teammate notices a version pin going missing, and `lint:api` already
+      # spends one deliberate exception on it (the ratchet lives in
+      # `.golangci.yml`, invisible here). One is enough.
+      #
+      # PINNED `go run`, same shape as `sqlc@v1.30.0` in validate:api and
+      # `golangci-lint@v2.12.2` above: identical version local and in CI, and it
+      # writes nothing to api/go.mod. v0.48.0 is the current release; v0.38.0 was
+      # measured independently on this tree and gave IDENTICAL counts (1 for api,
+      # 0 for controller), which is worth more than a figure from one version.
+      #
+      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64: 2.7-3.2s warm, ~25s
+      # on a cold GOCACHE (x/tools' own dependency tree). deadcode has NO result
+      # cache of its own - checked for one, and cold and warm runs were
+      # byte-identical - so carry-forward item 4's poisoned-cache hazard, where
+      # golangci-lint replays a sibling worktree's absolute paths, has no analogue
+      # here. Neither does its host-global LOCK: three concurrent runs, no
+      # contention.
+      - ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+
+  deadcode:api:all:
+    desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
+    dir: api
+    cmds:
+      # 🔴 THIS TARGET EXITS 0 EVEN WHEN IT REPORTS, WHICH IS THE OPPOSITE OF
+      # `lint:api:all`. Read both `desc:` lines together: golangci-lint exits 1
+      # on a finding, deadcode exits 0 on any number of them. That asymmetry is
+      # precisely why the gating target above goes through a wrapper and this one
+      # does not need to - and it is why "the output is the signal here" has to be
+      # said out loud rather than left to be inferred from a green.
+      #
+      # WHY IT EXISTS AT ALL, given the baseline is the full record for the gating
+      # invocation: `-test ./...` makes a PRODUCTION-DEAD function invisible the
+      # moment any test calls it, and `golangci-lint unused` does not catch it
+      # either. Measured on a scratch module:
+      #
+      #   deadcode       ./...   ExportedNoCaller + unexportedNoCaller
+      #   deadcode -test ./...   <EMPTY>
+      #   golangci-lint unused   "0 issues."
+      #
+      # That is the commonest way dead code enters a repo with a testing culture -
+      # write the function, write its test, never wire it up - and it is a class
+      # the gating invocation cannot see at all, so the baseline is NOT the full
+      # record for it. `-test` is still the right GATING default: 32 of api's
+      # 43-finding delta are `FakeClient.*` methods on a test double, correctly
+      # suppressed.
+      #
+      # THE POSITIVE PAIR (carry-forward item 5): as of 2026-08-02 this prints 44
+      # where `task deadcode:api` reports 0. A companion that reports one number
+      # needs the other to mean anything.
+      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
     dir: api
@@ -691,6 +805,31 @@ tasks:
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
+  deadcode:controller:
+    desc: controller - unreachable functions, gated against controller/.deadcode-baseline (EMPTY)
+    cmds:
+      # Same script, same pin, same reasons - read deadcode:api's comment before
+      # editing either. This module reported ZERO findings under the gating
+      # invocation when M4 landed, so nothing was deleted to reach zero here; the
+      # target exists to keep it there. An empty backlog is not the same thing as
+      # a no-op (fmt-check:controller shipped under the same argument).
+      - ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0
+
+  deadcode:controller:all:
+    desc: controller - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
+    dir: controller
+    cmds:
+      # Exits 0 even when it reports - see deadcode:api:all's first paragraph, and
+      # do not "fix" that by wrapping this target.
+      #
+      # THIS MODULE IS THE ONE THAT MAKES THE COMPANION'S CASE. It reads 0 under
+      # the gate and FOUR here (`SpecHashOf`, `SizeNames`, `TemplateNames`,
+      # `keys`), and all four are the write-it/test-it/never-wire-it shape: three
+      # are exported, so `golangci-lint unused` does not report them, and the
+      # fourth is called by two of the other three within its own package, so
+      # `unused` considers it used. Nothing else in the gate sees them.
+      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+
   test:controller:
     desc: controller unit tests (-count=1)
     dir: controller
@@ -759,6 +898,36 @@ tasks:
       # and fails closed with `command not found` instead.
       - npm run lint
 
+  deadcode:web:
+    desc: knip over web - unused files, exports, deps (see web/knip.jsonc for staging)
+    dir: web
+    cmds:
+      # DELEGATES TO package.json's `knip` SCRIPT, as this file's header requires of
+      # every npm target. That script is a BARE `knip` on purpose: every flag lives
+      # in `web/knip.jsonc`, so there is nothing here for a rewrite to drop
+      # silently, and `web/package.json` (a documented three-way contention point
+      # across this PRD's milestones) carries the smallest possible line.
+      #
+      # NEVER A BARE `npx knip`: npx fetches from the network when the dep is
+      # missing, which a gate may not do. `npm run` puts node_modules/.bin on PATH
+      # and fails closed with `command not found`.
+      #
+      # 🔴 WHAT GATES AND WHAT DOES NOT, because a green here does NOT mean "no
+      # unused exports". `web/knip.jsonc` stages `exports`/`types` and the rest of
+      # that family at `warn`, and WARN-SEVERITY ISSUES ARE PRINTED IN FULL AND DO
+      # NOT SET THE EXIT CODE. As of 2026-08-02 that is 22 findings on this package
+      # (9 exports + 13 exported types), reported on every run and gating nothing;
+      # unused FILES and DEPENDENCIES gate at zero. `--max-issues` is NOT a fallback
+      # for the warn tier - measured, it counts error-severity issues only and exits
+      # 0 with the warn findings printed. Burning the export tier down and promoting
+      # it to `error` is a follow-up issue, not this milestone.
+      #
+      # 🔴 AND NEVER ADD `--fix`. knip's fix mode edits files in the repo (it strips
+      # `export` keywords, and with --allow-remove-files deletes files). Nothing in
+      # the gate may be a fixing variant - the same rule that makes the format slot
+      # `fmt-check` rather than `fmt`.
+      - npm run knip
+
   check-docs:web:
     desc: docs frontmatter + relative-link lint
     dir: web
@@ -796,6 +965,21 @@ tasks:
       # Scoped `src test` rather than `src`: unlike web/, this package's tests live
       # OUTSIDE src/, and 7 of its 10 baseline findings are in test/.
       - npm run lint
+
+  deadcode:agent:
+    desc: knip over agent - unused files, exports, deps (see agent/knip.jsonc for staging)
+    dir: agent
+    cmds:
+      # Same delegation, same bans, same staging - read deadcode:web's comment
+      # before editing either. Two differences specific to this package:
+      #
+      #   - the debt is LARGER: 53 warn-tier findings as of 2026-08-02 (35 exports +
+      #     18 exported types) against web's 22.
+      #   - `agent-browser` is in `ignoreDependencies`, because it is resolved BY
+      #     PATH at runtime rather than by an import. `agent/knip.jsonc` states why;
+      #     deleting that line makes knip demand the removal of a dependency the
+      #     worker image genuinely needs.
+      - npm run knip
 
   typecheck:agent:
     desc: tsc --noEmit over agent
