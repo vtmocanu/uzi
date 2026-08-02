@@ -15655,3 +15655,57 @@ changing nothing.
   pre-existing 1-in-6 race between two `agent/` test files sharing a hard-coded `/tmp` worktree
   path, invisible until something ran every suite in one pass. That is the milestone's best
   evidence for itself, and it is an argument about the gate's *shape*, not about any tool it runs.
+
+## 465. Issue #195 — the run page and the rollups fold the same wire field, and the parity is a mechanism rather than an assertion
+
+The run page read each result frame's top-level `usage`; every rollup surface (board,
+`uzi run list`, `GET /api/usage`, admin totals) folds `modelUsage`. PRD #40 Decision 3
+asserted the two "cannot diverge", resting on an M1 verdict flagged PROVISIONAL in its own
+text — decompiled at SDK `0.3.201` with no live run available. Eighteen patch versions on,
+they did not agree: measured on run `84b6a933` seq 173, the page was low on every column,
+by 2.5x on output, 3.3x on cache_read and **229x on input**.
+
+- **The client folds `modelUsage` per model, and never the frame's top-level `usage`.** The
+  server's `resultUsagePayload` parses only `modelUsage`, so this is what makes the two
+  populations the same population. A frame carrying `usage` without `modelUsage` is SKIPPED,
+  mirroring the server exactly rather than falling back — a fallback would reintroduce the
+  divergence in the one case where the board shows nothing and the page shows numbers.
+  *(The no-fallback rule was the user's call, 2026-08-02; see the proposed `specs/human.md`
+  entry.)*
+- **Retention is a running HIGH-WATER MARK per model per column, seeded at zero — not the
+  last-seen value.** `modelUsage` is not model-stable across frames: a model present in one
+  result frame can be absent from a later one while the server retains it via `GREATEST`.
+  Seventeen runs in the live DB show that shape. Composing the server's fold with its read
+  (`UpsertRunUsage`'s `GREATEST` per `(run_id, session_id, model)`, then migration `00063`'s
+  `MAX` per `(run_id, model)` across sessions, then `SUM` across models) gives
+  `MAX over ALL frames of max(0, v)`. The client's `Σ max(0, vᵢ − mᵢ₋₁)` with `m₀ = 0`
+  telescopes to exactly that expression — the same expression, not an approximation. A
+  last-seen `prev` overcounts every non-monotonic run, and **nothing in the repo could see
+  that**: the entire 1,595-test web suite passed identically under both semantics.
+- **Per COLUMN, not per record.** The server maxes each column independently, so a stored row
+  can combine values that appeared together in no single frame.
+- **Cost is quantized to microdollars per model per frame**, where `numericUSD` quantizes it,
+  before the running max. The naive alternative — a tolerance on the total — cannot separate a
+  quantizing implementation from a non-quantizing one, because the residual is half a
+  microdollar per model and the margin is a property of the data rather than of the code.
+- **Parity is enforced by a fixture BOTH implementations read**, not by a decision record.
+  `fixtures/run-usage/` holds a real run's result frames and the `run_usage` rows the server
+  folded from them; a TS test and a Go test each fold it with their own production code and
+  compare against the recording, and neither reads the other. This is the residual PRD #40's
+  M6 deferred for want of credentials. It sits above both Go module roots, which is why
+  `-count=1` is load-bearing at both Go gates.
+- **Four divergences are kept by decision, not by omission**, all field-level and all
+  hostile-input-only: any field whose JSON type Go cannot decode into its Go type makes Go
+  skip the whole frame while the client coerces to 0 and folds. `Number.isInteger` would catch
+  a non-integer cheaply; int64/float64 **range** has no cheap JS equivalent, since JS loses
+  integer precision above 2^53. One benign entry-level divergence remains: an empty model id
+  makes Go fold the frame writing no rows while the client skips it — totals agree, only a
+  phase row is lost.
+- **A post-reset phase row can render 0 tokens beside nonzero turns and duration.** The server
+  has no per-phase view, so parity cannot decide this; the choice is that the run total is
+  right and the pathological path reads oddly.
+- **PRD #40 is NOT discharged by this.** Its M1/M2 live requeue-boundary check remains open and
+  needs a real requeue crossing a compose restart.
+
+Full rationale, the rejected alternatives, and the correction history in
+`adr/0195-run-usage-per-model-fold.md`.
