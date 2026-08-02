@@ -68,21 +68,46 @@ own leak detector), never by inference from the dev host's green run.
 
 Gate slots here are: **format `none (gap)`, lint `none (gap)`, dead code
 `none (gap)`, coverage `none (gap)`** — this repo has no linter or format check
-yet (PRD #103 builds them), so "run every slot" currently means typecheck + test
-+ build. Do not go hunting for a lint command; there isn't one.
+yet (PRD #103 builds them), so "run every slot" currently means vet + build +
+typecheck + test, which is what `task gate` runs. Do not go hunting for a lint
+command; there isn't one.
 
-Gates before reporting done: api — `cd api && go build ./... && go test -count=1 ./...`
-(after editing `internal/store/migrations/` or `queries/`, regenerate with the
-pinned `sqlc generate`); web — `cd web && npm run typecheck && npm test && npm run build`;
-agent — `cd agent && npm run typecheck && npm test`. Full-stack proof is
-`./e2e/run-e2e.sh` (isolated, dummy creds, stub executor) + `./scripts/smoke.sh` —
-never a bare `docker compose up` (it autoloads the real `./.env` and seeds the real
-admin/forge). Authoring rules live in root `CLAUDE.md` + `ARCHITECTURE.md` (read it
+**Every gate recipe lives in root `Taskfile.yml` and nowhere else** (PRD #103 M1);
+`task --list` enumerates it. Gates before reporting done: `task gate:api`
+(after editing `internal/store/migrations/` or `queries/`, also regenerate with the
+pinned `sqlc generate` and confirm `git diff -- internal/store` is empty — CI asserts
+it); `task gate:web`; `task gate:agent`; `task gate:controller` if you touched that
+module. `task gate` runs all four, serially. **`task` exits 201 on any failure, not
+the underlying command's code** — test for non-zero, never a number.
+
+`task gate:web` is check-docs + typecheck + test and does NOT bundle: `cd web && npm
+run build` additionally runs `vite build`, which no gate job runs (only the web image
+build does). Run it by hand after touching anything the bundler resolves.
+
+Full-stack proof is `./e2e/run-e2e.sh` (isolated, dummy creds, stub executor) +
+`./scripts/smoke.sh` — never a bare `docker compose up`. **The reason is your SHELL,
+not a dotfile**: the developer's profile exports the real `UZI_SEED_*`, `JWT_SECRET`,
+`UZI_SECRET_KEY` and `POSTGRES_PASSWORD`, and Compose ranks shell environment ABOVE
+`--env-file`, so dummy secrets alone are NOT sufficient — use `env -i HOME=$HOME
+PATH=$PATH docker compose --env-file <dummy.env> -p <unique> …` and verify with
+`compose config`. (Corrected 2026-08-02: this line said a bare `up` "autoloads the
+real `./.env`", which root `CLAUDE.md` records as measured-false on this host — there
+is no `.env` in any worktree or at the bare-clone root. The precaution was right and
+its stated mechanism was wrong.)
+
+Authoring rules live in root `CLAUDE.md` + `ARCHITECTURE.md` (read it
 for cross-service work). We test in k8s first now (dev-cluster, ArgoCD) — a
 worker/runtime feature is not done just because compose works. Remote is GitLab
 `gitlab.example.com:vtmocanu/uzi` (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`).
 Goose migration numbers are draft until merge — renumber above the live head on landing.
-In linked worktrees a bare `go build` can fail on VCS stamping; use `-buildvcs=false`
-locally, never commit it. In parallel mode, the shared files to stop-and-report on here
+In linked worktrees a bare `go build` can fail on VCS stamping. You cannot append a flag
+to a task target, so export `GOFLAGS=-buildvcs=false` in your shell instead; never commit
+either form. In parallel mode, the shared files to stop-and-report on here
 (rather than edit) are `api/go.mod`/`go.sum`, sqlc-generated code, `docker-compose.yml`,
-and `.env.example` — the lead does one consolidated edit after the parallel units land.
+`.env.example`, `Taskfile.yml` and `.gitlab-ci.yml` (every PRD #103 milestone appends to
+both), and **`web/package.json` / `agent/package.json`** — the lead does one consolidated
+edit after the parallel units land. The two `package.json` files are a three-way and a
+two-way contention in PRD #103 alone (M3 oxlint devDeps, M4 knip, M6 `@vitest/coverage-v8`),
+npm's `devDependencies` ordering makes a conflict likely rather than possible, and a
+teammate may have symlinked `node_modules` from a sibling worktree on the strength of the
+lockfiles being identical, which your edit breaks. Report before touching either.

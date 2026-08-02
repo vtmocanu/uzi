@@ -8,16 +8,52 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
-- **The release runbook no longer describes a skip-CI commit as merely a cold-cache
-  slowdown.** GitLab applies a skip-CI marker (`[skip ci]`, `[ci skip]`, at least, any
-  capitalization, anywhere in the message) to the commit, not the ref, so tagging one
-  skips the tag pipeline too and publishes nothing, while `git push` still reports
-  success and a bare `glab ci status` right after the push reports `main`'s pipeline,
-  not the tag's. `deploy/README.md` now calls this out separately from the cache note
-  it used to be folded into, names `glab ci status --branch <tag>` as the check that
-  actually looks at the right ref, and covers the recovery: trigger the pipeline
-  manually with `glab ci run --branch <tag>` rather than moving the tag (issue #178).
-- A repo with open issues but none carrying the PRD label no longer re-reads its entire open issue set on every poll: the PRD-labelled and additive open, no-label fetches (PRD #102 M6) now advance separate high-water marks instead of sharing one that could never move past zero when the PRD-labelled fetch came back empty (issue #177).
+- **The run page's token counts were low, by 2.5x on output and up to 229x on
+  input, and now match the board.** The run page read one field of each result
+  frame while every rollup surface (the board, `uzi run list`, `GET /api/usage`,
+  the admin totals) read another, and on the current Anthropic SDK those two
+  fields no longer agree. Cost was low too, by whatever a model that dropped out
+  of the run's last frame had spent. Both surfaces now fold the same field, per
+  model, and a recorded fixture from a real run pins them to each other from both
+  sides so they cannot drift apart again (issue #195). This also unblocks the
+  live cost estimate in PRD #194.
+
+## [0.13.0] - 2026-07-29
+
+### Added
+
+- **An agent can now stop mid-run and ask you a question**, instead of guessing or
+  stalling on something it shouldn't decide alone. The run parks with a **needs
+  your answer** badge, the question lands in the run feed with any suggested
+  options, and you answer from the run view's composer, a reply in the run's
+  Slack thread, or `uzi run answer <id>` — all three read the same open question
+  off the feed, so no surface invents a question the others don't have. Left
+  unanswered, the run fails closed ("clarification timed out") rather than
+  hanging forever. Autopilot runs never park on a question — they proceed on
+  their own best judgment and record the assumption in the feed instead
+  (PRD #88). See [docs/run-activity.md](docs/run-activity.md).
+
+- **The footer version badge is now a build-info popover.** Hover, focus or tap
+  it to see the release version, the project's founding date, age, and process
+  uptime, plus, on a release image built in CI, the source commit, build
+  timestamp and commit count. `uzi version` now reports the server's build info
+  alongside its own (PRD #175). See [docs/cli.md](docs/cli.md).
+
+### Fixed
+
+- **A run whose owner had already answered no longer keeps nudging them to
+  approve a plan.** The health check flagged `approval_idle` purely on how long
+  `runs.updated_at` had sat still, and a revise response deliberately never
+  touches that column — so a user who requested changes was told for the rest
+  of the wait that they were the one being waited on. Slack, the board, and the
+  run view now report that the run is waiting on the worker instead (issue #182).
+
+- **The plan-revision cap could be exceeded by two concurrent submissions.**
+  Two revise requests arriving at the cap's last slot could both read the same
+  pre-update count and both land, letting a run exceed `PLAN_MAX_REVISIONS`.
+  The cap is now enforced atomically inside a single row update instead of a
+  read-then-insert, closing the race for both the web and Slack paths
+  (issue #106).
 
 ## [0.12.0] - 2026-07-28
 

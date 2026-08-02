@@ -137,7 +137,7 @@
   //
   // `kubernetes-helm` + `kubeconform` (2026-07-27, owner decision) give an agent editing
   // deploy/chart/ a LOCAL gate. uzi ships a 2809-line chart whose only gate today is CI's
-  // `helm_chart` job (.gitlab-ci.yml:374-410 — `helm lint` plus four `helm template` runs
+  // `helm_chart` job (`helm lint` plus four `helm template` runs
   // with invariant guards), so a chart edit is committed blind and fails minutes later in
   // CI. `helm template … | kubeconform -strict` reproduces most of that locally:
   //   * `kubernetes-helm` — `helm lint` / `helm template` / `helm dependency`. The attr is
@@ -147,7 +147,10 @@
   //     `--dry-run=server` needs a live API server).
   //
   // KNOWN AND ACCEPTED (owner decision, 2026-07-27): this pinned rev carries helm **4.2.3**
-  // and has no helm-3 attr, while CI pins **3.16.4** (alpine/helm:3.16.4, .gitlab-ci.yml:376).
+  // and has no helm-3 attr, while CI pins **3.16.4** (the `helm_chart` job's
+  // `alpine/helm:3.16.4` pin — that string appears twice in .gitlab-ci.yml, the
+  // other being `publish:chart`'s, so "the helm_chart job's pin" is the
+  // unambiguous form).
   // A local helm run is therefore a SMOKE CHECK, NOT a mirror of the CI gate: a chart edit
   // that is green locally can still fail `helm_chart`, and the 3→4 breaking-change set has
   // NOT been enumerated here. CI's helm 3 stays the authority — an agent must not reshape

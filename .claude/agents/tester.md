@@ -153,8 +153,16 @@ the sibling of the positive-control rule above.
 
 ## For this repo (uzi)
 
-Gate slots, per component. Everything not listed as a command genuinely does not
+Gate slots, per component. Everything not listed as a target genuinely does not
 exist here yet — see PRD #103, which builds them.
+
+**The slots name TARGETS; every recipe lives in root `Taskfile.yml`** (PRD #103 M1).
+`task --list` enumerates it, and `task gate:api` / `gate:controller` / `gate:web` /
+`gate:agent` run a whole component when the diff warrants it (`task gate` runs all
+four, serially). **`task` exits 201 on any failure, never the underlying command's
+code** — test for non-zero, never a number. Task echoes each command before running
+it, so the load-bearing flags below are visible in your own output; read them there
+rather than trusting this file.
 
 ```
 format         none (gap)          # gofmt -l ./api reports PRE-EXISTING drift; run it for
@@ -165,44 +173,98 @@ format         none (gap)          # gofmt -l ./api reports PRE-EXISTING drift; 
                                    # list being EMPTY. (Corrected 2026-07-27: this line
                                    # said "reports 26 drifted files today"; a tester
                                    # measured 19 and correctly flagged the "today".)
-lint           none (gap)          # no golangci-lint, no eslint; `go vet` runs in CI only
-typecheck      cd web && npm run typecheck
-               cd agent && npm run typecheck
-test           cd api && go test -count=1 ./...
-               cd controller && go test -count=1 ./...
-               cd web && npm test          # vitest
-               cd agent && npm test        # node --test via tsx
-               cd web && npm run check-docs
+lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
+                                   # task gate:api / gate:controller and in CI, but a
+                                   # vet is not a lint slot. (Was "in CI only"; PRD
+                                   # #103 M1 made the local half true too.)
+typecheck      task typecheck:web
+               task typecheck:agent
+test           task test:api               # -race -count=1
+               task test:controller        # -count=1
+               task test:web               # vitest
+               task test:agent             # node --test via tsx, --test-timeout=30000
+               task check-docs:web
 dead code      none (gap)
 coverage       none (gap)
 security scan  none (gap)          # auditor's slot regardless
 pre-commit     none (gap)          # only Entire's session-logging hooks exist
-long-running   ./e2e/run-e2e.sh    # ~30 min (but see the samples below), exception applies
+long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
+                                   # Scope it instead -- see below.
+               ./e2e/run-e2e.sh    # ~30 min (but see the samples below), exception applies
 ```
 
-In linked worktrees a bare `go build`/`go test` can fail on VCS stamping; use
-`-buildvcs=false` locally, never commit it.
+In linked worktrees a bare `go build`/`go test` can fail on VCS stamping. You cannot
+append a flag to a task target, so export `GOFLAGS=-buildvcs=false` in your shell
+instead; never commit either form.
 
-`-count=1` on the two Go lines is part of the gate, not a habit: Go's test cache
+**`-race` on `task test:api`** is PRD #108 M4's and is as load-bearing as `-count=1`:
+`workersvc` holds a mutex-guarded map written by every `/messages` handler goroutine
+and read by the sweeper, and measured by deleting that lock, the test reddens 3/3
+under `-race` and only 2/3 without it. **`-p 1`** belongs to `./e2e/run-store-it.sh`
+(a script, not a target): the two live-DB packages share one database and, run
+concurrently, race goose into "relation already exists" and TRUNCATE each other's
+fixtures. **`--test-timeout=30000`** lives in `agent/package.json`'s `test` script,
+which `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
+`node --test` does not reproduce a hang today (measured, node v26.4.0: identical
+pass/fail counts to `npm test`); the cap is still live and worth carrying as
+insurance against a future slow test, not as a fix for a current hang.
+
+`-count=1` on the two Go test targets is part of the gate, not a habit: Go's test cache
 hashes only files INSIDE the module root, and this repo reads test inputs across
-module boundaries in both directions (`fixtures/judge-fidelity/` at the repo root
-by `api/internal/workersvc`, and the api's goldens by `controller/`). Without it a
-fixture-only edit leaves the gate printing `ok (cached)` having run nothing.
+module boundaries in both directions — **three such reads, not one**:
+`fixtures/judge-fidelity/` and `fixtures/run-usage/` at the repo root, both by
+`api/internal/workersvc` (so that package's flag is doubly load-bearing);
+`fixtures/run-usage/` again from the other side of the same contract by
+`web/src/lib/runUsageContract.test.ts`; and the api's goldens by `controller/`.
+Without it a fixture-only edit leaves the gate printing `ok (cached)` having run
+nothing.
 **The control is a mutation, not an absence: gut the fixture and confirm the gate
 reddens.** Do not substitute "no `(cached)` lines appeared" — that is satisfied by
 passing the flag at all, and it was measured PASSING in the exact broken
 configuration it would be claimed to detect. See `CLAUDE.md`'s api section.
 
-Real suites: `go test -count=1 ./...` (api), `npm test` (web = vitest, agent = node --test
-via tsx). The end-to-end gate is `./e2e/run-e2e.sh` (isolated stack, dummy creds,
-stub executor; `KEEP_STACK=1` to inspect) and `./scripts/smoke.sh` (auth-API smoke;
-needs a FRESH stack — `docker compose down -v` first). `run-e2e.sh` re-execs itself
+Real suites: `task test:api` (api), `task test:web` / `task test:agent` (web = vitest,
+agent = node --test via tsx). The end-to-end gate is `./e2e/run-e2e.sh` (isolated stack,
+dummy creds, stub executor; `KEEP_STACK=1` to inspect) and `./scripts/smoke.sh` (auth-API
+smoke; needs a FRESH stack — tear down YOUR project by explicit name, never a bare
+`down -v` and never `-p uzi`). Neither is a task target: e2e is deliberately out of CI.
+`run-e2e.sh` re-execs itself
 under `env -i` with a short allowlist, so it is safe from any shell — adding a var to
 that allowlist re-opens a real hazard, so don't without saying why. Never a bare
-`docker compose up` (it autoloads the real `./.env`). The primary runtime is now the
+`docker compose up`: **the reason is your SHELL, not a dotfile** — the developer's
+profile exports the real `UZI_SEED_*`, `JWT_SECRET`, `UZI_SECRET_KEY` and
+`POSTGRES_PASSWORD`, and Compose ranks shell environment ABOVE `--env-file`, so dummy
+secrets alone are not sufficient (`env -i HOME=$HOME PATH=$PATH docker compose
+--env-file <dummy.env> -p <unique> …`). (Corrected 2026-08-02: this said a bare `up`
+"autoloads the real `./.env`", which root `CLAUDE.md` records as measured-false on this
+host.) The primary runtime is now the
 hosted k8s deploy (dev-cluster, ArgoCD) — validate worker/runtime features there, not
-only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates but NOT e2e
-(it needs docker compose on the runner), so e2e + smoke stay the local pre-merge gate.
+only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates by invoking the
+same `task` targets you do, but NOT e2e (it needs docker compose on the runner), so
+e2e stays the local pre-merge gate; `scripts/smoke.sh` runs in CI's `e2e:kind-smoke` on
+PROTECTED refs only, so it is a post-merge gate there and pre-merge only locally.
+
+**`task gate` also over-runs the `<5min` bound, and scoping is the fix.** Measured
+2026-08-02: **8m31s** (`elapsed 511s`, EXIT=0) serial, in a fresh worktree with a warm
+module cache and a cold build cache — a fresh checkout pays the whole `-race` compile.
+A second sample the same day, in a worktree with a WARM build cache, ran **193s** with
+the same targets and EXIT=0, so the spread is the build cache rather than the machine.
+Treat 8m31s as the budget, not the expectation. **Do not start the full gate and abandon
+it at five minutes**; an inconclusive run reported as a failure is the exact damage the
+e2e exception below exists to prevent. Instead run the component gates for what the
+diff touched: **`task gate:api` 43-66s, `gate:controller` ~10s, `gate:web` 23s,
+`gate:agent` 34s** on that same run. Scoping to the touched component is already what
+the generic body above asks of you; these targets are how you do it here. Reserve the
+full `task gate` for a release or a cross-component change, and coordinate with the
+lead as you would for e2e.
+
+**A bare substring is not a failure count.** Measured on a fully green `task gate`
+log: `grep -c -F 'FAIL'` returned **9**, `grep -c -- '--- FAIL'` returned **0** — all
+nine were *passing* tests whose names contain the substring (`✓ a FAILED /api/version
+reaches the fleet panel …`). Use `--- FAIL` for Go, vitest's summary line, and
+`ℹ fail` plus the exit code for `node --test`. Same family as two traps `CLAUDE.md`
+records in its api and agent sections: the `--- PASS` population mismatch, and
+`node --test` printing `ℹ fail 0` while tests are failing by timeout.
 
 **Long-gate exception to the generic `<5min` live-wait bound:** `./e2e/run-e2e.sh` runs
 far past the `<5min` bound in the generic body above (it cycles the whole stack and drives

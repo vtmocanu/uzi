@@ -3218,6 +3218,104 @@ func (q *Queries) RequeueWorkerRuns(ctx context.Context, arg RequeueWorkerRunsPa
 	return result.RowsAffected(), nil
 }
 
+const runHasVerdictSinceGateOpened = `-- name: RunHasVerdictSinceGateOpened :one
+SELECT (EXISTS (
+    SELECT 1 FROM run_user_inputs
+    WHERE run_id = $1
+      AND kind IN ('approve_plan', 'reject_plan', 'cancel', 'revise_plan')
+      AND created_at >= $2
+))::boolean AS has_verdict
+`
+
+type RunHasVerdictSinceGateOpenedParams struct {
+	RunID        uuid.UUID          `json:"run_id"`
+	GateOpenedAt pgtype.Timestamptz `json:"gate_opened_at"`
+}
+
+// Has the owner already answered THIS approval gate, with the worker yet to act on it
+// (issue #182)? healthTargetFor's awaiting_approval arm asks before flagging
+// approval_idle, and reports waiting_worker instead when the answer is true: a run whose
+// human has responded is waiting on its WORKER, not on its owner. Before this existed the
+// arm timed purely off updated_at, so a user who requested changes at t+50m was still
+// nudged at t+60m to approve a plan they had already responded to.
+//
+// @gate_opened_at is runs.updated_at AS THE DETECTOR READ IT. SetRunAwaitingApproval sets
+// status, plan_md, the health columns and updated_at together, so that one column is both
+// the age clock the arm's threshold guard uses AND this episode's boundary. Passing the
+// value the detector already holds — rather than re-reading runs here — keeps this
+// predicate on the same snapshot as that guard, so the two cannot disagree about which
+// episode they are describing.
+//
+// 🔴 NO FLAPPING — BUT NOT BECAUSE THE PREDICATE IS MONOTONE. It was first documented
+// here as "monotone within an episode by construction", and that is FALSE. FIVE
+// statements bump runs.updated_at without moving the run out of awaiting_approval:
+// SetRunWaitOnLimit (user-reachable at PUT /api/runs/{id}/wait-on-limit),
+// ClearIssueRunsMovePending (a card drag), RecordRunColumnMove, ClearRunMovePending and
+// SetRunMRState. Four of the five carry no status guard at all. So this predicate CAN go
+// true → false inside one gate episode.
+//
+// The no-flapping conclusion survives, for a different reason, and the reason is worth
+// knowing because it is what a future change could break: updated_at is ALSO the arm's
+// threshold clock. Any bump therefore makes olderThan(now, updated_at, th.approval) false
+// FIRST, so the next tick returns healthOK before this lookup is reached at all. There is
+// no direct waiting_worker → approval_idle edge; the reachable path is
+// waiting_worker → ok → (one full threshold later) approval_idle, at the far end of which
+// #182's symptom returns. That reachability is a separate issue, not this query's to fix.
+//
+// Whoever separates the clock from the episode boundary re-opens the flap this paragraph
+// says is closed. That is the load-bearing sentence, not "monotone".
+//
+// 🔴 `>=`, NOT `>`, IS LOAD-BEARING. CreateApprovePlanInput and CreateStopVerdictInput both
+// `SET updated_at = now()` in the SAME statement that inserts the row, and now() is the
+// transaction timestamp — so created_at and updated_at come out EXACTLY EQUAL. Under `>`,
+// an undelivered approve-with-selection or an undelivered cancel would still report
+// "waiting for the plan to be approved" an hour after the owner acted.
+//
+// 🔴 FOUR OF THE SIX LEGAL KINDS (run_user_inputs_kind_check, widened by 00074 and 00092),
+// AND BOTH OMISSIONS ARE DELIBERATE. Read this before "fixing" the list against that CHECK.
+// The rule outlives the list: include exactly the kinds the worker's route()
+// (agent/src/steering.ts) turns into a gate event or a cancel.
+//
+//	follow_up is EXCLUDED because route() pushes it onto a buffer that never reaches
+//	serviceGate. It is a message, not an answer: the gate stays parked and the run IS still
+//	waiting on its human. Including it would be worse than a mistimed flag — a follow_up
+//	row never ages out of this predicate, so once true it stays true for as long as the
+//	gate stays open (nothing clears it but re-opening the gate, which requires someone to
+//	answer). A chatty owner would silently disable their own approval nudge indefinitely,
+//	through the normal UI. The updated_at bumps described above do not rescue this: they
+//	suppress the flag via the threshold clock rather than falsifying the predicate, so the
+//	run reports healthOK instead, which is equally silent.
+//
+//	answer is EXCLUDED as structurally unreachable here: submitAnswer
+//	(internal/workersvc/service.go) refuses unless the run is 'awaiting_input', and every
+//	path into 'awaiting_approval' stamps updated_at — so an answer from an earlier park is
+//	strictly older than this gate opened and fails the created_at test regardless.
+//
+// ACCEPTED RESIDUAL, recorded rather than coded around: an EMPTY-BODY revise_plan flags
+// waiting_worker on a run that is genuinely still waiting for a human. internal/handler's
+// worker input route validates the kind and passes the body through unchecked, while
+// route() drops an empty body without servicing the gate. It already burns a revision-cap
+// slot, reaching it needs a hand-crafted API call, and a kind-specific emptiness clause
+// would put body parsing inside a predicate whose whole value is that it reads one
+// timestamp and one kind.
+//
+// NO INDEX AND NO MIGRATION, deliberately. run_user_inputs' only index is
+// idx_run_user_inputs_pending ON (run_id, id) WHERE consumed_at IS NULL (00020) — PARTIAL
+// on pending rows, which this predicate does not filter on, so it cannot be used and this
+// is a sequential scan. That is affordable only because it runs BEHIND the arm's three
+// existing guards (!auto_approve, threshold enabled, past the threshold), i.e. for
+// approximately zero runs per tick. As a projection on ListActiveRunsForHealth it would be
+// one such scan per active run per 15s tick and an index would become mandatory.
+//
+// The EXISTS is CAST because sqlc's inference is weaker on expressions than on columns:
+// uncast, the projection arrives in Go as interface{} rather than bool.
+func (q *Queries) RunHasVerdictSinceGateOpened(ctx context.Context, arg RunHasVerdictSinceGateOpenedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runHasVerdictSinceGateOpened, arg.RunID, arg.GateOpenedAt)
+	var has_verdict bool
+	err := row.Scan(&has_verdict)
+	return has_verdict, err
+}
+
 const selfUsage = `-- name: SelfUsage :one
 WITH scoped AS (
     SELECT r.created_at,

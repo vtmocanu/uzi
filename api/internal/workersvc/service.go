@@ -275,6 +275,11 @@ type Store interface {
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
+	// owner already answered THIS gate reports waiting_worker rather than
+	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
+	// reason — it runs only for runs already past the approval threshold.
+	RunHasVerdictSinceGateOpened(ctx context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error)
 
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)

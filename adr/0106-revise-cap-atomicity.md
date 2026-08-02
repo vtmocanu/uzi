@@ -9,7 +9,7 @@
 ## Decision (summary)
 
 The plan-revision cap moves its source of truth from `count(*)` over `run_user_inputs`
-onto a **counter column on the `runs` row**, `runs.revise_count` (migration `00092`), and
+onto a **counter column on the `runs` row**, `runs.revise_count` (migration `00094`), and
 the cap predicate moves into the **UPDATE's own `WHERE` qual**:
 
 ```
@@ -87,7 +87,7 @@ the same migration that adds the column. This is load-bearing, not tidy: without
 existing run's budget silently resets to zero, and a run already at the cap gets a fresh
 three.
 
-#### Every column in the UPDATE must be qualified `runs.`, and sqlc is why
+#### Every column in the UPDATE's WHERE and RETURNING must be qualified `runs.`, and sqlc is why
 
 Not a stylistic preference — the unqualified form **does not build**:
 
@@ -105,6 +105,15 @@ Two teeth, both found by running it and neither guessable from reading:
   who trusts the reported line number debugs an untouched, correct query. This costs an
   hour if you do not know it, which is the only reason it is recorded in an ADR.
 
+**The SET target is necessarily bare**, and the scope above says "WHERE and RETURNING"
+for that reason. Postgres rejects a qualified SET target outright — `UPDATE t SET t.n = …`
+gives `column "t" of relation "t" does not exist` — so `revise_count = runs.revise_count + 1`
+is the only legal spelling. *(Corrected 2026-07-29: this subsection was headed "every
+column in the UPDATE", which is not a rule anyone could follow. Caught by the findings
+round on `eb1bfe90`, which fixed the same wording on the query and the migration; the ADR
+copy was missed. A rule stated one notch too broad is worse than a narrow one, because the
+person who tries to obey it concludes the codebase is wrong.)*
+
 Anyone editing this statement re-enters both traps. The query carries the same warning
 inline, where the edit happens.
 
@@ -118,8 +127,13 @@ recommended at all.
 They cannot diverge, structurally:
 
 - `run_user_inputs` has **exactly one** foreign key — `run_id → runs ON DELETE CASCADE`
-  (`00020_workers_runs.sql`), never altered since (the two later migrations touching the
-  table widen the `kind` CHECK).
+  (`00020_workers_runs.sql`), and **no later migration touches it**: `00074` widens the
+  `kind` CHECK, `00092` widens it again and adds a nullable `question_id` (PRD #88).
+  *(Corrected 2026-07-29: this read "the two later migrations touching the table widen the
+  `kind` CHECK". The count was wrong when written — it counted `00050`, which mentions the
+  table only in a comment — and `00092` has since made the description wrong too. Naming
+  the files and what each did is re-derivable; a count is a measurement with a shelf life,
+  and this one expired twice without ever being read as false.)*
 - There is **no `DELETE FROM run_user_inputs` anywhere in the repo**, in sqlc queries or
   in raw Go SQL.
 - Deletes of whole `runs` rows **do** exist, and they are the safe case: no sqlc query has

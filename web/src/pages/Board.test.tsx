@@ -1124,3 +1124,111 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(titles()).toContain("issue two");
   });
 });
+
+describe("Board attention strip — a run appears in exactly one bucket (#182)", () => {
+  // Issue #182 made `waiting_worker` reachable on an awaiting_approval run: the owner
+  // answered the gate and the worker has not delivered the next plan version yet. The
+  // strip's stuck bucket used to exclude only the `approval_idle` ENUM, which was the
+  // same statement as "exclude what the awaiting bucket already shows" ONLY while
+  // approval_idle was the sole flag that status could carry. It no longer is.
+  const aBoard = (): BoardData =>
+    ({
+      repo_id: "repo-1",
+      path_with_namespace: "grp/proj",
+      web_url: "https://gitlab.example.com/grp/proj",
+      forge_type: "gitlab",
+      columns: [{ label_name: "Planned" }] as BoardData["columns"],
+      cards: [aCard({ iid: 7, column: "Planned" })],
+      pipeline: null,
+    }) as BoardData;
+
+  // Only the four fields the strip's predicates read. RunListItem extends Run and
+  // carries ~30 more that no code path here touches.
+  const aRun = (over: { id: string; status: string; health: string; issue_iid: number }) =>
+    over as unknown as import("../lib/api").RunListItem;
+
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: false,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  const strip = () => screen.getByText(/needs approval|needs an answer|looks? stuck|look stuck/);
+
+  it("does not double-list an awaiting_approval run flagged waiting_worker", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-1", status: "awaiting_approval", health: "waiting_worker", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs approval");
+    // The single load-bearing assertion: one run, one clause. Before the fix this read
+    // "1 run needs approval · 1 run looks stuck" for one run.
+    expect(strip().textContent).toBe("1 run needs approval");
+    // ...and one chip, not two. The strip spreads all three buckets into one .map keyed
+    // on r.id, so a double-list is also a duplicate React key.
+    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+  });
+
+  it("still lists a genuinely stuck run — the control", async () => {
+    // A running run flagged stalled belongs to the stuck bucket and nothing else. Without
+    // this, a predicate that simply returned [] would pass the test above.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-2", status: "running", health: "stalled", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run looks stuck");
+    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+  });
+
+  it("keeps the buckets separate when two different runs are in different states", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "run-1", status: "awaiting_approval", health: "waiting_worker", issue_iid: 7 }),
+        aRun({ id: "run-2", status: "running", health: "stalled", issue_iid: 8 }),
+      ],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs approval · 1 run looks stuck");
+    expect(screen.getAllByRole("link", { name: /#(7|8) →/ })).toHaveLength(2);
+  });
+
+  it("does not double-list an awaiting_input run that still carries a flag", async () => {
+    // The same shape one status over. The server clears health on every status
+    // transition, so this needs a stale flag to occur at all — which is exactly why the
+    // exclusion is by status rather than by enumerating the flags each status can hold.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-3", status: "awaiting_input", health: "stalled", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs an answer");
+    expect(strip().textContent).toBe("1 run needs an answer");
+    expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+  });
+});

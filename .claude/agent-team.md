@@ -33,11 +33,13 @@ Default flow for a typical task:
    dependency graph when writing, and judges feasibility, hidden milestone
    coupling, and independent shippability when reviewing. Open design questions
    it flags go to the user, not to the coder as guesses.
-1. Spawn coder with the full task context. The coder runs the project's
-   test/lint gates before reporting done: `cd api && go test -count=1 ./...`;
-   `cd web && npm test && npm run typecheck`;
-   `cd agent && npm test && npm run typecheck` (plus `./e2e/run-e2e.sh` +
-   `./scripts/smoke.sh` for stack-level changes).
+1. Spawn coder with the full task context. The coder runs the project's gate
+   before reporting done: `task gate:api` / `gate:controller` / `gate:web` /
+   `gate:agent` for the components it touched, or `task gate` for all four (plus
+   `./e2e/run-e2e.sh` + `./scripts/smoke.sh` for stack-level changes, neither of
+   which is a target). Recipes live in root `Taskfile.yml`; never restate one
+   here, because a stale pasted command still runs and reports green while a
+   stale target name dies loudly.
 2. After coder reports done, spawn reviewer + auditor IN PARALLEL with
    coder's diff + report (pin to commit SHAs). Dispatch fact-checker in the
    same wave when the change touches claim-bearing artifacts (README,
@@ -1075,6 +1077,39 @@ Three things make it work, all learned the hard way in that batch:
   words, which discredits the true half along with the false one. Before writing "commit X
   did Y", run `git log -S '<the exact string>' -- <path>` and let it name X.
 
+  **But that plain form is FAIL-OPEN on a merge-introduced line, which makes it the
+  wrong instrument inside the rule that teaches distrust of fail-open instruments.**
+  Git omits merge diffs by default, so a line produced by a conflict resolution
+  returns **nothing** — and nothing reads as "refuted". Three commands, not one:
+
+  ```
+  git log --oneline -s -S '<string>' -- <path>                             # non-merge introductions
+  git log --oneline -s --diff-merges=first-parent -S '<string>' -- <path>  # + merge resolutions
+  git log --oneline -s --first-parent --diff-merges=first-parent -S '<string>' -- <path>   # when did MAIN get it
+  ```
+
+  **An empty plain `-S` is not a refutation until the merge-aware forms have run,
+  and disagreement between the three IS the finding.** Worked example, measured on
+  this repo at `1778f359` with `'race -count=1 ./...'` over `.gitlab-ci.yml`: **0
+  hits, 2 hits, 1 hit** for the same string. The 2 are `224b5349` (a branch merge)
+  and `77cb96e4` (when `main` got it, a day later); the plain form names neither.
+
+  Three further teeth, each of which cost someone a wrong answer here:
+
+  - **`--oneline` and `-s` are both required.** `--diff-merges` turns patch output
+    ON for merges, and without `--oneline` every hit still carries a full commit
+    header. The shape, measured rather than tallied (Decision 10 applies — the
+    numbers grow with history): `--oneline -s` gives **one line per commit**, `-s`
+    alone gives tens, and neither flag gives hundreds. A citation nobody can read
+    at a glance is one nobody runs twice.
+  - **Keep the path filter.** Unfiltered, that same query also matches PRD documents
+    that merely *quote* the string, and a noisy citation is one nobody follows.
+  - **`-S` counts occurrences, so a MOVE that leaves the string behind is invisible.**
+    `1778f359` moved that command out of `.gitlab-ci.yml` into `Taskfile.yml` and is
+    **not** a hit, because the explanatory comment left behind still quotes it: the
+    count went 1 → 1. Predicting "the newest hit will be the move" is the natural
+    inference and it was wrong. Read the chain, not the head.
+
 Corollary for the lead: when you dispatch a fix that names N sites, **verify all N landed**.
 The one that got missed in that batch was missed because the lead checked the site it had
 argued about and not the four it had listed in the same message.
@@ -1086,6 +1121,19 @@ cold-start and never read this file, so a slot you do not paste is a slot they
 cannot run. A `none (gap)` slot that has been raised once gets a `noted` marker
 appended here; roles report a gap only when its line carries no marker.
 
+**The slots name TARGETS, not recipes** (PRD #103 M1). Every recipe lives in
+`Taskfile.yml` at the repo root; `task --list` enumerates it, and `task gate:api` /
+`gate:controller` / `gate:web` / `gate:agent` run a whole component when the scope
+warrants it. This is not tidiness: a stale pasted *command* still runs, still prints
+`ok`, and gets reported green, while a stale *target* dies with
+`task: Task "gate:api" does not exist` and a nonzero exit. **`task` exits 201 on any
+failure, never the underlying command's code** — test for non-zero, never for a
+number. Output is `prefixed` per task and the components run serially, so a failing
+component's lines are labelled `[test:api]` and the named failing test is readable
+**while the run is still going** — `output: group` was measured and rejected because
+it buffers, which under CI's `interruptible: true` means a cancelled job loses every
+line it had produced.
+
 ```
 format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it
                                    # for the current list. Do NOT record a count here:
@@ -1094,20 +1142,71 @@ format         none (gap)          # gofmt -l ./api reports pre-existing drift; 
                                    # 4-file view reported as the whole list, 2026-07-25).
                                    # The check that matters is `comm -12` between
                                    # gofmt -l and your commit's file list being EMPTY.
-lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
-typecheck      cd web && npm run typecheck
-               cd agent && npm run typecheck
-test           cd api && go test -count=1 ./...
-               cd controller && go test -count=1 ./...
-               cd web && npm test
-               cd agent && npm test
-               cd web && npm run check-docs
+lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
+                                   # task gate:api / gate:controller and in CI, but a
+                                   # vet is not a lint slot. (Was "go vet in CI only";
+                                   # PRD #103 M1 made the local half true too.)
+typecheck      task typecheck:web
+               task typecheck:agent
+test           task test:api
+               task test:controller
+               task test:web
+               task test:agent
+               task check-docs:web
 dead code      none (gap, noted 2026-07-26)
-coverage       none (gap)
+coverage       none (gap, noted 2026-08-02)
 security scan  none (gap, noted 2026-07-21)
-pre-commit     none (gap)
-long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
+pre-commit     none (gap, noted 2026-08-02)
+long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
+               ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
+
+**`task gate` is a LONG-RUNNING slot, and the mitigation is scope, not patience.**
+Measured 2026-08-02: `GATE_EXIT=0, elapsed 511s` (8m31s), serial, in a fresh worktree
+with a warm module cache and a cold build cache — a fresh checkout pays the whole
+`-race` compile. A second sample the same day, in a long-lived worktree whose build
+cache was already warm, ran **193s** with the identical target set and EXIT=0 — so the
+spread is the BUILD cache, not the machine and not the test count, and 8m31s is what a
+CI-like cold checkout costs. Read it as the budget rather than the expectation, exactly
+as the `~30 min` below is read. **This over-runs the generic 5-minute
+live-wait bound, and an over-run against a stated bound is what makes an agent
+abandon a gate and report an inconclusive run as a failure** — the same failure the
+e2e exception below exists to prevent.
+
+**So scope it.** A change touching one component runs `task gate:<component>` and
+gets a complete answer in well under a minute: **api 43-66s, controller ~10s, web
+23s, agent 34s** on the same run. That is what per-component gates are FOR (PRD #103
+Decision 2), and nothing else here tells a cold-starting teammate to prefer them.
+Reach for the full `task gate` before a release or when a change crosses components,
+and coordinate with the lead the way you would for e2e.
+
+**Read a gate's result by its DISCRIMINATING form, never a bare substring.** A bare
+`grep -c -F 'FAIL'` over a fully green `task gate` log is non-zero, because some
+*passing* test's NAME contains the word (`✓ a FAILED /api/version reaches the fleet
+panel …`, `✔ … the liveness probe FAILS …`) — cite `grep -c -F 'FAIL' <log>` vs
+`grep -c -- '--- FAIL' <log>` on your own run rather than trusting a number recorded
+here, since the count of name-matches moves with whatever the tree happens to be
+called (measured 2026-08-02: 9 on one `task gate` log, 8 on another after a merge
+that only *added* tests — nothing broke, the tree's vocabulary changed). The forms
+that discriminate **within their own component**: `--- FAIL` for Go, the summary
+line for vitest, `ℹ fail` plus the exit code for `node --test`.
+
+**None of those three forms tells you the COMPOSITE gate's result, and trusting one
+to do so is the same defect in the other direction.** Measured 2026-08-02 across
+three real `task gate` logs, one of them genuinely red: the red run's `--- FAIL`
+count was **also 0**, because its actual failure (`batcher-poison`) was a
+`node --test` failure, and Go's format never appears in a `node --test` failure. The
+only thing distinguishing that red log from the two green ones was `Failed to run
+task` (1 vs 0) and the exit code. So each per-component form only says something
+about its OWN component — a component whose runner never ran contributes nothing
+to another component's pattern, silently — and reading any one of them as a verdict
+on the whole gate is exactly the kind of bare-tally trust this repo's own rules
+warn against. **The composite verdict is the exit code** (`task` exits 201 on any
+failure, per Decision 2 of PRD #103); use the per-component forms only to find
+*which* component failed and *which* test, never to decide pass/fail on their own.
+This is the same lesson as the `--- PASS` population trap in `CLAUDE.md`, arriving
+through test NAMES and cross-component blindness instead of through subtest
+indentation.
 
 **The `~30 min` above is left as written, deliberately, and here are the measurements
 against it.** *(Two samples, both on one machine, both reaching the final banner and the
@@ -1131,7 +1230,25 @@ than overwriting one figure with another.)*
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.
 
-**`-count=1` on the two Go lines is part of the gate, not decoration — without it a
+**The four load-bearing flags are inside the targets now. You no longer type them, and
+you must still recognise one going missing** — Task echoes each command, so they are in
+the output of any run you make:
+
+- **`-count=1`** on `task test:api` and `task test:controller` — cross-module fixture
+  reads are invisible to Go's test cache; measurement below.
+- **`-race`** on `task test:api` — PRD #108 M4. Measured by deleting the lock it
+  guards: 3/3 red with it, only 2/3 without.
+- **`-p 1`** on `./e2e/run-store-it.sh` (which is a script, not a target) — the two
+  live-DB packages share one database and, run concurrently, race goose into
+  "relation already exists" and TRUNCATE each other's fixtures. Both observed.
+- **`--test-timeout=30000`** inside `agent/package.json`'s `test` script, which
+  `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
+  `node --test` does not reproduce a hang today (measured, node v26.4.0:
+  identical pass/fail counts to `npm test`); the cap is still live and worth
+  carrying as insurance against a future slow test, not as a fix for a current
+  hang.
+
+**`-count=1` on the two Go test targets is part of the gate, not decoration — without it a
 green can mean the suite never ran.** Go's test cache hashes only files inside the
 module root, and this repo reads test inputs ACROSS module boundaries in both
 directions: `api/internal/workersvc/judge_backlog_fidelity_test.go` reads
@@ -1146,11 +1263,15 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
 
 ## Project signals
 
-- Test commands (see CLAUDE.md for detail): `cd api && go test -count=1 ./...`;
-  `cd web && npm test && npm run typecheck`; `cd agent && npm test && npm run typecheck`;
-  integration: `./e2e/run-e2e.sh` (isolated stack, dummy creds) and
-  `./scripts/smoke.sh` (needs a fresh stack). Never bare `docker compose up`
-  for testing — `--env-file` with dummy secrets + unique `-p` project.
+- Gate targets (recipes live in root `Taskfile.yml`; see CLAUDE.md for detail):
+  `task gate` or per component `task gate:api` / `gate:controller` / `gate:web` /
+  `gate:agent`; individual slots `task test:api`, `task typecheck:web`,
+  `task check-docs:web`, … (`task --list`). Integration is NOT a target:
+  `./e2e/run-e2e.sh` (isolated stack, dummy creds) and `./scripts/smoke.sh`
+  (needs a fresh stack). Never bare `docker compose up` for testing — the
+  developer's shell profile exports the real vars and Compose ranks shell
+  environment above `--env-file`, so use `env -i HOME=$HOME PATH=$PATH docker
+  compose --env-file <dummy.env> -p <unique> …`.
 - Release flow: tag-driven (PRD #52). `v*` tags publish the api/web images +
   the OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the
   tag); k8s deploy is GitOps via ArgoCD to dev-cluster (see `deploy/` +
@@ -1159,11 +1280,19 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
   `ai.md` = AI design decisions)
 - Authoring rules: `CLAUDE.md` at the repo root (commands, architecture map,
   conventions); plan.md is the working plan
-- CI: real (`.gitlab-ci.yml`, PRD #52) — validate/test across api/web/agent +
-  `helm lint`/`template` + kaniko image validation builds on every MR and
-  `main`; `v*` tags additionally publish the images + OCI chart to Harbor. e2e
-  is deliberately NOT in CI (it needs docker compose on the runner) — it stays
-  the local pre-merge gate. Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
+- CI: real (`.gitlab-ci.yml`, PRD #52) — validate/test across **api, controller,
+  web and agent** (four toolchains, not three: `controller/` is its own Go module
+  with its own jobs) + `helm lint`/`template` + kaniko image validation builds on
+  every MR and `main`; `v*` tags additionally publish the images + OCI chart to
+  Harbor. Since PRD #103 M1 each **per-toolchain** gate job invokes the same `task`
+  target you run locally (`test:api-store-it` invokes none, by design). **The compose e2e harness (`./e2e/run-e2e.sh`) is deliberately NOT in
+  CI** (it needs docker compose on the runner), so it stays a purely local
+  pre-merge gate. **`./scripts/smoke.sh` is a different case and the old wording
+  here collapsed them:** `e2e:kind-smoke` stands up a KinD cluster, installs the
+  chart and runs it — but only on PROTECTED refs (`main` and tags), never on an MR
+  pipeline. So smoke is a POST-merge gate in CI and a pre-merge gate only locally.
+  Run both locally before merging; a green MR pipeline is not smoke having passed.
+  Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
   use `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
@@ -1174,8 +1303,8 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
 ## The pattern worth inheriting, above any individual finding
 
 *Migrated from `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` (PRD #98, 2026-07-21)
-before that file dies — `.gitignore:27` ignores `agent-team-tasks/`, so nothing written there
-survives the worktree. None of this is PRD-98-specific.*
+before that file dies — `.gitignore`'s `.claude/agent-team-tasks/` entry ignores it, so
+nothing written there survives the worktree. None of this is PRD-98-specific.*
 
 **Every substantive correction on that branch was someone applying a rule its own author had
 stated and not applied to themselves.** Not carelessness — the rule-holder is simply not the

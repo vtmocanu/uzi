@@ -12,15 +12,42 @@ function m(kind: string, agent: string | null, payload: unknown): RunMessage {
   return { seq: ++seq, kind, agent, agent_instance: null, agent_label: null, payload, created_at: "2026-07-12T00:00:00Z" };
 }
 
+// A cumulative result frame. `modelUsage` is what the panel's figures come from
+// (issue #195) — the top-level `usage` beside it is a real frame's second, DISAGREEING
+// reading, kept here so this fixture cannot be satisfied by the field the run page
+// used to read. Do not tidy the two into agreement.
+function result(
+  cum: { input: number; cacheRead: number; cacheCreation?: number; output: number; cost: number },
+  meta: { turns: number; durationMs: number },
+): RunMessage {
+  return m("status", "lead", {
+    event: "result",
+    subtype: "success",
+    num_turns: meta.turns,
+    duration_ms: meta.durationMs,
+    total_cost_usd: 9.99, // sentinel: never read
+    usage: { input_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 1, output_tokens: 1 },
+    modelUsage: {
+      "claude-sonnet-5": {
+        inputTokens: cum.input,
+        outputTokens: cum.output,
+        cacheReadInputTokens: cum.cacheRead,
+        cacheCreationInputTokens: cum.cacheCreation ?? 0,
+        costUSD: cum.cost,
+      },
+    },
+  });
+}
+
 // A two-phase run: plan + one implement iteration, with per-agent assistant usage.
 function twoPhase(): RunMessage[] {
   seq = 0;
   return [
     m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
     m("text", "lead", { text: "planning", usage: { input_tokens: 20_000, cache_read_input_tokens: 180_000, cache_creation_input_tokens: 1_000, output_tokens: 6_000 } }),
-    m("status", "lead", { event: "result", subtype: "success", num_turns: 9, duration_ms: 100_000, total_cost_usd: 0.24, usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 } }),
+    result({ input: 21_400, cacheRead: 188_000, output: 6_100, cost: 0.24 }, { turns: 9, durationMs: 100_000 }),
     m("text", "coder", { text: "implementing", usage: { input_tokens: 50_000, cache_read_input_tokens: 600_000, cache_creation_input_tokens: 0, output_tokens: 28_000 } }),
-    m("status", "lead", { event: "result", subtype: "success", num_turns: 34, duration_ms: 200_000, total_cost_usd: 1.26, usage: { input_tokens: 80_300, cache_read_input_tokens: 800_300, cache_creation_input_tokens: 0, output_tokens: 34_800 } }),
+    result({ input: 80_300, cacheRead: 800_300, output: 34_800, cost: 1.26 }, { turns: 34, durationMs: 200_000 }),
   ];
 }
 
@@ -55,6 +82,37 @@ describe("RunUsagePanel", () => {
     const { container } = render(<RunUsagePanel usage={deriveRunUsage([m("text", "lead", { text: "hi" })])} />);
     expect(container.firstChild).toBeNull();
   });
+
+  it("names the strip with role=group, so the aria-label is actually exposed", () => {
+    // A bare div defaults to role `generic`, on which ARIA does not permit a name:
+    // Chrome exposes it anyway, NVDA/VoiceOver generally do not. Asserting the ROLE
+    // rather than just the label is the point — the label was already there and was
+    // unreliable, so a getByLabelText alone would have passed over the defect.
+    seq = 0;
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const strip = container.querySelector('[aria-label="Run usage totals"]');
+    expect(strip).toBeTruthy();
+    expect(strip?.getAttribute("role")).toBe("group");
+  });
+
+  it("never labels the strip 100% from cache while fresh tokens exist", () => {
+    // 99.6% cache — the band real runs actually sit in. Math.round put "100% from
+    // cache" on the strip beside a zero-width warn segment while 4k fresh tokens were
+    // rendered two cells away.
+    seq = 0;
+    const { container } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          result({ input: 4_000, cacheRead: 996_000, output: 100, cost: 1 }, { turns: 1, durationMs: 1 }),
+        ])}
+      />,
+    );
+    expect(container.textContent).toContain("99% from cache");
+    expect(container.textContent).not.toContain("100% from cache");
+    // And the bar still spans the full width: the two segments sum to 100%.
+    const widths = [...container.querySelectorAll<HTMLElement>('[role="img"] > span')].map((s) => s.style.width);
+    expect(widths).toEqual(["99%", "1%"]);
+  });
 });
 
 // PRD #93: the per-agent Model column. `model` rides the same frame as `usage`.
@@ -65,15 +123,10 @@ function assistantFrame(agent: string, out: number, model?: string): RunMessage 
     usage: { input_tokens: 1_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: out },
   });
 }
+// Only here to make hasUsage true so the panel renders; its modelUsage model is never
+// displayed (the per-agent Model column reads assistant frames, the strip reads init).
 function resultFrame(): RunMessage {
-  return m("status", "lead", {
-    event: "result",
-    subtype: "success",
-    num_turns: 3,
-    duration_ms: 5_000,
-    total_cost_usd: 0.5,
-    usage: { input_tokens: 3_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 300 },
-  });
+  return result({ input: 3_000, cacheRead: 0, output: 300, cost: 0.5 }, { turns: 3, durationMs: 5_000 });
 }
 
 // The panel renders two tables; the per-agent one is identified by its first header
@@ -199,16 +252,9 @@ describe("RunUsagePanel model column (PRD #93)", () => {
 describe("RunUsagePanel $0 cost (Decision 8)", () => {
   it("renders a $0 cost as '—' in the strip and per-phase total, never '$0.00'", () => {
     seq = 0;
-    const messages = [
-      m("status", "lead", {
-        event: "result",
-        subtype: "success",
-        num_turns: 3,
-        duration_ms: 5000,
-        total_cost_usd: 0,
-        usage: { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 200 },
-      }),
-    ];
+    // A subscription-auth run: real tokens, zero cost. Note it is `costUSD: 0` on the
+    // model entry that matters now, not the frame's `total_cost_usd` (issue #195).
+    const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
     const { container } = render(<RunUsagePanel usage={deriveRunUsage(messages)} />);
     expect(container.textContent).toContain("—");
     expect(container.textContent).not.toContain("$0.00");
