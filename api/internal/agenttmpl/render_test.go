@@ -183,11 +183,35 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 // deleted the post-implementation ordering and replaced it with a plan-time
 // wave kept all 14 of those pins green by reusing the one clause they share
 // (`send all allocated read-only validators together in one wave`), which is
-// deliberately prefix-agnostic. The pins below are written so that no single
-// sentence can satisfy both meanings: the first case fixes the wave that
-// happens AFTER implementation, the rest fix the one that happens BEFORE
-// `submit_plan`, and deleting any one of them from the template reddens its
-// own case alone.
+// deliberately prefix-agnostic. The first case below fixes the wave that
+// happens AFTER implementation; the rest fix the one that happens BEFORE
+// `submit_plan`, so no single sentence can satisfy both meanings.
+//
+// Two properties of this set are load-bearing and were both found the hard way,
+// by folds a deletion-only control cannot produce:
+//
+//  1. A phrase with no anchor to a wave is RELOCATION-BLIND. Deleting a clause
+//     is not the only way to lose it: move it into the other wave's bullet and
+//     every pin naming only the clause stays green while the behaviour is gone
+//     from the turn it bound. Measured on four separate phrases here, each of
+//     which passed a deletion control and then failed a relocation one. So every
+//     case below quotes enough context to name its wave — the ordering case
+//     carries the bullet's own opening, the plan-turn cases carry `Before you
+//     call submit_plan`, `over the plan in the same turn`, `an edit made during
+//     the plan turn`, or the sentence they follow.
+//     Consequence, deliberate and not an oversight: the spans are NOT pairwise
+//     disjoint. Two anchors are the tail of the previous case (the citation
+//     phrase carries `make the plan carry its own evidence:`, the revise phrase
+//     carries `is a change nobody saw when approving it.`), so deleting either
+//     anchor sentence reddens two cases rather than one. Relocation is what the
+//     overlap buys, and it is worth more here than a clean one-fold-one-red
+//     table.
+//  2. A constraint the lead must TRANSMIT has to be pinned as a transmission.
+//     A subagent's system prompt is its own template body and the lead cannot
+//     alter it, so the dispatch prompt is the only channel; `architect` and
+//     `tester` both ship with `Edit, Write`. The pin is therefore on `tell each
+//     of them the wave must not change anything`, which the un-relayed wording
+//     (`That wave must not change anything in the worktree`) does not satisfy.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
@@ -199,11 +223,13 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 		behavior string
 		phrase   string
 	}{
-		{"post-implementation wave is retained and is a REPEAT", "fans out again after an implementation unit lands"},
+		{"post-implementation wave is retained and is a REPEAT", "Read-only work fans out again after an implementation unit lands: send all allocated read-only validators together in one wave"},
 		{"the citation property is anchored on submit_plan", "Before you call `submit_plan`, make the plan carry its own evidence"},
-		{"every asserted mechanism is cited by file and line", "for every mechanism it asserts, name the file that implements it and quote the line"},
-		{"the plan-turn wave reviews the plan text, not a diff", "the artifact under review is the plan text, not a diff"},
-		{"the plan-turn wave is report-only", "must not change anything in the worktree"},
+		{"every asserted mechanism is cited by file and line", "make the plan carry its own evidence: for every mechanism it asserts, name the file that implements it and quote the line"},
+		{"the plan-turn wave reviews the plan text, not a diff", "over the plan in the same turn. Say in each dispatch that the artifact under review is the plan text, not a diff"},
+		{"the no-write rule is RELAYED to each dispatched validator", "tell each of them the wave must not change anything in the worktree"},
+		{"the no-write rule binds the PLAN TURN specifically", "an edit made during the plan turn is a change nobody saw when approving it"},
+		{"a revise turn re-cites only what the revision changed", "is a change nobody saw when approving it. On a revise turn, re-cite only the mechanisms your revision changed"},
 		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
 	}
 	for _, c := range cases {

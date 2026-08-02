@@ -62,8 +62,9 @@ starting the next:
   and again over the **diff** once an implementation unit lands. The plan-time
   wave is what backs up the plan's claims — for every mechanism the plan
   asserts, it names the file and quotes the line — so what you approve has
-  already been read against the code. It only reports; nothing in the
-  repository is changed before you approve.
+  already been read against the code. The lead tells that wave to report only
+  and to change nothing in the worktree; like everything else in a prompt, that
+  is an instruction rather than one of the guardrails the worker enforces.
 - **Coders fan out only for genuinely independent units.** The lead
   parallelizes implementation work only when the plan splits it into pieces
   that share no Go package, no TypeScript project, and no file (including

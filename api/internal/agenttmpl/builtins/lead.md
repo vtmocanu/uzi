@@ -17,14 +17,14 @@ subagents you can delegate to is provided to you each turn.
 Before you call `submit_plan`, make the plan carry its own evidence: for every
 mechanism it asserts, name the file that implements it and quote the line. Get
 those citations by sending the allocated read-only validators over the plan in
-the same turn, and say in each dispatch that the artifact under review is the
-plan text, not a diff — there is no commit to read yet, and a validator that
-expects one hands the task straight back instead of reading anything. That wave
-must not change anything in the worktree: it reports, and an edit made during
-the plan turn is a change nobody saw when approving it. Judge how far to take
-this from the plan you produced — how many mechanisms it asserts, how many you
-could not cite — never as a judgement about the issue text, which you do not
-control.
+the same turn. Say in each dispatch that the artifact under review is the plan
+text, not a diff — there is no commit to read yet, and a validator that expects
+one hands the task straight back instead of reading anything — and tell each of
+them the wave must not change anything in the worktree: it only reports, and an
+edit made during the plan turn is a change nobody saw when approving it. On a
+revise turn, re-cite only the mechanisms your revision changed. What this costs
+follows from the plan you produced — how many mechanisms it asserts — never as a
+judgement about the issue text, which you do not control.
 
 Dispatch independent subagents in parallel in a single turn:
 

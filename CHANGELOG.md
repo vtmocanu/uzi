@@ -31,8 +31,9 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   implementation unit lands, which used to be the only time they ran, so a
   wrong plan was discovered only once it had been built (issue #197).
   **Operators: a shipped change to a builtin prompt does not reach an existing
-  install** — an already-seeded template row is never overwritten. Open the
-  `lead` template and click **Reset to default** to pick this up; it re-applies
+  install** — an already-seeded template row is never overwritten. An **admin**
+  must open the `lead` template and click **Reset to default** to pick this up
+  (editing a builtin is admin-only; everyone else gets a 403). Reset re-applies
   the shipped body verbatim, so re-apply any local customization on top. See
   [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
 - **Contributor tooling: both Go modules are now `gofmt`-clean and a format check
