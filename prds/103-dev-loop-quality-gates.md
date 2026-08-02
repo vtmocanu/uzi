@@ -10,9 +10,9 @@
 
 - **Decision 1 argued *for* the silent-green mechanism this repo mandates `-count=1` against.** Its Taskfile justification cited `sources:`/`checksum` fingerprinting as "the real difference" from make. Rewritten, with a hard ban and a measurement (see Decision 1).
 - **The "gate is copy-pasted prose" premise was stale.** The `.claude/agent-team.md` line Success Criterion 4 targeted was deleted in `027a4b88`, the commit immediately after this PRD's last edit, and replaced by a deliberate **paste-block** whose whole rationale is duplication. SC3 as written would have deleted that mechanism. Resolved at the user's direction 2026-08-02 (see Decision 9).
-- **`-race` was already on `test:api`** (`.gitlab-ci.yml:178`, landed `224b5349` for PRD #108 M4). M6's "riskiest single change" was already done; rescoped to `controller` only.
+- **`-race` was already on `test:api`** (the `test:api` job, `go test -race -count=1 ./...`). M6's "riskiest single change" was already done; rescoped to `controller` only. *(Provenance corrected 2026-08-02 during M1 — see Decision 11. This bullet read "`.gitlab-ci.yml:178`, landed `224b5349` for PRD #108 M4", and all three parts were wrong or imprecise: the line number has since moved twice, `224b5349` is a branch merge rather than the introduction, and the combined line is two PRDs' work, not one.)*
 
-Plus: every numeric count in the document had drifted and is now struck (Decision 10), `check-docs.mjs` had grown to cover three of the four files Problem #4 claimed were uncovered, Decision 7 repeated a clause `devbox.json` itself corrects as false, and only M4 had a calibration step (now all of M2–M6 do).
+Plus: every numeric count in the document *had* drifted and *was* struck (Decision 10 — narrowed rather than deleted, since the count ban is on an undated tally of a moving population, and the counts since re-added each carry a date, a tool version and an invocation), `check-docs.mjs` had grown to cover three of the four files Problem #4 claimed were uncovered, Decision 7 repeated a clause `devbox.json` itself corrects as false, and only M4 had a calibration step (now all of M2–M6 do).
 **Related**: [#85](https://gitlab.example.com/vtmocanu/uzi/-/issues/85) (agenttmpl builtins drifted from the versioned role library)
 
 Six milestones, phased so the enabling work (M1) unblocks five independent
@@ -40,8 +40,8 @@ deliberately narrow class of bugs; it is not a substitute for `staticcheck`,
 
 `gofmt -l ./api` reports a non-empty list on `main`; `./controller` is clean.
 **The count is deliberately not recorded here** — see Decision 10. It has read
-26, 25, 19 and 16 on four different days, and `.claude/agent-team.md:1088-1094`
-forbids recording it in the paste-block for exactly that reason, naming the
+26, 25, 19 and 16 on four different days, and the `format` slot's own comment in
+`.claude/agent-team.md`'s Quality gates paste-block forbids recording it there for exactly that reason, naming the
 error a stale tally already caused. Re-measure at implementation time.
 
 This drift is entirely pre-existing — no recent branch introduced it. PRD #97
@@ -68,7 +68,7 @@ Several thousand lines of bash across every tracked `*.sh` (`git ls-files
 shellcheck. A `.gitlab-ci.yml` well past a thousand lines with no yamllint.
 
 Markdown link checking is **partial, not absent**, and the previous version of
-this paragraph was wrong about it: `web/scripts/check-docs.mjs:161` sets
+this paragraph was wrong about it: `web/scripts/check-docs.mjs` sets
 `extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"]` and appends
 every `specs/*.md`, validating both relative-link existence and link-*text*-path
 correctness. It landed for issue #132 (2026-07-25) after 36 dead PRD paths had
@@ -77,40 +77,54 @@ accumulated, 11 in `ARCHITECTURE.md` alone, and it runs in `validate:web` and in
 *sources*** — they are valid link *targets* today, but nothing checks the links
 they themselves contain. No secret scanner — a gap uzi already
 documents to itself in `.claude/agents/auditor.md`: "CI (`.gitlab-ci.yml`)
-runs validate/test/build across api/web/agent but has NO secret scanner
-(gitleaks/trufflehog)." No `govulncheck`, no `npm audit`.
+runs validate/test/build across api/controller/web/agent but has NO secret
+scanner (gitleaks/trufflehog)." No `govulncheck`, no `npm audit`.
 
 **5. There is no coverage signal.**
 
-No `-coverprofile`, no `vitest --coverage`, no codecov. `.gitignore:66` carries
+No `-coverprofile`, no `vitest --coverage`, no codecov. `.gitignore` carries
 a vestigial `coverage.out` entry pointing at tooling that does not exist.
 
 **`-race` is NOT part of this problem for `api`, and the previous version of
-this paragraph was wrong that it was.** `.gitlab-ci.yml:178` is
-`go test -race -count=1 ./...`, landed 2026-07-25 in `224b5349` for PRD #108 M4,
-under a 25-line comment (`:157-178`) stating that dropping either flag silently
-undoes a fix, with the cost already measured. `test:api-store-it` has it too
-(`:224`). **The only module still without `-race` is `controller`**
-(`.gitlab-ci.yml:299`, `go test -count=1 ./...`). M6 is scoped accordingly.
+this paragraph was wrong that it was.** The `test:api` job runs
+`go test -race -count=1 ./...` (since M1, via `task test:api`), under a long
+comment stating that dropping either flag silently undoes a fix, with the cost
+already measured. `test:api-store-it` has it too, in its `-run 'LiveDB$'` sweep.
+**The only module still without `-race` is `controller`**
+(the `test:controller` job, `go test -count=1 ./...`). M6 is scoped accordingly.
+
+*(Corrected 2026-08-02 during M1, twice over. The line numbers are gone because
+M1 edits this file and every anchor in it moves; cite by job name — see
+Decision 11. And the provenance previously given here, "landed 2026-07-25 in
+`224b5349` for PRD #108 M4", was wrong in all three parts: `224b5349` is a merge
+on the PRD #98 wave-3 branch, `main` got the line on **2026-07-26** via
+`77cb96e4`, and the combined command is two PRDs' work — `-count=1` is PRD #98's,
+`-race` is PRD #108 M4's, first introduced alone as `go test -race ./...` in
+`8f1b0c9b`.)*
 
 **6. There is no task runner, so the gate recipe is duplicated by hand.**
 
 No Makefile, no Taskfile, no justfile. The same multi-line gate recipe is
 written out by hand in at least four places — `CLAUDE.md` §Commands,
-`.claude/agent-team.md:1082-1110`, `.claude/agents/coder.md:69-70`,
-`.claude/agents/tester.md:158-181` — and drifts independently in each.
+the `.claude/agent-team.md` Quality gates paste-block, the
+`.claude/agents/coder.md` and `.claude/agents/tester.md` `## For this repo`
+tails (the tester's being a second full copy of the slot table) — and drifts
+independently in each.
 
 **Two corrections to how this problem was originally stated, both material:**
 
 - The quoted consequence — *"Lint command: none dedicated; `npm run build` in
   web/ runs the check-docs + tsc gate"* — **no longer exists anywhere in the
   repo.** It was removed in `027a4b88` (2026-07-21), the commit immediately
-  after this PRD's last edit. The current line is
-  `lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only`
-  (`.claude/agent-team.md:1097`). The underlying complaint still holds; the
-  evidence cited for it does not.
+  after this PRD's last edit. Its replacement, `# no golangci-lint, no eslint;
+  go vet in CI only`, rotted the same way in turn: M1 itself rewrote that
+  comment while landing (the criterion governing this slot, SC3 — a target
+  name replaced a command line, per Decision 9). Cite the slot, not its
+  wording, for exactly the reason this bullet exists — the paste-block's
+  `lint` slot in `.claude/agent-team.md`. The underlying complaint still
+  holds; the evidence cited for it does not, twice over now.
 - **The duplication is deliberate, and it must survive this PRD.**
-  `.claude/agent-team.md:1084-1086` states why: *"Paste this block into every
+  the paste-block's own intro states why: *"Paste this block into every
   tester, reviewer and auditor dispatch — teammates cold-start and never read
   this file, so a slot you do not paste is a slot they cannot run."* So the
   problem is not "the recipe appears more than once". It is that **the
@@ -156,6 +170,27 @@ Not on `gate`, `gate:*`, `test:*`, `lint:*`, `fmt-check:*`, `typecheck:*` or
 `check-docs:*`. If a target must carry `sources:` for some other reason, it also
 carries `method: none`.
 
+**M1 added three more bans to the same list, and they are security-shaped rather
+than correctness-shaped** (they live in `Taskfile.yml`'s header, in one list, so a
+later milestone sees all four at once):
+
+- **No `dotenv:`.** Task loads the named env files into *every* target's
+  environment, so a `dotenv: ['.env']` at the root silently injects a developer's
+  real secrets into every gate target. `.env` is gitignored and `CLAUDE.md` spends
+  a section on compose ranking shell environment above `--env-file`.
+- **No `includes:` at all, and the remote form is the sharp edge.** Task 3.x can
+  include a taskfile over https: unpinned remote code executing inside the gate.
+  `.gitignore` already carries a "Task remote-include cache" comment, so the
+  mechanism is one line from being invited back. The self-contained rule above is
+  the style reason; this is the security one.
+- **No dynamic root `vars: {X: {sh: ...}}`.** Those execute on every invocation,
+  including unrelated targets and a bare `task --list`.
+
+**And never splice a variable unquoted into a `cmds:` line.** Task templates are Go
+`text/template` and the result reaches `sh -c` unquoted, so `{{.CI_COMMIT_BRANCH}}`
+or `{{.CLI_ARGS}}` inside a command is injectable by anyone who can push a branch.
+M1 needs neither; **M6's coverage measurement is where the temptation appears.**
+
 An earlier version of this decision cited that very feature as the argument
 *for* Taskfile — *"Taskfile's `sources:`/`checksum` fingerprinting does cover
 phony-style targets, which is the real difference"* — which is the opposite of
@@ -176,10 +211,11 @@ both Go gates. Three aggravations specific to this repo:
   globs listed, and this repo's gates deliberately read files outside the module
   being tested: `fixtures/judge-fidelity/{cases,expected}.json` at the repo root,
   read by `api/internal/workersvc/`; `controller/internal/{protocol,preset}/`
-  reading `api/internal/hostedsvc/testdata/`. `.gitlab-ci.yml:145-156` and
-  `:277-293` spend 40 lines of comment on exactly this. Run 3 above is that
+  reading `api/internal/hostedsvc/testdata/`. The `test:api` and
+  `test:controller` jobs each carry a long comment block on exactly this. Run 3 above is that
   shape reproduced in miniature.
-- **`.task/` is gitignored** (`.gitignore:42`, already present — nothing to add).
+- **`.task/` is gitignored** (its own `.gitignore` entry, already present —
+  nothing to add).
   So CI always runs cold and always executes, while the contributor's `task gate`
   silently skips. That is divergence in the worst direction, and it makes Success
   Criterion 1 false in practice while reporting green.
@@ -230,8 +266,27 @@ Two consequences:
   modes. Any wrapper reading `$?` numerically must know this. Nothing in the
   plan does today; say so before someone writes one.
 
+**RESOLVED IN M1: `prefixed`, not `group` — and the heading above is now wrong
+about which is "required".** Once M1 made `gate` serial (see the CPU-contention
+paragraph below), the interleaving `group` exists to fix cannot occur, so `group`
+bought nothing and cost streaming. Measured on `task` 3.51.1, 2026-08-02, log read
+at t=1.5s into a target that prints `EARLY`, sleeps 3s, prints `LATE`:
+
+```
+group        task: [a] sh -c '...'                <- EARLY ABSENT, buffered
+prefixed     task: [a] sh -c '...'   [a] EARLY    <- streams
+interleaved  task: [a] sh -c '...'   EARLY        <- streams
+```
+
+Two costs, and the second is the serious one: locally `task gate:api` would print
+nothing for the whole 41s `go test -race` run and then dump; and in CI every gate
+job sets `interruptible: true`, so a cancelled or timed-out job under `group`
+loses **all** buffered output. A gate that discards its evidence on timeout is the
+failure class this PRD exists to remove. The parenthetical "(or `prefixed`)" above
+was always the escape hatch; M1 took it.
+
 **CPU contention is a measured flake source in this repo already.**
-`web/vite.config.ts:11-20` raised `testTimeout` to 20000 because "under full-suite
+`web/vite.config.ts` raised `testTimeout` to 20000 because "under full-suite
 CPU contention, THREE unrelated tests each timed out once across ~20 runs".
 Running two Go modules and `node --test` alongside vitest makes that strictly
 worse. Nothing in this decision *requires* concurrency: either serialise `gate`'s
@@ -245,8 +300,15 @@ New stage between `validate` and `test`, with `lint:api`, `lint:controller`,
 `lint:web`, `lint:agent`, `lint:shell`, `lint:yaml`, `scan:secrets`. Each job
 invokes the same `task` target a contributor runs locally.
 
-**The stage is organisational, not ordering.** All eight existing gate jobs set
-`needs: []`, so they start immediately regardless of stage. A new `lint` stage
+**The stage is organisational, not ordering.** All nine existing toolchain gate
+jobs — `validate:api`, `test:api`, `test:api-store-it`, `validate:controller`,
+`test:controller`, `validate:web`, `test:web`, `validate:agent`, `test:agent` —
+set `needs: []`, so they start immediately regardless of stage. **Eight of the
+nine are the set M1 rewires into `task` targets; `test:api-store-it` is the
+exception** — it inherits `.task_setup` but invokes no `task` target, since its
+pipefail + `grep -c '^--- PASS'` assertion is CI-specific and stays inline (see
+the two-jobs-keep-their-current-shape note in M1's Files section). A new `lint`
+stage
 therefore does **not** make lint gate test — everything still runs concurrently
 and the pipeline fails if any job fails. Stated because the placement "between
 `validate` and `test`" reads as sequencing and is not.
@@ -276,7 +338,7 @@ intuitive one and it will be re-proposed otherwise:
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
 | `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
 | `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
-| ESLint | **Yes** | Native bulk suppressions (`--suppress-all` writing a committed `eslint-suppressions.json`, with `--suppressions-location` and `--prune-suppressions`), ESLint ≥ 9.24. The only true baseline file in the set. **Caveat: it only suppresses rules configured as `error`** — `warn`-level rules are neither suppressed nor gated, so the M3 config must enable rules as `error`, not `warn`. |
+| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified on a **37-warning corpus** — not the correctness-tier debt below; see the TypeScript paragraph below for what that corpus was and was not. **Errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. |
 | `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
 So each milestone states its own mechanism rather than inheriting a shared
@@ -292,6 +354,48 @@ one. Two consequences worth pricing in now:
 - **`deadcode` needs a small committed wrapper** (~20 lines: run, sort, diff
   against `.deadcode-baseline`, fail on additions). That is real work M4 must
   budget, not a flag.
+
+**The TypeScript half is REWRITTEN, because the mechanism it named does not exist
+in the tool this PRD now uses.** *(Amended 2026-08-02 with Decision 8.)* ESLint's
+native bulk suppressions (`--suppress-all` writing a committed
+`eslint-suppressions.json`) have no oxlint equivalent, so a decision that shipped
+unamended would have sent M3 looking for a flag that is not there.
+
+**No baseline is needed, because the debt is not baseline-sized.** Measured
+2026-08-02 at oxlint 1.76.0, **with `--react-plugin`** (`oxlint --react-plugin src
+test` in `agent/`, `oxlint --react-plugin src` in `web/` — web's tests live under
+`src/`, hence the shorter invocation): **10 findings on `agent/`, 6 on `web/`, 16
+combined.** `--react-plugin` is the configuration M3 actually ships (Decision 8's
+whole point is the hooks rules it gates), and it costs `agent/` nothing — `agent/`
+has no React, so its count is 10 either way. At the shipped **default** tier
+(no `--react-plugin`), `web/` reports 4 rather than 6 (14 combined); the gap is
+the plugin flag, not version drift — web's default-tier `src` count held at 4
+across oxlint 1.70.0, 1.73.0, 1.75.0 and 1.76.0. That is
+an afternoon, not a burn-down, so **M3 fixes them** rather than recording them.
+
+**oxlint does have a ratchet, and its limit is worth stating before someone leans on
+it.** `--max-warnings <n>` is a count budget: 37 and 40 exiting 0, 36 and 0 exiting
+1, with errors failing regardless of the budget. Three things about that corpus,
+in increasing order of certainty lost:
+
+1. **Certain.** The flag's own boundary semantics (exits 0 iff warnings ≤ n) fixes
+   the corpus this ran against at exactly **37 warnings** — the 36→37 crossing from
+   fail to pass is what a 37-warning corpus and no other size produces. This is
+   not the 10/6/16 correctness-tier debt measured above.
+2. **Certain, measured 2026-08-02 at oxlint 1.76.0.** No plain severity tier on
+   `agent/ src test` produces 37: `correctness` 10, `suspicious` 136, `pedantic`
+   1292, `style` 10435, `restriction` 2825. So the corpus is not any shipped tier
+   either.
+3. **Unconfirmed hypothesis, labelled as such.** 37 matches the `agent/` component
+   of the type-aware split below ("37 + 178 = 215"), which would mean this ratchet
+   demo ran against the tier M3's own SCOPE RULING excludes. Type-aware needs
+   `oxlint-tsgolint`, not installed at either measurement above, so this is not
+   settled — re-run with it to settle it.
+
+None of the three affects the mechanism this decision is actually about: **a count cannot
+distinguish a fixed finding from a new one**, so it permits churn under the cap —
+fix one old finding, add one new, still green. It is a regression brake, not a
+ratchet, and it is the honest reason the fix-them-now route is preferred here.
 
 *Rejected — fix every finding before enabling*: produces one unreviewable
 mega-diff and blocks the gate for weeks, during which new findings
@@ -365,26 +469,63 @@ mistake. Treated as optional and deferred (Open Question 3).
 them on `PATH`, so a contributor with a devbox shell and a CI job with a
 prepared image run the identical target.
 
-**8. ESLint for `web/` and `agent/`, pending one verification.**
+**8. oxlint for `web/` and `agent/`.** *(Amended 2026-08-02. This decision
+previously read "ESLint … pending one verification" and deferred to oxlint only
+"if parity holds". Open Question 2 measured it; parity holds; amended rather than
+worked around, exactly as the previous text instructed.)*
 
-Default to ESLint flat config with `typescript-eslint`, plus
-`eslint-plugin-react-hooks` for `web/` — the hooks rules are the
-highest-value TypeScript lint available for this repo, and `tsc` cannot
-express them.
+The hooks rules are still the highest-value TypeScript lint available here, and
+`tsc` cannot express them. What changed is which tool provides them. Measured by
+the researcher, with the hooks-parity half re-verified independently by the lead.
+*(No first-party version record survives for this specific run; consistent with
+oxlint 1.76.0, the only version this PRD names anywhere else, and with two
+leftover scratchpad installs from what looks like the same research pass — but
+that is inference about someone else's run, not a measurement, and is recorded
+as such.)*
 
-*Rejected for now — oxlint*: dramatically faster and near-zero config, and
-worth revisiting if ESLint wall-time becomes a problem. **Not chosen because
-its `react-hooks` rule parity has not been verified by anyone here** —
-implementer must check this before the M3 MR rather than trusting either
-option. If parity holds, oxlint is the better pick and this decision should
-be amended, not worked around.
+- **Identical findings to ESLint on `web/src`** — 2 each, same files, same missing
+  dependency.
+- **36 of 37 identical rule sets** on a purpose-built fixture corpus, and **no file
+  flagged by one linter and not the other.**
+- **oxlint honours `// eslint-disable-next-line react-hooks/exhaustive-deps`
+  verbatim**, so this repo's two existing suppressions migrate with **zero source
+  edits**. Re-run as a matrix: the control fires 1, the suppressed fixtures 0.
+- **~20-50x faster**, and `typescript-plugin` covers `recommended` 20/20 and
+  `recommended-type-checked` 43/43 by name, with type-aware support available via
+  `oxlint-tsgolint`.
+
+**Two configuration traps, either of which produces a SILENT NO-OP.** Both must be
+in the M3 config, and neither is discoverable from a clean run:
+
+- **The `react` plugin is OFF BY DEFAULT.** Not enabling it means the hooks rules
+  this decision exists for never load.
+- **`rules-of-hooks` is `pedantic`, not `correctness`.** oxlint's default
+  `correctness` category therefore does **not** enable it. A config that turns the
+  plugin on and stops there still does not run the rule.
+
+**Three limits, recorded rather than glossed, because each is a claim this decision
+does NOT make:**
+
+- **typescript-eslint BEHAVIOUR parity is unmeasured.** What was measured is *name*
+  parity across the rule sets, which is a different and weaker claim.
+- **Every non-hooks rule was compared oxlint-against-oxlint across tiers**, never
+  against an ESLint equivalent. The cross-linter comparison covers the hooks family
+  and the `web/src` finding set, nothing wider.
+- **The React Compiler family is one experimental nursery rule in oxlint against 15
+  individually-tunable rules in ESLint.** This is **deliberately out of M3**: the
+  repo is on React 18.3.1, so the compiler is not in use. Weighed and excluded, not
+  missed. Revisit if the repo moves to React 19 and adopts the compiler.
+
+*Rejected — ESLint*: slower, and its one remaining advantage over oxlint for this
+repo (the granular React Compiler rules) applies to a compiler this repo does not
+run.
 
 **9. The Taskfile is the single source for gate *recipes*; the agent-team
 paste-block stays and names *targets*.**
 
 *Decided by the user, 2026-08-02.* This resolves a direct contradiction between
 the original Success Criterion 3 ("the gate command appears in exactly one place
-in the repo") and `.claude/agent-team.md:1084-1086`, which mandates pasting the
+in the repo") and the `.claude/agent-team.md` paste-block's intro, which mandates pasting the
 gate block into every tester/reviewer/auditor dispatch *because* teammates
 cold-start and cannot resolve a reference. Both could not hold; SC3 as written
 would have deleted the paste mechanism.
@@ -415,9 +556,16 @@ already rotted once in exactly this way (Problem #6).
 strictly better than either option, and the right end state. Not scoped here;
 worth its own issue once the Taskfile exists.
 
-**10. No count of anything appears in this PRD.**
+**10. No count of a population that moves with every commit appears in this
+PRD, undated.**
 
-Not a style preference. `.claude/agent-team.md:1088-1094` already forbids
+*(Heading narrowed 2026-08-02. The original absolute form — "no count of
+anything" — is false in this document: Decision 1's `task`-cache transcript
+and Decision 2's output-mode comparison are both counts, both legitimate, and
+both were added after this decision landed. The distinction below is what the
+body already argued; the heading now says it too.)*
+
+Not a style preference. The `format` slot in `.claude/agent-team.md`'s paste-block already forbids
 recording a gofmt count in the paste-block, naming the failure it caused: *"Do
 NOT record a count here: it read 26, then 25, and a stale tally invites the
 truncated-view error it already caused (a filtered 4-file view reported as the
@@ -426,14 +574,148 @@ whole list, 2026-07-25)."* This PRD recorded 26 in five places and, by
 file's size, `run-e2e.sh`'s length, the bash total, the jsdom pragma ratio, the
 docs and PRD counts, and six line-number citations.
 
-So: state the shape, cite the command that measures it, never the number. Where
-a milestone needs a figure it says "re-measure at implementation time" and the
-MR description carries the value. Arguments must survive the count changing —
-Decision 5's is a good example, since it holds for any non-empty drift list.
+**The ban is on an undated tally of a population that moves with every
+commit — a gofmt list, a bash-line total, a docs count.** Nothing dates it,
+nothing names the tool that produced it, and the population it counts changes
+under the next unrelated commit, so the number is stale before anyone reads
+it twice. **A dated, fixed-experiment measurement that names its tool version
+is not what this bans**, because it is not describing a moving population —
+it is the recorded result of one specific run that stays true regardless of
+what the codebase does afterward. Decision 1's `task` 3.51.1 cache transcript
+and Decision 2's `output: group` vs `prefixed` timing comparison are the
+worked examples: both are dated, both name the tool version, both report the
+exit codes of a fixed experiment, and both stay correct forever because
+nobody can retroactively change what that run printed.
+
+So: state the shape, cite the command that measures it, never an undated
+number. Where a milestone needs a figure it says "re-measure at
+implementation time" and the MR description carries the value. Arguments must
+survive the count changing — Decision 5's is a good example, since it holds
+for any non-empty drift list. Where a decision needs a fixed-experiment
+number instead, date it and name the tool version, the way Decisions 1, 2 and
+4 do.
+
+**11. No line anchor into any file this PRD's milestones edit appears in this
+document, and a commit SHA is not a provenance citation on its own.**
+
+*Added 2026-08-02 during M1; widened the same day after review.* Decision 10
+banned counts for a reason that turns out to apply verbatim to line anchors here:
+**M1 edits `.gitlab-ci.yml`, `Taskfile.yml`, `CLAUDE.md`, `.claude/agent-team.md`
+and the role files, so every line number this PRD cited into them moved** — and
+M2 through M6 each edit them again. The set is therefore `.gitlab-ci.yml`,
+`Taskfile.yml`, `.claude/agent-team.md`, `.claude/agents/*.md`, `CLAUDE.md`,
+`.gitignore`, `web/vite.config.ts`, `web/scripts/check-docs.mjs`, and both
+`package.json` files. Cite the **job name** (`test:api`, `validate:web`), the
+**section or slot name**, an **entry** (`coverage.out`, `.task/`), or an
+**exact quoted string**.
+
+*`.gitignore` was added to this set on the review pass that followed: M6 edits
+it, and this document cited `.gitignore:66` three times and `:42` twice — M6's
+own sentence citing `:66` in the same breath as the edit that invalidates it,
+which is the identical shape the paragraph below describes. Its entries are
+unique literals, so an entry cite greps where the anchor rots.*
+
+**The first version of this decision was FALSE IN THE DOCUMENT THAT STATED IT.**
+It said "no `.gitlab-ci.yml` line number appears in this PRD" while six remained,
+one of them **M1's own load-bearing-flag table** citing a range M1 had just moved.
+That is worse than ordinary staleness: those anchors were **accurate at
+`a87fd521` and this series invalidated them** — right before, wrong after, in the
+commit adding the rule against them.
+
+**Deleted rather than re-derived, deliberately.** Eighteen freshly-correct numbers
+would rot at the next milestone, and **a correct-looking anchor is the one nobody
+re-checks**. Two constraints on the replacements, because a bad fix relocates the
+problem instead of removing it: a **paraphrased** cite-by-string fails silently
+where a quoted one greps, so quote exactly or name something that exists; and a
+criterion must stay **falsifiable** — Success Criterion 4 names "the
+`## Quality gates` paste-block and its duplicate slot table in `tester.md`", which
+is checkable, where anything softer would satisfy the ban by becoming untestable.
+
+**Two carve-outs, and they are the same carve-out twice: a line number inside a
+correction block, quoting retired text, is a past-tense claim about a past state.**
+Rewriting it destroys the correction. That covers the `.gitlab-ci.yml:178` in the
+`-race` bullet at the top of this document and the `224b5349`-era anchors in the
+provenance notes below. **Two anchors are also deliberately left standing because
+they fall outside the rule** rather than inside a carve-out: `devbox.json` (which
+Decision 7 forbids this PRD from touching) and `agent/test/judge-runner.test.ts`
+(which no milestone edits). If a later milestone starts editing either, they come
+in scope.
+
+The `-race` citation is the worked example, and it was wrong three times in three
+different ways before anyone ran the query. This PRD said, at three sites,
+*"landed 2026-07-25 in `224b5349` for PRD #108 M4"*:
+
+- **`224b5349` is a merge on the PRD #98 wave-3 branch**, not the introduction.
+- **The date is wrong for `main`**, which got the line on **2026-07-26** via
+  `77cb96e4`, a commit this PRD never named. "Landed" reads as "landed on main".
+- **The command is two PRDs' work.** `-count=1` is PRD #98's; `-race` is
+  PRD #108 M4's, introduced alone as `go test -race ./...` in `8f1b0c9b`.
+  `.gitlab-ci.yml`'s own comment had this right all along.
+
+**The reproducing command, not the identifier, is the citation:**
+
+```
+git log --oneline -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
+```
+
+Three teeth, each of which cost someone a wrong answer: **plain `git log -S`
+returns NOTHING here**, because the line was produced by a conflict resolution
+inside a merge and git omits merge diffs by default — a fail-open instrument whose
+silence reads as refutation; **`--oneline` and `-s` are both required**, since
+`--diff-merges` turns patch output on and, without `--oneline`, every hit still
+carries a full commit header — the shape is that `--oneline -s` gives one line per
+commit while dropping either flag costs an order of magnitude, and no number is
+recorded here because it grows with history (Decision 10); and
+**keep the path filter**, since unfiltered the query also matches PRD documents
+that merely quote the string. Measured at `1778f359`, the three forms return **0,
+2 and 1** hits for the same string — and that disagreement *is* the finding.
+
+One more, measured rather than predicted: **`-S` counts occurrences, so M1's move
+of the command out of `.gitlab-ci.yml` is not a hit at all.** The explanatory
+comment left behind still quotes the string, so the count went 1 → 1. The chain
+head remains `77cb96e4`. Predicting "the newest hit will be the move" is the
+natural inference and it is wrong; read the chain, not the head. The corrected
+three-form control is now recorded in `.claude/agent-team.md`'s citation section,
+which previously prescribed only the fail-open form.
 
 **Phase 1 — enabling work (blocks everything else)**
 
 - [ ] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
+
+      > **STATUS 2026-08-02: implemented and validated, NOT merged. The box stays
+      > unchecked deliberately** — a tick would tell tomorrow's reader this landed,
+      > and nothing is pushed. Branch `feature/prd-103-dev-loop-quality-gates`.
+      > *(A tip SHA and a commit count are deliberately not pinned here: this
+      > line sits inside the tree it points into, so any value written here is
+      > wrong the moment the branch gains another commit — the exact failure
+      > Decision 11 names. Read `git log` on the branch for the current tip.)*
+      >
+      > **Four validators reported: no blocking findings on the code.** The
+      > Taskfile, the CI rewire and the supply chain all passed. The three blocking
+      > findings were documentation, two of them in this file, and all three are
+      > fixed: Decision 11 was false in its own document (six live
+      > `.gitlab-ci.yml` anchors, one of them M1's own flag table); every copy
+      > of the provenance command lacked `--oneline`; and `CLAUDE.md` carried a
+      > standing unqualified SHA citation.
+      >
+      > **The gate's liveness is proven, not asserted.** The tester's four-arm
+      > control came back conclusive, and **arm B is the one that matters: it
+      > reproduced the silent green on a broken fixture** (`ok … (cached)`,
+      > EXIT=0, zero FAILs), which is what makes arm C evidence about `-count=1`
+      > rather than about a cold cache. Equivalence verified 1:1 across all eight
+      > jobs, old recipes against new targets. The fingerprint ban was verified by
+      > parsing and behaviourally.
+      >
+      > **The gate found a real defect on day one**, which is this milestone's best
+      > evidence that it works: a pre-existing 1-in-6 race between two agent test
+      > files sharing a hard-coded `/tmp` worktree path, invisible until something
+      > ran a mandated whole-repo gate. Fixed here and controlled at 24 runs, zero
+      > failures. A second, timing-dependent flake
+      > (`agent/test/batcher-poison.test.ts`) is filed separately and remains open
+      > as issue #198 (and #162, an older issue naming the same file).
+      >
+      > **The re-check wave is done.** What remains is the push and the MR.
+
       root `Taskfile.yml` with `gate`, `gate:api`, `gate:controller`,
       `gate:web`, `gate:agent`, plus only the individual targets that have
       something to run today — `typecheck` and `test` per component, plus
@@ -451,24 +733,57 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       - `.gitlab-ci.yml`
       - `CLAUDE.md` §Commands — **command lines only**, see the scoping note
         below
-      - `.claude/agent-team.md` — the "Quality gates" paste-block at
-        `:1082-1110`, per Decision 9. (The `:143` "Lint command: none dedicated"
+      - `.claude/agent-team.md` — the `## Quality gates` paste-block, per
+        Decision 9. (The `:143` "Lint command: none dedicated"
         line this PRD used to cite **no longer exists**; it went in `027a4b88`.)
         Its closing line already says *"Every gap above is what PRD #103 exists
-        to close; re-derive this block when its milestones land"* (`:1131`).
-      - `.claude/agents/coder.md:69-70` — the inline slot summary
-      - `.claude/agents/tester.md:158-181` — **a second full copy of the slot
+        to close; re-derive this block when its milestones land"*.
+      - `.claude/agents/coder.md` — the inline slot summary in its
+        `## For this repo` tail, and the recipe block below it (two distinct
+        regions, edited for different reasons)
+      - `.claude/agents/tester.md` — **a second full copy of the slot
         table**, which the previous file map missed entirely
-      - `.claude/agents/auditor.md:63` — already reads "PRD #103 M5 adds them"
-      - `.claude/agents/reviewer.md:65` — gains the dead-code reference the
-        skills-repo deletion lens expects
+      - `.claude/agents/auditor.md` and `.claude/agents/reviewer.md` — **listed
+        here as already satisfied, not as pending edits.** Both already carry
+        what this milestone would otherwise add — the auditor's secret-scanner
+        note already reads "PRD #103 M5 adds them", and the reviewer already has
+        the dead-code reference the skills-repo deletion lens expects — because
+        that skills-repo sync (`d69fe53e`) merged into `main` before this branch
+        existed (it is an ancestor of `a87fd521`, M1's base). The "Deferrable
+        sub-item" below was therefore moot rather than deferred: there was
+        nothing left to ride along. Left in this list so a reader does not go
+        looking for a missing edit in either file.
 
       **Scoping, because this is where a coder will overreach.** `CLAUDE.md`
-      §Commands is ~340 lines across five component sections plus Integration
-      tests, and only a small fraction of it is recipes. The rest is measured
-      evidence that exists because someone trusted a green that ran nothing.
+      §Commands is mostly not recipes: the bulk of it is measured evidence that
+      exists because someone trusted a green that ran nothing.
       **Replace only the command lines; every measurement paragraph stays
       verbatim.**
+
+      **THE DISCRIMINATOR IS RECIPE-VERSUS-MEASUREMENT, AND IT APPLIES TO EVERY
+      FILE IN THIS REPO, NOT JUST `CLAUDE.md`.** A command written as an
+      *instruction* ("run this before reporting done") is a recipe and becomes a
+      target. A command written as an *observation* ("`go test ./...` printed
+      `ok (cached)` on a gutted fixture") is evidence, and rewriting it makes the
+      paragraph describe a run nobody performed. The same string appears in both
+      roles, so the test is the sentence around it, never the command itself.
+
+      Sites where this was live during M1, all of them measurements that stay
+      byte-identical: the "all green" list in `CLAUDE.md`'s goose parse-failure
+      paragraph and the `npm run typecheck | tail -3` example in its gate-status
+      paragraph; two rows in `fixtures/judge-fidelity/README.md`; the
+      `ok (cached)` reproduction in `api/internal/workersvc/`'s fidelity test; and
+      **the `ok (cached)` measurement inside `.claude/agent-team.md`'s own
+      `-count=1` paragraph** — which a blanket "replace every `cd <dir> &&`" would
+      have destroyed. That last one is the sharp case, because it sits three lines
+      below a slot table that genuinely did need rewriting, and because it is the
+      evidence M1's own acceptance control re-runs.
+
+      **Sweep the whole file rather than the line someone names.** After the
+      rewrite, `cd api &&` / `cd web &&` / `cd agent &&` / `cd controller &&`
+      appeared exactly **once** in `.claude/agent-team.md`, and that once was the
+      measurement. A per-file sweep is what turns "the line I was warned about is
+      safe" into "the rule held everywhere it applies".
 
       **Each Taskfile target carrying a load-bearing flag gets an inline comment
       naming why it is there**, and the flags are not optional:
@@ -476,7 +791,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       | Target | Flag | Why |
       |---|---|---|
       | `test:api` | `-count=1` | cross-module `fixtures/` reads are cache-invisible |
-      | `test:api` | `-race` | PRD #108 M4; `.gitlab-ci.yml:157-178` |
+      | `test:api` | `-race` | PRD #108 M4; see the comment block above the `test:api` job |
       | `test:controller` | `-count=1` | cross-module goldens under `api/internal/hostedsvc/testdata/` |
       | store-it | `-p 1` | package binaries race one shared database |
       | `test:agent` | `--test-timeout=30000` | node's default is *no* timeout; `agent/test/judge-runner.test.ts:167` is written against the cap |
@@ -484,7 +799,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       **`test:api` must carry `-race` AND `-count=1` or M1 silently weakens the
       api gate** while its own text claims it adds no new checks. This is the
       milestone's second real risk after the `task`-install one, and
-      `.gitlab-ci.yml:161-163` already names the live threat by name: *"a future
+      the `test:api` comment block already names the live threat by name: *"a future
       'simplify the gate' edit"*. Moving these flags into a new file **is** such
       an edit.
 
@@ -501,7 +816,8 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       with `fixture broken: cases.json has no case …`, then restore it and
       confirm green. Nothing weaker discriminates a live gate from a cached one
       — a run printing no cache markers, or exiting 0, is satisfied by a gate
-      that executed nothing. Set `output: group` at the root and record the
+      that executed nothing. Set an output mode at the root (**M1 chose
+      `prefixed`, not `group` — see Decision 2**) and record the
       serialise-vs-concurrent decision (Decision 2).
 
       **`task` is not in the CI images.** `golang:1.26`, `node:22-alpine`
@@ -515,7 +831,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       images rather than installing into `golang:1.26`), fetched at job time
       via a pinned `go run …@vX.Y.Z` (the `sqlc@v1.30.0` precedent in
       `validate:api`, and how M4 will invoke `deadcode`), installed as an npm
-      devDependency by the existing `npm ci` (knip, ESLint), or a
+      devDependency by the existing `npm ci` (knip, oxlint), or a
       `before_script` install.
 
       **Anything fetched in a `before_script` must be version- and
@@ -542,7 +858,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       `task typecheck:web` for `validate:web` and `task test:web` for
       `test:web`; M3 adds `task lint:web` to the first), and `task gate:web`
       stays the local convenience wrapper. And
-      `test:api-store-it` (`.gitlab-ci.yml:196-262`) wraps `go test` in a
+      the `test:api-store-it` job wraps `go test` in a
       pipefail + `grep -c '^--- PASS'` / `'^--- SKIP'` assertion that exists
       to catch the suite silently skipping against a missing Postgres; that
       logic is CI-specific and stays in `.gitlab-ci.yml`. Local and CI
@@ -550,22 +866,23 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       accordingly.
 
       M1 also adds the empty `- lint` entry to `stages:`
-      (`.gitlab-ci.yml:44-50`) even though it adds no lint job. That single
+      (the `stages:` list) even though it adds no lint job. That single
       line is genuinely inert, and it is the one edit M3 and M5 would
       otherwise both make at the identical position (see Parallelization).
 
       Note `-buildvcs=false` is a local-only flag per
-      `.claude/agents/coder.md:85` and `.claude/agents/tester.md:184`
+      the `.claude/agents/coder.md` and `.claude/agents/tester.md` tails
       (**not** `CLAUDE.md`, which does not mention it) — it must not be baked
       into the Taskfile's committed targets.
 
-      **Deferrable sub-item**: the `.claude/agents/*` generic-body sync from
-      the skills-repo role library (tester static-analysis duties, reviewer
-      deletion lens) rides along **only if** that PR has merged by the time
-      M1 lands. It is bundled here to avoid editing the same agent files
-      twice, but it must not block the critical path: if the PR is still
-      open, M1 ships the tail rewrites alone and the body sync becomes a
-      follow-up.
+      **Deferrable sub-item — turned out moot, not deferred.** The
+      `.claude/agents/*` generic-body sync from the skills-repo role library
+      (tester static-analysis duties, reviewer deletion lens) was written here
+      to ride along **only if** that PR had merged by the time M1 landed. It
+      had: `d69fe53e` is an ancestor of `a87fd521`, the commit M1 branched
+      from, so both files already carried the synced content before this
+      branch's first commit. There was nothing left for M1 to bundle — see the
+      Files list above.
 
 **Phase 2 — the four independent tracks (any order, after M1)**
 
@@ -588,32 +905,72 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       being empty (`test -z "$(gofmt -l .)"`), which `CLAUDE.md` documents as a
       trap already paid for here.
 
-- [ ] **M3 — Linting: golangci-lint + ESLint, each ratcheted its own way**: `.golangci.yml`
+- [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**: `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`
       `ineffassign` `unused` `unparam` `goconst` on; each *disabled* linter
       carries a one-line justification in the file, per that repo's
       convention) applied to both Go modules with per-linter test-file
-      exclusions. ESLint flat config for `web/` and `agent/` per Decision 8,
-      after verifying the oxlint question.
+      exclusions. **oxlint** for `web/` and `agent/` per Decision 8 — including
+      its two silent-no-op traps: **the `react` plugin is off by default, and
+      `rules-of-hooks` is `pedantic` rather than `correctness`**, so a config
+      that enables the plugin and stops there still never runs the rule this
+      milestone exists for.
+
+      **🔴 THE GATE TRAP, AND IT IS A HARD REQUIREMENT: `oxlint src test` EXITS 0
+      WHILE REPORTING FINDINGS.** `correctness` defaults to `warning` severity and
+      warnings do not set the exit code. Reproduced: the bare invocation exits 0
+      with 10 findings, while `-D correctness` exits 1 on the same 10. **A target
+      without `-D correctness` (or `--deny-warnings`) is a report that always
+      passes** — a lint job that can never fail, in the milestone that adds
+      linting. Same family as the `gofmt -l` trap `CLAUDE.md` already carries,
+      arriving through a default *severity* instead of through a flag.
 
       Ratchet mechanisms differ per Decision 4 and must be stated in the MR:
       Go uses `--new-from-merge-base=main --whole-files`, which requires
       raising GitLab's shallow `GIT_DEPTH` for the lint job or merge-base
-      resolution fails; TypeScript uses ESLint's native bulk suppressions
-      (`--suppress-all` → a committed `eslint-suppressions.json`, ESLint
-      ≥ 9.24). Also record the **unfiltered** finding count for each in the
+      resolution fails. **TypeScript has no baseline and needs none: measured with
+      `--react-plugin` (the configuration M3 ships), the debt is 10 findings on
+      `agent/` and 6 on `web/`, 16 combined, and M3 fixes them.** `--max-warnings`
+      exists as a regression brake, with the limit
+      Decision 4 records. Also record the **unfiltered** Go finding count in the
       MR description, since `--new-from-merge-base` reports nothing on `main`
-      pipelines and the debt is otherwise uncountable. Burn-down gets its own
+      pipelines and that debt is otherwise uncountable. Go burn-down gets its own
       issue.
 
-      **Precondition**: resolve Open Question 2 (oxlint vs ESLint react-hooks
-      parity) before starting. It is a Decision-8 note today, which is easy to
-      start past.
+      **SCOPE RULING — correctness-only.** *(Figures below are the fixed-experiment
+      kind Decision 10 exempts from the count ban, but the date and tool version
+      they were measured under were never recorded at the time — flagged rather
+      than backfilled, since backfilling a date onto a measurement nobody dated
+      would manufacture a precision that is not there. Re-measure at M3
+      implementation time and stamp it then.)* Type-aware linting becomes **its own
+      issue**: 37 + 178 = 215 findings with a real burn-down, and **119 of web's
+      are one shape** (`onClick={asyncHandler}`), which is a behavioural refactor
+      rather than a lint adoption and must not ride in on a tooling MR. **The
+      mechanism, so nobody reads 119 as mechanical:** wrapping a promise-returning
+      handler to satisfy the rule changes what happens to a REJECTION — the
+      rejection stops being the returned promise's and becomes unhandled, or gets
+      swallowed by whatever the wrapper does with it. That is 119 opportunities to
+      change error behaviour under cover of a lint fix. Pedantic
+      is dead on arrival at **3,015 combined**, with `no-inline-comments` alone at
+      **474** in a repo whose inline comments are mostly load-bearing recorded
+      evidence. **A later fact-check independently measured the pedantic combined
+      total at 2,976** (web `src` 1684 + agent `src test` 1292), against this
+      section's 3,015 — and nothing recorded here lets a reader decide which is
+      right. That is the finding, not the gap itself: `no-inline-comments`'s 474
+      reproduces exactly as 246 + 228, which is the tell that whatever moved is
+      scope or oxlint-version drift between the two runs, not an arithmetic slip
+      in either one. Do not silently adopt either number; re-measure at M3 and
+      record the version and invocation that produced whichever total lands.
+
+      **Precondition**: ~~resolve Open Question 2~~ — **RESOLVED 2026-08-02**, see
+      Decision 8. Nothing blocks M3 now.
 
       **Calibration**: add an unchecked error return in a scratch file, confirm
       `errcheck` fires through `task lint:api`; add a violating hook call,
-      confirm `react-hooks` fires through `task lint:web`. A first run reporting
-      nothing is indistinguishable from a linter that is not wired up.
+      confirm `rules-of-hooks` fires through `task lint:web`. **The calibration
+      must assert a NONZERO EXIT, not merely that output appeared** — per the gate
+      trap above, output and exit status are independent here, and a first run
+      reporting nothing is indistinguishable from a linter that is not wired up.
 
 - [ ] **M4 — Dead code detection**: `golang.org/x/tools/cmd/deadcode -test
       ./...` per Go module (invoked via `go run` with a pinned version, the
@@ -670,7 +1027,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       number.
 
       **`yamllint`** over `.gitlab-ci.yml` and `deploy/values/`. **`gitleaks`**
-      in CI, which lets `.claude/agents/auditor.md:63` stop documenting its own
+      in CI, which lets `.claude/agents/auditor.md`'s security-scan slot stop documenting its own
       absence. **`govulncheck`** for both Go modules and
       `npm audit --audit-level=high` for both npm packages, initially
       `allow_failure` only until the current finding count is known.
@@ -678,7 +1035,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       **Markdown link checking: extend `web/scripts/check-docs.mjs`, do not add
       a second checker.** It already validates relative-link existence and
       link-text-path correctness for `docs/`, `ARCHITECTURE.md`, `README.md`,
-      `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list at `:161`. The
+      `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list. The
       gap is `prds/` and `adr/` as link *sources*. Adding them to that list is a
       small change; a parallel checker would have different semantics and would
       have to rediscover why the existing one is gated on `fullCheckout` (the
@@ -698,16 +1055,25 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       in this milestone** (Decision 6).
 
       **`-race` is scoped to `test:controller` only. `test:api` already has
-      it**, and this milestone previously claimed otherwise. `.gitlab-ci.yml:178`
-      is `go test -race -count=1 ./...`, landed 2026-07-25 in `224b5349` for
-      PRD #108 M4; `test:api-store-it` has it at `:224`. The remaining module is
-      `controller` (`.gitlab-ci.yml:299`).
+      it**, and this milestone previously claimed otherwise. `task test:api` is
+      `go test -race -count=1 ./...`; `test:api-store-it` has it in its
+      `-run 'LiveDB$'` sweep. The remaining module is `controller`
+      (`task test:controller`, `go test -count=1 ./...`).
+
+      *(Provenance corrected 2026-08-02 during M1: this said "landed 2026-07-25
+      in `224b5349` for PRD #108 M4". `224b5349` is a merge on the PRD #98
+      wave-3 branch; `main` got the line on 2026-07-26 via `77cb96e4`; and the
+      two flags come from two PRDs. Reproduce with
+      `git log --oneline -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml`
+      — the plain `-S` form returns nothing, because the line was produced inside
+      a merge. See Decision 11.)*
 
       Consequently this is **no longer "the riskiest single change in the PRD"**
       — that framing was sized for the api suite. It still ships on its own,
       before the coverage work, and the cautions still apply to `controller`:
-      `-race` costs runtime (cite `.gitlab-ci.yml:157-178`, which already
-      records the api measurement, rather than re-deriving the general figure),
+      `-race` costs runtime (cite the comment block above `test:api`, which
+      already records the api measurement, rather than re-deriving the general
+      figure),
       and it detects latent races, so `main` can go red on code nobody touched.
       There is no ratchet — you cannot gate `-race` on new findings. If the
       first run is red, stop: file the races as their own issue and land `-race`
@@ -729,7 +1095,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       and works on the pinned `vitest ^2.1.9`, but it is deprecated from
       Vitest 3 in favour of the projects/workspace config, so it buys a
       migration later.) Removes the
-      vestigial `coverage.out` line from `.gitignore:66` or makes it real.
+      vestigial `coverage.out` line from `.gitignore` or makes it real.
 
 ## Parallelization
 
@@ -737,7 +1103,7 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
 |---|---|---|---|---|
 | 1 | M1 | — | `Taskfile.yml`, `.gitlab-ci.yml`, `CLAUDE.md`, `.claude/agent-team.md`, `.claude/agents/{coder,tester,reviewer,auditor}.md` | No — blocks all |
 | 2 | M2 | M1 | `api/**/*.go` (format only), `Taskfile.yml`, `.gitlab-ci.yml` | Yes |
-| 2 | M3 | M1 | `.golangci.yml`, `web/eslint.config.js`, `agent/eslint.config.js`, **`web/package.json`**, `agent/package.json`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes, except vs M4/M6 |
+| 2 | M3 | M1 | `.golangci.yml`, `web/.oxlintrc.json`, `agent/.oxlintrc.json`, **`web/package.json`**, `agent/package.json`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes, except vs M4/M6 |
 | 2 | M4 | M1 | `Taskfile.yml`, `knip.json` ×2, **`web/package.json`**, `agent/package.json`, `.gitlab-ci.yml` | Yes, except vs M3/M6 |
 | 2 | M5 | M1 | `.shellcheckrc`, `.yamllint`, `.gitleaks.toml`, `web/scripts/check-docs.mjs`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes |
 | 3 | M6 | M1 | `.gitlab-ci.yml`, `web/vite.config.ts`, **`web/package.json`**, `.gitignore` | Yes, except vs M3/M4 |
@@ -753,10 +1119,10 @@ Three exceptions where "append at the end" is not enough:
 
 - **The `stages:` list is a single hot line.** M3 and M5 both need a `lint`
   stage, and both would insert `- lint` at the identical position in
-  `.gitlab-ci.yml:44-50`. That is why M1 adds the (empty, inert) stage entry
+  the `stages:` list. That is why M1 adds the (empty, inert) stage entry
   up front — appending cannot resolve it.
 - **`web/package.json` is a three-way contention** that the previous version of
-  this table missed: M3 adds ESLint devDeps, M4 adds knip, M6 adds
+  this table missed: M3 adds the oxlint devDep, M4 adds knip, M6 adds
   `@vitest/coverage-v8`. `agent/package.json` is a two-way (M3, M4). Same class
   as the `stages:` conflict, and npm's own `devDependencies` ordering makes a
   merge conflict likely rather than possible. Sequence these three, or have each
@@ -807,12 +1173,19 @@ Three exceptions where "append at the end" is not enough:
    dispatch. *(This criterion previously read "the gate command appears in
    exactly one place in the repo", which would have deleted the paste
    mechanism.)*
-4. `.claude/agent-team.md:1082-1110` and `.claude/agents/tester.md:158-181` —
-   both copies of the slot table — carry a real `lint` command instead of
+4. The `## Quality gates` paste-block in `.claude/agent-team.md` and its
+   duplicate slot table in `.claude/agents/tester.md`'s `## For this repo` tail —
+   both copies — carry a real `lint` command instead of
    `lint none (gap)`, and the `noted` markers on the slots this PRD closes are
    removed rather than left behind. *(This criterion previously targeted the
    string "Lint command: none dedicated", which was deleted in `027a4b88` and
-   so was already satisfied while testing nothing.)*
+   so was already satisfied while testing nothing.)* **The two copies have
+   already drifted on this exact point, so "remove the `noted` markers" is not
+   a symmetric instruction: `.claude/agent-team.md`'s paste-block carries four
+   (`dead code`, `coverage`, `security scan`, `pre-commit`), and
+   `.claude/agents/tester.md`'s slot table carries none and never has.** A
+   milestone told to remove the markers "in both" will find only one file has
+   any, and should not read that as having edited the wrong file.
 5. `.claude/agents/auditor.md` no longer documents the absence of a secret
    scanner, because one runs.
 6. Coverage percentages for `api`, `controller` and `web` are visible on
@@ -831,20 +1204,19 @@ Three exceptions where "append at the end" is not enough:
 - ~~`.claude/agent-team.md` "Project signals": "Lint command: none dedicated;
   `npm run build` in web/ runs the check-docs + tsc gate"~~ — **already gone**,
   removed in `027a4b88` (2026-07-21). Nothing to correct. What M1 corrects
-  instead is the `lint none (gap)` slot in the paste-block at
-  `.claude/agent-team.md:1097` and its duplicate at
-  `.claude/agents/tester.md:168`.
-- `.claude/agents/auditor.md:63`: "CI (`.gitlab-ci.yml`) runs
-  validate/test/build across api/web/agent but has NO secret scanner
+  instead is the `lint           none (gap)` slot line in the paste-block and its
+  duplicate in `.claude/agents/tester.md`'s slot table.
+- `.claude/agents/auditor.md`'s security-scan slot: "CI (`.gitlab-ci.yml`) runs
+  validate/test/build across api/controller/web/agent but has NO secret scanner
   (gitleaks/trufflehog)" — corrected in M5. It already reads "PRD #103 M5 adds
   them", so the edit is to make the present tense true, not to add a pointer.
 - `CLAUDE.md` §Commands: the hand-typed recipes are replaced by `task`
   invocations in M1 — **command lines only**. Every measured-evidence paragraph
   around them stays verbatim; see M1's scoping note. The prose about e2e being
   deliberately out of CI stays true and is not touched.
-- `.gitignore:66`: the `coverage.out` entry currently refers to tooling that
+- `.gitignore`: the `coverage.out` entry currently refers to tooling that
   does not exist — M6 either makes it real or removes it. (`.task/` is already
-  present at `:42`; nothing to add, and adding it is not the work.)
+  present; nothing to add, and adding it is not the work.)
 - `docs/dev-conventions.md` (`audience: contributor`) currently covers only
   the `glab` bot scripting and the `UZI_E2E_BOT_*` vars, and says nothing
   about lint/format/test policy. M1 adds the gate; each later milestone adds
@@ -858,8 +1230,14 @@ Three exceptions where "append at the end" is not enough:
    have been advisory. Now set to `true` (with `allow_merge_on_skipped_pipeline:
    true`, so the repo's `[skip ci]` doc commits stay mergeable). CI is a real
    gate, and the PRD's premise holds.
-2. **oxlint vs ESLint react-hooks parity** (Decision 8) — must be verified
-   before M3, not assumed in either direction.
+2. ~~**oxlint vs ESLint react-hooks parity** (Decision 8)~~ — **RESOLVED
+   2026-08-02: parity holds, and oxlint is adopted.** Identical findings on
+   `web/src` (2 each, same files, same missing dep), 36 of 37 identical rule sets
+   on a fixture corpus with no file flagged by one and not the other, and oxlint
+   honours `// eslint-disable-next-line react-hooks/exhaustive-deps` verbatim, so
+   the repo's two existing suppressions migrate with zero source edits. Decision 8
+   is amended accordingly and records the two config traps and the three limits of
+   the measurement.
 3. **Is a contributor `devbox` environment wanted at all?** The toolchain
    (go 1.26.4, node 22, helm, sqlc, glab, jq, openssl, docker, and now
    golangci-lint, shellcheck, gitleaks) is currently unpinned and documented
@@ -874,10 +1252,10 @@ Three exceptions where "append at the end" is not enough:
    depends on the answer.
 5. **Prettier/`gofumpt`** — deliberately excluded from M2. Worth a follow-up
    or not?
-6. **Is `Formula/uzi-cli.rb` in scope for M5?** It has no lint of any kind, and
-   `devbox.json` carries ruby as a tier-2 package specifically so a run can
-   `ruby -c` it. A `ruby -c` target is nearly free. Include in M5 or declare it
-   out of scope — either is fine; leaving it undecided is not.
+6. ~~**Is `Formula/uzi-cli.rb` in scope for M5?**~~ — **RESOLVED 2026-08-02: IN
+   scope, via a `ruby -c` target.** It has no check of any kind today, `devbox.json`
+   already carries ruby as a tier-2 package so a run can `ruby -c` it, and the
+   target is nearly free. M5 adds it alongside the shell and YAML checks.
 7. **Should the agent-team paste-block be generated from `Taskfile.yml` and
    asserted in CI?** Decision 9 defers this as the right end state. It removes
    the last hand-maintained copy entirely. Own issue, after M1.

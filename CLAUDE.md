@@ -8,6 +8,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+**Getting `task`, because every command on this page now needs it:**
+
+```sh
+go install github.com/go-task/task/v3/cmd/task@v3.51.1   # pinned, sumdb-verified
+```
+
+Pinned and version-matched to what CI installs, mirroring the `sqlc@v1.30.0` precedent already in this file, and it needs only the Go toolchain this repo already requires. `brew install go-task` works too but is unpinned and drifts from CI. **It does NOT go in `devbox.json`** — that file is tier-2 *worker* configuration whose `packages` array is provisioned into opted-in runs (`agent/src/repo-tools.ts`), not a contributor environment.
+
+Note `go install` builds **from source**, so the resulting binary is **not** byte-identical to the release tarball CI's `.task_setup` fetches and sha256-verifies. That is expected, not a discrepancy to chase: `task --version` agreeing is the equivalence check here, the same trust model `sqlc` already runs under.
+
+**The gate lives in `Taskfile.yml` at the repo root and that is the only place a gate recipe is written** (PRD #103 M1). `task --list` enumerates it; `task gate` runs everything; `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component. `.gitlab-ci.yml`'s **per-toolchain** gate jobs invoke the same targets, so local and CI cannot drift apart (`test:api-store-it` invokes none, by design: its ran/skipped assertion is CI-specific). Every load-bearing flag now lives in that file with its reason beside it — Task echoes each command before running it, so `-race`, `-count=1` and `--test-timeout=30000` are still visible in the output, and that echo is how you notice one going missing.
+
+Two consequences worth knowing before you read a result:
+
+- **`task`'s own exit code is 201, not the underlying command's** (measured on 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": … exit status 7` with rc=201). `!= 0` is still a correct failure test; anything comparing `$?` to a specific number is not.
+- **The component gates run SERIALLY, deliberately.** CPU contention is a measured flake source here (`web/vite.config.ts` raised `testTimeout` to 20000 for it), and interleaved output would defeat the read-the-named-failing-test rule this file states in four places.
+
+**`task gate:api` is now STRICTER than the hand-typed recipe that used to sit here: it carries `-race`, which the old `go test -count=1 ./...` line did not and CI always did.** That is convergence in CI's direction, but be clear about which half changed: **CI gains nothing, and your local gate gains a check.** It runs longer (measured 43-66s wall for `task gate:api`) and it can newly redden on a real data race nobody has seen fail. Keeping the flag off the shared target was the alternative, and it would have silently weakened the CI job the moment that job called the target.
+
+The provenance is deliberately not a bare SHA — `-race` and `-count=1` reached that command from two different PRDs by way of a merge, and the Taskfile's `test:api` comment records the chain plus the query that reproduces it. Read it there rather than citing a commit from memory.
+
+Not everything below is a target. A single-test invocation, `sqlc generate`, the compose stack and the e2e harness are not gate recipes and stay written out as commands; where that is the case the line says so.
+
 ### Full stack
 
 ```sh
@@ -54,12 +77,13 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ### api (Go, chi + pgx + sqlc + goose)
 
 ```sh
-cd api
-go build ./...
-go test -count=1 ./...                     # NOT all tests — see live-DB note below
-go test ./internal/forge -run TestName     # single test
-# after editing internal/store/migrations/ or internal/store/queries/:
-go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
+task gate:api                              # vet + build + test — NOT all tests, see live-DB note below
+task test:api                              # the test slot alone (-race -count=1)
+task build:api                             # or vet:api, individually
+cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
+# after editing internal/store/migrations/ or internal/store/queries/ (CI asserts
+# the regenerate is a no-op in validate:api; no target, see Success Criterion 1):
+cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
 ```
 
 **`-count=1` ON THE GATE IS LOAD-BEARING, NOT A HABIT — a green `go test ./...` can mean the suite was served from cache and never ran.** Go's test cache hashes the files a test opens, **but only those inside the module root** (cmd/go: *"Do not recheck files outside the module, GOPATH, or GOROOT root"*, re-derived in go1.26.5). This repo now has a whole `fixtures/` directory at the **repo root**, above `api/`, read across the module boundary — `fixtures/judge-fidelity/{cases,expected}.json` by `api/internal/workersvc/judge_backlog_fidelity_test.go`, and the controller's contract goldens the other way. **Editing one of those files changes nothing in the module's cache key.** Measured 2026-07-25: deleting an entire case from `cases.json` left `cd api && go test ./internal/workersvc/` printing `ok (cached)`, while `-count=1` on the same tree reddened with *"fixture broken: cases.json has no case …"*. The vitest half has no such cache and reddened with no flag at all, so the two halves are **not** symmetric.
@@ -149,13 +173,15 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 ### web (Vite + React + TS)
 
 ```sh
-cd web
-npm run typecheck
-npm test                                   # vitest run
-npx vitest run src/pages/Foo.test.tsx      # single file
-npm run build                              # runs check-docs + tsc --noEmit + vite build
-VITE_UZI_MOCK=1 npm run dev                # mock mode — no backend, no network at all
+task gate:web                              # check-docs + typecheck + test
+task test:web                              # vitest run
+task typecheck:web                         # or check-docs:web, individually
+cd web && npx vitest run src/pages/Foo.test.tsx    # single file — no target
+cd web && npm run build                    # check-docs + tsc --noEmit + vite build
+cd web && VITE_UZI_MOCK=1 npm run dev      # mock mode — no backend, no network at all
 ```
+
+**`npm run build` is deliberately NOT part of `task gate:web`, and the delta is exactly `vite build`.** CI's `validate:web` runs check-docs + typecheck directly to skip the bundle, so **there is no `build:web` Taskfile target** — it would be a check CI does not run. The bundle is still not unchecked: the CI job **named** `build:web` (a kaniko image build, not a task target — the two names collide and only one of them exists in `Taskfile.yml`, which is neither) builds the web image, whose Dockerfile runs `npm run build`. Run it by hand when you have touched anything the bundler resolves.
 
 **Mock mode is a first-class dev workflow, not only the safety mitigation it appears as below.** `VITE_UZI_MOCK=1` is read once at build time (`web/src/lib/api.ts`) to swap `src/mocks/mockApi.ts` + `MockRunSocket` in for the real `api`/socket, so a mock bundle contains **no code path to a live backend** — not a disabled one. There is no dedicated npm script; set the var on `dev` or `build`. Demo scenarios then select via `?mock=<name>` or the sticky `uzi_mock_scenario` localStorage key (`mockScenario()`); it is a single string, so scenarios are mutually exclusive by construction. `web/Dockerfile.mock` builds the backend-free static image (context is the repo root), with `web/nginx.mock.conf` 404ing any stray `/api/` call as a tripwire. Known scenario names and what each unlocks are in [docs/dev-conventions.md](docs/dev-conventions.md#the-mockdemo-build), which also documents the E2E bot env vars (`UZI_E2E_BOT_PAT` / `_USERNAME`, `UZI_E2E_PROJECT`) that no test reads yet.
 
@@ -174,13 +200,13 @@ Mitigations, in order of preference: run with `VITE_UZI_MOCK=1`, which replaces 
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-cd agent
-npm run typecheck
-npm test                                   # node --test via tsx
-node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file
+task gate:agent                            # typecheck + test
+task test:agent                            # node --test via tsx
+task typecheck:agent
+cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file — no target
 ```
 
-**Carry `--test-timeout=30000` on the single-file form — `npm test` sets it and the suite depends on it.** `agent/package.json`'s `test` script is `node --import tsx --test --test-timeout=30000 test/*.test.ts`; node's own default is no timeout at all, so a single-file run without the flag **hangs** where `npm test` fails. At least one test is written against the cap existing (`test/judge-runner.test.ts:167` unrefs a 60s timer with the comment "else the file exceeds `--test-timeout` in CI"). A single-file recipe that silently differs from the gate is the same class as the reporting traps above: it can return a different verdict than the thing it is standing in for.
+**Carry `--test-timeout=30000` on the single-file form anyway — the cap is real and live, even though no test in the suite depends on it today.** `agent/package.json`'s `test` script is `node --import tsx --test --test-timeout=30000 test/*.test.ts`. The flag works: a 3-second test body run under `--test-timeout=1000` is cancelled with `test timed out after 1000ms`. But on node v26.4.0, a bare `node --import tsx --test test/*.test.ts` (node's own default is no timeout at all) does **not** reproduce a hang — measured identical to `npm test`: `EXIT=0, tests 1060, pass 1059, fail 0, skipped 1`, both forms. This PRD's earlier text claimed the bare form hangs; that does not reproduce today, and the mechanism is worth stating rather than just deleting the claim: `--test-timeout` bounds a test **body**, and every body in this suite finishes in under a second. `test/judge-runner.test.ts:167` unrefs a 60s timer, but that unref is load-bearing for **wall time** (454ms vs 60263ms measured), not for the cap — the file's bodies all pass quickly either way, and removing the unref makes the process linger 60s on the abandoned ref'd timer while a 30s `--test-timeout` still does not fire, because the cap measures body duration, not an idle timer holding the event loop open. So delegating to `npm test` is insurance against a future slow test, not a fix for a hang this suite has today. A single-file recipe that silently differs from the gate is still the same class as the reporting traps above: it can return a different verdict than the thing it is standing in for.
 
 **`cd agent && npm ci` BREAKS THE MACHINE'S `agent-browser` FOR EVERY OTHER SESSION, and deleting the worktree afterwards is what makes it permanent.** `agent/package.json` pins `agent-browser` (`0.32.3`) as a dependency, and that npm package's `postinstall` **rewrites `/opt/homebrew/bin/agent-browser`** to point inside whatever `node_modules` just installed it — clobbering the brew formula's symlink (`0.31.1` here, a different version). Install into a throwaway worktree, remove the worktree, and the CLI is off `PATH` host-wide with a dangling link. Observed twice on 2026-07-27, hours apart, from ordinary validator gate runs — this is not someone being careless, it is the documented gate step doing it.
 
@@ -195,10 +221,9 @@ node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single fil
 ### controller (Go, hosted-worker controller — a SECOND, SEPARATE Go module)
 
 ```sh
-cd controller
-go build ./...
-go vet ./...
-go test -count=1 ./...
+task gate:controller                       # vet + build + test
+task test:controller                       # -count=1, see below
+task vet:controller                        # or build:controller, individually
 ```
 
 **There are FOUR toolchains here, not three.** `controller/` is `uzi-controller` (PRD #58, `ARCHITECTURE.md` "Worker controller (k8s only)"): the only uzi component that ever holds a kube-apiserver credential, shipped in the chart but off by default (`workers.enabled: false`). Its own `go.mod` is deliberate and load-bearing — it is what keeps `k8s.io/client-go` structurally out of `api/go.mod`, so "the api gets zero kube access" is a build-graph fact rather than a policy. **A `cd api && go test ./...` therefore does not touch it**, and neither does anything else in the section above. CI runs it as `validate:controller` + `test:controller`, and builds/publishes it as `build:controller` + `publish:controller`.
@@ -307,7 +332,7 @@ So `env -i … --env-file <dummy.env> -p smk-<unique> up` is **NOT isolated**, a
 >
 > The closing sentence below was, at the moment it was first written, one revision short of true about itself. **A procedure is not documented until someone has run what is written down**, and "what is written down" means the page, not your memory of the page. A runbook is the worst place for this gap, because the reader executes it against real infrastructure instead of merely believing it.
 
-CI (`.gitlab-ci.yml`, PRD #52) now runs the real gates on every MR + `main`: validate/test across all three toolchains + `helm lint`/`template`, plus kaniko validation builds of the api/web images. `v*` tags additionally publish the images + OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the tag), and k8s deploy is GitOps via ArgoCD to dev-cluster — see `deploy/` (the chart + `deploy/README.md` release runbook). **The compose e2e harness (`./e2e/run-e2e.sh`) is NOT in CI** — it needs docker compose on the runner — so it stays a purely local gate. **`./scripts/smoke.sh` is a different story and the old wording here was wrong about it:** `e2e:kind-smoke` (`.gitlab-ci.yml:730`) stands up a KinD cluster, `helm install`s the chart and runs `bash scripts/smoke.sh` against it. So smoke.sh *does* run in CI. **But only on PROTECTED refs** (`rules: if $CI_COMMIT_REF_PROTECTED == "true"`), i.e. `main` and tags — never on an MR pipeline. So it is a POST-merge gate in CI and still a PRE-merge gate only locally, which is the distinction the previous sentence collapsed. Run both locally before merging; do not read a green MR pipeline as smoke having passed. *(Corrected 2026-07-25: the line read "e2e is deliberately NOT in CI … `./scripts/smoke.sh` stays the local pre-merge gate", which was true when written and became false when PRD #52 M8 added `e2e:kind-smoke` in `67e64972`.)*
+CI (`.gitlab-ci.yml`, PRD #52) now runs the real gates on every MR + `main`: validate/test across all four toolchains + `helm lint`/`template`, plus kaniko validation builds of the api, web, controller and agent images. `v*` tags additionally publish the images + OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the tag), and k8s deploy is GitOps via ArgoCD to dev-cluster — see `deploy/` (the chart + `deploy/README.md` release runbook). **The compose e2e harness (`./e2e/run-e2e.sh`) is NOT in CI** — it needs docker compose on the runner — so it stays a purely local gate. **`./scripts/smoke.sh` is a different story and the old wording here was wrong about it:** `e2e:kind-smoke` stands up a KinD cluster, `helm install`s the chart and runs `bash scripts/smoke.sh` against it. So smoke.sh *does* run in CI. **But only on PROTECTED refs** (`rules: if $CI_COMMIT_REF_PROTECTED == "true"`), i.e. `main` and tags — never on an MR pipeline. So it is a POST-merge gate in CI and still a PRE-merge gate only locally, which is the distinction the previous sentence collapsed. Run both locally before merging; do not read a green MR pipeline as smoke having passed. *(Corrected 2026-07-25: the line read "e2e is deliberately NOT in CI … `./scripts/smoke.sh` stays the local pre-merge gate", which was true when written and became false when PRD #52 M8 added `e2e:kind-smoke` in `67e64972`.)*
 
 **A HELM TEMPLATE COMMENT ENDING `*/ -}}` DIRECTLY BEFORE A `---` DELETES AN OBJECT FROM THE MANIFEST, SILENTLY.** The `-}}` trims the following whitespace *including the newline*, so the document separator is glued onto the previous value and two objects merge into ONE YAML document with duplicate keys — and every YAML parser (ArgoCD's included) keeps the LAST one. Measured 2026-07-27 (issue #149), rendered line 903:
 
@@ -351,6 +376,8 @@ So the widened pattern matches every line containing `tabIndex` — a comment, a
 It is a trap in the shape of a precaution: the escape a careful person adds to make the braces literal is the thing that breaks it.
 
 *(Two earlier versions of this paragraph were wrong, both written by the lead from a single observation. The first claimed a bare `{0}` miscounts under plain `grep` — it does not; a reviewer filed that after an off-by-one expectation (`^2$` against a true count of 3) and retracted it once measured. The second generalised to "any unescaped metacharacter in an intended literal", which a tester refuted as mode-dependent: in BRE `a.b` and `c*d` over-match but `e+f` does not, because `+` is literal there. The habit both failures share is going from one measurement to a stated mechanism without re-measuring.)*
+
+**A FRESH INSTANCE, 2026-08-02, and the circumstance is the part worth recording: it happened to someone writing the commit that documents a grep instrument defect.** Verifying a cross-reference before committing, a non-`-F` grep for the literal `grep -c '^--- PASS'` returned **0** against this very file, where the literal was present **six** times at that moment — seven once this paragraph was written, a count invalidated by the act of recording it, which is Decision 10's point arriving in miniature. The pattern carries `^` and `---`, so it was read as a regex; `-F` returned the right answer immediately. The failure was *silent and in the reassuring direction* — a 0 reads as "that text is not there", which would have justified deleting a correct cross-reference. Nothing about knowing the rule prevented it: the check being run was itself a rigour step, which is exactly when a wrong instrument is least likely to be doubted. Same shape as the four-for-four ROLES finding in `.claude/agent-team.md`: holding a rule and applying it to yourself are separate skills.
 
 **The rule that survives every case above, needs no taxonomy, and does not depend on which grep is installed: use `-F` when you mean a literal.** And **verify restores with `git status`/`git diff`, not with a grep count** — not because grep miscounts, but because a literal count only tells you something if you already know how many occurrences ought to exist. The VCS does not require you to know that, which is exactly why it is the right instrument for "is the tree back where it was".
 

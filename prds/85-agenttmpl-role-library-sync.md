@@ -46,8 +46,27 @@ Two secondary gaps:
 
 - **Roster.** The library has 11 roles; `builtins/` has 10, of which 9 are
   library roles plus the uzi-only `lead`. `release` and `web-ux` are missing.
-- **Stale docs.** `docs/agent-templates.md:30`, `CLAUDE.md:117`, and
-  `ARCHITECTURE.md:128` all hard-code "ten" / "nine subagents".
+  *(Correction, 2026-08-02, found while fixing citations for PRD #103: `web-ux`
+  is no longer missing. `api/internal/agenttmpl/builtins/web-ux.md` landed in
+  `30b06b94`, "feat(prd-87): M6 ship the web-ux builtin (roster ten->eleven)"
+  — a different PRD's milestone, not this one's. `builtins/` now holds 11 of
+  the 12 files this roster bullet counts against; only `release` is still
+  missing. This PRD's milestone plan (M3/M5/M6 below, which still budget work
+  for porting `web-ux`) needs re-deriving against that fact before this PRD
+  resumes — not done here, since rewriting another PRD's plan is out of scope
+  for a citation fix.)*
+- **Stale docs.** `docs/agent-templates.md:30`, CLAUDE.md's `**Builtin agent
+  templates**` bullet, and
+  `ARCHITECTURE.md:128` all hard-code "ten" / "nine subagents". *(Line cite
+  replaced with a string cite 2026-08-02, PRD #103: `CLAUDE.md`'s content had
+  moved past `:117` before this correction and keeps moving as later PRDs edit
+  it — cite the bullet, not a line.)* *(Second correction, same date and PRD:
+  this bullet's own claim is now stale too, not just its citations —
+  `docs/agent-templates.md:30` currently reads "uzi seeds eleven builtin
+  templates" and `ARCHITECTURE.md` nearby reads "Eleven builtin roles", neither
+  the "ten" / "nine" this bullet says they hard-code. Same rule as the Roster
+  correction above: noted, not fixed here — #85's owner re-derives the actual
+  gap against current text before resuming this PRD.)*
 
 ## Solution Overview
 
@@ -99,14 +118,16 @@ UI (Decision 8).
 
 3. **`version` renders immediately after `name`.** The skill's generated agent
    files order frontmatter `name, version, description, model`
-   (`.claude/agents/coder.md:1-5`). Matching that order means a builtin and a
+   (`.claude/agents/coder.md`'s frontmatter block: `name, version, description,
+   model`). Matching that order means a builtin and a
    skill-generated file are diffable with `diff`, which is the whole point of
    the exercise. Field order in `Render()` becomes: `name, version, description,
    tools, model`. `parse()` is order-independent already, so only the renderer
    and its byte-stability test move.
 
 4. **`lead` carries no version line.** It is uzi-only by design and must never
-   be flagged (CLAUDE.md:119 and issue #63 both say so). The drift check keys
+   be flagged (CLAUDE.md's `**Builtin agent templates**` bullet and issue #63
+   both say so). The drift check keys
    off the vendored **manifest**, not off the roster: a builtin with no manifest
    entry is simply not checked, and no test asserts the roster's shape against
    the library. Omission also exercises the omit-when-empty path the `tools` and
@@ -209,7 +230,7 @@ UI (Decision 8).
 | Drift check | `api/internal/agenttmpl/library_test.go` (new) | stamp-vs-manifest comparison |
 | Tests | `api/internal/agenttmpl/render_test.go` | `builtinNames` 10 → 12; round-trip; version render/omit cases; phrase pins for the two new roles |
 | Runbook | `docs/` or `prds/` (M7 decides) | the port procedure |
-| Docs | `docs/agent-templates.md:30`, `CLAUDE.md:117`, `ARCHITECTURE.md:128` | "ten"/"nine subagents" → twelve/eleven |
+| Docs | `docs/agent-templates.md:30`, CLAUDE.md's `Builtin agent templates` bullet, `ARCHITECTURE.md:128` | "ten"/"nine subagents" → twelve/eleven |
 | Issue #87 | GitLab comment | re-scope its §6/M6 per Decision 9 |
 
 Not touched:
@@ -266,7 +287,8 @@ distills all 11 library roles, and its missing-builtin check goes red on
   confirm-before-irreversible). Full `go test ./...` green with
   `UZI_TEST_DATABASE_URL` **unset**.
 - [ ] **M6 — Docs tell the truth, and #87 is re-scoped.**
-  `docs/agent-templates.md:30`, `CLAUDE.md:117`, `ARCHITECTURE.md:127-128`
+  `docs/agent-templates.md:30`, CLAUDE.md's `Builtin agent templates` bullet,
+  `ARCHITECTURE.md:127-128`
   counts corrected (ten → twelve, nine subagents → eleven) and the two new roles
   described; `cd web && npm run build` (check-docs) green. Comment on issue #87
   re-scoping its §6/M6 per Decision 9.

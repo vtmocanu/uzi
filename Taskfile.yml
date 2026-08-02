@@ -1,0 +1,305 @@
+# uzi's quality gate, in one file (PRD #103 M1).
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH FOR EVERY GATE RECIPE. `CLAUDE.md`, the
+# `.claude/agent-team.md` paste-block and the `.claude/agents/*` tails name TARGETS
+# from here and never restate a command line. A stale target name dies loudly
+# (`task: Task "gate:api" does not exist`, nonzero exit); a stale pasted command
+# line still runs, still prints `ok`, and is reported green. This repo's whole
+# documented failure history is silent-green over loud-red.
+#
+# SELF-CONTAINED ON PURPOSE. No `includes:`, no remote taskfiles, no shared task
+# library: the gate must be readable here without resolving anything.
+#
+# 🔴 FOUR TASKFILE FEATURES ARE BANNED IN THIS FILE. One list, so the next reader
+# sees all of them at once. Each is one line to avoid and expensive to retrofit.
+#
+# 1. NO `sources:`, `generates:` OR `status:` ON ANY TARGET. A fingerprinted
+#    target prints `Task "x" is up to date`, exits 0 and executes nothing -
+#    output indistinguishable from a passing run. That is the exact silent-green
+#    failure `CLAUDE.md` mandates `-count=1` against at both Go gates, and
+#    `checksum` has the SAME cross-module blind spot as Go's test cache: this
+#    repo's gates deliberately read `fixtures/judge-fidelity/{cases,expected}.json`
+#    at the repo root and `api/internal/hostedsvc/testdata/` from outside the
+#    module under test, so a `sources:` glob over one module cannot see them
+#    change. `.task/` is gitignored (its own entry in `.gitignore`), so CI would
+#    always run cold
+#    while a contributor's `task gate` silently skipped. If some future target
+#    must carry `sources:` for an unrelated reason, it also carries `method: none`.
+#
+# 2. NO `dotenv:`. Task loads the named env files into EVERY target's
+#    environment. `.env` is gitignored (its own entry in `.gitignore`) and root
+#    `CLAUDE.md`
+#    spends a section on compose ranking shell environment above `--env-file`, so
+#    a `dotenv: ['.env']` here would silently inject a developer's real secrets
+#    into every gate target - including whatever a future milestone adds.
+#
+# 3. NO `includes:` AT ALL, and the sharp edge is the remote form specifically.
+#    Task 3.x can include a taskfile over https, which is unpinned remote code
+#    executing inside the gate. `.gitignore` already carries a "Task
+#    remote-include cache" comment, so the mechanism is one line from being
+#    invited back. The self-contained rule above is the style reason; this is the
+#    security one.
+#
+# 4. NO DYNAMIC ROOT `vars:` (`vars: {X: {sh: ...}}`). Those execute on every
+#    invocation, including unrelated targets and a bare `task --list`. Not a hole,
+#    but it puts a shell command on the path of everything.
+#
+# 🔴 AND NEVER SPLICE A VARIABLE UNQUOTED INTO A `cmds:` LINE. Task templates are
+# Go `text/template` and the result reaches `sh -c` unquoted, so a
+# `{{.CI_COMMIT_BRANCH}}` or `{{.CLI_ARGS}}` inside a command is injectable by
+# anyone who can push a branch (branch names may contain `;`, `$`, backticks). M1
+# needs neither. Stated here because M6's coverage measurement is where the
+# temptation first appears.
+#
+# SERIAL, NOT CONCURRENT - a recorded decision, not an oversight. `gate` and each
+# `gate:*` call their components through `cmds:` (sequential) rather than `deps:`
+# (concurrent). Reason: CPU contention is an already-measured flake source here.
+# `web/vite.config.ts` raised `testTimeout` to 20000 because "under full-suite CPU
+# contention, THREE unrelated tests each timed out once across ~20 runs"; running
+# two Go modules and `node --test` alongside vitest makes that strictly worse. The
+# gate's job is a trustworthy verdict, not a fast one.
+#
+# `output: prefixed`, NOT `output: group`, and the two are not interchangeable.
+# Serial execution (above) already removes the interleaving `group` exists to fix,
+# so `group` would buy nothing and cost streaming. Measured on task 3.51.1, log
+# read at t=1.5s into a target that prints EARLY, sleeps 3s, prints LATE:
+#
+#   group        task: [a] sh -c '...'                  <- EARLY ABSENT, buffered
+#   prefixed     task: [a] sh -c '...'   [a] EARLY      <- streams
+#   interleaved  task: [a] sh -c '...'   EARLY          <- streams
+#
+# Two costs `group` would have imposed. Locally, `task gate:api` would print
+# NOTHING for the whole `go test -race` run - 41s wall per `.gitlab-ci.yml`'s own
+# measurement - then dump, which is a regression against today's streaming
+# `go test`. In CI it is worse: every gate job sets `interruptible: true`, so a
+# cancelled or timed-out job under `group` loses ALL buffered diagnostic output. A
+# gate that discards its evidence on timeout is the failure class this PRD exists
+# to remove. `prefixed` keeps the per-task disambiguation that both `CLAUDE.md`
+# and `.claude/agent-team.md` need for reading NAMED failing tests, and streams.
+#
+# `task`'s OWN EXIT CODE IS 201, NOT THE UNDERLYING COMMAND'S. Measured on task
+# 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": ...
+# exit status 7` with rc=201. Anything reading `$?` NUMERICALLY must know this;
+# `!= 0` is still a correct failure test.
+#
+# NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
+# CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
+# is expected to exist. `cd agent && npm ci` in particular has a documented
+# host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
+# file must never trigger one as a side effect of running a test.
+#
+# THE npm TARGETS DELEGATE TO THE EXISTING SCRIPT AND MUST KEEP DOING SO. A target
+# written `npm test` inherits whatever flags `package.json` already encodes; a
+# target that reimplements the command drops them SILENTLY. The live instance is
+# `test:agent`: `agent/package.json`'s test script carries `--test-timeout=30000`
+# and node's own default is NO timeout. On node v26.4.0 a spelled-out `node
+# --import tsx --test` does not actually hang (measured: identical pass/fail
+# counts to `npm test`) -- the cap is insurance against a future slow test, not
+# a fix for a current one, and a target that reimplements the command still
+# drops the flag silently either way. This is the same "a future simplify-the-gate edit"
+# hazard as `-race`/`-count=1`, arriving through `package.json` instead of
+# `.gitlab-ci.yml`. Before wrapping any npm script, read it for flags first; if you
+# must spell out the underlying command, re-add every flag the script carried and
+# say in the comment that you are re-adding it because the target bypassed the
+# script, not that the script never had it.
+#
+# NOT SILENT, DELIBERATELY. Task echoes each command before running it, so the
+# gate's own output shows `-race`, `-count=1` and `--test-timeout=30000` actually
+# being passed. That echo is how a teammate notices a load-bearing flag going
+# missing, which is the failure mode this milestone is most exposed to.
+#
+# NO `-buildvcs=false` HERE. It is a local-only workaround for VCS stamping in a
+# linked git worktree and must not be committed. If you hit it, export
+# `GOFLAGS=-buildvcs=false` in your shell - Go applies it to build/vet/test with
+# no change to this file.
+
+version: '3'
+
+output: prefixed
+
+tasks:
+  # ---------------------------------------------------------------- composed --
+  default:
+    desc: List the gate targets
+    cmds:
+      - task --list
+
+  gate:
+    desc: The whole gate, every component, serially (see the header for why)
+    cmds:
+      - task: gate:api
+      - task: gate:controller
+      - task: gate:web
+      - task: gate:agent
+
+  gate:api:
+    desc: api - vet, build, test
+    cmds:
+      - task: vet:api
+      - task: build:api
+      - task: test:api
+
+  gate:controller:
+    desc: controller - vet, build, test
+    cmds:
+      - task: vet:controller
+      - task: build:controller
+      - task: test:controller
+
+  gate:web:
+    desc: web - check-docs, typecheck, test
+    cmds:
+      - task: check-docs:web
+      - task: typecheck:web
+      - task: test:web
+
+  gate:agent:
+    desc: agent - typecheck, test
+    cmds:
+      - task: typecheck:agent
+      - task: test:agent
+
+  # ------------------------------------------------------------- api (Go) -----
+  vet:api:
+    desc: go vet over the api module
+    dir: api
+    cmds:
+      - go vet ./...
+
+  build:api:
+    desc: go build over the api module
+    dir: api
+    cmds:
+      - go build ./...
+
+  test:api:
+    desc: api unit tests (-race -count=1; live-DB tests self-skip)
+    dir: api
+    cmds:
+      # -race AND -count=1: two independently measured fixes on one command,
+      # neither of which subsumes the other. DROPPING EITHER SILENTLY UNDOES A
+      # FIX WHOSE ABSENCE IS INVISIBLE IN THE OUTPUT, which is why moving them
+      # into this file is itself the "simplify the gate" edit `.gitlab-ci.yml`
+      # warns about.
+      #
+      # -count=1 (PRD #98): fixtures/judge-fidelity/{cases,expected}.json live at
+      # the REPO ROOT, above this module, and are read by
+      # internal/workersvc/judge_backlog_fidelity_test.go. Go's test cache hashes
+      # only files INSIDE the module root, so a fixture-only edit changes nothing
+      # in the cache key and the gate serves a green that ran nothing. Measured:
+      # deleting a case left `go test ./internal/workersvc/` printing
+      # `ok (cached)` while -count=1 reddened with "fixture broken: cases.json has
+      # no case ...". It disables the test-RESULT cache only; compilation is still
+      # reused.
+      #
+      # -race (PRD #108 M4): workersvc holds a mutex-guarded map written by every
+      # /messages handler goroutine and read by the sweeper. Measured by deleting
+      # the lock: 3/3 red under -race, only 2/3 without it.
+      #
+      # PROVENANCE, CITED BY STRING because every SHA and date offered for this
+      # line has been wrong once. Reproduce it with:
+      #
+      #   git log --oneline -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
+      #
+      # Three things about that command, each of which someone got wrong:
+      #   - `--oneline -s` is REQUIRED, BOTH of them. `--diff-merges` turns patch
+      #     output ON for merges, and without `--oneline` each hit still carries a
+      #     full header. Measured at dc062ce5: the chain is TWO commits, and the
+      #     three flag sets print two lines, tens of lines and well over a hundred.
+      #     No number is recorded because it grows with history (Decision 10);
+      #     the shape is that only `--oneline -s` gives you one line per commit.
+      #   - PLAIN `git log -S` RETURNS NOTHING here. The combined line was produced
+      #     by a conflict resolution inside a merge and git omits merge diffs by
+      #     default, so the obvious form is fail-open and reads as "refuted".
+      #   - Keep the path filter. Unfiltered, the same query also matches PRD
+      #     documents that merely quote the string.
+      #
+      # The chain is 224b5349 (2026-07-25, on the PRD #98 wave-3 branch, where
+      # PRD #98's -count=1 and PRD #108 M4's -race were resolved onto one command)
+      # then 77cb96e4 (2026-07-26, which is when MAIN got it). -race itself
+      # predates both, as `go test -race ./...` in 8f1b0c9b.
+      #
+      # MEASURED at 1778f359: M1 moving this command out of .gitlab-ci.yml is NOT a
+      # hit. The comment left behind there still quotes the string, so its
+      # occurrence count went 1 -> 1 and `-S` sees no change. The chain head is
+      # therefore still 77cb96e4, not the move. Fragile in one direction: reword
+      # that CI comment so the string disappears and this commit becomes the newest
+      # hit. Read the chain, not the head, either way.
+      #
+      # Live-DB (*LiveDB) tests are NOT covered here - they self-skip without
+      # UZI_TEST_DATABASE_URL, and go RED if you export it for this run (the
+      # package binaries race one shared database). Run those via
+      # `./e2e/run-store-it.sh`, which carries `-p 1` for the same reason.
+      - go test -race -count=1 ./...
+
+  # ------------------------------------------------------ controller (Go) -----
+  vet:controller:
+    desc: go vet over the controller module
+    dir: controller
+    cmds:
+      - go vet ./...
+
+  build:controller:
+    desc: go build over the controller module
+    dir: controller
+    cmds:
+      - go build ./...
+
+  test:controller:
+    desc: controller unit tests (-count=1)
+    dir: controller
+    cmds:
+      # -count=1 is load-bearing BY CONSTRUCTION here, not by analogy with the
+      # api gate: every contract golden this module tests against lives in the
+      # OTHER module, above its own root -
+      # internal/protocol -> ../../../api/internal/hostedsvc/testdata/controller_poll_wire.json
+      # internal/preset   -> ../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json
+      # Those cross-reads ARE the gate on the wire format, so a `(cached)` run
+      # silently retires the only check on it.
+      - go test -count=1 ./...
+
+  # ------------------------------------------------------------- web (npm) ----
+  check-docs:web:
+    desc: docs frontmatter + relative-link lint
+    dir: web
+    cmds:
+      - npm run check-docs
+
+  typecheck:web:
+    desc: tsc --noEmit over web
+    dir: web
+    cmds:
+      - npm run typecheck
+
+  test:web:
+    desc: web unit tests (vitest)
+    dir: web
+    cmds:
+      # No cache flag needed: vitest has no result cache of the kind Go's test
+      # cache is, and the same fixture mutation reddens it with no flag at all.
+      # The two halves of this repo are NOT symmetric here.
+      - npm test
+
+  # ----------------------------------------------------------- agent (npm) ----
+  typecheck:agent:
+    desc: tsc --noEmit over agent
+    dir: agent
+    cmds:
+      - npm run typecheck
+
+  test:agent:
+    desc: agent unit tests (node --test via tsx)
+    dir: agent
+    cmds:
+      # `npm test` and NOT a bare `node --test`: agent/package.json's test script
+      # carries `--test-timeout=30000`, and node's own default is NO timeout at
+      # all. The cap is live (a 3s body under --test-timeout=1000 is cancelled),
+      # but on node v26.4.0 a bare `node --import tsx --test test/*.test.ts` does
+      # NOT hang -- measured identical to `npm test` (1059 pass, 0 fail, both
+      # forms) -- because every test body in this suite finishes in under a
+      # second; test/judge-runner.test.ts's unrefed 60s timer only holds process
+      # WALL TIME down (454ms vs 60263ms), which --test-timeout does not govern.
+      # So delegating here is insurance against a future slow test, not a fix for
+      # a hang this suite has today. Rewriting this line as a direct node call
+      # still drops the flag silently, which is the reason to delegate regardless.
+      - npm test
