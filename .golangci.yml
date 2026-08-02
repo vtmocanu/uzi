@@ -1,0 +1,144 @@
+# golangci-lint for BOTH Go modules — api/ and controller/ (PRD #103 M3).
+#
+# ONE ROOT FILE, ON PURPOSE. golangci-lint walks UP from its working directory to
+# find a config, and each Taskfile lint target sets `dir: api` / `dir: controller`,
+# so both modules reach this file by walk-up. Measured before shipping: from either
+# module directory `golangci-lint config path` resolves THIS file, and the control
+# run matters as much as the positive one — before this file existed, the same
+# command from both directories printed `No config file detected`, so nothing stray
+# was being picked up from outside the repo.
+#
+# 🔴 REACHED BY WALK-UP, NOT BY AN ABSOLUTE `--config` PATH. Passing this file by
+# absolute path from outside the tree makes findings print as
+# `../../../../../../Users/…/api/internal/…` — six levels of `../`, unreadable, and
+# it destroys the names-the-file property `fmt-check` was built for. The Taskfile
+# targets rely on the walk-up for exactly this reason; do not "fix" them by adding
+# `--config`.
+#
+# 🔴 THE PLUGIN ESCAPE HATCH IS FORBIDDEN IN THIS FILE. `linters.settings.custom.
+# <name>.path` names a `.so` Go plugin that the runner then LOADS AND EXECUTES.
+# A diff adding one is a policy violation, not a configuration change: it makes a
+# second, unreviewed file decide what runs inside the gate, and reviewers do not
+# read config files the way they read code. Same ban as `jsPlugins`/`extends` in
+# web/.oxlintrc.json and agent/.oxlintrc.json — see those headers.
+#
+# 🔴 AND THE WEAKER SIBLING HAS NO CI ANSWER: a branch author can NEUTER this gate
+# from this same file (`linters.default: none` with an empty `enable:`, or an
+# `exclusions` rule swallowing everything) and the pipeline stays green because the
+# linter genuinely found nothing. CODEOWNERS on this file and the two oxlintrc
+# files is the only structural fix; it is out of scope for M3 and is recorded in
+# the MR.
+
+version: "2"
+
+linters:
+  # `none` + an explicit list, so this file is the whole answer to "what runs?".
+  # The v2 DEFAULT set is errcheck, govet, ineffassign, staticcheck, unused — so
+  # the only default being dropped here is govet, which has its own justification
+  # below. Everything else is additive.
+  default: none
+  enable:
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+    - unparam
+
+  # EVERY DISABLED LINTER OWES A ONE-LINE JUSTIFICATION (git-manager's convention,
+  # adopted by PRD #103 M3). Two are disabled deliberately and both would otherwise
+  # be re-added by a future editor acting on a reasonable-sounding premise:
+  #
+  # govet — DISABLED because `task vet:api` / `vet:controller` already run
+  #   `go vet ./...` inside `gate:*` AND in CI (validate:api, validate:controller),
+  #   UNRATCHETED. Folding govet in here would be a NET WEAKENING: today every vet
+  #   finding blocks; ratcheted through `new-from-merge-base` below, only new ones
+  #   would. It finds 0 additional findings anyway, which is the expected result on
+  #   a tree `vet:*` already gates. "golangci-lint enables govet by default" is
+  #   exactly the premise that will motivate re-adding it — the answer is that the
+  #   check is not missing, it is elsewhere and stricter.
+  #
+  # goconst — DISABLED, and PRD #103's own M3 bullet lists it among the linters to
+  #   enable (the bullet is amended rather than worked around). Three reasons, in
+  #   increasing order of weight, measured 2026-08-02 at golangci-lint 2.12.2 /
+  #   go1.26.5 darwin/arm64 with `--max-issues-per-linter=0 --max-same-issues=0`:
+  #     1. SCALE. Uncapped it is 1178 findings in `api` (929 in _test.go, 247 not)
+  #        and 33 in `controller` — 90% of the combined backlog. Every figure
+  #        quoted for it during design was a CAP READING: the default
+  #        --max-issues-per-linter is 50 and goconst reported exactly 50, which is
+  #        the tell nobody looks at because 50 is a plausible number.
+  #     2. NO SIGNAL. All 21 non-test findings were read by hand, and none is a
+  #        defect. The tool's own message gives it away: "string `ember` has 6
+  #        occurrences, but such constant `Default` already exists" — a list of
+  #        theme names. The rest are the same shape: a status-string mapper, CLI
+  #        subcommand names, JSON field names, and the run-state vocabulary
+  #        (`queued`/`running`/…) that CLAUDE.md documents as a state machine, which
+  #        is a goconst finding at every switch arm. Extracting "aws" into a
+  #        constant in a file that enumerates tool names makes the code worse.
+  #     3. BLAST RADIUS UNDER `whole-files: true`, which is decisive. That flag
+  #        makes PRE-EXISTING findings in a TOUCHED file blocking, and goconst's
+  #        non-test findings span 86 distinct files in `api` alone. Touch
+  #        internal/handler/auth.go for any reason and the gate demands you extract
+  #        "status". That is the ratchet's one sharp edge pointed at the linter with
+  #        the least signal.
+  #   The PRD's argument FOR it was git-manager's "136 goconst warnings accumulated
+  #   unnoticed" — but the PRD itself quotes git-manager's CLAUDE.md saying that
+  #   repo has no CI gate at all. The lesson there is "no gate ⇒ accumulation", not
+  #   "goconst has signal".
+
+  exclusions:
+    rules:
+      # unparam in _test.go: 22 of its 26 findings are test helpers, all the same
+      # shape — `runningFor - container always receives "worker"`. A helper taking a
+      # parameter that today has one call site is how a test stays readable, and
+      # widening it later is a one-line change. This is the real per-linter
+      # test-file exclusion PRD #103's M3 bullet asks for; it survives goconst
+      # going off because it was never goconst's exclusion.
+      - path: _test\.go
+        linters:
+          - unparam
+
+# THE RATCHET. Gate on findings the branch introduces; the pre-existing backlog is
+# recorded (see `task lint:api:all` / `lint:controller:all`) and burned down under
+# its own issue, not here.
+issues:
+  # 🔴 `origin/main`, NEVER a bare `main`, and this is not a style preference.
+  # A bare `main` resolves in this repo's bare-clone-with-worktrees layout and does
+  # NOT resolve in GitLab's detached-HEAD checkout, where no local branch exists —
+  # a check that works on your machine and degrades in CI, which is precisely the
+  # divergence PRD #103 Success Criterion 1 exists to prevent. `origin/main`
+  # resolves in BOTH. A contributor whose `origin/main` is stale ratchets against an
+  # older base and therefore sees MORE findings, so the error direction is
+  # conservative.
+  #
+  # AND THE CI-VARIABLE ALTERNATIVE IS IMPOSSIBLE HERE, not merely worse:
+  # golangci-lint does NOT expand environment variables in config values. Measured
+  # with a positive control, so this is not "the key is broken" — `new-from-rev:
+  # ${MB_REF}` reaches git verbatim (`fatal: bad revision '${MB_REF}'`, then the
+  # full unfiltered set) while the same key with a literal SHA works. So
+  # CI_MERGE_REQUEST_DIFF_BASE_SHA would force the ratchet onto the CLI in the CI
+  # job only, which is the local/CI asymmetry putting it in this file removes.
+  #
+  # 🔴 IF `origin/main` IS UNRESOLVABLE THE RUN FAILS CLOSED, LOUDLY, AND
+  # MISLEADINGLY. It does not skip the ratchet and it does not error out: it logs
+  # ONE line — `level=warning msg="[runner] Can't process results by diff
+  # processor…"` — and then reports the ENTIRE unfiltered backlog, exit 1. The first
+  # reader concludes "the linter found 1300 problems" and starts a burn-down when
+  # the fix is one `git fetch`. That is why `lint:api` and `lint:controller` in
+  # Taskfile.yml open with an explicit `git rev-parse --verify origin/main`
+  # pre-flight that exits 2 with a message naming the cause: it converts a
+  # misleading red into an accurate one. CI additionally sets `GIT_DEPTH: "0"` and
+  # fetches the ref explicitly — depth alone is not sufficient.
+  new-from-merge-base: origin/main
+
+  # `whole-files: true` — without it, findings that are not ON a changed line are
+  # skipped, so moving a block of code past a finding hides it. THE ADOPTION COST IS
+  # REAL AND IS NOT A BUG: it makes PRE-EXISTING findings in a file you touched
+  # blocking. Measured 2→4 findings when it was added, the two extra being old
+  # findings in a file whose only change was an added comment. Expect that; it is
+  # the flag working.
+  #
+  # `golangci-lint run --help` says --whole-files "requires new-from-rev or
+  # new-from-patch" and omits new-from-merge-base. THE COMBINATION NEVERTHELESS
+  # WORKS — measured independently more than once. Recorded here because someone
+  # reading --help will otherwise "correct" this.
+  whole-files: true

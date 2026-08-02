@@ -153,7 +153,7 @@ tasks:
       - task: gate:agent
 
   gate:api:
-    desc: api - fmt-check, vet, build, test
+    desc: api - fmt-check, vet, build, lint, test
     cmds:
       # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
       # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
@@ -162,14 +162,23 @@ tasks:
       - task: fmt-check:api
       - task: vet:api
       - task: build:api
+      # lint AFTER build and BEFORE test, and the ordering is asymmetric with the
+      # npm gates below on purpose (PRD #103 M3). AFTER build because
+      # golangci-lint TYPE-CHECKS: on a tree that does not compile it reports
+      # `typechecking error` instead of the build error, which is a worse message
+      # for the same defect. BEFORE test because it is seconds against test:api's
+      # -race run.
+      - task: lint:api
       - task: test:api
 
   gate:controller:
-    desc: controller - fmt-check, vet, build, test
+    desc: controller - fmt-check, vet, build, lint, test
     cmds:
       - task: fmt-check:controller
       - task: vet:controller
       - task: build:controller
+      # Same ordering and the same reason as gate:api above.
+      - task: lint:controller
       - task: test:controller
 
   gate:web:
@@ -204,6 +213,18 @@ tasks:
     cmds:
       - task: fmt-check:api
       - task: fmt-check:controller
+
+  lint:
+    # EXTENSIBLE, NOT CLOSED — and it composes MORE than fmt-check above does, so
+    # do not copy that target's scope along with its shape. `fmt-check` composes
+    # TWO targets because only the Go modules have a format check; `lint` composes
+    # ALL FOUR components today, and PRD #103 M5 appends `lint:shell` and
+    # `lint:yaml` to this same list. Fail-fast for the same reason every other
+    # composed target here is.
+    desc: lint both Go modules (the npm half lands with the oxlint config)
+    cmds:
+      - task: lint:api
+      - task: lint:controller
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
@@ -317,6 +338,109 @@ tasks:
     cmds:
       - go build ./...
 
+  lint:api:
+    desc: golangci-lint over the api module (RATCHETED to origin/main - see .golangci.yml)
+    dir: api
+    cmds:
+      # 🔴 READ `.golangci.yml` BEFORE THIS TARGET. THE LOAD-BEARING CONFIGURATION
+      # IS NOT VISIBLE IN TASK'S ECHO, AND THAT IS THIS MILESTONE'S ONE DELIBERATE
+      # WEAKENING OF A MECHANISM THIS FILE RELIES ON. The header above says the
+      # echo is how a teammate notices a load-bearing flag going missing; for the
+      # RATCHET that property is now absent, because
+      # `issues: {new-from-merge-base: origin/main, whole-files: true}` lives in
+      # `.golangci.yml` rather than on the command line. Traded deliberately: the
+      # CLI form would have to be spliced into this line (banned by the header) or
+      # set in the CI job only (which makes local and CI disagree about what a
+      # finding IS - the exact divergence PRD #103 Success Criterion 1 exists to
+      # prevent). One recipe, byte-identical locally and in CI, was worth the echo.
+      #
+      # PRE-FLIGHT, AND IT IS NOT DEFENSIVE PADDING. If `origin/main` does not
+      # resolve, golangci-lint does NOT skip the ratchet and does NOT error: it
+      # emits ONE line - `level=warning msg="[runner] Can't process results by diff
+      # processor…"` - and then reports the ENTIRE unfiltered backlog with exit 1.
+      # It fails CLOSED, loudly, and in the most misleading possible way: the first
+      # reader sees ~107 findings, concludes the branch broke something enormous,
+      # and starts a burn-down when the fix is one `git fetch`. This line converts
+      # that misleading red into an accurate one.
+      #
+      # `exit 2` NOT `exit 1`, matching fmt-check:api's convention above:
+      # 2 = the instrument is broken, 1 = there are findings. `task`'s own rc is
+      # 201 for both, so the recipe is the only place that distinction can live.
+      #
+      # LITERAL REF, NEVER A VARIABLE. `git check-ref-format --branch` accepts
+      # `a;b`, `a$b`, backticks, `a|b`, `a&b`, `a(b)` as branch names - only a
+      # space is rejected - and anyone who can open an MR chooses the target
+      # branch, so `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen
+      # string with live metacharacters. Quoted here even though it is a literal.
+      - 'git rev-parse --verify -q "origin/main^{commit}" >/dev/null || { echo "lint: origin/main is unresolvable. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fetch it first (CI: GIT_DEPTH=0 plus an explicit git fetch)." >&2; exit 2; }'
+      # `config verify` AHEAD OF THE RUN: it is the positive control on the config
+      # this target's whole behaviour is delegated to. Exits 0 SILENTLY on a valid
+      # file and 3 with a named error otherwise - measured 2026-08-02 at 2.12.2, a
+      # bogus sibling key gives rc=3 and `additional properties 'no-such-key' not
+      # allowed`, so the green means something rather than merely meaning the
+      # parser did not crash. Cheap: ~0.9s warm.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
+      # PINNED `go run`, NOT A PREINSTALLED BINARY AND NOT THE OFFICIAL IMAGE.
+      # Written out in full rather than through a Taskfile var, deliberately: the
+      # header's echo property is what makes a version pin going missing VISIBLE,
+      # and it is the only such property this target still has (see the ratchet
+      # note at the top of this comment).
+      #   - Same shape as the `sqlc@v1.30.0` precedent already in validate:api.
+      #   - It pins the version IDENTICALLY local and in CI, which is what kills
+      #     the unpinned-local-binary divergence: a contributor's brew
+      #     golangci-lint drifts on its own schedule and would disagree with CI
+      #     about what a finding is.
+      #   - It does NOT touch api/go.mod. `go run pkg@version` resolves in its own
+      #     module context; verified, `git status -- api/go.mod api/go.sum` is
+      #     clean after a run. `go get -tool` would instead write golangci-lint's
+      #     whole dependency tree into api/go.mod, and this repo keeps that file
+      #     deliberately clean - the separate controller module exists precisely so
+      #     k8s.io/client-go stays out of it.
+      #   - NOT the official golangci/golangci-lint image: it ships Go 1.26.2 with
+      #     GOTOOLCHAIN=auto against both modules' `go 1.26.4`, so it would make
+      #     lint the first job in this pipeline whose effective toolchain is
+      #     FETCHED rather than pinned. The golang:1.26 image CI already pins is
+      #     1.26.4 with GOTOOLCHAIN=local.
+      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64 with isolated
+      # GOMODCACHE+GOCACHE: 51.6s COLD (first build of the dependency tree), then
+      # 1.77s and 0.89s WARM. CI persists both caches via .go_job's `cache:` keyed
+      # on api/go.sum, so the cold cost is per-cache-key, not per-pipeline.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+
+  lint:api:all:
+    desc: api - the UNFILTERED lint backlog, reported and never gating (PRD #103 Decision 4)
+    dir: api
+    cmds:
+      # NOT IN `gate`, NOT A CI JOB. `new-from-merge-base` reports nothing on a
+      # `main` pipeline (the merge-base of main with itself is main), so without
+      # this target the debt the ratchet defers would be uncountable.
+      #
+      # 🔴 THE FLAG NAME IS COUPLED TO THE CONFIG KEY AND THE TWO MOVE TOGETHER.
+      # An EMPTY `--new-from-merge-base=` is what clears a `new-from-merge-base`
+      # set in .golangci.yml. The two obvious alternatives DO NOT CLEAR IT and fail
+      # silently - measured 2026-08-02 on this tree against the shipped config:
+      #
+      #   --new-from-merge-base=  (empty)   rc=1   107 findings   <- cleared
+      #   --new-from-rev=         (empty)   rc=0     0 findings   <- STILL RATCHETED
+      #   --whole-files=false               rc=0     0 findings   <- STILL RATCHETED
+      #
+      # Neither of the last two errors. They yield a "full debt report" that is
+      # still filtered, so a companion target written either way reports `0 issues`
+      # over a module carrying 107 - the exact silent-green shape PRD #103 exists
+      # to remove. If the config key is ever renamed, rename this flag with it.
+      #
+      # 🔴 BOTH CAP FLAGS OR THE NUMBER IS A CAP READING, AND THEY ARE NOT
+      # REDUNDANT. Defaults are 50 per linter and 3 per repeated message. Measured
+      # the same day on the shipped config: api reads 56 capped against 107
+      # uncapped (errcheck 36→79 is --max-same-issues, staticcheck 13→21 is
+      # --max-issues-per-linter), while `controller` reads 5 EITHER WAY. THE
+      # SMALLER MODULE AGREEING EXACTLY IS THE CAMOUFLAGE - anyone who
+      # sanity-checks "do the caps matter?" on the cheap module concludes no.
+      #
+      # No `origin/main` pre-flight here, deliberately: this target does not use
+      # the ref, so the guard would fail a run that is not exposed to the hazard.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
+
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
     dir: api
@@ -400,6 +524,38 @@ tasks:
     dir: controller
     cmds:
       - go build ./...
+
+  lint:controller:
+    desc: golangci-lint over the controller module (RATCHETED to origin/main - see .golangci.yml)
+    dir: controller
+    cmds:
+      # Same recipe, same config, same reasons - READ lint:api's comment before
+      # editing either. One root .golangci.yml serves both modules: golangci-lint
+      # walks UP from its working directory, and `dir:` here is what puts it inside
+      # the module. Verified from BOTH module directories before this shipped -
+      # `golangci-lint config path` prints `../.golangci.yml` from each, and the
+      # control run matters as much: before the file existed the same command
+      # printed `No config file detected`, so nothing stray was being resolved from
+      # outside the repo.
+      #
+      # This module ships with a SMALL backlog, not an empty one: 5 findings
+      # uncapped (3 staticcheck, 2 errcheck) as of 2026-08-02. Ratcheted it reports
+      # 0 today, which is not the same thing as there being nothing there - run
+      # `task lint:controller:all` to see it.
+      - 'git rev-parse --verify -q "origin/main^{commit}" >/dev/null || { echo "lint: origin/main is unresolvable. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fetch it first (CI: GIT_DEPTH=0 plus an explicit git fetch)." >&2; exit 2; }'
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+
+  lint:controller:all:
+    desc: controller - the UNFILTERED lint backlog, reported and never gating
+    dir: controller
+    cmds:
+      # See lint:api:all for why the empty `--new-from-merge-base=` is the only
+      # spelling that clears the config's ratchet, and why both cap flags are
+      # required. THIS is the module where the caps make no difference (5 either
+      # way) - which is exactly why a "do the caps matter?" check must be run
+      # against `api`, not here.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
   test:controller:
     desc: controller unit tests (-count=1)
