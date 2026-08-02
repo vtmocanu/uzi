@@ -7,7 +7,7 @@
   "main": "src/main.ts",
   "scripts": {
     "start": "tsx src/main.ts",
-    "lint": "oxlint --config .oxlintrc.json -D correctness src test",
+    "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test --test-timeout=30000 test/*.test.ts"
   },

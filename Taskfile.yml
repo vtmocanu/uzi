@@ -365,14 +365,36 @@ tasks:
       # finding IS - the exact divergence PRD #103 Success Criterion 1 exists to
       # prevent). One recipe, byte-identical locally and in CI, was worth the echo.
       #
-      # PRE-FLIGHT, AND IT IS NOT DEFENSIVE PADDING. If `origin/main` does not
-      # resolve, golangci-lint does NOT skip the ratchet and does NOT error: it
-      # emits ONE line - `level=warning msg="[runner] Can't process results by diff
+      # PRE-FLIGHT, AND IT IS NOT DEFENSIVE PADDING. If the ratchet cannot resolve
+      # its base, golangci-lint does NOT skip it and does NOT error: it emits ONE
+      # line - `level=warning msg="[runner] Can't process results by diff
       # processor…"` - and then reports the ENTIRE unfiltered backlog with exit 1.
       # It fails CLOSED, loudly, and in the most misleading possible way: the first
       # reader sees ~107 findings, concludes the branch broke something enormous,
       # and starts a burn-down when the fix is one `git fetch`. This line converts
       # that misleading red into an accurate one.
+      #
+      # 🔴 THE PREDICATE IS `git merge-base`, NOT `git rev-parse`, AND THE
+      # DIFFERENCE IS A REAL HOLE THAT SHIPPED FIRST. This guard was originally
+      # `git rev-parse --verify -q "origin/main^{commit}"`, which asks whether the
+      # REF EXISTS. What golangci-lint needs is a REACHABLE COMMON ANCESTOR - its
+      # own error text is `error executing "git merge-base origin/main HEAD"` - and
+      # those are not the same question on a SHALLOW clone, which is exactly what
+      # CI produces. Measured in a CI-shaped scratch repo (feature branch cloned
+      # --depth 1, then the lint job's own explicit fetch of main):
+      #
+      #   shallow?                                     YES
+      #   git rev-parse --verify origin/main^{commit}  rc=0   <- GUARD SATISFIED
+      #   git merge-base origin/main HEAD              rc=1   <- no common ancestor
+      #   after `git fetch --unshallow`                rc=0
+      #
+      # So the ref resolved, the old guard passed, and the run took precisely the
+      # misleading path the guard exists to prevent. `merge-base` STRICTLY SUBSUMES
+      # the old check rather than adding to it: on a MISSING ref it exits 128
+      # (measured), so the case rev-parse did catch is still caught, and it also
+      # catches the shallow case rev-parse cannot see. One predicate, both failures.
+      # Do not "restore" the rev-parse form or add it alongside - it tests a weaker
+      # premise than the thing it is guarding.
       #
       # `exit 2` NOT `exit 1`, matching fmt-check:api's convention above:
       # 2 = the instrument is broken, 1 = there are findings. `task`'s own rc is
@@ -383,7 +405,7 @@ tasks:
       # space is rejected - and anyone who can open an MR chooses the target
       # branch, so `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen
       # string with live metacharacters. Quoted here even though it is a literal.
-      - 'git rev-parse --verify -q "origin/main^{commit}" >/dev/null || { echo "lint: origin/main is unresolvable. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fetch it first (CI: GIT_DEPTH=0 plus an explicit git fetch)." >&2; exit 2; }'
+      - 'git merge-base "origin/main" HEAD >/dev/null 2>&1 || { echo "lint: no merge-base between origin/main and HEAD - either the ref is missing, or this is a SHALLOW clone whose history does not reach a common ancestor. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fix the history first (CI: GIT_DEPTH=0 plus an explicit git fetch; locally: git fetch origin main, and git fetch --unshallow origin if the clone is shallow)." >&2; exit 2; }'
       # `config verify` AHEAD OF THE RUN: it is the positive control on the config
       # this target's whole behaviour is delegated to. Exits 0 SILENTLY on a valid
       # file and 3 with a named error otherwise - measured 2026-08-02 at 2.12.2, a
@@ -419,10 +441,20 @@ tasks:
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 
   lint:api:all:
-    desc: api - the UNFILTERED lint backlog, reported and never gating (PRD #103 Decision 4)
+    desc: api - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
     dir: api
     cmds:
-      # NOT IN `gate`, NOT A CI JOB. `new-from-merge-base` reports nothing on a
+      # 🔴 "NEVER GATING" MEANS NOT WIRED INTO ANYTHING - IT DOES NOT MEAN THIS
+      # TARGET EXITS 0. golangci-lint exits 1 whenever it reports a finding, so on
+      # a module with a backlog this target returns `task` rc=201, every time, by
+      # design. The two claims are independent and the `desc:` used to assert only
+      # the first, which reads as the second. Anyone who wraps this target, or adds
+      # a reporting job around it later, gets a red pipeline from something
+      # documented as non-gating - so if you build such a job, it needs an explicit
+      # `|| true` (or `allow_failure: true`) and a comment saying why.
+      #
+      # NOT IN `gate`, NOT IN THE COMPOSITE `lint`, NOT A CI JOB.
+      # `new-from-merge-base` reports nothing on a
       # `main` pipeline (the merge-base of main with itself is main), so without
       # this target the debt the ratchet defers would be uncountable.
       #
@@ -440,12 +472,35 @@ tasks:
       # over a module carrying 107 - the exact silent-green shape PRD #103 exists
       # to remove. If the config key is ever renamed, rename this flag with it.
       #
-      # 🔴 BOTH CAP FLAGS OR THE NUMBER IS A CAP READING, AND THEY ARE NOT
-      # REDUNDANT. Defaults are 50 per linter and 3 per repeated message. Measured
-      # the same day on the shipped config: api reads 56 capped against 107
-      # uncapped (errcheck 36→79 is --max-same-issues, staticcheck 13→21 is
-      # --max-issues-per-linter), while `controller` reads 5 EITHER WAY. THE
-      # SMALLER MODULE AGREEING EXACTLY IS THE CAMOUFLAGE - anyone who
+      # 🔴 BOTH CAP FLAGS OR THE NUMBER IS A CAP READING. Defaults are 50 per
+      # linter and 3 per repeated message. THEY COMPOSE IN ORDER; NEITHER "OWNS" A
+      # LINTER. Measured on the shipped config, `cache clean` first, each flag
+      # isolated:
+      #
+      #   --new-from-merge-base=                            56   errcheck 36  staticcheck 13
+      #   + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
+      #   + --max-same-issues=0                             78   errcheck 50  staticcheck 21
+      #   both                                             107   errcheck 79  staticcheck 21
+      #
+      # `--max-same-issues` folds duplicate MESSAGES first; `--max-issues-per-linter`
+      # then truncates the survivors at 50. So on this config `--max-issues-per-
+      # linter=0` ALONE IS A COMPLETE NO-OP - nothing exceeds 50 until the fold is
+      # lifted - and errcheck only clears 50 once the other flag has fired.
+      #
+      # 🔴 WHICH MAKES THE OBVIOUS "IS THE SECOND FLAG LOAD-BEARING?" CHECK A TRAP.
+      # Add `--max-issues-per-linter=0` on its own, see 56 -> 56, conclude it does
+      # nothing, delete it: errcheck then reads 50 forever, which is exactly the cap
+      # reading this paragraph exists to prevent.
+      #
+      # (Corrected 2026-08-02. This comment first read "errcheck 36→79 is
+      # --max-same-issues, staticcheck 13→21 is --max-issues-per-linter",
+      # attributing each delta to one flag from a 2-cell measurement that could not
+      # separate them. Refuted by a 2x2 and re-derived by the lead in the matrix
+      # above. The wrong version propagated out of THIS FILE into a PRD carry-forward
+      # before anyone re-measured, which is the real cost: a comment is a citation
+      # source, so an unsupported figure here does not stay here.)
+      #
+      # `controller` reads 5 EITHER WAY, AND THAT IS THE CAMOUFLAGE - anyone who
       # sanity-checks "do the caps matter?" on the cheap module concludes no.
       #
       # No `origin/main` pre-flight here, deliberately: this target does not use
@@ -541,7 +596,9 @@ tasks:
     dir: controller
     cmds:
       # Same recipe, same config, same reasons - READ lint:api's comment before
-      # editing either. One root .golangci.yml serves both modules: golangci-lint
+      # editing either, INCLUDING the paragraph on why the pre-flight predicate is
+      # `git merge-base` and not `git rev-parse`. One root .golangci.yml serves both
+      # modules: golangci-lint
       # walks UP from its working directory, and `dir:` here is what puts it inside
       # the module. Verified from BOTH module directories before this shipped -
       # `golangci-lint config path` prints `../.golangci.yml` from each, and the
@@ -553,14 +610,17 @@ tasks:
       # uncapped (3 staticcheck, 2 errcheck) as of 2026-08-02. Ratcheted it reports
       # 0 today, which is not the same thing as there being nothing there - run
       # `task lint:controller:all` to see it.
-      - 'git rev-parse --verify -q "origin/main^{commit}" >/dev/null || { echo "lint: origin/main is unresolvable. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fetch it first (CI: GIT_DEPTH=0 plus an explicit git fetch)." >&2; exit 2; }'
+      - 'git merge-base "origin/main" HEAD >/dev/null 2>&1 || { echo "lint: no merge-base between origin/main and HEAD - either the ref is missing, or this is a SHALLOW clone whose history does not reach a common ancestor. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fix the history first (CI: GIT_DEPTH=0 plus an explicit git fetch; locally: git fetch origin main, and git fetch --unshallow origin if the clone is shallow)." >&2; exit 2; }'
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 
   lint:controller:all:
-    desc: controller - the UNFILTERED lint backlog, reported and never gating
+    desc: controller - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
     dir: controller
     cmds:
+      # Exits nonzero whenever it reports anything, exactly like lint:api:all -
+      # read that target's first paragraph before wrapping either.
+      #
       # See lint:api:all for why the empty `--new-from-merge-base=` is the only
       # spelling that clears the config's ratchet, and why both cap flags are
       # required. THIS is the module where the caps make no difference (5 either
@@ -605,6 +665,25 @@ tasks:
       #                             so a target without this flag is a lint job that
       #                             CAN NEVER FAIL. Measured: the bare invocation
       #                             exits 0 on web's 6 findings.
+      #   --report-unused-disable-directives-severity=error
+      #                             🔴 A SUPPRESSION THAT NO LONGER SUPPRESSES
+      #                             ANYTHING IS INVISIBLE WITHOUT THIS, and it reads
+      #                             to every later reviewer as a live, justified
+      #                             one. That is the vacuous-negative class arriving
+      #                             through a COMMENT instead of an assertion - the
+      #                             same shape .claude/agent-team.md records for a
+      #                             negative assertion on retired copy. This MR ships
+      #                             11 new directives, so the exposure is its own.
+      #                             Measured on this tree: a directive for a rule
+      #                             that does not fire gives rc=1 and `Unused
+      #                             eslint-disable directive (no problems were
+      #                             reported)`, while the SAME tree without the flag
+      #                             gives rc=0 and prints nothing. The plain
+      #                             `--report-unused-disable-directives` form only
+      #                             WARNS, and a warning does not set the exit code
+      #                             here either - the `-severity=error` suffix is
+      #                             the whole point. Verified it does not fire on
+      #                             any of the 13 live directives in this repo.
       #
       # AND THIS FLAG IS NOT THE GUARD FOR `rules-of-hooks`, which is what this
       # milestone exists for: that rule is `pedantic`, not `correctness`, so

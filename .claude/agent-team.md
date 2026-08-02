@@ -1327,6 +1327,26 @@ lint           task lint           # composite, all four components (M5 will app
                                    # a pre-flight that exits 2 saying so; if you see
                                    # it, `git fetch origin main` -- do not start a
                                    # burn-down.
+                                   # 🔴 AND golangci-lint TAKES A HOST-GLOBAL LOCK,
+                                   # not just a host-global cache. If you see
+                                   # `Error: parallel golangci-lint is running` with
+                                   # `exit status 3`, ANOTHER WORKTREE HOLDS IT --
+                                   # RE-RUN, DO NOT REPORT A RED GATE. This repo is a
+                                   # bare clone with many sibling worktrees and this
+                                   # team runs agents concurrently by design, so the
+                                   # collision is normal rather than exceptional. It
+                                   # fails SAFE (false red, never false green), but
+                                   # 🔴 THE STATUS CANNOT DISTINGUISH IT FROM A REAL
+                                   # FINDING. golangci-lint exits 3; `go run` prints
+                                   # that as the TEXT `exit status 3` and then exits
+                                   # **1** itself (measured on a 3-exiting program),
+                                   # and 1 is this file's "there are findings" code.
+                                   # So the 3 never reaches the exit code at all,
+                                   # `task` reports its usual 201, and an automated
+                                   # reader testing `!= 0` -- or even reading the
+                                   # status carefully -- records a red gate over
+                                   # code that is fine. THE ONLY DISCRIMINATOR IS
+                                   # THE MESSAGE TEXT. Read it.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
                                    # still runs inside gate:api / gate:controller as
                                    # its OWN unratcheted step and is deliberately NOT

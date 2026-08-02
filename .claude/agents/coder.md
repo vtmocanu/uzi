@@ -79,7 +79,12 @@ meet first. `task lint:api:all` / `lint:controller:all` print the unfiltered
 backlog (107 and 5 as of 2026-08-02); they are reported, never gating, and are
 not in `task gate`. If a lint target dies with `origin/main is unresolvable`,
 run `git fetch origin main` — **do not read the backlog it would otherwise
-print as your branch's findings.** *(PRD #103 M3, 2026-08-02: this paragraph
+print as your branch's findings.** And if a Go lint target prints
+`Error: parallel golangci-lint is running`, a sibling worktree holds the
+host-global lock: **re-run, do not report a red gate.** That one is invisible to
+the exit code — golangci-lint exits 3, `go run` prints it as text and exits **1**
+itself, which is the "there are findings" status — so the message text is the
+only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
 said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go
 hunting for a lint command; there isn't one". M3 landed golangci-lint for both
 Go modules and oxlint for both npm packages.)* `fmt-check:api` /
