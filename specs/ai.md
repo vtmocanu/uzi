@@ -15751,10 +15751,13 @@ must reproduce, most of which are invisible in a passing run.
   exactly as live as before. Measured 2026-08-02 by extracting each branch's `api/` with
   `git archive` into a temp dir: non-empty on **every local branch but two**, and the sample
   was all of them. No count is recorded, deliberately — it moves with every commit and the
-  shape is the point. *(This bullet first said "five live branches", taken from the branches
-  that happened to have worktrees. True, and an understatement by several-fold that reads as
-  an enumeration.)* A claim true of one tree, written as a claim about the repo, is the defect
-  this milestone corrected twice in its own documentation.
+  shape is the point. *(This bullet first said "five live branches", from a sample narrower
+  than the population — an understatement that reads as an enumeration. **How much narrower is
+  not recoverable, and the obvious explanation is false**: this repo has 18 worktrees, not
+  five, so "the branches that happened to have worktrees" — asserted here until 2026-08-02 —
+  names a set larger than the population it was offered to explain, not smaller.)* A claim true
+  of one tree, written as a claim about the repo, is the defect this milestone corrected twice
+  in its own documentation.
 - **Never a root-scoped `gofmt -l .`; the composite COMPOSES the two per-module targets.** A
   repo-root walk descends into dot-directories, and CI's `.go_job` puts `GOPATH` and `GOCACHE`
   under `$CI_PROJECT_DIR` and runs `go mod download` before any script line — so a root-scoped
