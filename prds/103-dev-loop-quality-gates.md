@@ -857,7 +857,12 @@ which previously prescribed only the fail-open form.
       **SCOPE RULING — correctness-only.** Type-aware linting becomes **its own
       issue**: 37 + 178 = 215 findings with a real burn-down, and **119 of web's
       are one shape** (`onClick={asyncHandler}`), which is a behavioural refactor
-      rather than a lint adoption and must not ride in on a tooling MR. Pedantic
+      rather than a lint adoption and must not ride in on a tooling MR. **The
+      mechanism, so nobody reads 119 as mechanical:** wrapping a promise-returning
+      handler to satisfy the rule changes what happens to a REJECTION — the
+      rejection stops being the returned promise's and becomes unhandled, or gets
+      swallowed by whatever the wrapper does with it. That is 119 opportunities to
+      change error behaviour under cover of a lint fix. Pedantic
       is dead on arrival at **3,015 combined**, with `no-inline-comments` alone at
       **474** in a repo whose inline comments are mostly load-bearing recorded
       evidence.
