@@ -118,7 +118,8 @@ independently in each.
   repo.** It was removed in `027a4b88` (2026-07-21), the commit immediately
   after this PRD's last edit. Its replacement, `# no golangci-lint, no eslint;
   go vet in CI only`, rotted the same way in turn: M1 itself rewrote that
-  comment while landing (Success Criterion 4). Cite the slot, not its
+  comment while landing (the criterion governing this slot, SC3 — a target
+  name replaced a command line, per Decision 9). Cite the slot, not its
   wording, for exactly the reason this bullet exists — the paste-block's
   `lint` slot in `.claude/agent-team.md`. The underlying complaint still
   holds; the evidence cited for it does not, twice over now.
@@ -300,10 +301,14 @@ New stage between `validate` and `test`, with `lint:api`, `lint:controller`,
 invokes the same `task` target a contributor runs locally.
 
 **The stage is organisational, not ordering.** All nine existing toolchain gate
-jobs (`validate:api`, `test:api`, `test:api-store-it`, `validate:controller`,
+jobs — `validate:api`, `test:api`, `test:api-store-it`, `validate:controller`,
 `test:controller`, `validate:web`, `test:web`, `validate:agent`, `test:agent` —
-the set M1 rewires) set `needs: []`, so they start immediately regardless of
-stage. A new `lint` stage
+set `needs: []`, so they start immediately regardless of stage. **Eight of the
+nine are the set M1 rewires into `task` targets; `test:api-store-it` is the
+exception** — it inherits `.task_setup` but invokes no `task` target, since its
+pipefail + `grep -c '^--- PASS'` assertion is CI-specific and stays inline (see
+the two-jobs-keep-their-current-shape note in M1's Files section). A new `lint`
+stage
 therefore does **not** make lint gate test — everything still runs concurrently
 and the pipeline fails if any job fails. Stated because the placement "between
 `validate` and `test`" reads as sequencing and is not.
@@ -333,7 +338,7 @@ intuitive one and it will be re-proposed otherwise:
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
 | `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
 | `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
-| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified: 37 and 40 exit 0, 36 and 0 exit 1; **errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. See the TypeScript paragraph below. |
+| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified on a **37-warning corpus**: 37 and 40 exit 0, 36 and 0 exit 1 — the pass/fail boundary at 36→37 is what fixes the corpus size, since the flag is inclusive; this is a different corpus from the 10/6/16 correctness-tier debt below, not yet re-verified against it. **Errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. See the TypeScript paragraph below. |
 | `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
 So each milestone states its own mechanism rather than inheriting a shared
@@ -369,8 +374,12 @@ across oxlint 1.70.0, 1.73.0, 1.75.0 and 1.76.0. That is
 an afternoon, not a burn-down, so **M3 fixes them** rather than recording them.
 
 **oxlint does have a ratchet, and its limit is worth stating before someone leans on
-it.** `--max-warnings <n>` is a count budget: verified at 37 and 40 exiting 0 and at
-36 and 0 exiting 1, with errors failing regardless of the budget. **A count cannot
+it.** `--max-warnings <n>` is a count budget: verified on a **37-warning corpus** —
+37 and 40 exiting 0, 36 and 0 exiting 1, with errors failing regardless of the
+budget. That corpus is not the 10/6/16 correctness-tier debt measured above; the
+flag's own boundary semantics (exits 0 iff warnings ≤ n) is what pins the corpus
+size at 37, and it has not been re-verified against the debt this PRD now ships
+against. **A count cannot
 distinguish a fixed finding from a new one**, so it permits churn under the cap —
 fix one old finding, add one new, still green. It is a regression brake, not a
 ratchet, and it is the honest reason the fix-them-now route is preferred here.
@@ -453,8 +462,9 @@ previously read "ESLint … pending one verification" and deferred to oxlint onl
 worked around, exactly as the previous text instructed.)*
 
 The hooks rules are still the highest-value TypeScript lint available here, and
-`tsc` cannot express them. What changed is which tool provides them. Measured by
-the researcher, with the hooks-parity half re-verified independently by the lead:
+`tsc` cannot express them. What changed is which tool provides them. Measured at
+oxlint 1.76.0 (the same install used throughout this PRD's oxlint measurements)
+by the researcher, with the hooks-parity half re-verified independently by the lead:
 
 - **Identical findings to ESLint on `web/src`** — 2 each, same files, same missing
   dependency.
@@ -566,7 +576,7 @@ implementation time" and the MR description carries the value. Arguments must
 survive the count changing — Decision 5's is a good example, since it holds
 for any non-empty drift list. Where a decision needs a fixed-experiment
 number instead, date it and name the tool version, the way Decisions 1, 2 and
-8 do.
+4 do.
 
 **11. No line anchor into any file this PRD's milestones edit appears in this
 document, and a commit SHA is not a provenance citation on its own.**
@@ -667,7 +677,7 @@ which previously prescribed only the fail-open form.
       > Taskfile, the CI rewire and the supply chain all passed. The three blocking
       > findings were documentation, two of them in this file, and all three are
       > fixed: Decision 11 was false in its own document (six live
-      > `.gitlab-ci.yml` anchors, one of them M1's own flag table); all three copies
+      > `.gitlab-ci.yml` anchors, one of them M1's own flag table); every copy
       > of the provenance command lacked `--oneline`; and `CLAUDE.md` carried a
       > standing unqualified SHA citation.
       >
@@ -910,7 +920,12 @@ which previously prescribed only the fail-open form.
       pipelines and that debt is otherwise uncountable. Go burn-down gets its own
       issue.
 
-      **SCOPE RULING — correctness-only.** Type-aware linting becomes **its own
+      **SCOPE RULING — correctness-only.** *(Figures below are the fixed-experiment
+      kind Decision 10 exempts from the count ban, but the date and tool version
+      they were measured under were never recorded at the time — flagged rather
+      than backfilled, since backfilling a date onto a measurement nobody dated
+      would manufacture a precision that is not there. Re-measure at M3
+      implementation time and stamp it then.)* Type-aware linting becomes **its own
       issue**: 37 + 178 = 215 findings with a real burn-down, and **119 of web's
       are one shape** (`onClick={asyncHandler}`), which is a behavioural refactor
       rather than a lint adoption and must not ride in on a tooling MR. **The
@@ -921,7 +936,14 @@ which previously prescribed only the fail-open form.
       change error behaviour under cover of a lint fix. Pedantic
       is dead on arrival at **3,015 combined**, with `no-inline-comments` alone at
       **474** in a repo whose inline comments are mostly load-bearing recorded
-      evidence.
+      evidence. **A later fact-check independently measured the pedantic combined
+      total at 2,976** (web `src` 1684 + agent `src test` 1292), against this
+      section's 3,015 — and nothing recorded here lets a reader decide which is
+      right. That is the finding, not the gap itself: `no-inline-comments`'s 474
+      reproduces exactly as 246 + 228, which is the tell that whatever moved is
+      scope or oxlint-version drift between the two runs, not an arithmetic slip
+      in either one. Do not silently adopt either number; re-measure at M3 and
+      record the version and invocation that produced whichever total lands.
 
       **Precondition**: ~~resolve Open Question 2~~ — **RESOLVED 2026-08-02**, see
       Decision 8. Nothing blocks M3 now.

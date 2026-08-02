@@ -16,7 +16,7 @@ import { nullLogger } from "./helpers.js";
 // even though it is right for the skills tests further down, which do need real files.
 // Uniqueness is a RACE FIX: skillsPluginDir() derives `<dirname>/.uzi-skills-<basename>`
 // as a SIBLING, the executor materializes that directory, and `node --test` runs test
-// FILES concurrently. This file and ask-user-executor.test.ts both used the literal
+// FILES concurrently. This file and sdk-executor.test.ts both used the literal
 // "/tmp/does-not-need-to-exist", so both drove the identical plugin dir and raced:
 // measured 1 failure in 6 on the isolated pair, surfacing as ENOTEMPTY from one file's
 // recursive remove or ENOENT from the other's mkdir. Two different literals would have
