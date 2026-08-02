@@ -1225,11 +1225,19 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
   `ai.md` = AI design decisions)
 - Authoring rules: `CLAUDE.md` at the repo root (commands, architecture map,
   conventions); plan.md is the working plan
-- CI: real (`.gitlab-ci.yml`, PRD #52) — validate/test across api/web/agent +
-  `helm lint`/`template` + kaniko image validation builds on every MR and
-  `main`; `v*` tags additionally publish the images + OCI chart to Harbor. e2e
-  is deliberately NOT in CI (it needs docker compose on the runner) — it stays
-  the local pre-merge gate. Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
+- CI: real (`.gitlab-ci.yml`, PRD #52) — validate/test across **api, controller,
+  web and agent** (four toolchains, not three: `controller/` is its own Go module
+  with its own jobs) + `helm lint`/`template` + kaniko image validation builds on
+  every MR and `main`; `v*` tags additionally publish the images + OCI chart to
+  Harbor. Since PRD #103 M1 each gate job invokes the same `task` target you run
+  locally. **The compose e2e harness (`./e2e/run-e2e.sh`) is deliberately NOT in
+  CI** (it needs docker compose on the runner), so it stays a purely local
+  pre-merge gate. **`./scripts/smoke.sh` is a different case and the old wording
+  here collapsed them:** `e2e:kind-smoke` stands up a KinD cluster, installs the
+  chart and runs it — but only on PROTECTED refs (`main` and tags), never on an MR
+  pipeline. So smoke is a POST-merge gate in CI and a pre-merge gate only locally.
+  Run both locally before merging; a green MR pipeline is not smoke having passed.
+  Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
   use `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
