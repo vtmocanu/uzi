@@ -21,17 +21,22 @@ type reviewState struct {
 	open    bool
 	loading bool
 	review  *apitypes.ReviewDTO
-	err     error
-	cursor  int
+	// pendingJudge is the active judge run for this target (PRD #119): a verdict on
+	// its way. Held next to review rather than inside it because it is present
+	// precisely when review is often nil.
+	pendingJudge *apitypes.PendingJudgeDTO
+	err          error
+	cursor       int
 	// pendingDismiss is the recommendation awaiting a dismiss-reason keystroke.
 	pendingDismiss string
 	notice         string
 }
 
 type reviewLoadedMsg struct {
-	runID  string
-	review *apitypes.ReviewDTO
-	err    error
+	runID        string
+	review       *apitypes.ReviewDTO
+	pendingJudge *apitypes.PendingJudgeDTO
+	err          error
 }
 
 type dispositionDoneMsg struct {
@@ -42,8 +47,8 @@ type dispositionDoneMsg struct {
 func (m tuiModel) loadReviewCmd(runID string) tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
-		rv, err := c.RunReview(ctx, runID)
-		return reviewLoadedMsg{runID: runID, review: rv, err: err}
+		rv, pj, err := c.RunReview(ctx, runID)
+		return reviewLoadedMsg{runID: runID, review: rv, pendingJudge: pj, err: err}
 	}
 }
 
@@ -156,6 +161,12 @@ func (m tuiModel) renderReviewOverlay() string {
 		return sb.String()
 	case r.err != nil:
 		sb.WriteString(m.pal.faint.Render("could not load the review: " + fmtErr(r.err)))
+		return sb.String()
+	case r.review == nil && r.pendingJudge != nil:
+		// A judge is already in flight, so "has not been judged" would be answering
+		// the wrong question. State is the server's closed display vocabulary, not
+		// judge free text, so it is safe to branch on (pendingJudgePhrase).
+		sb.WriteString(m.pal.faint.Render("a judge is " + pendingJudgePhrase(r.pendingJudge.State) + " for this run"))
 		return sb.String()
 	case r.review == nil:
 		sb.WriteString(m.pal.faint.Render("this run has not been judged"))

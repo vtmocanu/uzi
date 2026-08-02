@@ -31,13 +31,48 @@ func TestFakeReviewTriState(t *testing.T) {
 		"judged":   {Verdict: "good"},
 		"unjudged": nil,
 	}}
-	if rv, err := f.RunReview(context.Background(), "judged"); err != nil || rv == nil {
+	if rv, _, err := f.RunReview(context.Background(), "judged"); err != nil || rv == nil {
 		t.Fatalf("judged: rv=%v err=%v", rv, err)
 	}
-	if rv, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil {
+	if rv, _, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil {
 		t.Fatalf("unjudged: want (nil,nil), got rv=%v err=%v", rv, err)
 	}
-	if _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
+	if _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
+		t.Fatalf("absent: exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
+	}
+}
+
+// PendingJudges is a SEPARATE axis from the tri-state above (PRD #119): it decides
+// whether a verdict is on its way, never whether the run is found. Both nil-review
+// cases — with and without a pending judge — stay exit-0 reads, and a pending judge
+// rides alongside a PRESENT review too (a re-judge in flight).
+func TestFakePendingJudgeIsIndependentOfReview(t *testing.T) {
+	f := &FakeClient{
+		Reviews: map[string]*apitypes.ReviewDTO{
+			"pending":  nil,
+			"unjudged": nil,
+			"rejudge":  {Verdict: "good"},
+		},
+		PendingJudges: map[string]*apitypes.PendingJudgeDTO{
+			"pending": {State: "scheduled"},
+			"rejudge": {State: "running"},
+		},
+	}
+	rv, pj, err := f.RunReview(context.Background(), "pending")
+	if err != nil || rv != nil || pj == nil || pj.State != "scheduled" {
+		t.Fatalf("pending: want (nil, scheduled, nil), got rv=%v pj=%+v err=%v", rv, pj, err)
+	}
+	if rv, pj, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil || pj != nil {
+		t.Fatalf("unjudged: want (nil,nil,nil), got rv=%v pj=%+v err=%v", rv, pj, err)
+	}
+	rv, pj, err = f.RunReview(context.Background(), "rejudge")
+	if err != nil || rv == nil || pj == nil || pj.State != "running" {
+		t.Fatalf("rejudge: want (review, running, nil), got rv=%v pj=%+v err=%v", rv, pj, err)
+	}
+	// A pending judge does NOT rescue an absent Reviews key: only that map decides
+	// found-vs-404, exactly as before this field existed.
+	f.PendingJudges["absent"] = &apitypes.PendingJudgeDTO{State: "running"}
+	if _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("absent: exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
 }
@@ -122,9 +157,9 @@ func TestHTTPClientReviewNull(t *testing.T) {
 		w.Write([]byte(`{"review":null}`))
 	}))
 	defer srv.Close()
-	rv, err := newTestClient(srv).RunReview(context.Background(), "r1")
-	if err != nil || rv != nil {
-		t.Fatalf("null review: want (nil,nil), got rv=%v err=%v", rv, err)
+	rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	if err != nil || rv != nil || pj != nil {
+		t.Fatalf("null review: want (nil,nil,nil), got rv=%v pj=%v err=%v", rv, pj, err)
 	}
 }
 
@@ -133,9 +168,58 @@ func TestHTTPClientReviewPresent(t *testing.T) {
 		w.Write([]byte(`{"review":{"id":"rv1","verdict":"needs_work","status":"failed"}}`))
 	}))
 	defer srv.Close()
-	rv, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	rv, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if err != nil || rv == nil || rv.Verdict != "needs_work" || rv.Status != "failed" {
 		t.Fatalf("present review: rv=%+v err=%v", rv, err)
+	}
+}
+
+// The response is a TWO-key envelope since PRD #119: {"review", "pending_judge"},
+// each independently nullable. This pins all three shapes the server can send —
+// pending over no review (the auto-judge case), pending over a present review (a
+// re-judge in flight), and an explicit `"pending_judge": null` — because the field
+// exists precisely to tell the first apart from the third, and a decode that dropped
+// it would leave the CLI printing "not judged" at both.
+func TestHTTPClientReviewPendingJudge(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantRv    bool
+		wantState string // "" = want no pending judge
+	}{
+		{"pending over unjudged", `{"review":null,"pending_judge":{"state":"scheduled","enqueued_at":"2026-07-20T10:00:00Z"}}`, false, "scheduled"},
+		{"pending over a review", `{"review":{"id":"rv1","verdict":"good"},"pending_judge":{"state":"running","enqueued_at":"2026-07-20T10:00:00Z"}}`, true, "running"},
+		{"explicit null pending", `{"review":{"id":"rv1","verdict":"good"},"pending_judge":null}`, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if (rv != nil) != tc.wantRv {
+				t.Errorf("review present = %v, want %v", rv != nil, tc.wantRv)
+			}
+			if tc.wantState == "" {
+				if pj != nil {
+					t.Fatalf("pending_judge = %+v, want nil", pj)
+				}
+				return
+			}
+			if pj == nil {
+				t.Fatalf("pending_judge = nil, want state %q", tc.wantState)
+			}
+			if pj.State != tc.wantState {
+				t.Errorf("state = %q, want %q", pj.State, tc.wantState)
+			}
+			if pj.EnqueuedAt.IsZero() {
+				t.Errorf("enqueued_at did not decode: %+v", pj)
+			}
+		})
 	}
 }
 
@@ -147,7 +231,7 @@ func TestHTTPClientReview404(t *testing.T) {
 		w.Write([]byte(`{"error":"run not found"}`))
 	}))
 	defer srv.Close()
-	_, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	_, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
@@ -309,7 +393,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"list-runs", func(c *HTTPClient) error { _, e := c.ListRuns(context.Background()); return e }},
 		{"get-run", func(c *HTTPClient) error { _, e := c.GetRun(context.Background(), "r1"); return e }},
 		{"run-logs", func(c *HTTPClient) error { _, e := c.RunLogs(context.Background(), "r1", 0); return e }},
-		{"run-review", func(c *HTTPClient) error { _, e := c.RunReview(context.Background(), "r1"); return e }},
+		{"run-review", func(c *HTTPClient) error { _, _, e := c.RunReview(context.Background(), "r1"); return e }},
 		{"run-inputs", func(c *HTTPClient) error { _, e := c.RunInputs(context.Background(), "r1"); return e }},
 		{"list-workers", func(c *HTTPClient) error { _, e := c.ListWorkers(context.Background()); return e }},
 		{"list-repos", func(c *HTTPClient) error { _, e := c.ListRepos(context.Background()); return e }},

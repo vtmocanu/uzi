@@ -406,7 +406,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   }
 
   it("renders the verdict chip + recommendations for a judged run", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     expect(await screen.findByText("Issues found")).toBeTruthy();
@@ -421,6 +421,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // A rationale containing markup must appear as literal characters (React escapes
     // it) — proving no dangerouslySetInnerHTML / markdown parsing on judge output.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         summary_md: "<img src=x onerror=alert(1)> **not bold**",
         recommendations: [],
@@ -455,6 +456,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // survived four #124 commits in that blind spot. A field added to the DTO must be added
     // here too, or this case silently stops covering it.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         summary_md: `The review ${RLO}approved this change`,
         judge_model: `hai${RLO}ku`,
@@ -493,7 +495,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: null });
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     mockApi.rerunJudge.mockResolvedValue({
       run: run({ id: "judge1", kind: "judge", status: "queued" }),
     });
@@ -503,19 +505,523 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(screen.getByText(/hasn't been judged yet/i)).toBeTruthy();
     fireEvent.click(btn);
     expect(mockApi.rerunJudge).toHaveBeenCalledWith("r1");
-    expect(await screen.findByText(/re-queued/i)).toBeTruthy();
+    // "Judge re-queued" verbatim, and ONLY on this arm: the note is armed here by the
+    // local optimistic flag, set right after THIS tab's POST resolved and before any
+    // fetch has returned — the one place the panel actually knows the viewer re-queued
+    // it. Two matches because the sr-only live region carries the same sentence.
+    const requeued = await screen.findAllByText(
+      "Judge re-queued — the new verdict will appear here when it finishes.",
+    );
+    expect(requeued).toHaveLength(2);
   });
 
-  it("surfaces a re-run error", async () => {
+  // ── Pending judge (PRD #119) ──────────────────────────────────────────────────────────
+  // The panel's two "no verdict" causes are opposite affordances: nobody is judging this
+  // (offer the button) vs a judge is already coming (say so, and take the button away —
+  // its only possible outcome is the 409 from the one-active-judge-per-target index).
+  const pending = (state: "scheduled" | "running") => ({
+    state,
+    enqueued_at: "2026-03-01T00:00:00Z",
+  });
+
+  it("shows the scheduled copy and a disabled button for an unjudged run with a judge queued (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "failed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge scheduled" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    // Twice: the visible paragraph, and the sr-only live region that is the only thing
+    // announcing this state to a screen reader (the button carrying it is disabled, so
+    // it is out of the tab order and cannot be reached to hear the label).
+    expect(
+      screen.getAllByText("Judge scheduled — the verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    // The never-judged copy is the OTHER cause and must not appear for this one.
+    expect(screen.queryByText(/hasn't been judged yet/i)).toBeNull();
+    // The redundant click is gone: pressing the disabled button fires no POST.
+    fireEvent.click(btn);
+    expect(mockApi.rerunJudge).not.toHaveBeenCalled();
+  });
+
+  it("shows the in-progress copy and a disabled button once a worker has the judge (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("running") });
+    render(<JudgePanel run={run({ status: "failed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+    fireEvent.click(btn);
+    expect(mockApi.rerunJudge).not.toHaveBeenCalled();
+  });
+
+  // The live region itself, asserted by NAME rather than only through the two-match
+  // counts above: those pass for any second copy of the string, including a visible one.
+  // What a screen reader needs is specifically an sr-only polite status region that was
+  // ALREADY MOUNTED before the text arrived — a region created in the same render as its
+  // first message is typically silent, and looks perfectly correct in the DOM.
+  it("announces the pending state through an sr-only region mounted before its text (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const { rerender } = render(<JudgePanel run={run({ status: "failed" })} />);
+    await screen.findByText(/hasn't been judged yet/i);
+
+    const live = document.querySelector('span.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.getAttribute("aria-live")).toBe("polite");
+    // Mounted and EMPTY while nothing is in flight.
+    expect(live.textContent).toBe("");
+
+    // A judge appears on the next fetch: the SAME node gains the text, which is the
+    // change assistive tech announces.
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("running") });
+    rerender(<JudgePanel run={run({ id: "r2", status: "failed" })} />);
+    await screen.findByRole("button", { name: "Judge running…" });
+    expect(document.querySelector('span.sr-only[role="status"]')!.textContent).toBe(
+      "Judge in progress…",
+    );
+  });
+
+  // Exactly ONE region carries the sentence: two live regions on the same string make a
+  // screen reader say it twice, so the visible paragraph must stay purely visual.
+  it("does not double-announce the pending copy (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    await screen.findByRole("button", { name: "Judge scheduled" });
+
+    const regions = [...document.querySelectorAll('[role="status"][aria-live="polite"]')];
+    const carrying = regions.filter((r) => /A judge is scheduled/.test(r.textContent ?? ""));
+    expect(carrying).toHaveLength(1);
+    expect((carrying[0] as HTMLElement).classList.contains("sr-only")).toBe(true);
+  });
+
+  // The survives-a-reload case, and the reason it is asserted on a FRESH mount with no
+  // click in the test: before #119 the re-queued note and the disabled button came from a
+  // local flag that only existed in the tab that pressed the button, so any other viewer —
+  // or the same viewer after a reload — was re-offered an action that would only 409.
+  it("shows the re-judge-in-flight note over an existing verdict on a fresh mount (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("running") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    // NEUTRAL wording on this arm, and that is the point of asserting it on a fresh
+    // mount with no click: all the panel knows here is that the SERVER reports an active
+    // judge. It may have been auto-enqueued at the terminal transition, or started by
+    // another admin. "Judge re-queued" would tell this viewer they did something they
+    // did not do — and it is in the wrong tense besides, sitting next to a button that
+    // reads "Judge running…".
+    expect(
+      screen.getAllByText("A judge is running for this run — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    expect(screen.queryByText(/re-queued/i)).toBeNull();
+    // The existing verdict keeps rendering underneath it.
+    expect(screen.getByText("Issues found")).toBeTruthy();
+  });
+
+  // The scheduled sibling of the arm above: the note tracks pendingJudge.state, so it
+  // agrees with the button rather than describing a judge that is already running.
+  it("says SCHEDULED, not running, while the server-truth judge is still queued (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByRole("button", { name: "Judge scheduled" });
+    expect(
+      screen.getAllByText("A judge is scheduled for this run — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    expect(screen.queryByText(/re-queued/i)).toBeNull();
+  });
+
+  // The other arm, on the same panel state: once THIS tab has fired the POST — and only
+  // until the next fetch answers — "Judge re-queued" is an accurate claim and is kept
+  // verbatim. Same note, different sentence, because the two arms know different facts.
+  it("keeps the re-queued wording for this tab's own optimistic click (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockResolvedValue({
+      run: run({ id: "judge1", kind: "judge", status: "queued" }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(
+      await screen.findAllByText("Judge re-queued — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    // Not the neutral server-truth sentence: nothing on the wire said a judge is active.
+    expect(screen.queryByText(/A judge is (scheduled|running) for this run/)).toBeNull();
+  });
+
+  // The TOCTOU backstop. The button is disabled whenever the last fetch saw a pending
+  // judge, but that answer is point-in-time: an auto-judge can enqueue between the fetch
+  // and the click. That 409 is absorbed — re-fetch, converge to pending — because the user
+  // asked for a judge and a judge is running; that is not an error to show them.
+  it("absorbs the already-active 409 into a re-fetch that converges to the pending state (#119)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({ review: review(), pending_judge: pending("running") });
     mockApi.rerunJudge.mockRejectedValue(
       new ApiError(409, "a judge run is already in progress for this run"),
     );
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Re-run judge"));
-    expect(await screen.findByText(/already in progress/i)).toBeTruthy();
+
+    // The panel converged to the server's answer…
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    // …and the raw 409 never reached the user as an error.
+    expect(screen.queryByText(/already in progress/i)).toBeNull();
+  });
+
+  // The route answers 409 for a SECOND reason — ErrJudgeDisabled — and that one must still
+  // surface: a user who turned the judge off has to see why nothing happened. Absorbing
+  // every 409 would swallow it into a silent, pointless re-fetch.
+  it("still surfaces the judge-disabled 409 rather than absorbing it (#119)", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockRejectedValue(new ApiError(409, "run judging is disabled"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(await screen.findByText(/run judging is disabled/i)).toBeTruthy();
+  });
+
+  it("surfaces a non-409 re-run error", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockRejectedValue(new ApiError(500, "internal error"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(await screen.findByText(/internal error/i)).toBeTruthy();
+    // A failed enqueue leaves the action available — nothing is in flight.
+    const btn = await screen.findByRole("button", { name: "Re-run judge" });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // The poll, on fake timers SCOPED to this test (every JudgePanel test that uses them
+  // restores real timers in a finally). This is the happy path where the swap and the stop
+  // coincide: one response carries both the new verdict and a cleared pending_judge. The
+  // two are independent, though — a stop with no swap is the next case, and a swap with no
+  // stop is "keeps polling while the judge is still active" below — so read this one as
+  // "the verdict reaches the panel", not as "a landed verdict is what ends the poll" (it
+  // is not: only a cleared pending_judge or the cap stops it).
+  it("polls while a judge is pending and swaps to the verdict when it lands (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        .mockResolvedValue({
+          review: review({ updated_at: "2026-03-02T00:00:00Z" }),
+          pending_judge: null,
+        });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(screen.getByText("Issues found")).toBeTruthy();
+      expect(screen.getByText("Lost time to a missing tool.")).toBeTruthy();
+      // Pending cleared, so the action is offered again.
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling when a judge leaves the active set without producing a review (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // A judge that fails/cancels: pending_judge clears and updated_at never moves,
+      // because there is no review at all. Only the cleared pending can end this poll.
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("scheduled") })
+        .mockResolvedValue({ review: null, pending_judge: null });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(
+        screen.getAllByText("Judge scheduled — the verdict will appear here when it finishes."),
+      ).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      // Back to the genuine never-judged state, with a live button.
+      expect(screen.getByText(/hasn't been judged yet/i)).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Run judge" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+
+      // And the poll really stopped: no further fetches after the stop condition.
+      const callsAfterStop = mockApi.getRunReview.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview.mock.calls.length).toBe(callsAfterStop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The reload-mid-re-judge journey, which is the headline case #119 exists for: the poll
+  // now starts from SERVER truth, so it can begin on a mount that already has a verdict on
+  // screen. The baseline the poll compares against therefore has to be seeded by the FETCH,
+  // not only by a click — otherwise tick 1 compares the old, already-displayed verdict
+  // against a null baseline, calls it "landed", and kills the interval on its first tick
+  // while the judge that will actually replace it is still running.
+  it("keeps polling across ticks that re-serve the SAME old verdict on a fresh mount (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      const old = review({ updated_at: "2026-03-01T00:00:00Z", summary_md: "The old verdict." });
+      mockApi.getRunReview.mockResolvedValue({ review: old, pending_judge: pending("running") });
+      render(<JudgePanel run={run({ status: "completed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // Three ticks that all re-serve the SAME verdict with the judge still active. The
+      // poll must survive every one of them: nothing has changed since the mount fetch.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(12_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(4);
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+
+      // Now the judge finishes and the new verdict lands.
+      mockApi.getRunReview.mockResolvedValue({
+        review: review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." }),
+        pending_judge: null,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      expect(screen.queryByText("The old verdict.")).toBeNull();
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+      // Pending cleared, so the poll is done.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The ordering the API actually has: PostReview authorizes against the caller's STILL
+  // ACTIVE judge run (workersvc/judge_review.go authorizeJudgeTrace), so the review row is
+  // written BEFORE the judge leaves the active set — the worker reports completion later.
+  // A tick landing in that window legitimately sees (fresh review, pending_judge non-null),
+  // and it must swap the panel WITHOUT stopping: stopping there freezes a disabled
+  // "Judge running…" button over the verdict that already arrived.
+  it("swaps to a landed verdict but keeps polling while the judge is still active (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh = review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." });
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        // Tick 1: the verdict is written, the judge run has not gone terminal yet.
+        .mockResolvedValueOnce({ review: fresh, pending_judge: pending("running") })
+        // Tick 2+: the worker's completion report landed.
+        .mockResolvedValue({ review: fresh, pending_judge: null });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      // The verdict swapped in…
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      // …and the panel still reports the judge as active, because the server does.
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // The poll did NOT stop on the landed verdict: tick 2 runs and sees pending clear.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(3);
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+
+      // …and once pending cleared, it stopped.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── The 150-try cap (#119) ────────────────────────────────────────────────────────────
+  // The cap is the LAST stop condition: a judge that neither produces a verdict nor leaves
+  // the active set would otherwise be polled every 4s for the life of the tab. 150 × 4s ≈
+  // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
+  // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
+  // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // ONE object, reused for every response: setPendingJudge with an identical reference
+      // lets React bail out of the re-render, so this is 150 ticks of poll, not 150 renders.
+      const stuck = { review: null, pending_judge: pending("running") };
+      mockApi.getRunReview.mockResolvedValue(stuck);
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The mount fetch, and nothing else yet.
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+
+      // One tick short of the cap: still polling.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(149 * 4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+
+      // The 150th tick trips the cap.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+
+      // And it is really over — half an hour of ticks adds nothing. Without the cap the
+      // interval would keep firing, because `polling` stays true while pendingJudge holds
+      // its last non-null value: the effect never re-runs, so its cleanup never runs.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
+  // `!next` branch — and one that could not have existed before #119. The effect used to
+  // key on `queued` alone, so `setQueued(false)` re-ran the effect and the cleanup stopped
+  // the timer. Now it keys on `polling = queued || pendingJudge !== null`, which stays TRUE
+  // over a permanently-failing endpoint (pendingJudge keeps its last non-null value and no
+  // response ever arrives to change it). The explicit clearInterval there is the ONLY thing
+  // that ever stops a /review that fails forever.
+  it("stops after the same 150-try cap when every poll tick FAILS (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // The mount fetch must SUCCEED and report a pending judge, or the poll never arms.
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        .mockRejectedValue(new Error("network down"));
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+      // The in-flight state the panel is showing while the endpoint is dead — the reason
+      // the failure is swallowed rather than banner-ed.
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(149 * 4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+
+      // 🔴 This is the assertion that reddens if the `clearInterval` in the `!next` branch
+      // is dropped: setQueued(false) alone does not stop this timer.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
+  // site is covered by "treats an absent pending_judge…" below; this covers the case where
+  // the panel mounts against an api that HAS the key (so the poll arms) and a later tick is
+  // served by a pod that does NOT — exactly what a rolling api deploy produces mid-poll.
+  // Without `next.pending_judge ?? null` the poll writes `undefined` into state, and
+  // `pendingJudge !== null` is true for undefined, so the button label walks into
+  // `pendingJudge.state` and throws during render — AND the poll never stops, because
+  // `nextPending === null` is false too.
+  it("normalizes an absent pending_judge on a POLL tick, not just on the mount fetch (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.getRunReview.mockResolvedValueOnce({
+        review: review({ updated_at: "2026-03-01T00:00:00Z", summary_md: "The old verdict." }),
+        pending_judge: pending("running"),
+      });
+      render(<JudgePanel run={run({ status: "completed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // The mid-poll response from the OLDER api: the key is absent entirely.
+      mockApi.getRunReview.mockResolvedValue({
+        review: review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." }),
+      } as unknown as Awaited<ReturnType<typeof api.getRunReview>>);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+
+      // It converged instead of throwing: verdict swapped, pending treated as cleared.
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      expect(screen.queryByText("The old verdict.")).toBeNull();
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+
+      // …and an absent key is a CLEARED pending, so the poll stopped on it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Rollout skew: api and web are separate Deployments, so a web pod can talk to an api
+  // that predates the pending_judge key. The key is then ABSENT, destructuring to
+  // undefined — and `undefined !== null` is true, so every `pendingJudge !== null` guard
+  // walks straight into `pendingJudge.state` and throws during render. There is no
+  // ErrorBoundary in web/src, so that TypeError unmounts the whole app over a missing
+  // optional field. api/internal/uzicli/client.go handles the same skew on the CLI side.
+  it("treats an absent pending_judge as no pending judge rather than throwing (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() } as unknown as Awaited<
+      ReturnType<typeof api.getRunReview>
+    >);
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Re-run judge" });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText("Issues found")).toBeTruthy();
   });
 
   it("renders nothing for an ineligible kind (chat) and never fetches a review", async () => {
@@ -532,6 +1038,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // because the just-filed LOCAL state masked it; only a persisted link exercises coordKey.
   it("renders a persisted filed link as the filed row, not the idle button", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         filed_issues: [
           {
@@ -587,7 +1094,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // the SEED, not on `value=`: these are controlled components, so the state IS the POST
   // body, and filtering the value would silently rewrite what the user typed.
   it("strips format characters from the SEEDED draft, before the user can edit it (#124)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -616,7 +1123,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("opens the draft with templated fields on File issue click (state B)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -641,7 +1148,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("files the issue and shows the created link (state C)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -669,7 +1176,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -698,7 +1205,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("keeps the draft open and shows the error when the forge rejects (state E)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -719,6 +1226,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("flags a stale filed link (filed before the current review revision)", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         updated_at: "2026-02-01T00:00:00Z",
         filed_issues: [
@@ -740,7 +1248,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("recovers from a draft-load failure with Retry and Cancel (no dead end)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({ repos: [] });
     mockApi.getIssueDraft.mockRejectedValue(new ApiError(500, "boom"));
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -771,6 +1279,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("renders a status chip per row by the disposition→filed→to-do ladder", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [
           rec("rc1", "install_worker_tool", "shellcheck"),
@@ -835,7 +1344,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Mark done sets a done disposition (no reason) and refetches the review", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Mark done"));
@@ -849,7 +1358,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Dismiss → Not an issue sets a not_an_issue dismissal", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Dismiss ▾"));
@@ -866,6 +1375,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("Undo clears the disposition via deleteDisposition and refetches", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         dispositions: [
           {
@@ -900,6 +1410,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("renders the stale note straight from the DTO's stale flag", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         dispositions: [
           {
@@ -931,6 +1442,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // ONE recommendation is rendered, but the server triage totals 5 — so the bar's
     // numbers can only come from review.triage, proving no TS re-derivation.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         triage: {
           total: 5,
@@ -953,6 +1465,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("collapse-dismissed toggle hides the dismissed rows", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [
           rec("rc1", "install_worker_tool", "shellcheck", "keep me"),
@@ -991,6 +1504,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // issue link, but NOT the create-issue affordance (you can't file a second issue).
   it("a filed-then-done row keeps the issue link but drops the File-issue action", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [rec("rc1", "add_agent", "deploy-agent")],
         filed_issues: [
@@ -1036,7 +1550,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Escape closes the Dismiss menu and returns focus to the trigger (a11y)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     const trigger = await screen.findByRole("button", { name: /Dismiss/ });
@@ -1052,8 +1566,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // Mount reads untriaged; the post-mutation refetch reads the row as done, so the row
     // swaps to the Undo branch and focus must land there.
     mockApi.getRunReview
-      .mockResolvedValueOnce({ review: review() })
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
       .mockResolvedValue({
+        pending_judge: null,
         review: review({
           dispositions: [
             {
@@ -1083,7 +1598,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("announces the mutation result via the polite live region (a11y)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Mark done"));

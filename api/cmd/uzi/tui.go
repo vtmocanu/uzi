@@ -251,6 +251,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail.review.loading = false
 		m.detail.review.review, m.detail.review.err = msg.review, msg.err
+		// Assigned on EVERY load, including the nil case: a judge that finished (or
+		// died) between two loads must clear the pending copy, not leave a stale "a
+		// judge is in progress" over a verdict that already landed.
+		m.detail.review.pendingJudge = msg.pendingJudge
 		return m, nil
 
 	case dispositionDoneMsg:

@@ -240,6 +240,77 @@ func TestRunReviewNotJudgedExit0(t *testing.T) {
 	if !strings.Contains(out, "not judged") {
 		t.Errorf("want a 'not judged' line, got:\n%s", out)
 	}
+	// The genuinely-unjudged case is the one PRD #119 does NOT change, so it must
+	// not pick up the pending vocabulary either.
+	if strings.Contains(out, "judge scheduled") || strings.Contains(out, "judge in progress") {
+		t.Errorf("a run with NO judge in flight must not claim one is coming:\n%s", out)
+	}
+}
+
+// The same review:null the test above covers, but with an ACTIVE judge for the
+// target: the run is not "not judged", a verdict is being written right now. Both
+// normalized states get their own phrase, and both are still exit 0 — a pending
+// judge is a fact about the run, not a failure to read it.
+func TestRunReviewPendingJudgePhrases(t *testing.T) {
+	cases := []struct {
+		state string
+		want  string
+	}{
+		{"scheduled", "run r1: judge scheduled"},
+		{"running", "run r1: judge in progress"},
+		// Defensive arm: a state this CLI does not know (an older binary against a
+		// newer server) must degrade to the in-progress wording, never print a blank
+		// phrase. "" is the shape a fall-through server mapper would send.
+		{"", "run r1: judge in progress"},
+		{"awaiting_something_new", "run r1: judge in progress"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			fc := &uzicli.FakeClient{
+				Reviews:       map[string]*apitypes.ReviewDTO{"r1": nil},
+				PendingJudges: map[string]*apitypes.PendingJudgeDTO{"r1": {State: tc.state}},
+			}
+			out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1")
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("want %q, got:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, "not judged") {
+				t.Errorf("a run with a judge in flight still reads as never-judged:\n%s", out)
+			}
+		})
+	}
+}
+
+// A present review WITH an active judge is a re-judge in flight: the verdict still
+// renders in full (it is the current answer), plus a note that it is about to be
+// replaced. The note sits with the "judge incomplete" caveat, and both print when
+// both apply — they are different claims about the same review.
+func TestRunReviewPendingJudgeOverExistingReview(t *testing.T) {
+	fc := &uzicli.FakeClient{
+		Reviews: map[string]*apitypes.ReviewDTO{
+			// "issues" is a real workersvc.ReviewVerdicts value (ideal/ok/issues) — the
+			// fake would accept anything, but a fixture staging a verdict the server
+			// cannot send teaches the next reader the wrong enum.
+			"r1": {Verdict: "issues", Status: "failed", SummaryMd: "partial"},
+		},
+		PendingJudges: map[string]*apitypes.PendingJudgeDTO{"r1": {State: "running"}},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "verdict: issues") {
+		t.Errorf("the existing verdict disappeared behind the pending judge:\n%s", out)
+	}
+	if !strings.Contains(out, "note: judge in progress") {
+		t.Errorf("want the re-judge note, got:\n%s", out)
+	}
+	if !strings.Contains(out, "note: judge incomplete") {
+		t.Errorf("the pending note displaced the incomplete caveat; both apply here:\n%s", out)
+	}
 }
 
 // A real 404 (absent id) is exit 4 — reserved, distinct from the null case above.
@@ -290,6 +361,47 @@ func TestRunReviewNullJSONEnvelope(t *testing.T) {
 	}
 	if !strings.Contains(out, `"review": null`) {
 		t.Errorf("null review --json should emit {\"review\": null}:\n%s", out)
+	}
+	// pending_judge is present-and-null, not omitted. --json re-mints its own
+	// envelope from the parsed DTOs (runReviewShow), so an absent key here would not
+	// mean "the server said nothing" — it would mean the CLI dropped a key it had.
+	// A consumer reading `"pending_judge": null` learns "no judge is coming"; one
+	// reading nothing learns only that it is talking to a CLI that cannot tell.
+	if !strings.Contains(out, `"pending_judge": null`) {
+		t.Errorf("--json must carry pending_judge as an explicit null when no judge is in flight:\n%s", out)
+	}
+}
+
+// The populated half of the pair: --json emits the pending judge with its
+// server-normalized state and enqueue time, alongside a null review. This is the
+// key the PRD calls out as the drop hazard — the DTO gaining the field is NOT
+// enough, because runReviewShow re-serializes its own map rather than proxying the
+// server body, so the field is invisible until it is named on that line.
+func TestRunReviewPendingJudgeJSONEnvelope(t *testing.T) {
+	enqueued := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	fc := &uzicli.FakeClient{
+		Reviews:       map[string]*apitypes.ReviewDTO{"r1": nil},
+		PendingJudges: map[string]*apitypes.PendingJudgeDTO{"r1": {State: "scheduled", EnqueuedAt: enqueued}},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var env struct {
+		Review       *apitypes.ReviewDTO       `json:"review"`
+		PendingJudge *apitypes.PendingJudgeDTO `json:"pending_judge"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("decode --json envelope: %v\n%s", err, out)
+	}
+	if env.Review != nil {
+		t.Errorf("review = %+v, want null", env.Review)
+	}
+	if env.PendingJudge == nil {
+		t.Fatalf("--json dropped pending_judge entirely:\n%s", out)
+	}
+	if env.PendingJudge.State != "scheduled" || !env.PendingJudge.EnqueuedAt.Equal(enqueued) {
+		t.Errorf("pending_judge = %+v, want state=scheduled enqueued_at=%s", env.PendingJudge, enqueued)
 	}
 }
 

@@ -274,25 +274,52 @@ func TestIssueDraftDTOTags(t *testing.T) {
 		"default_repo_id", "title", "description", "labels", "provenance", "default_note")
 }
 
+func TestPendingJudgeDTOTags(t *testing.T) {
+	assertTags(t, "PendingJudgeDTO", PendingJudgeDTO{}, "state", "enqueued_at")
+}
+
 // TestReviewNullEnvelope pins the GET /api/runs/{id}/review contract that a
-// visible-but-unjudged run returns 200 {"review": null}, and a null review is a
-// valid decode — the CLI/SPA must model review as nullable, not treat null as an
-// error (PRD #64 M1 A.3).
+// visible-but-unjudged run returns 200 with BOTH envelope keys present and null, and
+// that a null on either is a valid decode — the CLI/SPA must model review AND
+// pending_judge as nullable, not treat null as an error (PRD #64 M1 A.3, widened by
+// PRD #119 M1).
+//
+// The two keys are independently nullable and every combination is legal: (null, null)
+// is a never-judged run, (null, set) is one whose auto-judge is still in flight, (set,
+// set) is a re-judge in flight, (set, null) is a settled verdict. That is why
+// pending_judge is a sibling key rather than a ReviewDTO field — the state it most
+// needs to describe is exactly the one where review is null.
+//
+// The literals below are what json.Marshal actually emits: a map's keys are sorted, so
+// pending_judge precedes review regardless of the order they are written here.
 func TestReviewNullEnvelope(t *testing.T) {
-	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil)})
+	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil), "pending_judge": (*PendingJudgeDTO)(nil)})
 	if err != nil {
 		t.Fatalf("marshal null review envelope: %v", err)
 	}
-	if string(b) != `{"review":null}` {
-		t.Fatalf("null review envelope = %s, want {\"review\":null}", b)
+	if string(b) != `{"pending_judge":null,"review":null}` {
+		t.Fatalf("null review envelope = %s, want {\"pending_judge\":null,\"review\":null}", b)
 	}
-	// A populated review round-trips through the same envelope key.
-	b, err = json.Marshal(map[string]any{"review": ReviewDTO{ID: "r1"}})
+	// A populated review round-trips through the same envelope key, with pending_judge
+	// still present and null (the settled-verdict case).
+	b, err = json.Marshal(map[string]any{"review": ReviewDTO{ID: "r1"}, "pending_judge": (*PendingJudgeDTO)(nil)})
 	if err != nil {
 		t.Fatalf("marshal review envelope: %v", err)
 	}
-	if !strings.HasPrefix(string(b), `{"review":{`) {
-		t.Fatalf("populated review envelope = %s, want {\"review\":{...}}", b)
+	if !strings.Contains(string(b), `"review":{`) || !strings.Contains(string(b), `"pending_judge":null`) {
+		t.Fatalf("populated review envelope = %s, want a populated review and a null pending_judge", b)
+	}
+	// The unjudged-but-pending case: review null, pending_judge populated. This is the
+	// shape the run page reads to say "Judge scheduled" instead of "not judged yet".
+	b, err = json.Marshal(map[string]any{
+		"review":        (*ReviewDTO)(nil),
+		"pending_judge": PendingJudgeDTO{State: "scheduled"},
+	})
+	if err != nil {
+		t.Fatalf("marshal pending envelope: %v", err)
+	}
+	if !strings.Contains(string(b), `"review":null`) || !strings.Contains(string(b), `"state":"scheduled"`) {
+		t.Fatalf("pending envelope = %s, want a null review and a populated pending_judge", b)
 	}
 }
 
