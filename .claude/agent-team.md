@@ -98,6 +98,56 @@ The root, from the coder that made four of them: *"I trusted any claim I had
 personally verified once, and stopped re-checking it, because having checked it
 felt like knowing it."*
 
+**WHERE TO LOOK, WHICH THE RULE ABOVE DOES NOT TELL YOU: AUDIT THE SUPPORT UNDER
+CONCLUSIONS YOU AGREE WITH.** Re-deriving everything is not affordable, so the
+useful question is where unchecked claims accumulate — and it is not under
+contested conclusions. Those get argued and therefore checked. It is under
+**sound conclusions, in the corroborating detail nobody reads adversarially
+because the point it supports is already accepted.** Measured on PRD #103 M2
+(2026-08-02), where every false statement that reached the tree or a commit
+message had that exact shape:
+
+- The `gofmt -w` retirement was sound on **vacuity alone** — after the reformat,
+  an intersection against an empty set can never fail. A second reason was added,
+  labelled *measured*, saying the two sides of the retired `comm -12` idiom never
+  shared a path shape. **False**: re-derived, the idiom returns **16**, every file
+  the reformat touched. Nobody challenged it, because the conclusion it decorated
+  was right.
+- *"All 7 `gitleaks:allow` directives are unmoved."* The substantive half is true
+  and was the point. The count is not. Measured at `b0d8bf72`: **9 occurrences
+  across 7 files** repo-wide, **6 across 5 Go files** under `api/`. **So `7` is
+  the repo-wide FILE count, reported as a directive count** — and note the first
+  two attempts to correct it, by two different people, both asserted *"no scope
+  yields 7"*, which is itself false and was accepted twice. The corroborating
+  clause was wrong, its correction was wrong, and the conclusion it decorated was
+  right throughout.
+  *(Anchored to a SHA on purpose. Writing this bullet ADDED an occurrence to the
+  repo — the count read 10 across 8 files the moment it was recorded, and moves
+  again with the next quotation. A count of a population that includes the
+  document counting it is stale before it is committed; `CLAUDE.md` has the same
+  trap on its `grep -c '^--- PASS'` tally.)*
+- *"Three non-whitespace changes."* The conclusion — commit 1 is semantically
+  inert — is true and independently confirmed by a token-stream pass. The
+  enumeration bolted onto it is imprecise: one of the three changes **zero**
+  non-whitespace bytes.
+
+**And the sharpest instance is this entry's own first draft.** Handing the lesson
+over, the coder wrote that both of its errors were *"decorative evidence attached
+to a conclusion already sound without it — the retirement held on vacuity alone
+and the `|| exit` pin held on the intrinsic-property argument alone."* The lead
+quoted it back approvingly. **The second half does not survive checking**: the
+`|| exit` pin's supporting measurement was *true*; what was wrong there was a
+mechanism claim, a different defect. A neat generalisation had acquired a second
+example it did not have — **decorative evidence, inside the sentence defining
+decorative evidence, endorsed on sight by two people.** It was caught by applying
+the rule to the sentence itself before committing it, which is the only thing
+that would have caught it.
+
+So the practice: when a claim is going into a document, ask which clause is doing
+the work and which is *support*. Re-derive the support, or delete it. **A
+conclusion that stands without evidence does not need evidence attached to it,
+and evidence attached anyway is evidence nobody will check.**
+
 **Where it hides: the artifacts with no gate on them.** Comments get read in
 review, tests get run, commit messages get diffed. A "still open" list, a
 checkpoint, a handoff note — that is prose nobody executes, and it is what
