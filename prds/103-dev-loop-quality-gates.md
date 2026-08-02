@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 implemented 2026-08-02 on `feature/prd-103-m3-m6` but NOT MERGED and NOT YET PIPELINE-TESTED** (see their status blocks); M5-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 implemented + fully validated, M4 implemented but its validation wave was INTERRUPTED** — both on `feature/prd-103-m3-m6`, both NOT MERGED and NOT PIPELINE-TESTED (see their status blocks; the two carry different evidential weight and the M4 block says why); M5-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -1388,7 +1388,38 @@ which previously prescribed only the fail-open form.
       trap above, output and exit status are independent here, and a first run
       reporting nothing is indistinguishable from a linter that is not wired up.
 
-- [x] **M4 — Dead code detection**: `golang.org/x/tools/cmd/deadcode -test
+- [ ] **M4 — Dead code detection**:
+
+      > **🔴 STATUS 2026-08-02: IMPLEMENTED, NOT MERGED, AND ITS VALIDATION WAVE
+      > WAS INTERRUPTED. The box is UNTICKED for two reasons, and the second is
+      > the one a reader must not skip.**
+      >
+      > **First, the same reason M3's is unticked**: M1's status block defines
+      > ticking as *"the box is now ticked for the reason it was previously left
+      > unticked: this landed"*. This has not landed, and no pipeline has run
+      > against it. *(The box was briefly ticked in `78121d37` and is corrected
+      > here — M4 has landed no more than M3 has, and two adjacent milestones in
+      > opposite states would have read as a considered distinction rather than
+      > an oversight.)*
+      >
+      > **Second, and NOT true of M3: every acceptance figure below is the
+      > implementer's own and has been replicated by nobody.** A reviewer, a
+      > tester and a fact-checker were dispatched against `49832535` and the
+      > session ended before any of them reported. M3's evidence was reproduced
+      > independently by five agents across three review rounds, which found
+      > eight blocking issues in work that was already reported green — including
+      > a live release hole. **The two status blocks are not the same kind of
+      > claim and must not be read as one.**
+      >
+      > What that leaves unverified, specifically: the six calibration arms, the
+      > three knip suppressions (each of which silently disables a real finding
+      > class if wrong), the byte-identity of the `hookEvent` source change, the
+      > alpine/musl check, and the anchor lists being unchanged at 12 and 14.
+      > Every one of those is plausible and none is confirmed. **Re-run the
+      > validation wave before this merges** — the resumption instructions are in
+      > `.claude/agent-team-tasks/prd-103-m4.md`.
+
+      `golang.org/x/tools/cmd/deadcode -test
       ./...` per Go module (invoked via `go run` with a pinned version, the
       way `sqlc` already is at `v1.30.0` — git-manager's dependence on a
       preinstalled global binary is a trap worth not copying), plus `knip`
