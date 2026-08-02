@@ -327,7 +327,7 @@ intuitive one and it will be re-proposed otherwise:
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
 | `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
 | `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
-| ESLint | **Yes** | Native bulk suppressions (`--suppress-all` writing a committed `eslint-suppressions.json`, with `--suppressions-location` and `--prune-suppressions`), ESLint ≥ 9.24. The only true baseline file in the set. **Caveat: it only suppresses rules configured as `error`** — `warn`-level rules are neither suppressed nor gated, so the M3 config must enable rules as `error`, not `warn`. |
+| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified: 37 and 40 exit 0, 36 and 0 exit 1; **errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. See the TypeScript paragraph below. |
 | `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
 So each milestone states its own mechanism rather than inheriting a shared
@@ -343,6 +343,23 @@ one. Two consequences worth pricing in now:
 - **`deadcode` needs a small committed wrapper** (~20 lines: run, sort, diff
   against `.deadcode-baseline`, fail on additions). That is real work M4 must
   budget, not a flag.
+
+**The TypeScript half is REWRITTEN, because the mechanism it named does not exist
+in the tool this PRD now uses.** *(Amended 2026-08-02 with Decision 8.)* ESLint's
+native bulk suppressions (`--suppress-all` writing a committed
+`eslint-suppressions.json`) have no oxlint equivalent, so a decision that shipped
+unamended would have sent M3 looking for a flag that is not there.
+
+**No baseline is needed, because the debt is not baseline-sized.** Measured at the
+shipped default tier: **10 findings on `agent/`, 6 on `web/`, 16 combined.** That is
+an afternoon, not a burn-down, so **M3 fixes them** rather than recording them.
+
+**oxlint does have a ratchet, and its limit is worth stating before someone leans on
+it.** `--max-warnings <n>` is a count budget: verified at 37 and 40 exiting 0 and at
+36 and 0 exiting 1, with errors failing regardless of the budget. **A count cannot
+distinguish a fixed finding from a new one**, so it permits churn under the cap —
+fix one old finding, add one new, still green. It is a regression brake, not a
+ratchet, and it is the honest reason the fix-them-now route is preferred here.
 
 *Rejected — fix every finding before enabling*: produces one unreviewable
 mega-diff and blocks the gate for weeks, during which new findings
@@ -416,19 +433,51 @@ mistake. Treated as optional and deferred (Open Question 3).
 them on `PATH`, so a contributor with a devbox shell and a CI job with a
 prepared image run the identical target.
 
-**8. ESLint for `web/` and `agent/`, pending one verification.**
+**8. oxlint for `web/` and `agent/`.** *(Amended 2026-08-02. This decision
+previously read "ESLint … pending one verification" and deferred to oxlint only
+"if parity holds". Open Question 2 measured it; parity holds; amended rather than
+worked around, exactly as the previous text instructed.)*
 
-Default to ESLint flat config with `typescript-eslint`, plus
-`eslint-plugin-react-hooks` for `web/` — the hooks rules are the
-highest-value TypeScript lint available for this repo, and `tsc` cannot
-express them.
+The hooks rules are still the highest-value TypeScript lint available here, and
+`tsc` cannot express them. What changed is which tool provides them. Measured by
+the researcher, with the hooks-parity half re-verified independently by the lead:
 
-*Rejected for now — oxlint*: dramatically faster and near-zero config, and
-worth revisiting if ESLint wall-time becomes a problem. **Not chosen because
-its `react-hooks` rule parity has not been verified by anyone here** —
-implementer must check this before the M3 MR rather than trusting either
-option. If parity holds, oxlint is the better pick and this decision should
-be amended, not worked around.
+- **Identical findings to ESLint on `web/src`** — 2 each, same files, same missing
+  dependency.
+- **36 of 37 identical rule sets** on a purpose-built fixture corpus, and **no file
+  flagged by one linter and not the other.**
+- **oxlint honours `// eslint-disable-next-line react-hooks/exhaustive-deps`
+  verbatim**, so this repo's two existing suppressions migrate with **zero source
+  edits**. Re-run as a matrix: the control fires 1, the suppressed fixtures 0.
+- **~20-50x faster**, and `typescript-plugin` covers `recommended` 20/20 and
+  `recommended-type-checked` 43/43 by name, with type-aware support available via
+  `oxlint-tsgolint`.
+
+**Two configuration traps, either of which produces a SILENT NO-OP.** Both must be
+in the M3 config, and neither is discoverable from a clean run:
+
+- **The `react` plugin is OFF BY DEFAULT.** Not enabling it means the hooks rules
+  this decision exists for never load.
+- **`rules-of-hooks` is `pedantic`, not `correctness`.** oxlint's default
+  `correctness` category therefore does **not** enable it. A config that turns the
+  plugin on and stops there still does not run the rule.
+
+**Three limits, recorded rather than glossed, because each is a claim this decision
+does NOT make:**
+
+- **typescript-eslint BEHAVIOUR parity is unmeasured.** What was measured is *name*
+  parity across the rule sets, which is a different and weaker claim.
+- **Every non-hooks rule was compared oxlint-against-oxlint across tiers**, never
+  against an ESLint equivalent. The cross-linter comparison covers the hooks family
+  and the `web/src` finding set, nothing wider.
+- **The React Compiler family is one experimental nursery rule in oxlint against 15
+  individually-tunable rules in ESLint.** This is **deliberately out of M3**: the
+  repo is on React 18.3.1, so the compiler is not in use. Weighed and excluded, not
+  missed. Revisit if the repo moves to React 19 and adopts the compiler.
+
+*Rejected — ESLint*: slower, and its one remaining advantage over oxlint for this
+repo (the granular React Compiler rules) applies to a compiler this repo does not
+run.
 
 **9. The Taskfile is the single source for gate *recipes*; the agent-team
 paste-block stays and names *targets*.**
@@ -561,6 +610,38 @@ which previously prescribed only the fail-open form.
 **Phase 1 — enabling work (blocks everything else)**
 
 - [ ] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
+
+      > **STATUS 2026-08-02: implemented and validated, NOT merged. The box stays
+      > unchecked deliberately** — a tick would tell tomorrow's reader this landed,
+      > and nothing is pushed. Branch `feature/prd-103-dev-loop-quality-gates`,
+      > tip `215ffdba`, six commits off `a87fd521`.
+      >
+      > **Four validators reported: no blocking findings on the code.** The
+      > Taskfile, the CI rewire and the supply chain all passed. The three blocking
+      > findings were documentation, two of them in this file, and all three are
+      > fixed: Decision 11 was false in its own document (six live
+      > `.gitlab-ci.yml` anchors, one of them M1's own flag table); all three copies
+      > of the provenance command lacked `--oneline`; and `CLAUDE.md` carried a
+      > standing unqualified SHA citation.
+      >
+      > **The gate's liveness is proven, not asserted.** The tester's four-arm
+      > control came back conclusive, and **arm B is the one that matters: it
+      > reproduced the silent green on a broken fixture** (`ok … (cached)`,
+      > EXIT=0, zero FAILs), which is what makes arm C evidence about `-count=1`
+      > rather than about a cold cache. Equivalence verified 1:1 across all eight
+      > jobs, old recipes against new targets. The fingerprint ban was verified by
+      > parsing and behaviourally.
+      >
+      > **The gate found a real defect on day one**, which is this milestone's best
+      > evidence that it works: a pre-existing 1-in-6 race between two agent test
+      > files sharing a hard-coded `/tmp` worktree path, invisible until something
+      > ran a mandated whole-repo gate. Fixed here and controlled at 24 runs, zero
+      > failures. A second, timing-dependent flake
+      > (`agent/test/batcher-poison.test.ts`) is filed separately and remains open.
+      >
+      > **Three steps remain**: the re-check wave on the anchor deletions, the
+      > push, and the MR.
+
       root `Taskfile.yml` with `gate`, `gate:api`, `gate:controller`,
       `gate:web`, `gate:agent`, plus only the individual targets that have
       something to run today — `typecheck` and `test` per component, plus
@@ -669,7 +750,7 @@ which previously prescribed only the fail-open form.
       images rather than installing into `golang:1.26`), fetched at job time
       via a pinned `go run …@vX.Y.Z` (the `sqlc@v1.30.0` precedent in
       `validate:api`, and how M4 will invoke `deadcode`), installed as an npm
-      devDependency by the existing `npm ci` (knip, ESLint), or a
+      devDependency by the existing `npm ci` (knip, oxlint), or a
       `before_script` install.
 
       **Anything fetched in a `before_script` must be version- and
@@ -742,32 +823,54 @@ which previously prescribed only the fail-open form.
       being empty (`test -z "$(gofmt -l .)"`), which `CLAUDE.md` documents as a
       trap already paid for here.
 
-- [ ] **M3 — Linting: golangci-lint + ESLint, each ratcheted its own way**: `.golangci.yml`
+- [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**: `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`
       `ineffassign` `unused` `unparam` `goconst` on; each *disabled* linter
       carries a one-line justification in the file, per that repo's
       convention) applied to both Go modules with per-linter test-file
-      exclusions. ESLint flat config for `web/` and `agent/` per Decision 8,
-      after verifying the oxlint question.
+      exclusions. **oxlint** for `web/` and `agent/` per Decision 8 — including
+      its two silent-no-op traps: **the `react` plugin is off by default, and
+      `rules-of-hooks` is `pedantic` rather than `correctness`**, so a config
+      that enables the plugin and stops there still never runs the rule this
+      milestone exists for.
+
+      **🔴 THE GATE TRAP, AND IT IS A HARD REQUIREMENT: `oxlint src test` EXITS 0
+      WHILE REPORTING FINDINGS.** `correctness` defaults to `warning` severity and
+      warnings do not set the exit code. Reproduced: the bare invocation exits 0
+      with 10 findings, while `-D correctness` exits 1 on the same 10. **A target
+      without `-D correctness` (or `--deny-warnings`) is a report that always
+      passes** — a lint job that can never fail, in the milestone that adds
+      linting. Same family as the `gofmt -l` trap `CLAUDE.md` already carries,
+      arriving through a default *severity* instead of through a flag.
 
       Ratchet mechanisms differ per Decision 4 and must be stated in the MR:
       Go uses `--new-from-merge-base=main --whole-files`, which requires
       raising GitLab's shallow `GIT_DEPTH` for the lint job or merge-base
-      resolution fails; TypeScript uses ESLint's native bulk suppressions
-      (`--suppress-all` → a committed `eslint-suppressions.json`, ESLint
-      ≥ 9.24). Also record the **unfiltered** finding count for each in the
+      resolution fails. **TypeScript has no baseline and needs none: the measured
+      debt is 10 findings on `agent/` and 6 on `web/`, 16 combined, and M3 fixes
+      them.** `--max-warnings` exists as a regression brake, with the limit
+      Decision 4 records. Also record the **unfiltered** Go finding count in the
       MR description, since `--new-from-merge-base` reports nothing on `main`
-      pipelines and the debt is otherwise uncountable. Burn-down gets its own
+      pipelines and that debt is otherwise uncountable. Go burn-down gets its own
       issue.
 
-      **Precondition**: resolve Open Question 2 (oxlint vs ESLint react-hooks
-      parity) before starting. It is a Decision-8 note today, which is easy to
-      start past.
+      **SCOPE RULING — correctness-only.** Type-aware linting becomes **its own
+      issue**: 37 + 178 = 215 findings with a real burn-down, and **119 of web's
+      are one shape** (`onClick={asyncHandler}`), which is a behavioural refactor
+      rather than a lint adoption and must not ride in on a tooling MR. Pedantic
+      is dead on arrival at **3,015 combined**, with `no-inline-comments` alone at
+      **474** in a repo whose inline comments are mostly load-bearing recorded
+      evidence.
+
+      **Precondition**: ~~resolve Open Question 2~~ — **RESOLVED 2026-08-02**, see
+      Decision 8. Nothing blocks M3 now.
 
       **Calibration**: add an unchecked error return in a scratch file, confirm
       `errcheck` fires through `task lint:api`; add a violating hook call,
-      confirm `react-hooks` fires through `task lint:web`. A first run reporting
-      nothing is indistinguishable from a linter that is not wired up.
+      confirm `rules-of-hooks` fires through `task lint:web`. **The calibration
+      must assert a NONZERO EXIT, not merely that output appeared** — per the gate
+      trap above, output and exit status are independent here, and a first run
+      reporting nothing is indistinguishable from a linter that is not wired up.
 
 - [ ] **M4 — Dead code detection**: `golang.org/x/tools/cmd/deadcode -test
       ./...` per Go module (invoked via `go run` with a pinned version, the
@@ -900,7 +1003,7 @@ which previously prescribed only the fail-open form.
 |---|---|---|---|---|
 | 1 | M1 | — | `Taskfile.yml`, `.gitlab-ci.yml`, `CLAUDE.md`, `.claude/agent-team.md`, `.claude/agents/{coder,tester,reviewer,auditor}.md` | No — blocks all |
 | 2 | M2 | M1 | `api/**/*.go` (format only), `Taskfile.yml`, `.gitlab-ci.yml` | Yes |
-| 2 | M3 | M1 | `.golangci.yml`, `web/eslint.config.js`, `agent/eslint.config.js`, **`web/package.json`**, `agent/package.json`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes, except vs M4/M6 |
+| 2 | M3 | M1 | `.golangci.yml`, `web/.oxlintrc.json`, `agent/.oxlintrc.json`, **`web/package.json`**, `agent/package.json`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes, except vs M4/M6 |
 | 2 | M4 | M1 | `Taskfile.yml`, `knip.json` ×2, **`web/package.json`**, `agent/package.json`, `.gitlab-ci.yml` | Yes, except vs M3/M6 |
 | 2 | M5 | M1 | `.shellcheckrc`, `.yamllint`, `.gitleaks.toml`, `web/scripts/check-docs.mjs`, `Taskfile.yml`, `.gitlab-ci.yml` | Yes |
 | 3 | M6 | M1 | `.gitlab-ci.yml`, `web/vite.config.ts`, **`web/package.json`**, `.gitignore` | Yes, except vs M3/M4 |
@@ -919,7 +1022,7 @@ Three exceptions where "append at the end" is not enough:
   the `stages:` list. That is why M1 adds the (empty, inert) stage entry
   up front — appending cannot resolve it.
 - **`web/package.json` is a three-way contention** that the previous version of
-  this table missed: M3 adds ESLint devDeps, M4 adds knip, M6 adds
+  this table missed: M3 adds the oxlint devDep, M4 adds knip, M6 adds
   `@vitest/coverage-v8`. `agent/package.json` is a two-way (M3, M4). Same class
   as the `stages:` conflict, and npm's own `devDependencies` ordering makes a
   merge conflict likely rather than possible. Sequence these three, or have each
@@ -1021,8 +1124,14 @@ Three exceptions where "append at the end" is not enough:
    have been advisory. Now set to `true` (with `allow_merge_on_skipped_pipeline:
    true`, so the repo's `[skip ci]` doc commits stay mergeable). CI is a real
    gate, and the PRD's premise holds.
-2. **oxlint vs ESLint react-hooks parity** (Decision 8) — must be verified
-   before M3, not assumed in either direction.
+2. ~~**oxlint vs ESLint react-hooks parity** (Decision 8)~~ — **RESOLVED
+   2026-08-02: parity holds, and oxlint is adopted.** Identical findings on
+   `web/src` (2 each, same files, same missing dep), 36 of 37 identical rule sets
+   on a fixture corpus with no file flagged by one and not the other, and oxlint
+   honours `// eslint-disable-next-line react-hooks/exhaustive-deps` verbatim, so
+   the repo's two existing suppressions migrate with zero source edits. Decision 8
+   is amended accordingly and records the two config traps and the three limits of
+   the measurement.
 3. **Is a contributor `devbox` environment wanted at all?** The toolchain
    (go 1.26.4, node 22, helm, sqlc, glab, jq, openssl, docker, and now
    golangci-lint, shellcheck, gitleaks) is currently unpinned and documented
@@ -1037,10 +1146,10 @@ Three exceptions where "append at the end" is not enough:
    depends on the answer.
 5. **Prettier/`gofumpt`** — deliberately excluded from M2. Worth a follow-up
    or not?
-6. **Is `Formula/uzi-cli.rb` in scope for M5?** It has no lint of any kind, and
-   `devbox.json` carries ruby as a tier-2 package specifically so a run can
-   `ruby -c` it. A `ruby -c` target is nearly free. Include in M5 or declare it
-   out of scope — either is fine; leaving it undecided is not.
+6. ~~**Is `Formula/uzi-cli.rb` in scope for M5?**~~ — **RESOLVED 2026-08-02: IN
+   scope, via a `ruby -c` target.** It has no check of any kind today, `devbox.json`
+   already carries ruby as a tier-2 package so a run can `ruby -c` it, and the
+   target is nearly free. M5 adds it alongside the shell and YAML checks.
 7. **Should the agent-team paste-block be generated from `Taskfile.yml` and
    asserted in CI?** Decision 9 defers this as the right end state. It removes
    the last hand-maintained copy entirely. Own issue, after M1.
