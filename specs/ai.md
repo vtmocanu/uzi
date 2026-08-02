@@ -16063,3 +16063,356 @@ milestone measured — the form that fixes it going green on a non-parsing file 
 it. `api/internal/agenttmpl/builtins/tester.md` is deliberately **not** among the ten: it is
 product template content, decoupled from `.claude/agents/` (§Conventions), and a `gofmt` grep
 surfaces it looking editable.
+
+**Numbering note for the four M3 sections below.** They start at 468, not 467, because 467 was
+already held by the then-unmerged `fix/197-lead-design-critique-wave` branch — found by
+sweeping every sibling worktree of this bare clone at write time, which is the local form of
+the *"first free across all remotes"* rule stated in the numbering note above §455, and the
+same discipline §464 applied for the same reason one milestone earlier. The 467 gap is
+intended; closing it would recreate the collision.
+
+## 468. PRD #103 M3 — the Go ratchet lives in the CONFIG, which closes the ref question by construction, and the pre-flight guards `merge-base` rather than `rev-parse`
+
+M3 gives this repo its first linter. **`human.md` untouched and no entry proposed**, for the
+reason M1 and M2 proposed none: contributor tooling, no API, no schema, no worker behaviour,
+no UI. The linter *set* is `.golangci.yml`'s to state and is deliberately not recorded here —
+what a rebuild must reproduce is the placement decisions, every one of which was settled by
+running the tool and every one of which has a quieter failure on the other side.
+
+- **The ratchet is `issues: {new-from-merge-base: origin/main, whole-files: true}` in
+  `.golangci.yml`, NOT a flag on a command line — and the cost is written down rather than
+  absorbed.** §464 records that `Taskfile.yml`'s echo of each command is how a teammate
+  notices a load-bearing flag going missing; for this slot **that property is simply absent**,
+  and it is the one place M3 weakens a mechanism this repo relies on. It was traded knowingly:
+  the CLI form would need either a variable spliced into a `cmds:` line (banned) or a flag set
+  in the CI job only, and the second makes local and CI **disagree about what a finding is** —
+  the exact divergence Success Criterion 1 exists to prevent. One recipe, byte-identical in
+  both places, was worth the echo. The compensation is that the target's comment and **both**
+  slot-table copies name `.golangci.yml` as where the ratchet lives.
+- **The ref is `origin/main`, and the question is closed BY CONSTRUCTION rather than by
+  judgement: golangci-lint does not expand environment variables in config values.** Measured
+  with a positive control, which is what makes it a property of the tool rather than a broken
+  key — `new-from-rev: ${MB_REF}` reaches git verbatim (`fatal: bad revision '${MB_REF}'`,
+  then the full unfiltered set) while the same key holding a literal SHA works. So
+  `CI_MERGE_REQUEST_DIFF_BASE_SHA` is not *worse* than a static ref here, it is **impossible**;
+  it would force the ratchet onto the CLI in CI only, which is the asymmetry the config
+  placement exists to remove. Between the two static candidates, a bare `main` resolves in
+  this bare-clone-with-worktrees layout and does **not** resolve in GitLab's detached-HEAD
+  checkout — a check that works on your machine and degrades in CI. `origin/main` resolves in
+  both, and a contributor whose copy is stale ratchets against an older base and therefore
+  sees **more** findings, so the error direction is conservative.
+- **🔴 The pre-flight predicate is `git merge-base`, NOT `git rev-parse`, and the weaker
+  version SHIPPED FIRST.** `rev-parse` asks whether the ref *exists*; what golangci-lint needs
+  is a **reachable common ancestor**, and on a shallow clone — which is exactly what CI
+  produces — those are different questions. Measured in a CI-shaped scratch repo (feature
+  branch cloned `--depth 1`, then the lint job's own explicit fetch of main): `rev-parse
+  --verify origin/main^{commit}` returns 0 and **satisfies the old guard**, while `merge-base
+  origin/main HEAD` returns 1. `merge-base` strictly **subsumes** the old check rather than
+  adding to it — on a missing ref it exits 128 — so one predicate covers both failures and the
+  rev-parse form must not be restored alongside it.
+- **What the guard converts is a fail-CLOSED-but-MISLEADING run, not a fail-open one, and the
+  label is load-bearing.** An unresolvable base does not skip the ratchet and does not error:
+  golangci-lint emits **one** `level=warning msg="[runner] Can't process results by diff
+  processor…"` and then reports the **entire unfiltered backlog** at exit 1. The first reader
+  concludes the branch broke something enormous and opens a burn-down when the fix is one
+  `git fetch`. An earlier design note called this "fail-open into noise"; that label is wrong
+  and dangerous, because it sends the next reader hunting a silent green that does not exist.
+  The guard exits **2**, matching `fmt-check:api`'s convention — 2 = the instrument is broken,
+  1 = there are findings — because `task`'s own rc is 201 for both and the recipe is the only
+  place that distinction can live.
+- **The ref is a LITERAL in every one of the three places it appears.** `git check-ref-format
+  --branch` accepts `;`, `$`, backticks, `|`, `&` and parentheses in a branch name — only a
+  space is rejected — and anyone who can open an MR chooses the target branch, so
+  `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen string with live
+  metacharacters. Never interpolated, quoted even where it is a constant.
+- **Two linters are OFF, each carrying a one-line justification in the file (git-manager's
+  convention, adopted here), and the two reasons are opposites worth keeping distinct.**
+  `govet` is disabled because `vet:api` / `vet:controller` already run `go vet ./...`
+  **unratcheted**, in the gate and in CI: folding it in would be a **net weakening**, since
+  today every vet finding blocks and ratcheted only new ones would. It is a golangci-lint
+  default, which is precisely the premise ("the tool enables it by default") that will
+  motivate re-adding it — the answer is that the check is not missing, it is elsewhere and
+  stricter. `goconst` is disabled on evidence: measured 2026-08-02 at golangci-lint 2.12.2 /
+  go1.26.5 darwin/arm64 **with both cap flags cleared**, it is 1178 findings in `api` — 90% of
+  the combined backlog — of which 247 are outside `_test.go`, spread over 86 files; a hand
+  read of the non-test findings visible in the capped run plus a 1-in-20 re-sample across all
+  86 found no defect, only CLI subcommand names, JSON field names and the
+  `queued → claimed → running` run-state vocabulary, which is a goconst finding at every
+  switch arm. **The decisive argument is `whole-files`**, not the count: with a blast radius of
+  86 non-test files, touching any one of them for any reason would demand extracting
+  `"status"` into a constant. That is the ratchet's sharpest edge aimed at the linter with the
+  least signal. **This contradicts the PRD's own M3 bullet, which listed `goconst` among the
+  linters to enable — the bullet was amended, not worked around.**
+- **One per-linter test-file exclusion survives, and it was never goconst's.** `unparam` is
+  excluded in `_test.go`: 22 of its 26 findings were test helpers of one shape (a parameter
+  that today has a single call site), which is how a test stays readable and is a one-line
+  change to widen later.
+- **Delivery is a pinned `go run …@v2.12.2`, which is the same shape as the `sqlc@v1.30.0`
+  precedent already inside `validate:api`, and the version pin is identical local and in CI.**
+  That is what kills the unpinned-local-binary divergence: a contributor's brew-installed
+  golangci-lint drifts on its own schedule and would disagree with CI about what a finding is.
+  It writes nothing to either `go.mod` — verified, not assumed — where `go get -tool` would
+  write golangci-lint's whole dependency tree into `api/go.mod`, the file the separate
+  `controller` module exists to keep `k8s.io/client-go` out of. **The official
+  `golangci/golangci-lint` image was rejected on a measurement**: it ships Go 1.26.2 with
+  `GOTOOLCHAIN=auto` against both modules' `go 1.26.4`, so it would make lint the first job in
+  this pipeline whose effective toolchain is **fetched** rather than pinned, where the
+  `golang:1.26` image CI already uses is 1.26.4 with `GOTOOLCHAIN=local`. Cost, measured
+  2026-08-02 with isolated `GOMODCACHE`+`GOCACHE`: **51.6s cold, then under 2s warm**, and CI
+  persists both caches, so the cold cost is per-cache-key rather than per-pipeline.
+- **The backlog stays countable through `:all` companion targets, and clearing a config-set
+  ratchet has exactly one spelling.** `new-from-merge-base` reports nothing on a `main`
+  pipeline (the merge-base of `main` with itself is `main`), so without these the deferred
+  debt would be unmeasurable. An **empty** `--new-from-merge-base=` is what clears it; the two
+  obvious alternatives do not error and do not work — measured against the shipped config,
+  `--new-from-rev=` and `--whole-files=false` both return a still-filtered "full debt report"
+  reading 0 issues over a module carrying 107. **The flag name is coupled to the config key
+  and the two move together.** These targets are in no gate and no CI job, but *not gating*
+  does not mean *exits 0*: golangci-lint exits 1 whenever it reports anything, so anyone
+  wrapping them later needs an explicit `|| true` and a comment saying why.
+
+## 469. PRD #103 M3 — oxlint: every guard is a SILENT no-op if it moves, and the 16-finding debt is FIXED rather than baselined
+
+The npm half needed no ratchet, because its whole debt was 16 findings and M3 cleared them.
+What it needed instead was a configuration in which the rule the milestone exists for actually
+runs — and every way of getting that wrong is silent. The Go half's failures are loud and
+misleading; this half's are quiet, which is why the config file carries the measurements in
+its own header rather than deferring to a doc.
+
+- **Severity is pinned in `.oxlintrc.json`, never on the command line, and
+  `react-hooks/rules-of-hooks` needs RULE-level promotion — a category cannot reach it.** It is
+  `pedantic`, not `correctness`. Measured 2026-08-02 at oxlint 1.76.0: `--react-plugin` alone
+  exits 0 silently on a genuine conditional `useState`, **and so does `--react-plugin -D
+  correctness`**. That second row is the entire milestone going green over the rule it exists
+  for, and it is the configuration a careful reader arrives at after being told "the plugin is
+  off by default". The `-D correctness` flag stays, for the correctness *tier*, with a comment
+  saying it is **not** the guard for this rule.
+- **🔴 Naming a rule without declaring its plugin is a SILENT no-op; a typo in the rule name is
+  LOUD.** `{plugins:["react"], rules:{"react-hooks/rules-of-hooks":"error"}}` exits 1 and
+  fires; the same rules block **without** the plugin exits 0 and does nothing; the same config
+  with the rule misspelled exits 1 naming the unknown rule. That asymmetry makes the **plugin
+  list** the load-bearing half rather than the rules block, and it is exactly the case a
+  reviewer reading the config would pass, because the file visibly names the rule.
+- **`plugins` REPLACES the default list, it does not extend it.** All three defaults
+  (`unicorn`, `typescript`, `oxc`) are re-listed alongside `react` for that reason. Measured on
+  `web/src`: `["react"]` reports 5 findings, `["react","unicorn","typescript","oxc"]` reports
+  6. **Both exit 1, so the narrowing is invisible in the verdict** — it shows up only in a
+  count nobody re-derives. In `agent/` the same trap is worse in proportion: five of its ten
+  baseline findings come from `unicorn` and `typescript`, so a config dropping either would
+  silently retire half the package's findings.
+- **`--config` is passed explicitly, closing two holes at once.** oxlint walks up for
+  `.oxlintrc.json`, so a stray root config would silently govern both packages; and with the
+  file renamed or deleted a bare invocation reverts to the warning tier and exits 0 on a real
+  violation, where `--config` fails loudly with `Failed to parse config … NotFound`.
+- **`--report-unused-disable-directives-severity=error` is on both scripts, and it is the
+  vacuous-negative class arriving through a COMMENT instead of an assertion.** A suppression
+  that no longer suppresses anything reads to every later reviewer as live and justified.
+  Measured on this tree: a directive for a rule that does not fire gives rc=1 and `Unused
+  eslint-disable directive (no problems were reported)`, while the same tree **without** the
+  flag gives rc=0 and prints nothing. The plain `--report-unused-disable-directives` form only
+  *warns*, and a warning does not set the exit code here either — **the `-severity=error`
+  suffix is the whole point.** This milestone ships eleven new directives, so the exposure is
+  its own.
+- **Nothing ships at `"warn"`.** A rule at warn **prints its violation and exits 0**, which is
+  a report that always passes — the silent-green shape this PRD exists to remove.
+- **The npm targets DELEGATE to a `package.json` `lint` script rather than calling the binary,
+  because `Taskfile.yml`'s header requires it of every npm target**: a target that
+  reimplements a command drops whatever flags the script encodes, silently. Here that is not
+  hypothetical — the script carries both halves of this gate's severity. **Never a bare `npx
+  oxlint`**: npx fetches from the network when the dep is missing, which a gate may not do,
+  while `npm run` puts `node_modules/.bin` on PATH and fails closed with `command not found`.
+  The consequence to state in the target's comment is that Task's echo shows only
+  `npm run lint`, so **neither** load-bearing flag lives anywhere the echo can protect — the
+  same weakening §468 records for the Go ratchet, arriving by a different route.
+- **`agent/.oxlintrc.json` deliberately omits `react`, and that divergence from `web/`'s copy
+  is recorded as a decision rather than left to look like an omission.** The agent is a Node
+  worker with no React and no JSX; the plugin would load rules that can never fire, and its
+  count is 10 with or without it.
+- **The 16 findings were FIXED, not baselined (Decision 4): five real changes, eleven
+  suppressions each carrying its reason at the site.** The distribution matters more than the
+  total, because it is the argument against a baseline file: most of this debt was *code that
+  is deliberately what the rule objects to* — four control-character regexes whose entire job
+  is matching control characters (one of them the security strip that stops `java\tscript:`
+  reaching a scheme test), three never-yielding async generators that model a hung SDK query,
+  a `captured = this` that **is** the fixture, and a conditional spread that omits a key rather
+  than setting it undefined. **Every suppression was verified load-bearing rather than
+  assumed**: stripping the disable comments brings all findings back with a nonzero exit, and
+  restoring them returns both packages to green.
+- **One finding was a real bug and was fixed as one, explicitly, rather than folded into the
+  sweep.** `eslint(no-unsafe-optional-chaining)` on `(sent[0]?.payload as X).content` in an
+  agent test: on an empty `sent` the optional chain threw a `TypeError` instead of failing an
+  assertion. Same coverage, readable failure. The rule's advice to *read it before fixing it*
+  is the durable half — a lint sweep is the wrong place to change behaviour by accident.
+- **🔴 Two `react-hooks/exhaustive-deps` findings are SUPPRESSED rather than fixed, and the
+  ruling is a CONSISTENCY argument, not a convenience.** Adding a dependency changes identity
+  churn and therefore when downstream effects re-run — on a first-load effect that is a
+  behavioural change to page load, not a lint fix. **That is the same argument M3's scope
+  ruling uses to exclude the 119 type-aware `onClick={asyncHandler}` findings**, and admitting
+  these two while excluding those would be inconsistent. Both carry the reason at the site and
+  a pointer to issue #200 for the behavioural review. The general form: **a tooling milestone
+  may not change runtime behaviour under cover of a lint fix**, which is also why type-aware
+  linting (`oxlint-tsgolint`) and the React Compiler rule family are out of scope here — the
+  latter because this repo is on React 18.3.1 and does not run the compiler.
+
+## 470. PRD #103 M3 — where the checks are WIRED: an asymmetric CI shape, gate ordering that differs by component, and two anchor lists that turned out not to be a membership rule
+
+- **The Go half opens its own `lint`-stage jobs; the npm half folds into the existing
+  `validate:web` / `validate:agent`. That is a PARTIAL deviation from the PRD's Decision 3 and
+  is recorded there rather than worked around.** The asymmetry is not a compromise between two
+  readings — each half has its own reason. The Go jobs need `GIT_DEPTH: "0"` for the
+  merge-base ratchet: putting that on the shared Go template would hand a full-history clone
+  to every job extending it for a check only two need, and folding lint into `validate:api`
+  instead would hand it to the one job whose `sqlc generate` + `git diff --exit-code` already
+  makes its git state load-bearing. A dedicated job isolates the clone-strategy change to the
+  job that needs it. The npm checks measure ~0.06s and ~0.05s against a ~30s `npm ci` in each
+  job, so a separate job would pay a 500× setup overhead — and would add a name to both anchor
+  lists where the existing job already sits. **Depth alone is not sufficient**: merge-base
+  needs the *ref*, and whether `origin/main` exists after a clone is a property of the
+  runner's refspec rather than of the CI file, so each Go lint job also fetches it explicitly.
+  `publish:assert-changelog` is the in-repo precedent — the only other job setting
+  `GIT_DEPTH: 0`, and it still runs an explicit `git fetch`.
+- **🔴 `.gate_needs` and `.publish_needs` enumerate gate jobs BY NAME, so a gate job absent
+  from both is a TAG-TIME hole behind a green MR pipeline.** The lists are consumed by the
+  kaniko build template and `e2e:kind-smoke`, and by the publish-image template and
+  `publish:chart`. A missing name means a `v*` tag pushes every image and the OCI chart to
+  Harbor **while that job is failing**: the pipeline reddens afterwards and the artifacts are
+  already out. **A new gate job goes into both lists in the commit that creates it.** These
+  two lists are a second single-hot-line merge contention that the PRD's Parallelization
+  section does not name, and they are worse than `stages:` in one respect — **appending
+  resolves the merge but not the omission**.
+- **M3 shipped that rule while an existing job was violating it, which is what turns it from a
+  membership rule into a completeness property.** `test:api-store-it` — `stage: test`, no
+  `rules:` of its own, so it runs on tag pipelines — had been absent from **both** lists since
+  the commit that introduced it, with no reason recorded anywhere. So a `v*` tag published
+  while the **sole CI coverage of the LiveDB suite** was failing: the one job that catches a
+  `+goose`-poisoned migration, whose blast radius is every later migration staying unapplied
+  at API boot on every upgraded instance. M3 added it to both and corrected the list's own
+  header, whose *"The full validate+test+helm gate set"* admits one reading and was false
+  while that job was missing.
+- **🔴 The completeness check is by RESOLVED STAGE, never by job-name shape — and the
+  name-based check is what produced a false all-clear over this live hole.** A filter keyed on
+  `validate:*` / `test:*` / `lint:*` per component is satisfied by `test:api-store-it` in name
+  and slips past it in practice. **Enumerate every job whose resolved `stage` is `validate`,
+  `lint` or `test` — resolving `stage` through `extends` — and assert each appears in both
+  lists.** On the post-M3 tree that holds, with the two lists differing only by the two
+  `publish:assert-*` entries, which is the property to re-derive rather than a count to quote.
+- **The `.gate_needs` half of that fix carries an UNMEASURED latency cost, taken deliberately,
+  and its revisit criterion needs no baseline.** That list's consumers put a `postgres:17`
+  service container on every MR's validation-build path for no correctness gain there — the
+  release-integrity argument is entirely about `.publish_needs`. It was added to both anyway,
+  because granting an exception on an *unmeasured* cost is the inversion this PRD exists to
+  correct, and because an asymmetry between two adjacent lists invites a future "fix" in
+  either direction. The criterion: the build template starts when the **slowest** of the
+  needed jobs finishes, so compare `test:api-store-it`'s duration against the **max** of the
+  others — if it is not the max it added exactly zero, and if it is, the cost is its duration
+  minus the runner-up's. Read it on a warm pipeline, since a cold `lint` cache would otherwise
+  confound it.
+- **Each Go lint job takes its OWN cache key prefix over the same `go.sum`.** golangci-lint is
+  fetched by a pinned `go run`, so its build artifacts land in `GOCACHE` — and the sibling
+  jobs share the module's key **without ever building them**, so whichever finished last would
+  decide whether the next pipeline's lint job is warm or cold. A distinct prefix removes the
+  race in both directions.
+- **`needs: []` is inherited, so the `lint` stage is ORGANISATIONAL, not ordering.** The new
+  jobs start at pipeline T+0 like every other gate; the stage groups them, it does not sequence
+  them behind `validate`.
+- **Ordering inside `gate:*` differs by component ON PURPOSE, and the asymmetry is documented
+  where a reader would otherwise call it inconsistent.** Go runs lint **after** `build`,
+  because golangci-lint type-checks: on a tree that does not compile it reports
+  `typechecking error` instead of the build error, a worse message for the same defect — and
+  **before** `test`, because it is seconds against a `-race` run. Web and agent run lint
+  **first**: measured ~0.06s and ~0.05s, two orders of magnitude cheaper than anything else in
+  those gates, and oxlint is not type-aware so it has no ordering dependency. Same reason M2
+  put `fmt-check` first.
+- **The composite `lint` is EXTENSIBLE, not closed, and its `desc:` says so.** It composes all
+  four components today where the neighbouring `fmt-check` composes two (only the Go modules
+  have a format check), so a coder copying that target's shape would copy its scope; M5 appends
+  shell and YAML to this same list.
+- **The gate-timing figures in both slot-table copies were RE-MEASURED rather than left bare,
+  and the honest reading is a straddle.** They are used prescriptively ("a complete answer in
+  well under a minute"), so wiring lint into every `gate:*` invalidated them. Re-measured
+  2026-08-02 on a warm long-lived worktree, `task gate` EXIT=0 across three samples spanning
+  126-213s, which **straddles** the pre-M3 warm reading: the run-to-run spread is wider than
+  lint's contribution in both directions, so the defensible statement is that **lint did not
+  move this slot out of its envelope** — never that it made the gate faster. Quoting only the
+  fastest sample would invite exactly that inference.
+
+## 471. PRD #103 M3 — the two instruments that report a wrong number: the cap flags compose IN ORDER, and the result cache is HOST-GLOBAL and lies in BOTH directions
+
+Every figure in this milestone came from an instrument that had to be calibrated first, and
+three separate people published a wrong number before the calibration existed. These are
+properties of golangci-lint, not of this repo, and they outlive M3 — M4 and M5 add linters to
+the same runner.
+
+- **🔴 Any golangci-lint figure carries `--max-issues-per-linter=0 --max-same-issues=0`, or it
+  is a CAP READING.** Defaults are 50 per linter and 3 per repeated message. The tell in this
+  milestone was `goconst` reporting **exactly 50** — and that is the tell nobody looks at,
+  because 50 is a plausible number.
+- **The two flags COMPOSE IN ORDER and neither "owns" a linter, which is what makes the
+  obvious drop-one check a trap.** Measured 2026-08-02 on the shipped config, `cache clean`
+  before each cell:
+
+  ```
+  --new-from-merge-base=                            56   errcheck 36  staticcheck 13
+  + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
+  + --max-same-issues=0                             78   errcheck 50  staticcheck 21
+  both                                             107   errcheck 79  staticcheck 21
+  ```
+
+  `--max-same-issues` folds duplicate **messages** first; `--max-issues-per-linter` then
+  truncates the survivors at 50. So on this config **`--max-issues-per-linter=0` alone is a
+  complete no-op** — nothing exceeds 50 until the fold is lifted — and its real effect is
+  **errcheck 50→79**, visible only after the other flag has fired. Run cell two, see 56→56,
+  conclude the flag is dead weight and delete it, and errcheck reads 50 forever. **Cite the
+  pair, never a single flag's delta**: no one flag produces 36→79, and both this file's
+  ancestors in `Taskfile.yml` and the PRD once claimed it did, from a 2-cell measurement that
+  cannot separate them.
+- **`controller` reads the same number either way, and THAT is the camouflage.** A sanity
+  check of "do the caps matter?" run against the cheap module concludes no. The general form
+  is the one worth carrying: **a warning in one section does not protect a later section when
+  the underlying run is shared** — the camouflage was written down and then walked into two
+  sections later, by a different person reading the same capped output.
+- **`issues.uniq-by-line` defaults to TRUE, dedupping ACROSS linters, so any single linter's
+  count depends on which OTHERS are enabled.** On this tree the 107 becomes 108 with
+  `--uniq-by-line=false`. One finding today; recorded because **M4 and M5 add linters**, and
+  this is how a staticcheck finding disappears from an "unfiltered" total with nobody touching
+  staticcheck.
+- **🔴 Name the POPULATION or the counts will not reconcile — a wrapped record makes three
+  denominators all defensible.** Two `goconst` records quote a string literal containing a
+  newline, so each wraps across two output lines. The tool's own tally is 1178; well-formed
+  single-line records are 1176; and a `(goconst)$`-anchored grep also returns 1178 **by
+  coincidence**, counting the two pathless continuation lines while missing the two headers
+  that lost their suffix. Hand-splitting the wrong one puts both wrapped records in the
+  non-test bucket. Both are in `_test.go`, so the non-test figures hold either way. This cost
+  three people a wrong number.
+- **🔴 The result cache is HOST-GLOBAL and poisons across sibling worktrees IN TWO OPPOSITE
+  DIRECTIONS. The quiet direction is the dangerous one.** It lives outside the repo, shared by
+  every worktree of this bare clone exactly like the Go build cache, and a warm entry replays
+  the **absolute paths** of the tree that warmed it. The **ratcheted** targets then go falsely
+  **GREEN** — the diff processor cannot match a foreign path against `git diff` output, so it
+  drops everything — while the `:all` targets go falsely **LOUD**, since they have no diff
+  processor and the foreign findings are simply added. Measured 2026-08-02 with a validator's
+  throwaway worktree warm in the cache: `lint:api:all` printed 120 findings, every one pathed
+  into another tree, against 107 after a clean. **The tell is a `../` in a finding's path: that
+  is an invalid run, not a finding.** Two worktrees at the same SHA is the normal state of a
+  fresh worktree and is exactly the configuration of a calibration run.
+- **The `:all` targets clean IN-RECIPE; the gate targets deliberately do NOT, and the split is
+  the decision.** The `:all` targets are *recording* targets whose entire output is a number
+  someone writes down, so "remember to clean first" is discipline this repo removes rather
+  than relies on. The gate targets run on every MR and in every component gate, and the clean
+  is **host-global** — it would clear the cache for every concurrent agent and worktree, which
+  this team has by design. So calibration cleans; the gate does not.
+- **And clean AFTER deleting a throwaway worktree, not only before an arm. The cached paths
+  OUTLIVE THE TREE.** Cleaning before your own run protects you and does nothing for whoever
+  runs next, and a finding pathed into a directory that no longer exists is worse than one
+  pointing at a live sibling, because nobody can go look at it. That is precisely how the 120
+  above happened.
+- **🔴 The same directory holds a host-global LOCK whose failure is INDISTINGUISHABLE from a
+  finding by status alone.** Concurrent runs give `Error: parallel golangci-lint is running`
+  and golangci-lint exits **3** — but the pinned `go run` prints that as the *text*
+  `exit status 3` and then exits **1** itself, which is this repo's "there are findings" code,
+  and `task` reports its usual 201 regardless. So the 3 never reaches the exit code, and an
+  automated reader testing `!= 0` — or even reading the status carefully — records a red gate
+  over code that is fine. **The only discriminator is the message text.** It fails safe (false
+  red, never false green), and the correct response is to re-run rather than to report a red
+  gate; on a bare clone with many sibling worktrees and agents running concurrently by design,
+  the collision is normal rather than exceptional.
