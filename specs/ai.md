@@ -16381,6 +16381,19 @@ the same runner.
   pair, never a single flag's delta**: no one flag produces 36→79, and both this file's
   ancestors in `Taskfile.yml` and the PRD once claimed it did, from a 2-cell measurement that
   cannot separate them.
+- **🔴 AND "FLAG X IS A NO-OP HERE" IS A CLAIM ABOUT THE DATA, NOT ABOUT THE FLAG.** The no-op
+  above follows from the **mechanism**, not from the flag: two caps sit in series, the fold
+  runs first, and the per-linter cap can only bite on what survives it. So whether lifting it
+  alone changes anything depends entirely on whether some linter's folded count reaches 50 —
+  a property of the finding distribution. On the shipped set nothing does, which is why it
+  reads as dead weight; on a config enabling `goconst` it cannot possibly hold, since 1178
+  uncapped findings do not survive a per-linter cap of 50 unscathed. Confirmed by re-running
+  the same 2×2 there, and its figures are deliberately **not** carried into this record — they
+  are not the shipped set, and importing them is the mislabel this section exists to prevent.
+  **The tell that separates the two readings is where a count LANDS**: a linter coming to rest
+  on exactly `50` once the fold is lifted is the per-linter cap binding, not a finding total.
+  This is the `controller` camouflage below recurring one level down — inside the correction
+  to it, on the flags themselves.
 - **`controller` reads the same number either way, and THAT is the camouflage.** A sanity
   check of "do the caps matter?" run against the cheap module concludes no. The general form
   is the one worth carrying: **a warning in one section does not protect a later section when
