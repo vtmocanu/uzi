@@ -82,13 +82,25 @@
 # exit status 7` with rc=201. Anything reading `$?` NUMERICALLY must know this;
 # `!= 0` is still a correct failure test.
 #
-# AND 201 IS NOT THE ONLY NONZERO. `201` means a target RAN AND FAILED; `1` means
-# task never got that far, because THIS FILE DID NOT PARSE. Measured 2026-08-02
-# while editing it: a `desc:` reading `... modules (fail-fast: stops at the first
-# module)` puts a bare `: ` inside a plain YAML scalar, which is illegal, and
-# every target disappears at once - so the symptom does not resemble the edit
-# that caused it. Read the code, not just its sign, and parse this file after
-# touching it.
+# AND 201 IS NOT THE ONLY NONZERO. `201` means a target RAN AND FAILED; `109`
+# means task never got that far, because THIS FILE DID NOT PARSE - and that one
+# is LOUD AND SELF-LOCATING. Measured 2026-08-02 while editing this file, task
+# 3.51.1: a `desc:` reading `... modules (fail-fast: stops at the first module)`
+# puts a bare `: ` inside a plain YAML scalar, which is illegal. `task --list`,
+# `--list-all`, a named target and a bare `task` ALL return 109 and all print
+#
+#   task: Failed to parse Taskfile.yml:
+#   yaml: line 191: mapping values are not allowed in this context
+#
+# naming the file and the line you just edited. Still: parse this file after
+# touching it, because a `desc:` is the one place a stray `: ` looks harmless.
+#
+# (Corrected same day. This paragraph first said `1`, and said every target
+# disappears at once so the symptom does not resemble its cause. BOTH WRONG, and
+# the second is backwards. The `1` came from `python3 -c "import yaml..." && task
+# ...; echo $?` -- the YAML library exits 1, the && short-circuits, task NEVER
+# RUNS, and python's code was reported as task's. Reporting-failure form (1) in
+# CLAUDE.md's gate-status entry, committed inside a note about exit codes.)
 #
 # NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
@@ -243,6 +255,13 @@ tasks:
       #   sh -ec  'out="$(gofmt -l .)"; ...'            rc=2
       #   sh -c   'out="$(gofmt -l .)" || exit 1; ...'  rc=1
       #   sh -c   'out="$(gofmt -l .)" || exit 2; ...'  rc=2   <- shipped
+      #
+      # ONE ORDERING CONSEQUENCE, since `desc:` promises the files are named: on a
+      # tree carrying BOTH a non-parsing file AND drift, the guard fires before
+      # `$out` is echoed, so the drifted files are NOT named that run - you get
+      # the parse error and `exit status 2`, then the drift on the next run once
+      # the parse error is fixed. Measured. Two rounds, not a hole: gofmt does
+      # list the drifted files, the guard simply pre-empts the echo.
       #
       # `2` AND NOT `1`, FOR TWO REASONS. It reproduces gofmt's own exit status,
       # so the table at the top of this comment and CLAUDE.md's R10 paragraph -

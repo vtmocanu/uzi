@@ -118,9 +118,12 @@ message had that exact shape:
   across 7 files** repo-wide, **6 across 5 Go files** under `api/`. **So `7` is
   the repo-wide FILE count, reported as a directive count** — and note the first
   two attempts to correct it, by two different people, both asserted *"no scope
-  yields 7"*, which is itself false and was accepted twice. The corroborating
-  clause was wrong, its correction was wrong, and the conclusion it decorated was
-  right throughout.
+  yields 7"*, which is itself false and was accepted twice. **The corroborating
+  clause was wrong, its correction was wrong, the correction of that correction
+  was wrong — and the conclusion they all decorated (nothing moved) was right at
+  every layer.** Each layer was checked only against the layer below it, never
+  against the repo, because everyone already agreed on the point. This bullet is
+  the entry's own thesis landing on the entry.
   *(Anchored to a SHA on purpose. Writing this bullet ADDED an occurrence to the
   repo — the count read 10 across 8 files the moment it was recorded, and moves
   again with the next quotation. A count of a population that includes the
@@ -291,9 +294,11 @@ decides where the next person spends their time. Re-derive those too.
     drift is gone, so there is nothing left to sweep and the rule has no subject.
   - **Still fully live on a branch that has not rebased past it.** Measured 2026-08-02 with
     `git archive <branch> api | tar -x` into a temp dir (no sibling worktree touched), `gofmt -l`
-    was non-empty on **five** live branches, one of them well above `main`'s count. Numbers are
-    not recorded here: they move with every commit and the shape is the point. **Re-measure your
-    own branch; do not infer it from `main`.**
+    was non-empty on **every local branch sampled except two** — and the sample was all of them.
+    Counts are deliberately not recorded: they move with every commit and the shape is the point.
+    **Re-measure your own branch; do not infer it from `main`.** *(This first read "five live
+    branches", written from the five that had worktrees. True, and it understates by roughly 5x
+    while reading as an enumeration — one clause before a sentence about numbers moving.)*
   - **The new gate does NOT cover this case, and the obvious reading of it is wrong.** `fmt-check`
     detects DRIFT; the hazard here is a SWEEP, and a swept tree is gofmt-clean, so the gate is
     green by construction. It was never the drift's existence that hurt — it was foreign files

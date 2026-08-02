@@ -949,7 +949,10 @@ which previously prescribed only the fail-open form.
       `test -z "$(gofmt -l .)"`, which **fails OPEN on a Go file that does not
       parse** — gofmt exits 2 to stderr, the substitution captures nothing,
       `test -z` is trivially true, and the gate goes GREEN while printing the
-      parse error. Four independent reproductions on 2026-08-02. It also
+      parse error. Four independent reproductions on 2026-08-02 —
+      `CLAUDE.md`'s R10 paragraph says *three* and does not conflict: it
+      records the first three (reviewer, lead, tester) and predates the
+      fourth. It also
       swallows the filenames, which Success Criterion 8's calibration needs.
       **This mattered beyond M2**: M3 and M5 add gates of exactly this shape
       (`golangci-lint`, `oxlint`, `shellcheck`, `yamllint`), and a coder
