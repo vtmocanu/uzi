@@ -67,7 +67,11 @@ as a new Step 2 task plus a rewritten Step 3. Its load-bearing sentences:
   implementer, and treat the design as FROZEN once the implementer spawns."*
 - *"The wave's required deliverable is a CITATION, not a critique."* — for every mechanism
   the plan asserts, name the file that implements it and quote the line. "Attack the
-  design" is a mood; the lookup is what has actually paid.
+  design" is a mood; the lookup is what has actually paid. **This one is NOT from
+  `a78fc52`** — it was added 5½ hours later in `0a9f331` ("close the seam where the
+  template holds rules the steps never run"), at `agent-team/SKILL.md:634`. Corrected
+  2026-08-02 after `git log -S 'deliverable is a CITATION'` was run against the claim;
+  the other three below are verbatim in `a78fc52`.
 - *"once the implementer has spawned, a DESIGN change is a new wave, not a message."*
 - *"Skip this wave for a small fix — a one-line change with an obvious mechanism does not
   need a design round, and a step that fires on everything gets skipped on everything."*
@@ -428,3 +432,20 @@ with architect excluded.
 - **Prefer `git ls-remote` over `git fetch --all` for a freshness check** while other
   agents are running — the fact-checker avoided mutating shared refs and still proved the
   tracking refs current. My spec-sync instruction said `fetch --all`; it was wrong to.
+- **The lead's zsh `git show` warning was WRONG IN ITS MECHANISM, and it went to two
+  agents.** I told the tester and fact-checker that `git show $sha:api/…` "silently reads
+  a nonexistent path, returning the SHA-1 of empty input rather than an error." Measured:
+  it fails **loudly** — `rc=128`, `fatal: ambiguous argument '…/60bf036fpi/internal/…'`,
+  and **no stdout at all**. The empty-input hash in `CLAUDE.md`'s account is what a
+  *downstream hasher* produces when fed that empty stdout, not something git returns. So
+  the real hazard is narrower and more actionable: `n=$(git show "$r:file" 2>/dev/null | …)`
+  in a sweep loop, where suppressing stderr and ignoring `rc` converts a loud failure into
+  an empty string that reads as "this branch has no such file". Two distinct expansions,
+  both non-zero: `:s` (as in `:specs/…`) aborts with `bad substitution`; `:a` (as in
+  `:api/…`) absolutizes and hands git garbage. Bracing — `git show "${sha}:path"` — fixes
+  both and needs no second variable.
+- **Third citation defect in this brief, all three the lead's.** `tester.md:8`/`:20-21`,
+  `prompt.ts:908`, and now `a78fc52` for a sentence that is `0a9f331`'s. Each reached this
+  file from a report or from memory and was written down without being opened. The control
+  is one command — the skills repo's own `SKILL.md:383` says *"A CITATION is an assertion
+  too, and `git log -S` is its control"*, in the very file being mis-cited.
