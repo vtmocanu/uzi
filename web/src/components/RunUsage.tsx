@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
+import { cacheDisplayPct } from "../lib/runUsage";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { formatDuration } from "./RunEvent";
 import { cx } from "./ui";
@@ -109,12 +110,19 @@ function totalModelCell(models: string[]): ReactNode {
 export function RunUsagePanel({ usage }: { usage: RunUsage }) {
   if (!usage.hasUsage) return null;
   const { total, model, phases, agents, agentTotal, agentModels } = usage;
-  const cachePct = Math.round(usage.cacheHitRatio * 100);
+  // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
+  // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
+  const cachePct = cacheDisplayPct(total);
   const tokensIn = total.fresh + total.cached;
 
   return (
     <div>
+      {/* role="group" is required for the aria-label to be reliable: the default
+          role of a bare div is `generic`, and ARIA does not permit a name on it, so
+          Chrome exposes it while NVDA/VoiceOver generally do not. The two table
+          wrappers below already use role="region" for the same reason. */}
       <div
+        role="group"
         className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-edge bg-edge sm:grid-cols-4"
         aria-label="Run usage totals"
       >

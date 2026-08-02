@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { deriveRunUsage } from "./runUsage";
+import { deriveRunUsage, cacheDisplayPct } from "./runUsage";
 import type { RunMessage } from "./api";
 
 let seq = 0;
@@ -10,25 +10,64 @@ function beforeEachReset() {
   seq = 0;
 }
 
-// A cumulative result frame (verdict b): usage totals are session-to-date.
-function resultFrame(
+type ModelCum = { input: number; cacheRead?: number; cacheCreation?: number; output: number; cost: number };
+
+const SENTINEL_TOKENS = 777;
+const SENTINEL_COST = 7.77;
+
+/**
+ * A cumulative result frame (verdict b): usage totals are session-to-date, split per
+ * model exactly as the SDK forwards them.
+ *
+ * 🔴 The top-level `usage` and `total_cost_usd` this emits are DELIBERATE SENTINELS
+ * that disagree with `modelUsage`, and every assertion below is pinned to the
+ * modelUsage figures. That is not decoration: issue #195 was the run page reading
+ * top-level `usage` while every rollup folded `modelUsage`, and on the live SDK pin
+ * the two disagree by 2.5-3.3x. With the sentinels here, an implementation that
+ * regresses to the top-level field cannot pass these tests by coincidence. Do not
+ * "tidy" them into agreement — that deletes the only thing making these frames say
+ * which field was read.
+ */
+function modelResultFrame(
   agent: string,
-  cum: { input: number; cacheRead: number; cacheCreation?: number; output: number; cost: number },
+  models: Record<string, ModelCum>,
   meta: { turns: number; durationMs: number; kind?: "status" | "error"; subtype?: string },
 ): RunMessage {
+  const modelUsage = Object.fromEntries(
+    Object.entries(models).map(([m, c]) => [
+      m,
+      {
+        inputTokens: c.input,
+        outputTokens: c.output,
+        cacheReadInputTokens: c.cacheRead ?? 0,
+        cacheCreationInputTokens: c.cacheCreation ?? 0,
+        costUSD: c.cost,
+      },
+    ]),
+  );
   return msg(meta.kind ?? "status", agent, {
     event: "result",
     subtype: meta.subtype ?? (meta.kind === "error" ? "error_max_turns" : "success"),
     num_turns: meta.turns,
     duration_ms: meta.durationMs,
-    total_cost_usd: cum.cost,
+    total_cost_usd: SENTINEL_COST,
     usage: {
-      input_tokens: cum.input,
-      cache_read_input_tokens: cum.cacheRead,
-      cache_creation_input_tokens: cum.cacheCreation ?? 0,
-      output_tokens: cum.output,
+      input_tokens: SENTINEL_TOKENS,
+      cache_read_input_tokens: SENTINEL_TOKENS,
+      cache_creation_input_tokens: SENTINEL_TOKENS,
+      output_tokens: SENTINEL_TOKENS,
     },
+    modelUsage,
   });
+}
+
+/** The single-model shorthand the pre-#195 tests were written against. */
+function resultFrame(
+  agent: string,
+  cum: { input: number; cacheRead: number; cacheCreation?: number; output: number; cost: number },
+  meta: { turns: number; durationMs: number; kind?: "status" | "error"; subtype?: string },
+): RunMessage {
+  return modelResultFrame(agent, { "claude-sonnet-5": cum }, meta);
 }
 
 // An assistant frame carrying per-call usage (attached by the worker to one msg).
@@ -49,7 +88,7 @@ function assistantUsage(
 }
 
 describe("deriveRunUsage", () => {
-  it("differences cumulative result frames into per-phase deltas; total is the last cumulative", () => {
+  it("differences cumulative result frames into per-phase deltas; total is the high-water mark", () => {
     beforeEachReset();
     const messages = [
       msg("status", "lead", { event: "init", model: "claude-sonnet-5" }),
@@ -69,7 +108,11 @@ describe("deriveRunUsage", () => {
     expect(d.phases[1]).toMatchObject({ fresh: 58_900, cached: 612_300, out: 28_700, turns: 34, durationMs: 200_000 });
     expect(d.phases[1].costUsd).toBeCloseTo(1.02, 6);
 
-    // Run total = sum of deltas = last cumulative; turns/duration SUM.
+    // Run total = sum of the clamped deltas = each model's HIGH-WATER MARK, which on
+    // this monotonic fixture coincides with the last cumulative. That coincidence is
+    // exactly why the retired mechanism survived a rename here, and why it is spelled
+    // out rather than left as "= last cumulative"; the cases below discriminate.
+    // turns/duration SUM.
     expect(d.total).toMatchObject({ fresh: 80_300, cached: 800_300, out: 34_800, turns: 43, durationMs: 300_000, phaseCount: 2 });
     expect(d.total.costUsd).toBeCloseTo(1.26, 6);
     expect(d.cacheHitRatio).toBeCloseTo(800_300 / 880_600, 6);
@@ -96,16 +139,17 @@ describe("deriveRunUsage", () => {
     expect(d.agents.reduce((n, a) => n + a.out, 0)).toBe(34_800);
   });
 
-  it("has no usage for a pre-feature run (result frames without a usage object)", () => {
+  it("has no usage for a pre-feature run (result frames carrying no modelUsage)", () => {
     beforeEachReset();
     const messages = [
-      msg("status", "lead", { event: "result", subtype: "success", num_turns: 3 }), // no usage key
+      msg("status", "lead", { event: "result", subtype: "success", num_turns: 3 }), // no usage, no modelUsage
       msg("text", "lead", { text: "done" }),
     ];
     const d = deriveRunUsage(messages);
     expect(d.hasUsage).toBe(false);
     expect(d.phases).toHaveLength(0);
     expect(d.agents).toHaveLength(0);
+    expect(d.modelTotals).toEqual([]);
   });
 
   it("folds an error result frame's usage (a failed phase still spent tokens)", () => {
@@ -129,6 +173,434 @@ describe("deriveRunUsage", () => {
     const d = deriveRunUsage(messages);
     expect(d.phases[1]).toMatchObject({ fresh: 0, out: 0 }); // clamped, not negative
     expect(d.phases[1].costUsd).toBe(0);
+  });
+
+  // ── Issue #195: result frames are read PER MODEL, off `modelUsage` ───────────
+
+  it("reads modelUsage, never the frame's top-level usage or total_cost_usd", () => {
+    beforeEachReset();
+    // Both fields ride every real result frame, and on the shipped SDK pin they
+    // disagree — the run page read the wrong one for the whole of PRD #40's life.
+    const d = deriveRunUsage([
+      modelResultFrame(
+        "lead",
+        { "claude-opus-5": { input: 5_000, cacheRead: 40_000, cacheCreation: 1_000, output: 900, cost: 0.42 } },
+        { turns: 4, durationMs: 1_000 },
+      ),
+    ]);
+    expect(d.total).toMatchObject({ fresh: 6_000, cached: 40_000, out: 900 });
+    expect(d.total.costUsd).toBeCloseTo(0.42, 6);
+    // The sentinels the helper writes into the top-level fields must not appear.
+    expect([d.total.fresh, d.total.cached, d.total.out]).not.toContain(777);
+    expect(d.total.costUsd).not.toBeCloseTo(7.77, 6);
+  });
+
+  it("keeps a model that vanishes from a later frame's modelUsage (the #195 shape)", () => {
+    beforeEachReset();
+    // haiku is in the first result frame and gone from the second — measured on run
+    // 84b6a933 and on 16 other live runs. The server retains it via GREATEST per
+    // (run_id, session_id, model), so the client must too. An implementation that
+    // sums modelUsage PER FRAME and differences the sums telescopes to the LAST
+    // frame's models and loses haiku entirely: it would report fresh 300 / out 40 /
+    // cost 3 here instead of 305 / 41 / 3.5.
+    const d = deriveRunUsage([
+      modelResultFrame(
+        "lead",
+        {
+          "claude-opus-5": { input: 100, output: 10, cost: 1 },
+          "claude-haiku-4-5-20251001": { input: 5, output: 1, cost: 0.5 },
+        },
+        { turns: 3, durationMs: 1_000 },
+      ),
+      modelResultFrame("lead", { "claude-opus-5": { input: 300, output: 40, cost: 3 } }, { turns: 6, durationMs: 2_000 }),
+    ]);
+    expect(d.phases[0]).toMatchObject({ fresh: 105, out: 11 });
+    expect(d.phases[1]).toMatchObject({ fresh: 200, out: 30 }); // opus only; haiku contributes 0
+    expect(d.phases[1].costUsd).toBeCloseTo(2, 6);
+    expect(d.total).toMatchObject({ fresh: 305, out: 41 });
+    expect(d.total.costUsd).toBeCloseTo(3.5, 6);
+  });
+
+  it("clamps per model, so one model's regression cannot eat another's growth", () => {
+    beforeEachReset();
+    // Whole-frame clamping would see 200 → 350 and report a 150 delta. Per model,
+    // opus regressed (delta clamped to 0) and sonnet genuinely grew by 200.
+    const d = deriveRunUsage([
+      modelResultFrame(
+        "lead",
+        { "claude-opus-5": { input: 100, output: 0, cost: 0 }, "claude-sonnet-5": { input: 100, output: 0, cost: 0 } },
+        { turns: 1, durationMs: 1 },
+      ),
+      modelResultFrame(
+        "lead",
+        { "claude-opus-5": { input: 50, output: 0, cost: 0 }, "claude-sonnet-5": { input: 300, output: 0, cost: 0 } },
+        { turns: 1, durationMs: 1 },
+      ),
+    ]);
+    expect(d.phases[1].fresh).toBe(200);
+    expect(d.total.fresh).toBe(400);
+  });
+
+  it("skips a usage-only result frame entirely: no phase row AND no agent row", () => {
+    beforeEachReset();
+    // Decided with the user, 2026-08-02: mirror the server's `len(p.ModelUsage) == 0`
+    // guard exactly. A fallback to top-level `usage` would reintroduce the divergence.
+    //
+    // The second half of this is the sharper assertion. The skip is written as a
+    // `continue`, and a fall-through would drop this frame into the per-agent branch
+    // (which fires on any payload with a `usage` key) and fold the run's CUMULATIVE
+    // total into one agent's per-call sum. `agents` is what observes that; `phases`
+    // alone cannot. This is also the file's one remaining `usage`-only frame — keep
+    // it, or nothing left here exercises that branch at all.
+    const d = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 5,
+        duration_ms: 900,
+        total_cost_usd: 1.5,
+        usage: { input_tokens: 9_000, cache_read_input_tokens: 1_000, output_tokens: 400 },
+      }),
+    ]);
+    expect(d.hasUsage).toBe(false);
+    expect(d.phases).toHaveLength(0);
+    expect(d.agents).toHaveLength(0);
+    expect(d.agentTotal).toMatchObject({ fresh: 0, cached: 0, out: 0 });
+    expect(d.total).toMatchObject({ fresh: 0, cached: 0, out: 0, phaseCount: 0 });
+    expect(d.modelTotals).toEqual([]);
+  });
+
+  it("skips a zero-work frame (modelUsage: {}) without spending a phase label on it", () => {
+    beforeEachReset();
+    // A real one exists in the live DB (run e2d7427b seq 318: num_turns 0,
+    // duration_ms 288, every usage field 0). The server folds nothing for it, so it
+    // produces no phase row — and, because the label counter only advances on rows
+    // that are pushed, the NEXT frame is still "Implement · iteration 1" rather than
+    // 2. That renumbering is the visible consequence of the skip; it is asserted here
+    // so a future change to the labelling cannot happen silently.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { "claude-opus-5": { input: 100, output: 10, cost: 1 } }, { turns: 3, durationMs: 10 }),
+      msg("status", "lead", { event: "result", subtype: "success", num_turns: 0, duration_ms: 288, modelUsage: {} }),
+      modelResultFrame("lead", { "claude-opus-5": { input: 300, output: 40, cost: 3 } }, { turns: 4, durationMs: 20 }),
+    ]);
+    expect(d.phases.map((p) => p.label)).toEqual(["Plan", "Implement · iteration 1"]);
+    expect(d.total).toMatchObject({ fresh: 300, out: 40, phaseCount: 2, turns: 7, durationMs: 30 });
+  });
+
+  // The three malformed-entry shapes, each pinned against what Go actually does with
+  // the same bytes. Measured 2026-08-02 by running the real `resultUsagePayload`
+  // through encoding/json; the arms genuinely differ, so one blanket rule is wrong.
+
+  it("loses the phase row for a frame whose ONLY model id is empty, totals still agreeing", () => {
+    beforeEachReset();
+    // The SECOND trigger for "no phase row", alongside `modelUsage: {}`. Measured on
+    // both sides 2026-08-02: Go folds the frame (the map is non-empty) and then skips
+    // the entry via `if model == ""`, writing ZERO rows; this reader skips the entry,
+    // is left with nothing, and skips the frame. Totals therefore agree — both record
+    // nothing — and the only observable difference is the phase row, the same accepted
+    // consequence as the empty map.
+    const d = deriveRunUsage([msg("status", "lead", {
+      event: "result",
+      subtype: "success",
+      num_turns: 1,
+      duration_ms: 1,
+      modelUsage: { "": { inputTokens: 10, outputTokens: 1 } },
+    })]);
+    expect(d.hasUsage).toBe(false);
+    expect(d.phases).toHaveLength(0);
+    expect(d.total).toMatchObject({ fresh: 0, out: 0 });
+    expect(d.modelTotals).toEqual([]);
+  });
+
+  it("still folds a frame that has an empty model id ALONGSIDE a real one", () => {
+    beforeEachReset();
+    // The mixed case is NOT affected: Go folds the frame and writes one row, and so do
+    // we. Without this, the test above would be satisfied by a reader that discarded
+    // any frame containing an empty id — which would lose real usage.
+    const d = deriveRunUsage([msg("status", "lead", {
+      event: "result",
+      subtype: "success",
+      num_turns: 1,
+      duration_ms: 1,
+      modelUsage: { "": { inputTokens: 10 }, "claude-opus-5": { inputTokens: 7, outputTokens: 2 } },
+    })]);
+    expect(d.hasUsage).toBe(true);
+    expect(d.total).toMatchObject({ fresh: 7, out: 2 });
+    expect(d.modelTotals.map((t) => t.model)).toEqual(["claude-opus-5"]);
+  });
+
+  it("skips a frame whose modelUsage entry is a number (Go fails the whole payload)", () => {
+    beforeEachReset();
+    // Go: "cannot unmarshal number into ... resultModelUsage" → the server folds
+    // NOTHING for this frame, valid siblings included. Dropping only the bad entry
+    // here would leave the client counting a frame the server ignored.
+    const d = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": 5 },
+      }),
+    ]);
+    expect(d.hasUsage).toBe(false);
+    expect(d.phases).toHaveLength(0);
+  });
+
+  it("skips a frame whose modelUsage entry is an ARRAY, which typeof calls an object", () => {
+    beforeEachReset();
+    // `typeof [] === "object"`, so without an explicit Array.isArray check this folds
+    // as an all-zero model while Go answers "cannot unmarshal array" and skips the
+    // frame. The valid sibling is what makes the divergence expensive.
+    const d = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": [] },
+      }),
+    ]);
+    expect(d.hasUsage).toBe(false);
+    expect(d.phases).toHaveLength(0);
+    expect(d.modelTotals).toEqual([]);
+  });
+
+  it("folds a NULL modelUsage entry as an all-zero model, because Go does", () => {
+    beforeEachReset();
+    // Unmarshalling `null` into a struct is a documented no-op returning NO error, so
+    // Go lands the key with the zero value and folds the frame. Measured:
+    // {"good":{"inputTokens":10},"bad":null} → Go FOLDS 2 rows, bad all-zero.
+    // Treating null as a poison discards a frame whose VALID models the server has
+    // already folded — the costly direction of the two.
+    const d = deriveRunUsage([
+      msg("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 2,
+        duration_ms: 50,
+        modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": null },
+      }),
+    ]);
+    expect(d.hasUsage).toBe(true);
+    expect(d.phases).toHaveLength(1);
+    expect(d.total).toMatchObject({ fresh: 100, out: 10 });
+    expect(d.modelTotals).toEqual([
+      { model: "claude-opus-5", input: 100, cacheCreation: 0, cached: 0, out: 10, costUsd: 1 },
+      { model: "claude-sonnet-5", input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 },
+    ]);
+  });
+
+  // ── Issue #195: the mark is a RUNNING MAX, which is what makes the run total
+  // equal the server's. Every case below is red under last-seen semantics, and the
+  // whole 1595-test suite was green under BOTH before they existed — nothing else in
+  // the repo distinguishes them.
+
+  it("totals a non-monotonic model at its high-water mark, exactly as the server does", () => {
+    beforeEachReset();
+    // The server is MAX over frames per model (00063_run_usage_totals_view.sql). Under
+    // last-seen this reports 7000 (5000 + 0 + 2000); the server holds 5000.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: 5_000, output: 0, cost: 0 } }, { turns: 3, durationMs: 10 }),
+      modelResultFrame("lead", { m: { input: 1_000, output: 0, cost: 0 } }, { turns: 4, durationMs: 20 }),
+      modelResultFrame("lead", { m: { input: 3_000, output: 0, cost: 0 } }, { turns: 5, durationMs: 30 }),
+    ]);
+    expect(d.total.fresh).toBe(5_000);
+    expect(d.modelTotals).toEqual([{ model: "m", input: 5_000, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 }]);
+  });
+
+  it("renders a post-reset phase as 0 tokens beside nonzero turns and duration", () => {
+    beforeEachReset();
+    // The PRICE of the running max, asserted so it cannot change unnoticed. Phases 2
+    // and 3 did real work the run total already counts under the earlier high-water
+    // mark, so their rows read 0 tokens while still reporting their own turns and
+    // duration. Last-seen would render 2000 on phase 3 and overcount the run by 2000.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: 5_000, output: 0, cost: 0 } }, { turns: 3, durationMs: 10 }),
+      modelResultFrame("lead", { m: { input: 1_000, output: 0, cost: 0 } }, { turns: 4, durationMs: 20 }),
+      modelResultFrame("lead", { m: { input: 3_000, output: 0, cost: 0 } }, { turns: 5, durationMs: 30 }),
+    ]);
+    expect(d.phases.map((p) => p.fresh)).toEqual([5_000, 0, 0]);
+    expect(d.phases.map((p) => p.turns)).toEqual([3, 4, 5]);
+    expect(d.phases.map((p) => p.durationMs)).toEqual([10, 20, 30]);
+    expect(d.total).toMatchObject({ turns: 12, durationMs: 60 });
+  });
+
+  it("holds the mark through a dip that later recovers past it", () => {
+    beforeEachReset();
+    // [100, 80, 150]: last-seen gives 170, the server gives 150.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: 100, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+      modelResultFrame("lead", { m: { input: 80, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+      modelResultFrame("lead", { m: { input: 150, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.total.fresh).toBe(150);
+  });
+
+  it("clamps a negative cumulative at 0, the way nonNegTokens does before GREATEST", () => {
+    beforeEachReset();
+    // The server clamps the value at fold time (nonNegTokens), stores 0 then 100, and
+    // answers 100. This test pins that BEHAVIOUR, and deliberately not any one guard:
+    // the clamp is enforced in THREE independent places — `tokens()` at read, the zero
+    // seed on the running max, and `clampDelta` — so no single-clamp mutation is
+    // observable here. Measured 2026-08-02: `tokens()` losing its clamp reddens NOTHING
+    // in the suite; `clampDelta` losing its clamp reddens six tests but not this one;
+    // only the two together redden this one.
+    //
+    // An earlier version of this comment said last-seen would compute
+    // max(0, 100 − (−5)) = 105. It does not: `tokens()` floors the −5 at read, so it
+    // never reaches `prev`, and last-seen also answers 100. That counterfactual was
+    // wrong, and the sentence claiming the zero seed worked "with no separate negative
+    // guard" was wrong about code eight lines above it.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: -5, output: -1, cost: -2 } }, { turns: 1, durationMs: 1 }),
+      modelResultFrame("lead", { m: { input: 100, output: 20, cost: 3 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.total).toMatchObject({ fresh: 100, out: 20 });
+    expect(d.total.costUsd).toBeCloseTo(3, 6);
+    expect(d.modelTotals[0]).toMatchObject({ input: 100, out: 20, costUsd: 3 });
+  });
+
+  it("never lets a negative reach modelTotals, on a SINGLE frame", () => {
+    beforeEachReset();
+    // The gap the four-variant matrix exposed. The two-frame test above cannot see
+    // this: its second frame is positive, so the mark recovers to 100 either way and
+    // `modelTotals` reads correctly even with both guards gone. Only a lone negative
+    // frame leaves the mark itself negative.
+    //
+    // `total` is floored by clampDelta and never moves, so asserting it here would
+    // pin nothing — modelTotals is the ONLY surface on which the seed's flooring of
+    // the mark (via mergeMax) is observable at all. Measured on this input:
+    //   tokens() removed AND `?? cur`  ->  modelTotals.input -5
+    // every other single- or zero-mutation variant  ->  0.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: -5, cacheCreation: -7, cacheRead: -3, output: -1, cost: -2 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.modelTotals).toEqual([{ model: "m", input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 }]);
+    expect(d.total).toMatchObject({ fresh: 0, cached: 0, out: 0 });
+  });
+
+  it("maxes input and cache_creation as SEPARATE columns, not as their sum", () => {
+    beforeEachReset();
+    // The server GREATESTs input_tokens and cache_creation_tokens independently, and
+    // MAX(a)+MAX(b) is not MAX(a+b). Here input falls 100 → 50 while cache_creation
+    // rises 0 → 200: per column the run holds 100 + 200 = 300, while an implementation
+    // tracking the combined `fresh` as one column sees 100 → 250 and reports 250.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: 100, cacheCreation: 0, output: 0, cost: 0 } }, { turns: 1, durationMs: 1 }),
+      modelResultFrame(
+        "lead",
+        { m: { input: 50, cacheCreation: 200, output: 0, cost: 0 } },
+        { turns: 1, durationMs: 1 },
+      ),
+    ]);
+    expect(d.total.fresh).toBe(300);
+    expect(d.modelTotals[0]).toMatchObject({ input: 100, cacheCreation: 200 });
+  });
+
+  it("quantizes each model's cost to microdollars, where numericUSD does", () => {
+    beforeEachReset();
+    // numericUSD rounds to numeric(12,6) BEFORE storage, per frame per model. Doing it
+    // at the same point makes the client's per-model cost the NEAREST DOUBLE to the
+    // stored decimal (not "bit-equal to the decimal" — a double never is one), so the
+    // run total carries float-summation noise (~1e-14) rather than rounding error
+    // competing with the assertion's own tolerance.
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { m: { input: 1, output: 1, cost: 67.45905024999998 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.modelTotals[0].costUsd).toBe(67.45905); // exactly, not toBeCloseTo
+  });
+
+  // ── Issue #195: a model id is untrusted worker payload, and it keys the RUN TOTAL.
+
+  it("counts models named __proto__ and constructor without inheriting or vanishing", () => {
+    beforeEachReset();
+    // On a plain `{}` accumulator: the `__proto__` write goes through the prototype
+    // setter and the model is invisible client-side while the server folds it
+    // normally, and `constructor` reads back the inherited FUNCTION so every delta is
+    // NaN and the NaN propagates through phases.reduce into the whole panel. A Map has
+    // neither failure. Ordinary model ids cannot observe any of this.
+    const d = deriveRunUsage([
+      modelResultFrame(
+        "lead",
+        {
+          // COMPUTED key, deliberately: written as a plain `__proto__:` literal, JS
+          // object syntax sets the PROTOTYPE instead of creating an own property, so
+          // `Object.entries` never yields it and this test would silently assert
+          // nothing about the hazard it is named for.
+          ["__proto__"]: { input: 100, output: 10, cost: 1 },
+          constructor: { input: 200, output: 20, cost: 2 },
+          "claude-opus-5": { input: 300, output: 30, cost: 3 },
+        },
+        { turns: 1, durationMs: 1 },
+      ),
+    ]);
+    // A DIAGNOSTIC, not a defence, and SUBSUMED FOR COVERAGE by the value assertion
+    // below: `toMatchObject({ fresh: 600 })` fails whenever `fresh` is NaN, so no
+    // mutant reaches these that it would not already catch. They are first so the
+    // reported failure NAMES the mechanism instead of leaving it in a diff.
+    //
+    // `.not.toBeNaN()` rather than `expect(Number.isNaN(x)).toBe(false)`, because that
+    // form prints "expected true to be false" and names nothing at all. Measured:
+    //   bare isNaN     -> expected true to be false                        <- useless
+    //   not.toBeNaN    -> expected NaN not to be NaN                       <- names it
+    //   toMatchObject  -> expected { fresh: NaN, … } to match { fresh: 600 }
+    // Two earlier versions of this comment were wrong about these lines: one called
+    // them scaffolding "made live" by the reorder (they close no gap), the next
+    // claimed the reorder sharpened the message while shipping the bare form, which
+    // made the message strictly worse. The matcher change is what makes the claim true.
+    expect(d.total.fresh).not.toBeNaN();
+    expect(d.total.out).not.toBeNaN();
+    expect(d.modelTotals.map((t) => t.model)).toEqual(["__proto__", "claude-opus-5", "constructor"]);
+    expect(d.total).toMatchObject({ fresh: 600, out: 60 });
+    expect(d.total.costUsd).toBeCloseTo(6, 6);
+    // Nothing leaked onto Object.prototype on the way through.
+    expect(({} as Record<string, unknown>)["__proto__"]).toBe(Object.prototype);
+  });
+
+  it("caps a model id at 200 CODE POINTS, cutting where Go's []rune does", () => {
+    beforeEachReset();
+    // truncateRunes is string([]rune(s)[:200]). `.slice(0, 200)` is UTF-16 code units,
+    // so on astral input it keeps only 100 code points AND ends on a lone surrogate,
+    // which is not encodable as UTF-8 — Go's own round-trip would replace it with
+    // U+FFFD and the two sides would key the row differently.
+    const astral = "\u{1F600}".repeat(201);
+    const faithful = Array.from(astral).slice(0, 200).join("");
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { [astral]: { input: 100, output: 10, cost: 1 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    // Assert the STRING, not its length: the mixed case below produces 200 code points
+    // either way, so a length assertion passes on the broken implementation.
+    expect(d.modelTotals[0].model).toBe(faithful);
+    expect(d.modelTotals[0].model).not.toBe(astral.slice(0, 200));
+  });
+
+  it("caps on a rune boundary, which a code-unit cut of the same LENGTH gets wrong", () => {
+    beforeEachReset();
+    // 199 ASCII + 5 astral. Both cuts yield 200 code points, so only the content
+    // differs — the naive one ends in an unpaired high surrogate.
+    const mixed = "a".repeat(199) + "\u{1F600}".repeat(5);
+    const faithful = Array.from(mixed).slice(0, 200).join("");
+    const naive = mixed.slice(0, 200);
+    expect(Array.from(faithful)).toHaveLength(200);
+    expect(Array.from(naive)).toHaveLength(200); // the length assertion cannot tell them apart
+    expect(faithful).not.toBe(naive);
+    const d = deriveRunUsage([
+      modelResultFrame("lead", { [mixed]: { input: 100, output: 10, cost: 1 } }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(d.modelTotals[0].model).toBe(faithful);
+  });
+
+  it("merges two over-long ids that the cap collides by MAX, never by sum", () => {
+    beforeEachReset();
+    // Server-side the cap makes these one row, merged with GREATEST. Without the cap
+    // the client would keep them distinct and SUM them (300 instead of 200).
+    const base = "m".repeat(200);
+    const d = deriveRunUsage([
+      modelResultFrame(
+        "lead",
+        { [base + "aaa"]: { input: 100, output: 0, cost: 0 }, [base + "bbb"]: { input: 200, output: 0, cost: 0 } },
+        { turns: 1, durationMs: 1 },
+      ),
+    ]);
+    expect(d.modelTotals).toHaveLength(1);
+    expect(d.total.fresh).toBe(200);
   });
 
   // ── PRD #93: per-agent model, read off the same frames that carry usage ──────
@@ -242,5 +714,54 @@ describe("deriveRunUsage", () => {
     // The map itself has no prototype, and nothing leaked onto Object.prototype.
     expect(Object.getPrototypeOf(d.agents[0].modelCounts)).toBeNull();
     expect(({} as Record<string, unknown>)["__proto__"]).toBe(Object.prototype);
+  });
+});
+
+// ── The cache-percentage display invariant (issue #195 web-ux follow-up) ───────
+
+describe("cacheDisplayPct", () => {
+  it("never reads 100% while fresh tokens exist — the 99.6% case that prompted this", () => {
+    // Real runs sit in the 97-99.6% band, so this is the ordinary case, not an edge.
+    // `Math.round(0.996 * 100)` is 100, which labelled the strip "100% from cache"
+    // beside a zero-width warn segment while 4,000 fresh tokens sat in the same panel.
+    expect(cacheDisplayPct({ fresh: 4_000, cached: 996_000 })).toBe(99);
+    expect(cacheDisplayPct({ fresh: 1, cached: 10_000_000 })).toBe(99);
+  });
+
+  it("never reads 0% while any cache reads exist — the mirror, which flooring would break", () => {
+    // Flooring is the obvious fix for the case above and introduces this one: a small
+    // but real cache ratio would render "0% from cache" and a zero-width info segment.
+    expect(cacheDisplayPct({ fresh: 996_000, cached: 4_000 })).toBe(1);
+    expect(cacheDisplayPct({ fresh: 10_000_000, cached: 1 })).toBe(1);
+  });
+
+  it("still reports the true endpoints when they are true", () => {
+    expect(cacheDisplayPct({ fresh: 1_000, cached: 0 })).toBe(0); // nothing cached
+    expect(cacheDisplayPct({ fresh: 0, cached: 1_000 })).toBe(100); // genuinely all cache
+    expect(cacheDisplayPct({ fresh: 0, cached: 0 })).toBe(0); // no usage at all
+  });
+
+  it("holds the two-sided clamp, and integrality, at every ratio", () => {
+    // Named for what these assertions can actually fail on. An earlier version was
+    // called "keeps the two bar segments summing to exactly 100" and asserted
+    // `pct + (100 - pct) === 100`, which is algebraically 100 for any integer and so
+    // could not redden against any production change — while the NAME pointed a reader
+    // at exactly that line and invited them to stop looking.
+    //
+    // The segments-sum invariant is real and is pinned where it CAN fail: at the
+    // component level in RunUsage.test.tsx, `expect(widths).toEqual(["99%", "1%"])`,
+    // because the warn segment's `100 - pct` is computed there and not here.
+    for (const [fresh, cached] of [
+      [0, 0], [1, 0], [0, 1], [1, 1], [4_000, 996_000], [996_000, 4_000],
+      [1, 10_000_000], [10_000_000, 1], [21_400, 188_000], [80_300, 800_300],
+    ]) {
+      const pct = cacheDisplayPct({ fresh, cached });
+      const at = `fresh=${fresh} cached=${cached}`;
+      expect(Number.isInteger(pct), `${at}: a fractional width would break the bar`).toBe(true);
+      expect(pct, at).toBeGreaterThanOrEqual(0);
+      expect(pct, at).toBeLessThanOrEqual(100);
+      if (fresh > 0) expect(pct, `${at}: fresh tokens exist, so 100% would be a lie`).toBeLessThan(100);
+      if (cached > 0) expect(pct, `${at}: cache reads exist, so 0% would be a lie`).toBeGreaterThan(0);
+    }
   });
 });

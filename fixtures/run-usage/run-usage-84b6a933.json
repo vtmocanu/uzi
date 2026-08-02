@@ -1,0 +1,30 @@
+{
+    "note": "The run_usage rollup the server folded from the frames in result-frames-84b6a933.json, recorded from dev-cluster on 2026-08-02. session_id redacted. This is the authoritative total the run page must match.",
+    "rows": [
+        {
+            "model": "claude-haiku-4-5-20251001",
+            "cost_usd": 0.005242,
+            "input_tokens": 5162,
+            "output_tokens": 16,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0
+        },
+        {
+            "model": "claude-opus-5",
+            "cost_usd": 67.459050,
+            "input_tokens": 1770,
+            "output_tokens": 592895,
+            "cache_read_tokens": 78119788,
+            "cache_creation_tokens": 2017902
+        },
+        {
+            "model": "claude-sonnet-5",
+            "cost_usd": 1.696694,
+            "input_tokens": 104,
+            "output_tokens": 28108,
+            "cache_read_tokens": 2529269,
+            "cache_creation_tokens": 137595
+        }
+    ],
+    "run_id": "84b6a933-ceea-4f6e-9f29-75143555ec0f"
+}
