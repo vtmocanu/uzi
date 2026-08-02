@@ -338,7 +338,7 @@ intuitive one and it will be re-proposed otherwise:
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
 | `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
 | `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
-| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified on a **37-warning corpus**: 37 and 40 exit 0, 36 and 0 exit 1 — the pass/fail boundary at 36→37 is what fixes the corpus size, since the flag is inclusive; this is a different corpus from the 10/6/16 correctness-tier debt below, not yet re-verified against it. **Errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. See the TypeScript paragraph below. |
+| `oxlint` | **No** | `--max-warnings <n>` as a count budget (verified on a **37-warning corpus** — not the correctness-tier debt below; see the TypeScript paragraph below for what that corpus was and was not. **Errors fail regardless of the budget**). No baseline file exists, and none is needed — the measured debt is small enough to fix outright. |
 | `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
 So each milestone states its own mechanism rather than inheriting a shared
@@ -374,12 +374,25 @@ across oxlint 1.70.0, 1.73.0, 1.75.0 and 1.76.0. That is
 an afternoon, not a burn-down, so **M3 fixes them** rather than recording them.
 
 **oxlint does have a ratchet, and its limit is worth stating before someone leans on
-it.** `--max-warnings <n>` is a count budget: verified on a **37-warning corpus** —
-37 and 40 exiting 0, 36 and 0 exiting 1, with errors failing regardless of the
-budget. That corpus is not the 10/6/16 correctness-tier debt measured above; the
-flag's own boundary semantics (exits 0 iff warnings ≤ n) is what pins the corpus
-size at 37, and it has not been re-verified against the debt this PRD now ships
-against. **A count cannot
+it.** `--max-warnings <n>` is a count budget: 37 and 40 exiting 0, 36 and 0 exiting
+1, with errors failing regardless of the budget. Three things about that corpus,
+in increasing order of certainty lost:
+
+1. **Certain.** The flag's own boundary semantics (exits 0 iff warnings ≤ n) fixes
+   the corpus this ran against at exactly **37 warnings** — the 36→37 crossing from
+   fail to pass is what a 37-warning corpus and no other size produces. This is
+   not the 10/6/16 correctness-tier debt measured above.
+2. **Certain, measured 2026-08-02 at oxlint 1.76.0.** No plain severity tier on
+   `agent/ src test` produces 37: `correctness` 10, `suspicious` 136, `pedantic`
+   1292, `style` 10435, `restriction` 2825. So the corpus is not any shipped tier
+   either.
+3. **Unconfirmed hypothesis, labelled as such.** 37 matches the `agent/` component
+   of the type-aware split below ("37 + 178 = 215"), which would mean this ratchet
+   demo ran against the tier M3's own SCOPE RULING excludes. Type-aware needs
+   `oxlint-tsgolint`, not installed at either measurement above, so this is not
+   settled — re-run with it to settle it.
+
+None of the three affects the mechanism this decision is actually about: **a count cannot
 distinguish a fixed finding from a new one**, so it permits churn under the cap —
 fix one old finding, add one new, still green. It is a regression brake, not a
 ratchet, and it is the honest reason the fix-them-now route is preferred here.
@@ -462,9 +475,13 @@ previously read "ESLint … pending one verification" and deferred to oxlint onl
 worked around, exactly as the previous text instructed.)*
 
 The hooks rules are still the highest-value TypeScript lint available here, and
-`tsc` cannot express them. What changed is which tool provides them. Measured at
-oxlint 1.76.0 (the same install used throughout this PRD's oxlint measurements)
-by the researcher, with the hooks-parity half re-verified independently by the lead:
+`tsc` cannot express them. What changed is which tool provides them. Measured by
+the researcher, with the hooks-parity half re-verified independently by the lead.
+*(No first-party version record survives for this specific run; consistent with
+oxlint 1.76.0, the only version this PRD names anywhere else, and with two
+leftover scratchpad installs from what looks like the same research pass — but
+that is inference about someone else's run, not a measurement, and is recorded
+as such.)*
 
 - **Identical findings to ESLint on `web/src`** — 2 each, same files, same missing
   dependency.

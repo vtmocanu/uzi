@@ -46,6 +46,15 @@ Two secondary gaps:
 
 - **Roster.** The library has 11 roles; `builtins/` has 10, of which 9 are
   library roles plus the uzi-only `lead`. `release` and `web-ux` are missing.
+  *(Correction, 2026-08-02, found while fixing citations for PRD #103: `web-ux`
+  is no longer missing. `api/internal/agenttmpl/builtins/web-ux.md` landed in
+  `30b06b94`, "feat(prd-87): M6 ship the web-ux builtin (roster ten->eleven)"
+  — a different PRD's milestone, not this one's. `builtins/` now holds 11 of
+  the 12 files this roster bullet counts against; only `release` is still
+  missing. This PRD's milestone plan (M3/M5/M6 below, which still budget work
+  for porting `web-ux`) needs re-deriving against that fact before this PRD
+  resumes — not done here, since rewriting another PRD's plan is out of scope
+  for a citation fix.)*
 - **Stale docs.** `docs/agent-templates.md:30`, CLAUDE.md's `**Builtin agent
   templates**` bullet, and
   `ARCHITECTURE.md:128` all hard-code "ten" / "nine subagents". *(Line cite
