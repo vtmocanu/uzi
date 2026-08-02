@@ -104,7 +104,7 @@ type Format int
 
 const (
 	FormatTable Format = iota // human tables on a TTY
-	FormatJSON                 // machine-readable, for agents (--json)
+	FormatJSON                // machine-readable, for agents (--json)
 )
 
 // Printer renders command output either as an indented JSON document (--json)

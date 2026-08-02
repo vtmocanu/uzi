@@ -82,6 +82,26 @@
 # exit status 7` with rc=201. Anything reading `$?` NUMERICALLY must know this;
 # `!= 0` is still a correct failure test.
 #
+# AND 201 IS NOT THE ONLY NONZERO. `201` means a target RAN AND FAILED; `109`
+# means task never got that far, because THIS FILE DID NOT PARSE - and that one
+# is LOUD AND SELF-LOCATING. Measured 2026-08-02 while editing this file, task
+# 3.51.1: a `desc:` reading `... modules (fail-fast: stops at the first module)`
+# puts a bare `: ` inside a plain YAML scalar, which is illegal. `task --list`,
+# `--list-all`, a named target and a bare `task` ALL return 109 and all print
+#
+#   task: Failed to parse Taskfile.yml:
+#   yaml: line 191: mapping values are not allowed in this context
+#
+# naming the file and the line you just edited. Still: parse this file after
+# touching it, because a `desc:` is the one place a stray `: ` looks harmless.
+#
+# (Corrected same day. This paragraph first said `1`, and said every target
+# disappears at once so the symptom does not resemble its cause. BOTH WRONG, and
+# the second is backwards. The `1` came from `python3 -c "import yaml..." && task
+# ...; echo $?` -- the YAML library exits 1, the && short-circuits, task NEVER
+# RUNS, and python's code was reported as task's. Reporting-failure form (1) in
+# CLAUDE.md's gate-status entry, committed inside a note about exit codes.)
+#
 # NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
@@ -133,15 +153,21 @@ tasks:
       - task: gate:agent
 
   gate:api:
-    desc: api - vet, build, test
+    desc: api - fmt-check, vet, build, test
     cmds:
+      # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
+      # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
+      # 48.7s for this whole gate, so a coder learns about a misformat in the first
+      # fifth of a second instead of after test:api's -race compile.
+      - task: fmt-check:api
       - task: vet:api
       - task: build:api
       - task: test:api
 
   gate:controller:
-    desc: controller - vet, build, test
+    desc: controller - fmt-check, vet, build, test
     cmds:
+      - task: fmt-check:controller
       - task: vet:controller
       - task: build:controller
       - task: test:controller
@@ -159,7 +185,126 @@ tasks:
       - task: typecheck:agent
       - task: test:agent
 
+  fmt-check:
+    # COMPOSES THE TWO PER-MODULE TARGETS; IT DOES NOT RE-SCOPE THEM. There must
+    # never be a root-scoped `gofmt -l .` in this file. A repo-root walk descends
+    # into dot-directories, and `.go_job` sets GOPATH=$CI_PROJECT_DIR/.go and
+    # GOCACHE=$CI_PROJECT_DIR/.gocache and runs `go mod download` before any script
+    # line - so in CI a root-scoped gofmt would traverse the populated module cache
+    # and red the gate on third-party source. Neither directory is in .gitignore,
+    # so nothing else would catch it.
+    #
+    # FAIL-FAST, NOT A COMBINED REPORT, consistent with `gate` and every other
+    # composed target here. Measured with drift in BOTH modules: this dies at
+    # fmt-check:api and fmt-check:controller never runs, so one invocation does
+    # not enumerate both modules. `desc:` says "over both Go modules" and that is
+    # the SCOPE, not a promise of a single combined listing. CI is unaffected -
+    # validate:api and validate:controller report independently.
+    desc: gofmt -l over both Go modules, fail-fast at the first drifted one
+    cmds:
+      - task: fmt-check:api
+      - task: fmt-check:controller
+
   # ------------------------------------------------------------- api (Go) -----
+  fmt-check:api:
+    desc: gofmt -l over the api module (fails on drift, naming the files)
+    dir: api
+    cmds:
+      # 🔴 DO NOT SIMPLIFY THIS LINE TO `test -z "$(gofmt -l .)"`. It reads as the
+      # tidier spelling of the same check and it is not the same check. Measured
+      # 2026-08-02 on task 3.51.1 under `output: prefixed`, first by the lead and
+      # then independently reproduced before this target shipped:
+      #
+      #   tree                  form               task rc   stdout
+      #   drifted               assignment (below) 201       NAMES THE FILES
+      #   drifted               test -z "$(...)"   201       empty
+      #   a Go file that does   assignment (below) 201       the parse errors
+      #     not parse           test -z "$(...)"   0 GREEN   the parse errors
+      #
+      # Two independent reasons, and the second is the one the PRD did not have:
+      #
+      # 1. `gofmt -l` EXITS 0 WHETHER OR NOT IT LISTS ANYTHING (CLAUDE.md documents
+      #    this trap), so the gate must be on the OUTPUT, not the exit code. Both
+      #    forms get that right - but `test -z` SWALLOWS THE FILENAMES, and a gate
+      #    that reddens without naming the file is not the gate PRD #103 SC8 asks
+      #    for (a control that produces no output is not a control).
+      # 2. `test -z "$(...)"` FAILS OPEN ON A GO FILE THAT DOES NOT PARSE. gofmt
+      #    exits 2 and writes to stderr, so `$(…)` captures nothing and `test -z`
+      #    is TRUE. THE POSIX DISTINCTION IS WHY THAT FORM HAS THE HOLE AND AN
+      #    UNGUARDED ASSIGNMENT DOES NOT: under errexit, an ASSIGNMENT whose
+      #    command substitution fails aborts the script, while a substitution
+      #    inside a SIMPLE COMMAND does not. It is NOT the mechanism the line
+      #    below relies on - see the next paragraph, and do not read it as one.
+      #    And because `output: prefixed` puts a recipe's stderr on Task's
+      #    stdout, the green run PRINTS the parse errors: visible-and-ignored,
+      #    which is worse than silent, because the error text reads as the gate
+      #    having done its job.
+      #
+      # THE `|| exit 2` IS WHAT THE SHIPPED LINE ACTUALLY RELIES ON, DELIBERATELY.
+      # Once `||` is on the line the assignment sits in a CONDITION CONTEXT, so
+      # errexit no longer fires for it at all and the explicit exit is the whole
+      # guarantee. Measured 2026-08-02: `sh -ec 'x="$(false)"; echo R'` exits 1
+      # with errexit doing the work, while both `sh -c` and `sh -ec` of
+      # `'x="$(false)" || exit 7; echo R'` exit **7**. So this is not belt-and-
+      # braces over reason 2's mechanism, it REPLACES it - the property is now
+      # intrinsic to the recipe and survives a future `set +e`, a Task release
+      # changing its shell defaults, or this line being copied somewhere with
+      # neither. Measured on one non-parsing file, nothing else drifted:
+      #
+      #   sh -c   'out="$(gofmt -l .)"; ...'            rc=0   <- FAILS OPEN
+      #   sh -ec  'out="$(gofmt -l .)"; ...'            rc=2
+      #   sh -c   'out="$(gofmt -l .)" || exit 1; ...'  rc=1
+      #   sh -c   'out="$(gofmt -l .)" || exit 2; ...'  rc=2   <- shipped
+      #
+      # ONE ORDERING CONSEQUENCE, since `desc:` promises the files are named: on a
+      # tree carrying BOTH a non-parsing file AND drift, the guard fires before
+      # `$out` is echoed, so the drifted files are NOT named that run - you get
+      # the parse error and `exit status 2`, then the drift on the next run once
+      # the parse error is fixed. Measured. Two rounds, not a hole: gofmt does
+      # list the drifted files, the guard simply pre-empts the echo.
+      #
+      # `2` AND NOT `1`, FOR TWO REASONS. It reproduces gofmt's own exit status,
+      # so the table at the top of this comment and CLAUDE.md's R10 paragraph -
+      # both of which recorded `exit status 2` against the UNPINNED form - stay
+      # true rather than going stale in the commit that pinned them. And it keeps
+      # the two red modes distinguishable: `exit status 2` means a file does not
+      # PARSE, `exit status 1` means a file is MISFORMATTED. Task's own rc is 201
+      # for both, so this line is the only status-level discriminator there is.
+      #
+      # ONE MEASURED SUBTLETY, BECAUSE IT INVERTS THE INTUITION: the fail-open
+      # window is exactly a tree with NO OTHER DRIFT. gofmt still LISTS every
+      # other misformatted file while erroring on the unparseable one, so on the
+      # 16-file drifted tree this milestone started from, the bare form under
+      # `sh -c` returned 1 and looked fine. Clearing the drift is what arms the
+      # hole. THE GATE'S OWN SUCCESS IS THE PRECONDITION FOR ITS FAILURE MODE,
+      # which is why this cannot be left to be noticed later.
+      #
+      # Also forbidden here, all three for reasons above or in this file's header:
+      # no `{{.CLI_ARGS}}` (the splicing ban, and it would let a caller narrow the
+      # gate's scope); no `xargs`/`gofmt -d $out` "improvement" that unquotes the
+      # filename list; and no `vars: {DRIFT: {sh: gofmt -l api}}` + `test -z
+      # "{{.DRIFT}}"`, which splices shell output through text/template into
+      # `sh -c` and so dies on the splicing ban alone. (Header ban 4 is scoped to
+      # dynamic ROOT vars; the form above would sit on the target, so it is the
+      # SPLICE ban that catches it, not ban 4. The conclusion was always right and
+      # this citation was one word loose until 2026-08-02.)
+      #
+      # NO `sources:` ON THIS TARGET (header ban 1). A `**/*.go` fingerprint is
+      # MORE defensible here than anywhere else in this file - gofmt reads nothing
+      # across the module boundary, so the cross-module blind spot the header
+      # argues does not apply - and it is still wrong, for a reason specific to
+      # this check: A CHECKSUM OVER THE INPUTS CANNOT SEE THE GOFMT BINARY CHANGE.
+      # It would serve a stale green across exactly the toolchain bump most likely
+      # to introduce new drift. Reproduced by the auditor: a `sources:`-carrying
+      # fmt-check printed `up to date`, exited 0 and executed nothing.
+      #
+      # THE NAME IS `fmt-check`, NEVER `fmt`. `.claude/agents/tester.md` instructs
+      # testers to refuse a slot whose command looks like a fixing variant, `gofmt
+      # -w` and "a bare `fmt` target" named explicitly - so a target called `fmt`
+      # would be declined by the role that is supposed to run it. Do not tidy the
+      # suffix away.
+      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
+
   vet:api:
     desc: go vet over the api module
     dir: api
@@ -233,6 +378,17 @@ tasks:
       - go test -race -count=1 ./...
 
   # ------------------------------------------------------ controller (Go) -----
+  fmt-check:controller:
+    desc: gofmt -l over the controller module (fails on drift, naming the files)
+    dir: controller
+    cmds:
+      # Same recipe, same bans, same reasons - read fmt-check:api's comment before
+      # editing either. This module was ALREADY gofmt-clean when PRD #103 M2 landed
+      # (measured 2026-08-02 at 755861e8, go1.26.5: `gofmt -l ./controller` empty
+      # while ./api listed 16 files); the target exists to keep it that way. It
+      # ships with an empty backlog, which is not the same thing as a no-op.
+      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
+
   vet:controller:
     desc: go vet over the controller module
     dir: controller

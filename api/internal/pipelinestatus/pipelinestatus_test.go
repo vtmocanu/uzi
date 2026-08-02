@@ -51,7 +51,7 @@ func TestMirrorsWebPipelineBadge(t *testing.T) {
 		"manual":               "attention",
 		"canceled":             "neutral",
 		// Forgejo Actions run status
-		"failure": "failed",
+		"failure":   "failed",
 		"cancelled": "neutral",
 		"waiting":   "running",
 		"blocked":   "running",

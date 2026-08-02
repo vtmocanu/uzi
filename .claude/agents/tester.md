@@ -165,14 +165,44 @@ it, so the load-bearing flags below are visible in your own output; read them th
 rather than trusting this file.
 
 ```
-format         none (gap)          # gofmt -l ./api reports PRE-EXISTING drift; run it for
-                                   # the current list. Do NOT record a count here: it read
-                                   # 26, then 25, then 19, and a stale present-tense tally
-                                   # is read as a fact about today. The check that matters
-                                   # is `comm -12` between gofmt -l and YOUR commit's file
-                                   # list being EMPTY. (Corrected 2026-07-27: this line
-                                   # said "reports 26 drifted files today"; a tester
-                                   # measured 19 and correctly flagged the "today".)
+format         task fmt-check      # gofmt -l over both Go modules; fails on drift and
+                                   # NAMES the files, module-relative (internal/...), not
+                                   # repo-root-relative. It is a CHECK, never a fixing
+                                   # variant -- that is why it is not called `fmt`.
+                                   # FAIL-FAST: with drift in both modules it stops at
+                                   # the api half and never reaches the controller one.
+                                   # What runs FIRST inside gate:api / gate:controller is
+                                   # the PER-MODULE fmt-check:api / fmt-check:controller,
+                                   # not this composite -- so gating a component already
+                                   # covers this slot for that component.
+                                   # 🔴 ON AN UN-REBASED BRANCH, gofmt -l ./api IS STILL
+                                   # NON-EMPTY -- M2 cleared it on main, not on the tree
+                                   # you were dispatched against. A red format slot there
+                                   # may be PRE-EXISTING rather than the change's fault;
+                                   # say which, as you would for a lint finding on an
+                                   # untouched line. And this slot cannot catch a
+                                   # directory-wide `gofmt -w` sweeping foreign files into
+                                   # a commit: a swept tree is gofmt-clean and PASSES.
+                                   # It detects drift; it cannot detect a sweep.
+                                   # (Corrected 2026-08-02 by PRD #103 M2, which cleared
+                                   # the drift under api/ and added this target, and again
+                                   # by its follow-up, which found the first correction
+                                   # had stated that unconditionally -- true on a tree
+                                   # carrying the reformat, false on any branch behind it.
+                                   # This line originally read `none (gap)` and said
+                                   # gofmt -l ./api reports PRE-EXISTING drift, which is
+                                   # now tree-conditional rather than simply false. Its
+                                   # own history, kept: the tally read 26, then 25, then
+                                   # 19, and a stale present-tense tally is read as a fact
+                                   # about today -- corrected once already on 2026-07-27,
+                                   # when this line said "reports 26 drifted files today"
+                                   # and a tester measured 19 and flagged the "today".
+                                   # That is the same defect this slot has now been
+                                   # corrected for twice: a claim true of one tree written
+                                   # as a claim about the repo. The `comm -12` idiom it
+                                   # prescribed is retired for VACUITY on a reformatted
+                                   # tree -- an intersection against an empty set can
+                                   # never fail -- NOT for having been broken; it worked.)
 lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
                                    # task gate:api / gate:controller and in CI, but a
                                    # vet is not a lint slot. (Was "in CI only"; PRD

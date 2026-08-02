@@ -412,7 +412,15 @@ situation. Accept the main-branch blind spot instead, and measure the total
 finding count separately (a plain unfiltered run, reported not enforced) so
 the debt is still countable.
 
-**5. The 26-file gofmt reformat and the gofmt gate land in the same MR.**
+**5. The gofmt reformat and the gofmt gate land in the same MR.**
+
+*(Heading corrected 2026-08-02 during M2: it read "The 26-file gofmt reformat".
+That is an undated count of a population that moves with every commit — the
+thing Decision 10 bans, naming this exact metric as its example. It measured 16
+at `755861e8`. No number is needed: the argument below holds for any non-empty
+drift list, as the decision itself says. Line 6's "26-file gofmt drift" is
+deliberately left alone — it quotes issue #101's own wording and correcting it
+would falsify the citation.)*
 
 This is the reason item 3 moved out of #101. The two orderings both fail:
 gate-first turns CI red on files nobody touched; reformat-first leaves the
@@ -931,8 +939,29 @@ which previously prescribed only the fail-open form.
       **Do not test the gate by its exit code alone.** `gofmt -l` exits 0
       whether or not it lists anything, so a target written
       `gofmt -l . && echo drift` fires unconditionally. Gate on the *output*
-      being empty (`test -z "$(gofmt -l .)"`), which `CLAUDE.md` documents as a
-      trap already paid for here.
+      being empty, which `CLAUDE.md` documents as a trap already paid for here
+      — and gate on it with an **assignment carrying an explicit guard**, not
+      with `test -z "$(...)"`. The shipped form is `Taskfile.yml`'s
+      `fmt-check:api` target; read the recipe there rather than restating one
+      here (Decision 9, Success Criterion 3).
+
+      *(Corrected 2026-08-02 during M2. This paragraph prescribed
+      `test -z "$(gofmt -l .)"`, which **fails OPEN on a Go file that does not
+      parse** — gofmt exits 2 to stderr, the substitution captures nothing,
+      `test -z` is trivially true, and the gate goes GREEN while printing the
+      parse error. Four independent reproductions on 2026-08-02 —
+      `CLAUDE.md`'s R10 paragraph says *three* and does not conflict: it
+      records the first three (reviewer, lead, tester) and predates the
+      fourth. It also
+      swallows the filenames, which Success Criterion 8's calibration needs.
+      **This mattered beyond M2**: M3 and M5 add gates of exactly this shape
+      (`golangci-lint`, `oxlint`, `shellcheck`, `yamllint`), and a coder
+      following the old sentence writes the same hole again. Two further
+      details are recorded beside the target: the fail-open window is exactly
+      a tree with **no other drift**, so clearing the drift is what arms it;
+      and the guard is `|| exit 2` rather than `|| exit 1`, to reproduce
+      gofmt's own status and keep "does not parse" distinguishable from
+      "misformatted" when `task`'s own rc is 201 for both.)*
 
 - [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**: `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`

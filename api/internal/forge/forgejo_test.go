@@ -121,18 +121,18 @@ func TestForgejoVersionGate(t *testing.T) {
 		reported string
 		accept   bool
 	}{
-		{"16.0.0+gitea-1.22.0", true},  // the release; build metadata must not defeat the compare
-		{"16.0.1", true},               // patch above the floor
-		{"16.1.0", true},               // minor above the floor
-		{"17.0.0", true},               // major above the floor
-		{"17.0.0-dev-3-abc123+gitea-1.22.0", true}, // major dominates: v17 cycle carries the v16 surface
+		{"16.0.0+gitea-1.22.0", true},                   // the release; build metadata must not defeat the compare
+		{"16.0.1", true},                                // patch above the floor
+		{"16.1.0", true},                                // minor above the floor
+		{"17.0.0", true},                                // major above the floor
+		{"17.0.0-dev-3-abc123+gitea-1.22.0", true},      // major dominates: v17 cycle carries the v16 surface
 		{"16.0.0-dev-626-32363b81+gitea-1.22.0", false}, // codeberg live: prerelease < release, refuse
-		{"15.0.4", false},              // below the floor (route genuinely absent)
-		{"15.0.5+gitea-1.22.0", false}, // below the floor
-		{"1.21.11-2", false},           // legacy 1.x scheme
-		{"1.21.0-rc1", false},          // legacy 1.x rc
-		{"32363b81+gitea-1.22.0", false}, // bare sha from `git describe --always`: unparseable
-		{"", false},                      // empty: unparseable
+		{"15.0.4", false},                               // below the floor (route genuinely absent)
+		{"15.0.5+gitea-1.22.0", false},                  // below the floor
+		{"1.21.11-2", false},                            // legacy 1.x scheme
+		{"1.21.0-rc1", false},                           // legacy 1.x rc
+		{"32363b81+gitea-1.22.0", false},                // bare sha from `git describe --always`: unparseable
+		{"", false},                                     // empty: unparseable
 	} {
 		t.Run(tc.reported, func(t *testing.T) {
 			userHit := false
@@ -230,7 +230,7 @@ func TestForgejoListIssuesFiltersPullRequests(t *testing.T) {
 					"html_url": "https://fj/acme/widgets/issues/11", "updated_at": "2026-07-03T10:00:00Z",
 					"user": map[string]any{"login": "alice"}},
 				{"id": 101, "number": 12, "title": "A pull request", "state": "open",
-					"html_url": "https://fj/acme/widgets/pulls/12",
+					"html_url":     "https://fj/acme/widgets/pulls/12",
 					"pull_request": map[string]any{"merged": false, "html_url": "https://fj/acme/widgets/pulls/12"}},
 			})
 		},
@@ -277,8 +277,8 @@ func TestForgejoGetIssueReturnsDescription(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 100, "number": 11, "title": "Do the thing", "state": "open",
-				"labels": []map[string]any{{"id": 3, "name": "PRD"}},
-				"body":   "body links prds/4-agent-runtime-workers.md",
+				"labels":   []map[string]any{{"id": 3, "name": "PRD"}},
+				"body":     "body links prds/4-agent-runtime-workers.md",
 				"html_url": "https://fj/acme/widgets/issues/11",
 			})
 		},
@@ -632,12 +632,12 @@ func TestForgejoRoleForPermission(t *testing.T) {
 // guardrail to a warning — D6).
 func TestForgejoBranchProtectionAuthoritative(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		protected  bool
-		canPush    bool
-		canMerge   bool
-		wantPush   bool
-		wantMerge  bool
+		name      string
+		protected bool
+		canPush   bool
+		canMerge  bool
+		wantPush  bool
+		wantMerge bool
 	}{
 		{"protected-and-locked", true, false, false, false, false},
 		{"protected-but-pushable", true, true, false, true, false},
@@ -740,10 +740,10 @@ func TestForgejoErrorsAreRedacted(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom " + token})
 	}
 	m := newMockForgejo(t, map[string]http.HandlerFunc{
-		"/version":     leak, // VerifyToken (version transport)
-		"/user/repos":  leak, // ListProjects
-		"/users/alice": leak, // UserExists
-		"/repositories/9": leak, // slug resolution for a bad project id
+		"/version":                          leak, // VerifyToken (version transport)
+		"/user/repos":                       leak, // ListProjects
+		"/users/alice":                      leak, // UserExists
+		"/repositories/9":                   leak, // slug resolution for a bad project id
 		"/repos/acme/widgets/branches/main": leak, // DefaultBranchProtection (past slug)
 		"/users/search": func(w http.ResponseWriter, _ *http.Request) { // ProjectRole gets past user resolution
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": 4242, "login": "uzi-bot"}}})
@@ -1076,10 +1076,10 @@ func TestForgejoM4ErrorsAreRedacted(t *testing.T) {
 		"/user": func(w http.ResponseWriter, _ *http.Request) { // TokenInfo gets past bot identification
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
 		},
-		"/repos/acme/widgets/pulls/13":            leak, // GetMergeRequest (SDK)
-		"/repos/acme/widgets/issues/11/comments":  leak, // CreateIssueNote (SDK)
-		"/repos/acme/widgets/issues/11/timeline":  leak, // ListIssueLabelEvents (hand-rolled)
-		"/users/uzi-bot/tokens":                   leak, // TokenInfo (hand-rolled)
+		"/repos/acme/widgets/pulls/13":           leak, // GetMergeRequest (SDK)
+		"/repos/acme/widgets/issues/11/comments": leak, // CreateIssueNote (SDK)
+		"/repos/acme/widgets/issues/11/timeline": leak, // ListIssueLabelEvents (hand-rolled)
+		"/users/uzi-bot/tokens":                  leak, // TokenInfo (hand-rolled)
 	})
 	d := newForgejoDriver(t, m, token)
 	ctx := context.Background()

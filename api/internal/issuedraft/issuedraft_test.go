@@ -107,7 +107,7 @@ func TestStripUnfencedSlashLines(t *testing.T) {
 		"/label ~autopilot", // unfenced → dropped
 		"  /assign @me",     // leading spaces then / → dropped
 		"```",
-		"/close",   // fenced → kept
+		"/close", // fenced → kept
 		"code line",
 		"```",
 		"/relabel", // unfenced again → dropped
@@ -208,14 +208,14 @@ func TestScrubSecretShapes(t *testing.T) {
 	// runtime — the source never carries one, which keeps the repo secret-scanner quiet
 	// while still exercising the scrubber against realistic secret SHAPES.
 	redacted := []string{
-		"AKIA" + strings.Repeat("A", 16),                                                       // AWS access key id
-		"ghp_" + strings.Repeat("a", 36),                                                       // GitHub token
-		"glpat-" + strings.Repeat("x", 20),                                                     // GitLab PAT
-		"sk-ant-" + "api03" + strings.Repeat("Z", 16),                                          // Anthropic
-		"xoxb-" + strings.Repeat("9", 10) + "-abcXYZ",                                          // Slack
+		"AKIA" + strings.Repeat("A", 16),              // AWS access key id
+		"ghp_" + strings.Repeat("a", 36),              // GitHub token
+		"glpat-" + strings.Repeat("x", 20),            // GitLab PAT
+		"sk-ant-" + "api03" + strings.Repeat("Z", 16), // Anthropic
+		"xoxb-" + strings.Repeat("9", 10) + "-abcXYZ", // Slack
 		"eyJ" + strings.Repeat("A", 24) + "." + strings.Repeat("B", 16) + "." + strings.Repeat("C", 16), // JWT
-		"postgres://app:" + "s3cr3tpw" + "@db.internal:5432/uzi",                               // DB URL creds
-		"Authorization: Bearer " + strings.Repeat("t", 24),                                     // bearer header
+		"postgres://app:" + "s3cr3tpw" + "@db.internal:5432/uzi",                                        // DB URL creds
+		"Authorization: Bearer " + strings.Repeat("t", 24),                                              // bearer header
 	}
 	for _, sec := range redacted {
 		out := ScrubSecretShapes("prefix " + sec + " suffix")

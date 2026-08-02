@@ -33,6 +33,7 @@ import (
 //     tells users to put UZI_TOKEN in a GitLab CI variable, so a `uzi ...` invocation
 //     that echoes its token into a trace is exactly the path this snapshot ingests —
 //     a uzc_/uza_ minted by this API must never freeze into a failure_snapshot.
+//
 // Arbitrary third-party secrets with no recognizable shape remain the documented
 // residual risk (docs/configuration.md); the snapshot is owner/admin-visible only.
 var snapshotSecretPatterns = []*regexp.Regexp{

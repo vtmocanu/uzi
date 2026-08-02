@@ -15944,3 +15944,122 @@ by 2.5x on output, 3.3x on cache_read and **229x on input**.
 
 Full rationale, the rejected alternatives, and the correction history in
 `adr/0195-run-usage-per-model-fold.md`.
+
+## 466. PRD #103 M2 — the format gate reads the OUTPUT and fails CLOSED, it detects DRIFT but cannot detect a SWEEP, and its own success is what arms its one hole
+
+M2 changes no runtime behaviour: no route, no schema, no worker path, no user-visible
+surface. Both Go modules are `gofmt`-clean and a check keeps them that way — `fmt-check:api`
+and `fmt-check:controller` run **first** inside `gate:api` / `gate:controller` and **first**
+in CI's `validate:api` / `validate:controller`, with a composite `fmt-check` over both. The
+ordering inside the milestone (reformat, then gate) is the PRD's Decision 5 and the target
+list is `Taskfile.yml`'s to state; what is recorded here is the set of properties a rebuild
+must reproduce, most of which are invisible in a passing run.
+
+- **The check is on the OUTPUT, and the obvious fix for that fails OPEN.** Two hazards
+  compose, which is what makes this recipe un-simplifiable rather than merely fussy:
+  `gofmt -l` **exits 0 whether or not it lists anything**, so an exit-code gate never fires;
+  and `test -z "$(gofmt -l .)"` — the form that correctly fixes *that* — goes **GREEN on a Go
+  file that does not parse**, because gofmt exits 2 writing to stderr, the substitution
+  captures nothing and `test -z` is trivially true. Four independent reproductions,
+  2026-08-02, `task` 3.51.1. The shipped form is an assignment carrying an explicit guard;
+  read it at the `fmt-check:api` target, not from a copy (Decision 9 / SC3).
+- **THE FAIL-OPEN WINDOW IS EXACTLY A TREE WITH NO OTHER DRIFT, so the gate's own success is
+  its precondition.** gofmt still lists every *other* misformatted file while erroring on the
+  unparseable one, so on the drifted tree this milestone started from the unguarded form
+  returned non-zero and looked correct. **Clearing the drift is what arms the hole** — the
+  order in which M2's two commits land is therefore not only Decision 5's argument about CI
+  noise, it is also the window in which this defect becomes reachable.
+- **The guard is `|| exit 2`, not `|| exit 1`, and it REPLACES errexit rather than backing it
+  up.** `2` reproduces gofmt's own status, keeping *"a file does not parse"* distinguishable
+  from *"a file is misformatted"* (`exit status 1`); Task's own rc is **201** for both, so
+  gofmt's status is the only signal that separates them. The mechanism claim matters as much
+  as the number: the POSIX errexit distinction (an *assignment* whose command substitution
+  fails aborts the script, a substitution inside a *simple command* does not) explains only
+  why the **rejected** form has the hole. Once `||` is on the line the assignment sits in a
+  condition context and errexit stops firing for it at all — measured — so the explicit exit
+  is the shipped line's whole guarantee.
+- **The gate detects DRIFT; it cannot detect a SWEEP, and conflating the two retires a rule
+  that is still live.** `gofmt -w` leaves the tree clean, so a tree someone swept wholesale
+  **passes**. That is why the retirement of the directory-wide-`gofmt -w` standing rule is
+  **conditional on the tree**: on any tree carrying M2's reformat there is nothing left to
+  sweep, and on an un-rebased branch `gofmt -l ./api` is still non-empty and the hazard is
+  exactly as live as before. Measured 2026-08-02 by extracting each branch's `api/` with
+  `git archive` into a temp dir: non-empty on **nearly every local branch**, and the sample
+  was all of them. No count is recorded, deliberately — any branch cut from a merged `main`
+  is clean on day one, so a tally here is stale on the next branch, not merely on the next
+  commit. The shape is the point. *(This bullet first said "five live branches", from a sample narrower
+  than the population — an understatement that reads as an enumeration. **How much narrower is
+  not recoverable, and the obvious explanation is false**: this repo has 18 worktrees, not
+  five, so "the branches that happened to have worktrees" — asserted here until 2026-08-02 —
+  names a set larger than the population it was offered to explain, not smaller.)* A claim true
+  of one tree, written as a claim about the repo, is the defect this milestone corrected twice
+  in its own documentation.
+- **Never a root-scoped `gofmt -l .`; the composite COMPOSES the two per-module targets.** A
+  repo-root walk descends into dot-directories, and CI's `.go_job` puts `GOPATH` and `GOCACHE`
+  under `$CI_PROJECT_DIR` and runs `go mod download` before any script line — so a root-scoped
+  walk would traverse the populated module cache and red the gate on third-party source.
+  Neither directory is in `.gitignore`, so nothing else would catch it. The composite is
+  fail-fast (with drift in both modules it dies at the api half and the controller half never
+  runs), consistent with `gate`; CI is unaffected because the two validate jobs report
+  independently.
+- **No `sources:` on these targets, for a reason the general ban (§464) does not supply.** A
+  `**/*.go` fingerprint is *more* defensible here than anywhere else in the file — gofmt reads
+  nothing across the module boundary, so the cross-module blind spot does not apply — and it is
+  still wrong, because **a checksum over the inputs cannot see the gofmt BINARY change.** It
+  would serve a stale green across exactly the toolchain bump most likely to introduce new
+  drift. Reproduced: a `sources:`-carrying variant printed `up to date`, exited 0 and executed
+  nothing.
+- **The target is named `fmt-check` and must never be `fmt`** — a naming constraint imposed by a
+  role prompt, not by taste. The tester role is instructed to refuse a gate slot whose command
+  looks like a *fixing* variant, naming a bare `fmt` target explicitly, so a target called `fmt`
+  would be declined by the role that is supposed to run it.
+- **CI EXTENDS the two existing validate jobs; it does not open a `lint`-stage job.** The
+  decisive argument is anchor wiring, not runtime: `.gate_needs` and `.publish_needs` enumerate
+  jobs **by name**, so a new job forgotten in either produces this repo's signature failure
+  shape — a red job nothing `needs:`, with the images and chart publishing anyway. Secondary and
+  all pointing the same way: no extra tool fetch, no extra cache cycle, no `go mod download` for
+  a check needing no modules, no new `rules:` block to get wrong, and `format` and `lint` are
+  separate gate slots. Placement is **first, not appended**: appended it would run only once the
+  sqlc drift check had passed, and would then inspect a tree `sqlc generate` had just rewritten.
+- **gofmt version parity is a MEASUREMENT on this corpus, never a contract.** CI's pinned
+  `golang:1.26` digest is **go1.26.4** while local is **go1.26.5**; measured 2026-08-02 the two
+  agree — same drift list, byte-identical formatted output per file, and `gofmt -w` under one
+  followed by `gofmt -l` under the other empty both ways. Phrase any future restatement as
+  *"measured equal at these two versions"*; *"gofmt is stable across patch releases"* is not
+  something the toolchain promises, and a digest bump re-opens the question.
+- **A `gofmt -w` sweep is semantically inert but NOT whitespace-only — and any count of "how
+  many non-whitespace changes" is a property of the INSTRUMENT, so this file states one with
+  its instrument attached.** Three reproduce and all three are correct answers to different
+  questions: `git diff -w --ignore-blank-lines` says **3 files** changed other than in
+  whitespace *runs*; a whole-file whitespace-strip hash says **2** changed in non-whitespace
+  *bytes*; a `go/scanner` token stream with semicolons normalised says **0** changed
+  *semantically*. The figure this document means is the second: **two non-whitespace edits**,
+  plus a third file where a one-line anonymous struct expands to three and changes **no
+  non-whitespace byte at all** — the braces, the field and the tag already existed, so only
+  newlines and indentation were inserted. The notable edit is **gofmt inserting a bare `//`
+  line into a doc comment** (Go 1.19+ doc-comment handling terminating a bulleted list) — which
+  landed in the PAT scrubber's rationale block, the single most alarming place for a comment
+  edit inside a commit claiming inertness. The scrubber's pattern literals are byte-identical,
+  so what it strips cannot change. Two durable halves: *"pure gofmt"* does not imply
+  *"comments untouched"*, and predicting the diff costs a sentence where not predicting it
+  costs a review round; and the question anyone actually has of a reformat — *is it inert?* —
+  is answered only by the token stream, which is the instrument nobody reaches for first.
+- **CHANGELOG coverage is a gate with a tag-time fuse, and M2 disarmed one that M1 had lit.**
+  `publish:assert-changelog` is tag-only and sits in `*publish_needs`, so it blocks every image
+  and chart push; it requires any first-parent merge touching a *shipping* path (which includes
+  `docs/*`) without touching `CHANGELOG.md` to have one of its cited issue numbers present in
+  the release section. M1's merge satisfied none of that, so the next `v*` tag would have
+  failed. **"The previous milestone added no entry" is therefore never a precedent** — it is a
+  pending failure, and the check that finds it is one nothing in an MR pipeline runs.
+
+Nine documentation sites carried present-tense claims that the reformat falsified, and correcting
+them is the milestone's other half rather than a tidy-up: the two Go gate `desc:`s, the two
+`CLAUDE.md` command comments plus its two fenced blocks, `docs/dev-conventions.md`'s gate block
+and its *"There is no linter, no format check…"* paragraph, the coder role's slot list, both
+gate-slot tables, and the retired standing rule. A tenth site is an **addition** rather than a
+correction: `CLAUDE.md` already documented one `gofmt -l` exit-0 trap (the `&&` form firing
+unconditionally) and that paragraph stays byte-identical, with the opposite failure this
+milestone measured — the form that fixes it going green on a non-parsing file — recorded beside
+it. `api/internal/agenttmpl/builtins/tester.md` is deliberately **not** among the ten: it is
+product template content, decoupled from `.claude/agents/` (§Conventions), and a `gofmt` grep
+surfaces it looking editable.

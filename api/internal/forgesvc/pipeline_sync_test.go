@@ -90,7 +90,7 @@ func TestSyncPipelinesRunBranchWithoutMRUsesBranchPipeline(t *testing.T) {
 	st := &fakeStore{watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("agent/issue-9", 0)}}
 	svc := newTestService(st)
 	f := &fakeForge{pipelineByRef: map[string]forge.Pipeline{
-		"main":         pipelineAt(1, "success"),
+		"main":          pipelineAt(1, "success"),
 		"agent/issue-9": pipelineAt(9001, "running"),
 	}}
 

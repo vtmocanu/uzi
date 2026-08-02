@@ -451,7 +451,7 @@ func TestPerTokenBackoffIsolation(t *testing.T) {
 		}
 		return reading(7, 7, anthropic.SourceUsageEndpoint), nil
 	}}
-	e := New(st, passthroughOpener{}, cl, time.Minute, false /* probe off → refusal arms backoff */,
+	e := New(st, passthroughOpener{}, cl, time.Minute, false, /* probe off → refusal arms backoff */
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	e.tickAll(context.Background())

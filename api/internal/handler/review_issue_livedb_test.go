@@ -144,29 +144,29 @@ func fileIssueLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *se
 // (owner + a distinct admin) and their repos. Fresh uuids per call — the LiveDB runner
 // shares one database across the suite.
 type fileFixture struct {
-	owner    store.User
-	admin    store.User
-	stranger store.User
+	owner     store.User
+	admin     store.User
+	stranger  store.User
 	ownerRepo uuid.UUID
 	adminRepo uuid.UUID
-	runID    uuid.UUID
-	reviewID uuid.UUID
-	recID    uuid.UUID
-	category string
-	target   string
+	runID     uuid.UUID
+	reviewID  uuid.UUID
+	recID     uuid.UUID
+	category  string
+	target    string
 }
 
 func seedFileFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, forgeURL string) fileFixture {
 	t.Helper()
 	f := fileFixture{
-		owner:    store.User{ID: uuid.New(), Email: fmt.Sprintf("owner-%s@e2e", uuid.NewString()[:8])},
-		admin:    store.User{ID: uuid.New(), Email: fmt.Sprintf("admin-%s@e2e", uuid.NewString()[:8]), IsAdmin: true},
-		stranger: store.User{ID: uuid.New(), Email: fmt.Sprintf("stranger-%s@e2e", uuid.NewString()[:8])},
+		owner:     store.User{ID: uuid.New(), Email: fmt.Sprintf("owner-%s@e2e", uuid.NewString()[:8])},
+		admin:     store.User{ID: uuid.New(), Email: fmt.Sprintf("admin-%s@e2e", uuid.NewString()[:8]), IsAdmin: true},
+		stranger:  store.User{ID: uuid.New(), Email: fmt.Sprintf("stranger-%s@e2e", uuid.NewString()[:8])},
 		ownerRepo: uuid.New(),
 		adminRepo: uuid.New(),
-		runID:    uuid.New(),
-		category: "improve_agent",
-		target:   "reviewer",
+		runID:     uuid.New(),
+		category:  "improve_agent",
+		target:    "reviewer",
 	}
 	sealed, err := box.Seal([]byte("glpat-dummy-token"))
 	if err != nil {
@@ -250,8 +250,10 @@ func TestFileIssueOwnerHappyPathLiveDB(t *testing.T) {
 		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
 	}
 	var resp struct {
-		Issue   struct{ IID int64 `json:"iid"` } `json:"issue"`
-		Warning string                           `json:"warning"`
+		Issue struct {
+			IID int64 `json:"iid"`
+		} `json:"issue"`
+		Warning string `json:"warning"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
