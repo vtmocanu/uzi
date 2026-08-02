@@ -290,8 +290,13 @@ tasks:
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
       # carries `--test-timeout=30000`, and node's own default is NO timeout at
-      # all, so a hand-rolled invocation HANGS where this one fails. At least one
-      # test is written against the cap existing (test/judge-runner.test.ts unrefs
-      # a 60s timer "else the file exceeds --test-timeout in CI"). Rewriting this
-      # line as a direct node call drops the flag silently.
+      # all. The cap is live (a 3s body under --test-timeout=1000 is cancelled),
+      # but on node v26.4.0 a bare `node --import tsx --test test/*.test.ts` does
+      # NOT hang -- measured identical to `npm test` (1059 pass, 0 fail, both
+      # forms) -- because every test body in this suite finishes in under a
+      # second; test/judge-runner.test.ts's unrefed 60s timer only holds process
+      # WALL TIME down (454ms vs 60263ms), which --test-timeout does not govern.
+      # So delegating here is insurance against a future slow test, not a fix for
+      # a hang this suite has today. Rewriting this line as a direct node call
+      # still drops the flag silently, which is the reason to delegate regardless.
       - npm test
