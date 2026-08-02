@@ -16110,16 +16110,33 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   `tester.md:89-90` each tell their agent to surface missing context rather than guess and
   to wait for re-delegation, so an unqualified dispatch returns bounce-backs instead of
   citations and is worse than no wave. Editing those three bodies was rejected as the wrong
-  lever: it triples the scope and puts three more pin sets in play. (b) Report-only:
-  `architect.md:4` and `tester.md:4` both declare `Edit, Write`, `agents.ts` honours a
-  template's `tools` list verbatim, and the path hook only JAILS writes to the worktree
-  rather than denying them (`guardrails.ts:757`). A plan-turn write is an uncommitted change
-  the human never saw, which the first implement commit then sweeps in — it weakens the
-  APPROVAL GATE, not a guardrail layer. (c) Any bar is stated over the plan the lead
-  produced, never over the issue: `buildPlanPrompt` carries only the issue title and
-  description, which `UNTRUSTED_FRAME` (`prompt.ts:18`) declares attacker-controlled, and
-  there is no label or effort field — so "beyond a small fix" would be a predicate computed
-  from hostile text.
+  lever: it triples the scope and puts three more pin sets in play. (b) Report-only, **and
+  the constraint has to be RELAYED rather than merely held by the lead**: a subagent's
+  system prompt is its own `prompt_body` (`agents.ts:94-96`) and the lead cannot alter it,
+  so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
+  declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
+  path hook only JAILS writes to the worktree rather than denying them
+  (`guardrails.ts:757`). `architect.md:35` compounds it by offering "a SendMessage design
+  summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
+  `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
+  unavailable, naming `SendMessage` as the case — so that role's remaining options are both
+  writes. A plan-turn write is an uncommitted change the human never saw, which the first
+  implement commit then sweeps in: it weakens the APPROVAL GATE, not a guardrail layer.
+  (c) Any bar is stated over the plan the lead produced, never over the issue.
+  `PlanPromptInput` (`prompt.ts:498-518`) carries **nine** fields, and none of them is a
+  label or an effort estimate; the task reaches the lead as `issueTitle` and
+  `issueDescription`, which `UNTRUSTED_FRAME` (`prompt.ts:18`) declares attacker-controlled.
+  So "beyond a small fix" would be a predicate computed from hostile text. *(An earlier
+  version of this bullet said `buildPlanPrompt` "carries only the issue title and
+  description". That is false — the load-bearing half, no label and no effort field, was
+  exact. `2f0017b5`'s commit message carries the wrong version and is immutable.)*
+- **Residual, stated rather than closed: a plan that asserts ZERO mechanisms is compliant
+  and gets no wave.** The property is absolute over what the plan asserts, so there is no
+  reachable state where a plan asserts a mechanism and skips its citation — but a lead can
+  still write a mechanism-free plan and pay nothing. What that buys an attacker is a **cost
+  channel, not a safety channel**: a plan asserting nothing is also a plan the human at the
+  gate can see asserts nothing. Deliberately not closed in the prompt, because the
+  closing predicate would be another self-graded dial of the kind D2 exists to remove.
 - **Structure: a separate short paragraph above the bullet list, not a sixth bullet.** The
   list encodes one contract (*what fans out in parallel*); the citation property is a
   different axis (*what the plan must contain before `submit_plan`*). Mixing them in one list
@@ -16132,25 +16149,63 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   read-only validators together in one wave`, and **all 14 pins stayed green** (control:
   mutating one pinned phrase reds exactly 1 of 14, so the harness does discriminate). Those
   14 are therefore kept **unedited** — the pinned clause excludes the prefix, so rewording
-  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds six pins no single
-  sentence can satisfy for both meanings: one on the retained post-implementation ordering,
-  five on the plan-time property. The control was run **per behaviour, never as a tally**:
-  deleting each of the six from `lead.md` one at a time reddens exactly its own case, on
-  disjoint sets, with all three `TestLead*` tests present as `=== RUN` in every mutated run
-  (so no case was a compile error reading as silence) and the template restored from a `cp`
-  backup, never `git checkout --`. The first ordering fold capitalised the surviving clause
-  and reddened two cases; that was a defect in the fold, not an overlap in the pins, and it
-  is recorded because a control that reddens more than its own case is exactly as suspect as
-  one that reddens nothing.
+  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds eight pins no single
+  sentence can satisfy for both meanings. Every fold ran with all three `TestLead*` tests
+  present as `=== RUN` (so no fold was a compile error reading as silence), the template
+  restored from a `cp` backup rather than `git checkout --`, and, after three agents
+  collided in the shared worktree during the findings round, in a **throwaway detached
+  worktree** rather than the branch's own tree.
+- **DELETION AND RELOCATION ARE DIFFERENT INSTRUMENTS, AND THE FIRST ROUND USED ONLY ONE OF
+  THEM.** The coder's per-behaviour sentence deletions, the reviewer's word-level
+  weakenings and the auditor's seven mutants are all **presence** mutations. None can
+  produce the disconfirming answer, because a clause moved into the other wave's bullet is
+  still present character-for-character: measured by the tester on the first pin set,
+  relocating the citation clause or the no-write clause into the post-implementation bullet
+  and deleting the plan-turn sentence left the plan-turn constraint gone from the template
+  and **all 20 pins green at exit 0**. Three separate controls agreeing was three readings
+  of one instrument. That is this issue's own defect one level in: the old pins were blind
+  to *which wave fans out*, the first new set was blind to *which wave a constraint binds
+  to*.
+  **The second round folded both classes, and relocation found three MORE blind pins than
+  the findings round had named** (the artifact clause, the revise-turn clause, and — in the
+  inverse direction, moved out of its bullet into the plan paragraph — the
+  post-implementation ordering itself), each of which had passed its deletion fold. Every
+  case now quotes enough context to name its wave. Final control, 14 folds: 8 deletions and
+  6 relocations, every one red, `rc=1`. Two deletions redden two cases each, because the
+  spans are deliberately **not** pairwise disjoint — two anchors are the tail of the
+  preceding case, which is exactly what buys relocation-detection. **A one-fold-one-red
+  table is a weaker result than it looks; disjointness was the property that had to be
+  given up to get this.**
 - **Reach: correct, fully gated, merged — and INERT on every install that has booted once.**
   `queries/agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING`,
   and `store/agent_templates_builtins.go` states it in prose: an existing row, builtin or
-  admin-edited, is never overwritten. The only recovery is the admin-only, per-template,
-  verbatim **Reset to default**, which `CHANGELOG.md` now says in an operator note. A
-  propagation mechanism for builtin updates (schema + reconcile + UI, plus a policy question
-  about overriding admin customizations) and the missing `version:` field on `builtins/*.md`
-  (0 of 11) are the real fix and are filed separately — user decision 2026-08-02 was to ship
-  #197 small.
+  admin-edited, is never overwritten. The only **mechanism** is the admin-only,
+  per-template, verbatim **Reset to default** — admin-only by
+  `authorizeTemplateWrite` (`handler/agent_templates.go:146-152`), which 403s a
+  `builtin`-scope write for a non-admin, so the operator note has to say who can do it.
+  Not "the only path": an admin hand-pasting the new body works too, and
+  `docs/agent-templates.md` already offers exactly that ("skip reset entirely and
+  hand-merge the new paragraphs"). A propagation mechanism for builtin updates (schema +
+  reconcile + UI, plus a policy question about overriding admin customizations) and the
+  missing `version:` field on `builtins/*.md` (0 of 11) are the real fix and are filed
+  separately — user decision 2026-08-02 was to ship #197 small.
+- **D12 — `architect` is deliberately NOT sequenced into the wave, which is half of what the
+  issue asked for.** The issue proposes dispatching "the allocated read-only validators
+  (**and `architect`, when allocated**)". Shipped `lead.md` says only "the allocated
+  read-only validators" and does not mention `architect` at all (measured: zero
+  occurrences). That is not an oversight and it follows from D5 rather than contradicting
+  it — `architect` declares `Edit, Write`, so it is not a read-only validator and the
+  wording excludes it. It joins the plan-turn wave when **#203** removes its write tools,
+  not before. Recorded because an unstated omission becomes a surprise; note it does not
+  weaken the relay requirement, since `tester` also declares `Edit, Write` and *is* named a
+  read-only validator by the product's own docs.
+- **The wave is bounded on REPETITION, not only on width.** A planning turn re-enters from
+  two loops: `QUESTION_MAX` (default 5, `config.go:664`) allows up to six planning turns per
+  gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —
+  a ceiling of 24 planning turns, each of which would otherwise carry a full wave, against a
+  **non-resetting** 2h `RUN_TIMEOUT`, since `started_at` is `COALESCE`d once and never
+  re-stamped (`queries/runtime.sql:647`). One clause bounds it and is right on the merits
+  anyway: on a revise turn, re-cite only the mechanisms the revision changed.
 - **`docs/agent-templates.md` was the fifth file, and the run brief missed it.** Its
   `:58-61` restated the post-implementation-only ordering and its frontmatter is
   `audience: user`, so it renders in-app at `/docs/agent-templates`: shipping without it
