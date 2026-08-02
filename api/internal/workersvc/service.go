@@ -203,6 +203,12 @@ type Store interface {
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.
 	GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.RunReview, error)
+	// The ACTIVE judge run for a target (PRD #119 M1): the panel's pending-judge signal,
+	// on the same owner-or-admin gate as the review read. Its predicate is the
+	// one-active-judge-per-target index's partial WHERE with the indexed column
+	// (target_run_id) spelled out as an equality, so "pending" and "a click would 23505"
+	// are the same set of states.
+	GetActiveJudgeRunForTarget(ctx context.Context, targetRunID pgtype.UUID) (store.GetActiveJudgeRunForTargetRow, error)
 	ListRecommendationsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.ReviewRecommendation, error)
 	ListFiledIssuesForReview(ctx context.Context, reviewID uuid.UUID) ([]store.RecommendationFiledIssue, error)
 	// Judge review triage (PRD #94 M1): the coordinate-keyed disposition upsert/undo,

@@ -34,6 +34,7 @@ import {
   type Memory,
   type Notification,
   type NotificationList,
+  type PendingJudge,
   type PrivilegeReport,
   type RecommendationCategory,
   type Run,
@@ -79,6 +80,7 @@ import {
   mockNotifications,
   type MockNotification,
   mockRepos,
+  mockPendingJudges,
   mockReviews,
   type MockReview,
   mockRepoToolProfiles,
@@ -216,6 +218,12 @@ const reviews: MockReview[] = mockReviews.map((r) => ({
   filed_issues: r.filed_issues.map((x) => ({ ...x })),
   dispositions: r.dispositions.map((x) => ({ ...x })),
 }));
+// Same mutable-copy pattern for the active judges (PRD #119), keyed by target run id:
+// the seed stays pristine so a reload of the module re-seeds a clean demo, and this
+// copy is what getRunReview reads and rerunJudge guards against.
+const pendingJudges: Record<string, PendingJudge> = Object.fromEntries(
+  Object.entries(mockPendingJudges).map(([id, p]) => [id, { ...p }]),
+);
 
 // recomputeTriage buckets a review's recommendations through the SAME precedence
 // ladder as the server (dismissed > done > filed[settled] > todo), so the mock's
@@ -2263,11 +2271,21 @@ export const mockApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
-  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  // ── Run judge review (PRD #46 M4, PRD #119) ────────────────────────────────
+  // The two-key envelope the server emits: BOTH keys always present, either nullable
+  // and independent of the other. A pending judge over no review is the auto-judge
+  // case; a pending judge over a review is a re-judge in flight.
   getRunReview: async (id: string) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     const review = reviews.find((r) => r.target_run_id === id);
-    return delay({ review: review ? reviewDTO(review) : null }, 60);
+    const pending = pendingJudges[id];
+    return delay(
+      {
+        review: review ? reviewDTO(review) : null,
+        pending_judge: pending ? { ...pending } : null,
+      },
+      60,
+    );
   },
 
   // ── Triage a recommendation (PRD #94) ──────────────────────────────────────
@@ -2473,10 +2491,29 @@ export const mockApi = {
     if (run.kind !== "issue" && run.kind !== "ci_fix") {
       throw new ApiError(422, "this run cannot be judged");
     }
+    // Server parity with uq_runs_one_active_judge_per_target (PRD #119): a target that
+    // already has an active judge cannot get a second one, and the real API answers
+    // that with a 409 carrying exactly this message. Keeping it here is what makes the
+    // panel's TOCTOU backstop (409 → re-fetch → converge to pending, no error banner)
+    // exercisable in mock mode instead of only against a live database.
+    if (pendingJudges[id]) {
+      throw new ApiError(409, "a judge run is already in progress for this run");
+    }
     // A mock judge run: no worker executes it, so the seeded review is unchanged —
-    // the panel just shows the "re-queued" note. Cloning the target run yields a
+    // the panel just shows the in-flight note. Cloning the target run yields a
     // valid Run shape for the envelope.
     const judge: Run = { ...run, id: nextRunId(), kind: "judge", status: "queued" };
+    // Register it as the target's ACTIVE judge, mirroring the row the real POST inserts
+    // (`queued` → the DTO's `scheduled`). Without this the mock told two lies at once:
+    // the next getRunReview kept answering pending_judge:null, so a re-run left the
+    // button disabled by the local flag but still LABELLED "Re-run judge" where the real
+    // server flips it to "Judge scheduled" on the very next poll; and nothing ever
+    // populated pendingJudges from the UI, so the 409 branch below — the panel's TOCTOU
+    // absorb path — was unreachable in mock mode and could not be demoed at all.
+    // The demo consequence is that the button stays disabled until a reload re-seeds the
+    // module. That is FAITHFUL: a real judge holds the target's active slot until it
+    // reaches a terminal status, and no mock worker will ever finish this one.
+    pendingJudges[id] = { state: "scheduled", enqueued_at: new Date().toISOString() };
     return delay({ run: judge }, 120);
   },
   getRunMessages: async (id: string, afterSeq = 0) => {

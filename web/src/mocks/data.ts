@@ -17,6 +17,7 @@ import type {
   LatestRun,
   Memory,
   MyRateLimits,
+  PendingJudge,
   RateLimitSource,
   RecommendationCategory,
   Repo,
@@ -639,6 +640,32 @@ export const mockReviews: MockReview[] = [
   },
 ];
 
+// ── Pending judges (PRD #119) ────────────────────────────────────────────────
+// The ACTIVE judge run per TARGET run id, mirroring the server's
+// uq_runs_one_active_judge_per_target read: at most one entry per target, and it is
+// orthogonal to whether a review exists. Keyed by target id rather than modelled as a
+// judge Run because the wire has no back-link to derive it from — the run DTO carries
+// no target_run_id — and a mock must not invent wire fields (see mockApi.test.ts's
+// set_via case). getRunReview reads it; rerunJudge 409s off it, the way the unique
+// index makes the real server 409.
+//
+// Four terminal fixtures cover the panel's four states between them — one each, so
+// dropping any one of them takes a state off the demo:
+//   run-failed    — no review + scheduled: the empty-state "verdict will appear here"
+//                   copy with the button disabled and relabelled "Judge scheduled";
+//   run-closed    — a seeded review + running: the re-judge-in-flight note over an
+//                   existing verdict;
+//   run-done      — a seeded review and NO entry: the settled panel with a live
+//                   Re-run judge button, which must stay demoable;
+//   run-unjudged  — NO review and NO entry: the never-judged empty state with the
+//                   ENABLED Run judge button. Added after #119 took run-failed for
+//                   the scheduled case and left this one, the state the PRD promises
+//                   is unchanged, with no fixture at all.
+export const mockPendingJudges: Record<string, PendingJudge> = {
+  "run-failed": { state: "scheduled", enqueued_at: minsAgo(2) },
+  "run-closed": { state: "running", enqueued_at: minsAgo(9) },
+};
+
 // ── Secrets ──────────────────────────────────────────────────────────────────
 
 // Two tokens for the demo user (PRD #104): the multi-token list, the default
@@ -1088,7 +1115,20 @@ const boardFixtures: Record<string, Board> = {
         closed: true,
         conflict: false,
         forge_updated_at: minsAgo(4200),
-        latest_run: null,
+        // run-unjudged works this issue, so the card carries its snapshot — every other
+        // card whose issue has a run in mockRuns does, and a card claiming no run for an
+        // issue that has one is the cross-fixture contradiction this file keeps tripping
+        // over. Same shape as iid 18's: a closed issue whose run merged.
+        latest_run: latestRun({
+          id: "run-unjudged",
+          status: "completed",
+          mr_iid: 39,
+          mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/39",
+          mr_state: "merged",
+          worker_name: "laptop",
+          created_at: minsAgo(520),
+          updated_at: minsAgo(470),
+        }),
         pipeline: null,
       },
       // ── Non-PRD issues (PRD #102 M6) ────────────────────────────────────────
@@ -1889,6 +1929,71 @@ export const mockRuns: Run[] = [
     finished_at: minsAgo(184),
     created_at: minsAgo(225),
     updated_at: minsAgo(184),
+  },
+  {
+    // run-unjudged: the NEVER-JUDGED fixture (PRD #119 follow-up). Terminal and
+    // judge-eligible (kind "issue"), with NO seeded review and NO entry in
+    // mockPendingJudges — the only combination that renders the run-review panel's
+    // untouched empty state, "This run hasn't been judged yet.", beside an ENABLED
+    // Run judge button.
+    //
+    // 🔴 IT EXISTS BECAUSE #119 CONSUMED THE FIXTURE THAT USED TO REACH IT. run-failed
+    // was the one terminal run with no review, and giving it a scheduled auto-judge
+    // left run-done (review, settled), run-closed (review + running) and run-failed
+    // (no review + scheduled) — three of the panel's four states, with the fourth, the
+    // control state the PRD promises is UNCHANGED, unreachable in the browser. The
+    // regression is invisible to the suite, which mounts JudgePanel against stubbed
+    // responses and never asks whether mock mode can still show the state.
+    // Do not give this run a review or a pending judge; that is its whole job.
+    //
+    // The story is a run whose owner had the judge switched off when it finished: a
+    // clean merged issue run, the ordinary shape, so the demo's enabled button sits
+    // under a settled panel rather than a failure.
+    id: "run-unjudged",
+    repo_id: "repo-uzi",
+    issue_iid: 15,
+    issue_title: "Encrypt per-user Anthropic tokens at rest",
+    issue_description: "See prds/15-token-encryption.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "completed",
+    requeue_count: 0,
+    iteration_count: 1,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: "agent/issue-15",
+    forge_type: "gitlab",
+    mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/39",
+    mr_iid: 39,
+    mr_state: "merged",
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: SAMPLE_PLAN(),
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(515),
+    started_at: minsAgo(514),
+    finished_at: minsAgo(470),
+    created_at: minsAgo(520),
+    updated_at: minsAgo(470),
   },
   {
     // run-closed: a completed run whose MR was later closed unmerged (PRD #24). It

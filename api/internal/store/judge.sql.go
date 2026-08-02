@@ -110,6 +110,55 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 	return i, err
 }
 
+const getActiveJudgeRunForTarget = `-- name: GetActiveJudgeRunForTarget :one
+SELECT id, status, created_at FROM runs
+WHERE kind = 'judge'
+  AND target_run_id = $1
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+LIMIT 1
+`
+
+type GetActiveJudgeRunForTargetRow struct {
+	ID        uuid.UUID          `json:"id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// The ACTIVE judge run for a target, for the run page's pending-judge signal (PRD #119
+// M1). This is GetActiveJudgeRunForWorkerTarget minus the worker scope: no worker owns
+// this read, it answers "is a judge already coming for this run?" for whoever can see
+// the target (owner-or-admin, enforced by GetRunForViewer BEFORE this read, never here).
+//
+// The WHERE predicate is the uq_runs_one_active_judge_per_target partial unique index
+// (00058) with its INDEXED COLUMN SPELLED OUT — not a literal copy of the index, which
+// is `ON runs (target_run_id) WHERE kind = 'judge' AND status NOT IN
+// ('completed','failed','cancelled')`. This is that partial WHERE term for term, PLUS
+// the equality on the key column (target_run_id = @target_run_id) that the index carries
+// by being keyed on it rather than by predicating on it. The two are therefore
+// EQUIVALENT in the sense that matters: a row this query returns is exactly a row that
+// would make a fresh judge insert for the same target raise 23505, and no row returned
+// means no 23505. That equivalence is the whole point of the query and is load-bearing:
+// the UI must show "pending" in PRECISELY the set of states where a manual "Run judge"
+// click would hit the index and 23505, and offer the button in precisely the set where
+// the click is the legitimate way to start one. Paraphrase the predicate and the two
+// sets drift apart — the panel either hides a button that would have worked, or offers
+// one that can only produce an error toast, which is the confusion #119 exists to
+// remove. TestJudgeQueriesLiveDB pins the equivalence directly: an active judge found;
+// a completed/failed/cancelled one not; a judge on another target not; and a NON-judge
+// run carrying this target_run_id not.
+//
+// Because the index is UNIQUE on target_run_id over exactly that partial predicate, at
+// most one row can ever match; LIMIT 1 is belt-and-braces, not a real narrowing. Only
+// the three columns the panel needs are projected — this is a UI signal, not the judge
+// machinery, so it deliberately does not return the whole run row the way the
+// worker-scoped query does.
+func (q *Queries) GetActiveJudgeRunForTarget(ctx context.Context, targetRunID pgtype.UUID) (GetActiveJudgeRunForTargetRow, error) {
+	row := q.db.QueryRow(ctx, getActiveJudgeRunForTarget, targetRunID)
+	var i GetActiveJudgeRunForTargetRow
+	err := row.Scan(&i.ID, &i.Status, &i.CreatedAt)
+	return i, err
+}
+
 const getActiveJudgeRunForWorkerTarget = `-- name: GetActiveJudgeRunForWorkerTarget :one
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count FROM runs
 WHERE worker_id = $1

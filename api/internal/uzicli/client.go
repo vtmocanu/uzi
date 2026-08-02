@@ -34,7 +34,18 @@ type Client interface {
 	// but unjudged (the endpoint answers 200 {"review":null}). A run that is absent
 	// or not visible is a real 404 → *ExitError{ExitNotFound}. The two cases are
 	// deliberately distinct: nil is exit 0 "not judged", 404 is exit 4.
-	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, error)
+	//
+	// The SECOND return is the active judge run for this target (PRD #119), and it
+	// exists because `review == nil` was answering two different questions with one
+	// word. A nil review means either "no judge has ever run on this" or "a judge is
+	// already in flight and a verdict is seconds away" — auto-judge enqueues one at
+	// the terminal transition, so the second case is the COMMON one right after a run
+	// finishes. The CLI printed "not judged" for both, which told a user a review was
+	// missing at the exact moment one was being written. A non-nil pending judge
+	// carries the server-normalized state ("scheduled" | "running") and its enqueue
+	// time; it is orthogonal to the review and can accompany a non-nil one too (a
+	// re-judge in flight over an existing verdict).
+	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error)
 	// RunInputs returns a run's follow_up steer queue (newest-first) with delivery
 	// status (PRD #95). Owner-only server-side (GetRunByIDForUser): a non-owner —
 	// including an admin_ro token on another user's run — gets a 404 →
@@ -537,17 +548,25 @@ func (c *HTTPClient) RunLogs(ctx context.Context, id string, after int32) ([]api
 	return env.Messages, nil
 }
 
-func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, error) {
-	// The envelope is {"review": <dto>|null}. A 200 with review:null is a
-	// visible-but-unjudged run — return (nil, nil) so the command exits 0 "not
-	// judged". A real 404 arrives here as *ExitError{ExitNotFound} from get.
+func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {
+	// The envelope is {"review": <dto>|null, "pending_judge": <dto>|null} — both keys
+	// always present, either nullable (PRD #119 M1). A 200 with review:null is a
+	// visible-but-unjudged run — return a nil review so the command exits 0 rather
+	// than inventing a 404, which arrives here as *ExitError{ExitNotFound} from get.
+	//
+	// pending_judge is decoded as a SECOND return rather than folded into the review
+	// because review:null is two states, not one: a run nobody ever judged, and a run
+	// whose auto-enqueued judge is still queued or running. The CLI printed "not
+	// judged" for both. A pre-#119 server omits the key, which decodes to nil — the
+	// same value it sends for "no judge in flight", and the same output as before.
 	var env struct {
-		Review *apitypes.ReviewDTO `json:"review"`
+		Review       *apitypes.ReviewDTO       `json:"review"`
+		PendingJudge *apitypes.PendingJudgeDTO `json:"pending_judge"`
 	}
 	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/review", &env); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return env.Review, nil
+	return env.Review, env.PendingJudge, nil
 }
 
 func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error) {

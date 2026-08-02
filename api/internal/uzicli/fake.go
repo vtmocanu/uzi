@@ -17,6 +17,18 @@ import (
 //
 // so a test can exercise the "not judged" (nil) path WITHOUT reusing the 404
 // path — the two are deliberately distinct (PRD #64 M7).
+//
+// PendingJudges (PRD #119) is a SEPARATE map on the same run ids, and it does not
+// participate in that tri-state: only Reviews decides 404-vs-found, exactly as
+// before, because the server answers both keys off one visibility gate. Its own
+// two cases are:
+//   - key present, non-nil value → an active judge for that run ("scheduled"/"running")
+//   - key present-nil or absent  → no judge in flight
+//
+// Both spellings of "no pending judge" are the same reply, deliberately: the server
+// sends `"pending_judge": null` and a pre-#119 one omits the key, and the CLI must
+// render those identically. A test that wants a pending judge over a run with NO
+// review still needs the nil Reviews entry — otherwise it is asking about a 404.
 type FakeClient struct {
 	User           apitypes.UserDTO
 	Runs           []apitypes.RunListItemDTO
@@ -24,6 +36,7 @@ type FakeClient struct {
 	LogsByID       map[string][]apitypes.MessageDTO
 	InputsByID     map[string][]apitypes.SteerInputDTO
 	Reviews        map[string]*apitypes.ReviewDTO
+	PendingJudges  map[string]*apitypes.PendingJudgeDTO
 	Workers        []apitypes.WorkerDTO
 	Repos          []apitypes.RepoDTO
 	AdminUsers     []apitypes.UserDTO
@@ -182,14 +195,18 @@ func (f *FakeClient) RunLogs(_ context.Context, id string, after int32) ([]apity
 	return out, nil
 }
 
-func (f *FakeClient) RunReview(_ context.Context, id string) (*apitypes.ReviewDTO, error) {
+func (f *FakeClient) RunReview(_ context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {
 	if f.Err != nil {
-		return nil, f.Err
+		return nil, nil, f.Err
 	}
 	if r, ok := f.Reviews[id]; ok {
-		return r, nil // r may be nil: a visible-but-unjudged run
+		// r may be nil: a visible-but-unjudged run. The pending judge is looked up
+		// independently and may be set alongside either — a nil review with a pending
+		// judge is "a verdict is on its way", a non-nil one with a pending judge is a
+		// re-judge in flight.
+		return r, f.PendingJudges[id], nil
 	}
-	return nil, Exitf(ExitNotFound, "run %s not found", id)
+	return nil, nil, Exitf(ExitNotFound, "run %s not found", id)
 }
 
 // RunInputs mirrors the live owner-only endpoint: a key present in InputsByID is

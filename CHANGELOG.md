@@ -6,6 +6,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **The run page now says when a judge is already on its way**, instead of
+  offering a **Run judge** button whose only possible outcome was an error
+  toast. A finished run enqueues a judge automatically, but the review panel
+  used to show the same "not judged yet" state whether one was in flight or
+  not, so the obvious click hit the one-active-judge-per-target index and came
+  back a 409. The panel now reads **Judge scheduled** or **Judge running…**
+  with the button disabled, keeps any existing verdict on screen while a
+  re-judge runs, and swaps in the new one on its own. It is server truth, so it
+  survives a reload and shows to every viewer of the run, not just the tab that
+  started it. `uzi review` and its `--json` output carry the same distinction
+  via a new `pending_judge` key (issue #119).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on
