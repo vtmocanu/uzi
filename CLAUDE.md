@@ -8,6 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+**The gate lives in `Taskfile.yml` at the repo root and that is the only place a gate recipe is written** (PRD #103 M1). `task --list` enumerates it; `task gate` runs everything; `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component. `.gitlab-ci.yml`'s gate jobs invoke the same targets, so local and CI cannot drift apart. Every load-bearing flag now lives in that file with its reason beside it — Task echoes each command before running it, so `-race`, `-count=1` and `--test-timeout=30000` are still visible in the output, and that echo is how you notice one going missing.
+
+Two consequences worth knowing before you read a result:
+
+- **`task`'s own exit code is 201, not the underlying command's** (measured on 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": … exit status 7` with rc=201). `!= 0` is still a correct failure test; anything comparing `$?` to a specific number is not.
+- **The component gates run SERIALLY, deliberately.** CPU contention is a measured flake source here (`web/vite.config.ts` raised `testTimeout` to 20000 for it), and interleaved output would defeat the read-the-named-failing-test rule this file states in four places.
+
+**`task gate:api` is now STRICTER than the hand-typed recipe that used to sit here: it carries `-race`, which the old `go test -count=1 ./...` line did not and CI always did.** That is convergence, not a new check — the flag has been on `test:api` in CI since `224b5349`. It is called out because a local gate silently weaker than CI is what M1 exists to end, and because the cost is small enough to be invisible (41s wall against 40s on the whole api module).
+
+Not everything below is a target. A single-test invocation, `sqlc generate`, the compose stack and the e2e harness are not gate recipes and stay written out as commands; where that is the case the line says so.
+
 ### Full stack
 
 ```sh
@@ -54,12 +65,13 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ### api (Go, chi + pgx + sqlc + goose)
 
 ```sh
-cd api
-go build ./...
-go test -count=1 ./...                     # NOT all tests — see live-DB note below
-go test ./internal/forge -run TestName     # single test
-# after editing internal/store/migrations/ or internal/store/queries/:
-go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
+task gate:api                              # vet + build + test — NOT all tests, see live-DB note below
+task test:api                              # the test slot alone (-race -count=1)
+task build:api                             # or vet:api, individually
+cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
+# after editing internal/store/migrations/ or internal/store/queries/ (CI asserts
+# the regenerate is a no-op in validate:api; no target, see Success Criterion 1):
+cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
 ```
 
 **`-count=1` ON THE GATE IS LOAD-BEARING, NOT A HABIT — a green `go test ./...` can mean the suite was served from cache and never ran.** Go's test cache hashes the files a test opens, **but only those inside the module root** (cmd/go: *"Do not recheck files outside the module, GOPATH, or GOROOT root"*, re-derived in go1.26.5). This repo now has a whole `fixtures/` directory at the **repo root**, above `api/`, read across the module boundary — `fixtures/judge-fidelity/{cases,expected}.json` by `api/internal/workersvc/judge_backlog_fidelity_test.go`, and the controller's contract goldens the other way. **Editing one of those files changes nothing in the module's cache key.** Measured 2026-07-25: deleting an entire case from `cases.json` left `cd api && go test ./internal/workersvc/` printing `ok (cached)`, while `-count=1` on the same tree reddened with *"fixture broken: cases.json has no case …"*. The vitest half has no such cache and reddened with no flag at all, so the two halves are **not** symmetric.
@@ -143,13 +155,15 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 ### web (Vite + React + TS)
 
 ```sh
-cd web
-npm run typecheck
-npm test                                   # vitest run
-npx vitest run src/pages/Foo.test.tsx      # single file
-npm run build                              # runs check-docs + tsc --noEmit + vite build
-VITE_UZI_MOCK=1 npm run dev                # mock mode — no backend, no network at all
+task gate:web                              # check-docs + typecheck + test
+task test:web                              # vitest run
+task typecheck:web                         # or check-docs:web, individually
+cd web && npx vitest run src/pages/Foo.test.tsx    # single file — no target
+cd web && npm run build                    # check-docs + tsc --noEmit + vite build
+cd web && VITE_UZI_MOCK=1 npm run dev      # mock mode — no backend, no network at all
 ```
+
+**`npm run build` is deliberately NOT part of `task gate:web`, and the delta is exactly `vite build`.** CI's `validate:web` runs check-docs + typecheck directly to skip the bundle, so a `build:web` target would be a check CI does not run — and the bundle is not unchecked: the `build:web` kaniko job builds the web image, whose Dockerfile runs `npm run build`. Run it by hand when you have touched anything the bundler resolves.
 
 **Mock mode is a first-class dev workflow, not only the safety mitigation it appears as below.** `VITE_UZI_MOCK=1` is read once at build time (`web/src/lib/api.ts`) to swap `src/mocks/mockApi.ts` + `MockRunSocket` in for the real `api`/socket, so a mock bundle contains **no code path to a live backend** — not a disabled one. There is no dedicated npm script; set the var on `dev` or `build`. Demo scenarios then select via `?mock=<name>` or the sticky `uzi_mock_scenario` localStorage key (`mockScenario()`); it is a single string, so scenarios are mutually exclusive by construction. `web/Dockerfile.mock` builds the backend-free static image (context is the repo root), with `web/nginx.mock.conf` 404ing any stray `/api/` call as a tripwire. Known scenario names and what each unlocks are in [docs/dev-conventions.md](docs/dev-conventions.md#the-mockdemo-build), which also documents the E2E bot env vars (`UZI_E2E_BOT_PAT` / `_USERNAME`, `UZI_E2E_PROJECT`) that no test reads yet.
 
@@ -168,10 +182,10 @@ Mitigations, in order of preference: run with `VITE_UZI_MOCK=1`, which replaces 
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-cd agent
-npm run typecheck
-npm test                                   # node --test via tsx
-node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file
+task gate:agent                            # typecheck + test
+task test:agent                            # node --test via tsx
+task typecheck:agent
+cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file — no target
 ```
 
 **Carry `--test-timeout=30000` on the single-file form — `npm test` sets it and the suite depends on it.** `agent/package.json`'s `test` script is `node --import tsx --test --test-timeout=30000 test/*.test.ts`; node's own default is no timeout at all, so a single-file run without the flag **hangs** where `npm test` fails. At least one test is written against the cap existing (`test/judge-runner.test.ts:167` unrefs a 60s timer with the comment "else the file exceeds `--test-timeout` in CI"). A single-file recipe that silently differs from the gate is the same class as the reporting traps above: it can return a different verdict than the thing it is standing in for.
@@ -189,10 +203,9 @@ node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single fil
 ### controller (Go, hosted-worker controller — a SECOND, SEPARATE Go module)
 
 ```sh
-cd controller
-go build ./...
-go vet ./...
-go test -count=1 ./...
+task gate:controller                       # vet + build + test
+task test:controller                       # -count=1, see below
+task vet:controller                        # or build:controller, individually
 ```
 
 **There are FOUR toolchains here, not three.** `controller/` is `uzi-controller` (PRD #58, `ARCHITECTURE.md` "Worker controller (k8s only)"): the only uzi component that ever holds a kube-apiserver credential, shipped in the chart but off by default (`workers.enabled: false`). Its own `go.mod` is deliberate and load-bearing — it is what keeps `k8s.io/client-go` structurally out of `api/go.mod`, so "the api gets zero kube access" is a build-graph fact rather than a policy. **A `cd api && go test ./...` therefore does not touch it**, and neither does anything else in the section above. CI runs it as `validate:controller` + `test:controller`, and builds/publishes it as `build:controller` + `publish:controller`.

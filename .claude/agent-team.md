@@ -1086,6 +1086,16 @@ cold-start and never read this file, so a slot you do not paste is a slot they
 cannot run. A `none (gap)` slot that has been raised once gets a `noted` marker
 appended here; roles report a gap only when its line carries no marker.
 
+**The slots name TARGETS, not recipes** (PRD #103 M1). Every recipe lives in
+`Taskfile.yml` at the repo root; `task --list` enumerates it, and `task gate:api` /
+`gate:controller` / `gate:web` / `gate:agent` run a whole component when the scope
+warrants it. This is not tidiness: a stale pasted *command* still runs, still prints
+`ok`, and gets reported green, while a stale *target* dies with
+`task: Task "gate:api" does not exist` and a nonzero exit. **`task` exits 201 on any
+failure, never the underlying command's code** — test for non-zero, never for a
+number. Output is grouped per task and the components run serially, so a failing
+component's block is contiguous and the named failing test is readable.
+
 ```
 format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it
                                    # for the current list. Do NOT record a count here:
@@ -1094,14 +1104,17 @@ format         none (gap)          # gofmt -l ./api reports pre-existing drift; 
                                    # 4-file view reported as the whole list, 2026-07-25).
                                    # The check that matters is `comm -12` between
                                    # gofmt -l and your commit's file list being EMPTY.
-lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
-typecheck      cd web && npm run typecheck
-               cd agent && npm run typecheck
-test           cd api && go test -count=1 ./...
-               cd controller && go test -count=1 ./...
-               cd web && npm test
-               cd agent && npm test
-               cd web && npm run check-docs
+lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
+                                   # task gate:api / gate:controller and in CI, but a
+                                   # vet is not a lint slot. (Was "go vet in CI only";
+                                   # PRD #103 M1 made the local half true too.)
+typecheck      task typecheck:web
+               task typecheck:agent
+test           task test:api
+               task test:controller
+               task test:web
+               task test:agent
+               task check-docs:web
 dead code      none (gap, noted 2026-07-26)
 coverage       none (gap)
 security scan  none (gap, noted 2026-07-21)
@@ -1131,7 +1144,22 @@ than overwriting one figure with another.)*
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.
 
-**`-count=1` on the two Go lines is part of the gate, not decoration — without it a
+**The four load-bearing flags are inside the targets now. You no longer type them, and
+you must still recognise one going missing** — Task echoes each command, so they are in
+the output of any run you make:
+
+- **`-count=1`** on `task test:api` and `task test:controller` — cross-module fixture
+  reads are invisible to Go's test cache; measurement below.
+- **`-race`** on `task test:api` — PRD #108 M4. Measured by deleting the lock it
+  guards: 3/3 red with it, only 2/3 without.
+- **`-p 1`** on `./e2e/run-store-it.sh` (which is a script, not a target) — the two
+  live-DB packages share one database and, run concurrently, race goose into
+  "relation already exists" and TRUNCATE each other's fixtures. Both observed.
+- **`--test-timeout=30000`** inside `agent/package.json`'s `test` script, which
+  `task test:agent` invokes — node's own default is NO timeout, so a hand-rolled
+  `node --test` HANGS where the gate fails.
+
+**`-count=1` on the two Go test targets is part of the gate, not decoration — without it a
 green can mean the suite never ran.** Go's test cache hashes only files inside the
 module root, and this repo reads test inputs ACROSS module boundaries in both
 directions: `api/internal/workersvc/judge_backlog_fidelity_test.go` reads
@@ -1146,11 +1174,15 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
 
 ## Project signals
 
-- Test commands (see CLAUDE.md for detail): `cd api && go test -count=1 ./...`;
-  `cd web && npm test && npm run typecheck`; `cd agent && npm test && npm run typecheck`;
-  integration: `./e2e/run-e2e.sh` (isolated stack, dummy creds) and
-  `./scripts/smoke.sh` (needs a fresh stack). Never bare `docker compose up`
-  for testing — `--env-file` with dummy secrets + unique `-p` project.
+- Gate targets (recipes live in root `Taskfile.yml`; see CLAUDE.md for detail):
+  `task gate` or per component `task gate:api` / `gate:controller` / `gate:web` /
+  `gate:agent`; individual slots `task test:api`, `task typecheck:web`,
+  `task check-docs:web`, … (`task --list`). Integration is NOT a target:
+  `./e2e/run-e2e.sh` (isolated stack, dummy creds) and `./scripts/smoke.sh`
+  (needs a fresh stack). Never bare `docker compose up` for testing — the
+  developer's shell profile exports the real vars and Compose ranks shell
+  environment above `--env-file`, so use `env -i HOME=$HOME PATH=$PATH docker
+  compose --env-file <dummy.env> -p <unique> …`.
 - Release flow: tag-driven (PRD #52). `v*` tags publish the api/web images +
   the OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the
   tag); k8s deploy is GitOps via ArgoCD to dev-cluster (see `deploy/` +

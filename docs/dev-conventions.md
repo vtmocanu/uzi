@@ -5,9 +5,60 @@ audience: contributor
 
 # Developer conventions
 
-Two conventions split out of the user-facing [GitLab bot setup](./gitlab-bot-setup.md)
-page: they're for people scripting or testing uzi itself, not for someone
-setting up their own bot through the UI.
+Conventions for people scripting or testing uzi itself, rather than setting up
+their own bot through the UI. The `glab` and E2E-bot sections below were split
+out of the user-facing [GitLab bot setup](./gitlab-bot-setup.md) page.
+
+## The quality gate
+
+**`Taskfile.yml` at the repo root is the single source of truth for every gate
+recipe.** No command line for a check is written anywhere else: `CLAUDE.md`, the
+agent-team docs and the CI jobs all name targets from it. `task --list`
+enumerates them.
+
+```sh
+task gate              # everything, serially
+task gate:api          # one component: vet + build + test
+task gate:controller
+task gate:web          # check-docs + typecheck + test
+task gate:agent
+```
+
+Individual slots exist too (`task test:api`, `task typecheck:web`,
+`task check-docs:web`, …), and `.gitlab-ci.yml` calls those fine-grained targets
+rather than the component wrappers, because `validate:*` and `test:*` are separate
+jobs and a wrapper would run the tests twice.
+
+Four things about it that are decisions rather than accidents:
+
+- **The load-bearing flags live in the targets, with their reason beside them.**
+  `-race` and `-count=1` on `test:api`, `-count=1` on `test:controller`,
+  `--test-timeout=30000` inside `agent/package.json`'s `test` script. None is
+  optional and each one's absence is invisible in a passing run, which is why
+  the Taskfile is not `silent:` — Task echoes every command, so you can read the
+  flags in the output instead of trusting a file.
+- **No `sources:`, `generates:` or `status:` on any target.** A fingerprinted
+  target prints `Task "x" is up to date`, exits 0 and runs nothing, which is
+  indistinguishable from a pass. uzi's gates deliberately read fixtures from
+  outside the module under test, so a checksum over one module cannot see them
+  change — the same blind spot `-count=1` exists to close.
+- **Components run serially.** Concurrency is a measured flake source here
+  (`web/vite.config.ts` raised its `testTimeout` for exactly that), and
+  interleaved output makes the named failing test unreadable.
+- **`task` exits 201 on any failure**, not the underlying command's code. Test
+  for non-zero; never for a specific number.
+
+Not everything is a target. A single-test run, `sqlc generate`, the compose
+stack, `./e2e/run-e2e.sh` and `./scripts/smoke.sh` are not gate recipes and stay
+written out as commands in `CLAUDE.md`.
+
+The Taskfile installs nothing — no `npm ci`, no `go mod download`. Your
+`node_modules` and module cache are expected to exist; CI does that in its
+`before_script`.
+
+There is no linter, no format check, no dead-code check and no coverage signal
+yet. That is PRD #103's remaining milestones, and a target for each arrives with
+the check itself rather than as an empty stub.
 
 ## Scripting the bot setup with `glab`
 
