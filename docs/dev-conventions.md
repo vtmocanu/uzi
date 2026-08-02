@@ -88,8 +88,11 @@ It fails on any drift and prints the offending files, module-relative
 things about the recipe are deliberate and easy to undo by accident. It assigns
 `gofmt -l`'s output to a variable rather than testing it inline, because the
 inline form both swallows the filenames and goes **green** on a Go file that does
-not parse. It carries an explicit `|| exit 1` on that assignment, so the
-fail-closed behaviour lives in the line rather than in Task's errexit shell.
+not parse. It carries an explicit `|| exit 2` on that assignment, so the
+fail-closed behaviour lives in the line rather than in Task's errexit shell —
+`2` because it reproduces gofmt's own status, which keeps a parse failure
+(`exit status 2`) distinguishable from a misformat (`exit status 1`) where
+`task`'s own exit code is 201 for both.
 And it is named `fmt-check` rather than `fmt` because nothing in the gate may be
 a fixing variant. All three reasons are written beside the recipe.
 

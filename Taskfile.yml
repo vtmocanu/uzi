@@ -210,28 +210,39 @@ tasks:
       #    for (a control that produces no output is not a control).
       # 2. `test -z "$(...)"` FAILS OPEN ON A GO FILE THAT DOES NOT PARSE. gofmt
       #    exits 2 and writes to stderr, so `$(…)` captures nothing and `test -z`
-      #    is TRUE. Under Task's errexit shell an ASSIGNMENT whose command
-      #    substitution fails aborts the script, while a substitution inside a
-      #    SIMPLE COMMAND does not - that POSIX distinction is the entire
-      #    difference. And because `output: prefixed` puts a recipe's stderr on
-      #    Task's stdout, the green run PRINTS the parse errors: visible-and-
-      #    ignored, which is worse than silent, because the error text reads as
-      #    the gate having done its job.
+      #    is TRUE. THE POSIX DISTINCTION IS WHY THAT FORM HAS THE HOLE AND AN
+      #    UNGUARDED ASSIGNMENT DOES NOT: under errexit, an ASSIGNMENT whose
+      #    command substitution fails aborts the script, while a substitution
+      #    inside a SIMPLE COMMAND does not. It is NOT the mechanism the line
+      #    below relies on - see the next paragraph, and do not read it as one.
+      #    And because `output: prefixed` puts a recipe's stderr on Task's
+      #    stdout, the green run PRINTS the parse errors: visible-and-ignored,
+      #    which is worse than silent, because the error text reads as the gate
+      #    having done its job.
       #
-      # THE `|| exit 1` IS THE WHOLE GUARANTEE, AND IT IS THERE SO THIS RECIPE
-      # DOES NOT DEPEND ON TASK'S SHELL. Reason 2 above is a statement about
-      # ERREXIT, not about this line: Task runs its recipes errexit, so the bare
-      # assignment already aborts. Measured 2026-08-02, same tree, one non-parsing
-      # file, gofmt exiting 2 --
+      # THE `|| exit 2` IS WHAT THE SHIPPED LINE ACTUALLY RELIES ON, DELIBERATELY.
+      # Once `||` is on the line the assignment sits in a CONDITION CONTEXT, so
+      # errexit no longer fires for it at all and the explicit exit is the whole
+      # guarantee. Measured 2026-08-02: `sh -ec 'x="$(false)"; echo R'` exits 1
+      # with errexit doing the work, while both `sh -c` and `sh -ec` of
+      # `'x="$(false)" || exit 7; echo R'` exit **7**. So this is not belt-and-
+      # braces over reason 2's mechanism, it REPLACES it - the property is now
+      # intrinsic to the recipe and survives a future `set +e`, a Task release
+      # changing its shell defaults, or this line being copied somewhere with
+      # neither. Measured on one non-parsing file, nothing else drifted:
       #
       #   sh -c   'out="$(gofmt -l .)"; ...'            rc=0   <- FAILS OPEN
       #   sh -ec  'out="$(gofmt -l .)"; ...'            rc=2
-      #   sh -c   'out="$(gofmt -l .)" || exit 1; ...'  rc=1   <- intrinsic
+      #   sh -c   'out="$(gofmt -l .)" || exit 1; ...'  rc=1
+      #   sh -c   'out="$(gofmt -l .)" || exit 2; ...'  rc=2   <- shipped
       #
-      # -- so the bare form's correctness lives in the shell's configuration while
-      # the comment above reads as though the recipe were guarded. `|| exit 1`
-      # moves the property into the line, where it survives a future `set +e`, a
-      # shell swap, or this recipe being copied somewhere with neither.
+      # `2` AND NOT `1`, FOR TWO REASONS. It reproduces gofmt's own exit status,
+      # so the table at the top of this comment and CLAUDE.md's R10 paragraph -
+      # both of which recorded `exit status 2` against the UNPINNED form - stay
+      # true rather than going stale in the commit that pinned them. And it keeps
+      # the two red modes distinguishable: `exit status 2` means a file does not
+      # PARSE, `exit status 1` means a file is MISFORMATTED. Task's own rc is 201
+      # for both, so this line is the only status-level discriminator there is.
       #
       # ONE MEASURED SUBTLETY, BECAUSE IT INVERTS THE INTUITION: the fail-open
       # window is exactly a tree with NO OTHER DRIFT. gofmt still LISTS every
@@ -245,8 +256,11 @@ tasks:
       # no `{{.CLI_ARGS}}` (the splicing ban, and it would let a caller narrow the
       # gate's scope); no `xargs`/`gofmt -d $out` "improvement" that unquotes the
       # filename list; and no `vars: {DRIFT: {sh: gofmt -l api}}` + `test -z
-      # "{{.DRIFT}}"`, which is a banned dynamic root var AND splices shell output
-      # through text/template into `sh -c`.
+      # "{{.DRIFT}}"`, which splices shell output through text/template into
+      # `sh -c` and so dies on the splicing ban alone. (Header ban 4 is scoped to
+      # dynamic ROOT vars; the form above would sit on the target, so it is the
+      # SPLICE ban that catches it, not ban 4. The conclusion was always right and
+      # this citation was one word loose until 2026-08-02.)
       #
       # NO `sources:` ON THIS TARGET (header ban 1). A `**/*.go` fingerprint is
       # MORE defensible here than anywhere else in this file - gofmt reads nothing
@@ -262,7 +276,7 @@ tasks:
       # -w` and "a bare `fmt` target" named explicitly - so a target called `fmt`
       # would be declined by the role that is supposed to run it. Do not tidy the
       # suffix away.
-      - 'out="$(gofmt -l .)" || exit 1; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:api:
     desc: go vet over the api module
@@ -346,7 +360,7 @@ tasks:
       # (measured 2026-08-02 at 755861e8, go1.26.5: `gofmt -l ./controller` empty
       # while ./api listed 16 files); the target exists to keep it that way. It
       # ships with an empty backlog, which is not the same thing as a no-op.
-      - 'out="$(gofmt -l .)" || exit 1; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      - 'out="$(gofmt -l .)" || exit 2; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:controller:
     desc: go vet over the controller module

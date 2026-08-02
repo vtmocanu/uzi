@@ -231,33 +231,51 @@ decides where the next person spends their time. Re-derive those too.
   fails silent, and the surrounding output still looks like success.** Use a real array
   (`combo=(g1 g2); for g in "${combo[@]}"`), and give any mutation loop a counter asserting the
   expected number of substitutions actually applied.
-- **RETIRED 2026-08-02 by PRD #103 M2 — the directory-wide-`gofmt -w` rule that stood here.**
-  It said a `gofmt -w internal/<pkg>/` sweeps pre-existing drift into your commit under your
-  commit message, because `gofmt -l ./api` was not empty, and it prescribed `comm -12` between
-  `gofmt -l` and your commit's file list as the check. M2's first commit cleared that drift (a
-  closed, dated measurement rather than a live tally: `gofmt -l ./api` listed 16 files at
-  `755861e8` under go1.26.5, and `./controller` was already empty), and its second added the
-  `fmt-check:api` / `fmt-check:controller` targets — run first inside `gate:api` /
-  `gate:controller` and first in CI's `validate:api` / `validate:controller` — so there is
-  nothing left for a directory-wide `gofmt -w` to sweep, and any new drift reddens the gate
-  rather than riding along in silence.
-  **The `comm -12` idiom is retired with it, for one reason and one only**: after commit 1 there
-  is no pre-existing drift, so the intersection is empty BY CONSTRUCTION and the check can never
-  fail. **The idiom itself worked and is not what is being retired here** — measured at
-  `755861e8`, `gofmt -l ./api` from the repo root and `git diff --name-only` against commit 1
-  both list the same 16 `api/internal/…` paths and `comm -12` returns all **16**. Do not rebuild
-  it against the new target either: a `dir:`-carrying target prints `internal/…` while
-  `git diff --name-only` prints `api/internal/…`, so a naive rewrite would return empty
-  regardless of input. The count ban it cited was sound; its evidence is preserved as a dated
-  note in the `format` slot below.
-  *(Corrected 2026-08-02, same day, one commit later: this bullet first said the idiom died
-  "twice over" and that the path shapes never matched, "so it returned empty regardless of what
-  it was fed" — labelled **measured** and false. The mismatch is a property of the NEW target,
-  which did not exist when the idiom was written; the idiom's left side was `gofmt -l ./api`
-  from the repo root, the same shape as its right side. A conditional warning about a rewrite
-  became an unconditional past-tense claim, in the one document about not trusting unverified
-  claims, and it retroactively defamed a check that worked. `cd37e182`'s commit message carries
-  the same false sentence and cannot be fixed there.)*
+- **DIRECTORY-WIDE `gofmt -w` IS A TRAP ON ANY TREE WHERE `gofmt -l ./api` IS NOT EMPTY —
+  which after PRD #103 M2 means an un-rebased branch, and nothing else.** `gofmt -w
+  internal/<pkg>/` reformats whatever pre-existing drift that tree carries and sweeps files you
+  never touched into your commit, under your commit message. Scope it to your own files, by name.
+  **Run `gofmt -l ./api` on YOUR tree before reaching for a directory-wide `-w`** — that is the
+  whole check, and it is one command.
+  - **Retired on any tree containing M2's reformat** (`b0d8bf72`, and `main` once merged): the
+    drift is gone, so there is nothing left to sweep and the rule has no subject.
+  - **Still fully live on a branch that has not rebased past it.** Measured 2026-08-02 with
+    `git archive <branch> api | tar -x` into a temp dir (no sibling worktree touched), `gofmt -l`
+    was non-empty on **five** live branches, one of them well above `main`'s count. Numbers are
+    not recorded here: they move with every commit and the shape is the point. **Re-measure your
+    own branch; do not infer it from `main`.**
+  - **The new gate does NOT cover this case, and the obvious reading of it is wrong.** `fmt-check`
+    detects DRIFT; the hazard here is a SWEEP, and a swept tree is gofmt-clean, so the gate is
+    green by construction. It was never the drift's existence that hurt — it was foreign files
+    riding into your commit. Nothing automated catches that.
+
+  **The `comm -12` idiom the rule prescribed is retired for VACUITY, on the trees where the rule
+  itself is retired**: with `gofmt -l ./api` empty, the intersection is empty BY CONSTRUCTION and
+  the check can never fail. **It is not retired for having been broken — it worked.** Measured at
+  `755861e8`: `gofmt -l ./api` from the repo root against `git diff --name-only` for commit 1
+  gives `comm -12` = **16**, which is *every file commit 1 touched*. A perfect hit, not a failure.
+  **Do not rebuild it against the new target**, and this is a live trap because the new target is
+  what you now reach for: `task fmt-check:api` carries `dir:` and prints **module-relative**
+  paths (`internal/config/config_oidc_test.go`) while `git diff --name-only` prints
+  **repo-root-relative** ones (`api/internal/config/config_oidc_test.go`), so `comm -12` over that
+  pair measures **0** on a tree where the old form measures 16. Both numbers are real; they are
+  answers to different commands. The count ban the rule cited was sound; its evidence is preserved
+  as a dated note in the `format` slot below.
+  *(Corrected twice on 2026-08-02, one commit apart, and the second correction is the instructive
+  one. The bullet was first rewritten as an unconditional retirement claiming the idiom died
+  "twice over" because the path shapes never matched, "so it returned empty regardless of what it
+  was fed" — labelled **measured** and false. The defect was a **swapped antecedent, not a wrong
+  number**: the rule supplies its own antecedent one clause earlier, so its bare `gofmt -l` meant
+  `gofmt -l ./api` from the repo root; the 0 was measured with `cd api && gofmt -l .`, a shape
+  created by the `dir:`-carrying target **that same commit introduced**. A property of the new
+  thing was attributed retroactively to the old one. The unconditional SCOPE was the second and
+  larger error, caught by the fact-checker: the retirement travels into dispatches via the
+  paste-block, which exists precisely because teammates cold-start, so it would have told a
+  teammate on a branch with live drift that there was nothing to sweep. Note what both errors
+  share — the retirement's real reason needs no evidence at all, and **a sound argument that needs
+  no evidence is the one most likely to acquire decorative evidence.** `cd37e182`'s commit message
+  carries the first false sentence and `65e2b053`'s carries the unconditional scope; neither can
+  be fixed there, and this bullet is the record.)*
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
@@ -1298,8 +1316,10 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
 
 - Gate targets (recipes live in root `Taskfile.yml`; see CLAUDE.md for detail):
   `task gate` or per component `task gate:api` / `gate:controller` / `gate:web` /
-  `gate:agent`; individual slots `task test:api`, `task typecheck:web`,
-  `task check-docs:web`, … (`task --list`). Integration is NOT a target:
+  `gate:agent`; individual slots `task fmt-check` (PRD #103 M2 — `gofmt -l` over
+  both Go modules; the per-module `fmt-check:api` / `fmt-check:controller` run
+  first inside `gate:api` / `gate:controller`), `task test:api`,
+  `task typecheck:web`, `task check-docs:web`, … (`task --list`). Integration is NOT a target:
   `./e2e/run-e2e.sh` (isolated stack, dummy creds) and `./scripts/smoke.sh`
   (needs a fresh stack). Never bare `docker compose up` for testing — the
   developer's shell profile exports the real vars and Compose ranks shell
