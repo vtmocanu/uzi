@@ -15749,9 +15749,10 @@ must reproduce, most of which are invisible in a passing run.
   **conditional on the tree**: on any tree carrying M2's reformat there is nothing left to
   sweep, and on an un-rebased branch `gofmt -l ./api` is still non-empty and the hazard is
   exactly as live as before. Measured 2026-08-02 by extracting each branch's `api/` with
-  `git archive` into a temp dir: non-empty on **every local branch but two**, and the sample
-  was all of them. No count is recorded, deliberately — it moves with every commit and the
-  shape is the point. *(This bullet first said "five live branches", from a sample narrower
+  `git archive` into a temp dir: non-empty on **nearly every local branch**, and the sample
+  was all of them. No count is recorded, deliberately — any branch cut from a merged `main`
+  is clean on day one, so a tally here is stale on the next branch, not merely on the next
+  commit. The shape is the point. *(This bullet first said "five live branches", from a sample narrower
   than the population — an understatement that reads as an enumeration. **How much narrower is
   not recoverable, and the obvious explanation is false**: this repo has 18 worktrees, not
   five, so "the branches that happened to have worktrees" — asserted here until 2026-08-02 —
