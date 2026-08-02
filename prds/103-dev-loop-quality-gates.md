@@ -10,7 +10,7 @@
 
 - **Decision 1 argued *for* the silent-green mechanism this repo mandates `-count=1` against.** Its Taskfile justification cited `sources:`/`checksum` fingerprinting as "the real difference" from make. Rewritten, with a hard ban and a measurement (see Decision 1).
 - **The "gate is copy-pasted prose" premise was stale.** The `.claude/agent-team.md` line Success Criterion 4 targeted was deleted in `027a4b88`, the commit immediately after this PRD's last edit, and replaced by a deliberate **paste-block** whose whole rationale is duplication. SC3 as written would have deleted that mechanism. Resolved at the user's direction 2026-08-02 (see Decision 9).
-- **`-race` was already on `test:api`** (`.gitlab-ci.yml:178`, landed `224b5349` for PRD #108 M4). M6's "riskiest single change" was already done; rescoped to `controller` only.
+- **`-race` was already on `test:api`** (the `test:api` job, `go test -race -count=1 ./...`). M6's "riskiest single change" was already done; rescoped to `controller` only. *(Provenance corrected 2026-08-02 during M1 — see Decision 11. This bullet read "`.gitlab-ci.yml:178`, landed `224b5349` for PRD #108 M4", and all three parts were wrong or imprecise: the line number has since moved twice, `224b5349` is a branch merge rather than the introduction, and the combined line is two PRDs' work, not one.)*
 
 Plus: every numeric count in the document had drifted and is now struck (Decision 10), `check-docs.mjs` had grown to cover three of the four files Problem #4 claimed were uncovered, Decision 7 repeated a clause `devbox.json` itself corrects as false, and only M4 had a calibration step (now all of M2–M6 do).
 **Related**: [#85](https://gitlab.example.com/vtmocanu/uzi/-/issues/85) (agenttmpl builtins drifted from the versioned role library)
@@ -86,12 +86,21 @@ No `-coverprofile`, no `vitest --coverage`, no codecov. `.gitignore:66` carries
 a vestigial `coverage.out` entry pointing at tooling that does not exist.
 
 **`-race` is NOT part of this problem for `api`, and the previous version of
-this paragraph was wrong that it was.** `.gitlab-ci.yml:178` is
-`go test -race -count=1 ./...`, landed 2026-07-25 in `224b5349` for PRD #108 M4,
-under a 25-line comment (`:157-178`) stating that dropping either flag silently
-undoes a fix, with the cost already measured. `test:api-store-it` has it too
-(`:224`). **The only module still without `-race` is `controller`**
-(`.gitlab-ci.yml:299`, `go test -count=1 ./...`). M6 is scoped accordingly.
+this paragraph was wrong that it was.** The `test:api` job runs
+`go test -race -count=1 ./...` (since M1, via `task test:api`), under a long
+comment stating that dropping either flag silently undoes a fix, with the cost
+already measured. `test:api-store-it` has it too, in its `-run 'LiveDB$'` sweep.
+**The only module still without `-race` is `controller`**
+(the `test:controller` job, `go test -count=1 ./...`). M6 is scoped accordingly.
+
+*(Corrected 2026-08-02 during M1, twice over. The line numbers are gone because
+M1 edits this file and every anchor in it moves; cite by job name — see
+Decision 11. And the provenance previously given here, "landed 2026-07-25 in
+`224b5349` for PRD #108 M4", was wrong in all three parts: `224b5349` is a merge
+on the PRD #98 wave-3 branch, `main` got the line on **2026-07-26** via
+`77cb96e4`, and the combined command is two PRDs' work — `-count=1` is PRD #98's,
+`-race` is PRD #108 M4's, first introduced alone as `go test -race ./...` in
+`8f1b0c9b`.)*
 
 **6. There is no task runner, so the gate recipe is duplicated by hand.**
 
@@ -155,6 +164,27 @@ library anyway.
 Not on `gate`, `gate:*`, `test:*`, `lint:*`, `fmt-check:*`, `typecheck:*` or
 `check-docs:*`. If a target must carry `sources:` for some other reason, it also
 carries `method: none`.
+
+**M1 added three more bans to the same list, and they are security-shaped rather
+than correctness-shaped** (they live in `Taskfile.yml`'s header, in one list, so a
+later milestone sees all four at once):
+
+- **No `dotenv:`.** Task loads the named env files into *every* target's
+  environment, so a `dotenv: ['.env']` at the root silently injects a developer's
+  real secrets into every gate target. `.env` is gitignored and `CLAUDE.md` spends
+  a section on compose ranking shell environment above `--env-file`.
+- **No `includes:` at all, and the remote form is the sharp edge.** Task 3.x can
+  include a taskfile over https: unpinned remote code executing inside the gate.
+  `.gitignore` already carries a "Task remote-include cache" comment, so the
+  mechanism is one line from being invited back. The self-contained rule above is
+  the style reason; this is the security one.
+- **No dynamic root `vars: {X: {sh: ...}}`.** Those execute on every invocation,
+  including unrelated targets and a bare `task --list`.
+
+**And never splice a variable unquoted into a `cmds:` line.** Task templates are Go
+`text/template` and the result reaches `sh -c` unquoted, so `{{.CI_COMMIT_BRANCH}}`
+or `{{.CLI_ARGS}}` inside a command is injectable by anyone who can push a branch.
+M1 needs neither; **M6's coverage measurement is where the temptation appears.**
 
 An earlier version of this decision cited that very feature as the argument
 *for* Taskfile — *"Taskfile's `sources:`/`checksum` fingerprinting does cover
@@ -229,6 +259,25 @@ Two consequences:
 - **`task`'s own exit code is 201, not the underlying 7**, under both output
   modes. Any wrapper reading `$?` numerically must know this. Nothing in the
   plan does today; say so before someone writes one.
+
+**RESOLVED IN M1: `prefixed`, not `group` — and the heading above is now wrong
+about which is "required".** Once M1 made `gate` serial (see the CPU-contention
+paragraph below), the interleaving `group` exists to fix cannot occur, so `group`
+bought nothing and cost streaming. Measured on `task` 3.51.1, 2026-08-02, log read
+at t=1.5s into a target that prints `EARLY`, sleeps 3s, prints `LATE`:
+
+```
+group        task: [a] sh -c '...'                <- EARLY ABSENT, buffered
+prefixed     task: [a] sh -c '...'   [a] EARLY    <- streams
+interleaved  task: [a] sh -c '...'   EARLY        <- streams
+```
+
+Two costs, and the second is the serious one: locally `task gate:api` would print
+nothing for the whole 41s `go test -race` run and then dump; and in CI every gate
+job sets `interruptible: true`, so a cancelled or timed-out job under `group`
+loses **all** buffered output. A gate that discards its evidence on timeout is the
+failure class this PRD exists to remove. The parenthetical "(or `prefixed`)" above
+was always the escape hatch; M1 took it.
 
 **CPU contention is a measured flake source in this repo already.**
 `web/vite.config.ts:11-20` raised `testTimeout` to 20000 because "under full-suite
@@ -431,6 +480,48 @@ a milestone needs a figure it says "re-measure at implementation time" and the
 MR description carries the value. Arguments must survive the count changing —
 Decision 5's is a good example, since it holds for any non-empty drift list.
 
+**11. No `.gitlab-ci.yml` line number appears in this PRD, and a commit SHA is
+not a provenance citation on its own.**
+
+*Added 2026-08-02 during M1.* Decision 10 banned counts for a reason that turns
+out to apply verbatim to line anchors here: **M1 edits `.gitlab-ci.yml`, so every
+line number this PRD cited into it moved**, and later milestones each edit it
+again. Cite the **job name** (`test:api`, `validate:web`) or the **string**.
+
+The `-race` citation is the worked example, and it was wrong three times in three
+different ways before anyone ran the query. This PRD said, at three sites,
+*"landed 2026-07-25 in `224b5349` for PRD #108 M4"*:
+
+- **`224b5349` is a merge on the PRD #98 wave-3 branch**, not the introduction.
+- **The date is wrong for `main`**, which got the line on **2026-07-26** via
+  `77cb96e4`, a commit this PRD never named. "Landed" reads as "landed on main".
+- **The command is two PRDs' work.** `-count=1` is PRD #98's; `-race` is
+  PRD #108 M4's, introduced alone as `go test -race ./...` in `8f1b0c9b`.
+  `.gitlab-ci.yml`'s own comment had this right all along.
+
+**The reproducing command, not the identifier, is the citation:**
+
+```
+git log -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
+```
+
+Three teeth, each of which cost someone a wrong answer: **plain `git log -S`
+returns NOTHING here**, because the line was produced by a conflict resolution
+inside a merge and git omits merge diffs by default — a fail-open instrument whose
+silence reads as refutation; **`-s` is required**, since `--diff-merges` turns
+patch output on and a two-line chain otherwise arrives as ~170 lines of diff; and
+**keep the path filter**, since unfiltered the query also matches PRD documents
+that merely quote the string. Measured at `1778f359`, the three forms return **0,
+2 and 1** hits for the same string — and that disagreement *is* the finding.
+
+One more, measured rather than predicted: **`-S` counts occurrences, so M1's move
+of the command out of `.gitlab-ci.yml` is not a hit at all.** The explanatory
+comment left behind still quotes the string, so the count went 1 → 1. The chain
+head remains `77cb96e4`. Predicting "the newest hit will be the move" is the
+natural inference and it is wrong; read the chain, not the head. The corrected
+three-form control is now recorded in `.claude/agent-team.md`'s citation section,
+which previously prescribed only the fail-open form.
+
 **Phase 1 — enabling work (blocks everything else)**
 
 - [ ] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
@@ -501,7 +592,8 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       with `fixture broken: cases.json has no case …`, then restore it and
       confirm green. Nothing weaker discriminates a live gate from a cached one
       — a run printing no cache markers, or exiting 0, is satisfied by a gate
-      that executed nothing. Set `output: group` at the root and record the
+      that executed nothing. Set an output mode at the root (**M1 chose
+      `prefixed`, not `group` — see Decision 2**) and record the
       serialise-vs-concurrent decision (Decision 2).
 
       **`task` is not in the CI images.** `golang:1.26`, `node:22-alpine`
@@ -698,16 +790,25 @@ Decision 5's is a good example, since it holds for any non-empty drift list.
       in this milestone** (Decision 6).
 
       **`-race` is scoped to `test:controller` only. `test:api` already has
-      it**, and this milestone previously claimed otherwise. `.gitlab-ci.yml:178`
-      is `go test -race -count=1 ./...`, landed 2026-07-25 in `224b5349` for
-      PRD #108 M4; `test:api-store-it` has it at `:224`. The remaining module is
-      `controller` (`.gitlab-ci.yml:299`).
+      it**, and this milestone previously claimed otherwise. `task test:api` is
+      `go test -race -count=1 ./...`; `test:api-store-it` has it in its
+      `-run 'LiveDB$'` sweep. The remaining module is `controller`
+      (`task test:controller`, `go test -count=1 ./...`).
+
+      *(Provenance corrected 2026-08-02 during M1: this said "landed 2026-07-25
+      in `224b5349` for PRD #108 M4". `224b5349` is a merge on the PRD #98
+      wave-3 branch; `main` got the line on 2026-07-26 via `77cb96e4`; and the
+      two flags come from two PRDs. Reproduce with
+      `git log -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml`
+      — the plain `-S` form returns nothing, because the line was produced inside
+      a merge. See Decision 11.)*
 
       Consequently this is **no longer "the riskiest single change in the PRD"**
       — that framing was sized for the api suite. It still ships on its own,
       before the coverage work, and the cautions still apply to `controller`:
-      `-race` costs runtime (cite `.gitlab-ci.yml:157-178`, which already
-      records the api measurement, rather than re-deriving the general figure),
+      `-race` costs runtime (cite the comment block above `test:api`, which
+      already records the api measurement, rather than re-deriving the general
+      figure),
       and it detects latent races, so `main` can go red on code nobody touched.
       There is no ratchet — you cannot gate `-race` on new findings. If the
       first run is red, stop: file the races as their own issue and land `-race`

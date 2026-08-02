@@ -33,11 +33,13 @@ Default flow for a typical task:
    dependency graph when writing, and judges feasibility, hidden milestone
    coupling, and independent shippability when reviewing. Open design questions
    it flags go to the user, not to the coder as guesses.
-1. Spawn coder with the full task context. The coder runs the project's
-   test/lint gates before reporting done: `cd api && go test -count=1 ./...`;
-   `cd web && npm test && npm run typecheck`;
-   `cd agent && npm test && npm run typecheck` (plus `./e2e/run-e2e.sh` +
-   `./scripts/smoke.sh` for stack-level changes).
+1. Spawn coder with the full task context. The coder runs the project's gate
+   before reporting done: `task gate:api` / `gate:controller` / `gate:web` /
+   `gate:agent` for the components it touched, or `task gate` for all four (plus
+   `./e2e/run-e2e.sh` + `./scripts/smoke.sh` for stack-level changes, neither of
+   which is a target). Recipes live in root `Taskfile.yml`; never restate one
+   here, because a stale pasted command still runs and reports green while a
+   stale target name dies loudly.
 2. After coder reports done, spawn reviewer + auditor IN PARALLEL with
    coder's diff + report (pin to commit SHAs). Dispatch fact-checker in the
    same wave when the change touches claim-bearing artifacts (README,
@@ -1075,6 +1077,35 @@ Three things make it work, all learned the hard way in that batch:
   words, which discredits the true half along with the false one. Before writing "commit X
   did Y", run `git log -S '<the exact string>' -- <path>` and let it name X.
 
+  **But that plain form is FAIL-OPEN on a merge-introduced line, which makes it the
+  wrong instrument inside the rule that teaches distrust of fail-open instruments.**
+  Git omits merge diffs by default, so a line produced by a conflict resolution
+  returns **nothing** — and nothing reads as "refuted". Three commands, not one:
+
+  ```
+  git log -s -S '<string>' -- <path>                                  # non-merge introductions
+  git log -s --diff-merges=first-parent -S '<string>' -- <path>       # + merge resolutions
+  git log -s --first-parent --diff-merges=first-parent -S '<string>' -- <path>   # when did MAIN get it
+  ```
+
+  **An empty plain `-S` is not a refutation until the merge-aware forms have run,
+  and disagreement between the three IS the finding.** Worked example, measured on
+  this repo at `1778f359` with `'race -count=1 ./...'` over `.gitlab-ci.yml`: **0
+  hits, 2 hits, 1 hit** for the same string. The 2 are `224b5349` (a branch merge)
+  and `77cb96e4` (when `main` got it, a day later); the plain form names neither.
+
+  Three further teeth, each of which cost someone a wrong answer here:
+
+  - **`-s` is required.** `--diff-merges` turns patch output ON for merges, so
+    without it a two-line chain arrives as ~170 lines of merge diff.
+  - **Keep the path filter.** Unfiltered, that same query also matches PRD documents
+    that merely *quote* the string, and a noisy citation is one nobody follows.
+  - **`-S` counts occurrences, so a MOVE that leaves the string behind is invisible.**
+    `1778f359` moved that command out of `.gitlab-ci.yml` into `Taskfile.yml` and is
+    **not** a hit, because the explanatory comment left behind still quotes it: the
+    count went 1 → 1. Predicting "the newest hit will be the move" is the natural
+    inference and it was wrong. Read the chain, not the head.
+
 Corollary for the lead: when you dispatch a fix that names N sites, **verify all N landed**.
 The one that got missed in that batch was missed because the lead checked the site it had
 argued about and not the four it had listed in the same message.
@@ -1093,8 +1124,11 @@ warrants it. This is not tidiness: a stale pasted *command* still runs, still pr
 `ok`, and gets reported green, while a stale *target* dies with
 `task: Task "gate:api" does not exist` and a nonzero exit. **`task` exits 201 on any
 failure, never the underlying command's code** — test for non-zero, never for a
-number. Output is grouped per task and the components run serially, so a failing
-component's block is contiguous and the named failing test is readable.
+number. Output is `prefixed` per task and the components run serially, so a failing
+component's lines are labelled `[test:api]` and the named failing test is readable
+**while the run is still going** — `output: group` was measured and rejected because
+it buffers, which under CI's `interruptible: true` means a cancelled job loses every
+line it had produced.
 
 ```
 format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it

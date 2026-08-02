@@ -104,5 +104,10 @@ In linked worktrees a bare `go build` can fail on VCS stamping. You cannot appen
 to a task target, so export `GOFLAGS=-buildvcs=false` in your shell instead; never commit
 either form. In parallel mode, the shared files to stop-and-report on here
 (rather than edit) are `api/go.mod`/`go.sum`, sqlc-generated code, `docker-compose.yml`,
-`.env.example`, and now `Taskfile.yml` and `.gitlab-ci.yml` (every PRD #103 milestone
-appends to both) — the lead does one consolidated edit after the parallel units land.
+`.env.example`, `Taskfile.yml` and `.gitlab-ci.yml` (every PRD #103 milestone appends to
+both), and **`web/package.json` / `agent/package.json`** — the lead does one consolidated
+edit after the parallel units land. The two `package.json` files are a three-way and a
+two-way contention in PRD #103 alone (M3 ESLint devDeps, M4 knip, M6 `@vitest/coverage-v8`),
+npm's `devDependencies` ordering makes a conflict likely rather than possible, and a
+teammate may have symlinked `node_modules` from a sibling worktree on the strength of the
+lockfiles being identical, which your edit breaks. Report before touching either.

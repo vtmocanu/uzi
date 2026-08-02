@@ -10,17 +10,44 @@
 # SELF-CONTAINED ON PURPOSE. No `includes:`, no remote taskfiles, no shared task
 # library: the gate must be readable here without resolving anything.
 #
-# 🔴 NO `sources:`, `generates:` OR `status:` ON ANY TARGET IN THIS FILE. A
-# fingerprinted target prints `Task "x" is up to date`, exits 0 and executes
-# nothing - output indistinguishable from a passing run. That is the exact
-# silent-green failure `CLAUDE.md` mandates `-count=1` against at both Go gates,
-# and `checksum` has the SAME cross-module blind spot as Go's test cache: this
-# repo's gates deliberately read `fixtures/judge-fidelity/{cases,expected}.json`
-# at the repo root and `api/internal/hostedsvc/testdata/` from outside the module
-# under test, so a `sources:` glob over one module cannot see them change.
-# `.task/` is gitignored (`.gitignore:42`), so CI would always run cold while a
-# contributor's `task gate` silently skipped. If some future target must carry
-# `sources:` for an unrelated reason, it also carries `method: none`.
+# 🔴 FOUR TASKFILE FEATURES ARE BANNED IN THIS FILE. One list, so the next reader
+# sees all of them at once. Each is one line to avoid and expensive to retrofit.
+#
+# 1. NO `sources:`, `generates:` OR `status:` ON ANY TARGET. A fingerprinted
+#    target prints `Task "x" is up to date`, exits 0 and executes nothing -
+#    output indistinguishable from a passing run. That is the exact silent-green
+#    failure `CLAUDE.md` mandates `-count=1` against at both Go gates, and
+#    `checksum` has the SAME cross-module blind spot as Go's test cache: this
+#    repo's gates deliberately read `fixtures/judge-fidelity/{cases,expected}.json`
+#    at the repo root and `api/internal/hostedsvc/testdata/` from outside the
+#    module under test, so a `sources:` glob over one module cannot see them
+#    change. `.task/` is gitignored (`.gitignore:42`), so CI would always run cold
+#    while a contributor's `task gate` silently skipped. If some future target
+#    must carry `sources:` for an unrelated reason, it also carries `method: none`.
+#
+# 2. NO `dotenv:`. Task loads the named env files into EVERY target's
+#    environment. `.env` is gitignored (`.gitignore:2`) and root `CLAUDE.md`
+#    spends a section on compose ranking shell environment above `--env-file`, so
+#    a `dotenv: ['.env']` here would silently inject a developer's real secrets
+#    into every gate target - including whatever a future milestone adds.
+#
+# 3. NO `includes:` AT ALL, and the sharp edge is the remote form specifically.
+#    Task 3.x can include a taskfile over https, which is unpinned remote code
+#    executing inside the gate. `.gitignore:41` already carries a "Task
+#    remote-include cache" comment, so the mechanism is one line from being
+#    invited back. The self-contained rule above is the style reason; this is the
+#    security one.
+#
+# 4. NO DYNAMIC ROOT `vars:` (`vars: {X: {sh: ...}}`). Those execute on every
+#    invocation, including unrelated targets and a bare `task --list`. Not a hole,
+#    but it puts a shell command on the path of everything.
+#
+# 🔴 AND NEVER SPLICE A VARIABLE UNQUOTED INTO A `cmds:` LINE. Task templates are
+# Go `text/template` and the result reaches `sh -c` unquoted, so a
+# `{{.CI_COMMIT_BRANCH}}` or `{{.CLI_ARGS}}` inside a command is injectable by
+# anyone who can push a branch (branch names may contain `;`, `$`, backticks). M1
+# needs neither. Stated here because M6's coverage measurement is where the
+# temptation first appears.
 #
 # SERIAL, NOT CONCURRENT - a recorded decision, not an oversight. `gate` and each
 # `gate:*` call their components through `cmds:` (sequential) rather than `deps:`
@@ -30,11 +57,23 @@
 # two Go modules and `node --test` alongside vitest makes that strictly worse. The
 # gate's job is a trustworthy verdict, not a fast one.
 #
-# `output: group` is set below anyway, and is required rather than cosmetic: Task
-# interleaves concurrent output line-by-line by default, and both `CLAUDE.md` and
-# `.claude/agent-team.md` require reading NAMED failing tests rather than a tally,
-# which interleaved output makes impossible. It also keeps each `go test` package
-# block contiguous.
+# `output: prefixed`, NOT `output: group`, and the two are not interchangeable.
+# Serial execution (above) already removes the interleaving `group` exists to fix,
+# so `group` would buy nothing and cost streaming. Measured on task 3.51.1, log
+# read at t=1.5s into a target that prints EARLY, sleeps 3s, prints LATE:
+#
+#   group        task: [a] sh -c '...'                  <- EARLY ABSENT, buffered
+#   prefixed     task: [a] sh -c '...'   [a] EARLY      <- streams
+#   interleaved  task: [a] sh -c '...'   EARLY          <- streams
+#
+# Two costs `group` would have imposed. Locally, `task gate:api` would print
+# NOTHING for the whole `go test -race` run - 41s wall per `.gitlab-ci.yml`'s own
+# measurement - then dump, which is a regression against today's streaming
+# `go test`. In CI it is worse: every gate job sets `interruptible: true`, so a
+# cancelled or timed-out job under `group` loses ALL buffered diagnostic output. A
+# gate that discards its evidence on timeout is the failure class this PRD exists
+# to remove. `prefixed` keeps the per-task disambiguation that both `CLAUDE.md`
+# and `.claude/agent-team.md` need for reading NAMED failing tests, and streams.
 #
 # `task`'s OWN EXIT CODE IS 201, NOT THE UNDERLYING COMMAND'S. Measured on task
 # 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": ...
@@ -46,6 +85,18 @@
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
 # file must never trigger one as a side effect of running a test.
+#
+# THE npm TARGETS DELEGATE TO THE EXISTING SCRIPT AND MUST KEEP DOING SO. A target
+# written `npm test` inherits whatever flags `package.json` already encodes; a
+# target that reimplements the command drops them SILENTLY. The live instance is
+# `test:agent`: `agent/package.json`'s test script carries `--test-timeout=30000`
+# and node's own default is NO timeout, so a spelled-out `node --import tsx --test`
+# hangs where the gate fails. This is the same "a future simplify-the-gate edit"
+# hazard as `-race`/`-count=1`, arriving through `package.json` instead of
+# `.gitlab-ci.yml`. Before wrapping any npm script, read it for flags first; if you
+# must spell out the underlying command, re-add every flag the script carried and
+# say in the comment that you are re-adding it because the target bypassed the
+# script, not that the script never had it.
 #
 # NOT SILENT, DELIBERATELY. Task echoes each command before running it, so the
 # gate's own output shows `-race`, `-count=1` and `--test-timeout=30000` actually
@@ -59,7 +110,7 @@
 
 version: '3'
 
-output: group
+output: prefixed
 
 tasks:
   # ---------------------------------------------------------------- composed --
@@ -139,6 +190,32 @@ tasks:
       # -race (PRD #108 M4): workersvc holds a mutex-guarded map written by every
       # /messages handler goroutine and read by the sweeper. Measured by deleting
       # the lock: 3/3 red under -race, only 2/3 without it.
+      #
+      # PROVENANCE, CITED BY STRING because every SHA and date offered for this
+      # line has been wrong once. Reproduce it with:
+      #
+      #   git log -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
+      #
+      # Three things about that command, each of which someone got wrong:
+      #   - `-s` is REQUIRED. `--diff-merges` turns patch output ON for merges, so
+      #     without it a two-line chain arrives as ~170 lines of merge diff.
+      #   - PLAIN `git log -S` RETURNS NOTHING here. The combined line was produced
+      #     by a conflict resolution inside a merge and git omits merge diffs by
+      #     default, so the obvious form is fail-open and reads as "refuted".
+      #   - Keep the path filter. Unfiltered, the same query also matches PRD
+      #     documents that merely quote the string.
+      #
+      # The chain is 224b5349 (2026-07-25, on the PRD #98 wave-3 branch, where
+      # PRD #98's -count=1 and PRD #108 M4's -race were resolved onto one command)
+      # then 77cb96e4 (2026-07-26, which is when MAIN got it). -race itself
+      # predates both, as `go test -race ./...` in 8f1b0c9b.
+      #
+      # MEASURED at 1778f359: M1 moving this command out of .gitlab-ci.yml is NOT a
+      # hit. The comment left behind there still quotes the string, so its
+      # occurrence count went 1 -> 1 and `-S` sees no change. The chain head is
+      # therefore still 77cb96e4, not the move. Fragile in one direction: reword
+      # that CI comment so the string disappears and this commit becomes the newest
+      # hit. Read the chain, not the head, either way.
       #
       # Live-DB (*LiveDB) tests are NOT covered here - they self-skip without
       # UZI_TEST_DATABASE_URL, and go RED if you export it for this run (the
