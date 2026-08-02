@@ -225,6 +225,11 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     SteeringChannel.prototype.start = function (
       this: SteeringChannel,
     ): void {
+      // Capturing `this` IS the fixture: the test patches the prototype precisely to
+      // get hold of the instance the runner constructs. An arrow function cannot do
+      // it, since it would not receive a `this` to capture (PRD #103 M3, oxlint
+      // typescript/no-this-alias).
+      // eslint-disable-next-line typescript/no-this-alias
       captured = this;
       return origStart.call(this);
     };

@@ -20,6 +20,12 @@ export const SKILL_MAX_BYTES = 65536;
 // Control chars (incl. newlines) would break out of the single synthesized
 // frontmatter line, the same guard the server's hasControlChar enforces. Built
 // from a string of \u escapes so this source file stays ASCII-only.
+//
+// Matching control characters is the ENTIRE PURPOSE of this regex, so the rule's
+// advice ("use a Unicode escape instead") is already taken and the finding cannot
+// be fixed, only stated. Suppressed rather than silenced globally: the rule has
+// real signal on a regex that matches a control char by ACCIDENT.
+// eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_RE = new RegExp("[\\u0000-\\u001f\\u007f]");
 
 // byteLength counts UTF-8 bytes, matching the server's len(body) check (Go
