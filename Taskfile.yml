@@ -194,11 +194,15 @@ tasks:
       # PROVENANCE, CITED BY STRING because every SHA and date offered for this
       # line has been wrong once. Reproduce it with:
       #
-      #   git log -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
+      #   git log --oneline -s --diff-merges=first-parent -S 'race -count=1 ./...' -- .gitlab-ci.yml
       #
       # Three things about that command, each of which someone got wrong:
-      #   - `-s` is REQUIRED. `--diff-merges` turns patch output ON for merges, so
-      #     without it a two-line chain arrives as ~170 lines of merge diff.
+      #   - `--oneline -s` is REQUIRED, BOTH of them. `--diff-merges` turns patch
+      #     output ON for merges, and without `--oneline` each hit still carries a
+      #     full header. Measured at dc062ce5: the chain is TWO commits, and the
+      #     three flag sets print two lines, tens of lines and well over a hundred.
+      #     No number is recorded because it grows with history (Decision 10);
+      #     the shape is that only `--oneline -s` gives you one line per commit.
       #   - PLAIN `git log -S` RETURNS NOTHING here. The combined line was produced
       #     by a conflict resolution inside a merge and git omits merge diffs by
       #     default, so the obvious form is fail-open and reads as "refuted".

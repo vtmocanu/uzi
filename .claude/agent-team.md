@@ -1083,9 +1083,9 @@ Three things make it work, all learned the hard way in that batch:
   returns **nothing** — and nothing reads as "refuted". Three commands, not one:
 
   ```
-  git log -s -S '<string>' -- <path>                                  # non-merge introductions
-  git log -s --diff-merges=first-parent -S '<string>' -- <path>       # + merge resolutions
-  git log -s --first-parent --diff-merges=first-parent -S '<string>' -- <path>   # when did MAIN get it
+  git log --oneline -s -S '<string>' -- <path>                             # non-merge introductions
+  git log --oneline -s --diff-merges=first-parent -S '<string>' -- <path>  # + merge resolutions
+  git log --oneline -s --first-parent --diff-merges=first-parent -S '<string>' -- <path>   # when did MAIN get it
   ```
 
   **An empty plain `-S` is not a refutation until the merge-aware forms have run,
@@ -1096,8 +1096,12 @@ Three things make it work, all learned the hard way in that batch:
 
   Three further teeth, each of which cost someone a wrong answer here:
 
-  - **`-s` is required.** `--diff-merges` turns patch output ON for merges, so
-    without it a two-line chain arrives as ~170 lines of merge diff.
+  - **`--oneline` and `-s` are both required.** `--diff-merges` turns patch output
+    ON for merges, and without `--oneline` every hit still carries a full commit
+    header. The shape, measured rather than tallied (Decision 10 applies — the
+    numbers grow with history): `--oneline -s` gives **one line per commit**, `-s`
+    alone gives tens, and neither flag gives hundreds. A citation nobody can read
+    at a glance is one nobody runs twice.
   - **Keep the path filter.** Unfiltered, that same query also matches PRD documents
     that merely *quote* the string, and a noisy citation is one nobody follows.
   - **`-S` counts occurrences, so a MOVE that leaves the string behind is invisible.**
@@ -1150,9 +1154,9 @@ test           task test:api
                task test:agent
                task check-docs:web
 dead code      none (gap, noted 2026-07-26)
-coverage       none (gap)
+coverage       none (gap, noted 2026-08-02)
 security scan  none (gap, noted 2026-07-21)
-pre-commit     none (gap)
+pre-commit     none (gap, noted 2026-08-02)
 long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
 
@@ -1229,8 +1233,8 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
   web and agent** (four toolchains, not three: `controller/` is its own Go module
   with its own jobs) + `helm lint`/`template` + kaniko image validation builds on
   every MR and `main`; `v*` tags additionally publish the images + OCI chart to
-  Harbor. Since PRD #103 M1 each gate job invokes the same `task` target you run
-  locally. **The compose e2e harness (`./e2e/run-e2e.sh`) is deliberately NOT in
+  Harbor. Since PRD #103 M1 each **per-toolchain** gate job invokes the same `task`
+  target you run locally (`test:api-store-it` invokes none, by design). **The compose e2e harness (`./e2e/run-e2e.sh`) is deliberately NOT in
   CI** (it needs docker compose on the runner), so it stays a purely local
   pre-merge gate. **`./scripts/smoke.sh` is a different case and the old wording
   here collapsed them:** `e2e:kind-smoke` stands up a KinD cluster, installs the

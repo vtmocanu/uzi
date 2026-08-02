@@ -16,6 +16,23 @@ recipe.** No command line for a check is written anywhere else: `CLAUDE.md`, the
 agent-team docs and the CI jobs all name targets from it. `task --list`
 enumerates them.
 
+Install the runner first:
+
+```sh
+go install github.com/go-task/task/v3/cmd/task@v3.51.1
+```
+
+Pinned to the same version CI installs, verified through Go's checksum database,
+and it needs only the Go toolchain this repo already requires. `brew install
+go-task` also works but is unpinned and will drift from CI. Deliberately **not**
+in `devbox.json`: that file is tier-2 worker configuration whose `packages` array
+gets provisioned into opted-in agent runs, not a contributor environment.
+
+`go install` builds from source, so your binary is **not** byte-identical to the
+release tarball CI fetches and sha256-verifies. Matching `task --version` is the
+equivalence check, not a matching hash. This is the same trust model the repo
+already uses for `sqlc@v1.30.0`.
+
 ```sh
 task gate              # everything, serially
 task gate:api          # one component: vet + build + test

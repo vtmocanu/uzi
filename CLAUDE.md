@@ -8,14 +8,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-**The gate lives in `Taskfile.yml` at the repo root and that is the only place a gate recipe is written** (PRD #103 M1). `task --list` enumerates it; `task gate` runs everything; `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component. `.gitlab-ci.yml`'s gate jobs invoke the same targets, so local and CI cannot drift apart. Every load-bearing flag now lives in that file with its reason beside it — Task echoes each command before running it, so `-race`, `-count=1` and `--test-timeout=30000` are still visible in the output, and that echo is how you notice one going missing.
+**Getting `task`, because every command on this page now needs it:**
+
+```sh
+go install github.com/go-task/task/v3/cmd/task@v3.51.1   # pinned, sumdb-verified
+```
+
+Pinned and version-matched to what CI installs, mirroring the `sqlc@v1.30.0` precedent already in this file, and it needs only the Go toolchain this repo already requires. `brew install go-task` works too but is unpinned and drifts from CI. **It does NOT go in `devbox.json`** — that file is tier-2 *worker* configuration whose `packages` array is provisioned into opted-in runs (`agent/src/repo-tools.ts`), not a contributor environment.
+
+Note `go install` builds **from source**, so the resulting binary is **not** byte-identical to the release tarball CI's `.task_setup` fetches and sha256-verifies. That is expected, not a discrepancy to chase: `task --version` agreeing is the equivalence check here, the same trust model `sqlc` already runs under.
+
+**The gate lives in `Taskfile.yml` at the repo root and that is the only place a gate recipe is written** (PRD #103 M1). `task --list` enumerates it; `task gate` runs everything; `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component. `.gitlab-ci.yml`'s **per-toolchain** gate jobs invoke the same targets, so local and CI cannot drift apart (`test:api-store-it` invokes none, by design: its ran/skipped assertion is CI-specific). Every load-bearing flag now lives in that file with its reason beside it — Task echoes each command before running it, so `-race`, `-count=1` and `--test-timeout=30000` are still visible in the output, and that echo is how you notice one going missing.
 
 Two consequences worth knowing before you read a result:
 
 - **`task`'s own exit code is 201, not the underlying command's** (measured on 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": … exit status 7` with rc=201). `!= 0` is still a correct failure test; anything comparing `$?` to a specific number is not.
 - **The component gates run SERIALLY, deliberately.** CPU contention is a measured flake source here (`web/vite.config.ts` raised `testTimeout` to 20000 for it), and interleaved output would defeat the read-the-named-failing-test rule this file states in four places.
 
-**`task gate:api` is now STRICTER than the hand-typed recipe that used to sit here: it carries `-race`, which the old `go test -count=1 ./...` line did not and CI always did.** That is convergence, not a new check — the flag has been on `test:api` in CI since `224b5349`. It is called out because a local gate silently weaker than CI is what M1 exists to end, and because the cost is small enough to be invisible (41s wall against 40s on the whole api module).
+**`task gate:api` is now STRICTER than the hand-typed recipe that used to sit here: it carries `-race`, which the old `go test -count=1 ./...` line did not and CI always did.** That is convergence in CI's direction, but be clear about which half changed: **CI gains nothing, and your local gate gains a check.** It runs longer (measured 43-66s wall for `task gate:api`) and it can newly redden on a real data race nobody has seen fail. Keeping the flag off the shared target was the alternative, and it would have silently weakened the CI job the moment that job called the target.
+
+The provenance is deliberately not a bare SHA — `-race` and `-count=1` reached that command from two different PRDs by way of a merge, and the Taskfile's `test:api` comment records the chain plus the query that reproduces it. Read it there rather than citing a commit from memory.
 
 Not everything below is a target. A single-test invocation, `sqlc generate`, the compose stack and the e2e harness are not gate recipes and stay written out as commands; where that is the case the line says so.
 
@@ -163,7 +175,7 @@ cd web && npm run build                    # check-docs + tsc --noEmit + vite bu
 cd web && VITE_UZI_MOCK=1 npm run dev      # mock mode — no backend, no network at all
 ```
 
-**`npm run build` is deliberately NOT part of `task gate:web`, and the delta is exactly `vite build`.** CI's `validate:web` runs check-docs + typecheck directly to skip the bundle, so a `build:web` target would be a check CI does not run — and the bundle is not unchecked: the `build:web` kaniko job builds the web image, whose Dockerfile runs `npm run build`. Run it by hand when you have touched anything the bundler resolves.
+**`npm run build` is deliberately NOT part of `task gate:web`, and the delta is exactly `vite build`.** CI's `validate:web` runs check-docs + typecheck directly to skip the bundle, so **there is no `build:web` Taskfile target** — it would be a check CI does not run. The bundle is still not unchecked: the CI job **named** `build:web` (a kaniko image build, not a task target — the two names collide and only one of them exists in `Taskfile.yml`, which is neither) builds the web image, whose Dockerfile runs `npm run build`. Run it by hand when you have touched anything the bundler resolves.
 
 **Mock mode is a first-class dev workflow, not only the safety mitigation it appears as below.** `VITE_UZI_MOCK=1` is read once at build time (`web/src/lib/api.ts`) to swap `src/mocks/mockApi.ts` + `MockRunSocket` in for the real `api`/socket, so a mock bundle contains **no code path to a live backend** — not a disabled one. There is no dedicated npm script; set the var on `dev` or `build`. Demo scenarios then select via `?mock=<name>` or the sticky `uzi_mock_scenario` localStorage key (`mockScenario()`); it is a single string, so scenarios are mutually exclusive by construction. `web/Dockerfile.mock` builds the backend-free static image (context is the repo root), with `web/nginx.mock.conf` 404ing any stray `/api/` call as a tripwire. Known scenario names and what each unlocks are in [docs/dev-conventions.md](docs/dev-conventions.md#the-mockdemo-build), which also documents the E2E bot env vars (`UZI_E2E_BOT_PAT` / `_USERNAME`, `UZI_E2E_PROJECT`) that no test reads yet.
 
