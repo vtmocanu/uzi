@@ -154,6 +154,115 @@ pastes that block into every validator dispatch.
 - Commit locally on `fix/197-lead-design-critique-wave`. Never touch `main`, never push.
 - Prose edits here are claims about code. Re-derive at the moment you assert.
 
+## Round 4 (2026-08-02, at `dcf9d0f9`) — small, then SHIP
+
+**0 Blocking.** One prompt clause, the rest comment and spec prose. The shipped
+template is correct at this SHA; what follows is about not *claiming* more than the
+guard delivers.
+
+**The ruling that shapes it.** The tester and auditor folded the same mutation and
+reported opposite verdicts. Both results were right; only one **referent** was. For the
+six **descriptive** pins the pinned behaviour is *the template states rule R*, so a
+relocated sentence still states it — green is correct, and relocation genuinely cannot
+produce a disconfirming answer there. For the one **transmission** pin (the relay) the
+behaviour is *the lead relays the no-write rule **when it dispatches the plan-critique
+wave***, which is constituted by **where the sentence sits**. Relocation does not misplace
+that behaviour, it destroys one and creates another. Position is not packaging; for a
+positional behaviour, position is the content — and a substring is position-independent by
+definition, so no anchor can ever express it.
+
+Underneath: a mutation fold is a test **of the pin set**, not of the template. Read
+correctly the result is not *"the pins stayed green"* but *"a template missing the
+behaviour passes the suite"*.
+
+**R4-1 — NAME THE RECIPIENTS IN THE PHRASE. This supersedes the `during the plan turn`
+rebind, which was the weaker of the two fixes.**
+
+The reason position matters for this pin is a single pronoun: the clause says `tell **each
+of them** …`, and `each of them` takes its referent from the preceding sentence. Relocated
+into the diff bullet it silently re-resolves to the post-implementation validators, and the
+plan-turn dispatch is told nothing.
+
+So replace the pronoun with its antecedent — something of the shape *"tell each validator
+you send over the plan that it must not change anything in the worktree"* — and update the
+pin phrase and anchor to match. That names the recipient set **inside the phrase**, so the
+transmission stops depending on position and the pin becomes genuinely anchorable. This
+**dissolves** the residual for this pin rather than mitigating it.
+
+The general rule, worth keeping: **a transmission pin is anchorable exactly when its
+recipients are named in the phrase.** And the reviewer's one-glance tell: **a pin is
+relocation-proof iff its behaviour is fully determined by its own content; look for a
+context-bound referent inside the phrase.** P5 had one; pins 1, 2, 3, 4, 6 and 8 have none,
+which predicts exactly the six/one split.
+
+**This wording is UNFOLDED — a proposal, not a verified fix.** Run a relocation fold against
+it before believing it: move the rewritten clause into the diff bullet and require the relay
+pin to red. If it does not, say so rather than shipping it.
+
+Rebinding to `during the plan turn` is still worth taking **alongside** it (it is the right
+axis — it anchors the *act of telling* rather than the *content of the constraint*), but on
+its own it only downgrades silently-vacuous to visibly-wrong. Do not describe it as a fix
+for relocation.
+
+**R4-2 — unsay two things in the test comment.**
+(a) *"an anchored pin staying green under relocation is correct rather than blind"* — true
+of the descriptive pins, false of the transmission pin. Qualify it and name the exception.
+Stated unqualified it tells the next reader not to run the only fold class that finds this,
+which is a self-sealing claim: it guarantees its own green by instruction.
+(b) Any implication that property 1 enforces turn-naming. It enforces **substring-presence
+of a declared token** — measured: `anchor: ""` passes (`Contains(x, "")` is always true) and
+`anchor: "the wave"` passes, and round 3's exact blocking finding was reconstructed with the
+audit fully green.
+
+**R4-3 — say the residual as ONE root with two consequences**, beside the insertion limit
+and in the same register. **Root:** property 1 is a *syntactic containment* check, and
+neither semantic property it would need is expressible as a substring relation.
+
+- **(a) quality gap** — it cannot check the anchor **names a turn**. `anchor: ""` passes
+  (`Contains(x, "")` is always true) and `anchor: "the wave"` passes. Applies to all pins; a
+  better-chosen anchor fixes any instance.
+- **(b) expressiveness gap** — it cannot check the behaviour is **anchorable at all**. For a
+  pin whose phrase carries a context-bound referent, *no* anchor fixes it. Unfixable within
+  the anchor model; **R4-1 removes the referent instead**, which is why it dissolves the case
+  rather than mitigating it.
+
+Use the auditor's F6' as the citation for (b), not the tester's reconstruction: F6' needed
+only a relocation against the **shipped pin with a genuine anchor**, where the reconstruction
+stacked three things (reverted phrase + degenerate anchor + relocation). Cleaner
+demonstration, stronger conclusion.
+
+The qualifier for the comment, in the tester's own words: *relocation is non-discriminating
+for pins whose behaviour is fully determined by their own content (1, 2, 3, 4, 6, 8) and
+remains discriminating for any pin with a context-bound referent. Reversion is the fold for
+the former; relocation is still required for the latter.*
+
+**Do NOT add a turn-token allowlist.** It would reject `"the wave"` and pass
+`"before the plan is approved"` while the relay pin stays exactly as blind — making the
+audit *look* stronger with the load-bearing hole untouched. Net loss for the reader, and it
+goes stale like the negative assertion already refused.
+
+**R4-4 — `specs/ai.md` §467 prose.**
+(a) State the **new** ceiling. The bullet retires "one clause bounds it" as an over-claim
+and says the clause was widened, but the only figure left (~6) belongs to the *rejected*
+phrasing; the shipped wording takes it to ~1.
+(b) Scope the `docs/agent-templates.md:58-61` citation to its SHA — correct as history, but
+a reader at HEAD lands on the new bullet saying the opposite. Three words.
+(c) One line worth keeping beyond this issue: **when two agents fold the same mutation and
+disagree, settle what each takes "the behaviour" to be before deciding which result is
+right.**
+
+**The one thing that WOULD block, and it is not the hole — it is a claim about the hole.**
+If the comment asserts property 1 is machine-checked and relocation non-discriminating,
+a known limit becomes a believed-closed property, the residual goes invisible, and #205
+loses the evidence that motivates it. Ship with the residual stated; never with it claimed
+closed.
+
+**Merge note (not a code change): the repo's highest `specs/ai.md` section is now 471**, not
+467. `feature/prd-103-m3-m6` added 468-471 and deliberately skipped 467 — verified, and ours
+is the only ref carrying `## 467.`, so there is no collision and the merged sequence is
+contiguous 466 → 471. Anyone sweeping from here takes **472**, and must not "renumber 467 to
+the tail" on the strength of a fresh sweep.
+
 ## Round 3 findings (2026-08-02, at `bade5648`) — fix these, then re-gate
 
 Full detail in the round-3 reports. **1 Blocking, 7 Should-fix.** Every claim below
