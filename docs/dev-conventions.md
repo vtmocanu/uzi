@@ -82,10 +82,12 @@ cold, then under 2s warm**. It is pinned and sumdb-verified and writes nothing t
 either `go.mod`, so it changes no dependency of yours — but the first run is slow
 and that is expected, not a hang.
 
-**🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3, YOU
-MUST INSTALL IN BOTH npm PACKAGES.** oxlint is a new devDependency, and the lint
-step fails closed with `oxlint: command not found` until it is present — in a
-package you may not have touched. Run it in **both** `web/` and `agent/`:
+**🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3 OR
+M4, YOU MUST INSTALL IN BOTH npm PACKAGES.** M3 added oxlint and M4 added knip,
+both as devDependencies in both packages, and the lint and dead-code steps fail
+closed with `oxlint: command not found` / `knip: command not found` until they are
+present — in a package you may not have touched. Run it in **both** `web/` and
+`agent/`:
 
 ```sh
 npm install --ignore-scripts
@@ -146,11 +148,47 @@ If a Go lint target exits with `origin/main is unresolvable`, run
 does not skip the ratchet — it reports the entire backlog behind a single warning
 line, which reads as a large new regression.
 
-There is still no dead-code check and no coverage signal. Those are PRD #103's M4
-and M6, and a target for each arrives with the check itself rather than as an
-empty stub. `unused` above partially covers dead code — unused unexported symbols
-within a Go package — but not cross-package reachability and nothing on the
-TypeScript side.
+There **is** a dead-code check, as of PRD #103 M4: `task deadcode` runs all four
+components, and each `task gate:<component>` runs its own. Go (`api`,
+`controller`) is `golang.org/x/tools/cmd/deadcode -test ./...`, invoked through
+`scripts/deadcode-gate.sh`; `web` and `agent` are knip. *(This paragraph read
+"There is still no dead-code check and no coverage signal" until M4 landed. The
+coverage half is still true and is M6's.)*
+
+**The two halves gate differently, and that is the thing to know before you read
+a green.** The Go half holds both modules at **zero**: the baselines
+(`api/.deadcode-baseline`, `controller/.deadcode-baseline`) are committed and
+**empty**, so any unreachable function reddens the gate. The routine fix is to
+delete the function — M4 itself deleted the one finding that existed
+(`HookManager.SettingsPath`) rather than baselining it. Adding a line to a
+baseline is a deliberate suppression and owes a reason in a comment beside it;
+the script treats an entry that is no longer reported as a failure, so a
+suppression cannot outlive the finding it covered.
+
+The npm half is **staged by severity** instead. Unused files, dependencies,
+unlisted imports, binaries, unresolved imports and duplicate exports are `error`
+and gate at zero. The **unused-export family is `warn`: printed in full on every
+run and setting no exit code** — 22 findings on `web` and 53 on `agent` as of
+2026-08-02. So a green `task deadcode:web` means no *gating* tier fired, not
+"no unused exports". Burning that tier down and promoting it to `error` is
+tracked separately; `--max-issues` is not a stopgap for it, because it counts
+error-severity issues only.
+
+**Neither tool sees a dead *branch*.** `deadcode` finds unreachable functions and
+knip finds unused exports, files and dependencies; a `case` arm that nothing
+reaches inside a live function is invisible to both. The known instance is the
+legacy `"Task"` switch case in `web/src/components/RunEvent.tsx`. Dead branches
+stay a review question, which is why the reviewer role keeps a deletion lens
+rather than deferring to the slot.
+
+Two companion targets, `task deadcode:api:all` and `task deadcode:controller:all`,
+drop `-test` and print what the gating invocation cannot see: a function whose
+only remaining caller is a test (44 and 4 respectively as of 2026-08-02). Unlike
+`task lint:api:all`, **they always exit 0** — deadcode has no failure status of
+its own, so read their output rather than their exit code.
+
+There is still no coverage signal. That is PRD #103's M6, and a target for it
+arrives with the check itself rather than as an empty stub.
 
 ## Scripting the bot setup with `glab`
 

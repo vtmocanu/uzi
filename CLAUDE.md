@@ -22,6 +22,14 @@ Note `go install` builds **from source**, so the resulting binary is **not** byt
 
 **🔴 ONE SLOT IS EXEMPT FROM THAT ECHO PROPERTY, AND IT IS THE NEWEST ONE.** PRD #103 M3 put the Go lint ratchet — `issues: {new-from-merge-base: origin/main, whole-files: true}` — in **`.golangci.yml`**, not on `lint:api`'s command line, so `task`'s echo shows only `go run …golangci-lint@v2.12.2 run ./...` and the sentence above does **not** cover it. Traded deliberately: the CLI form would need either a variable spliced into a `cmds:` line (banned in `Taskfile.yml`'s header) or a flag set in the CI job only, and the second makes local and CI disagree about what a finding *is*, which is the divergence Success Criterion 1 exists to prevent. **Read `.golangci.yml` rather than the gate's output** for that one. Two consequences you will meet before you meet the file: only findings your branch introduces block, and `whole-files` makes pre-existing findings in a file you merely *touched* block too. `task lint:api:all` / `lint:controller:all` print the unfiltered backlog and gate nothing. And if `origin/main` does not resolve, golangci-lint does **not** skip the ratchet — it reports the whole backlog behind one buried warning line, which reads as an enormous new regression; the targets carry a pre-flight that exits 2 saying exactly that, so `git fetch origin main` rather than starting a burn-down. *(The npm half needs none of this: oxlint is unratcheted, and its severity lives in each package's `.oxlintrc.json` plus the `-D correctness` in its `lint` script, which Task's echo also cannot show — it echoes `npm run lint`.)*
 
+**🔴 AND THE DEAD-CODE SLOT'S TWO HALVES GATE DIFFERENTLY, SO A GREEN MEANS TWO DIFFERENT THINGS DEPENDING ON WHICH COMPONENT PRINTED IT** (PRD #103 M4). `task deadcode` runs all four; each `gate:<component>` runs its own. The **Go** half (`deadcode -test ./...` per module, through `scripts/deadcode-gate.sh`) holds both modules at **zero** against a committed, **empty** baseline — the routine fix for a finding is to delete the function, and M4 deleted the one that existed rather than baselining it. The **npm** half (knip) is **severity-staged**: unused files, dependencies, unlisted imports, binaries, unresolved imports and duplicate exports are `error` and gate at zero, while **the unused-export family is `warn` — printed in full on every run and setting NO exit code** (22 findings on `web`, 53 on `agent`, 2026-08-02). So a green `task deadcode:web` means no *gating* tier fired, not "no unused exports". **`--max-issues` is not a stopgap for that tier** — measured twice independently, it counts error-severity issues only and exits 0 with every warn finding printed, so any plan reading "stage exports to `warn` AND hold the line with `--max-issues`" describes something the tool cannot do.
+
+Three more properties of that slot, each measured and each easy to get wrong:
+
+- **`deadcode` EXITS 0 WHETHER IT FINDS 0, 1 OR 44 DEAD FUNCTIONS.** rc=1 only on a load error — and on that path **stdout is 0 bytes**, so the obvious wrapper (run, sort, diff, fail on additions) reads a module that does not compile as *clean* and passes green. That is the `test -z "$(gofmt -l .)"` hole through a different door: an empty result set indistinguishable from a clean one. `scripts/deadcode-gate.sh` exists for the exit code, not for the baseline, and reads rc **before** output; it uses `fmt-check:api`'s convention (2 = instrument broken, 1 = findings). The same property is why **`task deadcode:api:all` / `deadcode:controller:all` ALWAYS EXIT 0** — the opposite of `lint:*:all`, which exits 1 on any finding. Read their output, not their status.
+- **CALIBRATING THIS SLOT REQUIRES AN EXPORTED SYMBOL.** golangci-lint's `unused` reports unused *unexported* symbols and runs **earlier** in `gate:api`, so an unexported dead function makes the gate fail-fast at lint and `deadcode` never executes — measured: the exported probe gives `task lint:api` "0 issues." and `task deadcode:api` exit 1, while the unexported one reddens `lint:api` and stops the gate there. A calibration built on the unexported form demonstrates M3's linter while claiming to demonstrate M4's.
+- **NEITHER TOOL SEES A DEAD *BRANCH*.** `deadcode` finds unreachable *functions*, knip finds unused *exports/files/deps*; a `case` arm nothing reaches inside a live function is invisible to both. The live instance is PRD #99's legacy `case "Task":` arms in `web/src/components/RunEvent.tsx` — which is also why they are **not** a valid probe here: a fully working tool reports nothing on them. Dead branches stay a review question.
+
 Two consequences worth knowing before you read a result:
 
 - **`task`'s own exit code is 201, not the underlying command's** (measured on 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": … exit status 7` with rc=201). `!= 0` is still a correct failure test; anything comparing `$?` to a specific number is not. **But `!= 0` covers two distinct meanings: `201` means a target RAN AND FAILED, while a malformed `Taskfile.yml` exits `109` with nothing having executed** — and that failure is **loud and self-locating**, printing `task: Failed to parse Taskfile.yml:` followed by the YAML error and its line number. Measured 2026-08-02, `task` 3.51.1: a `desc:` written `gofmt -l over both Go modules (fail-fast: stops at the first module)` puts a bare `: ` inside a plain YAML scalar, which is illegal; `task --list`, `--list-all`, a named target and a bare `task` all return **109** and all name the file and the line you just edited. *(Corrected 2026-08-02, same day: this said **1**, and added that "every target vanishes at once, so it does not look like the edit that caused it". **Both halves were wrong, and the second inverts the truth** — nothing vanishes silently; `task` names the line. The `1` was never `task`'s at all: it came from `python3 -c "import yaml…" && task …; echo $?`, where the YAML library exits 1, the `&&` short-circuits, and **`task` never runs** — so a python exit code was reported as task's. That is reporting-failure form (1) from the gate-status entry below, committed inside an entry about reading an instrument's output correctly.)*
@@ -89,10 +97,12 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ### api (Go, chi + pgx + sqlc + goose)
 
 ```sh
-task gate:api                              # fmt-check + vet + build + lint + test — NOT all tests, see live-DB note below
+task gate:api                              # fmt-check + vet + build + lint + deadcode + test — NOT all tests, see live-DB note below
 task fmt-check:api                         # the format slot alone (gofmt -l, names the drifted files)
 task lint:api                              # the lint slot alone — RATCHETED, see .golangci.yml
 task lint:api:all                          # the UNFILTERED backlog (reported, never gating, not in `task gate`)
+task deadcode:api                          # the dead-code slot alone — gated at ZERO against an EMPTY baseline
+task deadcode:api:all                      # WITHOUT -test; reported, never gating, and ALWAYS EXITS 0
 task test:api                              # the test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
 cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
@@ -190,8 +200,9 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 ### web (Vite + React + TS)
 
 ```sh
-task gate:web                              # lint + check-docs + typecheck + test
+task gate:web                              # lint + deadcode + check-docs + typecheck + test
 task lint:web                              # the lint slot alone (oxlint; NOT ratcheted)
+task deadcode:web                          # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:web                              # vitest run
 task typecheck:web                         # or check-docs:web, individually
 cd web && npx vitest run src/pages/Foo.test.tsx    # single file — no target
@@ -248,8 +259,9 @@ Two refinements measured here, because both forms of that slip are easy to mis-s
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-task gate:agent                            # lint + typecheck + test
+task gate:agent                            # lint + deadcode + typecheck + test
 task lint:agent                            # the lint slot alone (oxlint; NOT ratcheted)
+task deadcode:agent                        # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:agent                            # node --test via tsx
 task typecheck:agent
 cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file — no target
@@ -276,10 +288,12 @@ cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   
 ### controller (Go, hosted-worker controller — a SECOND, SEPARATE Go module)
 
 ```sh
-task gate:controller                       # fmt-check + vet + build + lint + test
+task gate:controller                       # fmt-check + vet + build + lint + deadcode + test
 task fmt-check:controller                  # the format slot alone; `task fmt-check` does both modules
 task lint:controller                       # the lint slot alone — RATCHETED, see .golangci.yml
 task lint:controller:all                   # the UNFILTERED backlog; `task lint` does all four components
+task deadcode:controller                   # the dead-code slot alone; `task deadcode` does all four components
+task deadcode:controller:all               # WITHOUT -test — 4 findings the gate cannot see; ALWAYS EXITS 0
 task test:controller                       # -count=1, see below
 task vet:controller                        # or build:controller, individually
 ```

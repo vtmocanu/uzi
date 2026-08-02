@@ -47,6 +47,21 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   postinstall rewrites the host's `agent-browser` binary. See
   [docs/dev-conventions.md](docs/dev-conventions.md).
 
+- **Contributor tooling: dead code is now detected in the gate and on every MR.**
+  `task deadcode` covers all four components and each `task gate:<component>`
+  runs its own. The Go modules use `golang.org/x/tools/cmd/deadcode` against a
+  committed baseline that ships **empty**, so both are held at zero — the one
+  unreachable function that existed was deleted rather than baselined. `web` and
+  `agent` use knip, which gates unused files and dependencies at zero while
+  reporting unused *exports* without failing the build; burning that tier down
+  is tracked separately. Neither tool sees a dead *branch*, which stays a review
+  question. Part of PRD #103; no new CI jobs. Developer-facing only: no change to
+  how uzi behaves. **Existing checkouts need `npm install --ignore-scripts` in
+  *both* `web/` and `agent/`** before `task gate:web` / `task gate:agent` will
+  run — knip is a new devDependency and the step fails closed with
+  `knip: command not found` until it is installed, the same way oxlint did.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on

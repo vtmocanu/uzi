@@ -1405,14 +1405,33 @@ test           task test:api
                task test:web
                task test:agent
                task check-docs:web
-dead code      none (gap, noted 2026-07-26)
-                                   # STILL A GAP, and M4 still owns it, but it is now
-                                   # PARTIALLY covered: the lint slot above enables
-                                   # golangci-lint's `unused`, which finds unused
-                                   # UNEXPORTED symbols WITHIN a Go package. It does
-                                   # not do `deadcode`'s cross-package reachability
-                                   # analysis and says nothing at all about unused TS
-                                   # exports, so report the gap as before.
+dead code      task deadcode       # all four; or deadcode:{api,controller,web,agent}
+                                   # (Was `none (gap, noted 2026-07-26)`; PRD #103 M4
+                                   # closed it.) Go = `deadcode -test ./...` per module
+                                   # against a COMMITTED, EMPTY baseline, so both
+                                   # modules gate at ZERO. npm = knip.
+                                   # 🔴 THE npm HALF IS STAGED AND A GREEN DOES NOT MEAN
+                                   # "no unused exports". knip's exports/types family is
+                                   # at `warn`: printed in full on every run, setting NO
+                                   # exit code. 22 findings on web, 53 on agent as of
+                                   # 2026-08-02. Unused FILES and DEPENDENCIES gate at
+                                   # zero. `--max-issues` is NOT a fallback for the warn
+                                   # tier -- measured, it counts error-severity only.
+                                   # 🔴 AND NEITHER TOOL SEES A DEAD *BRANCH*. deadcode
+                                   # finds unreachable FUNCTIONS, knip finds unused
+                                   # EXPORTS/FILES/DEPS; a `case` arm nothing reaches
+                                   # inside a live function is invisible to both. The
+                                   # live example is PRD #99's `case "Task":` arms in
+                                   # web/src/components/RunEvent.tsx, which is also why
+                                   # they are NOT a valid probe for this slot -- they
+                                   # produce a clean "no findings" from a working tool.
+                                   # Dead branches stay the reviewer's job.
+                                   # CALIBRATING THIS SLOT? USE AN EXPORTED SYMBOL. An
+                                   # unexported one is caught by golangci-lint `unused`,
+                                   # which runs EARLIER in gate:api, so the gate
+                                   # fail-fasts at lint and deadcode never executes --
+                                   # measured, and it demonstrates the lint slot while
+                                   # claiming to demonstrate this one.
 coverage       none (gap, noted 2026-08-02)
 security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap, noted 2026-08-02)

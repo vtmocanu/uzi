@@ -309,12 +309,32 @@ test           task test:api               # -race -count=1
                task test:web               # vitest
                task test:agent             # node --test via tsx, --test-timeout=30000
                task check-docs:web
-dead code      none (gap)          # STILL A GAP (PRD #103 M4 owns it), but now
-                                   # PARTIALLY covered: the lint slot enables
-                                   # golangci-lint's `unused`, which finds unused
-                                   # UNEXPORTED symbols WITHIN a Go package. No
-                                   # cross-package reachability (that is `deadcode`),
-                                   # nothing about unused TS exports. Report the gap.
+dead code      task deadcode       # all four; or deadcode:{api,controller,web,agent}
+                                   # (Was `none (gap)`; PRD #103 M4 closed it.) Go =
+                                   # `deadcode -test ./...` per module against a
+                                   # committed, EMPTY baseline, so both Go modules gate
+                                   # at ZERO. npm = knip.
+                                   # 🔴 A GREEN DOES NOT MEAN "no unused exports". The
+                                   # knip exports/types family is staged at `warn`:
+                                   # printed on every run, setting NO exit code -- 22
+                                   # findings on web and 53 on agent as of 2026-08-02.
+                                   # Unused FILES and DEPENDENCIES gate at zero. Report
+                                   # the warn tier as debt, not as a gate failure.
+                                   # 🔴 NEITHER TOOL SEES A DEAD *BRANCH* (a `case` arm
+                                   # nothing reaches inside a live function). That stays
+                                   # the reviewer's job, and it is why PRD #99's
+                                   # `case "Task":` arms in RunEvent.tsx are NOT a valid
+                                   # probe for this slot.
+                                   # CALIBRATING IT? USE AN EXPORTED SYMBOL -- an
+                                   # unexported one reddens `unused` in the lint slot,
+                                   # which runs FIRST in gate:api, so the gate
+                                   # fail-fasts and deadcode never runs.
+                                   # `deadcode:api:all` / `:controller:all` drop `-test`
+                                   # and print what the gate cannot see (a function
+                                   # whose only caller is a test): 44 and 4 as of
+                                   # 2026-08-02. They ALWAYS EXIT 0 -- the output is the
+                                   # signal, not the status, which is the opposite of
+                                   # `lint:*:all`.
 coverage       none (gap)
 security scan  none (gap)          # auditor's slot regardless
 pre-commit     none (gap)          # only Entire's session-logging hooks exist

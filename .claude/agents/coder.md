@@ -67,8 +67,24 @@ own leak detector), never by inference from the dev host's green run.
 ## For this repo (uzi)
 
 Gate slots here are: **format `task fmt-check`, lint `task lint`, dead code
-`none (gap)`, coverage `none (gap)`** — so "run every slot" means fmt-check +
-vet + build + lint + typecheck + test, which is what `task gate` runs.
+`task deadcode`, coverage `none (gap)`** — so "run every slot" means fmt-check +
+vet + build + lint + deadcode + typecheck + test, which is what `task gate`
+runs. *(PRD #103 M4, 2026-08-02: the dead-code slot read `none (gap)` here until
+M4 closed it. Note this file phrases the claim differently from every other copy,
+which is how a literal grep for the wording used elsewhere missed it during M3.)*
+
+**Two things about the dead-code slot that decide how you read a green.** The Go
+half (`deadcode -test ./...` per module) gates at ZERO against a committed,
+EMPTY baseline — if it reddens, DELETE the function; adding a line to
+`api/.deadcode-baseline` is a deliberate suppression that owes a reason in a
+comment, and the gate treats an entry that has stopped being reported as a
+failure so a suppression cannot outlive its finding. The npm half (knip) stages
+the **exports/types family at `warn`: printed on every run, setting no exit
+code** — 22 findings on `web` and 53 on `agent` as of 2026-08-02 — while unused
+files and dependencies gate at zero. So a green `task deadcode:web` does not
+mean "no unused exports"; it means none of the *gating* tiers fired. Neither
+tool sees a dead **branch** (a `case` arm nothing reaches inside a live
+function); that stays the reviewer's job.
 
 **The lint slot is ratcheted on the Go side and `task`'s echo cannot show it.**
 `.golangci.yml` carries `issues: {new-from-merge-base: origin/main,
