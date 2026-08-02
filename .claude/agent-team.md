@@ -1183,16 +1183,34 @@ format         task fmt-check      # gofmt -l over both Go modules; fails on dri
                                    # the PER-MODULE fmt-check:api / fmt-check:controller,
                                    # not this composite -- so a component gate already
                                    # covers this slot for the component it gates.
-                                   # (Corrected 2026-08-02 by PRD #103 M2: this slot read
+                                   # 🔴 ON AN UN-REBASED BRANCH, gofmt -l ./api IS STILL
+                                   # NON-EMPTY -- M2 cleared it on main, not on your tree.
+                                   # RUN IT ON YOUR OWN TREE before a directory-wide
+                                   # `gofmt -w`, which will still sweep foreign files into
+                                   # your commit there. This slot CANNOT catch that: a
+                                   # swept tree is gofmt-clean, so fmt-check passes. It
+                                   # detects drift; it cannot detect a sweep.
+                                   # (Corrected twice on 2026-08-02, by PRD #103 M2 and
+                                   # then by its own follow-up. The slot first read
                                    # `none (gap)` and told you gofmt -l ./api reports
-                                   # pre-existing drift. M2 cleared it and gated it, so
-                                   # that instruction now sends you looking for drift that
-                                   # does not exist. Its count ban was real and is kept as
-                                   # history: the tally read 26, then 25, and a filtered
-                                   # 4-file view was once reported as the whole list,
-                                   # 2026-07-25. The `comm -12` idiom it prescribed is
-                                   # retired -- with no pre-existing drift left, an
-                                   # intersection against an empty set can never fail.)
+                                   # pre-existing drift; M2 cleared and gated that, so on
+                                   # a tree carrying the reformat the old instruction sent
+                                   # you looking for drift that is not there. The FIRST
+                                   # correction then overshot, stating that flatly -- and
+                                   # this block is PASTED INTO EVERY DISPATCH precisely
+                                   # because teammates cold-start, so it reached teammates
+                                   # on branches where the drift is exactly as live as
+                                   # ever. Both halves are tree-conditional; neither is a
+                                   # fact about the repo. Its count ban was real and is
+                                   # kept as history: the tally read 26, then 25, and a
+                                   # filtered 4-file view was once reported as the whole
+                                   # list, 2026-07-25. The `comm -12` idiom it prescribed
+                                   # is retired for VACUITY on a reformatted tree -- an
+                                   # intersection against an empty set can never fail --
+                                   # and NOT for having been broken: it worked, returning
+                                   # every one of the files commit 1 touched. See the
+                                   # standing rule for the full retirement and for why a
+                                   # naive rebuild against fmt-check:api returns empty.)
 lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
                                    # task gate:api / gate:controller and in CI, but a
                                    # vet is not a lint slot. (Was "go vet in CI only";
