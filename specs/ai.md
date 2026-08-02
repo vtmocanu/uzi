@@ -15541,3 +15541,114 @@ supersedes §451's fold.
   own numbers are meaningless while rendering them. The first arrived through a race, the
   second through unreachable copy. Worth pairing, because the next instance will arrive
   through a third route and the shape is the recognisable part.
+
+---
+
+# PRD #103 — Dev-loop quality gates (task runner, linters, dead code, formatting, coverage)
+
+Serves human: the best-practice bar, plus Feature #52's "real CI/CD: a working pipeline" —
+the toolchain gate jobs M1 rewires live in that pipeline. **`human.md` untouched and no entry
+proposed**: this is contributor tooling and nothing about the product changes — no API, no
+schema, no worker behaviour, no UI. Design record: `prds/103-dev-loop-quality-gates.md`
+(Decisions 1–11).
+
+**Numbering note.** These start at 464, not 461. 461–463 are held by the unmerged
+`agent/issue-119` branch (MR !152), found by sweeping every remote ref at write time per the
+rule §455 records. The gap is intended; closing it recreates the collision.
+
+## 464. PRD #103 M1 — recipes collapse into one file, the FLAGS are what must survive the move, and every Taskfile feature that can make a gate skip is banned
+
+M1 adds no new checks. It changes how every existing one is invoked, which is not the same as
+changing nothing.
+
+- **Why a build-tooling milestone is recorded here at all.** Almost every section in this file
+  rests on a gate having actually executed, and four flags are the only thing that makes that
+  true: `-count=1` (both Go modules), `-race` (api), `-p 1` (store-it), `--test-timeout=30000`
+  (agent). Each is a separately measured fix **whose absence is invisible in the output** — the
+  suite still prints `ok`, still exits 0. Relocating them into a new file *is* the "a future
+  simplify-the-gate edit" the `test:api` comment already named as the live threat. So the
+  invariants below constrain any rebuild; **the target list does not and is deliberately not
+  recorded here** — it is obsolete by M3 and `Taskfile.yml` is the place to read it.
+- **Gate RECIPES live in exactly one file; every other surface names TARGETS.** `CLAUDE.md`, the
+  `.claude/agent-team.md` paste-block and the `.claude/agents/*` tails say `task gate:api`, never
+  a command line. The paste mechanism itself stays — teammates cold-start and cannot resolve a
+  reference — and so does its one-line "why" per load-bearing flag, because they must still
+  recognise one going missing. **The decisive argument is the asymmetry of staleness**: a drifted
+  pasted `go test -count=1 ./...` still runs, still prints `ok`, and is reported green; a drifted
+  *target* dies with `task: Task "gate:api" does not exist` and a nonzero exit. This repo's whole
+  documented failure history is silent-green over loud-red, and the block had already rotted once
+  in exactly this way.
+- **The discriminator is RECIPE versus MEASUREMENT, and it is a property of the surrounding
+  sentence, never of the command.** A command written as an instruction ("run this before
+  reporting done") is a recipe and becomes a target. The identical string written as an
+  observation ("`go test ./...` printed `ok (cached)` on a gutted fixture") is evidence, and
+  rewriting it makes the paragraph describe a run nobody performed. Applies repo-wide, not just
+  to `CLAUDE.md`; the sharp case was the `ok (cached)` measurement inside `.claude/agent-team.md`,
+  three lines below a slot table that genuinely did need rewriting.
+- **🔴 Four Taskfile features are banned, kept as one list in the file's own header so the next
+  reader meets all of them at once.** The first is correctness, the rest are security:
+  - **No `sources:`, `generates:` or `status:` on any target** (escape hatch: a target needing
+    `sources:` for an unrelated reason also carries `method: none`). A fingerprinted target prints
+    `Task "x" is up to date`, exits 0 and executes nothing — output indistinguishable from a pass.
+    **`checksum` has the same cross-module blind spot as Go's test cache**, which is the specific
+    reason it cannot be trusted here: this repo's gates deliberately read `fixtures/judge-fidelity/`
+    at the repo root and `api/internal/hostedsvc/testdata/` from outside the module under test, so
+    a glob over one module cannot see them change. And `.task/` is gitignored, so CI would always
+    run cold while a contributor's `task gate` silently skipped — divergence in the worst
+    direction, reporting green.
+  - **No `dotenv:`** — Task loads it into *every* target's environment, so one root entry injects a
+    developer's real `.env` secrets into the whole gate.
+  - **No `includes:`, the remote form being the sharp edge** — unpinned remote code executing
+    inside the gate. Self-containment is the style reason; this is the security one.
+  - **No dynamic root `vars: {X: {sh: ...}}`** — they execute on every invocation, including a bare
+    `task --list`.
+  - **And never splice a variable unquoted into a `cmds:` line.** Templates are Go `text/template`
+    and the result reaches `sh -c` unquoted, so `{{.CI_COMMIT_BRANCH}}` or `{{.CLI_ARGS}}` is
+    injectable by anyone who can push a branch. M1 needs neither; a coverage measurement is where
+    the temptation first appears.
+- **Serial, and `output: prefixed` rather than `group`.** `gate` composes its components through
+  `cmds:` (sequential), not `deps:` (concurrent), because CPU contention is an already-measured
+  flake source here — `web/vite.config.ts` raised `testTimeout` for exactly that, and adding two Go
+  modules alongside vitest makes it worse. The gate's job is a trustworthy verdict, not a fast one.
+  Serial then removes the interleaving `group` exists to fix, leaving only its cost: `group`
+  buffers, so a long test run prints nothing until it ends and — worse — every gate job sets
+  `interruptible: true`, so a cancelled or timed-out job loses **all** buffered output. **A gate
+  that discards its evidence on timeout is the failure class this PRD exists to remove.**
+- **`task`'s own exit code is 201, not the underlying command's.** Anything reading `$?`
+  numerically must know this; `!= 0` is still a correct failure test.
+- **The Taskfile installs nothing and knows nothing about devbox.** No `npm ci`, no `go mod
+  download`: CI installs in `before_script`, locally your `node_modules` is expected to exist, and
+  `cd agent && npm ci` in particular has a documented host-wide side effect that must never fire as
+  a byproduct of running a test. Targets invoke tools directly and whatever put them on `PATH` is
+  not the file's concern; CI jobs call `task <target>`, never `devbox run -- task <target>`.
+  Local-only workarounds (`-buildvcs=false`) stay out of committed targets — `GOFLAGS` is the
+  contributor's lever.
+- **npm targets delegate to the existing `package.json` script and must keep doing so.** A target
+  written `npm test` inherits whatever flags the script encodes; one that reimplements the command
+  drops them **silently**. The live instance is `test:agent`, where `--test-timeout=30000` lives in
+  the script and node's own default is *no* timeout — a spelled-out `node --import tsx --test`
+  hangs where the gate fails.
+- **CI must PROVIDE each tool, and anything fetched at job time is version- and sha256-pinned.**
+  "Provide" means a digest-pinned image, a pinned `go run …@vX.Y.Z`, an npm devDependency, or a
+  pinned `before_script` install — never devbox. **The checksum is a literal at its use site, not a
+  variable**: top-level `variables:` are overridable by a manual pipeline, so a version/checksum
+  pair held in two variables can be replaced with a *self-consistent* pair by anyone who can set
+  them, and shape-validating the hash does not help because a valid-looking hex string is exactly
+  what such a pair contains. Removing the indirection is what closes it. The install ends in a
+  positive control (`task --version`), because a step whose only evidence is the absence of an
+  error cannot distinguish a working install from one that never ran.
+- **Local and CI deliberately do NOT fully converge, in exactly two places**, so "one command
+  everywhere" is a scoped claim rather than an absolute one. `validate:web` and `test:web` are
+  separate jobs, so they call the fine-grained targets — a job calling `gate:web` would run vitest
+  twice, and `gate:web` stays the local convenience wrapper. And `test:api-store-it` wraps its run
+  in a ran-or-skipped assertion that exists to catch the live-DB suite silently skipping against a
+  missing Postgres; that logic is CI-specific and stays in `.gitlab-ci.yml`.
+- **The acceptance criterion is a MUTATION, because nothing weaker discriminates a live gate from a
+  cached one.** Gut a case from `fixtures/judge-fidelity/cases.json`, confirm `task gate:api`
+  reddens *by name* (`fixture broken: cases.json has no case …`), restore, confirm green. A run
+  printing no cache markers, or exiting 0, is satisfied by a gate that executed nothing — the
+  proxy passes in the broken configuration.
+- **A whole-repo serial gate finds what per-package runs cannot, and did on day one**: a
+  pre-existing 1-in-6 race between two `agent/` test files sharing a hard-coded `/tmp` worktree
+  path, invisible until something ran every suite in one pass. That is the milestone's best
+  evidence for itself, and it is an argument about the gate's *shape*, not about any tool it runs.
