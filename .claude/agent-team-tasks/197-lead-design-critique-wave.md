@@ -287,3 +287,144 @@ limitation.
 No amends after a SHA is dispatched for review. Report the tip SHA at the top of every
 report. Commit locally on `fix/197-lead-design-critique-wave`; never push, never touch
 `main`.
+
+### 2026-08-02 (later) — findings round on `60bf036f`. Fix these, then re-gate.
+
+Reviewer, auditor, tester and fact-checker all reported at `60bf036f`. The lead
+re-derived each load-bearing claim. **2 Blocking, 6 Should-fix, 1 new decision.**
+
+#### Correction to D6, the lead's again
+
+D6 says `buildPlanPrompt` "carries only `issueTitle` and `issueDescription`". It carries
+**nine** fields (`prompt.ts:498-518`): also `issueIid`, `branch`, `subagentNames`,
+`memory`, `priorWork`, `baseCommit`, `defaultBranchCommit`. **The load-bearing half is
+exact and unchanged** — there is no label and no effort field, so a "beyond a small fix"
+predicate would still be computed from `UNTRUSTED_FRAME`-declared hostile text. Nothing
+shipped repeats the wrong version; the imprecision was only here.
+
+#### B1 (BLOCKING) — the no-write rule is never marked for RELAY
+
+`lead.md:19-22` marks exactly one thing to transmit — *"say in each dispatch that the
+artifact under review is the plan text, not a diff"* (D4). The no-write rule arrives as
+a separate sentence addressed to the lead and is **not** marked for relay.
+
+Why that is fatal rather than untidy: a subagent's system prompt is `t.prompt_body`
+(`agents.ts:96`) and the lead cannot alter it, so **the dispatch prompt is the only
+channel**. Meanwhile `architect.md:37` tells it to "right-size" to *a SendMessage design
+summary for small changes*, an ADR, or a design doc — and **`SendMessage` does not exist
+in a uzi run**: `repoagents.ts:25-29` states an allowlist entry matching no real tool is
+silently unavailable, naming `SendMessage` explicitly. So the non-writing branch is
+unreachable and both remaining options are writes. `tester.md`'s prohibitions are all
+*external* (push, merge, comment) and do not cover a local worktree write.
+
+`lead.md:43-45` already shows the idiom the paragraph should have used: *"stated in its
+delegation prompt, and tell it not to commit"*.
+
+**Fix:** add the relay verb, e.g. `…and tell each of them the wave must not change
+anything in the worktree`. **And pin the RELAY, not the constraint** — the current pin
+`must not change anything in the worktree` is satisfied by the un-relayed wording, so it
+cannot detect this.
+
+#### B2 (BLOCKING) — two new pins are RELOCATION-BLIND
+
+C3 (`for every mechanism it asserts, name the file that implements it and quote the
+line`) and C5 (`must not change anything in the worktree`) carry **no anchor to a wave**.
+Measured by the tester and reproduced from a clean detached checkout: relocate either
+clause into the post-implementation bullet and delete the plan-turn sentence — the
+plan-turn constraint is **gone from the template** and **all 20 pins stay green, exit 0**.
+
+This is the issue's own defect one level in. The old set was blind to *which wave fans
+out*; this set is blind to *which wave a constraint binds to*.
+
+**It survived three controls because all three were the same instrument.** The coder's
+sentence deletions, the reviewer's word-level weakenings and the auditor's seven mutants
+are all **presence** mutations; none can produce the disconfirming answer, because in a
+relocation mutant every pinned phrase is still present character-for-character.
+
+**Fix** (tester's, strings verified present exactly once — but it did not fold against a
+patched pin set, so re-verify):
+
+- C5 → `an edit made during the plan turn is a change nobody saw when approving it`.
+  **Do NOT use `That wave must not change anything in the worktree`** — the fold-9 mutant
+  contains that string verbatim in the wrong bullet, so it is already disproven.
+- C3 → widen to `make the plan carry its own evidence: for every mechanism it asserts,
+  name the file that implements it and quote the line`, so relocation must carry C2's
+  anchor along. Note this **overlaps C2's tail**, breaking the pairwise-disjoint-spans
+  property the tester measured; that is acceptable here but say so rather than letting a
+  later reader think it is an accident.
+- **Re-verify with RELOCATION folds, not deletions.** A deletion-only re-run reports 6/6
+  and proves nothing about this class. B1's new relay pin needs the same treatment.
+
+#### Should-fix
+
+- **S1 — D2 drifts at the close.** `lead.md:24-27` (*"Judge how far to take this … how
+  many you could not cite"*) reinstalls a self-graded dial and concedes uncited mechanisms
+  as an end state, contradicting the absolute bar seven lines above. Reviewer's
+  replacement keeps the C6 pin byte-identical: `What this costs follows from the plan you
+  produced — how many mechanisms it asserts — never as a judgement about the issue text,
+  which you do not control.`
+- **S2 — `docs/agent-templates.md:65-66` over-claims.** *"nothing in the repository is
+  changed before you approve"* states a prompt-level, unenforced property as a flat
+  guarantee. Found independently by reviewer and fact-checker. The same page draws the
+  distinction correctly at `:48-50` (*"enforced by the worker regardless"*). Soften to
+  the instructed register.
+- **S3 — the CHANGELOG omits that Reset is ADMIN-ONLY.** `authorizeTemplateWrite`
+  (`handler/agent_templates.go:146-152`) returns 403 for `builtin` scope unless
+  `actor.IsAdmin`. The note exists to make the reader act, so it must say who can.
+- **S4 — no bound on wave REPETITION.** Planning turns re-enter from two loops:
+  `QUESTION_MAX` default 5 ⇒ up to 6 per gate entry, and `PLAN_MAX_REVISIONS` default 3
+  ⇒ up to 4 entries (`config.go:663-664`). Ceiling 24 planning turns, each now carrying a
+  wave, against a **non-resetting** 2h wall (`started_at` is `COALESCE`d once,
+  `runtime.sql:647`). One clause fixes it and is right on the merits: on a revise turn,
+  re-cite only what changed.
+- **S5 — record D6's residual in §467.** A plan asserting **zero** mechanisms is
+  compliant and gets no wave. The attacker keeps a cost channel, not a safety channel —
+  there is no reachable state where a plan asserts a mechanism and skips its citation.
+  Write the residual down; optionally one sentence telling the lead a plan asserting
+  nothing is itself suspect.
+- **S6 — "the only path" over-claims, in `specs/ai.md` §467 and in `2f0017b5`'s message.**
+  The CHANGELOG never says it (verified: 0 matches) and is fine. But an admin
+  hand-pasting the body also works, and `docs/agent-templates.md:143-144` already says so.
+  Say "the only mechanism" where the text survives; the commit message is immutable.
+
+#### D12 (NEW DECISION) — `architect` is deliberately NOT sequenced, and that is half of what the issue asked for
+
+The issue proposes dispatching *"the allocated read-only validators (**and `architect`,
+when allocated**)"*. Shipped `lead.md` says only "the allocated read-only validators", and
+`architect` mentions appears **zero** times in it (measured). Since `architect` declares
+`Edit, Write` it is not a read-only validator, so it is excluded by the wording.
+
+That follows from D5 rather than contradicting it, and it is the safe outcome — but it
+was never written down as a decision, which is how a gap becomes a surprise. **Record it:**
+`architect` joins the plan-turn wave when **#203** removes its write tools, not before.
+Nothing shipped is untrue today; §467 mentions architect only in the statement of the
+defect. State it in the MR description so it is a decision on the record.
+
+Note this does **not** weaken B1: `tester` also declares `Edit, Write` and *is* named a
+read-only validator by the product's own docs, so the relay verb is still load-bearing
+with architect excluded.
+
+#### Not defects, recorded so nobody re-derives them
+
+- `lead.md`'s *"hands the task straight back instead of reading anything"* is slightly
+  stronger than any single source line — `tester.md:89-90`'s trigger is an unclear spec,
+  not a missing diff (its diff presupposition is at `:20-21`). §467's shipped wording
+  ("surface missing context") is careful and true of all three. Leave it.
+- *"all three plan prompts end with it"* — `buildPlanPrompt`'s `submit_plan` at `:559-561`
+  has a 3-line PRD conditional after it, so it is the terminal *instruction*, not the last
+  line.
+- `prds/done/43:29`/`:46` still carry the old ordering and are **correctly** left alone:
+  past-tense records of a shipped PRD, per `CLAUDE.md`'s convention.
+
+#### Process, for the reflect pass
+
+- **A shared worktree needs per-agent isolation stated in the dispatch, not assumed.** The
+  tester restored after each of ten folds and proved the tree clean at the end — but each
+  fold held a mutation for 10-30s, and the auditor's gate run and the fact-checker's prose
+  read both landed in one of those windows. "Clean at the end" is not "never dirty". My
+  dispatch said "detached worktree" to the reviewer and not to the tester.
+- **Namespace scratchpad log paths.** `gate-api.log` was clobbered by three agents; one
+  red read from it was briefly taken for a regression.
+- **Prefer `git ls-remote` over `git fetch --all` for a freshness check** while other
+  agents are running — the fact-checker avoided mutating shared refs and still proved the
+  tracking refs current. My spec-sync instruction said `fetch --all`; it was wrong to.
