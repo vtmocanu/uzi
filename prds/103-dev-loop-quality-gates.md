@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155); M3-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 implemented 2026-08-02 on `feature/prd-103-m3-m6` but NOT MERGED and NOT YET PIPELINE-TESTED** (see its status block); M4-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -1112,7 +1112,82 @@ which previously prescribed only the fail-open form.
       gofmt's own status and keep "does not parse" distinguishable from
       "misformatted" when `task`'s own rc is 201 for both.)*
 
-- [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**: `.golangci.yml`
+- [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**:
+
+      > **STATUS 2026-08-02: IMPLEMENTED, NOT MERGED. The box stays unticked
+      > deliberately** — M1's own status block defines what ticking it means
+      > (*"the box is now ticked for the reason it was previously left unticked:
+      > this landed"*), and this has not landed. It sits on
+      > `feature/prd-103-m3-m6`, and **no pipeline has run against it.**
+      >
+      > **Four things are settled only by CI and are listed here rather than
+      > buried in an MR description**, because a reader who finds this merged
+      > should be able to check that they were watched: whether `origin/main`
+      > resolves **and has a merge-base** after `GIT_DEPTH: "0"` plus the
+      > explicit fetch; the absence of `Can't process results by diff processor`
+      > in `lint:api`'s log (grep the message prefix, **never a status code** —
+      > the two failure arms emit `exit status 1` and `exit status 128` behind an
+      > identical outcome); `test:api-store-it`'s duration against the **max of
+      > the other eleven** on a warm pipeline; and `@oxlint/binding-linux-x64-musl`
+      > resolving on alpine.
+      >
+      > **The acceptance bar (Success Criteria 2 and 8) is met four times over,
+      > and it is stricter than the criterion asked for.** Four calibration arms —
+      > `lint:api`, `lint:controller`, `lint:web`, `lint:agent` — each asserting
+      > **all four** properties rather than a red: non-zero exit, the **rule name**
+      > in the output (`(errcheck)`, `react-hooks(rules-of-hooks)`,
+      > `eslint(no-dupe-keys)`), a repo-root-relative path, and green on restore
+      > verified with `git status`. Reproduced independently by the tester in its
+      > own tree with its own paths. Plus three controls nobody specified: the
+      > `:all` companions' **positive pair** (0 ratcheted against 107 and 5
+      > unfiltered), the pre-flight in **both** directions, and a strip-and-restore
+      > over all 13 `eslint-disable` comments proving each suppression is
+      > load-bearing rather than decorative.
+      >
+      > **Zero behavioural defects were found in the shipped code, across three
+      > review rounds and five validators. Every blocking finding was a false or
+      > unsupported CLAIM about code that already worked** — the same result M2
+      > recorded. The difference is where one of them lived: `.gitlab-ci.yml`'s
+      > `.gate_needs` header asserted it was *"The full validate+test+helm gate
+      > set"* while `test:api-store-it` was absent from both anchor lists and runs
+      > on tag pipelines. **A wrong claim about what gates a release IS a release
+      > hole**, and a `v*` tag could have published every image and the OCI chart
+      > over a red LiveDB suite — the only CI coverage of `store.Migrate`. Fixed
+      > here (lists at 12 and 14, verified complete **and exact** by parse), and
+      > the completeness check is now by **resolved stage through `extends`**,
+      > never by job-name shape: a name-based filter is exactly what produced the
+      > false claim.
+      >
+      > **Success Criterion 4 is met**: both copies of the slot table carry real
+      > `task lint:*` targets instead of `lint none (gap)`. The `dead code` slot
+      > deliberately stays `none (gap, noted 2026-07-26)` with a clause naming
+      > `unused`'s **partial** coverage — it finds unused unexported symbols within
+      > a package and does not do `deadcode`'s cross-package reachability, nor
+      > anything about unused TS exports. M4 still owns that slot.
+      >
+      > **Deviations from this document, all recorded in place rather than worked
+      > around**: `goconst` is OFF (Decision 4's enable list amended — measured at
+      > 1211 of 1344 combined findings, and under `--whole-files` its blast radius
+      > is 87 non-test files in `api`); `govet` is OFF because `vet:*` already runs
+      > it **unratcheted**, so folding it into a ratcheted run is a net weakening;
+      > and Decision 3 is **partially** deviated from — Go opens `lint`-stage jobs
+      > while the npm half folds into `validate:web`/`validate:agent`, because
+      > `GIT_DEPTH: "0"` belongs on the two jobs that need it rather than on a
+      > template five jobs share.
+      >
+      > **What it cost, recorded because it is the useful part.** 20 commits, of
+      > which 4 do the work. Three review rounds. **Five numbers were wrong at some
+      > point and three of them were wrong in the lead's own dispatches** — a
+      > relayed goconst split that would have corrupted a correct figure, a
+      > recapped list item that never existed, and a cap-flag attribution written
+      > into the very document warning against carried-through numbers. The
+      > dominant shape, named by the reviewer, is worth more than the tally:
+      > **an inference written in the register of a measurement.** Four instances
+      > in one day's prose; the one that was caught was a *narrative*, and the ones
+      > that shipped were *numbers already carrying a date and a tool version* —
+      > which is the thing nobody re-runs.
+
+      `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`
       `ineffassign` `unused` `unparam` on; each *disabled* linter
       carries a one-line justification in the file, per that repo's
