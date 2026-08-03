@@ -284,6 +284,61 @@ changing at all.)*
 
 ## Amendments
 
+### Amendment 10 — 2026-08-03. Re-measure at `261e9f9b`. All findings fixed; one residual.
+
+Run after the session cap lifted, on a genuinely quiet tree, with the expectations re-derived
+from source BEFORE the saved harness ran — the inversion rule from Amendment 6, applied by the
+agent that raised it.
+
+**FIXED and verified from the DOM:** S1 (the panel now names whether it means saved or
+unsaved, in BOTH directions, not just the one filed), F5 (Reset raises a confirm; **dismiss is
+a real escape hatch, measured** — `resetAgentTemplate: 0`, unsaved marker intact, badge
+unchanged), F12, S3, S4, S6. **Criterion 9's client half still holds** after two commits moved
+the file: reset 1, all three reads 0, positive control first so the zeros are observations.
+
+**S5 — HALF fixed, and the honest scoping is the agent's own.** The sr-only markers close the
+screen-reader half; the **visual** half is unchanged, since an sr-only span is clipped to 1px.
+`LineDiff` and `ToolsDiff` carry visible `+`/`-`; `InlineDiff` still does not, so a sighted
+colour-blind user has only the tints. **WCAG 1.4.1 is about VISUAL means, so it is not
+discharged.** Not blocking. Recorded so nobody later reads "S5 fixed" as covering both halves.
+
+**B1 — resolved on the merits, and the geometry is UNCHANGED.** Re-measured: diff bottom
+871px, Reset top 1524px, still a 653px gap on a 633px viewport. **Both facts are true and the
+second alone would mislead.** B1's substance was never the pixels — it was that the
+destructive click happened without the evidence, and the confirm now carries the drifted
+column names into the click itself. That is the better of the two fixes offered: it works at
+every viewport and scroll position, which a layout change would not.
+
+#### RESIDUAL — the confirm names SAVED drift, not unsaved form edits
+
+`AgentDetail.tsx:120` calls `driftedColumns(shipped.def, template)` against the **stored** row.
+Measured: the dialog said *"discards the current prompt body"* while also silently discarding
+an unsaved **description** edit it never mentioned. Correct as far as it goes and far better
+than no dialog — but **an admin mid-edit is under-warned by exactly the columns they have
+touched**, which is the population most likely to be mid-edit when they press it.
+
+#### WEB-UX'S PROBE RETURNED THE WRONG VERDICT, AND ITS OWN PROPOSED FIX WAS WORSE
+
+**S2 is FIXED, and fixed better than proposed.** Its probe keyed on the panel HEADER alone,
+read "Differs from shipped — prompt body", and printed `"S2 reproduces"`. The pane underneath
+said the opposite: *"Identical except for trailing whitespace at the end of the body."*
+**A one-signal probe on a two-part surface** — the same shape as every other instrument defect
+in this file.
+
+And the fix it had recommended — normalize both sides before diffing — **would have HIDDEN a
+real stored difference that Reset does change.** Naming the condition instead keeps the header
+honest and the pane readable. Worth keeping: a validator's proposed remedy is not covered by
+the evidence that established the finding, and this one was refuted by the implementation
+choosing differently.
+
+#### THE FIRST FIRE WAS ON A TREE THAT WAS NEITHER CLEAN NOR IDLE
+
+Independently confirmed. At that dispatch HEAD was already `0e1d3d79`, `git status` showed
+`M web/src/pages/AgentDetail.tsx`, and its **mtime was 69 seconds after the HEAD commit** —
+someone was still typing in the instrumented file. Web-ux watched the mtime until it went 75s
+quiet rather than measuring or guessing. **Had it measured then, the saved harness would have
+asserted the old notice string and reported a RED from a FIXED tree** — the silent direction.
+
 ### Amendment 9 — 2026-08-03. Round complete at `0e1d3d79`; state of play for whoever resumes.
 
 **All thirteen fixes landed.** Code commits in order: `bcd67c72`, `10970920`, `74dcb9f6`
