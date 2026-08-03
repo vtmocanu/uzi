@@ -14633,6 +14633,34 @@ across all remotes"**, swept at write time, then re-derived above the live head 
 landing per the goose-style renumber rule. The 447–454 gap here is intended; closing
 it recreates the collision.
 
+**🔴 AND THE LAYOUT RULE, WHICH THE PARAGRAPH ABOVE LEAVES UNSAID AND WHICH THIS VERY
+BLOCK IS THE COUNTER-EXAMPLE TO: THIS FILE IS *NOT* ORDERED BY SECTION NUMBER. New
+sections are APPENDED AT THE TAIL, in LANDING order.** Numbers ascend within any
+contiguous run of appends because *allocation* is monotonic — not because anything
+sorts them, and nothing ever re-sorts them. Read the file from §446 and you get
+**446 → 455-460 → 447-454 → 461-463**, which is not a mistake and must not be
+"tidied": §455-460 (this block) were written while 447-454 were **reserved but not yet
+landed**, so when those later landed they appended at what was by then the tail —
+**below** the block that had skipped over them. That is the paragraph above happening
+one level down, and it is permanent.
+
+**Two consequences worth having before you touch the tail.** *Numeric order is a
+property of the recent tail, not of the file*, so a merge that interleaves two branches'
+sections numerically is right only when allocation order happens to agree — it does
+whenever neither branch allocated below the other, and it will not the first time one
+does. *(Checked at the `origin/main` merge into `feature/prd-103-m3-m6`, `88f0bde7`:
+ours 468-471 + 473-474 against main's 467 + 472, allocation and numeric order
+coincided, so the union is in both orders at once and settles nothing about the
+general case.)* And **a section's position is not evidence of anything** — not of
+recency, not of topic. Use the `# <topic>` H1 headings and the title cross-references
+for that; §444's title points forward at §447 across an intervening stretch that
+includes the whole of this PRD #88 block, which is how this file carries a relation it
+cannot express by adjacency. *(Deliberately not "across N sections". That count is a
+tally over a population this file exists to grow, and the first draft of this sentence
+said **five** where the answer was **eight** — caught by re-checking a number the
+author had carried from their own previous commit rather than derived. The immutable
+version is in `88f0bde7`'s merge message; this is the correction it points to.)*
+
 ## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
 
 - **A new status, not a reuse.** The obvious economy — park a question in
