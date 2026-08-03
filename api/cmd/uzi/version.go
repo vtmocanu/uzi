@@ -93,10 +93,17 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 				// the `server version ` label this line prints and an attacker
 				// sentence appears to come from uzi. Four such attacks were executed
 				// against this exact line (erase-display, line-overwrite, OSC 8
-				// hyperlink, bidi override), all exit 0. Sanitizing at PRINT time
-				// leaves --json byte-exact, which is the repo's standing rule: the
-				// structural encoder escapes what matters there and agents decode it
-				// verbatim.
+				// hyperlink, bidi override), all exit 0.
+				//
+				// Sanitizing at PRINT time leaves --json byte-exact, which is the
+				// repo's standing rule. 🔴 THE REASON IS THE DESTINATION, NOT THE
+				// ENCODER — do not restate this as "json escapes what matters".
+				// Measured on encoding/json: C0 and U+2028/U+2029 are escaped, but
+				// DEL (0x7f), the C1 controls (0x9b CSI among them), U+202E and the
+				// zero-widths are NOT. What makes --json safe is that its bytes go
+				// to a PARSER rather than to a terminal, and that sanitizing there
+				// would corrupt the payload an agent decodes. A caller who pipes
+				// --json straight to a TTY is outside that guarantee.
 				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], cellText(row[1]))
 			}
 			return nil

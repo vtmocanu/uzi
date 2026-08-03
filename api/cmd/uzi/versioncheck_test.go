@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -494,9 +495,46 @@ func TestVersionCommandSanitizesServerBuildInfo(t *testing.T) {
 	}
 }
 
-// --json stays BYTE-EXACT: the structural encoder escapes what matters and agents
-// decode it verbatim, so sanitizing there would corrupt payloads. This pins that the
-// sanitizer sits on the human render path only.
+// 🔴 PINS A SAFETY PROPERTY THAT IS EMERGENT FROM STATEMENT ORDERING, WITH NOTHING
+// ELSE HOLDING IT.
+//
+// compactText truncates with `s[:200]` — 200 BYTES, not runes — so a multi-byte rune
+// straddling that boundary is cut in half and the tail is an orphan continuation
+// byte. The output is nevertheless valid UTF-8, but ONLY because cellText runs its
+// outer strings.Map AFTER that slice, and Map re-encodes the orphan as U+FFFD.
+//
+// Swap those two steps, or call compactText alone on this path, and uzi emits
+// invalid UTF-8 derived from attacker-chosen input — with every existing assertion
+// still green, because the bytes carry no control character and sit on one line.
+// That is what this test exists for; it is not a duplicate of the control-character
+// tests above.
+//
+// The payload puts the boundary inside a 3-byte rune deliberately: 199 ASCII bytes
+// then U+20AC, so the slice keeps one byte of it.
+func TestVersionCommandOutputStaysValidUTF8(t *testing.T) {
+	withVersion(t, "v1.2.3")
+	payload := strings.Repeat("A", 199) + strings.Repeat("€", 4)
+	fc := &uzicli.FakeClient{Build: apitypes.BuildInfoDTO{Version: payload, Founded: "2026-07-03"}}
+
+	out, _, code := runCLI(t, skewEnv(t, fc), "version", "--url", skewURL)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "server version") {
+		t.Fatalf("the payload never reached the render path, so this proves nothing:\n%.120q", out)
+	}
+	if !utf8.ValidString(out) {
+		t.Errorf("stdout is not valid UTF-8 — the byte-slice truncation cut a rune and "+
+			"nothing re-encoded the orphan:\n%.120q", out)
+	}
+}
+
+// --json stays BYTE-EXACT, and the reason is the DESTINATION rather than the encoder:
+// those bytes go to a parser, and sanitizing them would corrupt the payload an agent
+// decodes. (encoding/json escapes C0 and U+2028/29 but NOT DEL, the C1 controls,
+// U+202E or the zero-widths — so "json escapes what matters" is not the reason and
+// must not be written down as one.) This pins that the sanitizer sits on the human
+// render path only.
 func TestVersionJSONStaysUnsanitized(t *testing.T) {
 	withVersion(t, "v1.2.3")
 	const raw = "0.14.0\rspoof"
