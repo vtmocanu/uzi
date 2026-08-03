@@ -92,6 +92,9 @@ function renderPage() {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // The confirm spy is per-test; restoring stops one test's stub deciding
+  // another's Reset click.
+  vi.restoreAllMocks();
 });
 
 describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
@@ -133,10 +136,19 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
       template: row({ updated_at: "2026-01-03T00:00:00Z" }),
     });
 
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderPage();
     expect(await screen.findByText("differs from shipped")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+
+    // The confirmation NAMES what it will discard, rather than asking a generic
+    // are-you-sure — the diff that justifies this click is several viewport
+    // heights above the button and cannot be read at the moment of pressing it.
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0][0]).toContain("description");
+    expect(confirm.mock.calls[0][0]).toContain("prompt body");
+    expect(confirm.mock.calls[0][0]).toContain("cannot be undone");
 
     await waitFor(() => expect(screen.queryByText("differs from shipped")).toBeNull());
     expect(await screen.findByText(/Matches the shipped definition/)).toBeTruthy();
@@ -221,6 +233,72 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
     // is not an error about the template, which loaded fine.
     expect(screen.queryByText("differs from shipped")).toBeNull();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeTruthy();
+  });
+
+  it("does not draw a phantom changed line for a trailing-newline mismatch", async () => {
+    // diffLines keeps the newline inside its token, so a body ending "…main." and
+    // one ending "…main.\n" came back as one removed and one added line of
+    // BYTE-IDENTICAL text — one green, one red, nothing saying why. Reachable on
+    // real data: every builtin .md ends with a newline and a textarea adds none.
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({
+        differs_from_builtin: true,
+        prompt_body: SHIPPED.prompt_body.replace(/\n$/, ""),
+      }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    const { container } = renderPage();
+
+    // The column is still NAMED — nothing upstream trims, so the row really does
+    // differ and really does badge. Only the RENDERER stops drawing a diff it
+    // cannot explain, and it says which case this is instead of showing nothing.
+    expect(await screen.findByText(/Identical except for trailing whitespace/)).toBeTruthy();
+    expect(screen.getByText(/prompt body/)).toBeTruthy();
+    // No line is shown as both removed and added.
+    const rows = Array.from(container.querySelectorAll("span.block"));
+    const added = rows.filter((r) => r.className.includes("text-danger")).map((r) => r.textContent);
+    const removed = rows.filter((r) => r.className.includes("text-ok")).map((r) => r.textContent);
+    expect(added.filter((a) => removed.some((r) => r?.slice(1) === a?.slice(1)))).toHaveLength(0);
+  });
+
+  it("does NOT reset when the confirmation is dismissed", async () => {
+    // The discriminating half: without this, a confirm that always returned true
+    // — or one wired to nothing at all — would pass the test above unchanged.
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: DRIFTED });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+    expect(await screen.findByText("differs from shipped")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(mockApi.resetAgentTemplate).not.toHaveBeenCalled();
+    expect(screen.getByText("differs from shipped")).toBeTruthy();
+  });
+
+  it("names only the columns that actually differ", async () => {
+    // A confirmation that always listed all four would be as uninformative as a
+    // generic one, and would misstate what is at stake.
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ differs_from_builtin: true, model: "haiku" }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Reset to default" }));
+
+    const message = confirm.mock.calls[0][0] as string;
+    expect(message).toContain("model");
+    expect(message).not.toContain("prompt body");
+    expect(message).not.toContain("description");
+    expect(message).not.toContain("tools");
   });
 
   it("the ins/del assertion can actually fire — control on the instrument, not the component", () => {

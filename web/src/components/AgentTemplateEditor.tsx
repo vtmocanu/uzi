@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
-import { diffArrays, diffLines, diffWords, type Change } from "diff";
+import { diffLines, diffWords, type Change } from "diff";
 import type { AgentTemplateInput, BuiltinDefinition } from "../lib/api";
 import { Alert, Button, Field, Input, Select } from "./ui";
 import { ModelSelect } from "./ModelSelect";
@@ -10,6 +10,9 @@ import {
   modelFieldWarning,
   renderSubagent,
   splitToolInput,
+  toolsSummary,
+  driftedColumns,
+  type TemplateContent,
   unknownTools,
 } from "../lib/agentTemplates";
 
@@ -32,6 +35,7 @@ export function AgentTemplateEditor({
   scopeEditable = false,
   isAdmin = false,
   builtin = null,
+  storedDiffers = false,
   submitLabel,
   busy,
   error,
@@ -47,6 +51,11 @@ export function AgentTemplateEditor({
   // every non-builtin row and for a builtin this release no longer ships — both
   // states the caller learns from GET /agent-templates/{id}/builtin.
   builtin?: BuiltinDefinition | null;
+  // storedDiffers is the SAVED row's server-computed verdict. The diff panel
+  // compares against live form state, so the two disagree the moment anyone
+  // edits; passing it in is what lets the panel say WHICH it is talking about
+  // instead of leaving the header badge to contradict it from 370px away.
+  storedDiffers?: boolean;
   submitLabel: string;
   busy: boolean;
   error: string;
@@ -241,6 +250,7 @@ export function AgentTemplateEditor({
       {builtin && (
         <BuiltinDiff
           shipped={builtin}
+          storedDiffers={storedDiffers}
           current={{
             description,
             model: model.trim() || null,
@@ -287,41 +297,43 @@ export function AgentTemplateEditor({
 // saying how much was skipped.
 const DIFF_CONTEXT = 3;
 
-// changedFields lists which of the four compared columns actually differ, using
-// the SAME rules as the server's agenttmpl.SameContent: tools order-sensitive,
-// null and [] both meaning inherit-all, and no trimming anywhere.
-function changedFields(shipped: BuiltinDefinition, current: EditorDiffState): string[] {
-  const out: string[] = [];
-  if (shipped.description !== current.description) out.push("description");
-  if ((shipped.model ?? "") !== (current.model ?? "")) out.push("model");
-  const a = shipped.tools ?? [];
-  const b = current.tools ?? [];
-  if (a.length !== b.length || a.some((t, i) => t !== b[i])) out.push("tools");
-  if (shipped.prompt_body !== current.prompt_body) out.push("prompt body");
-  return out;
-}
-
-interface EditorDiffState {
-  description: string;
-  model: string | null;
-  tools: string[] | null;
-  prompt_body: string;
-}
+// NBSP keeps a blank diff line from collapsing to zero height. Written as an
+// escape rather than as a literal on purpose: as a raw U+00A0 it is
+// indistinguishable from an ASCII space in every editor and terminal, and it
+// already cost one reviewer a mutation run whose pattern silently failed to
+// match. An invisible character in source is a trap for the next person folding
+// this code, not a formatting detail.
+const NBSP = "\u00a0";
 
 function BuiltinDiff({
   shipped,
   current,
+  storedDiffers,
 }: {
   shipped: BuiltinDefinition;
-  current: EditorDiffState;
+  current: TemplateContent;
+  // storedDiffers is the SAVED row's verdict, straight from the server DTO. The
+  // panel below compares against the CURRENT FORM STATE, so the two legitimately
+  // disagree the moment anyone edits — and they sit ~370px apart, far enough that
+  // an admin reads one with the other off screen. Whichever is true, the panel
+  // says so explicitly rather than leaving two unqualified sentences to contradict
+  // each other in different parts of the page.
+  storedDiffers: boolean;
 }) {
-  const changed = useMemo(() => changedFields(shipped, current), [shipped, current]);
+  const changed = useMemo(() => driftedColumns(shipped, current), [shipped, current]);
 
   if (changed.length === 0) {
     return (
       <div className="rounded-lg border border-edge bg-raised/40 p-3 text-sm text-muted">
         <span className="font-medium text-fg">Matches the shipped definition.</span> Nothing
         here differs from what this release ships for <code className="font-mono">{shipped.name}</code>.
+        {storedDiffers && (
+          <span>
+            {" "}
+            The <strong className="font-medium text-fg">saved</strong> template still differs —
+            save these changes to clear the badge.
+          </span>
+        )}
       </div>
     );
   }
@@ -334,6 +346,13 @@ function BuiltinDiff({
           {" "}
           — {changed.join(", ")}. Green is what this release ships; red is what this
           template says now. Reset replaces the red with the green.
+          {!storedDiffers && (
+            <span>
+              {" "}
+              These are <strong className="font-medium text-fg">unsaved</strong> edits; the
+              saved template still matches what is shipped.
+            </span>
+          )}
         </span>
       </div>
 
@@ -359,7 +378,7 @@ function BuiltinDiff({
 
       {changed.includes("prompt body") && (
         <DiffField label="Prompt body">
-          <LineDiff parts={diffLines(shipped.prompt_body, current.prompt_body)} />
+          <PromptBodyDiff shipped={shipped.prompt_body} current={current.prompt_body} />
         </DiffField>
       )}
     </div>
@@ -377,8 +396,23 @@ function DiffField({ label, children }: { label: string; children: ReactNode }) 
   );
 }
 
+// SR_MARKER labels a diff side for assistive tech. WCAG 1.4.1: colour may not be
+// the only carrier of meaning, and the word-diff below has no +/- prefix to lean
+// on the way the line and tools diffs do.
+//
+// THESE ARE sr-only SPANS AND DELIBERATELY NOT `<ins>`/`<del>`, which would be the
+// obvious semantic choice. The XSS canary in AgentDetail.test.tsx asserts the
+// rendered diff contains ZERO ins/del elements — that is the whole of how it
+// detects jsdiff's convertChangesToXML, which escapes its payload but not its own
+// wrappers. Adopting the semantic elements here would silently destroy that
+// canary. If a future change genuinely needs them, RESHAPE THE CANARY IN THE SAME
+// COMMIT and record why; a guard deleted to make an unrelated change compile is
+// how this class of guard dies.
+const SR_MARKER = { added: "now: ", removed: "shipped: " } as const;
+
 // InlineDiff renders a word-level diff as text nodes: shipped-only words in the
-// added tone, current-only words in the removed tone.
+// shipped tone, current-only words in the edited tone, each announced by an
+// sr-only marker so the distinction survives without colour.
 function InlineDiff({ parts }: { parts: Change[] }) {
   return (
     <>
@@ -387,6 +421,9 @@ function InlineDiff({ parts }: { parts: Change[] }) {
           key={i}
           className={p.added ? "bg-danger/15 text-danger" : p.removed ? "bg-ok/15 text-ok" : "text-muted"}
         >
+          {(p.added || p.removed) && (
+            <span className="sr-only">{p.added ? SR_MARKER.added : SR_MARKER.removed}</span>
+          )}
           {p.value}
         </span>
       ))}
@@ -394,25 +431,59 @@ function InlineDiff({ parts }: { parts: Change[] }) {
   );
 }
 
-// ToolsDiff diffs the allowlist as a SEQUENCE, not a set: order is rendered into
-// the subagent file, so a reordering is a real difference and shows up here as a
-// move rather than as "no change".
+// ToolsDiff shows the allowlist as BEFORE and AFTER rather than as a sequence
+// diff.
+//
+// The sequence form was correct and unreadable: the case this milestone most
+// needs to communicate is a pure REORDER, and a sequence diff renders that as
+// "Bash removed … Bash added" — two rows naming the same tool, which reads as a
+// rendering bug rather than as the answer to "what changed". Order still matters
+// and is still compared order-sensitively upstream; it is only the DISPLAY that
+// stops trying to express a move. This is the shape web-ux rated the most legible
+// of the four, already used by the model row.
 function ToolsDiff({ shipped, current }: { shipped: string[] | null; current: string[] | null }) {
-  const parts = diffArrays(shipped ?? [], current ?? []);
   return (
     <>
-      {(shipped ?? []).length === 0 && <span className="text-ok">(shipped: inherit all){"\n"}</span>}
-      {(current ?? []).length === 0 && <span className="text-danger">(now: inherit all){"\n"}</span>}
-      {parts.map((p, i) => (
-        <span
-          key={i}
-          className={p.added ? "bg-danger/15 text-danger" : p.removed ? "bg-ok/15 text-ok" : "text-muted"}
-        >
-          {`${p.added ? "+" : p.removed ? "-" : " "} ${(p.value as string[]).join(", ")}\n`}
-        </span>
-      ))}
+      <span className="block bg-ok/15 text-ok">
+        <span className="sr-only">{SR_MARKER.removed}</span>- {toolsSummary(shipped)}
+      </span>
+      <span className="block bg-danger/15 text-danger">
+        <span className="sr-only">{SR_MARKER.added}</span>+ {toolsSummary(current)}
+      </span>
     </>
   );
+}
+
+// PromptBodyDiff handles the one difference `diffLines` cannot render usefully: a
+// trailing-newline mismatch.
+//
+// `diffLines` keeps the newline inside its token, so a body ending "…main." and
+// one ending "…main.\n" come back as one removed and one added line of
+// BYTE-IDENTICAL text — one green, one red, with nothing on screen saying why.
+// It is reachable on real data rather than theoretical: every builtin `.md` ends
+// with a newline, the editor's textarea adds none, and `prompt_body` is submitted
+// verbatim, so an admin who retypes the last line earns a permanent unexplained
+// "changed" row.
+//
+// A trailing newline is a TERMINATOR, not content, so it is normalized away for
+// the DISPLAY only. Nothing upstream is trimmed: driftedColumns and the server's
+// SameContent both still compare exactly, so a whitespace-only edit still badges
+// and still lists "prompt body" here — which is why the whitespace-only case gets
+// its own sentence rather than an empty panel. Without it, the panel would name a
+// changed column and then show nothing that changed.
+function PromptBodyDiff({ shipped, current }: { shipped: string; current: string }) {
+  const oneTrailingNewline = (s: string) => s.replace(/\n*$/, "\n");
+  const a = oneTrailingNewline(shipped);
+  const b = oneTrailingNewline(current);
+
+  if (a === b) {
+    return (
+      <span className="text-muted">
+        Identical except for trailing whitespace at the end of the body.
+      </span>
+    );
+  }
+  return <LineDiff parts={diffLines(a, b)} />;
 }
 
 // LineDiff renders a line-level diff, collapsing long unchanged runs to a
@@ -463,7 +534,7 @@ function LineDiff({ parts }: { parts: Change[] }) {
       {rows.map((r, i) => (
         <span key={i} className={`block ${TONE[r.tone]}`}>
           {r.tone === "added" ? "+ " : r.tone === "removed" ? "- " : r.tone === "same" ? "  " : ""}
-          {r.text || " "}
+          {r.text || NBSP}
         </span>
       ))}
     </>

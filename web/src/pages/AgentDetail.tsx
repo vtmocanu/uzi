@@ -8,7 +8,7 @@ import {
   type AgentTemplateInput,
   type BuiltinDefinition,
 } from "../lib/api";
-import { renderSubagent, summarizeTools } from "../lib/agentTemplates";
+import { driftedColumns, renderSubagent, summarizeTools } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
 import { SkillAllocationPanel } from "../components/SkillAllocationPanel";
@@ -103,6 +103,29 @@ export function AgentDetail() {
   };
 
   const reset = async () => {
+    // F5: THE DIFF AND THIS BUTTON CANNOT BE ON SCREEN TOGETHER. Measured at
+    // 1280x633 the diff panel ends at 871px and this button starts at 1524px — a
+    // 653px gap on a 633px viewport, with the full-body preview between them, and
+    // that was against an 11-line mock body where real builtins run 27-138 lines.
+    // So the evidence this milestone exists to produce sits where it cannot reach
+    // the click, and "the diff view is what makes Reset safe to press" would have
+    // shipped false.
+    //
+    // The confirmation NAMES the columns rather than asking a generic
+    // are-you-sure, following the deleteWarning precedent in AnthropicTokens.tsx
+    // and for the same stated reason: a destructive action must say what it will
+    // take, not leave the user to discover it afterwards. It reads the shared
+    // driftedColumns, so it can never name a different set than the panel above.
+    if (template && shipped.kind === "ok") {
+      const columns = driftedColumns(shipped.def, template);
+      const warning =
+        columns.length > 0
+          ? `Reset "${template.name}" to the definition shipped in this release?\n\n` +
+            `This discards the current ${columns.join(", ")} and cannot be undone.`
+          : `Reset "${template.name}" to the definition shipped in this release?\n\n` +
+            `This template already matches what is shipped, so nothing will change.`;
+      if (!window.confirm(warning)) return;
+    }
     setFormError("");
     setNotice("");
     setBusy(true);
@@ -145,14 +168,27 @@ export function AgentDetail() {
             <h1 className="font-mono text-2xl font-semibold">{template.name}</h1>
             {/* Same copy as the Agents list, and deliberately not "customized":
                 the question is whether this row matches THIS release's shipped
-                body, not whether a human edited it. */}
+                body, not whether a human edited it.
+
+                F10: the explanation is DESCRIBED and also carried in an sr-only
+                span, because a bare `title` reaches mouse users only — the
+                RunCredential pattern. It is never an aria-label: that would
+                REPLACE the visible text, so a voice-control user saying "differs
+                from shipped" would match nothing (WCAG 2.5.3 Label in Name). */}
             {template.differs_from_builtin && (
-              <Badge
-                tone="info"
-                title="This template no longer matches the definition shipped in this release. The diff below shows what Reset would restore."
-              >
-                differs from shipped
-              </Badge>
+              <>
+                <Badge
+                  tone="info"
+                  aria-describedby="drift-hint"
+                  title="This template no longer matches the definition shipped in this release. The diff below shows what Reset would restore."
+                >
+                  differs from shipped
+                </Badge>
+                <span id="drift-hint" className="sr-only">
+                  This template no longer matches the definition shipped in this release. The
+                  diff below shows what Reset would restore.
+                </span>
+              </>
             )}
           </div>
           <p className="mt-1 text-muted">
@@ -178,6 +214,7 @@ export function AgentDetail() {
               initial={template}
               nameEditable={false}
               builtin={shipped.kind === "ok" ? shipped.def : null}
+              storedDiffers={template.differs_from_builtin}
               submitLabel="Save changes"
               busy={busy}
               error={formError}

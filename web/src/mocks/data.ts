@@ -1531,8 +1531,14 @@ export const mockRepoToolProfiles: Record<string, string[]> = {
 
 // ── Agent templates ──────────────────────────────────────────────────────────
 
+// The TRAILING NEWLINE is load-bearing, not formatting (issue #201 M4a F7b).
+// Every real builtin `.md` ends with one — agenttmpl's parse->Render round-trip
+// pins it byte-for-byte — and without it here the demo's own diff opened with a
+// phantom "changed" row: identical text shown once removed and once added,
+// because diffLines keeps the newline inside its token. The mock was making the
+// diff look broken in a way real data never would.
 const builtinBody = (name: string, description: string) =>
-  `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`;
+  `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.\n`;
 
 // mockShippedBuiltins is the SHIPPED side of the drift comparison (issue #201
 // M4a): what this mock "release" carries under each builtin name, and what Reset
