@@ -240,16 +240,22 @@ const (
 //     way. What clause 3 buys there is the message. Seven reds say the template
 //     lost seven behaviors, which is false; one Fatal says the boundary moved,
 //     which is true, and sends the reader to the one thing that changed.
-//   - boundary moved DOWN, past the first bullet: this is the one that matters.
-//     The bullet case reds, correctly-looking and misleadingly — the ordering
-//     sentence is still in the template — while every plan assertion passes
-//     against a region that has silently GROWN to include the first bullet. A
-//     plan phrase relocated into that bullet would satisfy its plan case from
-//     then on. One red pointing at the wrong thing, over a scope that quietly
-//     loosened: the same shape as the naive-split trap, one level in.
+//   - boundary moved DOWN, past the first bullet: this is the one that matters,
+//     and the cost is measured rather than predicted. Without clause 3 the only
+//     red is the bullet case — correct-looking and misleading, since the
+//     ordering sentence is still in the template — while the plan region has
+//     silently GROWN to include the first bullet. Folded on that tree: move the
+//     boundary down AND relocate the citation clause into the first bullet, and
+//     the citation case does NOT red. It matched from inside the bullet. One
+//     red pointing at the wrong thing, over a scope that quietly loosened, with
+//     a relocation going undetected underneath it — which is the exact class
+//     this whole change exists to close. With clause 3 present the same tree
+//     stops at `guard 3`, before any assertion is read.
 //
-// So: clause 3 is not the sole detector, it is the clause that keeps a red
-// honest and the one that notices a region growing. Both are worth a Fatal.
+// So: clause 3 is not the sole detector of a moved boundary. It is the clause
+// that keeps a red honest, and the one that stops a region silently growing
+// back into the whole-body semantics this change replaced. Both are worth a
+// Fatal, and the second is the one that would otherwise undo the change.
 //
 // All three are Fatalf rather than Errorf on purpose: once the split is not
 // trustworthy, the assertions below report on regions that are not the regions
