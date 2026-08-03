@@ -236,7 +236,9 @@ clone was destroyed, recreated at the same path, and the session still resolved
       8 files, which the run never edited — rather than acquiring `65496d0e`'s 10
       (shas and counts are in the "checkable from GitLab alone" passage above).
       Strictly it is the parked tree's roster, not the base commit's, and the two
-      coincide only because nothing in the run wrote under `.claude/`. That is
+      coincide only because nothing in the run wrote under the clone's
+      `.claude/` (the SDK's own transcript lives under `/data/agent-home/<run-id>/`
+      and is a different tree). That is
       correct — a resume that keeps its tree should keep
       the roster that tree was planned against — and it closes the reverse hazard,
       where a resume adopts a half-edited or role-dropping `.claude/agents/` that
@@ -374,8 +376,11 @@ clone was destroyed, recreated at the same path, and the session still resolved
   matches it. Measured 2026-08-03: we sent a push-your-branch follow-up to both
   parked runs — `a146df98` (example-app #78) and `edbc3884` (**uzi #209**) — and the one
   to `edbc3884` cites *"your fix wave (committed 15:28)"*, commits today's
-  behaviour destroys before the message is read. Both still show `consumed_at:
-  null` via `uzi run inputs --json`, so the claim is re-queryable. The instruction
+  behaviour destroys before the message is read. The durable anchors are the
+  input rows themselves — **id 43** (`created_at 2026-08-03T16:41:03.144954Z`)
+  and **id 44** (`16:44:44.761582Z`) — not their `consumed_at: null` at the time
+  of writing, which the worker's consume-on-read `GET /inputs`
+  (`workersvc/service.go:2467`) stamps the instant either run resumes. The instruction
   stays correct; its premise does not, and the agent has no way to tell. It
   belongs in its own issue rather than here on three counts: it is anchored to the
   bug, not to anything M1/M2 introduce; it fires on any re-clone, including a
@@ -391,7 +396,9 @@ clone was destroyed, recreated at the same path, and the session still resolved
   picks it up has a natural home: `buildImplementPrompt` already carries
   first-turn-only facts (`prompt.ts:608-650`), and the ordering there is free,
   since `pullFollowUp` runs at the END of an iteration and turn 1 therefore
-  cannot structurally carry a follow-up.
+  cannot carry a QUEUED follow-up. (Only queued: the `ask_user` path also writes
+  `followUp`, at `sdk-executor.ts:1036`/`:1042`, each with `iteration--; continue`,
+  so turn 1 can carry the lead's own answered question — a different channel.)
 
 ## Related
 
