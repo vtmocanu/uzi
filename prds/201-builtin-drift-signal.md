@@ -309,7 +309,28 @@ destructive click happened without the evidence, and the confirm now carries the
 column names into the click itself. That is the better of the two fixes offered: it works at
 every viewport and scroll position, which a layout change would not.
 
-#### RESIDUAL — the confirm names SAVED drift, not unsaved form edits
+#### F14 — FIX THIS. Owner-approved 2026-08-03, after the re-measure.
+
+**The behaviour that must hold:** an admin with unsaved edits who presses Reset is warned
+about *those* edits, naming the columns they have actually touched — not only the columns
+that differ in the saved row.
+
+**Not prescribing the implementation.** `AgentDetail` does not hold the form state today
+(`AgentTemplateEditor` does), so this needs either the editor to surface it or the
+confirmation to move. Both are defensible; the coder chooses and says which and why. Do not
+widen the dialog into a second diff — it is a warning, not a review surface.
+
+**Acceptance, and it must fail before the fix:** a stored row differing only in `prompt_body`,
+with an unsaved `description` edit in the form. Today the dialog names the prompt body and
+says nothing about the description. After the fix it names the description too. **Write the
+test so that reverting the change reddens it** — the vacuous-assertion trap in Amendment 3 F1
+was exactly a test that looked like it pinned a state it could not observe.
+
+Scoped deliberately: nothing else about Reset changes. The confirm still exists, dismiss is
+still a real escape hatch (measured), and criterion 9's client half must still hold —
+**re-run that, since it is the interaction this dialog sits in front of.**
+
+#### RESIDUAL that produced F14 — the confirm names SAVED drift, not unsaved form edits
 
 `AgentDetail.tsx:120` calls `driftedColumns(shipped.def, template)` against the **stored** row.
 Measured: the dialog said *"discards the current prompt body"* while also silently discarding
