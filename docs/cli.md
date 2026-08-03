@@ -622,8 +622,8 @@ uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew 
   warning at all. That also means the remedy is always the right one: only a
   `brew`-installed CLI can ever see this message.
 - **Not shown** when the CLI is *newer* than the server (nothing for you to do),
-  under `--quiet`, or for `uzi logout` and `uzi auth token`, which otherwise
-  make no network call at all.
+  under `--quiet`, or for `uzi logout`, `uzi auth token` and `uzi auth status`,
+  which otherwise make no network call at all.
 
 Set `UZI_VERSION_CHECK=0` to turn the check off entirely — for a test harness
 that counts output lines, say. It is a poor substitute for upgrading.

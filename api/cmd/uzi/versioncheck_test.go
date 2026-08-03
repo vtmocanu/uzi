@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -274,6 +275,50 @@ func TestSkewWarningSurvivesATransientProbeFailure(t *testing.T) {
 	_, err3, _ := runCLI(t, env, "run", "list", "--url", skewURL)
 	if !strings.Contains(err3, "is behind server 0.14.0") {
 		t.Errorf("a transient probe failure silenced the warning for the rest of the TTL:\n%q", err3)
+	}
+}
+
+// 🔴 THE OTHER HALF OF THE N-1 FIX, AND THE SUITE COULD NOT SEE IT.
+//
+// TestSkewWarningSurvivesATransientProbeFailure above drives its outage through the
+// `uzi version` call site and then reads a FRESH cache, so the HOOK's own
+// `serverVersion, _ = env.Store.RecordServerVersion(...)` is never exercised where
+// its return value matters. Folding that line back to discarding the return left the
+// entire suite green while silently losing the warning.
+//
+// The scenario that exercises it is the most ordinary instance of N-1 there is —
+// the offline laptop the morning after:
+//
+//	STALE cache (TTL expired) + FAILED probe + a prior good reading
+//
+// Stale, so the hook probes rather than taking the cache-hit branch; failed, so the
+// probe yields nothing; prior good reading, so there is something for the store to
+// hand back that the hook must then USE rather than discard.
+func TestSkewWarningStaleCachePlusFailedProbeKeepsWarning(t *testing.T) {
+	withVersion(t, "v0.11.8")
+
+	st := uzicli.NewStore(t.TempDir())
+	// A good reading from two hours ago — stale under the 1h TTL.
+	if _, err := st.RecordServerVersion(skewURL, "0.14.0", "v0.11.8", time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// PRECONDITION, asserted rather than assumed. Were this entry still fresh the hook
+	// would take the cache-hit branch and this test would pass while proving nothing —
+	// the exact vacuity it exists to avoid.
+	if v, fresh := st.CachedServerVersion(skewURL, time.Now(), uzicli.VersionCheckTTL); fresh {
+		t.Fatalf("precondition failed: seeded entry still fresh (%q) — the probe path is not exercised", v)
+	}
+
+	down := &uzicli.FakeClient{BuildErr: uzicli.Exitf(uzicli.ExitUnreachable, "dial tcp: connection refused")}
+	env := skewEnv(t, down)
+	env.Store = st
+
+	_, errOut, _ := runCLI(t, env, "run", "list", "--url", skewURL)
+	if down.BuildInfoCalls != 1 {
+		t.Errorf("BuildInfoCalls = %d, want 1 — a stale entry must be re-probed", down.BuildInfoCalls)
+	}
+	if !strings.Contains(errOut, "is behind server 0.14.0") {
+		t.Errorf("stale cache + failed probe + prior good reading lost the warning:\n%q", errOut)
 	}
 }
 
