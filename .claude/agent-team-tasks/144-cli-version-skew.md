@@ -1868,3 +1868,55 @@ auto      api/cmd/uzi/run.go, CLAUDE.md, specs/ai.md
 
 **This is the documented default-branch-drift hazard**, and the reason it was caught is a
 diffstat that did not look right — not a check anyone had scheduled.
+
+---
+
+## 27. AMENDMENT 20 — USER-APPROVED REWORK PLAN. Merge `main`, adopt `termsafe`, keep H2.
+
+Approved 2026-08-03 after §26. **This supersedes the "branch complete" state — the branch is
+NOT ready for an MR until this lands and is re-validated.**
+
+### The merge
+
+**`git fetch origin && git merge origin/main`. A PLAIN MERGE — never a rebase.** These SHAs
+have been reviewed by three validators and this repo forbids force-push; rewriting them
+invalidates every pinned measurement in §14-§25. Three conflicts, measured with
+`merge-tree` at `2ba2314f`: **`CHANGELOG.md`, `api/cmd/uzi/root.go`,
+`api/cmd/uzi/version.go`.** `run.go`, `CLAUDE.md`, `specs/ai.md` and `go.mod` auto-merge.
+
+### 🔴 THE ONE THING THAT WILL SILENTLY GO WRONG
+
+**`main` closed H1 and left H2 open, and the two functions are one letter apart.**
+
+| | strips controls? | truncates? |
+|---|---|---|
+| `uzicli.CellText` → `termsafe.CellText` | yes | **NO** — its doc says *"deliberately does not truncate"* |
+| `api/cmd/uzi`'s local `cellText` | yes | **yes**, via `compactText`'s `const max = 200` |
+
+`main`'s `version.go:79` uses the **non-truncating** one. So **a 1 MiB version string still
+prints in full on `main` today** — the auditor's H2, measured at 1,048,673 bytes on stderr,
+is live in shipped code.
+
+**Adopting `termsafe` without carrying a bound REOPENS H2, and every name involved says you
+did the safe thing.** The tester's `M26` fold is the control that catches it: with the cap
+gone, `TestSkewWarningSanitizesTheServerString/unbounded_build_metadata` must still redden.
+
+### Scope, as approved
+
+| item | action |
+|---|---|
+| the skew warning | **keep**, re-point its sanitization at `termsafe` |
+| our H1 sanitization of `serverRows` | **DROP** — `main` did it, as a shared leaf package with a biconditional pinned over every rune in Unicode. Theirs is better. |
+| the 200-char bound (H2) | **KEEP, and it now applies to `main`'s call site too** — that path is currently unbounded |
+| `x/text` v0.39.0, `goldmark` v1.7.17 | **keep** — `main` is still on v0.38.0 / v1.7.8 |
+| our `run.go` comment fix | **RE-READ before keeping.** `main` restructured this surface: `sanitize.go` now delegates to `termsafe`, whose package comment already carries a threat model. Ours may be redundant, misplaced, or still correct — decide by reading, not by assuming. |
+| our errcheck `_, _ =` edits | `main`'s `fb85e732` made the same edits. Take whichever the merge produces; do not re-apply by hand. |
+| `CHANGELOG` / `specs/*` / `CLAUDE.md` | keep; resolve the CHANGELOG conflict |
+
+### Re-validation is NOT optional
+
+Every measurement in §14 through §25 was taken against helpers that have now moved.
+**The full 32-mutation programme, the gate, and a review+audit pass must be re-run against
+the merged tip.** A green gate on a merge is not evidence that a pinned property survived
+the merge — that is the *fixture-across-a-boundary* shape this repo documents, arriving via
+someone else's refactor instead of via a cache.
