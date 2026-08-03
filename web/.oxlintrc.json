@@ -1,0 +1,68 @@
+// oxlint for web/ (PRD #103 M3).
+//
+// JSONC, DELIBERATELY. oxlint parses this file as JSONC (verified at 1.76.0:
+// both `//` and `/* */` are accepted), which is the only way to document a
+// config whose every trap below is invisible in a clean run. A `"//": [...]`
+// comment KEY does NOT work - oxlint's schema rejects unknown top-level fields
+// and exits 1 naming the field, which is the right direction but is not a
+// comment mechanism.
+//
+// Run it via `task lint:web` -> `npm run lint` -> oxlint --config THIS FILE.
+// Read that chain before changing anything here.
+//
+// 🔴 FORBIDDEN IN THIS FILE, and a diff adding either reads as a policy
+// violation rather than a configuration change: `jsPlugins` (oxlint's own docs
+// describe the value as a "Path or package name of the plugin" - an executable
+// the runner then loads) and `extends` (which indirects the effective ruleset
+// out of the reviewed file). Reviewers do not read config files the way they
+// read code, so the ban lives where the diff lands. Same ban as
+// `linters.settings.custom` in .golangci.yml - see that file's header, which
+// also records the weaker sibling neither ban closes: a branch author can
+// NEUTER this gate from this file (an empty plugin list, an ignorePatterns
+// swallowing everything) and the pipeline stays green because the linter
+// genuinely found nothing. CODEOWNERS is the only structural fix and is out of
+// scope for M3.
+//
+// 🔴 `plugins` REPLACES THE DEFAULT LIST, IT DOES NOT EXTEND IT. All three
+// defaults (unicorn, typescript, oxc) are re-listed below alongside react for
+// exactly that reason. Measured on web/src at oxlint 1.76.0, 2026-08-02:
+//
+//   plugins: ["react"]                                 5 findings
+//   plugins: ["react","unicorn","typescript","oxc"]    6 findings
+//
+// The narrowing is invisible in the verdict - it shows up only in the count,
+// which is the one thing nobody re-derives.
+//
+// 🔴 NAMING A RULE WITHOUT DECLARING ITS PLUGIN IS A SILENT NO-OP, and it is
+// precisely the case a reviewer reading this file would pass, because the
+// config visibly names the rule. Measured the same day:
+//
+//   {plugins:["react"], rules:{"react-hooks/rules-of-hooks":"error"}}  exit 1, FIRES
+//   {                   rules:{"react-hooks/rules-of-hooks":"error"}}  exit 0, SILENT
+//   {plugins:["react"], rules:{"react-hooks/rules-of-hookz":"error"}}  exit 1, LOUD
+//
+// A TYPO IS LOUD; A MISSING PLUGIN IS SILENT. That asymmetry is why the plugin
+// list is the load-bearing half, not the rules block.
+//
+// 🔴 AND `rules-of-hooks` NEEDS EXPLICIT RULE-LEVEL PROMOTION, NEVER A
+// CATEGORY. It is `pedantic`, not `correctness`, so the correctness tier cannot
+// reach it:
+//
+//   oxlint --react-plugin src                    exit 0, silent
+//   oxlint --react-plugin -D correctness src     exit 0, SILENT   <- the trap
+//   ... plus -D react-hooks/rules-of-hooks       exit 1, fires
+//
+// Line 2 is this whole milestone going green over the rule it exists for. The
+// `-D correctness` in package.json's `lint` script is for the correctness TIER
+// and is NOT the guard for this rule; the entry below is.
+//
+// 🔴 NOTHING HERE MAY SHIP AT "warn". A rule at warn PRINTS its violation and
+// EXITS 0 (measured), so a warn-severity gate is a report that always passes.
+// That is the same silent-green shape PRD #103 exists to remove.
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "unicorn", "typescript", "oxc"],
+  "rules": {
+    "react-hooks/rules-of-hooks": "error"
+  }
+}

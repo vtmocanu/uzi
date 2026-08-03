@@ -1,0 +1,31 @@
+# deadcode baseline for the `controller` Go module (PRD #103 M4).
+#
+# 🔴 EMPTY OF ENTRIES BY DESIGN. `deadcode -test ./...` reported ZERO findings on
+# this module when M4 landed (2026-08-02), so it ships at zero and the gate holds
+# it there. Nothing was deleted here -- unlike `api/.deadcode-baseline`, which
+# reached zero by deleting one function.
+#
+# READ `api/.deadcode-baseline`'s HEADER before adding anything here. It carries
+# the full rules (format, when a suppression is legitimate, how to regenerate,
+# why the key is position-free, and the CODEOWNERS residual this file shares);
+# they are identical for both modules and are not restated so the two cannot
+# drift apart.
+#
+# 🔴 THE RESIDUAL IN ONE LINE, because it is the one rule a reader must not have
+# to follow a pointer for: a branch author can baseline a genuinely dead function
+# in this file and the pipeline stays green, since the gate fails on ADDITIONS
+# rather than on entries. There is no CODEOWNERS file anywhere in this tree today.
+#
+# REGENERATE WITH (by hand):
+#     ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0 --write
+#
+# ONE FIGURE WORTH KNOWING BEFORE YOU READ A ZERO HERE AS "no dead code":
+# WITHOUT `-test` this module reports FOUR functions -- `SpecHashOf`,
+# `SizeNames`, `TemplateNames` and `keys`. They are reachable ONLY from tests, so
+# the gating invocation correctly treats them as live -- and `golangci-lint
+# unused` does not see them either: three are EXPORTED (which `unused` does not
+# report), and the fourth, unexported `keys`, is called by two of the other three
+# inside its own package, so it is used by `unused`'s definition. That is the
+# commonest way dead code enters a repo with a testing culture: write the
+# function, write its test, never wire it up. `task deadcode:controller:all`
+# prints them; it is reported and never gating.

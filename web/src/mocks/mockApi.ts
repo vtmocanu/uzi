@@ -2423,7 +2423,7 @@ export const mockApi = {
     // Re-read at bucket=all (so a just-dismissed group still returns with its new rollup),
     // narrowed to the acted-on coordinates — the shape the page re-renders rows from.
     const backlog = computeBacklog("all", "");
-    const acted = new Set([...want.keys()]);
+    const acted = new Set(want.keys());
     const groups = backlog.groups.filter((g) => acted.has(coordKey(g.category, g.target)));
     const result: JudgeDispositionResult = {
       updated: writtenTriples.size,

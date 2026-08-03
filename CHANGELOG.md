@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-03
+
 ### Added
 
 - **The run page now says when a judge is already on its way**, instead of
@@ -41,6 +43,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (editing a builtin is admin-only; everyone else gets a 403). Reset re-applies
   the shipped body verbatim, so re-apply any local customization on top. See
   [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
+- **Contributor tooling: the `agent` suite's per-test timeout is 120000, and its
+  largest test file was split into seven.** The cap was binding in CI and nowhere
+  else — node isolates test files in a child process per file on the CI image but
+  shares one process locally, so the same flag caps a whole *file* there and each
+  *suite* here, and a file running 96s locally passed a 30s cap while failing it
+  in CI. Splitting the file is what removed the knife edge; the raised cap only
+  bought margin. Cut the whole agent suite from 112s to 46s locally
+  (`37eefea6`, `32ff4bcf`). Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: the three prior-art projects are no longer vendored as
+  git submodules.** `./scripts/link-inspiration.sh` clones them once to a shared
+  directory outside the repo and symlinks them into a gitignored `inspiration/`,
+  so a fresh clone no longer drags the corpus along. Note `rg` and `grep -r` do
+  not follow symlinked directories, so a repo-wide sweep silently returns nothing
+  from it — search it by explicit path or with `-L` (`19ad63c3`). Developer-facing
+  only: no change to how uzi behaves, and a worker container never had access to
+  the corpus either way.
+
 - **Contributor tooling: both Go modules are now `gofmt`-clean and a format check
   runs in the gate.** `task fmt-check` fails on any formatting drift and names the
   files; it also runs first inside `task gate:api` / `task gate:controller` and
@@ -48,6 +68,39 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   MR instead of accumulating. Part of the developer-loop quality-gate work in
   PRD #103, which also moved every gate recipe into the root `Taskfile.yml`.
   Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: linting now runs in the gate and on every MR**, for the
+  first time in this repo. `task lint` covers all four components and each
+  `task gate:<component>` runs its own. Go gets golangci-lint (`errcheck`,
+  `staticcheck`, `ineffassign`, `unused`, `unparam`, and `nolintlint`, which
+  lints the suppressions themselves so a bare or vacuous `//nolint` is a finding
+  rather than a silent blanket exemption), ratcheted against
+  `origin/main` so only findings a branch introduces block; `web` and `agent` get
+  oxlint, configured so `react-hooks/rules-of-hooks` actually runs, which the
+  default severity tier does not reach. The 16 pre-existing TypeScript findings
+  were fixed rather than baselined. Part of PRD #103. Developer-facing only: no
+  change to how uzi behaves. **Existing checkouts need
+  `npm install --ignore-scripts` in *both* `web/` and `agent/` before
+  `task gate:web` / `task gate:agent` will run** — oxlint is a new devDependency
+  and the lint step fails closed with `oxlint: command not found` until it is
+  installed. `--ignore-scripts` matters in `agent/`: without it, `agent-browser`'s
+  postinstall rewrites the host's `agent-browser` binary. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: dead code is now detected in the gate and on every MR.**
+  `task deadcode` covers all four components and each `task gate:<component>`
+  runs its own. The Go modules use `golang.org/x/tools/cmd/deadcode` against a
+  committed baseline that ships **empty**, so both are held at zero — the one
+  unreachable function that existed was deleted rather than baselined. `web` and
+  `agent` use knip, which gates unused files and dependencies at zero while
+  reporting unused *exports* without failing the build; burning that tier down
+  is tracked as issue #206. Neither tool sees a dead *branch*, which stays a review
+  question. Part of PRD #103; no new CI jobs. Developer-facing only: no change to
+  how uzi behaves. **Existing checkouts need `npm install --ignore-scripts` in
+  *both* `web/` and `agent/`** before `task gate:web` / `task gate:agent` will
+  run — knip is a new devDependency and the step fails closed with
+  `knip: command not found` until it is installed, the same way oxlint did.
   See [docs/dev-conventions.md](docs/dev-conventions.md).
 
 ### Fixed
@@ -61,6 +114,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   model, and a recorded fixture from a real run pins them to each other from both
   sides so they cannot drift apart again (issue #195). This also unblocks the
   live cost estimate in PRD #194.
+
+- **Git repositories the worker creates no longer leave a background daemon
+  watching their directory.** Any git command in a repo where `core.fsmonitor`
+  is on spawns `git fsmonitor--daemon --detach`, which reparents to init and
+  holds directory handles for as long as it lives, so the run's cleanup deleted
+  every file and then could not remove the directory. Issue #127 removed a
+  different detached child (`git maintenance run --auto`) and could not cover
+  this one: a retry absorbs a lock held for milliseconds, not a watcher that
+  never lets go. The worker's bare clone, the runner clone and the seed
+  destination now set `core.fsmonitor=false`. **In a worker container this is a
+  no-op** — the daemon dies with the container either way — so the effect is on
+  local development, where one such daemon was found still alive 21 days after
+  its repo was created (issue #127).
+
+### Security
+
+- **The web image's SPA build stage now runs `npm ci --ignore-scripts`.** No
+  dependency in the current lockfile tree would execute a lifecycle script
+  while producing the bundle served to users; the flag keeps that true across
+  the next lockfile refresh, which is when nobody is looking. Hardening, not a
+  fix: the image built both ways is byte-identical today. Deliberately not
+  applied to the worker's base image, whose postinstall is what bakes in the
+  `agent-browser` CLI.
 
 ## [0.13.0] - 2026-07-29
 

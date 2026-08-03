@@ -42,6 +42,17 @@ export interface Fixture {
 export function disableAutoMaintenance(repoPath: string, env: NodeJS.ProcessEnv): void {
   execFileSync("git", ["-C", repoPath, "config", "maintenance.auto", "false"], { env, stdio: "pipe" });
   execFileSync("git", ["-C", repoPath, "config", "gc.auto", "0"], { env, stdio: "pipe" });
+  // A SECOND detached daemon the two keys above do not cover: `git fsmonitor--daemon
+  // run --detach`, spawned wherever core.fsmonitor is true. It reparents to init and
+  // watches the directory for its whole life, so it holds handles indefinitely rather
+  // than for the milliseconds a maintenance child does — the difference between a race
+  // and a permanent block. Callers here pass a GIT_CONFIG_GLOBAL=/dev/null env, so this
+  // key is belt-and-braces for the fixture origin; the repos that actually leaked are
+  // the ones `src/git.ts` creates, and it sets the same key for the reason written
+  // there. Kept symmetrical on purpose: a reader comparing the two helpers should not
+  // have to wonder whether the omission was deliberate. See that comment for the
+  // measurement (a 21-day-old daemon holding a deleted fixture).
+  execFileSync("git", ["-C", repoPath, "config", "core.fsmonitor", "false"], { env, stdio: "pipe" });
 }
 
 /**

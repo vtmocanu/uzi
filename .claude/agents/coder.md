@@ -95,11 +95,47 @@ own leak detector), never by inference from the dev host's green run.
 
 ## For this repo (uzi)
 
-Gate slots here are: **format `task fmt-check`, lint `none (gap)`, dead code
-`none (gap)`, coverage `none (gap)`** — this repo has no linter yet (PRD #103 M3
-builds one), so "run every slot" means fmt-check + vet + build + typecheck +
-test, which is what `task gate` runs. Do not go hunting for a lint command;
-there isn't one. `fmt-check:api` / `fmt-check:controller` run FIRST inside
+Gate slots here are: **format `task fmt-check`, lint `task lint`, dead code
+`task deadcode`, coverage `none (gap)`** — so "run every slot" means fmt-check +
+vet + build + lint + deadcode + typecheck + test, which is what `task gate`
+runs. *(PRD #103 M4, 2026-08-02: the dead-code slot read `none (gap)` here until
+M4 closed it. Note this file phrases the claim differently from every other copy,
+which is how a literal grep for the wording used elsewhere missed it during M3.)*
+
+**Two things about the dead-code slot that decide how you read a green.** The Go
+half (`deadcode -test ./...` per module) gates at ZERO against a committed,
+EMPTY baseline — if it reddens, DELETE the function; adding a line to
+`api/.deadcode-baseline` is a deliberate suppression that owes a reason in a
+comment, and the gate treats an entry that has stopped being reported as a
+failure so a suppression cannot outlive its finding. The npm half (knip) stages
+the **exports/types family at `warn`: printed on every run, setting no exit
+code** — 22 findings on `web` and 53 on `agent` as of 2026-08-02 — while unused
+files and dependencies gate at zero. So a green `task deadcode:web` does not
+mean "no unused exports"; it means none of the *gating* tiers fired. Neither
+tool sees a dead **branch** (a `case` arm nothing reaches inside a live
+function); that stays the reviewer's job.
+
+**The lint slot is ratcheted on the Go side and `task`'s echo cannot show it.**
+`.golangci.yml` carries `issues: {new-from-merge-base: origin/main,
+whole-files: true}`, so only findings your branch introduces block — and
+`whole-files` means **pre-existing findings in a file you merely touched block
+too**. That is the flag working, not a bug, and it is the adoption cost you will
+meet first. `task lint:api:all` / `lint:controller:all` print the unfiltered
+backlog; they are reported, never gating, and are not in `task gate` — though
+they still **exit nonzero** whenever they report anything. **Run one rather than
+quoting a number from here**: this block sits two slots below a `format` slot
+whose whole comment is about a tally that read 26, then 25, then 19, then 16. If a lint target dies with `origin/main is unresolvable`,
+run `git fetch origin main` — **do not read the backlog it would otherwise
+print as your branch's findings.** And if a Go lint target prints
+`Error: parallel golangci-lint is running`, a sibling worktree holds the
+host-global lock: **re-run, do not report a red gate.** That one is invisible to
+the exit code — golangci-lint exits 3, `go run` prints it as text and exits **1**
+itself, which is the "there are findings" status — so the message text is the
+only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
+said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go
+hunting for a lint command; there isn't one". M3 landed golangci-lint for both
+Go modules and oxlint for both npm packages.)* `fmt-check:api` /
+`fmt-check:controller` run FIRST inside
 `gate:api` / `gate:controller`, so a component gate already covers the format
 slot; `task fmt-check` runs just that slot over both Go modules. It fails on any
 `gofmt` drift and names the files, module-relative (`internal/…`). *(PRD #103 M2,

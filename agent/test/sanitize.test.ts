@@ -173,8 +173,15 @@ describe("MessageBatcher sanitizes BEFORE redacting (PRD #108, security)", () =>
     batcher.emit({ kind: "tool_result", agent: "lead", payload: { content: spew } });
     await batcher.close();
 
-    const wire = JSON.stringify(sent[0]);
+    const first = sent[0];
+    // Asserted BEFORE indexing into it (PRD #103 M3, oxlint
+    // eslint(no-unsafe-optional-chaining)): the old form was
+    // `(sent[0]?.payload as …).content`, which on an empty `sent` threw a
+    // TypeError from the optional chain rather than failing an assertion. Same
+    // coverage, a readable failure instead of a crash.
+    assert.ok(first, "the batcher must have sent a frame");
+    const wire = JSON.stringify(first);
     assert.ok(!wire.includes("\\u0000"), "no NUL escape reaches the api");
-    assert.strictEqual((sent[0]?.payload as { content: string }).content.length, 600);
+    assert.strictEqual((first.payload as { content: string }).content.length, 600);
   });
 });
