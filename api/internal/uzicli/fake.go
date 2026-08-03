@@ -47,9 +47,12 @@ type FakeClient struct {
 	RateLimits     []apitypes.AdminRateLimitRowDTO
 
 	// Build is the canned GET /api/version reply; BuildErr fails that one call
-	// without failing the rest (see BuildInfo).
-	Build    apitypes.BuildInfoDTO
-	BuildErr error
+	// without failing the rest (see BuildInfo). BuildInfoCalls counts the calls —
+	// no mutex, like the rest of this fake, because every consumer is a
+	// single-goroutine command test.
+	Build          apitypes.BuildInfoDTO
+	BuildErr       error
+	BuildInfoCalls int
 
 	// Auth-flow canned replies (uzi login). StartCLIAuth returns AuthStart;
 	// PollCLIAuth pops the front of AuthPolls each call (and repeats the last entry
@@ -343,7 +346,14 @@ func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {
 // unreachable, so a test needs to fail this one call without failing everything
 // else the command might do. Err still applies when BuildErr is unset, so the
 // usual "every method fails" fixture keeps working.
+//
+// It counts its calls, and that counter is not a convenience: with the version-skew
+// hook on the root command, "the probe was skipped" and "the probe ran and printed
+// nothing" produce IDENTICAL output, so every exemption, suppression and cache-hit
+// claim is unobservable without it. Asserting on absent stderr would pass against an
+// implementation that probes on every command and merely stays quiet.
 func (f *FakeClient) BuildInfo(context.Context) (apitypes.BuildInfoDTO, error) {
+	f.BuildInfoCalls++
 	if f.BuildErr != nil {
 		return apitypes.BuildInfoDTO{}, f.BuildErr
 	}

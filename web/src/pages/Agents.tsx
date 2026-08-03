@@ -17,6 +17,12 @@ import {
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
 import { PlusIcon } from "../components/icons";
 
+// SHADOWED_HINT is stated once and used twice — as the badge's `title` and as the
+// text of the sr-only span it points at. Two copies of the same sentence is how a
+// tooltip and its accessible description quietly stop agreeing.
+const SHADOWED_HINT =
+  "A builtin or global template shares this name and takes precedence, so this agent is dropped from your runs. Rename it to use it.";
+
 export function Agents() {
   const { user } = useAuth();
   const isAdmin = !!user?.is_admin;
@@ -181,6 +187,17 @@ function AgentRow({
 }) {
   const effective = alloc?.effective ?? false;
   const globalDefault = alloc?.global_default ?? false;
+  // Per-row ids: these hints sit in a table, so a single shared id would point
+  // every row's badge at the first row's description.
+  const shadowedHintId = `shadowed-hint-${t.id}`;
+  const driftHintId = `drift-hint-${t.id}`;
+  // F4: the second sentence is admin-only because the diff is not universally
+  // reachable — a non-admin gets ReadOnlyView on the detail page, which has no
+  // diff panel, and /{id}/builtin 403s them anyway. The badge itself is honest
+  // for everyone; only the invitation to open it was not.
+  const driftHint = isAdmin
+    ? "This template no longer matches the definition shipped in this release. Open it to see the diff."
+    : "This template no longer matches the definition shipped in this release.";
   return (
     <tr className="transition-colors hover:bg-raised/30">
       <td className="px-4 py-3">
@@ -193,13 +210,40 @@ function AgentRow({
               orchestrator
             </Badge>
           )}
+          {/* F10: every badge here explains itself through a `title` alone, which
+              reaches mouse users only. The explanation is DESCRIBED via an sr-only
+              span (RunCredential's pattern) and never via aria-label, which would
+              REPLACE the visible word and break voice control (WCAG 2.5.3).
+              `shadowed` is fixed alongside because it has the identical gap — it
+              is page-wide, not something the drift badge introduced. */}
           {shadowed && (
-            <Badge
-              tone="warning"
-              title="A builtin or global template shares this name and takes precedence, so this agent is dropped from your runs. Rename it to use it."
-            >
-              shadowed
-            </Badge>
+            <>
+              <Badge
+                tone="warning"
+                aria-describedby={shadowedHintId}
+                title={SHADOWED_HINT}
+              >
+                shadowed
+              </Badge>
+              <span id={shadowedHintId} className="sr-only">
+                {SHADOWED_HINT}
+              </span>
+            </>
+          )}
+          {/* The copy is "differs from shipped", never "customized" or "edited"
+              (issue #201 M4a). This answers "does this row differ from the body
+              shipped in THIS release?", which a row nobody has touched can answer
+              yes to simply by predating the release. Calling it an edit would make
+              M4b's auto-update read as undoing someone's work. */}
+          {t.differs_from_builtin && (
+            <>
+              <Badge tone="info" aria-describedby={driftHintId} title={driftHint}>
+                differs from shipped
+              </Badge>
+              <span id={driftHintId} className="sr-only">
+                {driftHint}
+              </span>
+            </>
           )}
         </span>
       </td>

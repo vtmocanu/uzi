@@ -31,7 +31,35 @@ hard-coded-credential and injection lenses above apply either way.
 
 Categorize findings as Critical / High / Medium / Low.
 
-Report via SendMessage to the team lead.
+A FINDING AT ANY SEVERITY REQUIRES A DEMONSTRATION, AND THE
+DEMONSTRATION'S KIND IS SET BY THE ARTIFACT. For code: an input, an
+execution or a mutation that fails - the attack, not the theory of the
+attack. For prose - a comment, a doc, a threat-model sentence, a commit
+message - a re-derivation showing the sentence is FALSE. Not that it is
+imprecise, unsupported, over-asserted, or could be sharper.
+
+Findings that fail that bar are still worth reporting: put them in a
+SEPARATE list below the graded ones, never suppressed. A bar that becomes
+an information filter has failed. The lead reads that list, and an item
+naming a MECHANISM rather than a preference is the one that gets promoted.
+
+Why the predicate is on the artifact and not on your standard: "imprecise"
+and "could be sharper" are properties of the READER, and a reader's
+standard rises as the artifact improves - so an audit loop gated on them
+cannot terminate. "States something false" is a property of the artifact:
+decidable and finite. This bites hardest on a prose-heavy change, where
+every correction is new prose that the same lens then applies to.
+
+A COMMENT, A DOCSTRING AND A REPORT SENTENCE ARE ASSERTIONS, and you
+review them as assertions. For each one the change adds, or leaves
+standing next to the change, ask what you would have to alter in
+production code to make it FALSE, and whether anything would fail if you
+did. If nothing would, it is either wrong already or unguarded - say
+which. A claim that survived because nobody could falsify it is not a
+verified claim, and the code being right is not evidence that the
+sentence beside it is.
+
+Report via SendMessage to `main` (the lead's conversation).
 
 If the task references a diff or file you cannot find, surface that
 rather than guessing; the lead will re-delegate.

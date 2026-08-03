@@ -719,6 +719,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/{id}", h.GetAgentTemplate)
 			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
 
+			// The definition this binary ships for a builtin row (issue #201 M4a),
+			// so the editor can diff shipped-vs-stored before anyone presses Reset.
+			// Read-only, but gated by the WRITE authz (authorizeTemplateWrite inside
+			// the handler, as reset is) because its whole audience is the callers who
+			// can press that button.
+			r.Get("/{id}/builtin", h.GetBuiltinAgentTemplate)
+
 			// Skill allocations (PRD #16): the shared half is admin-only and the
 			// mine half is any user's own overlay, so authz is per-half inside the
 			// handler (per-half), not a blanket admin gate.

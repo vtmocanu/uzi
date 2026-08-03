@@ -8,6 +8,127 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Agent templates now flag when a builtin has drifted from what this uzi
+  version ships.** A **differs from shipped** badge appears on the Agents
+  list and on a builtin's detail page whenever its stored description,
+  model, tools, or prompt body no longer matches the shipped definition,
+  whether the drift is your own edit or a shipped update you haven't picked
+  up yet. Opening the template now shows the actual diff before you press
+  **Reset to default**, which still replaces the whole body verbatim and
+  still isn't automatic (issue #201). **Operators:** issue #210 rewrote ten
+  of the eleven builtin templates' bodies to fix an unreachable report
+  recipient (see Fixed, below); on any already-seeded install, those ten
+  will badge as differing the moment you deploy this build. That's the new
+  signal working as intended, not a defect: open each and click Reset to
+  pick it up. See
+  [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
+- **`uzi` now warns when the CLI you're running is older than the server it's
+  talking to.** A CLI three minors behind was silently dropping fields it
+  didn't know about — `run get --json` printed `null` for token attribution
+  that a `curl` against the same endpoint returned fine — with nothing telling
+  you why. The warning prints to stderr (never stdout, so `--json` output stays
+  parseable) and costs at most one version probe an hour. Suppress it with
+  `--quiet` or `UZI_VERSION_CHECK=0` (issue #144).
+
+### Changed
+
+- **Subagents no longer have the ordinary route to write files during a run's
+  plan turn**, the phase before you approve a plan. Every subagent's `Edit`,
+  `Write`, `MultiEdit` and `NotebookEdit` tools are removed for that turn
+  only; the implement turn is unaffected, so a role that needs to write is
+  exactly as able to once the plan is approved. This is a hygiene control,
+  not a guarantee: the turn still runs under `Bash`, and nothing at the
+  guardrail layer denies a shell-based write (`echo >`, `sed -i`, `tee`), so
+  what changes is the tool a model reaches for by default and its awareness
+  that one exists, on top of the prompt instruction that was previously the
+  only thing saying not to. Actually catching a worktree change no matter how
+  it was made is tracked separately as issue #212 (issue #203).
+
+- **Worker names and CLI-token names are now validated on write, and reject
+  terminal-unsafe characters that were accepted before.** `POST
+  /api/workers`, the hosted-worker provisioning path, and both the
+  CLI-token mint and device-start flows now return 400 for control
+  characters, Unicode format characters (bidi overrides, zero-widths, the
+  BOM, the soft hyphen), and invalid UTF-8; names are still trimmed of
+  leading and trailing whitespace before that check, unchanged from before.
+  These names are read back in cross-tenant admin listings beside a
+  different user's account, so an unvalidated one was terminal control
+  injection into another user's session, and an embedded newline could
+  forge a whole table row in a listing an admin reads to make decisions.
+  Existing stored names are untouched by this change and stay covered by
+  the render-side fix instead (issue #180), which strips the same
+  characters on the way out (issue #169).
+
+### Fixed
+
+- **Subagents in ten of the eleven builtin agent templates now reach the team
+  lead when they report back.** Each template's "report via SendMessage"
+  instruction named the recipient "the team lead," but the only address
+  reachable from a builtin body is `main`: the lead's own template runs as the
+  main thread, not as an invokable subagent, so a call addressed to "the team
+  lead" (or a bare "lead") failed with "No agent named 'lead' is reachable."
+  Measured across three real runs, 8 of 26 SendMessage reports failed this
+  way. Five subagents recovered by resending to `main`, each costing a
+  regenerated report of several kilobytes plus a few tool round-trips; the
+  other three gave up on SendMessage entirely and returned their findings
+  through a different channel, each prefixed with an apology about uzi's own
+  plumbing that a human then read in the report. The thirteen recipient
+  instructions across the ten templates now name `main` explicitly; the role
+  is still called "the team lead" in surrounding prose, since a blanket
+  rename there would misread as proposing action to the tool address rather
+  than describing the role. **Operators:** the fix does not reach an install
+  that has already booted, since builtin seeding never overwrites an existing
+  template row. An admin must open each of the ten affected templates and
+  click **Reset to default** to pick it up (issue #210).
+
+- **Release tooling: the CHANGELOG coverage gate could block a good release,
+  about once every dozen runs, and a retry made it go away.** It reported a
+  merge as uncited while the section cited it on the line the check had just
+  matched. Cause: `printf '%s' "$SECTION" | grep -q <pattern>` under
+  `set -o pipefail`. `grep -q` exits the instant it matches and closes the pipe;
+  bash's `printf` builtin writes line-buffered, so an 8.5 KB section leaves the
+  shell as 72 separate writes and is still writing when grep goes; the next
+  write takes SIGPIPE and `pipefail` reports 141 for a pipeline whose grep
+  succeeded. Every `grep` in the script now reads a file, which has no writer to
+  kill. Present since the gate was first added, on the issue-number lookup and
+  on both escape hatches, not only on the short-SHA citation added the same day
+  it was found (`19ad63c3` was the merge it flagged; job 134884 failed, retry
+  134892 passed on the identical commit). Developer-facing only: no change to
+  how uzi behaves.
+
+- **A hostile server can no longer flood your terminal through `uzi version`.**
+  The build-info strings uzi prints are now capped as well as stripped of
+  terminal control characters: the stripping arrived with the shared render
+  boundary (issue #180), but that boundary deliberately does not truncate, so a
+  server returning a megabyte-long version string still printed all of it. The
+  version line is bounded now (issue #144).
+
+### Security
+
+- **The `uzi` CLI no longer renders server-supplied text on your terminal
+  raw.** Every human-readable render path (tables, printed lines, the error
+  line, login and version output) passed the server's strings straight
+  through, so a hostile or compromised server the user had pointed `--url`
+  at could clear the screen, rewrite the window title, or use a bidi
+  override to make a name read as something other than what it says.
+  Terminal control characters and Unicode format characters (the bidi
+  overrides, zero-widths, the BOM) are now stripped at a shared render
+  boundary before anything reaches stdout; `--json` output is deliberately
+  untouched, since it already escapes those bytes and stays the lossless
+  forensic channel. **The accepted cost:** a zero-width joiner is itself one
+  of the stripped characters, so a multi-part emoji built from one (a family
+  emoji) now renders as its separate members instead of the joined glyph; a
+  single-codepoint emoji is unaffected (issue #180).
+
+- Bumped `golang.org/x/text` v0.38.0 → v0.39.0, closing `GO-2026-5970` (infinite
+  loop on invalid input), and `github.com/yuin/goldmark` v1.7.8 → v1.7.17,
+  closing `GO-2026-5320` (XSS). Both were pre-existing on `main`, caught in an
+  unrelated `govulncheck` scan and folded in here rather than filed separately.
+
+## [0.14.0] - 2026-08-03
+
+### Added
+
 - **The run page now says when a judge is already on its way**, instead of
   offering a **Run judge** button whose only possible outcome was an error
   toast. A finished run enqueues a judge automatically, but the review panel
@@ -41,6 +162,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (editing a builtin is admin-only; everyone else gets a 403). Reset re-applies
   the shipped body verbatim, so re-apply any local customization on top. See
   [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
+- **Contributor tooling: the `agent` suite's per-test timeout is 120000, and its
+  largest test file was split into seven.** The cap was binding in CI and nowhere
+  else — node isolates test files in a child process per file on the CI image but
+  shares one process locally, so the same flag caps a whole *file* there and each
+  *suite* here, and a file running 96s locally passed a 30s cap while failing it
+  in CI. Splitting the file is what removed the knife edge; the raised cap only
+  bought margin. Cut the whole agent suite from 112s to 46s locally
+  (`37eefea6`, `32ff4bcf`). Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: the three prior-art projects are no longer vendored as
+  git submodules.** `./scripts/link-inspiration.sh` clones them once to a shared
+  directory outside the repo and symlinks them into a gitignored `inspiration/`,
+  so a fresh clone no longer drags the corpus along. Note `rg` and `grep -r` do
+  not follow symlinked directories, so a repo-wide sweep silently returns nothing
+  from it — search it by explicit path or with `-L` (`19ad63c3`). Developer-facing
+  only: no change to how uzi behaves, and a worker container never had access to
+  the corpus either way.
+
 - **Contributor tooling: both Go modules are now `gofmt`-clean and a format check
   runs in the gate.** `task fmt-check` fails on any formatting drift and names the
   files; it also runs first inside `task gate:api` / `task gate:controller` and
@@ -148,6 +287,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   model, and a recorded fixture from a real run pins them to each other from both
   sides so they cannot drift apart again (issue #195). This also unblocks the
   live cost estimate in PRD #194.
+
+- **Git repositories the worker creates no longer leave a background daemon
+  watching their directory.** Any git command in a repo where `core.fsmonitor`
+  is on spawns `git fsmonitor--daemon --detach`, which reparents to init and
+  holds directory handles for as long as it lives, so the run's cleanup deleted
+  every file and then could not remove the directory. Issue #127 removed a
+  different detached child (`git maintenance run --auto`) and could not cover
+  this one: a retry absorbs a lock held for milliseconds, not a watcher that
+  never lets go. The worker's bare clone, the runner clone and the seed
+  destination now set `core.fsmonitor=false`. **In a worker container this is a
+  no-op** — the daemon dies with the container either way — so the effect is on
+  local development, where one such daemon was found still alive 21 days after
+  its repo was created (issue #127).
+
+### Security
+
+- **The web image's SPA build stage now runs `npm ci --ignore-scripts`.** No
+  dependency in the current lockfile tree would execute a lifecycle script
+  while producing the bundle served to users; the flag keeps that true across
+  the next lockfile refresh, which is when nobody is looking. Hardening, not a
+  fix: the image built both ways is byte-identical today. Deliberately not
+  applied to the worker's base image, whose postinstall is what bakes in the
+  `agent-browser` CLI.
 
 ## [0.13.0] - 2026-07-29
 

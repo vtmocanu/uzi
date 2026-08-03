@@ -35,8 +35,8 @@ uzi seeds eleven builtin templates:
 | `coder` | Implements features, fixes bugs, refactors code. |
 | `reviewer` | Reviews code changes for correctness, style, and edge cases. |
 | `auditor` | Audits code for security vulnerabilities and unsafe patterns. |
-| `tester` | Validates changes against representative real-world inputs. |
-| `architect` | Designs the approach before coding and reviews changes for architectural fit; writes design docs only. |
+| `tester` | Validates changes against representative real-world inputs, authoring and extending tests as part of the implementation phase. |
+| `architect` | Designs the approach before coding and reviews changes for architectural fit; writes design docs only, and only once the plan is approved. |
 | `documenter` | Updates documentation only; never touches source code. |
 | `fact-checker` | Adversarially verifies factual claims against authoritative sources. |
 | `spec-keeper` | Keeps `specs/` in sync with implementation work. |
@@ -55,16 +55,25 @@ The lead can dispatch more than one subagent in the same turn when their
 work doesn't overlap, instead of always waiting for one to finish before
 starting the next:
 
-- **Read-only validators fan out together, twice.** The lead sends every
-  allocated read-only subagent (`reviewer`, `auditor`, `tester`,
-  `fact-checker` — whichever the run allocated) in one wave rather than one at
-  a time: first over the **plan**, before it reaches you at the approval gate,
-  and again over the **diff** once an implementation unit lands. The plan-time
-  wave is what backs up the plan's claims — for every mechanism the plan
-  asserts, it names the file and quotes the line — so what you approve has
-  already been read against the code. The lead tells that wave to report only
-  and to change nothing in the worktree; like everything else in a prompt, that
-  is an instruction rather than one of the guardrails the worker enforces.
+- **Validators fan out together, twice.** The lead sends every allocated
+  validator (`reviewer`, `auditor`, `tester`, `fact-checker` — whichever the run
+  allocated) in one wave rather than one at a time: first over the **plan**,
+  before it reaches you at the approval gate, and again over the **diff** once an
+  implementation unit lands. The plan-time wave is what backs up the plan's
+  claims — for every mechanism the plan asserts, it names the file and quotes the
+  line — so what you approve has already been read against the code. Of those
+  four, `reviewer`, `auditor` and `fact-checker` declare no file-writing tools at
+  all, so they are read-only everywhere; `tester` does declare them, because
+  authoring tests is its job during implementation.
+- **Nothing a subagent does before the gate can change the worktree by the
+  ordinary route.** On the planning turn the worker takes the file-writing tools
+  (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) off every subagent it dispatches,
+  so what you approve is not quietly accompanied by edits you never saw. This is
+  half of the property, and the honest half to state: those roles still have
+  `Bash`, and the worker does not screen shell redirection, so the lead's
+  report-only instruction to the wave still carries the rest. Like everything
+  else in a prompt, that part is an instruction rather than one of the guardrails
+  the worker enforces.
 - **Coders fan out only for genuinely independent units.** The lead
   parallelizes implementation work only when the plan splits it into pieces
   that share no Go package, no TypeScript project, and no file (including
@@ -126,19 +135,27 @@ click **Reset to default**. It re-applies the shipped builtin body
 (say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
 uzi version, your customization is gone, not folded into the new body.
 
+A **differs from shipped** badge on the Agents list and on a builtin's
+detail page tells you when its stored description, model, tools, or prompt
+body no longer matches what this uzi version ships for it, whether that's
+your own edit or a shipped update you haven't picked up. Open the template
+before resetting: the editor shows exactly what's different, so you're not
+resetting blind.
+
 That's also why a shipped change to a builtin's prompt doesn't reach you
 automatically: it seeds into a fresh database on first boot, but an
 already-seeded row is never silently overwritten (that's what keeps your
-customizations durable across every other upgrade). Reset is the only
-automatic path that pulls in a newer builtin body for an existing deployment,
-and it's all-or-nothing — the alternative is pasting the new body in by hand,
-below.
+customizations durable across every other upgrade). The badge above is what
+tells you an update is waiting; picking it up is still manual. Reset is the
+only automatic path that pulls in a newer builtin body for an existing
+deployment, and it's all-or-nothing — the alternative is pasting the new
+body in by hand, below.
 
 To pick up a new builtin body without losing your own edits:
 
-1. Compare your current template body against the new one shipped in this
-   version (its git history is `api/internal/agenttmpl/builtins/` in the uzi
-   repo, or ask whoever deployed the upgrade).
+1. Open the template and read the shipped-vs-stored diff to see exactly
+   what changed (or check `api/internal/agenttmpl/builtins/`'s git history
+   in the uzi repo, or ask whoever deployed the upgrade).
 2. Reset the template.
 3. Re-apply your customization on top of the new body.
 

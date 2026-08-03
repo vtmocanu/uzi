@@ -65,8 +65,15 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool,
 		`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 3, 'tool_use', $2)`,
 		targetID, []byte(`{"id":"tu-1","name":"Bash","input":{"command":"npm run typecheck"}}`))
+	// tokenHash(), not a literal: workers.token_hash is globally UNIQUE (00020), so a
+	// fixed []byte collides on workers_token_hash_key the SECOND time this runs against
+	// a database that outlives the invocation (issue #184). Invisible under
+	// e2e/run-store-it.sh, which builds a fresh container every time; it bites a loop
+	// that REUSES one, which is exactly what mutation testing does — and the resulting
+	// red reads as "my restore did not take" rather than as a fixture colliding with
+	// its own previous run.
 	mustExec(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`,
-		workerID, userID, []byte{0x2})
+		workerID, userID, tokenHash())
 
 	// ── CreateJudgeRun: repo/issue-less, kind='judge', points at the target ──
 	judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{

@@ -57,6 +57,12 @@ it.
 - There is deliberately **no flag that takes the token on the command line** — a
   credential must never land on `argv` (readable via `ps` / `/proc`). Use
   `UZI_TOKEN`, or `uzi auth token` which reads the token from stdin.
+- `UZI_VERSION_CHECK=0` — disable the CLI-vs-server version warning described
+  under **Version** below. Prefer reporting the warning over silencing it: it
+  fires only when this binary is genuinely older than the server, and the fields
+  it warns about are ones you would otherwise read as `null`. Set it in a
+  harness where an extra stderr line breaks an assertion, not to make a real
+  skew quieter.
 
 The global flag `--url <url>` overrides `UZI_URL`. Only `https` URLs are accepted
 (plus `http` on `127.0.0.1`/`localhost` for a local compose stack); a plaintext
@@ -348,3 +354,11 @@ The server is contacted best-effort with a short timeout, and the command exits
 0 whether or not one is reachable. Fields the server did not stamp are OMITTED
 rather than sent as empty or zero, so `server.commit` being absent means "this
 build does not know", never "the commit is empty".
+
+**If you see `uzi: CLI <a> is behind server <b>` on stderr, believe it and act on
+it.** It is not noise: a CLI older than the server silently DROPS response fields
+it does not know about, including in `--json`. That is a wrong answer, not a
+missing feature — the field reads `null` while the server holds a real value, and
+nothing else tells you. Report the skew to the human rather than reasoning about
+the `null`. The check compares this binary's version against the server's, is
+cached for an hour per server, and never changes an exit code or touches stdout.

@@ -42,7 +42,7 @@ import {
   type JsDepsInstall,
   type JsDepsResult,
 } from "./js-deps.js";
-import { assembleAgents, selectSubagents } from "./agents.js";
+import { assembleAgents, planTurnSubagents, selectSubagents } from "./agents.js";
 import {
   resolveAgentSelection,
   type AgentSelectionParse,
@@ -420,8 +420,34 @@ export class SdkExecutor implements Executor {
       prepared.repoSurvivorNames,
     );
     // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
-    // choice only takes effect after the plan is approved.
-    const ownSubagentNames = Object.keys(assembled.subagents);
+    // choice only takes effect after the plan is approved. #203 additionally
+    // strips the file-write tools from each of them, and DROPS any whose declared
+    // allowlist consisted only of write tools (see planTurnSubagents).
+    //
+    // The names come from the RESULT, never from `assembled.subagents`. They feed
+    // the plan turn's Agent-guard allowSet AND the "Available subagents to
+    // delegate to:" line of every plan prompt, so a name surviving here while its
+    // definition is gone would advertise — and let the lead invoke — an agent the
+    // SDK cannot resolve. Every use of this list is plan-turn; the implement turn
+    // derives its own from `selectSubagents`.
+    const planTurn = planTurnSubagents(assembled.subagents);
+    const planSubagentNames = Object.keys(planTurn.subagents);
+    if (planTurn.dropped.length > 0) {
+      // Visible rather than silent: an agent missing from the plan wave is a
+      // template-shape problem the operator can fix, and the approver should not
+      // have to infer the omission from a plan that never mentions the role.
+      this.log.warn("plan turn: dropped subagents whose allowlist is only write tools", {
+        run_id: ctx.runId,
+        dropped: planTurn.dropped,
+      });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `not planning with ${planTurn.dropped.join(", ")}: ${planTurn.dropped.length === 1 ? "its declared toolset is" : "their declared toolsets are"} file-writing only, and the planning turn grants no write tools`,
+        },
+      });
+    }
 
     // The Bash + path-guard hooks are roster-independent, so build them once and
     // reuse; only the Agent-guard hook's allowSet is frozen at construction and so
@@ -492,7 +518,24 @@ export class SdkExecutor implements Executor {
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
       }),
-      agents: assembled.subagents,
+      // PLAN-TURN roster: every subagent minus the file-write tools (#203).
+      // `baseOptions` drives both planning turns (first plan at the
+      // `drivePlanningTurn` call in Phase 1, re-plan in the revise loop) while
+      // `implementOptions` spreads `baseOptions` and OVERRIDES this key from
+      // `selectSubagents(...)`, which reads `assembled.subagents` directly and is
+      // therefore untouched.
+      //
+      // `agents` is one of THREE keys `implementOptions` overrides, and all three
+      // are plan-turn-scoped by that same mechanism: `agents`, `systemPrompt` and
+      // `hooks`. Worth knowing which, because `hooks` is where the recorded
+      // upgrade path goes — a plan-turn-only `PreToolUse` deny on the write-tool
+      // family, the one mechanism that would also reach the LEAD's own writes.
+      //
+      // DO NOT move this denial down to the `disallowedTools` key below. That one
+      // is top-level and is NOT overridden, so the spread carries it into the
+      // implement turn and it would strip write tools for the whole run, breaking
+      // `coder`. The scoping is the point of doing it here.
+      agents: planTurn.subagents,
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
       // (save_memory, PRD #90). Only the lead (full toolset) reaches them.
@@ -506,10 +549,13 @@ export class SdkExecutor implements Executor {
       // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
       // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
       // hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan
-      // turn allows the OWN subagents; the implement turns rebuild this with the
-      // selected roster (PRD #37).
+      // turn allows the own subagents THAT SURVIVED the #203 transform — the
+      // allowSet is frozen at construction, so it must be the same list the
+      // `agents` map above holds, or the guard admits an Agent call the SDK
+      // cannot resolve. The implement turns rebuild this with the selected
+      // roster (PRD #37).
       hooks: {
-        PreToolUse: preToolUse(ownSubagentNames),
+        PreToolUse: preToolUse(planSubagentNames),
       },
       // Persist discrete blocks only; partial token deltas would flood the seq
       // stream (the live-partial channel is M5, not M3).
@@ -678,7 +724,7 @@ export class SdkExecutor implements Executor {
               stage: j.stage,
               logTail: j.log_tail,
             })),
-            subagentNames: ownSubagentNames,
+            subagentNames: planSubagentNames,
             // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
@@ -697,7 +743,7 @@ export class SdkExecutor implements Executor {
           planPrompt = buildSelfImprovePlanPrompt({
             branch: ctx.branch,
             recommendations: ctx.issueDescription,
-            subagentNames: ownSubagentNames,
+            subagentNames: planSubagentNames,
             // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
@@ -714,7 +760,7 @@ export class SdkExecutor implements Executor {
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
             branch: ctx.branch,
-            subagentNames: ownSubagentNames,
+            subagentNames: planSubagentNames,
             // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
             // runner fetched it at claim time; empty/absent injects nothing).
             memory: ctx.memory,

@@ -592,6 +592,42 @@ neither.
 variable points into a git-tracked, synced directory, and honouring it would
 write a live token into version control.
 
+## When your CLI is older than the server
+
+A CLI that predates a server **silently drops response fields it does not know
+about** — including under `--json`, where the field reads `null` while the
+server holds a real value. That is a wrong answer rather than a missing
+feature, and nothing used to say so. It happened for real: a `v0.11.8` binary
+reported `anthropic_secret_label: null` for two runs whose labels the server
+was serving perfectly well, and the web UI showed them correctly the whole time.
+
+So every command now compares its own version against the server's and prints
+one line to **stderr** when it is behind:
+
+```
+uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
+```
+
+- **stderr, never stdout.** `--json` output stays byte-exact and parseable.
+- **The exit code never changes.** A skew warning is not a failure.
+- **Cached**, so it costs at most one short request per hour per server —
+  recorded in `~/.config/uzi/version-check.json` (0644; it holds a version
+  string and a hash of the server URL, no credentials). A failed probe is
+  cached too, so an unreachable server does not slow every command down.
+- **It clears the moment you upgrade.** The file stores the *server's* version,
+  never a verdict, so the comparison is redone against your new binary on the
+  very next command — there is no cache to wait out.
+- **Silent when it cannot be sure.** A binary built from source reports `dev`
+  rather than a release, and an unparseable version on either side means no
+  warning at all. That also means the remedy is always the right one: only a
+  `brew`-installed CLI can ever see this message.
+- **Not shown** when the CLI is *newer* than the server (nothing for you to do),
+  under `--quiet`, or for `uzi logout`, `uzi auth token` and `uzi auth status`,
+  which otherwise make no network call at all.
+
+Set `UZI_VERSION_CHECK=0` to turn the check off entirely — for a test harness
+that counts output lines, say. It is a poor substitute for upgrading.
+
 ## Managing tokens
 
 > **A password change is NOT an incident-response control for CLI tokens. You

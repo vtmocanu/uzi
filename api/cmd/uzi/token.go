@@ -101,13 +101,15 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// autoselect.Classify's answer, the same function the selector gates on,
 				// so this column cannot promise something the selector will not do.
 				//
-				// The label goes through cellText: it is user-authored and
-				// uzicli.Printer.Table does not sanitize what it is handed. This comment
-				// used to add "validateSecretLabel permits unicode.Cf", which PRD #111 M2
-				// made false — and which sat 124 lines from another comment in this same
-				// file that was corrected while this one was missed. The conclusion is
-				// unchanged: cellText folds newlines and tabs, which sanitizeTTY does not,
-				// and rows written before the validator landed are never re-validated.
+				// The label goes through cellText because it is user-authored. This comment
+				// has now had BOTH of its stated premises go false in turn, which is worth
+				// more than either correction: it first added "validateSecretLabel permits
+				// unicode.Cf" (PRD #111 M2 made that false), and then "uzicli.Printer.Table
+				// does not sanitize what it is handed" (#180 made THAT false — Table now
+				// runs CellText over every cell). The conclusion has survived both, and the
+				// reasons are the durable part: cellText additionally caps length, it names
+				// this value as untrusted where the boundary cannot, and it keeps holding if
+				// this row ever stops being rendered through Printer.Table.
 				rows = append(rows, []string{
 					s.ID, cellText(s.Label), boolStr(s.IsDefault), boolStr(s.AutoEligible),
 					eligibilityCell(s.AutoEligible, eligibility[s.ID]),

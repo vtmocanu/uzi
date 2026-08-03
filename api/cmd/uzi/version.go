@@ -19,6 +19,11 @@ import (
 // (Formula/uzi-cli.rb, scripts/brew-local-test.sh). A 30s stall there is a failed
 // release. Two seconds is long enough for a laptop compose stack or a LAN
 // deployment and short enough that a human never wonders whether it hung.
+//
+// SECOND CONSUMER since the version-skew warning (issue #144): serverBuildInfo is
+// also called from the root PersistentPreRun hook, once per TTL per server, where
+// this cap is what bounds the added latency of every uzi command. It is a
+// PER-REQUEST cap, not a per-invocation budget — it reads like a total and is not.
 const serverProbeTimeout = 2 * time.Second
 
 // versionOut is the --json shape (PRD #175 M4, OQ-B).
@@ -55,6 +60,13 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := env.printer(gf)
 			srv := serverBuildInfo(cmd.Context(), env, gf)
+			// This command is exempt from the PersistentPreRun skew hook and warns
+			// here instead, from the live probe it was already making — see
+			// exemptFromVersionCheck for why a cached warning would visibly
+			// contradict the `server version` line printed below. It also warms the
+			// shared cache, so the next command hits it. Before the JSON return, so
+			// both output modes carry the warning on stderr.
+			recordAndWarnVersionSkew(env, gf, srv)
 
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(versionOut{Version: version, Server: srv})
@@ -66,12 +78,39 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// anchored at the start of the WHOLE stdout — stricter than the Formula's
 			// substring assert_match. A header line, a "uzi " label, or a leading
 			// blank line passes the Formula and fails the script.
-			fmt.Fprintln(env.Stdout, version)
+			_, _ = fmt.Fprintln(env.Stdout, version)
 			if srv == nil {
 				return nil
 			}
+			// Server-supplied build strings, printed outside the Printer because line
+			// one must be the bare version and nothing else. So the uzicli boundary
+			// cannot reach them and the sanitize is explicit here (#180). CellText, not
+			// SanitizeTTY: %-8s pads a column, and a newline or tab in `version` or
+			// `commit` would break the label rail these six lines share.
 			for _, row := range serverRows(*srv) {
-				fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], row[1])
+				// 🔴 THE LOCAL `cellText`, NOT `uzicli.CellText`, AND THE NAMES ARE
+				// THE TRAP. #180 closed the injection half at this exact line and did
+				// it better than this branch had — a shared leaf package with a
+				// biconditional pinned over every rune in Unicode — so the predicate
+				// below is termsafe's, reached through compactText. What #180
+				// deliberately did NOT close is LENGTH: termsafe.CellText's own doc
+				// says it "deliberately does not truncate", correctly, because a
+				// shared boundary that silently shortened every cell would corrupt
+				// run titles and emails to buy nothing.
+				//
+				// This call site is not a shared boundary. `version` carries no
+				// server-side constraint at all (contrast `commit`, gated by
+				// isFullSHA, and `built_at`, gated by time.Parse) and the only
+				// ceiling on the wire is client.go's 32 MiB, so a hostile server's
+				// 1 MiB version string prints here in full — measured at 1,048,673
+				// bytes. The local helper adds compactText's 200-char cap on top of
+				// the same predicate, which is the whole difference.
+				//
+				// So: swapping this to `uzicli.CellText` reopens that, and every name
+				// involved says you did the safe thing. TestVersionCommandSanitizes-
+				// ServerBuildInfo/unbounded is the guard; it asserts a byte count and
+				// nothing else will catch this.
+				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], cellText(row[1]))
 			}
 			return nil
 		},

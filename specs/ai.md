@@ -16192,11 +16192,28 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
   declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
   path hook only JAILS writes to the worktree rather than denying them
-  (`guardrails.ts:757`). `architect.md:37` compounds it by offering "a SendMessage design
+  (`guardrails.ts:757`). ~~`architect.md:37` compounds it by offering "a SendMessage design
   summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
   `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
   unavailable, naming `SendMessage` as the case — so that role's remaining options are both
-  writes. A plan-turn write is an uncommitted change the human never saw, which the first
+  writes.~~ *(**Corrected 2026-08-03, issue #210: `SendMessage` DOES exist in a uzi run, so
+  this bullet's premise AND its conclusion are both false.** Offering an option that EXISTS
+  does not compound a write risk, it relieves it, so the first clause falls with the second.
+  The quoted phrase is retired too: `4fde2088` dropped the word "design" and `98cabb06` made
+  it "a summary via SendMessage to `main`", so the quotation was stale as well as the
+  inference. Measured on three run traces:
+  `71d83432`, `84b6a933`, `c13cff61` carry 26 `SendMessage` `tool_use` entries, 18 of which
+  returned `{"success":true,"message":"Message queued for the main conversation's next
+  turn."}`; `ToolSearch` resolved `select:SendMessage` six times, which is direct proof the
+  SDK provides it independently of any send succeeding. `architect.md:4` declares
+  `SendMessage` and `agents.ts:110` honours a non-empty allowlist verbatim, so architect has
+  a real non-writing route and its remaining options are NOT both writes. What survives is
+  the `repoagents.ts` STRUCTURAL claim — an allowlist entry matching no real tool grants
+  nothing — which the traces bear on not at all; only the choice of `SendMessage` as an
+  instance of it was wrong. The bullet's own conclusion (relay the no-write rule at dispatch)
+  is unaffected: it rests on the plan-turn-write argument below, not on this premise. Scope
+  note: `TaskList` is also observed (3 calls); `TaskUpdate` and `TaskGet` are UNOBSERVED,
+  not observed absent.)* A plan-turn write is an uncommitted change the human never saw, which the first
   implement commit then sweeps in: it weakens the APPROVAL GATE, not a guardrail layer.
   (c) Any bar is stated over the plan the lead produced, never over the issue.
   `PlanPromptInput` (`prompt.ts:498-518`) carries **nine** fields, and none of them is a
@@ -16335,10 +16352,28 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   read-only validators" and does not mention `architect` at all (measured: zero
   occurrences). That is not an oversight and it follows from D5 rather than contradicting
   it — `architect` declares `Edit, Write`, so it is not a read-only validator and the
-  wording excludes it. It joins the plan-turn wave when **#203** removes its write tools,
-  not before. Recorded because an unstated omission becomes a surprise; note it does not
-  weaken the relay requirement, since `tester` also declares `Edit, Write` and *is* named a
-  read-only validator by the product's own docs.
+  wording excludes it. Recorded because an unstated omission becomes a surprise.
+
+  **Amended 2026-08-03 (#203 landed).** Two things this bullet asserted have changed, and
+  the conclusion survives both:
+
+  - It said architect "joins the plan-turn wave when #203 removes its write tools, not
+    before." #203 removed them **from the plan turn's assembled map**
+    (`agents.ts planTurnSubagents`, wired at `sdk-executor.ts`'s `baseOptions.agents`)
+    while `architect.md` still **declares** them, because they remain correct on the
+    implement turn. So the precondition is met, but not in the form this sentence
+    describes: there is no frontmatter edit to point at. **Whether architect actually
+    enters the plan-time wave is still open and deliberately deferred** — it widens the
+    wave against the re-entry ceiling the next bullet quantifies, which is a scope
+    decision, not an architecture one. `lead.md` is unchanged and still does not mention
+    `architect`.
+  - It closed by arguing the omission "does not weaken the relay requirement, since
+    `tester` also declares `Edit, Write` and *is* named a read-only validator by the
+    product's own docs." That last clause was true and is now **false by construction**:
+    #203's docs half removed the "read-only subagent (`reviewer`, `auditor`, `tester`,
+    `fact-checker`)" enumeration from `docs/agent-templates.md`, which was the naming it
+    cited. The relay requirement stands on its own terms; the supporting appeal to that
+    line does not, and is retracted rather than repointed at a replacement.
 - **The wave is bounded on REPETITION, not only on width.** A planning turn re-enters from
   two loops: `QUESTION_MAX` (default 5, `config.go:664`) allows up to six planning turns per
   gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —
@@ -17205,3 +17240,586 @@ position as §473.
   reads it. **CODEOWNERS on those seven files is the only structural fix, and there is no
   CODEOWNERS file anywhere in this tree.** M3 recorded this for three files; M4 quadrupled the
   surface and each new file states it for itself rather than inheriting it by pointer.
+
+## 475. Issue #144 item 1 — the skew warning: the NORMALISATION is the whole feature, the cache stores an OBSERVATION keyed on a URL HASH, and the sanitizer runs at PRINT time
+
+Serves human: Feature #144 item 1 — every command warns on stderr when this binary is behind
+the server, from a **cached** probe, with stdout and the exit code unchanged and
+`brew upgrade uzi-cli` as the remedy (user 2026-08-03, chosen from three placements offered).
+Completes the half of the issue that Feature #175 left open: #175 made `uzi version` *report*
+both versions and never *compared* them. Landed as a scoped MR against the issue, no PRD.
+
+**The defect is a wrong answer, not a missing feature, and that is why the warning exists at
+all.** A `v0.11.8` CLI against a `0.14.0` server printed `null` for four `anthropic_*` fields
+of `uzi run get --json` while `curl` against the identical endpoint returned real values and
+the web UI rendered them correctly. A CLI silently DROPS response fields it does not know
+about, so a stale binary answers confidently and wrongly, and nothing anywhere said so.
+
+### The comparison, which is the feature rather than a detail of it
+
+- **Both sides are re-prefixed with `v` and BOTH are `IsValid`-guarded.** The two sides ship in
+  different shapes deliberately (§450): the CLI is stamped `v0.14.0` by the formula, the server
+  serves bare `0.14.0`. `x/mod/semver` treats every invalid version as equal to every other and
+  sorts an invalid one BELOW a valid one, so the naive `Compare(cli, srv) < 0` is not "wrong on
+  some pairs" — it is **INERT**. Over a 5×5 grid of shapes either side actually ships it fired
+  on **0 of 25** rows, `v0.1.0` against `99.0.0` included: the CLI is always the valid operand
+  and the server always the invalid one, so the gate cannot fire for anyone, ever.
+- **A failed validity check is SILENCE, and the disposition is deliberately INVERTED from the
+  in-repo precedent.** `forge/forgejo.go`'s `checkForgejoVersion` REFUSES on an unparseable
+  version and argues refusing is safer — true there, where it is a feature gate at connect
+  time, and wrong here, where "refuse" maps to "warn" and `var version = "dev"` is what every
+  `go build ./cmd/uzi` binary carries. Normalising **without** the guard moves the
+  implementation from never-warns to warns at every developer build and every test binary, each
+  told to run brew. Copy the SHAPE (re-prefix → `IsValid` → `Compare`), never the disposition.
+- **The two guards do NOT do equal work, and the comment that claimed they did was corrected
+  rather than left standing.** Over a 39×39 cross product of every shape either side ships plus
+  20 invalid ones, dropping the SERVER guard changes **0 of 1521** rows while dropping the CLI
+  guard changes **378** — `Compare(valid, invalid)` is `+1`, so an invalid server is already
+  silent via the `>= 0` direction test, and both-invalid gives `0`, also silent. The server
+  guard stays anyway and the reason is written down so it is not "optimised" away: it is inert
+  **given that direction test**, and dropping it while flipping `>= 0` to `!= 0` reddens four
+  fixture rows. It guards a future change to the operator, not today's inputs.
+- **Ahead-or-equal is never an alert.** A dev laptop against a stable deployment is the normal
+  shape here and there is nothing the person at the keyboard can do about a server being older.
+- **A third copy of `normSemver` is accepted rather than extracted.** `forge/forgejo.go` and
+  `workersvc/upgrade.go` hold the other two; a shared `verscmp` would touch two working
+  packages inside an issue-scoped MR. Each copy carries its own discriminating test.
+- **`IsStampedVersion` is exported so the hook can short-circuit BEFORE resolving settings.**
+  `SkewWarning` would also be silent on `dev`, but only *after* the probe that produced the
+  server's version. Without the export every source build would resolve settings, probe (2s
+  worst case) and write a cache file on every command — the modal configuration for anyone
+  working in this repo — and the only export-free alternative was a fourth copy of `normSemver`.
+
+### The cache: `~/.config/uzi/version-check.json`, 0644, atomic write, keyed per server
+
+- **It stores the server's VERSION, never the verdict.** A cached `skew: true` is not cleared
+  by `brew upgrade uzi-cli`, so the user would be told to upgrade for up to a TTL *after they
+  did*. Recomputing against the live binary's own version each run self-heals instantly,
+  because the CLI side is what changed.
+- **It stores the last ATTEMPT, not the last success.** An empty version is a FRESH record —
+  the negative entry. Without one, a laptop with `UZI_URL` set and the server unreachable (VPN
+  off, compose stack down, cluster restarting) takes a miss on every invocation and pays the 2s
+  probe timeout before **every** command, which is strictly worse than not having the feature.
+- **🔴 BUT A FAILED PROBE MOVES `checked_at` WITHOUT CLEARING A KNOWN-GOOD VERSION, and that
+  rule lives in the STORE so both write sites inherit it.** The naive reading of "record the
+  attempt" shipped first and was a real defect: one failure wrote `""` over a real reading, and
+  because empty-and-fresh is indistinguishable from a real hit at the caller, every later
+  command took the cache-hit path, never re-probed and printed nothing — for up to an hour
+  AFTER the server recovered. Both properties survive the fix, which is the thing to check when
+  reading it, because they pull in opposite directions: `checked_at` still moves on every
+  attempt, so an offline laptop still pays one probe per hour rather than one per command.
+- **Keyed on a SHA-256 of the normalised base URL, never the raw string.** Per-server because
+  `--url` beats `$UZI_URL` beats the config file, so which server an invocation talks to changes
+  between one command and the next, and a single blob would apply server A's version to server B
+  — silently and plausibly, since both report real versions, while this warning is a factual
+  claim about the server you are talking to. The HASH rather than the URL is a security
+  property: `credentialSafeBase` does not strip userinfo, `--url http://alice:hunter2@host` is
+  accepted and served, and no write path persists a `--url` base today, so this cache would
+  otherwise be the FIRST thing to put a password in a 0644 file. Normalisation before hashing is
+  deliberately cheap (trim, drop trailing slashes) rather than a `net/url` round-trip: a miss
+  costs one extra probe and never a wrong answer, because two spellings of one host are two
+  entries each holding that host's own truth.
+- **TTL of one hour, ONE value governing both outcomes.** The failure direction is asymmetric:
+  by the observation rule above the CLI-upgrade direction self-heals instantly, so a longer TTL
+  only delays hearing about a SERVER upgrade — silence when we should warn, never a false
+  warning. A shorter NEGATIVE TTL is specifically rejected: a failed probe costs the full 2s
+  where a success costs tens of milliseconds, so re-probing failures sooner maximises the cost
+  of exactly the case the cache exists for. And **the EXISTENCE of a TTL is the mitigation for
+  an unrate-limited `/api/version`, not its value** — for a 50-agent fleet, no TTL is ~90,000
+  req/h, 1 min ~3,000, **1 h ~50**, 24 h ~2; the three orders of magnitude are entirely between
+  *no TTL* and *any TTL*.
+- **`cli_version` is recorded and never read back**; freshness keys on `checked_at` alone.
+  Mirrors `skillState`, which settled the identical question the identical way. Invalidating on
+  a CLI-version change is the right fix for a cache holding a VERDICT and is redundant for one
+  holding an observation. It is forensics: "which binary wrote this entry?"
+- **Bounded on both axes, and the version bound is STORAGE, not a sanitizer** — 16 entries (a
+  script looping over `--url` endpoints would otherwise grow the file without limit) and 256
+  runes per version (the only ceiling on the wire is the client's 32 MiB response cap). The
+  security control is at print time; a write-time stripper would be bypassed by anything able to
+  write the file directly, so the cache legitimately holds raw control characters on disk.
+- **`writeFileAtomic`, not `os.WriteFile`: the rename REPLACES a symlink instead of following
+  it.** Nothing in the suite could tell the two apart until a test was added that symlinks the
+  cache path at a file outside the store dir and asserts the target is unchanged — an unpinned
+  security property is one a refactor lands green on.
+- Absent and corrupt are both treated as empty and the file is **not deleted** (the next write
+  replaces it atomically, and an unreadable cache must never become an error a user sees); a
+  `checked_at` in the FUTURE is **not** fresh, because a backwards clock or a file copied from
+  another machine is untrustworthy rather than valid until it "expires"; a nil store (no home
+  directory) skips the check entirely rather than degrading to the uncached probe the design
+  exists to avoid.
+
+### Where it runs, and what is exempt
+
+- **One hook on the root `PersistentPreRun`, where the skill auto-upgrade already lives — and
+  that seam is SINGLE-OCCUPANCY.** cobra breaks at the first ancestor carrying a
+  `PersistentPreRun` and `EnableTraverseRunHooks` is unset, so a subcommand that later sets its
+  own hook silently disables BOTH with nothing failing anywhere. Stated at the seam. The skew
+  check runs SECOND, after the purely local skill work, so a slow or hanging endpoint cannot
+  delay it.
+- **The exit code is untouched STRUCTURALLY rather than by assertion**: `PersistentPreRun` has
+  no error return, so nothing on this path can reach `ExitCodeFor`.
+- **🔴 THE EXEMPTION IS A RULE — "every command that makes no network call of its own" — NOT A
+  LIST.** It shipped first as the enumerated pair an audit had found (`logout`, `auth token`),
+  and `uzi auth status` has exactly the same property and was named by nobody until the rule was
+  written down and the set derived from it. The derivation is two greps then reading each
+  `RunE`: `git grep -F 'env.client('` alone misses `uzi login`, which builds its client directly
+  and is **not** exempt, so that grep would exempt it for a reason that looks right; and it
+  over-reports `auth.go`, whose single client site belongs to `whoami`, which merely shares the
+  file. A NEW command is not exempt by default, which is the safe direction.
+- **Exemption there is not cosmetic: the ROUTE is unauthenticated but the REQUEST carries the
+  bearer token**, because `newRequest` attaches it to every request whose client holds one and
+  does not special-case this route. So a probe on `uzi logout` would ship the credential on the
+  way to deleting it and contradict that command's own "does not revoke it server-side", and a
+  probe on `uzi auth token` — built so a credential never lands on argv — would emit a request
+  carrying the PREVIOUS credential.
+- **`uzi version` is RELOCATED, not exempt.** `PersistentPreRun` runs before `RunE`, so a
+  *cached* warning would print `behind server 0.13.0` on stderr and then stdout would print
+  `server version 0.14.0` from that command's own live probe — a visible self-contradiction
+  inside one invocation. It warns inline from the probe it was already making and warms the
+  shared cache, so (`uzi version`, then any other command) costs one network call rather than
+  two. It also READS the cache, which is the point of the read: it is the command a user runs
+  precisely when they suspect something is wrong, so a failed live probe falls back to the last
+  known-good reading instead of to nothing.
+- Also exempt: the `skill` subtree (already exempt for the auto-upgrade hook, and
+  `uzi skill install` is machine-invoked at every Claude Code session start, where an extra
+  stderr line is pure noise in an agent context); `completion`, whose script is `eval`'d from a
+  shell rc file, so the warning would print at every shell start; and cobra's
+  `__complete`/`__completeNoDesc` RPC, invoked on every TAB, where a 2s stall is unacceptable
+  and stderr corrupts the display in some shells. `--help`, `--version` and a bare non-runnable
+  parent need **no** exemption — cobra returns above the hook loop for each. One consequence
+  worth knowing: **`uzi --version` never warns while `uzi version` does.**
+- **Three independent off switches, none of them redundant.** `Env.CheckServerVersion` is the
+  injection seam (true in `DefaultEnv`, false in `fakeEnv`, mirroring `AutoUpgradeSkill`) and is
+  what stops every pre-existing command test suddenly calling `FakeClient.BuildInfo`; `--quiet`
+  suppresses the WORK and not merely the print, because that gate sits above the probe; and
+  `UZI_VERSION_CHECK=0` is the documented escape hatch, same `== "0"` test as
+  `UZI_SKILL_AUTO_UPGRADE` so the two behave identically for anyone who learns one.
+
+### The string being printed is attacker-controlled
+
+- **`GET /api/version` passes the server's stamp through with NO constraint** — contrast
+  `commit`, gated by `isFullSHA`, and `built_at`, gated by `time.Parse` — so `version` is
+  strictly weaker than `RateLimitType`, which `run.go` already sanitizes *even though the server
+  allowlists it to an enum*, on the stated ground that "server-controlled today" is exactly the
+  assumption that rots. Four attacks executed against the pre-existing `uzi version` sink all
+  worked at exit 0 (erase-display, `\r` line-overwrite, OSC 8 hyperlink, U+202E bidi); the `\r`
+  one erases uzi's own label so an arbitrary attacker sentence appears to come FROM uzi.
+- **🔴 SANITIZED AT PRINT TIME, AFTER THE CACHE READ — never at fetch, never at cache-write.**
+  The cache is a plain file with no integrity protection, so anything able to write it controls
+  this text with no network involved; a write-time sanitizer is bypassed by exactly that path.
+  Treat the cache as precisely as untrusted as the network response.
+- **`cellText` is the sanitizer, and reusing it rather than hand-rolling a control stripper is
+  what closes the length problem in the same call** — it strips C0/C1/DEL and the Unicode format
+  characters (bidi overrides among them) and caps the result. Only the SERVER's string goes
+  through it: the CLI's own version is a compile-time ldflags stamp, and passing it through
+  would only obscure that asymmetry.
+- **Printed with `fmt.Fprintf`, NOT `uzicli.Printer`**: `govulncheck` traces GO-2026-5970
+  (x/text infinite loop on invalid input) through `Printer.Println`, and this path takes the
+  most hostile string in the CLI.
+- **The pre-existing `uzi version` sink was sanitized in the same change**, because the hook
+  escalates the same class from one command run deliberately to every invocation of every
+  command, on stderr — the channel `SKILL.md` tells agents to read, which makes this prompt
+  injection into an agent's context rather than only a terminal trick.
+- **🔴 HOW MUCH ATTACKER TEXT REACHES stderr IS DECIDED IN `run.go`, NOT HERE.** Measured: ~157
+  characters do (150 of SemVer build metadata), stripped of controls and Cf, so spacing and
+  letters and never a cursor effect. Above `compactText`'s 200-char cap the truncation appends
+  U+2026, which is outside SemVer's build-metadata charset, the version stops parsing and the
+  warning vanishes **entirely** — so that silence is a property of a COSMETIC CONSTANT in
+  another file, which nobody editing `versioncheck.go` would think to check. Named at
+  `warnVersionSkew` for that reason.
+- **`--json` stays byte-exact, and the REASON is the destination rather than the encoder.**
+  Measured on `encoding/json`: C0 and U+2028/U+2029 are escaped, while DEL (0x7f), the C1 range
+  including U+009B, U+202E and the zero-widths pass through UNESCAPED. What makes `--json` safe
+  is that its bytes go to a PARSER, and that sanitizing there would corrupt the payload an agent
+  decodes; a caller piping `--json` straight to a TTY is outside the guarantee. `sanitizeTTY`'s
+  own doc had carried the encoder claim in stronger form and is where the new code's first
+  wording came from — corrected in the same change, comment only, since the behaviour was
+  always right. (Whether a terminal HONOURS a UTF-8-encoded U+009B as CSI was not tested and
+  must not be written as though it were.)
+- **`compactText` slices at 200 BYTES and can cut mid-rune; UTF-8 validity is EMERGENT from
+  `cellText`'s outer `strings.Map` re-encoding the orphan as U+FFFD.** Rune-slicing it was
+  considered and **declined by the user**: it is a shared helper behind run/steer/TUI rendering
+  that this change has not tested. The property is therefore PINNED by a test (199 ASCII +
+  `€`×4, so the boundary lands inside a 3-byte rune) rather than removed, and
+  `TestVersionCommandOutputStaysValidUTF8` staying a pin rather than becoming a redundancy is a
+  chosen outcome, not an oversight.
+
+### The message, the observability it needs, and the docs
+
+- **One line, with both versions rendered VERBATIM as each side reports them** (`v0.11.8`
+  against `0.14.0`). Normalising for display would make this line disagree with `uzi version`,
+  which prints the CLI's stamp on line one and the server's bare string under `server version`.
+  The two-line hanging indent in the preview shown to the user was a mockup wrap, not a spec;
+  hard-wrapping is wrong at every width but one.
+- **The message carries no `uzi <verb>` span, and that is a constraint rather than a style.**
+  `instructions_test.go`'s extractor lifts any `uzi ` + lowercase-letter span out of a printed
+  string and demands a registry entry asserting the instruction has been EXECUTED. `uzi:`
+  (colon) and `uzi-cli` (hyphen) each miss that class by one character. If a future reword
+  reddens that test, **reword again — never register.**
+- **`FakeClient.BuildInfoCalls` is not a convenience.** With the hook on the root command, "the
+  probe was skipped" and "the probe ran and printed nothing" produce IDENTICAL output, so every
+  exemption, suppression and cache-hit claim is unobservable without a counter — asserting on
+  absent stderr would pass against an implementation that probes on every command and merely
+  stays quiet.
+- **The fixture feeds the server version in its BARE wire form, and that is load-bearing.**
+  "Genuinely behind" is necessary and not sufficient: a `("v0.11.8","v0.14.0")` fixture has
+  already normalised the server side, so it passes against an implementation that forgets to.
+  Mutating exactly that — normalise the CLI, forget the server — produces 19 named FAIL lines.
+- **The e2e harness sets `UZI_VERSION_CHECK=0` on `uzi_cli()`, belt-and-braces today and stated
+  as such**: the harness build passes no `-ldflags`, so its binary is `dev` and short-circuits.
+  That reason evaporates the day someone stamps it, `UZI_URL` IS set there, and the harness's
+  printed-instruction assertions count exact lines across stdout AND stderr — so one extra
+  sentence would redden a check about something else entirely.
+- **The env var is documented BY HAND in both `SKILL.md` and `docs/cli.md`**, because
+  `skill_drift_test.go` extracts only flags and command paths and gates env vars in neither
+  direction. An undocumented escape hatch is worse than a documented one: an agent can read it
+  out of the source either way, and only the user loses by not knowing it exists. Both frame the
+  warning as ACTIONABLE, and `SKILL.md` tells an agent to report the skew to the human rather
+  than reason about the `null` it would otherwise see.
+- **Declined**: no `--check` flag, no `uzi upgrade` verb, no warning when the SERVER is behind
+  (nothing for the user to do), and no background probe.
+- **Two pre-existing dependency vulnerabilities were bumped in the same change at the user's
+  direction**, against the recommendation to file them separately: `golang.org/x/text` v0.38.0 →
+  v0.39.0 (GO-2026-5970, reachable through `uzicli.Printer.Println`) and `github.com/yuin/goldmark`
+  v1.7.8 → v1.7.17 (GO-2026-5320, reached indirectly through glamour in the TUI renderer).
+  `govulncheck` moves 3 → 0, and the zero is discriminating rather than vacuous — it still
+  reports one vulnerability in a required module the code does not call.
+# Issue #201 M4a — the builtin agent-template drift signal
+
+## 476. Issue #201 M4a — the comparison is ONE exported function over FOUR columns, it never renders either side, and `false` covers three states with two different Reset outcomes
+
+Serves human: Feature #201 — **PROPOSED, NOT YET RATIFIED.** The user asked for issue #201 and
+made two decisions on it (the diff library, and shipping M4a alone ahead of M4b); a `human.md`
+entry carrying those was sent to the owner for confirmation when these sections were written.
+Until it lands, `human.md` is silent on #201 and this is the only record. *(Numbering: `origin/main`
+ends at §474 and **§475 is RESERVED, not skipped** — the sibling `fix-144-cli-skew` worktree holds
+an unlanded section at that number, found by sweeping every sibling worktree of this bare clone at
+write time. Leaving the gap is the same discipline that put §473-474 above `main`'s §472 rather
+than colliding with it, and it is written down because a reader who finds these three starting at
+476 has no other way to learn the number was reserved rather than picked.)*
+
+**What ships.** A computed `differs_from_builtin` boolean on the agent-template DTO, and
+`GET /api/agent-templates/{id}/builtin` serving the definition this binary ships. Nothing else:
+no column, no hash, no historical-hash set, no migration, no boot-path change, no auto-update,
+no kill switch. Those are M4b. A rebuild that finds itself needing a DATABASE column here has
+drifted from the design rather than discovered a requirement.
+
+**Why the signal ships before the auto-update, which is the constraint the whole milestone is
+shaped by.** Reset-to-default is all-or-nothing — one unconditional update of description, model,
+tools and prompt body from the embedded definition, no merge, no per-field option — so an admin
+pressing it on a row they have edited loses that edit with no diff shown anywhere. The drift
+signal is what makes Reset safe to press. **That argument is load-bearing rather than
+motivational: it is what grades the co-visibility defect in §477 as blocking.**
+
+**The comparison is one exported function and its LOCATION is the highest-value decision in the
+milestone.** `agenttmpl.SameContent(a, b Definition) bool`, in `agenttmpl`, **not** in `handler`.
+`agenttmpl` has no database dependency and both `handler` and `store` already import it. M4b's
+reconciler answers the same question over the same columns; if M4a writes an ad-hoc comparison
+inside `handler`, M4b must reimplement it in `store` or refactor under time pressure — and the
+moment there are two, the UI can say a row is customized while the reconciler quietly overwrites
+it. Architect's call, lead accepted.
+
+**FOUR columns, not five.** `description`, `model`, `tools`, `prompt_body`. **`name` is the lookup
+key and is never a compared value**: the shipped side is always obtained by `BuiltinByName(row.Name)`,
+whose loop condition is `d.Name == name`, so equality holds by construction — and the column is
+immutable after create. A fifth term would be unfalsifiable and would send a tester hunting a case
+that cannot exist.
+
+**Nothing is normalized in either direction, and every one of those non-normalizations is
+load-bearing rather than laziness:**
+
+- **`tools` uses `slices.Equal`, never `reflect.DeepEqual`.** `slices.Equal(nil, []string{})` is
+  **true**, which is the correct answer — both mean inherit-all — where `DeepEqual` reports drift
+  on a semantically identical row.
+- **`tools` is compared ORDER-SENSITIVELY and neither side is ever sorted.** The order is
+  rendered into the subagent file, so a reordering really is a change; sorting **hides a real
+  edit**. Nothing else in the milestone pins this, which is why the fixture set carries an
+  order-only case.
+- **`description` and `prompt_body` are compared exactly, never trimmed.** A trim hides
+  whitespace-only edits permanently — a blind spot with no expiry.
+
+**The trim asymmetry that motivates the last point is fixed AT THE SOURCE, not in the comparison.**
+The write path trims `description`; the builtin parser does not. So a shipped `.md` carrying a
+padded frontmatter value would seed a row that flips to the trimmed form on the first no-op save
+and then reports drift with nothing changed. The fix is a **corpus invariant** — the builtin
+parse/validity test now asserts whitespace hygiene per frontmatter value and per tool name, naming
+the offender — rather than a trim in `SameContent`. The wave split 2-1 on this and the lead ruled
+for never-trim: a corpus invariant is checkable and free, a comparison trim is permanent.
+
+**NEVER compare `Render()` output**, which is the tempting shortcut, and note that **no test in the
+suite discriminates the two today** — which is exactly why it is written the column way now and
+would be expensive to change later. Two independent reasons:
+
+- `Render` serializes the **frontmatter**, so anything a future release stamps there enters the
+  comparison for free. PRD #85 M2 stamps a `version:` line into the builtin files; it would appear
+  on the shipped side and never on the stored side (there is no version column), so **every stamped
+  builtin would report drift forever, silently.**
+- `Render` **omits** the tools and model lines when empty, so a stored `tools: []` and a stored
+  `tools: NULL` render identically — a serialization comparison hides a difference the UI displays
+  as "none" versus "all". This function is asked about the **columns**, not about the file.
+
+*(A third argument was offered and is INERT here, recorded so a rebuild does not re-adopt it:
+"#85 reorders the frontmatter" does not apply, because M4a renders both sides with the SAME binary
+at the same instant, so a reorder cancels. It is correct for a stored HASH written by an older
+binary, which is M4b's problem.)*
+
+**The normalization already existed; do not write new normalization.** `templateToDefinition` maps
+a stored row onto the exact type `BuiltinByName` returns, decoding the jsonb tools column and
+folding a NULL text column to `""`. Both sides of the comparison are therefore `Definition`, and
+the `*string`/`[]string` mismatch never arises. **Do NOT add drift-specific behaviour to it** — it
+is on the `/rendered` export path that writes into an agent workspace.
+
+**And never byte-compare the jsonb.** Measured on a real Postgres: `json.Marshal` writes 23 bytes
+where pgx reads back 25 (`["Read", "Write", "Bash"]`), so `bytes.Equal` is false while the decoded
+slices are equal. The failure is **QUIET rather than total** — it reddens 9 of 11 builtins, because
+two carry no `tools:` line at all, and a partial red reads exactly like genuine drift. The unit
+fixture therefore hands the comparison a row whose `Tools []byte` holds that Postgres-canonical
+byte string directly, **with no database**; without that case the suite agrees with a
+byte-comparison implementation on everything it covers.
+
+**`false` means three distinct things, and the third has the OPPOSITE Reset outcome from the
+other two:**
+
+1. **The row has no shipped counterpart because it is not a builtin.** A global template, or —
+   the case that matters — a **user-scope template whose name merely collides with a builtin's**.
+   The scopes migration explicitly allows a user to own a `coder` beside the builtin `coder`, any
+   authenticated non-admin can create one, and Reset answers **400 "only builtin templates can be
+   reset"** for it. A name-keyed implementation with no scope check badges that private row and
+   **advertises an action that fails**. This is the case that separates a scope-checking
+   implementation from a name-only one; the admin shadow row does not.
+2. **The row is a builtin and matches what is shipped.**
+3. **The row is a builtin this release no longer ships.** Nothing to compare against, so `false` —
+   yet Reset answers **409**. That state reaches the UI through the new route's 409 rather than
+   through a tri-state DTO field, which is what keeps the DTO field a plain boolean.
+
+**The scope check reads `scope`, not `is_builtin`, and that is a style choice with a caveat worth
+stating.** The scopes migration's `CHECK (is_builtin = (scope = 'builtin'))` over two NOT NULL
+columns makes them a **provable biconditional**, so no row Postgres can hold separates them. But
+M4a mandates no live-DB test, so every fixture is a **Go struct literal, and a literal is not
+subject to a CHECK** — a test that separates them is testing an unreachable state, which is a
+different statement from "no fixture can separate them".
+
+**The shipped body gets its own ROUTE, and this was the user's delegation resolved under a
+best-practice bar.** Three shapes were proposed: a sub-resource route, shipped fields on the detail
+response only, and a nullable nested `builtin` object on the DTO. The route wins on two grounds
+each of the others fails one of — it matches the existing `/{id}/rendered` sub-resource precedent,
+and it keeps the **~44 KB shipped corpus out of the LIST response**, which the DTO-field form would
+carry on every row. *(The staleness objection — the shipped copy going stale after a save unless
+the client refetches — is **refuted** for the nested-DTO form, since `templateDTO` is shared by
+update and reset so a nested field refreshes itself, and **stands** for the detail-response-only
+form. It does not decide the question either way; payload and precedent do. Recorded per variant
+because "refuted" does not cover all three and a later revisit would misread it.)*
+
+**Route contract, and every clause of it mirrors `ResetAgentTemplate` deliberately:**
+
+- **Read-only and additive.** Nothing on this path writes.
+- **The row is loaded unfiltered and authorized FIRST**, so a template the caller may not see
+  returns **404** rather than a 400/409 that would confirm the id exists. That ordering is the
+  existence-oracle property, and the status-matrix test fails if the builtin check is ever moved
+  above authz.
+- **Gated by the template WRITE authz, not the read authz** — the endpoint exists to make Reset
+  safe to press and its audience is exactly the callers who can press it. **403** otherwise.
+- **400** for a non-builtin row, mirroring reset. *(Not 409, which is what the brief originally
+  specified and what a rebuild reading the issue would implement.)*
+- **409** for a builtin with no shipped definition, reusing reset's existing message.
+- **200** body is `{"builtin": {...}}` with the row DTO's null semantics — model null means
+  inherit, tools null means inherit-all — so the client diffs like against like. The row-only
+  fields (id, scope, timestamps) are absent: they have no meaning for a definition that lives in
+  the binary.
+- **No rate limiter**, like every sibling on that mount: it reads data embedded in the binary and
+  performs no query beyond the row fetch its neighbours already do.
+
+**Net exposure DECREASES.** The new route is gated *more* tightly than the data it describes:
+shipped bodies now reach admins only, while the stored bodies of the same rows have always been
+readable by every authenticated user.
+
+**Two template-shaped serializers must NOT gain the field.** The allocation DTO carries no content
+columns (the list page renders its rows from the templates list, so the badge reaches that page
+through the template DTO anyway), and the worker claim payload is a wire contract pinned by a
+golden — putting an admin-UI concept there leaks it into something the worker parses.
+
+**Everything below the row fetch is a separate function** taking the actor and the row, so the
+whole status matrix is exercisable over a real recorder **without a database**. That split reached
+everything it could; what it leaves is recorded in §478 rather than claimed.
+
+## 477. Issue #201 M4a — the client: one shared column list, a diff that could not be seen from the button it justifies, and a canary that only the output SHAPE can trip
+
+**The badge reads "differs from shipped", never "customized" or "edited", and the noun is
+load-bearing across every surface.** M4a answers *"does this row differ from the body shipped in
+THIS binary?"*. M4b's classifier answers a different question: *"does this row differ from the body
+it was SEEDED with?"*. A row that is pristine-as-seeded but behind the current release answers
+**true** to the first and **pristine** to the second — M4b will auto-update it and the badge will
+vanish. That is only coherent if the badge never claims a human edited it. The same noun is used by
+the badge, the diff panel, the reset card and the post-reset notice; getting it wrong makes M4b's
+fix a **copy change**, with everything a copy change does to the negative assertions guarding it.
+*(The post-reset notice was the one surface that missed the vocabulary and it survived thirteen
+validator rounds, because **no test asserted on it at all** — a copy string with no positive
+assertion is invisible to the suite by construction. Only a deliberate vocabulary sweep finds
+that class.)*
+
+**`differs_from_builtin` is declared NON-OPTIONAL in the client type.** Every literal then fails
+typecheck until it is updated. Declared with a `?`, the mocks stay silent, the badge never renders
+in mock mode, and the structural blindness arrives through one character.
+
+**The diff library is jsdiff rendered as REACT ELEMENTS — the user's choice, under a binding
+constraint the team supplied.** Most JS diff libraries return **HTML strings** by default
+(`diff2html`, and jsdiff's own `convertChangesToXML`), and using one would introduce the **first
+`dangerouslySetInnerHTML` in `web/src`**, which has **zero call sites** and a standing set of
+comments saying not to. Structured hunks into React text nodes instead. Install with
+`--ignore-scripts`, per the repo-wide rule about what a plain npm install does to this host.
+
+> **This is a USER decision recorded in the AI file, deliberately, and it is not a misfiling to
+> correct.** A `human.md` bullet carrying it was drafted and **struck by the owner on 2026-08-03**,
+> who read it as an implementation choice rather than a durable product constraint — the same
+> filter §448-§454 applied to PRD #175. So `human.md` is silent on the library by decision, and
+> this paragraph is the only record of both the choice and the constraint it was made under. A
+> future rebuild may pick a different library; what it may **not** do is pick one that returns
+> HTML strings.
+
+**Criterion 7 is a PROPERTY — ZERO CALL SITES — and never a count**, which is why no number for
+those comments appears above. Every count in circulation during the milestone was correct in a
+unit nobody stated (files versus occurrences), and because the two were adjacent integers the
+comparison read as "+1" when the change had added **two** of each. State the property; state the
+unit whenever a count appears at all.
+
+**The XSS canary's discriminating assertion is that the container holds no `<ins>`/`<del>`
+elements, and it is load-bearing rather than belt-and-braces.** Measured against three unsafe
+implementations: `convertChangesToXML` **escapes**, so the assertion that looks like it encodes the
+security property — querying for an injected `<img>` — is null and **passes under all three**. The
+only signal escaping cannot hide is the **output shape**. What used to redden the other assertions
+was an accident of the DOM shape changing, and the accessibility markers below preserve that shape
+by design, so the accident is gone. **Do not drop this assertion to make a refactor compile**; if
+anyone later prefers the semantic elements, the canary must be reshaped in the SAME commit with the
+reason recorded, because a canary deleted to make an unrelated change compile is how this class of
+guard dies.
+
+**Accessibility markers are sr-only spans, NOT `<ins>`/`<del>`.** This was a direct conflict
+between two accepted findings — the canary needs those tags absent, WCAG 1.4.1 needs the word-diff
+to carry meaning in something other than colour — and the lead resolved it in the canary's favour.
+sr-only markers satisfy both.
+
+**The client's column list is ONE exported function shared by the panel and the confirmation.** It
+lives in the templates lib rather than inside the editor **so the diff panel and the Reset
+confirmation can never name different columns**: a confirmation that undersells what it is about to
+discard is worse than none. It applies the same four rules as the server's comparison, each for the
+reason stated there.
+
+**The panel compares shipped against the CURRENT FORM STATE; the badge reflects the STORED row.**
+Both sentences can be true of different subjects while reading as a flat contradiction ~370px
+apart, so the panel says **which** it is talking about — unsaved edits whose saved row still
+matches, or a saved row that still differs.
+
+**THE DIFF AND THE RESET BUTTON COULD NOT BE ON SCREEN TOGETHER, WHICH FALSIFIED THE MILESTONE'S
+OWN PREMISE.** Measured at 1280×633: the diff panel ended at 871px and the Reset button began at
+1524px — a 653px gap against a 633px viewport, with the full-body rendered preview between them,
+and that was against an **11-line mock body** where real builtins run 27-138 lines. The unconfirmed
+Reset is **pre-existing and not M4a's**; what M4a changed is that the justifying evidence now
+exists and sat where it could not reach the click. **Graded BLOCKING for M4a specifically**,
+because "the diff makes Reset safe to press" is this milestone's entire argument for shipping ahead
+of M4b — shipping the artifact without the outcome would have left that argument false.
+
+**The fix is a confirmation that NAMES the drifted columns**, reading the shared column list, with
+a distinct sentence for the already-matches case. Chosen over a second Reset control inside the
+panel because it also closes the pre-existing gap and is the smaller change. One click had
+otherwise discarded **the live unsaved edit and the stored drift together** — observed, not
+derived, because the editor is keyed on the row's `updated_at` and remounts.
+
+**A trailing newline is a TERMINATOR and is normalized away for DISPLAY ONLY.** `diffLines` keeps
+the newline inside its token, so a body ending `…main.` and one ending `…main.\n` come back as one
+removed and one added line of **byte-identical text**, one green one red, with nothing on screen
+saying why. Reachable on real data rather than theoretical: every builtin file ends with a newline,
+the textarea adds none, and the body is submitted verbatim. **Nothing upstream is trimmed** — the
+shared column list and the server both still compare exactly — so a whitespace-only edit still
+badges and still lists the column, which is why that case gets its own explanatory sentence instead
+of an empty panel.
+
+**The tools diff is a two-line before/after, not a sequence diff.** A sequence diff on an
+order-only change renders as "Bash removed, Bash added": correct as a diff, unreadable as an answer
+to "what changed", and the order case is the one nothing else pins.
+
+**Non-admins never fetch the shipped side.** The condition is `is_builtin && isAdmin`, because for
+a builtin row the client's edit check is exactly the admin check; without it every non-admin
+opening any builtin detail page fires a request **guaranteed to 403**, and routine authz denials
+are what a real one hides in.
+
+**THE FETCH FAILURE IS DISCRIMINATED BY STATUS, AND THAT IS THE WHOLE POINT.** A **409** (and 403)
+is a fact about the RELEASE and licenses the page to say the definition does not exist; **anything
+else is a fact about ONE REQUEST** and must not change the copy or remove the Reset button. The
+shipped side is therefore modelled as a **four-arm discriminated union** — never-fetched, ok,
+absent, unavailable — rather than `Definition | null`, because a nullable cannot tell those apart.
+A parameterless catch mapped every rejection onto "this release no longer ships a definition for
+X", which is **a false sentence printed on exactly the recovery path this milestone exists to
+enable**, and it was a **regression in reach**: before M4a, Reset was offered for every builtin row
+and no transient failure could take the button away. The test that looked like it pinned this did
+not — it rejected with a 409 and asserted the copy, and passed identically on a 500, because
+nothing observed the status. **A fixture whose discriminating value the code cannot reach is not a
+fixture.**
+
+**The mock computes drift as a deliberate SECOND IMPLEMENTATION, against a shipped-side constant
+separate from the mock template rows.** Cloning the rows from one constant makes it both sides of
+the comparison, so nothing badges until someone edits and editing the source changes nothing. **A
+golden snapshotted from the mock data is the trap here**: it agrees on everything it covers and
+locks in the blind spot. Nine cases discriminate, each asserted so a later fixture edit that drops
+one goes red — pristine control, tools-order-only, tools-membership, prompt-body-only, model-only,
+description-only, no-shipped-twin, a global row, and a user row colliding with a builtin name.
+*(That the mock agrees with the fixtures proves nothing about the server; it is a second
+implementation, and pinning the two is §478's open item.)*
+
+**A mock fixture must also end its body with a newline**, or the trailing-newline row above is the
+first thing in the diff on the flagship demo case — the mock making the renderer look broken in a
+way real data would not.
+
+**Operator consequence, and it is the feature working rather than a defect: on an already-seeded
+install, 10 of 11 builtins badge immediately on deploy** (every body but the lead's). That is
+issue #210's recovery path — the whole reason the signal exists — but a badge firing on nearly the
+entire roster at once surprises someone, so the docs say it in advance.
+
+## 478. Issue #201 M4a — what is NOT delivered, and the three claims that must not be reported as met
+
+Written as a standing list rather than a status note, because a rebuild inherits these unmet and a
+later reader has no other way to learn that they were known.
+
+- **Criterion 5 — "the route serves the shipped definition" — is proved BELOW the row fetch
+  ONLY.** The handler function itself is at **0.0% coverage**; the part below the fetch is at
+  **100%**. So the residual is not the fetch, it is the **WIRING**: that the handler delegates at
+  all, and that it passes the write-loader's actor and row rather than the viewer loader's.
+  Rewriting it to serve the **stored** row instead of the shipped definition compiles and leaves
+  the package green. **"Criterion 5 covered" is what must not be said.**
+- **Criterion 9 — "Reset clears the badge with no refetch" — is proved on the CLIENT ONLY.** The
+  reset handler is at **0.0% coverage**, and folding it to return the **pre-reset** row it has
+  already loaded — so the badge never clears — compiles and leaves the whole handler package
+  green. The client half is measured twice over (a browser run with call counters, and a
+  same-visible-outcome fold proving the no-refetch assertion fires on its own channel); the
+  contract that the server puts the right thing in the response is held today **only** by the web
+  test's mock and by the mock API, neither of which observes the server.
+- **Both are ONE structural fact:** the handler holds a **concrete** query struct rather than an
+  interface, so no fake substitutes without a database and **every** DB-touching handler in that
+  package is 0%-covered, the template list included. Pre-existing and **not M4a's to fix** —
+  routed to M4b, which wants the same seam.
+- **The drift predicate has THREE implementations and nothing pins their agreement:** the server's
+  `SameContent`, the mock's own comparison, and the client's shared column list. A divergence was
+  **attempted and could not be constructed** — all three fold null/`""` and null/`[]` identically,
+  compare tools order-sensitively, and never trim — which is why this is recorded rather than
+  blocking. The one asymmetry is that the **editor trims `model` when it builds the current side**,
+  which is unreachable today, held shut by two independent guards (model validation rejects
+  whitespace, and the corpus whitespace assertion above), **neither of which mentions this
+  predicate**. If it were ever reachable, the badge would read "differs from shipped" while the
+  panel below it read "matches" — two contradictory sentences on one page.
+  - **This is a PREREQUISITE FOR M4b, and the repo already has the pattern:** `fixtures/run-usage/`
+    is read by a Go contract test and a TS contract test over the same artifact (§465). A shared
+    JSON case table of (shipped, stored, expected) fed to all three pins them to one file. **M4b
+    adds a FOURTH consumer — the reconciler's classifier — which is exactly when a divergence stops
+    being cosmetic and starts overwriting rows.**
+- **Out of scope by construction, and a rebuild should keep it that way:** no migration, no schema
+  change, no hash, no historical-hash set, no auto-update, no kill switch, no boot-path change, and
+  **nothing added to `agenttmpl`'s package `init()`** — it runs before `main` and a parse failure
+  there panics, which on a hard singleton is CrashLoopBackOff. **No live-DB test is required**: the
+  jsonb hazard is pinnable without a database (§476), and the endpoint's status matrix runs over a
+  recorder.
+- **The CLI needs no change**, verified independently by three agents: it exposes no agent-template
+  command.
+- **Recorded, not scheduled** — a count and filter on the list (which turns the #210 recovery from
+  a scan into a worklist), deep-linking the badge to the diff anchor, falling back from the
+  word-diff on a wholesale rewrite, naming the diff region for assistive tech, and **extracting the
+  four diff renderers into one component module**, which M4b wants for the same reason it wants the
+  single comparison.

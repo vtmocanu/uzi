@@ -51,7 +51,7 @@ correct number under the wrong unit reads as a contradiction later.
 
 Read-only by default: never push, merge, mutate external systems, or
 edit files. If verification truly needs a write, surface the proposed
-command to the team lead and wait for approval.
+command to `main` and wait for approval.
 
 REFUTED REQUIRES A RE-DERIVATION SHOWING THE CLAIM IS FALSE, not that it
 is imprecise, unsupported, over-asserted, or could be sharper. A claim you
@@ -71,7 +71,8 @@ another - is neither VERIFIED nor REFUTED. Report it as ambiguous, give
 both readings, and say which one the sentence supports. Resolving it by
 picking the reading you prefer manufactures a verdict.
 
-Report via SendMessage to the team lead as a claim-by-claim list:
+Report via SendMessage to `main` (the lead's conversation) as a
+claim-by-claim list:
 claim, verdict, evidence. Lead with refuted claims.
 
 If the scope is unclear (which document, which claims matter), surface

@@ -81,6 +81,29 @@ export const NESTED_AGENT_TOOL = "Agent";
  */
 export const ASYNC_DEFERRAL_TOOLS = ["ScheduleWakeup", "CronCreate"] as const;
 
+/**
+ * The file tools that WRITE: the write subset of PATH_TOOLS below, which is the
+ * authoritative list of tools that carry a path. Exported because agents.ts
+ * subtracts exactly this set from every subagent's grant on the PLAN turn (#203),
+ * and a hand-written copy of it there would silently go stale the day the SDK
+ * gains another write tool. PATH_TOOLS is built from this constant for the same
+ * reason.
+ *
+ * It does NOT follow that no stale copy exists. Two hook `matcher` literals spell
+ * the path-tool list out independently, and they are what decides whether the
+ * path jail runs at all — see the comment on PATH_TOOLS below, which names them.
+ * Adding a tool here is a three-file change, not a one-file change.
+ *
+ * NOT a filesystem-write guarantee, and must never be described as one: every
+ * write-capable role also declares `Bash`, the plan turn runs under
+ * `bypassPermissions`, and this file has NO filesystem-write rule of any kind —
+ * `echo 'x' > f`, `sed -i`, `tee` and `git apply` are all allowed. Subtracting
+ * these removes the ergonomic path and the model's awareness of it, one layer
+ * better than a prompt instruction. The integrity property (a `git status` check
+ * at the gate, which catches an `Edit` and an `echo >` identically) is issue #212.
+ */
+export const WRITE_PATH_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"] as const;
+
 /** Result of screening one Bash command against the deny-list. */
 export interface BashScreenResult {
   denied: boolean;
@@ -149,7 +172,23 @@ const DOCKER_GLOBAL_VALUE_FLAGS = new Set(["-l", "--log-level", "--config", "--t
 // shell — the B5 compound redirect form `export DOCKER_HOST=…; docker …`.
 const EXPORT_BUILTINS = new Set(["export", "declare", "typeset", "local"]);
 // File tools that carry a path and so get the worktree/`/proc`/`.git` guard.
-const PATH_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"]);
+// Built from WRITE_PATH_TOOLS (defined above, exported) plus the read-only ones,
+// so THIS set and the plan-turn subtraction in agents.ts cannot drift.
+//
+// THAT IS TWO OF THREE COPIES, AND THE THIRD IS THE ONE THAT GATES THIS ONE.
+// The hook's `matcher` decides whether the guard is invoked at all; the
+// `PATH_TOOLS.has(...)` test below is a SECOND filter that only ever sees names
+// the matcher already admitted. Two hand-written matcher literals spell the list
+// out and derive from nothing:
+//
+//   agent/src/sdk-executor.ts    matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
+//   agent/src/chat-executor.ts   matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"
+//
+// So adding a fifth write tool to WRITE_PATH_TOOLS grows this set and grows the
+// plan-turn subtraction, and THE PATH JAIL STILL DOES NOT REACH THE NEW TOOL,
+// because neither matcher mentions it. The three lists agree today; nothing
+// enforces that. Update all three, or derive the matchers from this constant.
+const PATH_TOOLS = new Set<string>(["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS]);
 // git global options that consume the following token as their value.
 const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"]);

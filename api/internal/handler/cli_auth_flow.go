@@ -22,6 +22,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // The browser-brokered, poll-based `uzi login` flow (PRD #64 M5). The CLI mints a
@@ -150,6 +151,14 @@ func (h *Handler) CLIAuthStart(w http.ResponseWriter, r *http.Request) {
 		// rune into invalid UTF-8, which the INSERT rejects → a 500 on this UNAUTH
 		// endpoint. A client_desc is auto-derived hostname/os, so a clear 400 is fine.
 		httpx.Error(w, http.StatusBadRequest, "client_desc is too long")
+		return
+	}
+	// #169: this string becomes a cli_tokens.name via browserTokenName, and that name is
+	// a NAME column in `uzi admin cli-tokens` beside another user's owner_email. Same rule
+	// as the static mint path in cli_tokens.go, and rejecting rather than stripping is the
+	// idiom the length check directly above already set on this same field.
+	if err := termsafe.Validate("client_desc", desc); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

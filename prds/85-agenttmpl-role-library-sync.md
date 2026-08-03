@@ -200,15 +200,38 @@ UI (Decision 8).
    #87 afterwards does not execute obsolete instructions.
 
    On the tools line specifically, #87 is factually right and its conclusion is
-   still wrong for us: the worker SDK genuinely never provides those four names,
-   and the resolver is case-sensitive and fail-closed, so an unmatched entry
-   grants nothing (`agent/src/repoagents.ts:20-29`). But all nine existing
+   still wrong for us: ~~the worker SDK genuinely never provides those four names,~~
+   the resolver is case-sensitive and fail-closed, so an unmatched entry
+   grants nothing (`agent/src/repoagents.ts:20-29`). *(**Corrected 2026-08-03,
+   issue #210: the struck clause is false for at least two of the four.** The
+   worker SDK provides `SendMessage` — 26 `tool_use` entries across runs
+   `71d83432` / `84b6a933` / `c13cff61`, 18 successful, plus six `ToolSearch`
+   resolutions of `select:SendMessage` — and `TaskList` (3 calls). `TaskUpdate`
+   and `TaskGet` are UNOBSERVED in those traces, which is not the same as observed
+   absent, so this correction deliberately does not claim all four exist. **The
+   decision's conclusion survives and its REASON INVERTS**: keep them verbatim not
+   because they are inert, but because at least two are live and useful — a
+   subagent's only channel to the lead's conversation **while it is still
+   running** runs through `SendMessage`, which is precisely what issue #210 fixes
+   the recipient of. The qualifier is load-bearing and was missing: the Agent
+   tool's return value is a second channel, and issue #210's own traces show three
+   subagents falling back to it (6468 / 6251 / 4400 chars, run `84b6a933` seq 337
+   / 994 / 2454). What `SendMessage` uniquely provides is reaching the lead
+   BEFORE the subagent finishes. Recorded here rather
+   than silently edited so the next reader does not conclude Decision 9 was wrong
+   rather than under-argued.)* But all nine existing
    library-derived builtins carry them verbatim (`builtins/auditor.md:4`,
    `builtins/reviewer.md:4`, …), and this PRD's entire thesis is that a builtin
    and its library counterpart should be diffable (Decision 3). Pruning two of
    twelve files would make those two the only ones whose `tools` line does not
-   match `roles.yaml`, to remove names that are already inert. So: **keep them
-   verbatim.** If the inert names are worth removing, that is a separate,
+   match `roles.yaml`, ~~to remove names that are already inert~~ *(struck
+   2026-08-03, issue #210: at least `SendMessage` and `TaskList` are live — see
+   the correction above. The whole purpose clause goes, not the adjective alone:
+   striking only "inert" leaves "to remove names that are already", which is why
+   this strike is wider than the one 165 lines below. The reason for pruning was
+   never strong and this removes what was left of it.)*. So: **keep them
+   verbatim.** If ~~the inert names~~ *(same correction — read: those four names)*
+   are worth removing, that is a separate,
    roster-wide change (all twelve at once, with the diffability cost taken
    deliberately), not a two-file exception.
 
@@ -325,6 +348,54 @@ the duplicate #202 was.
 **These are gated behind M1 and ship as independent MRs, the way PRD #103's milestones
 did** — folding does not make this one large change.
 
+> ### 🔴 AMENDED 2026-08-03 by #201 M4a. READ THIS BEFORE M8-M11.
+>
+> **M10 SHIPPED, on its own, and NOT in the order below.** It is #201's M4a, merged as
+> MR !171: a computed `differs_from_builtin`, a "differs from shipped" badge, a
+> shipped-vs-stored diff, and `GET /agent-templates/{id}/builtin`. Spec of record is
+> `prds/201-builtin-drift-signal.md`; design decisions are `specs/ai.md` §476-§478.
+>
+> **1. The ORDER BELOW IS INVERTED, and following it costs a migration you do not need.**
+> M8 (`version`) is listed before M9 (hash) and both are gated behind M1's parser change.
+> **The hash needs neither.** The question delivery must answer is *"has this row been
+> edited since we seeded it"*, which is a **hash** question, not a version question — as
+> M9's own text already says: *"an admin editing a stored prompt bumps no version."*
+> Verified against the tree: `Definition` has no `Version` field, the parser rejects the
+> key, and nothing in the reconcile path reads a version. **So the drift work ships
+> without M1-M3 and without M8**, which is the difference between a milestone and a PRD.
+>
+> **2. M8 SURVIVES, for a narrower reason than it claims.** What `version` still buys is
+> M10's admin-facing *label* ("shipped is v4, yours is based on v3"). A hash yields a
+> boolean. That argues for keeping M8 as a later UX improvement, not for doing it first.
+>
+> **3. NEVER HASH `Render(def)`. Hash a canonical projection of the persisted columns.**
+> Two changes scheduled in THIS PRD each silently break a `Render`-based hash with nothing
+> reddening: **Decision 3** reorders the frontmatter, and **M2** adds a `version:` line
+> that a hash-only world can never reproduce from a row. Every stored hash would mismatch
+> and every row would reclassify as edited. A third reason found during M4a: `Render`
+> omits `tools` and `model` when empty, so a stored `tools: []` and a stored `tools: NULL`
+> render identically, which HIDES a difference the UI displays as "none" vs "all".
+>
+> **4. M11's stated policy is A NO-OP AS WRITTEN — corrected inline below.** "Auto-update
+> rows still byte-identical to **the shipped default**" describes rows that have nothing
+> to update, since a row identical to what is *currently* shipped is already current. The
+> intent is **the default it was SEEDED with**. That distinction is the whole mechanism:
+> it is what separates a pristine row that is merely behind from a row an admin edited.
+>
+> **5. M11's real hard part is the NULL-hash backfill, which is not mentioned below.**
+> Every row on an already-seeded install has no seed hash, and that is the population this
+> exists to serve. See #201's note_22449 for the embedded historical-hash design, plus D4
+> (do NOT convert `InsertBuiltinAgentTemplate` to `DO UPDATE` — it is `:execrows` and the
+> `n > 0` branch seeds a global default allocation), D5 (never fatal at boot; it runs
+> pre-listen in a hard singleton, so a returned error is CrashLoopBackOff) and D7 (a
+> misclassifying auto-update has no in-product undo, because Reset restores the shipped
+> body, which is exactly what the bad update just wrote).
+>
+> **6. Issue #223 is a PREREQUISITE for M11**, not optional cleanup: `Handler.q` is a
+> concrete `*store.Queries`, so every DB-touching handler in `agent_templates.go` is at
+> 0.0% coverage, and M4a left three implementations of the drift predicate pinned by
+> nothing. M11's classifier is the fourth consumer, and it is the one that writes.
+
 - [ ] **M8 — `version` persisted.** Migration adding the column to
   `agent_templates` (Decision 8 previously deferred exactly this), plus the DTO and
   the reconcile path that writes it on insert. **`lead` stays unstamped per M2** and is
@@ -335,14 +406,18 @@ did** — folding does not make this one large change.
   version**, so drift detection cannot work on versions alone — and the hash is also
   what covers `lead`, which has no upstream number to carry. Establish both at reconcile
   time.
-- [ ] **M10 — The drift signal.** Admin-visible: this builtin has an upstream change
+- [x] **M10 — The drift signal.** ~~Admin-visible: this builtin has an upstream change
   pending. Today the only way to know is to have read a changelog, which is why #197's
-  fix is sitting unapplied.
+  fix is sitting unapplied.~~ **DONE 2026-08-03 as #201 M4a (MR !171), ahead of M8/M9 and
+  without either.** No version, no hash, no migration: the badge compares the stored row
+  against the embedded definition at request time. See the amendment above.
 - [ ] **M11 — The update policy, and this is the hard part, not the schema.** What
   happens to a row an admin has edited. The cheapest defensible shape, using M9's hash:
-  **auto-update rows still byte-identical to the shipped default** — provably
-  uncustomized, which is most installs — and **flag the rest for a manual diff**, never
-  overwriting anyone's work. Decide it in the Decision Log before writing the migration;
+  **auto-update rows still byte-identical to the default THEY WERE SEEDED WITH** —
+  provably uncustomized, which is most installs — and **flag the rest for a manual diff**,
+  never overwriting anyone's work. *(Corrected 2026-08-03: this read "byte-identical to
+  the shipped default", which is a no-op — a row identical to what is currently shipped
+  has nothing to update. Seeded-with vs shipped-with is the entire mechanism.)* Decide it in the Decision Log before writing the migration;
   the edit-preserving behaviour in `ON CONFLICT … DO NOTHING` is **correct** and must not
   simply be reversed. A third option between *never update* and *discard everything* is
   the entire product of this phase.
@@ -369,9 +444,15 @@ did** — folding does not make this one large change.
   `roles.yaml`). The four adapted bodies mean a generator would have to
   round-trip local edits; the manual port plus a red test is the honest version
   until the adaptation set shrinks.
-- **Pruning the four inert Claude Code team tools** (`SendMessage`,
+- **Pruning the four ~~inert~~ Claude Code team tools** (`SendMessage`,
   `TaskUpdate`, `TaskList`, `TaskGet`) from builtin `tools` lines — Decision 9.
   If worth doing, it is one roster-wide change, not a two-file exception here.
+  *(Corrected 2026-08-03, issue #210: "inert" is wrong for at least `SendMessage`
+  and `TaskList`, both observed executing in real runs — see the correction under
+  Decision 9. This stays out of scope, but the reason is now stronger rather than
+  weaker: pruning a LIVE tool would remove a subagent's only channel to the lead
+  **while it is still running** — the Agent tool's return value still delivers a
+  finished report, so the qualifier is what makes the claim true.)*
 - **The dev-team ↔ product parity nudge** — issue #63, a different comparison.
 - **Prebaking a browser into the worker image** — issue #87 / PRD #87. This PRD
   ships `web-ux` degraded and says so; it does not make it functional.
