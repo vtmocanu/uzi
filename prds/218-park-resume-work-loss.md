@@ -369,7 +369,9 @@ clone was destroyed, recreated at the same path, and the session still resolved
 - Any change to PRD #217's credential selection. The two PRDs touch the same park
   and are independent: #217 is about *which token* the resume spends, this is
   about *what tree* it resumes onto. Neither blocks the other.
-- **Steering-channel staleness — real, measured, and NOT a risk of this fix.** A
+- **Steering-channel staleness — real, measured, and NOT a risk of this fix.**
+  Tracked as [#222](https://gitlab.example.com/vtmocanu/uzi/-/issues/222); this
+  bullet stays the canonical write-up and that issue points back at it. A
   follow-up queued while a run is parked is drained by `pullFollowUp`
   (`sdk-executor.ts:1048`) inside the implement loop, after the reseed's `fs.rm`,
   so a correction written against the parked tree reaches a session that no longer
