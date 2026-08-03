@@ -83,6 +83,25 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `knip: command not found` until it is installed, the same way oxlint did.
   See [docs/dev-conventions.md](docs/dev-conventions.md).
 
+- **Contributor tooling: shell scripts, YAML and the Homebrew formula are now
+  checked in the gate and on every MR.** `task gate:repo` runs first inside
+  `task gate` and covers the checks that belong to no single component:
+  shellcheck over every tracked `*.sh` (scoped by `git ls-files`, so
+  `agent/templates/entrypoint.sh`, the worker container entrypoint, is finally in
+  scope), yamllint over every tracked YAML except the Helm templates (which are Go
+  templates, not YAML), and a syntax check of `Formula/uzi-cli.rb`, which release
+  CI copies verbatim into the shared tap on every tag. All three gate at zero: the
+  four shellcheck warnings and three yamllint findings that existed were fixed
+  rather than suppressed. One new CI job, `lint:repo`. `web/scripts/check-docs.mjs`
+  also now validates relative links in `prds/*.md` and `adr/*.md`, which nothing
+  checked before, and the three that had rotted are repaired. Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves. **Running `task gate`
+  locally now needs two tools on your `PATH`**: shellcheck **exactly 0.11.0** (the
+  version is asserted, because 0.10.0 does not report one of the diagnostics this
+  repo relies on, and a mismatch exits 2 rather than quietly grading differently)
+  and a **Ruby 3.1 or newer**, which macOS's own `/usr/bin/ruby` is not. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on
