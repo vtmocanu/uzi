@@ -78,32 +78,38 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// anchored at the start of the WHOLE stdout — stricter than the Formula's
 			// substring assert_match. A header line, a "uzi " label, or a leading
 			// blank line passes the Formula and fails the script.
-			// Write errors dropped explicitly here and below: this command's whole
-			// contract is that it reports the CLI version and exits 0 regardless of
-			// anything else. (Made explicit for errcheck, which gates this file now
-			// that the branch touches it.)
 			_, _ = fmt.Fprintln(env.Stdout, version)
 			if srv == nil {
 				return nil
 			}
+			// Server-supplied build strings, printed outside the Printer because line
+			// one must be the bare version and nothing else. So the uzicli boundary
+			// cannot reach them and the sanitize is explicit here (#180). CellText, not
+			// SanitizeTTY: %-8s pads a column, and a newline or tab in `version` or
+			// `commit` would break the label rail these six lines share.
 			for _, row := range serverRows(*srv) {
-				// cellText, not the raw value. These are server-controlled strings
-				// bound for a TTY and this sink PREDATES the skew warning: `version`
-				// carries no server-side constraint at all, so a `\r` in it erases
-				// the `server version ` label this line prints and an attacker
-				// sentence appears to come from uzi. Four such attacks were executed
-				// against this exact line (erase-display, line-overwrite, OSC 8
-				// hyperlink, bidi override), all exit 0.
+				// 🔴 THE LOCAL `cellText`, NOT `uzicli.CellText`, AND THE NAMES ARE
+				// THE TRAP. #180 closed the injection half at this exact line and did
+				// it better than this branch had — a shared leaf package with a
+				// biconditional pinned over every rune in Unicode — so the predicate
+				// below is termsafe's, reached through compactText. What #180
+				// deliberately did NOT close is LENGTH: termsafe.CellText's own doc
+				// says it "deliberately does not truncate", correctly, because a
+				// shared boundary that silently shortened every cell would corrupt
+				// run titles and emails to buy nothing.
 				//
-				// Sanitizing at PRINT time leaves --json byte-exact, which is the
-				// repo's standing rule. 🔴 THE REASON IS THE DESTINATION, NOT THE
-				// ENCODER — do not restate this as "json escapes what matters".
-				// Measured on encoding/json: C0 and U+2028/U+2029 are escaped, but
-				// DEL (0x7f), the C1 controls (0x9b CSI among them), U+202E and the
-				// zero-widths are NOT. What makes --json safe is that its bytes go
-				// to a PARSER rather than to a terminal, and that sanitizing there
-				// would corrupt the payload an agent decodes. A caller who pipes
-				// --json straight to a TTY is outside that guarantee.
+				// This call site is not a shared boundary. `version` carries no
+				// server-side constraint at all (contrast `commit`, gated by
+				// isFullSHA, and `built_at`, gated by time.Parse) and the only
+				// ceiling on the wire is client.go's 32 MiB, so a hostile server's
+				// 1 MiB version string prints here in full — measured at 1,048,673
+				// bytes. The local helper adds compactText's 200-char cap on top of
+				// the same predicate, which is the whole difference.
+				//
+				// So: swapping this to `uzicli.CellText` reopens that, and every name
+				// involved says you did the safe thing. TestVersionCommandSanitizes-
+				// ServerBuildInfo/unbounded is the guard; it asserts a byte count and
+				// nothing else will catch this.
 				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], cellText(row[1]))
 			}
 			return nil

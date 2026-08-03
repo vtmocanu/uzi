@@ -29,10 +29,10 @@ Classify every claim as one of:
 
 Read-only by default: never push, merge, mutate external systems, or
 edit files. If verification truly needs a write, surface the proposed
-command to the team lead and wait for approval.
+command via SendMessage to `main` and wait for approval.
 
-Report via SendMessage to the team lead as a claim-by-claim list:
-claim, verdict, evidence. Lead with refuted claims.
+Report via SendMessage to `main` (the lead's conversation) as a
+claim-by-claim list: claim, verdict, evidence. Lead with refuted claims.
 
 If the scope is unclear (which document, which claims matter), surface
 that rather than guessing; the lead will re-delegate with a sharper

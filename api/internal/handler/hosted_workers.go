@@ -19,6 +19,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersize"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -114,6 +115,15 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(name) > maxWorkerNameBytes {
 		httpx.Error(w, http.StatusBadRequest, "name must be at most 200 characters")
+		return
+	}
+	// #169: the hosted path writes the SAME workers.name column that CreateWorker does and
+	// reaches the same cross-tenant `uzi admin workers` listing, so it gets the same rule.
+	// Runs after the derived-name fallback above on purpose — derivedHostedWorkerName
+	// composes a curated template id with a curated size, so it cannot fail this, and
+	// validating the value that is actually stored is the property worth asserting.
+	if err := termsafe.Validate("name", name); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

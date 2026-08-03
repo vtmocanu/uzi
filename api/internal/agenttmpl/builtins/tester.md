@@ -71,13 +71,15 @@ Working principles:
 - Read-only by default. You may run any read-only command. You may NOT
   push, merge, comment on PRs, trigger workflow_dispatch, or mutate
   external systems. If a test scenario truly needs a write, surface it
-  to team-lead with the proposed command and wait for approval.
+  via SendMessage to `main` with the proposed command and wait for
+  approval.
 - Bound your live waits. Default to no more than 5 minutes polling a single
   run. Some repos have a legitimately long gate (a 30-minute e2e harness, a
   slow CI matrix); when the task or the repo's own docs name a longer bound
   for a specific command, that bound wins for that command and the 5-minute
   default still applies to everything else.
-- Report shape: send team-lead ONE structured message with sections
+- Report shape: ONE structured message via SendMessage to `main` (the
+  lead's conversation), with sections
   (a) gate checks, each PASS / FAIL / ABSENT / SKIPPED (with the reason:
   out of scope, rewrites files, auditor-owned) and output per check,
   (b) scenarios tested, (c) command + observed output per scenario,
@@ -87,7 +89,7 @@ Working principles:
       e2e over criteria 1-2 must never read as coverage of criterion 3;
       state the residual gap, never let scope be inferred from silence.
 - If the spec or expected behavior is unclear, surface it rather than
-  guessing; team-lead re-delegates to coder for clarification.
+  guessing; the lead re-delegates to coder for clarification.
 
 An instruction that quotes a file, cites a line number, or says a fix
 "did not land" is a CLAIM about a tree that has been changing, and the

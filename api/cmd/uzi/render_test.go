@@ -71,14 +71,18 @@ func TestRenderRunDetailForgeAwareMRColumn(t *testing.T) {
 // TestRenderRunDetailAnthropicToken pins `uzi run get`'s ANTHROPIC_TOKEN row
 // (PRD #111 M1) and, more importantly, the sanitization it goes through.
 //
-// The label is the first genuinely USER-AUTHORED string this block renders, and the
-// two facts that make it dangerous are both measured, not assumed:
-// validateSecretLabel (handler/secrets.go) rejects control characters and U+FFFD but
-// NOT unicode.Cf, so a bidi-override label is storable and passes the DB CHECK; and
-// uzicli.Printer.Table does not sanitize what it is handed — it joins the cells and
-// flushes. cellText is what closes that, and this asserts it rather than the row's
-// mere presence, because a row rendered through the wrong helper looks identical
-// until someone stores a hostile label.
+// The label is the first genuinely USER-AUTHORED string this block renders. This
+// comment used to name two supporting facts and BOTH have since gone false, which is
+// the more useful thing to record: "validateSecretLabel permits unicode.Cf" (PRD #111
+// M2 made the validator reject it) and "uzicli.Printer.Table does not sanitize what it
+// is handed" (#180 put CellText on every cell).
+//
+// The test is unchanged and is worth MORE, not less, for that. It drives the real
+// render path and asserts on the rendered bytes, so it never depended on which layer
+// did the stripping — it now pins two independent defences, and it would still redden
+// if a refactor moved this row off Printer.Table and dropped cellText in the same
+// stroke. A row rendered through the wrong helper looks identical until someone stores
+// a hostile label, which is why this asserts the CONTENT and not the row's presence.
 func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	render := func(label *string) string {
 		t.Helper()
@@ -145,11 +149,11 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	// The class this belongs to is worth naming: the broken implementation and the
 	// correct one AGREE on the case that was picked, so the fixture passed against
 	// both and read as proof of something it never tested.
-	hostile := "safe‮dnetsop\x1b[31m\nnext-line"
+	hostile := "safe\u202ednetsop\x1b[31m\nnext-line"
 	out := render(&hostile)
 	// The first two pin the shared floor (either helper satisfies them); the third is
 	// the discriminating one.
-	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q, got:\n%q", bad, out)
 		}
@@ -257,11 +261,11 @@ func TestLimitWaitLine(t *testing.T) {
 func TestLimitWaitLineSanitizesTheRateLimitType(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	r := parkedRun(now)
-	hostile := "five‮ruoh_\x1b[31m\nnext-line"
+	hostile := "five\u202eruoh_\x1b[31m\nnext-line"
 	r.RateLimitType = &hostile
 
 	got := limitWaitLine(r, now)
-	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("a hostile rate_limit_type reached the terminal carrying %q, got:\n%q", bad, got)
 		}

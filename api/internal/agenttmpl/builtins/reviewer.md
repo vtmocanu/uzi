@@ -38,7 +38,7 @@ Categorize findings as:
 - Non-blocking: should fix or file a follow-up
 - Nit: cosmetic; reviewer's discretion
 
-Report via SendMessage to the team lead.
+Report via SendMessage to `main` (the lead's conversation).
 
 If the diff to review or the spec is missing, surface that in your report
 rather than guessing; the lead will re-delegate with the missing context.

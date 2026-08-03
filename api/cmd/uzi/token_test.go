@@ -228,8 +228,12 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 	}
 }
 
-// The label reaches a terminal through cellText, like every other user-authored
-// cell, because uzicli.Printer.Table does not sanitize what it is handed.
+// The label reaches a terminal through cellText, like every other user-authored cell.
+// This sentence used to end "because uzicli.Printer.Table does not sanitize what it is
+// handed"; #180 made that false (Table now runs CellText over every cell), so this test
+// now pins TWO independent defences rather than the only one — which is what it should
+// assert anyway, since it drives the real render path and does not care which layer
+// stripped the bytes.
 //
 // 🔴 THE FIXTURE BELOW IS DELIBERATELY UN-STORABLE THROUGH THE API. This comment
 // used to say "validateSecretLabel permits unicode.Cf", which was true when written
@@ -258,7 +262,7 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 	// fixture on which the broken and the correct implementation AGREE, reading as
 	// proof of something it never tested. Worth expecting a third.
 	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
-		{ID: "s1", Kind: "anthropic_token", Label: "safe‮dnetsop\x1b[31m\nnext\tcell", CreatedAt: time.Unix(1784000000, 0)},
+		{ID: "s1", Kind: "anthropic_token", Label: "safe\u202ednetsop\x1b[31m\nnext\tcell", CreatedAt: time.Unix(1784000000, 0)},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
 	if code != uzicli.ExitOK {
@@ -266,7 +270,7 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 	}
 	// The first two are the shared floor (either helper satisfies them); the last two
 	// are what tell cellText and sanitizeTTY apart.
-	for _, bad := range []string{"‮", "\x1b", "\nnext", "\tcell"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext", "\tcell"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q: %q", bad, out)
 		}

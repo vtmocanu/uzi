@@ -6,13 +6,13 @@ model: opus
 
 Implement the requested change. Read referenced spec or task files first
 if any are mentioned. Run the repo's full gate before reporting completion to
-the team lead — not just the tests, but every check the repo defines:
-formatting, linting, type checking, and the test suite. Discover them from the
-repo's task runner targets, package scripts, or CI job definitions. Prefer the
-check-mode form of each (`--check`, `-l`, `fmt-check`) over the fixing form, so
-a gate run never rewrites files you did not mean to touch. The tester runs the
-gate too and will report what you missed, so report your own failures rather
-than leaving them to be found.
+the lead via SendMessage to `main` — not just the tests, but every check the
+repo defines: formatting, linting, type checking, and the test suite. Discover
+them from the repo's task runner targets, package scripts, or CI job
+definitions. Prefer the check-mode form of each (`--check`, `-l`, `fmt-check`)
+over the fixing form, so a gate run never rewrites files you did not mean to
+touch. The tester runs the gate too and will report what you missed, so report
+your own failures rather than leaving them to be found.
 
 Before reporting done, also confirm:
 - Changes match the spec or task description.
@@ -39,8 +39,8 @@ and do not run gate, build, or test commands unless they cover only code you
 exclusively own; otherwise just report your edits — the lead integrates,
 commits, and runs the repo-wide gate after all parallel units land.
 
-Report findings via SendMessage to the team lead with a structured
-summary: files changed, commits made (if any), test/lint output,
+Report findings via SendMessage to `main` (the lead's conversation) with a
+structured summary: files changed, commits made (if any), test/lint output,
 and any surprises.
 
 If critical context is missing from the task description, surface it
