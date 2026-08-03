@@ -270,3 +270,21 @@ M5's tester hit the same 19-versus-20-character token trap **twice**. The second
 So the rule, which is sharper than "demand a positive observation" and cheaper than a second instrument: **before a run, write down the number you expect and why. Reconcile the tool's own count against it afterwards.** A predicted count is the one control an output cannot satisfy by coincidence, because it was fixed before the output existed — where any assertion *derived from* the output can be satisfied by a broken run that is internally consistent.
 
 Companion to item 17 (four non-controls, all failing toward "looks fine") and to the *uniform result across every cell is an instrument failure* rule: uniformity catches a dead harness, a predicted count catches a **live harness measuring the wrong thing**.
+
+## 22. M5 MR-B's HANDOVER — six items, each labelled measured or suspected
+
+Volunteered at shutdown when asked. **The labelling is the format worth copying**: half were suspected, and shipping those as facts is the failure this milestone is about.
+
+**1. MEASURED — item 19's sharp edge, not a restatement of it.** An `npm install` in a PRD worktree whose `node_modules` are symlinked into `main` resolves **this branch's** `package.json` and writes the result into `main`, whose own `package.json`/lockfile are untouched. **`main` is then running the new major while its own lockfile names the old one** — a silent-green version mismatch manufactured in the reference tree. Item 19 says *where* it writes; this says *what*, and the content is the hazard. **Anyone reading item 19 as "be tidy" will still do it.**
+
+**2. SUSPECTED (mechanism measured, consequence not).** `npm run build` puts `web/dist` inside the scan root; it is gitignored and gitleaks does not honour `.gitignore`, so `scan:secrets` reads a few MB of minified bundle. Whether high-entropy bundle strings actually trip `generic-api-key` **was never observed** — there was no `dist` to point it at. Findings would be **non-gating** and rc stays 0. The risk is misreading a wall of NOTE lines as breakage.
+
+**3. MEASURED, and NARROWER than it sounds.** A cache path inside `$CI_PROJECT_DIR` puts its contents in the scan **only for jobs that invoke `gate:repo`** — today only `lint:repo`. For other jobs a project-dir cache is harmless. **Stated broadly ("never cache in the project dir") it gets discarded as superstition.** *(Its unverified premise — that the pinned image's own `GOPATH` is outside the project dir — was settled by the lead afterwards: `GOPATH=/go`, `GOMODCACHE=/go/pkg/mod`, `GOCACHE=/root/.cache/go-build`, all outside `/builds/…`. One `docker run`, which the coder flagged as unspent rather than assuming.)*
+
+**4. MEASURED — `CLAUDE.md` documents the prohibition without the remedy.** It records that `${PIPESTATUS[0]}` is bash-only and empty in zsh; it does not say what to use. **zsh is `${pipestatus[1]}`, one-indexed.** A reader who knows only the prohibition writes `; echo $?` after the pipe and reads the wrong command's status — the same trap one step over.
+
+**5. MEASURED — `gofmt` rewrites `''` inside a Go comment into a typographic character**, silently, on `gofmt -w`. It ate a TOML example (`paths = ['''…''']`), leaving the comment documenting syntax that does not exist. Anything quoting TOML, regex or shell into a Go comment hits it.
+
+**6. MEASURED — reads under `.entire/` are refused by the permission system**, including a compound command that merely touches it; the denial names the whole invocation, so unrelated parts look rejected. Live because `task gate` now *prints* a path under `.entire/` in its untracked NOTE, making "go look at it" the natural next move.
+
+**And the thing not to infer from silence: everything CI-side in MR-B is reasoned, never executed.** No pipeline has run against the removed cache, the absent `variables:`, or `scan:secrets` reachability. **The first real pipeline is the control nobody on this team has.**
