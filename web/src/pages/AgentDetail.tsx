@@ -132,7 +132,12 @@ export function AgentDetail() {
     try {
       const { template } = await api.resetAgentTemplate(id);
       setTemplate(template);
-      setNotice("Reset to the builtin default.");
+      // "shipped", not "builtin default": the badge, the panel and the reset card
+      // all say shipped, and Amendment 1 §3 settled that noun deliberately —
+      // M4b's classifier answers a different question ("does this match what it
+      // was SEEDED with?"), and the shared vocabulary is what keeps the two from
+      // reading as the same claim.
+      setNotice("Reset to the shipped definition.");
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : "Failed to reset");
     } finally {
