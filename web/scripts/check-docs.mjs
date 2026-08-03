@@ -67,12 +67,36 @@ function extractTargets(md) {
 
 const isExternal = (t) => /^[a-z][a-z0-9+.-]*:/i.test(t) || t.startsWith("//");
 
-// The web image build context is trimmed to web/ + docs/ (see the root
-// .dockerignore + Dockerfile), so repo-root link targets (../ARCHITECTURE.md,
-// ../plan.md) are absent there by design — the viewer rewrites them to GitLab
-// anyway. Links resolving INSIDE docs/ (doc->doc, doc->img) are always in
-// context and always checked; targets OUTSIDE docs/ are only checked in a full
-// checkout, so the containerized build stays green.
+// 🔴 WHAT MAKES THE CONTAINERIZED BUILD SAFE IS THE Dockerfile's COPY SET. Not a
+// trimmed build context, and not `.dockerignore`. Three protections exist and only
+// the first is a cause; the other two are its consequences:
+//
+//   (a) web/Dockerfile does `WORKDIR /app/web`, `COPY web/ ./` and
+//       `COPY docs/ /app/docs/`, so /app contains EXACTLY web/ and docs/. This
+//       file resolves repoRoot as `<scriptDir>/../..` = /app.
+//   (b) therefore /app/.git cannot exist, so `fullCheckout` is false and the whole
+//       outside-docs block below never runs there;
+//   (c) therefore /app/prds and /app/adr do not exist either, so the extraLinkFiles
+//       loop's existsSync guards find nothing to add.
+//
+// Nothing COPYs `.git`, `prds/` or `adr/` into /app, so (b) and (c) hold WHATEVER
+// `.dockerignore` says — delete its `.git` line and `fullCheckout` is still false.
+// `.dockerignore`'s real job here is the BUILD CONTEXT: it keeps the upload small
+// and, load-bearing for `COPY web/ ./` specifically, keeps `web/node_modules` and
+// `web/dist` out of the image.
+//
+// (Corrected twice, 2026-08-03, PRD #103 M5, and the second correction is the
+// instructive one. This comment first said "the web image build context is trimmed
+// to web/ + docs/ (see the root .dockerignore + Dockerfile)" — WRONG NOUN, RIGHT
+// CITATIONS. The first fix corrected the noun and dropped the Dockerfile half,
+// which was the true half, leaving a single causal claim resting on the one input
+// that does not carry the weight. Both were mechanism errors in a comment about a
+// mechanism error.)
+//
+// Links resolving INSIDE docs/ (doc->doc, doc->img) are always present and always
+// checked; targets OUTSIDE docs/ are only checked in a full checkout. Repo-root
+// link targets (../ARCHITECTURE.md, ../plan.md) are absent from the viewer's view
+// by design either way — the viewer rewrites them to GitLab.
 const fullCheckout = existsSync(path.join(repoRoot, ".git"));
 
 const files = readdirSync(docsDir)
@@ -155,13 +179,44 @@ for (const file of files) {
 // ARCHITECTURE.md alone. These files carry no frontmatter and no `order`, so
 // only the link check applies to them.
 //
-// Gated on fullCheckout for the same reason as the doc->outside case above: the
-// web image build context is trimmed to web/ + docs/, so these files are absent
-// there by design and the containerized build must stay green.
+// Gated on fullCheckout for the same reason as the doc->outside case above — read
+// that comment for the mechanism, which is the Dockerfile's COPY set (/app holds
+// only web/ and docs/), NOT `.dockerignore` and NOT a trimmed context.
+//
+// prds/ and adr/ joined specs/ here in PRD #103 M5. They are the two remaining
+// heavy PRD-linking populations. adr/ is small but concentrated: an ADR's number
+// is its TRACKING-ITEM number, which may be a PRD number or a bare issue number,
+// so THREE of the five open with a relative
+// `**PRD**: [prds/done/N-slug.md](../prds/done/N-slug.md)` line (0035, 0042,
+// 0065) and the other two open with an EXTERNAL issue link and no relative link
+// at all (0106, 0195). Two of those three relative links were dead when this
+// landed — 0042 and 0065, both `git mv … prds/done/` rot — and they are the class
+// this extension exists to catch.
+//
+// (Corrected 2026-08-03: the commit that ADDED this paragraph, in the same breath
+// as correcting a different false comment in this same file, claimed "every one of
+// the five" opens with such a line and that "three such links were dead". Both are
+// false and the first defeats itself: BECAUSE the number is an issue number, an
+// ADR need not have a PRD at all, and `adr/0106` says so in its own second line —
+// "there is no PRD" — warning that a reader assuming otherwise "will go looking
+// for prds/106-*.md and find nothing". The counterexample was inside the file the
+// sentence was about. The third dead link was in prds/66-guardrail-enforcement.md,
+// which is not an ADR opener.)
+//
+// 🔴 FLAT, NOT RECURSIVE, AND readdirSync IS WHAT MAKES IT SO. A non-recursive
+// read returns `done` and `mockups` as directory ENTRIES, and neither ends in
+// `.md`, so the filter drops them without a stat. That is a load-bearing property
+// of this loop rather than a happy accident: recursing would pull in
+// prds/done/*.md, which carries 16 further true positives (all the same move rot)
+// and would make this commit a 10-completed-PRD edit. Scoped flat by the user's
+// ruling of 2026-08-03; prds/done/ is a KNOWN, DELIBERATE residual. Widening it
+// is a decision, not a tidy-up.
 const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
-if (existsSync(path.join(repoRoot, "specs"))) {
-  for (const f of readdirSync(path.join(repoRoot, "specs")).sort()) {
-    if (f.endsWith(".md")) extraLinkFiles.push(path.join("specs", f));
+for (const dir of ["specs", "prds", "adr"]) {
+  const abs = path.join(repoRoot, dir);
+  if (!existsSync(abs)) continue; // optional directories
+  for (const f of readdirSync(abs).sort()) {
+    if (f.endsWith(".md")) extraLinkFiles.push(path.join(dir, f));
   }
 }
 

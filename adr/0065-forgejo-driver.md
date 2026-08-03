@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #65 merged)
 **Date**: 2026-07-17
 **Deciders**: Vlad + agent team (architect, coders, three review waves — design + security audit + fact-check — over two revision rounds)
-**PRD**: [prds/65-forgejo-support.md](../prds/65-forgejo-support.md) (GitLab issue [vtmocanu/uzi#65](https://gitlab.example.com/vtmocanu/uzi/-/issues/65)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale, for a reader rebuilding from specs who should not have to reread 900 lines.
+**PRD**: [prds/done/65-forgejo-support.md](../prds/done/65-forgejo-support.md) (GitLab issue [vtmocanu/uzi#65](https://gitlab.example.com/vtmocanu/uzi/-/issues/65)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale, for a reader rebuilding from specs who should not have to reread 900 lines.
 
 ## Decision (summary)
 

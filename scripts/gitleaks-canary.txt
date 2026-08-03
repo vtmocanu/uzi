@@ -1,0 +1,58 @@
+GITLEAKS CANARY -- DO NOT DELETE, DO NOT "FIX", DO NOT ANNOTATE (PRD #103 M5)
+================================================================================
+
+The token on the last line of this file is a FAKE GitLab personal access token.
+It has never been valid anywhere. It exists so that `scripts/scan-secrets.sh`
+can assert, on every run, that the scanner it just invoked was actually looking.
+
+WHY A FILE FULL OF A FAKE SECRET IS THE CHEAPEST HONEST CHECK
+--------------------------------------------------------------------------------
+gitleaks AUTO-DISCOVERS `.gitleaks.toml` FROM THE ROOT OF THE TREE IT IS
+SCANNING, so the scanner's configuration is an ordinary tracked file that anyone
+who can open a merge request can add or widen -- and that merge request's own
+`scan:secrets` job then reads it. Measured 2026-08-03, same directory, same two
+planted secrets, no `-c` flag in either run: config absent -> 2 leaks; a config
+carrying `[allowlist] regexes = ['''.*''']` -> "no leaks found", exit 0.
+
+A secret scanner a contributor can switch off in the same commit that adds the
+secret is worse than no scanner, because it reports green.
+
+What makes that closable rather than merely documented is that EVERY ALLOWLIST
+BROAD ENOUGH TO BLIND THE SCANNER ALSO BLINDS THIS FILE. Measured on the same
+pair of runs: with the disarming config in place the canary's own finding
+disappears too. So the wrapper does not need to inspect, parse or trust the
+config at all -- it asks one question of the report ("is the canary in here?")
+and every way of switching the scanner off answers it "no".
+
+THIS IS ONE OF TWO. The other is `api/internal/config/gitleaks_canary_test.go`,
+and the split is deliberate: this file catches a scanner that has been switched
+OFF, and could not see one that had merely been NARROWED.
+
+The narrowing that matters is the one written CORRECTLY, which is the part worth
+remembering. A bare `[allowlist] paths` REPLACES gitleaks' ruleset outright, so
+no rule loads, every canary dies, and the wrapper catches it. Add
+`[extend] useDefault = true` above it -- which is what a careful contributor
+writes -- and the rules stay loaded while the named paths simply go unread. With
+a `paths` regex matching `_test.go`, secret scanning is off for every test file
+in the repo and this canary, sitting in `scripts/`, goes on reporting happily.
+The second canary lives inside the test corpus so that config dies loudly. Two
+canaries cover two regions and no more; read the wrapper's header for the limit.
+
+WHAT BREAKS IF YOU TOUCH THIS FILE
+--------------------------------------------------------------------------------
+* Delete it, move it, or rename it        -> `task scan:secrets` exits 2.
+* Add a `gitleaks:allow` to the token line -> exits 2 (the annotation is matched
+  as a substring of the LINE, so it would suppress the canary and the wrapper
+  would correctly report the scanner as blind).
+* Change the token so it no longer matches gitleaks' `gitlab-pat` rule -> exits 2.
+
+Exit 2 is this repo's "the instrument is broken", never "there are findings".
+The wrapper's message names this file and this paragraph.
+
+Prose ABOVE the token is safe: the annotation match is per-line, verified
+2026-08-03 by writing the literal annotation text on a preceding line and
+confirming the token was still reported. It is deliberately not written anywhere
+in this file all the same.
+
+--------------------------------------------------------------------------------
+GITLEAKS_CANARY_TOKEN = "glpat-uziCANARYcanary01234"

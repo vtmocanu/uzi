@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5-M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5 two-thirds done 2026-08-03** — MR-A (shell/YAML/formula/check-docs) and MR-B (gitleaks + canary) validated and up for review; **MR-C deferred** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4). **M5 stays unticked and Success Criterion 5 unmet until MR-C lands**, since that criterion is atomic across all three security tools. **M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
 
 *(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
@@ -1025,12 +1025,25 @@ which previously prescribed only the fail-open form.
       Same rule for every tool a later milestone adds: **the CI job must
       provide it — never devbox.** "Provide" means whichever of these fits:
       baked into a digest-pinned image (the lint jobs can use the official
-      `golangci/golangci-lint`, `koalaman/shellcheck-alpine` and `gitleaks`
-      images rather than installing into `golang:1.26`), fetched at job time
+      `golangci/golangci-lint` or `gitleaks` images rather than installing into
+      `golang:1.26`), fetched at job time
       via a pinned `go run …@vX.Y.Z` (the `sqlc@v1.30.0` precedent in
       `validate:api`, and how M4 will invoke `deadcode`), installed as an npm
       devDependency by the existing `npm ci` (knip, oxlint), or a
       `before_script` install.
+
+      *(`koalaman/shellcheck-alpine` was struck from that list on 2026-08-03
+      during M5, on measured grounds: it ships no `git`, and `lint:shell`'s scope
+      IS `git ls-files`, so the job could not enumerate its own inputs; and every
+      distro-packaged shellcheck is 0.10.0, which does not emit SC3067 at all and
+      is therefore a different gate rather than the same one. M5 ships a pinned
+      tarball into `golang:1.26` instead. Struck here so the PRD stops offering a
+      route its own milestone ruled out. Note also that this list is explicitly
+      "whichever of these fits" and is NOT a ranking — the preference order lives
+      in the PRD #103 carry-forward, item 6, with the measured reason: the official
+      `golangci/golangci-lint` image ships Go 1.26.2 with `GOTOOLCHAIN=auto`
+      against both modules' `go 1.26.4`, so it would be the pipeline's first
+      unpinned effective toolchain.)*
 
       **Anything fetched in a `before_script` must be version- and
       sha256-pinned**, matching what `e2e:kind-smoke` already does for
@@ -1760,6 +1773,61 @@ which previously prescribed only the fail-open form.
 
 - [ ] **M5 — The long tail: shell, YAML, secrets, vulns**:
 
+      > **STATUS 2026-08-03: TWO THIRDS LANDED, NOT COMPLETE.** M5 was split
+      > into three MRs at design time because each has a different review
+      > question. **MR-A** (shellcheck, yamllint, `ruby -c`, the flat
+      > `prds/`+`adr/` check-docs extension) and **MR-B** (gitleaks + a
+      > committed canary) are done, validated and merged into the branch;
+      > **MR-C** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4)
+      > is deferred. **The box stays unticked and Success Criterion 5 stays
+      > unmet** — its sentence is atomic across gitleaks *and* `govulncheck`
+      > *and* `npm audit`, and only the first ships.
+      >
+      > **The design's central mechanism is the gitleaks canary.** gitleaks
+      > auto-discovers `.gitleaks.toml` **from the scan root**, so the
+      > scanner's configuration lives inside the tree it scans: a four-line
+      > allowlist added in an MR disarms that same MR's scan job, at exit 0,
+      > reporting clean. The wrapper therefore runs with `--exit-code 0` and
+      > **exits 2 unless a committed canary appears in the report** — the
+      > canary dies with the scanner, so its absence is the signal. Two
+      > canaries in different populations, because one cannot see a narrowing
+      > of another.
+      >
+      > **Known residual, deliberately not closed**: an allowlist scoped to a
+      > directory containing no canary narrows the scan undetected. Banning
+      > `.gitleaks.toml` was considered and rejected — it makes the canary's
+      > own failure branch unreachable, so nobody could demonstrate the
+      > mechanism works.
+      >
+      > **One blocking defect was found in review and fixed.** `gitleaks dir`
+      > honours **one** target and silently widens to `.` on two or more, so
+      > the original 1465-target invocation scanned byte-identically to
+      > `gitleaks dir -- .`. In CI that would have walked a 424 MB Go module
+      > cache and reported **630 findings on every MR and every `v*` publish**.
+      > The probe that established multi-target support could not have caught
+      > it: *"two targets, both scanned, each under its own spelling"* is true,
+      > and the inference — that nothing else is scanned — is not. The
+      > disconfirming control is a third file that is not a target.
+      >
+      > **Success Criterion 8 is met for everything MR-A and MR-B ship**,
+      > across four calibration passes. The arms that would have passed in a
+      > weaker form and did not: the severity tier pinned from *both* sides
+      > (the same tree at `-S error` returns 0, so shipping `error` would have
+      > sailed through), the version refusal tested with a **newer** shim (the
+      > only arm separating an exact pin from a floor), and the canary
+      > assertion deleted → `rc=0 "clean"` on a tree with a planted secret,
+      > which is what makes the shipped `rc=2` mean anything.
+      >
+      > **🔴 No pipeline has run against any of this.** The `lint:repo` job,
+      > the removed cache, `scan:secrets` reachability, the three
+      > `apt`-installed tools and the sha256-pinned shellcheck fetch are all
+      > reasoned, never executed. **The first pipeline is the control nobody
+      > on the authoring side has.**
+      >
+      > Full record: `.claude/agent-team-tasks/prd-103-m5.md`, 27 dated
+      > amendments. Cross-milestone lessons: `prd-103-carry-forward.md`,
+      > items 16-22.
+
       **`shellcheck` over every tracked shell script — scope it as
       `git ls-files '*.sh'`, not `e2e/*.sh` + `scripts/*.sh`.** Those two globs
       miss a third of the tracked scripts, including
@@ -1793,8 +1861,16 @@ which previously prescribed only the fail-open form.
       `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list. The
       gap is `prds/` and `adr/` as link *sources*. Adding them to that list is a
       small change; a parallel checker would have different semantics and would
-      have to rediscover why the existing one is gated on `fullCheckout` (the
-      web image build context is trimmed to `web/` + `docs/`).
+      have to rediscover why the existing one is gated on `fullCheckout`
+      (`web/Dockerfile` COPYs only `web/` and `docs/` into `/app`, which is what
+      the checker resolves as its repo root, so `/app/.git` cannot exist).
+      *(Corrected twice on 2026-08-03 during M5. It first read "the web image
+      build context is trimmed to `web/` + `docs/`" — wrong noun: `.dockerignore`
+      excludes a named list, so the CONTEXT is the repo root minus that list and
+      still carries `prds/`, `adr/` and `specs/`. The first correction then
+      attributed it to `.dockerignore` excluding `.git`, which is redundant here —
+      nothing COPYs `.git` into `/app` regardless. The COPY set is the cause; the
+      conclusion was never in doubt.)*
 
       **Calibration**: add an unquoted `$var` in a scoped script and confirm
       shellcheck fires; add a broken relative link in a `prds/` file and confirm

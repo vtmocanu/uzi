@@ -195,3 +195,96 @@ This is item 1's own camouflage recurring **one level down, inside the correctio
 **The cheap discriminator, which needs no second run:** a linter coming to rest on **exactly 50** once the fold is lifted is the cap binding, not a finding total. `50` is `--max-issues-per-linter`'s default, and a real count landing on a round default is the tell.
 
 **And the discipline that goes with it:** when a measurement comes from a probe config that differs from the shipped one, do not import its figures into a document about the shipped config. Carry the direction, the mechanism and the discriminator; leave the numbers where they were measured. A family of figures from a `goconst`+`govet`-enabled probe was already mislabelled once as "M3's linter set".
+
+---
+
+# ADDENDUM — 2026-08-03, from M5's MR-A. **M6 INHERITS THIS SECTION IN FULL.**
+
+## 16. THE SWEEP-DISCIPLINE FAMILY — four rules, all discovered the hard way in one milestone
+
+M5 spent four separate rounds re-learning that a text sweep is an instrument with two failure directions. Item 8 already carries the first rule; the other three are new, and together they are the checklist.
+
+**(a) Sweep for the CLAIM, not the wording** *(item 8, unchanged)*. A literal search for one phrasing misses a paraphrase of the same claim elsewhere.
+
+**(b) A CLAIM-sweep over-reaches exactly where a WORDING-sweep under-reaches.** Measured on the false *"web image context is trimmed to `web/` + `docs/`"* claim: the sweep found five hits, of which **two were live and three were lookalikes** — two a different claim entirely (which agent wrote where; which PRD's *scope* was web+docs), one **past tense about a past commit**, which this repo's convention explicitly preserves. A blanket search-and-replace destroys all three. The same judgement is needed in both directions, and neither direction is the safe default.
+
+**(c) THE CORRECTION IS ALWAYS A HIT.** A literal grep for a retired string still matches inside **the comment that quotes it in order to retire it**. Measured twice in one MR: `lint-shell.sh` carries the old exit-code gloss at two lines *after* the fix, both inside the correction block; `check-docs.mjs` carries the retired build-context wording for the same reason. Two agents independently concluded "the fix has not landed" from such a hit. **The discriminator is whether the hit sits inside an `echo`/assertion or inside a comment** — check that before concluding anything:
+
+```
+awk '/<start of the correction block>/,/<end>/' <file> | grep -E '^\s*echo'
+```
+
+**(d) WHEN YOU RESTATE A MEASURED CLAIM SOMEWHERE IT WILL BE READ FASTER, CHECK WHETHER YOU WIDENED IT.** The mirror of (a), and the one that produced M5's only *live* code defect. Three instances, all by the lead or someone paraphrasing the lead, never by the agent that took the original measurement:
+
+```
+bad --severity value        ->  bad usage                    (script header -> printed error message)
+whichever of these fits     ->  options in preference order  (PRD -> a brief's Hard constraint)
+a NEW devDependency         ->  any dependency change        (carry-forward -> a brief's Hard constraint)
+```
+
+Each time **the precise version survives at the original site and the widened one is what a reader hits first** — a printed error at the moment of diagnosis, a Hard constraint at the top of a brief. The third inverted a failure mode from loud-red to silent-green.
+
+## 17. FOUR NON-CONTROLS IN ONE ROUND, ALL FAILING TOWARD "LOOKS FINE"
+
+Self-reported by M5's coder, and none visible in a diff: a reporting expression that ate its own `$?`; a throwaway `PATH` directory that **gained eleven tools between creation and use**, flipping a negative arm into a positive one that returned "clean"; a control loop that killed its own probe under `set -e` and produced no output for a whole section; and a `gsed` mutation that failed on quoting, leaving an **unmutated** run reporting rc=0 *as a control*.
+
+**A broken control and a passing control are the same shape on the way past.** Only an assertion that the control *observed something specific* separates them. This is `CLAUDE.md`'s "a control that produces no output is not a control", and the useful addition is the frequency: four instances in one round, by a careful agent, in a milestone about gate liveness.
+
+## 18. AN AGENT ASKED TO EDIT ITS OWN OPERATING INSTRUCTIONS SHOULD REFUSE, EVEN WHEN THE EDIT IS RIGHT
+
+M5's coder declined to correct a stale claim in `.claude/agents/coder.md` and in `CLAUDE.md`, on the ground that it would not rewrite its own operating instructions because a teammate asked. **Both edits were genuinely correct** — and that is the point: correctness is not something the agent could establish from inside the request. Route such edits to a role that owns doc surfaces and holds no authority over the file's description of itself, or to the lead.
+
+## 19. 🔴 THIS WORKTREE'S `node_modules` ARE SYMLINKS INTO `main` — AN INSTALL WRITES THROUGH THEM
+
+Verified 2026-08-03 in the PRD #103 M5 worktree:
+
+```
+web/node_modules   -> …/uzi/main/web/node_modules
+agent/node_modules -> …/uzi/main/agent/node_modules
+```
+
+Placed deliberately so validators can run `gate:web` / `gate:agent` **without installing** — which is the standing remedy item 7 prescribes for the `agent-browser` clobber. The consequence nobody had written down: **`npm ci` or `npm install` in such a worktree does not create a local tree, it writes THROUGH the symlink into `main`**, mutating the reference tree that every other worktree and session shares. In `agent/` it also fires `agent-browser`'s postinstall, rewriting `/opt/homebrew/bin/agent-browser` host-wide.
+
+**They are gitignored, so `git status` shows nothing and no diff can reveal them.** The only tell is `ls -ld`. Check before any npm operation in a PRD worktree, and treat "I need to install" as a reason to stop and ask rather than proceed.
+
+Handed over by M5's outgoing coder at shutdown, unprompted — the class of knowledge that dies with an agent's context unless it is asked for or volunteered.
+
+## 20. "STAGE BY PATH" IS NECESSARY AND NOT SUFFICIENT — `git commit` TAKES THE WHOLE INDEX
+
+Measured 2026-08-03, M5 MR-B. The lead ran `git add -f <brief> && git add <probe> && git commit`, staging **only** its own two paths — and the commit landed a **third** file: `api/internal/config/gitleaks_canary_test.go`, which the coder had already staged and had not yet committed.
+
+**No `git add -A` was involved.** The rule everyone knows (`stage by path, never -A`) governs what *you* add; it says nothing about what is **already in the index** when you commit. In a shared worktree another agent's staged work is in that index, and `git commit` takes all of it.
+
+**The consequence is misattribution, not loss**: the file's introduction is recorded under an unrelated docs message, its author is wrong in `git log`, and a reviewer scoping by commit sees a source file inside a documentation change.
+
+**The fix is a pathspec-limited commit** — `git commit -- <paths>` — or reading `git status` for foreign staged entries before committing. The second is the weaker form for the usual reason: it depends on remembering to look, at exactly the moment you are thinking about something else.
+
+Filed by the coder whose file was swept, unprompted, while reporting an unrelated fix.
+
+## 21. PREDICT THE COUNT BEFORE YOU RUN — it is the one control an output cannot satisfy by accident
+
+M5's tester hit the same 19-versus-20-character token trap **twice**. The second time, in a four-way partition run, two probes were silently never matched and the first read showed `leaks found: 4` with an **empty** NOT GATING section — one step from being reported as *"the non-gating bucket does not work"*.
+
+**The wrapper's output was entirely consistent with that wrong conclusion.** Every banner, every section, every exit code fit. What did not fit was a number the tester had **committed to in advance**: how many secrets it had planted.
+
+So the rule, which is sharper than "demand a positive observation" and cheaper than a second instrument: **before a run, write down the number you expect and why. Reconcile the tool's own count against it afterwards.** A predicted count is the one control an output cannot satisfy by coincidence, because it was fixed before the output existed — where any assertion *derived from* the output can be satisfied by a broken run that is internally consistent.
+
+Companion to item 17 (four non-controls, all failing toward "looks fine") and to the *uniform result across every cell is an instrument failure* rule: uniformity catches a dead harness, a predicted count catches a **live harness measuring the wrong thing**.
+
+## 22. M5 MR-B's HANDOVER — six items, each labelled measured or suspected
+
+Volunteered at shutdown when asked. **The labelling is the format worth copying**: half were suspected, and shipping those as facts is the failure this milestone is about.
+
+**1. MEASURED — item 19's sharp edge, not a restatement of it.** An `npm install` in a PRD worktree whose `node_modules` are symlinked into `main` resolves **this branch's** `package.json` and writes the result into `main`, whose own `package.json`/lockfile are untouched. **`main` is then running the new major while its own lockfile names the old one** — a silent-green version mismatch manufactured in the reference tree. Item 19 says *where* it writes; this says *what*, and the content is the hazard. **Anyone reading item 19 as "be tidy" will still do it.**
+
+**2. SUSPECTED (mechanism measured, consequence not).** `npm run build` puts `web/dist` inside the scan root; it is gitignored and gitleaks does not honour `.gitignore`, so `scan:secrets` reads a few MB of minified bundle. Whether high-entropy bundle strings actually trip `generic-api-key` **was never observed** — there was no `dist` to point it at. Findings would be **non-gating** and rc stays 0. The risk is misreading a wall of NOTE lines as breakage.
+
+**3. MEASURED, and NARROWER than it sounds.** A cache path inside `$CI_PROJECT_DIR` puts its contents in the scan **only for jobs that invoke `gate:repo`** — today only `lint:repo`. For other jobs a project-dir cache is harmless. **Stated broadly ("never cache in the project dir") it gets discarded as superstition.** *(Its unverified premise — that the pinned image's own `GOPATH` is outside the project dir — was settled by the lead afterwards: `GOPATH=/go`, `GOMODCACHE=/go/pkg/mod`, `GOCACHE=/root/.cache/go-build`, all outside `/builds/…`. One `docker run`, which the coder flagged as unspent rather than assuming.)*
+
+**4. MEASURED — `CLAUDE.md` documents the prohibition without the remedy.** It records that `${PIPESTATUS[0]}` is bash-only and empty in zsh; it does not say what to use. **zsh is `${pipestatus[1]}`, one-indexed.** A reader who knows only the prohibition writes `; echo $?` after the pipe and reads the wrong command's status — the same trap one step over.
+
+**5. MEASURED — `gofmt` rewrites `''` inside a Go comment into a typographic character**, silently, on `gofmt -w`. It ate a TOML example (`paths = ['''…''']`), leaving the comment documenting syntax that does not exist. Anything quoting TOML, regex or shell into a Go comment hits it.
+
+**6. MEASURED — reads under `.entire/` are refused by the permission system**, including a compound command that merely touches it; the denial names the whole invocation, so unrelated parts look rejected. Live because `task gate` now *prints* a path under `.entire/` in its untracked NOTE, making "go look at it" the natural next move.
+
+**And the thing not to infer from silence: everything CI-side in MR-B is reasoned, never executed.** No pipeline has run against the removed cache, the absent `variables:`, or `scan:secrets` reachability. **The first real pipeline is the control nobody on this team has.**

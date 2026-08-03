@@ -116,10 +116,14 @@ written under exactly the conditions that produce weak ones.
 
 Gate slots here are: **format `task fmt-check`, lint `task lint`, dead code
 `task deadcode`, coverage `none (gap)`** — so "run every slot" means fmt-check +
-vet + build + lint + deadcode + typecheck + test, which is what `task gate`
-runs. *(PRD #103 M4, 2026-08-02: the dead-code slot read `none (gap)` here until
-M4 closed it. Note this file phrases the claim differently from every other copy,
-which is how a literal grep for the wording used elsewhere missed it during M3.)*
+vet + build + lint + deadcode + typecheck + test, plus `gate:repo`'s three
+repo-wide checks (shellcheck, yamllint, the Homebrew formula) with no component
+of their own — all of which is what `task gate` runs. *(PRD #103 M4, 2026-08-02:
+the dead-code slot read `none (gap)` here until M4 closed it. Note this file
+phrases the claim differently from every other copy, which is how a literal grep
+for the wording used elsewhere missed it during M3. PRD #103 M5, 2026-08-03: this
+undercounted `task gate` again, having stopped naming `gate:repo`, added the same
+milestone.)*
 
 **Two things about the dead-code slot that decide how you read a green.** The Go
 half (`deadcode -test ./...` per module) gates at ZERO against a committed,
@@ -166,7 +170,8 @@ at `none (gap)`. M2 cleared the drift under `api/` and added the gate.)*
 (after editing `internal/store/migrations/` or `queries/`, also regenerate with the
 pinned `sqlc generate` and confirm `git diff -- internal/store` is empty — CI asserts
 it); `task gate:web`; `task gate:agent`; `task gate:controller` if you touched that
-module. `task gate` runs all four, serially. **`task` exits 201 on any failure, not
+module. `task gate` runs `gate:repo` (shell/YAML/formula) first, then all four
+components, serially. **`task` exits 201 on any failure, not
 the underlying command's code** — test for non-zero, never a number.
 
 `task gate:web` is check-docs + typecheck + test and does NOT bundle: `cd web && npm

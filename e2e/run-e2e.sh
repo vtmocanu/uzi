@@ -3712,7 +3712,15 @@ done
 record_margin "issues.synced_at advances (poller liveness)" "$((SECONDS - B6_LIVE_START))" 20
 pass "poller liveness: issues.synced_at for #$F_IID advanced off '$B6_SYNC0' — a tick has run since the close"
 
-wait_disposition "$F_REVIEW" "$B6_CAT" "$B6_TGT" done
+# `"done"` IS QUOTED TO KEEP IT A WORD, NOT FOR STYLE. Bare `done` here is the
+# WANT positional (wait_disposition's `want="$4"`, compared with `[ "$got" =
+# "$want" ]`), but shellcheck reads a bare `done` after a simple command as a
+# missing `;` before a loop terminator and reports SC1010 at warning severity.
+# The quotes are semantically inert -- the shell word is `done` either way -- and
+# they are what lets PRD #103 M5 gate `shellcheck --severity=warning` at zero
+# without an `-e SC1010` that would blind every other script in the repo to a
+# genuinely missing `;`. Do not unquote it.
+wait_disposition "$F_REVIEW" "$B6_CAT" "$B6_TGT" "done"
 
 # THE PROVENANCE TRIPLE, and it is the assertion that makes this row about the POLLER
 # rather than about a disposition existing. status='done' alone is equally satisfied by a

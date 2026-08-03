@@ -373,9 +373,6 @@ services:
       - dindsock:/run/dind
     secrets:
       - worker_token
-    depends_on:
-      api:
-        condition: service_healthy
     # NOTE (M2 follow-up): the agent does NOT `depends_on: dind`. On the pinned engine
     # (Docker Compose 5.1.2) a `depends_on` whose target is disabled by the active profiles
     # ERRORS the whole project ("service agent depends on undefined service dind: invalid
@@ -385,6 +382,9 @@ services:
     # / DOCKER_HOST set) the worker retries the probe until the daemon is up. The e2e names
     # `dind` in its `up` so the daemon starts; the `dind` healthcheck makes `up --wait dind`
     # meaningful.
+    depends_on:
+      api:
+        condition: service_healthy
 
   # PRD #83 M2: socket-permission helper for the rootless DinD sidecar. Two problems the
   # rootless daemon cannot solve for itself, both established live (see the M2 commit /
@@ -437,6 +437,17 @@ services:
   # none of the worker's secret/`/data`/`/nix`. Profile-gated: the plain `--profile
   # agent` path is UNCHANGED; bring the daemon up with `--profile agent-docker`.
   dind:
+    # Namespace isolation (auditor E1/E2 — MUST): an ORDINARY sibling service. NO
+    # `network_mode: "service:agent"`, no `pid:`/`ipc:` sharing. The worker reaches the
+    # daemon ONLY through the shared socket volume. A shared netns would put the daemon's
+    # socket on the worker's own loopback and defeat the separate-mount-ns isolation's intent.
+    #
+    # CROSS-UID socket access (arch §Q4) is SOLVED by dind-init above (chown /run/dind →
+    # 1000:1000 0711 so the rootless daemon starts, then hold the socket at 0666 so both the
+    # worker probe uid 10001 and the runner-uid 10002 agent reach it — validated live). The
+    # remaining tester day-1 item is the minimal privileged/security set (Decision 2), NOT the
+    # socket wiring.
+    #
     # Rootless DinD (Decision 2): a breakout lands as an unprivileged, userns-mapped host
     # uid — the same rootless stance as our nix/devbox engine, never host root, never a
     # host docker.sock. Pinned by digest (multi-arch: amd64 + Apple-Silicon). The
@@ -501,16 +512,6 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-    # Namespace isolation (auditor E1/E2 — MUST): an ORDINARY sibling service. NO
-    # `network_mode: "service:agent"`, no `pid:`/`ipc:` sharing. The worker reaches the
-    # daemon ONLY through the shared socket volume. A shared netns would put the daemon's
-    # socket on the worker's own loopback and defeat the separate-mount-ns isolation's intent.
-    #
-    # CROSS-UID socket access (arch §Q4) is SOLVED by dind-init above (chown /run/dind →
-    # 1000:1000 0711 so the rootless daemon starts, then hold the socket at 0666 so both the
-    # worker probe uid 10001 and the runner-uid 10002 agent reach it — validated live). The
-    # remaining tester day-1 item is the minimal privileged/security set (Decision 2), NOT the
-    # socket wiring.
 
 volumes:
   pgdata:

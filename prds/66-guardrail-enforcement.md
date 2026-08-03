@@ -1,7 +1,7 @@
 # PRD #66: Refuse runs when the bot can push or merge to the default branch
 
 **GitLab Issue**: [#66](https://gitlab.example.com/vtmocanu/uzi/-/issues/66)
-**Status**: Draft (created 2026-07-17; split out of [PRD #65](65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it)
+**Status**: Draft (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it)
 **Priority**: High
 **Depends on**: **PRD #65** — it lands `WriteRoleCanMerge`/`BotCanMerge`, the `Role` enum, and the shared `evaluateRepo` whose fields this PRD consumes. #65 reports; #66 refuses.
 **Touches the contracts of**: PRD #5 (privilege checks — **this PRD changes its warn-don't-block policy**, the first time uzi refuses a run for any reason), PRD #19 (autopilot creates runs), PRD #6 (CI-fix creates runs), PRD #46 (self-improve creates runs), PRD #42 (claim path).

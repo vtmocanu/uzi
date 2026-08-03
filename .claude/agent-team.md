@@ -1362,12 +1362,39 @@ format         task fmt-check      # gofmt -l over both Go modules; fails on dri
                                    # every one of the files commit 1 touched. See the
                                    # standing rule for the full retirement and for why a
                                    # naive rebuild against fmt-check:api returns empty.)
-lint           task lint           # composite, all four components (M5 will append
-               task lint:api       # shell + YAML to it). Each gate:<c> already runs
+lint           task lint           # composite over SEVEN targets, not four: the four
+               task lint:api       # components plus lint:shell, lint:yaml and
                task lint:controller
-               task lint:web       # its own lint:<c>, so a COMPONENT GATE ALREADY
-               task lint:agent     # COVERS THIS SLOT for that component -- same shape
-                                   # as the format slot above. Go is golangci-lint
+               task lint:web       # lint:formula, which PRD #103 M5 appended. (This
+               task lint:agent     # line read "all four components (M5 will append
+               task lint:shell     # shell + YAML to it)" until M5 landed; M5 appended
+               task lint:yaml      # THREE, not two, and the future tense was wrong
+               task lint:formula   # the moment it did.) Each gate:<c> already runs
+               task gate:repo      # its own lint:<c>, so a COMPONENT GATE ALREADY
+                                   # COVERS THIS SLOT for that component -- same shape
+                                   # as the format slot above.
+                                   # 🔴 BUT THE THREE REPO-WIDE ONES ARE IN NO
+                                   # gate:<c> AT ALL. They are functions of the TREE
+                                   # and hang off `task gate:repo`, which `task gate`
+                                   # runs FIRST -- so running a component gate does
+                                   # NOT cover them.
+                                   # 🔴 AND A GREEN gate:repo CAN MEAN "CHECKED
+                                   # NOTHING". If shellcheck or yamllint is not on
+                                   # your PATH the script prints a boxed SKIP banner
+                                   # and exits 0, deliberately (gate:repo runs first,
+                                   # so a hard fail there would block every component
+                                   # gate). CI arms them, so they never skip on an MR.
+                                   # READ THE BANNER, NOT THE STATUS. A WRONG VERSION
+                                   # is different and still exit 2: shellcheck is
+                                   # pinned EXACTLY 0.11.0 because 0.10.0 does not
+                                   # emit SC3067 at all and is therefore a different
+                                   # gate, not the same one running late.
+                                   # lint:formula is `ruby -c` on the brew formula
+                                   # (syntax only); it wants ruby >= 3.1, falls back
+                                   # to Homebrew's vendored ruby, and skips loudly
+                                   # if neither exists -- macOS's own ruby is 2.6.10
+                                   # and reports a syntax error on a CORRECT file.
+                                   # Go is golangci-lint
                                    # (errcheck, staticcheck, ineffassign, unused,
                                    # unparam, nolintlint) via a pinned
                                    # `go run ...@v2.12.2`; npm
@@ -1521,7 +1548,50 @@ dead code      task deadcode       # all four; or deadcode:{api,controller,web,a
                                    # measured, and it demonstrates the lint slot while
                                    # claiming to demonstrate this one.
 coverage       none (gap, noted 2026-08-02)
-security scan  none (gap, noted 2026-07-21)
+security scan  task scan:secrets   # gitleaks, inside gate:repo, inside `task gate`
+                                   # (PRD #103 M5 MR-B). THIS IS NOW THE TESTER'S
+                                   # SLOT, NOT THE AUDITOR'S -- it runs inside the
+                                   # gate the tester already runs on every change,
+                                   # so "none (gap, noted 2026-07-21)" (this line)
+                                   # went stale the moment the check entered
+                                   # `task gate`.
+                                   # 🔴 WRAPPED IN A CANARY, AND THE CANARY IS THE
+                                   # CONTROL. `scripts/scan-secrets.sh` plants two
+                                   # known tokens (scripts/gitleaks-canary.txt and
+                                   # api/internal/config/gitleaks_canary_test.go) and
+                                   # asserts BOTH are reported before trusting a
+                                   # clean run. `.gitleaks.toml` auto-discovers from
+                                   # the scan root, so a contributor can silently
+                                   # disarm the scanner in the same commit that adds
+                                   # a secret; a missing canary is what catches that.
+                                   # READ THE "canaries DETECTED" LINE, not just
+                                   # rc=0 -- a clean run that does not print it is
+                                   # unproven, not clean.
+                                   # GATING SCOPE IS THE INDEX, FILTERED FROM THE
+                                   # REPORT, NOT PASSED AS TARGETS: `gitleaks dir`
+                                   # silently widens to `.` on two or more targets,
+                                   # so the wrapper scans everything and filters the
+                                   # report against `git ls-files` afterward.
+                                   # TRACKED findings gate (exit 1). UNTRACKED or
+                                   # gitignored findings (gitleaks does not honour
+                                   # `.gitignore`) print under a "NOTE -- N
+                                   # finding(s) ... NOT GATING" banner, capped at 10,
+                                   # and exit 0 -- read that as neither a pass that
+                                   # found nothing nor as a finding. A secret in a
+                                   # git SUBMODULE is classified untracked (only the
+                                   # gitlink is indexed) and does not gate -- none
+                                   # exist here today (inspiration/ was unvendored
+                                   # 2026-08-03).
+                                   # NO SKIP BRANCH, unlike lint:shell/yaml/formula
+                                   # above: gitleaks arrives through the same
+                                   # mandatory Go toolchain gate:api already `go
+                                   # run`s two pinned modules through, so anyone who
+                                   # cannot obtain it cannot run gate:api either.
+                                   # 13 `//gitleaks:allow` directives cover fake
+                                   # secrets in test fixtures, each per-instance
+                                   # with a written reason -- never a
+                                   # `.gitleaks.toml [allowlist] paths` regex, which
+                                   # would silently exempt every file it matches.
 pre-commit     none (gap, noted 2026-08-02)
 long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
                ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound

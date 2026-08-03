@@ -222,6 +222,60 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `knip: command not found` until it is installed, the same way oxlint did.
   See [docs/dev-conventions.md](docs/dev-conventions.md).
 
+- **Contributor tooling: shell scripts, YAML and the Homebrew formula are now
+  checked in the gate and on every MR.** `task gate:repo` runs first inside
+  `task gate` and covers the checks that belong to no single component:
+  shellcheck over every tracked shell script (the git index unioned with a
+  shebang scan, so `agent/templates/entrypoint.sh` and `agent/bin/agent-browser`
+  — the worker container entrypoint and the `agent-browser` shim inside every
+  worker pod, neither reachable by extension alone — are finally in scope),
+  yamllint over every tracked YAML except the Helm templates (which are Go
+  templates, not YAML), and a syntax check of `Formula/uzi-cli.rb`, which release
+  CI copies verbatim into the shared tap on every tag. All three gate at zero: the
+  four shellcheck warnings and three yamllint findings that existed were fixed
+  rather than suppressed. One new CI job, `lint:repo`. `web/scripts/check-docs.mjs`
+  also now validates relative links in `prds/*.md` and `adr/*.md`, which nothing
+  checked before, and the three that had rotted are repaired. Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves. **None of the three tools
+  is required locally** — a missing shellcheck, yamllint or Ruby ≥3.1 prints a
+  loud skip and passes rather than blocking you (the formula check falls back to
+  Homebrew's own bundled Ruby first, so it only skips outright without Homebrew
+  either). **A shellcheck that IS present must be exactly 0.11.0**: the version
+  is asserted and a mismatch exits 2 rather than quietly grading differently,
+  because 0.10.0 does not report one of the diagnostics this repo relies on. CI
+  always runs all three. **Adding an `ignore` key to `.yamllint` — top-level,
+  `ignore-from-file`, or an indented per-rule `ignore` inside a `rules:`
+  block — is refused at exit 2, before yamllint even runs**, because it would
+  silently narrow what gets read while the gate's success line still reports
+  the tracked-file count from its own separate query, so the two would quietly
+  disagree. Disabling a *rule* is still a legitimate, deliberate suppression —
+  it leaves that count truthful, only an ignore key breaks the agreement
+  between what was counted and what was checked. The clean-run line now says
+  files were **handed to yamllint** rather than **checked**, which is the
+  claim the script can actually make good on. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: the repo is now scanned for secrets on every gate run
+  and every MR**, which nothing did before. `task scan:secrets` runs gitleaks
+  (pinned to v8.30.1) over every tracked file and joins `task gate:repo`, so it
+  is part of `task gate` and of CI's `lint:repo` job. Eight fake-credential test
+  fixtures that the first scan reported are now annotated individually with a
+  written justification, rather than by excluding test files as a class. The
+  seven `gitleaks:allow` annotations this repo already carried — written before
+  anyone had run gitleaks — were each checked by removing it and re-scanning:
+  five suppress a real finding and keep their line, two suppressed nothing and
+  are gone. **The scanner's own configuration lives in the tree it scans**, so a
+  four-line `.gitleaks.toml` could switch it off in the same merge request that
+  adds a secret, and the job would report green. A committed canary closes that:
+  `scripts/gitleaks-canary.txt` holds a fake token the scan must report on every
+  run, and any allowlist broad enough to hide a real secret hides the canary too,
+  so the check exits 2 (instrument broken) instead of 0. A run that finds nothing
+  now prints the canary it did find. Part of PRD #103. Developer-facing only: no
+  change to how uzi behaves. **gitleaks needs no separate install** — it arrives
+  through `go run`, like the linters — so unlike the three checks above this one
+  has no skip and always runs. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on

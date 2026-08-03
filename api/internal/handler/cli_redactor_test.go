@@ -15,7 +15,7 @@ import (
 // owns the redactor precisely because M5 is what mints these tokens.
 func TestCLITokenSealedThroughBothScrubPaths(t *testing.T) {
 	// A fake uzc_ token with a realistic ≥16-char base64url body.
-	const uzc = "uzc_A1b2C3d4E5f6G7h8i9j0k1lM" //gitleaks:allow
+	const uzc = "uzc_A1b2C3d4E5f6G7h8i9j0k1lM"
 
 	t.Run("failure-snapshot ingest", func(t *testing.T) {
 		out := scrubKnownTokens("+ uzi run list\nUZI_TOKEN=" + uzc + "\nexit status 1")

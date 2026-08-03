@@ -1,0 +1,22 @@
+{{- /*
+Report template for scripts/scan-secrets.sh (PRD #103 M5).
+
+TAB-SEPARATED `File<TAB>StartLine<TAB>RuleID`, ONE FINDING PER LINE, AND NOTHING
+ELSE. Three reasons this exists rather than `-f json` + jq:
+
+  1. NO SECRET REACHES THE REPORT. gitleaks' json/csv/sarif reports all carry the
+     matched `Secret` and its surrounding `Match`, so a report file (or a CI job
+     artifact, or a pasted terminal buffer) becomes a place secrets live. The
+     three fields below are all the wrapper needs and none of them is sensitive.
+     `--redact` is passed as well; this is the belt to that braces.
+  2. NO jq. The `lint:repo` CI job runs on `golang:1.26`, which ships no jq, and
+     adding one would be a second unpinned `apt-get` on a gate whose verdict
+     already depends on Debian's state for yamllint and ruby.
+  3. A MALFORMED TEMPLATE FAILS CLOSED. gitleaks exits non-zero on a template it
+     cannot render, which the wrapper maps to exit 2 (instrument broken) rather
+     than to 0. The parse cannot silently return "no findings".
+
+DO NOT ADD FIELDS. scan-secrets.sh reads exactly three tab-separated columns.
+*/ -}}
+{{range .}}{{.File}}	{{.StartLine}}	{{.RuleID}}
+{{end -}}
