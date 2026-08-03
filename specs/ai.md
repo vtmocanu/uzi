@@ -17225,3 +17225,247 @@ position as §473.
   reads it. **CODEOWNERS on those seven files is the only structural fix, and there is no
   CODEOWNERS file anywhere in this tree.** M3 recorded this for three files; M4 quadrupled the
   surface and each new file states it for itself rather than inheriting it by pointer.
+
+## 475. Issue #144 item 1 — the skew warning: the NORMALISATION is the whole feature, the cache stores an OBSERVATION keyed on a URL HASH, and the sanitizer runs at PRINT time
+
+Serves human: Feature #144 item 1 — every command warns on stderr when this binary is behind
+the server, from a **cached** probe, with stdout and the exit code unchanged and
+`brew upgrade uzi-cli` as the remedy (user 2026-08-03, chosen from three placements offered).
+Completes the half of the issue that Feature #175 left open: #175 made `uzi version` *report*
+both versions and never *compared* them. Landed as a scoped MR against the issue, no PRD.
+
+**The defect is a wrong answer, not a missing feature, and that is why the warning exists at
+all.** A `v0.11.8` CLI against a `0.14.0` server printed `null` for four `anthropic_*` fields
+of `uzi run get --json` while `curl` against the identical endpoint returned real values and
+the web UI rendered them correctly. A CLI silently DROPS response fields it does not know
+about, so a stale binary answers confidently and wrongly, and nothing anywhere said so.
+
+### The comparison, which is the feature rather than a detail of it
+
+- **Both sides are re-prefixed with `v` and BOTH are `IsValid`-guarded.** The two sides ship in
+  different shapes deliberately (§450): the CLI is stamped `v0.14.0` by the formula, the server
+  serves bare `0.14.0`. `x/mod/semver` treats every invalid version as equal to every other and
+  sorts an invalid one BELOW a valid one, so the naive `Compare(cli, srv) < 0` is not "wrong on
+  some pairs" — it is **INERT**. Over a 5×5 grid of shapes either side actually ships it fired
+  on **0 of 25** rows, `v0.1.0` against `99.0.0` included: the CLI is always the valid operand
+  and the server always the invalid one, so the gate cannot fire for anyone, ever.
+- **A failed validity check is SILENCE, and the disposition is deliberately INVERTED from the
+  in-repo precedent.** `forge/forgejo.go`'s `checkForgejoVersion` REFUSES on an unparseable
+  version and argues refusing is safer — true there, where it is a feature gate at connect
+  time, and wrong here, where "refuse" maps to "warn" and `var version = "dev"` is what every
+  `go build ./cmd/uzi` binary carries. Normalising **without** the guard moves the
+  implementation from never-warns to warns at every developer build and every test binary, each
+  told to run brew. Copy the SHAPE (re-prefix → `IsValid` → `Compare`), never the disposition.
+- **The two guards do NOT do equal work, and the comment that claimed they did was corrected
+  rather than left standing.** Over a 39×39 cross product of every shape either side ships plus
+  20 invalid ones, dropping the SERVER guard changes **0 of 1521** rows while dropping the CLI
+  guard changes **378** — `Compare(valid, invalid)` is `+1`, so an invalid server is already
+  silent via the `>= 0` direction test, and both-invalid gives `0`, also silent. The server
+  guard stays anyway and the reason is written down so it is not "optimised" away: it is inert
+  **given that direction test**, and dropping it while flipping `>= 0` to `!= 0` reddens four
+  fixture rows. It guards a future change to the operator, not today's inputs.
+- **Ahead-or-equal is never an alert.** A dev laptop against a stable deployment is the normal
+  shape here and there is nothing the person at the keyboard can do about a server being older.
+- **A third copy of `normSemver` is accepted rather than extracted.** `forge/forgejo.go` and
+  `workersvc/upgrade.go` hold the other two; a shared `verscmp` would touch two working
+  packages inside an issue-scoped MR. Each copy carries its own discriminating test.
+- **`IsStampedVersion` is exported so the hook can short-circuit BEFORE resolving settings.**
+  `SkewWarning` would also be silent on `dev`, but only *after* the probe that produced the
+  server's version. Without the export every source build would resolve settings, probe (2s
+  worst case) and write a cache file on every command — the modal configuration for anyone
+  working in this repo — and the only export-free alternative was a fourth copy of `normSemver`.
+
+### The cache: `~/.config/uzi/version-check.json`, 0644, atomic write, keyed per server
+
+- **It stores the server's VERSION, never the verdict.** A cached `skew: true` is not cleared
+  by `brew upgrade uzi-cli`, so the user would be told to upgrade for up to a TTL *after they
+  did*. Recomputing against the live binary's own version each run self-heals instantly,
+  because the CLI side is what changed.
+- **It stores the last ATTEMPT, not the last success.** An empty version is a FRESH record —
+  the negative entry. Without one, a laptop with `UZI_URL` set and the server unreachable (VPN
+  off, compose stack down, cluster restarting) takes a miss on every invocation and pays the 2s
+  probe timeout before **every** command, which is strictly worse than not having the feature.
+- **🔴 BUT A FAILED PROBE MOVES `checked_at` WITHOUT CLEARING A KNOWN-GOOD VERSION, and that
+  rule lives in the STORE so both write sites inherit it.** The naive reading of "record the
+  attempt" shipped first and was a real defect: one failure wrote `""` over a real reading, and
+  because empty-and-fresh is indistinguishable from a real hit at the caller, every later
+  command took the cache-hit path, never re-probed and printed nothing — for up to an hour
+  AFTER the server recovered. Both properties survive the fix, which is the thing to check when
+  reading it, because they pull in opposite directions: `checked_at` still moves on every
+  attempt, so an offline laptop still pays one probe per hour rather than one per command.
+- **Keyed on a SHA-256 of the normalised base URL, never the raw string.** Per-server because
+  `--url` beats `$UZI_URL` beats the config file, so which server an invocation talks to changes
+  between one command and the next, and a single blob would apply server A's version to server B
+  — silently and plausibly, since both report real versions, while this warning is a factual
+  claim about the server you are talking to. The HASH rather than the URL is a security
+  property: `credentialSafeBase` does not strip userinfo, `--url http://alice:hunter2@host` is
+  accepted and served, and no write path persists a `--url` base today, so this cache would
+  otherwise be the FIRST thing to put a password in a 0644 file. Normalisation before hashing is
+  deliberately cheap (trim, drop trailing slashes) rather than a `net/url` round-trip: a miss
+  costs one extra probe and never a wrong answer, because two spellings of one host are two
+  entries each holding that host's own truth.
+- **TTL of one hour, ONE value governing both outcomes.** The failure direction is asymmetric:
+  by the observation rule above the CLI-upgrade direction self-heals instantly, so a longer TTL
+  only delays hearing about a SERVER upgrade — silence when we should warn, never a false
+  warning. A shorter NEGATIVE TTL is specifically rejected: a failed probe costs the full 2s
+  where a success costs tens of milliseconds, so re-probing failures sooner maximises the cost
+  of exactly the case the cache exists for. And **the EXISTENCE of a TTL is the mitigation for
+  an unrate-limited `/api/version`, not its value** — for a 50-agent fleet, no TTL is ~90,000
+  req/h, 1 min ~3,000, **1 h ~50**, 24 h ~2; the three orders of magnitude are entirely between
+  *no TTL* and *any TTL*.
+- **`cli_version` is recorded and never read back**; freshness keys on `checked_at` alone.
+  Mirrors `skillState`, which settled the identical question the identical way. Invalidating on
+  a CLI-version change is the right fix for a cache holding a VERDICT and is redundant for one
+  holding an observation. It is forensics: "which binary wrote this entry?"
+- **Bounded on both axes, and the version bound is STORAGE, not a sanitizer** — 16 entries (a
+  script looping over `--url` endpoints would otherwise grow the file without limit) and 256
+  runes per version (the only ceiling on the wire is the client's 32 MiB response cap). The
+  security control is at print time; a write-time stripper would be bypassed by anything able to
+  write the file directly, so the cache legitimately holds raw control characters on disk.
+- **`writeFileAtomic`, not `os.WriteFile`: the rename REPLACES a symlink instead of following
+  it.** Nothing in the suite could tell the two apart until a test was added that symlinks the
+  cache path at a file outside the store dir and asserts the target is unchanged — an unpinned
+  security property is one a refactor lands green on.
+- Absent and corrupt are both treated as empty and the file is **not deleted** (the next write
+  replaces it atomically, and an unreadable cache must never become an error a user sees); a
+  `checked_at` in the FUTURE is **not** fresh, because a backwards clock or a file copied from
+  another machine is untrustworthy rather than valid until it "expires"; a nil store (no home
+  directory) skips the check entirely rather than degrading to the uncached probe the design
+  exists to avoid.
+
+### Where it runs, and what is exempt
+
+- **One hook on the root `PersistentPreRun`, where the skill auto-upgrade already lives — and
+  that seam is SINGLE-OCCUPANCY.** cobra breaks at the first ancestor carrying a
+  `PersistentPreRun` and `EnableTraverseRunHooks` is unset, so a subcommand that later sets its
+  own hook silently disables BOTH with nothing failing anywhere. Stated at the seam. The skew
+  check runs SECOND, after the purely local skill work, so a slow or hanging endpoint cannot
+  delay it.
+- **The exit code is untouched STRUCTURALLY rather than by assertion**: `PersistentPreRun` has
+  no error return, so nothing on this path can reach `ExitCodeFor`.
+- **🔴 THE EXEMPTION IS A RULE — "every command that makes no network call of its own" — NOT A
+  LIST.** It shipped first as the enumerated pair an audit had found (`logout`, `auth token`),
+  and `uzi auth status` has exactly the same property and was named by nobody until the rule was
+  written down and the set derived from it. The derivation is two greps then reading each
+  `RunE`: `git grep -F 'env.client('` alone misses `uzi login`, which builds its client directly
+  and is **not** exempt, so that grep would exempt it for a reason that looks right; and it
+  over-reports `auth.go`, whose single client site belongs to `whoami`, which merely shares the
+  file. A NEW command is not exempt by default, which is the safe direction.
+- **Exemption there is not cosmetic: the ROUTE is unauthenticated but the REQUEST carries the
+  bearer token**, because `newRequest` attaches it to every request whose client holds one and
+  does not special-case this route. So a probe on `uzi logout` would ship the credential on the
+  way to deleting it and contradict that command's own "does not revoke it server-side", and a
+  probe on `uzi auth token` — built so a credential never lands on argv — would emit a request
+  carrying the PREVIOUS credential.
+- **`uzi version` is RELOCATED, not exempt.** `PersistentPreRun` runs before `RunE`, so a
+  *cached* warning would print `behind server 0.13.0` on stderr and then stdout would print
+  `server version 0.14.0` from that command's own live probe — a visible self-contradiction
+  inside one invocation. It warns inline from the probe it was already making and warms the
+  shared cache, so (`uzi version`, then any other command) costs one network call rather than
+  two. It also READS the cache, which is the point of the read: it is the command a user runs
+  precisely when they suspect something is wrong, so a failed live probe falls back to the last
+  known-good reading instead of to nothing.
+- Also exempt: the `skill` subtree (already exempt for the auto-upgrade hook, and
+  `uzi skill install` is machine-invoked at every Claude Code session start, where an extra
+  stderr line is pure noise in an agent context); `completion`, whose script is `eval`'d from a
+  shell rc file, so the warning would print at every shell start; and cobra's
+  `__complete`/`__completeNoDesc` RPC, invoked on every TAB, where a 2s stall is unacceptable
+  and stderr corrupts the display in some shells. `--help`, `--version` and a bare non-runnable
+  parent need **no** exemption — cobra returns above the hook loop for each. One consequence
+  worth knowing: **`uzi --version` never warns while `uzi version` does.**
+- **Three independent off switches, none of them redundant.** `Env.CheckServerVersion` is the
+  injection seam (true in `DefaultEnv`, false in `fakeEnv`, mirroring `AutoUpgradeSkill`) and is
+  what stops every pre-existing command test suddenly calling `FakeClient.BuildInfo`; `--quiet`
+  suppresses the WORK and not merely the print, because that gate sits above the probe; and
+  `UZI_VERSION_CHECK=0` is the documented escape hatch, same `== "0"` test as
+  `UZI_SKILL_AUTO_UPGRADE` so the two behave identically for anyone who learns one.
+
+### The string being printed is attacker-controlled
+
+- **`GET /api/version` passes the server's stamp through with NO constraint** — contrast
+  `commit`, gated by `isFullSHA`, and `built_at`, gated by `time.Parse` — so `version` is
+  strictly weaker than `RateLimitType`, which `run.go` already sanitizes *even though the server
+  allowlists it to an enum*, on the stated ground that "server-controlled today" is exactly the
+  assumption that rots. Four attacks executed against the pre-existing `uzi version` sink all
+  worked at exit 0 (erase-display, `\r` line-overwrite, OSC 8 hyperlink, U+202E bidi); the `\r`
+  one erases uzi's own label so an arbitrary attacker sentence appears to come FROM uzi.
+- **🔴 SANITIZED AT PRINT TIME, AFTER THE CACHE READ — never at fetch, never at cache-write.**
+  The cache is a plain file with no integrity protection, so anything able to write it controls
+  this text with no network involved; a write-time sanitizer is bypassed by exactly that path.
+  Treat the cache as precisely as untrusted as the network response.
+- **`cellText` is the sanitizer, and reusing it rather than hand-rolling a control stripper is
+  what closes the length problem in the same call** — it strips C0/C1/DEL and the Unicode format
+  characters (bidi overrides among them) and caps the result. Only the SERVER's string goes
+  through it: the CLI's own version is a compile-time ldflags stamp, and passing it through
+  would only obscure that asymmetry.
+- **Printed with `fmt.Fprintf`, NOT `uzicli.Printer`**: `govulncheck` traces GO-2026-5970
+  (x/text infinite loop on invalid input) through `Printer.Println`, and this path takes the
+  most hostile string in the CLI.
+- **The pre-existing `uzi version` sink was sanitized in the same change**, because the hook
+  escalates the same class from one command run deliberately to every invocation of every
+  command, on stderr — the channel `SKILL.md` tells agents to read, which makes this prompt
+  injection into an agent's context rather than only a terminal trick.
+- **🔴 HOW MUCH ATTACKER TEXT REACHES stderr IS DECIDED IN `run.go`, NOT HERE.** Measured: ~157
+  characters do (150 of SemVer build metadata), stripped of controls and Cf, so spacing and
+  letters and never a cursor effect. Above `compactText`'s 200-char cap the truncation appends
+  U+2026, which is outside SemVer's build-metadata charset, the version stops parsing and the
+  warning vanishes **entirely** — so that silence is a property of a COSMETIC CONSTANT in
+  another file, which nobody editing `versioncheck.go` would think to check. Named at
+  `warnVersionSkew` for that reason.
+- **`--json` stays byte-exact, and the REASON is the destination rather than the encoder.**
+  Measured on `encoding/json`: C0 and U+2028/U+2029 are escaped, while DEL (0x7f), the C1 range
+  including U+009B, U+202E and the zero-widths pass through UNESCAPED. What makes `--json` safe
+  is that its bytes go to a PARSER, and that sanitizing there would corrupt the payload an agent
+  decodes; a caller piping `--json` straight to a TTY is outside the guarantee. `sanitizeTTY`'s
+  own doc had carried the encoder claim in stronger form and is where the new code's first
+  wording came from — corrected in the same change, comment only, since the behaviour was
+  always right. (Whether a terminal HONOURS a UTF-8-encoded U+009B as CSI was not tested and
+  must not be written as though it were.)
+- **`compactText` slices at 200 BYTES and can cut mid-rune; UTF-8 validity is EMERGENT from
+  `cellText`'s outer `strings.Map` re-encoding the orphan as U+FFFD.** Rune-slicing it was
+  considered and **declined by the user**: it is a shared helper behind run/steer/TUI rendering
+  that this change has not tested. The property is therefore PINNED by a test (199 ASCII +
+  `€`×4, so the boundary lands inside a 3-byte rune) rather than removed, and
+  `TestVersionCommandOutputStaysValidUTF8` staying a pin rather than becoming a redundancy is a
+  chosen outcome, not an oversight.
+
+### The message, the observability it needs, and the docs
+
+- **One line, with both versions rendered VERBATIM as each side reports them** (`v0.11.8`
+  against `0.14.0`). Normalising for display would make this line disagree with `uzi version`,
+  which prints the CLI's stamp on line one and the server's bare string under `server version`.
+  The two-line hanging indent in the preview shown to the user was a mockup wrap, not a spec;
+  hard-wrapping is wrong at every width but one.
+- **The message carries no `uzi <verb>` span, and that is a constraint rather than a style.**
+  `instructions_test.go`'s extractor lifts any `uzi ` + lowercase-letter span out of a printed
+  string and demands a registry entry asserting the instruction has been EXECUTED. `uzi:`
+  (colon) and `uzi-cli` (hyphen) each miss that class by one character. If a future reword
+  reddens that test, **reword again — never register.**
+- **`FakeClient.BuildInfoCalls` is not a convenience.** With the hook on the root command, "the
+  probe was skipped" and "the probe ran and printed nothing" produce IDENTICAL output, so every
+  exemption, suppression and cache-hit claim is unobservable without a counter — asserting on
+  absent stderr would pass against an implementation that probes on every command and merely
+  stays quiet.
+- **The fixture feeds the server version in its BARE wire form, and that is load-bearing.**
+  "Genuinely behind" is necessary and not sufficient: a `("v0.11.8","v0.14.0")` fixture has
+  already normalised the server side, so it passes against an implementation that forgets to.
+  Mutating exactly that — normalise the CLI, forget the server — produces 19 named FAIL lines.
+- **The e2e harness sets `UZI_VERSION_CHECK=0` on `uzi_cli()`, belt-and-braces today and stated
+  as such**: the harness build passes no `-ldflags`, so its binary is `dev` and short-circuits.
+  That reason evaporates the day someone stamps it, `UZI_URL` IS set there, and the harness's
+  printed-instruction assertions count exact lines across stdout AND stderr — so one extra
+  sentence would redden a check about something else entirely.
+- **The env var is documented BY HAND in both `SKILL.md` and `docs/cli.md`**, because
+  `skill_drift_test.go` extracts only flags and command paths and gates env vars in neither
+  direction. An undocumented escape hatch is worse than a documented one: an agent can read it
+  out of the source either way, and only the user loses by not knowing it exists. Both frame the
+  warning as ACTIONABLE, and `SKILL.md` tells an agent to report the skew to the human rather
+  than reason about the `null` it would otherwise see.
+- **Declined**: no `--check` flag, no `uzi upgrade` verb, no warning when the SERVER is behind
+  (nothing for the user to do), and no background probe.
+- **Two pre-existing dependency vulnerabilities were bumped in the same change at the user's
+  direction**, against the recommendation to file them separately: `golang.org/x/text` v0.38.0 →
+  v0.39.0 (GO-2026-5970, reachable through `uzicli.Printer.Println`) and `github.com/yuin/goldmark`
+  v1.7.8 → v1.7.17 (GO-2026-5320, reached indirectly through glamour in the TUI renderer).
+  `govulncheck` moves 3 → 0, and the zero is discriminating rather than vacuous — it still
+  reports one vulnerability in a required module the code does not call.

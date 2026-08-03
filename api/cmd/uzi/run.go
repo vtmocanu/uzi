@@ -820,8 +820,22 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 // newline, plus every Unicode format character (category Cf); all printable UTF-8
 // passes through unchanged. It iterates runes (not bytes) so a multibyte codepoint
 // whose bytes fall in 0x80–0x9F is never corrupted. Human render path ONLY —
-// --json output stays byte-exact (structural JSON encoding already escapes these
-// and agents decode it verbatim, so sanitizing there would corrupt payloads).
+// --json output stays byte-exact, and sanitizing there would corrupt the payload an
+// agent decodes.
+//
+// 🔴 THE REASON --json IS SAFE IS THE DESTINATION, NOT THE ENCODER. This sentence
+// used to read "structural JSON encoding already escapes these", where "these" is
+// the C0/C1/DEL/Cf set enumerated above — false for three of those four families.
+// Measured on encoding/json (issue #144, re-derived independently by two people):
+// C0 and U+2028/U+2029 are escaped; DEL (0x7f), the C1 range including U+009B, and
+// the Cf family including U+202E and the zero-widths all pass through UNESCAPED.
+// What makes --json safe is that its bytes go to a PARSER rather than to a terminal.
+// A caller who pipes --json straight to a TTY is outside that guarantee, and no
+// encoder property will save them.
+//
+// (Stated as an escaping fact on purpose. Whether a terminal HONOURS a UTF-8-encoded
+// U+009B as a CSI introducer depends on its 8-bit control handling and has not been
+// tested here — do not upgrade this into a claim about exploitability.)
 //
 // The Cf half and DEL arrived with PRD #112 M3. This comment used to say it removed
 // "C0 controls (0x00–0x1F) except tab and newline, and C1 controls (0x80–0x9F)",

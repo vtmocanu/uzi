@@ -48,20 +48,31 @@ type Env struct {
 	// command. DefaultEnv enables it; command tests leave it false so unrelated
 	// tests do no filesystem writes. UZI_SKILL_AUTO_UPGRADE=0 disables it at runtime.
 	AutoUpgradeSkill bool
+
+	// CheckServerVersion enables the best-effort CLI-vs-server skew warning run
+	// before every command (and inline in `uzi version`). DefaultEnv enables it;
+	// command tests leave it false so unrelated tests make no network call and no
+	// filesystem write. UZI_VERSION_CHECK=0 disables it at runtime.
+	//
+	// Same seam and same reasoning as AutoUpgradeSkill, deliberately: a test that has
+	// to opt IN to a background behaviour is the only shape under which adding one
+	// does not silently rewrite what every existing test exercises.
+	CheckServerVersion bool
 }
 
 // DefaultEnv wires the real dependencies.
 func DefaultEnv() Env {
 	store, _ := uzicli.DefaultStore() // nil store tolerated; env/flags still work
 	return Env{
-		Stdout:           os.Stdout,
-		Stderr:           os.Stderr,
-		Stdin:            os.Stdin,
-		StdoutTTY:        uzicli.IsTerminal(os.Stdout),
-		StdinTTY:         uzicli.IsTerminal(os.Stdin),
-		NewClient:        func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
-		Store:            store,
-		AutoUpgradeSkill: true,
+		Stdout:             os.Stdout,
+		Stderr:             os.Stderr,
+		Stdin:              os.Stdin,
+		StdoutTTY:          uzicli.IsTerminal(os.Stdout),
+		StdinTTY:           uzicli.IsTerminal(os.Stdin),
+		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
+		Store:              store,
+		AutoUpgradeSkill:   true,
+		CheckServerVersion: true,
 	}
 }
 
@@ -115,10 +126,21 @@ func newRootCmd(env Env) *cobra.Command {
 	// would otherwise race their own report). Never fatal, never blocking: any
 	// error warns on stderr and the real command still runs — a read-only $HOME in
 	// CI must not break `uzi run list --json`.
+	//
+	// 🔴 THIS SEAM IS SINGLE-OCCUPANCY AND NOW HAS TWO CONSUMERS. cobra walks
+	// ancestors and BREAKS at the first command carrying a PersistentPreRun, and
+	// EnableTraverseRunHooks is unset, so a subcommand that later sets its own hook
+	// silently disables BOTH of these with nothing failing anywhere. Add work HERE
+	// rather than on a subcommand.
+	//
+	// The skew check runs SECOND, after the purely local skill work: it is the one
+	// that may make a network call, and ordering the local work first means a slow
+	// or hanging endpoint cannot delay it.
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
 		if env.AutoUpgradeSkill && !underSkillCmd(cmd) {
 			maybeAutoUpgradeSkill(env)
 		}
+		maybeWarnVersionSkew(cmd, env, gf)
 	}
 	root.SetOut(env.Stdout)
 	root.SetErr(env.Stderr)
