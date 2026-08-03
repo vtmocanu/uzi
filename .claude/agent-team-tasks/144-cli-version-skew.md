@@ -1729,3 +1729,48 @@ is `dev` so the hook short-circuits — §11 6e's belt-and-braces claim). No liv
 all `FakeClient`, and the bare-`0.14.0` wire shape is inherited from §1 rather than
 re-derived. Only `api/` was gated; `docs/` and `e2e/` verified statically at their unchanged
 state.
+
+---
+
+## 24. AMENDMENT 19 — specs synced (§475, `21f90c05`). TWO ITEMS LEFT, one commit.
+
+`specs/ai.md` §475 landed. Section number swept **three ways** — five local sibling
+worktrees (working trees, so uncommitted sections would have shown), `origin/main` after a
+fetch, and every remote branch — all agreeing on 474 as the highest claimed. That is the
+numbering-collision rule in `CLAUDE.md` applied properly rather than assumed.
+
+`specs/human.md` **untouched**; proposed text is with the user.
+
+### 🔴 OUTSTANDING — two items, one commit, then the MR
+
+1. **M30 — pin the hook half of the N-1 fix** (§23). Folding `maybeWarnVersionSkew:153`
+   back to ignoring `RecordServerVersion`'s return leaves the **whole suite green** while
+   silently losing the warning on stale-cache + failed-probe + prior-good-reading. The
+   tester's throwaway probe is at
+   `<scratchpad>/t144/zz_tester_m30_test.go` — adapt or take as is. **Seed the store at
+   `now-2h`, run with a failing client, assert the warning**, and keep its
+   assert-the-precondition step so an accidentally-fresh cache fails loudly rather than
+   passing vacuously.
+2. **`docs/cli.md:626` is WRONG and it is user-facing.** It reads *"for `uzi logout` and
+   `uzi auth token`"* — **two** commands — while `versioncheck.go:89` exempts **three**
+   (`logout`, `auth token`, `auth status`). Lead verified both sides at `d4d05c22`.
+   Suggested: *"…or for `uzi logout`, `uzi auth token` and `uzi auth status`, which
+   otherwise make no network call at all."*
+
+**Item 2 is the FIFTH instance of this branch's dominant defect class, and the most
+pointed one yet.** §14 corrected the code comment that said *"`logout` and `auth token` are
+the two commands that make NO network call today"*; `docs/cli.md` was written from that same
+wrong set and was never revisited. So the correction landed in one file and not its copy —
+and `exemptFromVersionCheck`'s own doc warns that *stating the set as a list is how the third
+member gets missed*, now demonstrated once more by the document that documents it.
+
+Nothing in `task gate:api` reads `docs/cli.md` prose (`check-docs.mjs` covers frontmatter
+and links only), so nothing would ever have caught it.
+
+**Not taken, correctly:** the spec-keeper proposed the fix and did not apply it — out of its
+dispatched scope, and the tree was frozen for a detached tester. `CLAUDE.md`'s fix-the-doc
+rule explicitly permits proposing when a fix is out of scope.
+
+**Left alone deliberately:** `docs/cli.md` also says the warning is not shown *"when the CLI
+is newer than the server"*, where the shipped rule is ahead-**or-equal**. Not wrong — the
+"when it is behind" framing covers it — just less precise than the code. Do not churn it.
