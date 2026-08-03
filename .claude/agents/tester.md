@@ -223,7 +223,10 @@ which `task test:agent` invokes — node's own default is NO timeout. It was `30
 until 2026-08-03, when it was found to be **binding in CI and nowhere else**: the
 cap bounds each top-level SUITE locally (node v26.4.0) and each FILE in CI
 (node:22-alpine, child process per file), so `runner.test.ts` summed to ~96s
-locally under a 30s cap and passed, while landing ~25-30s in CI and flaking.
+locally under a 30s cap and passed, while landing ~25-30s in CI and flaking. That
+file was split into seven `runner-*.test.ts` sharing `test/runner-harness.ts` the
+same day — **prefer splitting a file over raising the cap**, since under a per-file
+cap a large test file is a serialization point no timeout value fixes.
 **A file killed by the cap reports `cancelled`, not `fail`** — the summary reads
 `fail 0` on a red job — so read the exit code and the TAP plan (it shrinks, with
 the file named in place of its suites), never the tally. See `CLAUDE.md`'s

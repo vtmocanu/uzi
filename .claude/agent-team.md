@@ -1466,9 +1466,12 @@ the output of any run you make:
   until 2026-08-03, where it was **binding in CI and nowhere else**: what the cap
   governs depends on the node major, so it bounds each top-level SUITE locally
   (node v26.4.0, files share a process) and each FILE in CI (node:22-alpine,
-  child process per file). `runner.test.ts` sums to ~96s locally and passed a 30s
-  cap; in CI it lands ~25-30s and flaked. Read `CLAUDE.md`'s `--test-timeout`
-  block before touching the number. The cap is live and worth
+  child process per file). `runner.test.ts` summed to ~96s locally and passed a 30s
+  cap; in CI it landed ~25-30s and flaked. It was **split into seven
+  `runner-*.test.ts` files the same day** (sharing `test/runner-harness.ts`), which
+  is what actually removed the knife-edge and cut the agent suite 112s -> 46s wall.
+  Read `CLAUDE.md`'s `--test-timeout` block before touching the number, and prefer
+  splitting a file over raising the cap. The cap is live and worth
   carrying as insurance against a future slow test, not as a fix for a current
   hang.
 
