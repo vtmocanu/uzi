@@ -1375,3 +1375,107 @@ Escalated to the user in the same turn as this amendment.
 restores verified against `git diff`), but *"anything building from this tree during those
 windows would have measured a mutated binary."* That is the other half of the auditor's and
 reviewer's contamination — **the lead's frozen-SHA process fix covers all three.**
+
+---
+
+## 19. AMENDMENT 14 — tester round. 30 mutations, 2 SURVIVORS, no blocking findings.
+
+Full `task gate:api` at `a4a18c0d`: **EXIT=0**, all seven populated slots, `lint:api` **0
+issues** with the ratchet resolved against `origin/main`. Positive control that the suite
+executed: **`RUN=478 PASS=478 FAIL=0 SKIP=0`**. Worked in a throwaway worktree with a
+**private `GOLANGCI_LINT_CACHE`**, so it never touched the shared tree or the host-global
+lint lock — the discipline the coder and auditor both hit.
+
+Mutation hygiene: `cp` backups, mutation asserted **textually by sha256**, `go vet` before
+reading any result, `git status` verified clean after each. Three folds failed to apply and
+one typechecked-but-was-inert (`M24`: the deref placed *after* the guard) — **all re-run
+rather than counted**, which is the assert-it-changed-BEHAVIOUR rule catching its own author.
+
+### The three questions I dispatched — all three CLOSED
+
+1. **The fixture DOES discriminate.** `M1b` (normalise the CLI side, forget the server side —
+   exactly the bug a `("v0.11.8","v0.14.0")` fixture would certify) → **19 named FAIL lines**.
+   The bare `"0.14.0"` wire form in `skewRows` is load-bearing and now proven so.
+2. **The suite does NOT pass at the broken middle stage.** `M2` reddens `dev_cli` and
+   `four-part_cli`. Worth knowing *where*: caught by the **unit table**, not end-to-end —
+   `TestSkewWarningDevBuildDoesNotProbe` short-circuits on `IsStampedVersion`, a separate
+   function, so it stays green under `M2`. The table is the load-bearing catcher.
+3. **6b refuted a third time**, independently and before `d96b6fe8` landed. Agrees with §13
+   row for row. **6b was right about its own four payloads and blind to a class it never
+   contemplated.**
+
+### The one place the suite was genuinely weak — and it is now CLOSED
+
+At `ea71a367`, `M26` (keep control-stripping and folding, **drop only the 200-char cap**) →
+**rc=0, zero failures**. The cap at the warning path was unpinned, and the consequence was a
+**one-megabyte line on stderr of every command** from a hostile server. At `a4a18c0d` the
+same fold reddens `unbounded_build_metadata`. **The coder's new row is doing real work, not
+decorating.**
+
+### 🔴 N1 (SURVIVOR) — the SERVER-side `IsValid` guard is behaviourally INERT, and its comment says otherwise
+
+`M2a` (drop the server guard alone) → **rc=0, zero failures across all 478 tests.** Not a
+fixture gap — measured exhaustively over a **39×39 cross product** of every shape either side
+ships plus 20 invalid ones:
+
+```
+grid = 1521 rows | dropping the SERVER guard changes   0
+                 | dropping the CLI    guard changes 378
+```
+
+Mechanism, and it follows from measurements already in this brief: `Compare(valid, invalid)`
+is always `+1`, so a valid CLI against an invalid server is already silent via the `>= 0`
+direction test; both-invalid gives `0`, also silent. **Only the CLI-side guard can change an
+answer** — it is what stops B1's dev-build over-fire.
+
+`versioncheck.go:70-73` claims *"Both guards are load-bearing and they guard different
+populations."* **The populations half is right; "both load-bearing" is refuted for the
+server side.** Those inputs exist, but the direction test handles them, not that guard.
+
+**NOT a defect and NOT a code change.** `M27` (drop the server guard **and** flip the
+direction to `!= 0`) reddens `dev_server`, `empty_server`, `four-part_server`, `cli_ahead` —
+so it is real defence-in-depth that becomes live the moment the operator changes. **Fix the
+COMMENT**: say the server guard is redundant *given the current direction test* and retained
+so that changing that test cannot silently open the invalid-server path.
+
+The same measurement retires a worry: the three `skewRows` no single fold can kill
+(`dev server`, `empty server`, `four-part server`) are **not dead pins** — `M27` reddens all
+three. They discriminate only in combination, which is what they are for.
+
+### N2 (SURVIVOR) — `writeFileAtomic` → `os.WriteFile` goes fully GREEN
+
+`M23` → rc=0, zero failures. §7 H4 says a hand-rolled `os.WriteFile` *"would follow a symlink
+and would be a real vulnerability"*, and the code comment repeats it. **Nothing in the suite
+can tell the two apart.** Shipped code is correct; the property is unpinned, so a future
+refactor lands green. **LEAD RULING: add the pin** — symlink `version-check.json` at a file
+outside the store dir, write, assert the target is unchanged. This branch's whole discipline
+is that an unpinned property silently stops being true, and §17 is the same class.
+
+### N3 — an assertion that cannot fire, crediting itself in its own comment
+
+`versioncheck_test.go:458`'s `if len(errOut) > 4096` says *"The length bound is what
+discriminates the build-metadata row."* Measured: under `M26` that row aborts at the
+**earlier** `t.Fatalf` on `wantWarning` (`:443`), so `:458` never executes for it. **Positive
+control that the line is not dead**: lowering the threshold to `> 0` reddens the four short
+rows at 96 bytes each. So it runs for rows that can never exceed 4096 and is skipped for the
+one that can. `wantWarning` is the real catcher. Redundant, not harmful — **the comment
+credits the wrong assertion.**
+
+Cosmetic, same file: under `M6` the `leading CR` row fails with *"no warning printed, so this
+test proves nothing about sanitization"* when a warning **was** printed — `\r0.14.0` is
+interpolated verbatim so the `Contains` misses. The row still catches the mutation; the
+diagnostic misdescribes why.
+
+### What this run did NOT reach — stated rather than implied
+
+- **`./e2e/run-e2e.sh` NOT run** (~8 min, not asked for). Verified statically instead:
+  `bash -n` clean, `UZI_VERSION_CHECK=0` present at `:1687`, and **6e's belt-and-braces claim
+  confirmed** — neither `go build` passes `-ldflags`, so the harness binary is `dev`.
+- **No live server, no k8s.** Everything is `FakeClient`; the bare-wire-form claim is
+  inherited from §1, not re-derived.
+- **`e137d145` is UNVERIFIED by the tester** — it landed after the gate run, and `M7`/`M19`
+  touch that file, so treat those two as one commit stale. It checked both survivor sites by
+  hand against the live tree and says only that they are *"almost certainly still live"*.
+
+**Re-run offered at ~6 minutes** once a frozen SHA exists, harness already built. **Taking
+it** — the branch will have a fourth commit.
