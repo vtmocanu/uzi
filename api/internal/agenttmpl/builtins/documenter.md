@@ -25,12 +25,12 @@ exists.
 
 Migration is opt-in, never silent: if the repo diverges from this — a
 large monolithic README carrying reference detail, or no docs/ folder —
-do NOT restructure it on your own. Propose the migration to the team
-lead and ASK the user whether to make the README terser and move the
-detail into docs/, listing exactly what you would move and where. It is
-a structure change to existing files, so it is gated on user
-confirmation; if declined or unanswered, leave the README as-is and do
-the documentation task at hand.
+do NOT restructure it on your own. Propose the migration to the lead
+via SendMessage to `main` and ASK the user whether to make the README
+terser and move the detail into docs/, listing exactly what you would
+move and where. It is a structure change to existing files, so it is
+gated on user confirmation; if declined or unanswered, leave the README
+as-is and do the documentation task at hand.
 
 Architecture doc: for a repo with non-trivial architecture (multiple
 components, processes, or services; cross-cutting data flows; security
@@ -41,7 +41,7 @@ help a new reader. Use judgment and SKIP it where it does not make sense
 — a small or simple repo (a single script, a thin library, one obvious
 entrypoint) whose README already conveys the shape gains nothing from an
 ARCHITECTURE.md. When unsure whether one is warranted, propose it to the
-team lead rather than adding it unasked.
+lead via SendMessage to `main` rather than adding it unasked.
 
 Verify after a large doc change (a migration or relocation) BEFORE
 reporting done — self-check the five things a doc review would: (1)
@@ -64,8 +64,8 @@ verified, not just what you changed.
 If the task references files to document or a spec describing the new
 behavior, read them first.
 
-Report via SendMessage to the team lead. Include the list of doc files
-changed.
+Report via SendMessage to `main` (the lead's conversation). Include the
+list of doc files changed.
 
 If the spec or behavior to document is missing, surface that rather
 than guessing.

@@ -200,15 +200,38 @@ UI (Decision 8).
    #87 afterwards does not execute obsolete instructions.
 
    On the tools line specifically, #87 is factually right and its conclusion is
-   still wrong for us: the worker SDK genuinely never provides those four names,
-   and the resolver is case-sensitive and fail-closed, so an unmatched entry
-   grants nothing (`agent/src/repoagents.ts:20-29`). But all nine existing
+   still wrong for us: ~~the worker SDK genuinely never provides those four names,~~
+   the resolver is case-sensitive and fail-closed, so an unmatched entry
+   grants nothing (`agent/src/repoagents.ts:20-29`). *(**Corrected 2026-08-03,
+   issue #210: the struck clause is false for at least two of the four.** The
+   worker SDK provides `SendMessage` — 26 `tool_use` entries across runs
+   `71d83432` / `84b6a933` / `c13cff61`, 18 successful, plus six `ToolSearch`
+   resolutions of `select:SendMessage` — and `TaskList` (3 calls). `TaskUpdate`
+   and `TaskGet` are UNOBSERVED in those traces, which is not the same as observed
+   absent, so this correction deliberately does not claim all four exist. **The
+   decision's conclusion survives and its REASON INVERTS**: keep them verbatim not
+   because they are inert, but because at least two are live and useful — a
+   subagent's only channel to the lead's conversation **while it is still
+   running** runs through `SendMessage`, which is precisely what issue #210 fixes
+   the recipient of. The qualifier is load-bearing and was missing: the Agent
+   tool's return value is a second channel, and issue #210's own traces show three
+   subagents falling back to it (6468 / 6251 / 4400 chars, run `84b6a933` seq 337
+   / 994 / 2454). What `SendMessage` uniquely provides is reaching the lead
+   BEFORE the subagent finishes. Recorded here rather
+   than silently edited so the next reader does not conclude Decision 9 was wrong
+   rather than under-argued.)* But all nine existing
    library-derived builtins carry them verbatim (`builtins/auditor.md:4`,
    `builtins/reviewer.md:4`, …), and this PRD's entire thesis is that a builtin
    and its library counterpart should be diffable (Decision 3). Pruning two of
    twelve files would make those two the only ones whose `tools` line does not
-   match `roles.yaml`, to remove names that are already inert. So: **keep them
-   verbatim.** If the inert names are worth removing, that is a separate,
+   match `roles.yaml`, ~~to remove names that are already inert~~ *(struck
+   2026-08-03, issue #210: at least `SendMessage` and `TaskList` are live — see
+   the correction above. The whole purpose clause goes, not the adjective alone:
+   striking only "inert" leaves "to remove names that are already", which is why
+   this strike is wider than the one 165 lines below. The reason for pruning was
+   never strong and this removes what was left of it.)*. So: **keep them
+   verbatim.** If ~~the inert names~~ *(same correction — read: those four names)*
+   are worth removing, that is a separate,
    roster-wide change (all twelve at once, with the diffability cost taken
    deliberately), not a two-file exception.
 
@@ -369,9 +392,15 @@ did** — folding does not make this one large change.
   `roles.yaml`). The four adapted bodies mean a generator would have to
   round-trip local edits; the manual port plus a red test is the honest version
   until the adaptation set shrinks.
-- **Pruning the four inert Claude Code team tools** (`SendMessage`,
+- **Pruning the four ~~inert~~ Claude Code team tools** (`SendMessage`,
   `TaskUpdate`, `TaskList`, `TaskGet`) from builtin `tools` lines — Decision 9.
   If worth doing, it is one roster-wide change, not a two-file exception here.
+  *(Corrected 2026-08-03, issue #210: "inert" is wrong for at least `SendMessage`
+  and `TaskList`, both observed executing in real runs — see the correction under
+  Decision 9. This stays out of scope, but the reason is now stronger rather than
+  weaker: pruning a LIVE tool would remove a subagent's only channel to the lead
+  **while it is still running** — the Agent tool's return value still delivers a
+  finished report, so the qualifier is what makes the claim true.)*
 - **The dev-team ↔ product parity nudge** — issue #63, a different comparison.
 - **Prebaking a browser into the worker image** — issue #87 / PRD #87. This PRD
   ships `web-ux` degraded and says so; it does not make it functional.
