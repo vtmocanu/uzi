@@ -246,6 +246,70 @@ Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4
 
 ## Amendments
 
+### Amendment 2 — 2026-08-03, audit findings at `c3704d25` (ACCEPTED, fix not yet dispatched)
+
+Auditor verdict: **no security regression**, both design-wave blockers landed correctly. The
+new route is gated *more* tightly than the data it describes — shipped bodies now reach
+admins only, while the stored bodies of the same rows have always been readable by every
+authenticated user, so this is a net reduction in exposure. `npm audit` base-vs-head shows
+`diff@9.0.0` adds **zero** advisories, with the prod-dep count moving 112→113 as the positive
+control that the two runs read different inputs.
+
+**A1 (Medium) — BLOCKING. `AgentDetail`'s catch cannot tell "no shipped definition" from
+"the request failed", and prints a false sentence when it cannot.** Verified by the lead.
+`web/src/pages/AgentDetail.tsx:42` is a **parameterless** `catch {`, so every rejection maps
+to `builtin = null`, and `!builtin` at `:163` is the sole input to copy reading *"This release
+no longer ships a definition for `<name>`"* — plus removal of the Reset button. A 500, a 502
+or a dropped connection therefore makes the page assert something false, silently, on exactly
+the recovery path this milestone exists to enable: an admin working through #210's ten
+templates is told the definitions do not exist.
+
+The comment at `:43-45` shows the conflation of 409 and 403 was deliberate. What is not
+deliberate is that it also swallows every transient failure into the same copy.
+
+**And the test that looks like it pins this does not.** `AgentDetail.test.tsx:172-191` rejects
+with `ApiError(409, "no builtin definition to reset to")` and asserts the copy — but because
+the catch takes no parameter, **it passes identically with `ApiError(500)` or a bare
+`Error`.** The `409` is decorative: nothing observes it. Same class as a fixture whose
+discriminating value the code cannot reach.
+
+*Fix direction:* bind the error; treat only `ApiError` 409 and 403 as "no shipped side";
+let anything else leave `builtin` null WITHOUT switching the copy — better, keep Reset offered
+with a muted "couldn't load the shipped definition" note. Then flipping the fixture's 409 to a
+500 reddens, which is the point.
+
+**A2 (Low) — `Builtins()`' doc comment is false as written.** Verified by the lead.
+`api/internal/agenttmpl/builtins.go:49-50` says *"The returned slice is a copy so callers
+cannot mutate the package state."* `copy(out, builtins)` is **shallow**, and `Definition.Tools`
+is a `[]string`, so every returned struct's `Tools` aliases the package's backing array.
+Pre-existing and not live — the only write to a `Definition.Tools` in `api/` is inside
+`parse()` on a fresh value — but M4a's response DTO assigns `Tools: def.Tools`, so the alias
+now escapes the package through one more path. Fix the comment, or deep-copy `Tools`.
+
+**Accepted non-blocking, promoted because each names a MECHANISM rather than a preference:**
+
+- **Every non-admin viewing any builtin detail page issues a request guaranteed to 403.** The
+  condition is `template.is_builtin`, not `canEdit && template.is_builtin`. Cost is a wasted
+  round-trip and a steady 403 stream in the access log — and routine authz denials are what a
+  real one hides in.
+- **The editor trims `model` but the server's `SameContent` trims neither field.** If a stored
+  builtin ever carried a padded `model`, the badge would read "differs from shipped" while the
+  panel below it read "Matches the shipped definition" — two contradictory sentences on one
+  page. Closed today only by the new `render_test.go` `TrimSpace` assertions; the auditor
+  walked 202 sha/file pairs with a positive control to confirm no reachable revision has
+  padded frontmatter. Recorded because that assertion looks cosmetic and is the only thing
+  holding this shut.
+
+**Noted, no action:** `react-router-dom` is a floating `^6.28.0` on a prod dep with a live
+moderate advisory (pre-existing, not M4a's); `ToolsDiff`'s `as string[]` is a type assertion
+over a library type, bounded by the exact pin; the 409 body is worded for a write
+("no builtin definition to reset to") on a GET.
+
+**Evidence kind, as the auditor stated it:** A1 and A2 are re-derivations from source, not
+executions. It deliberately did not run the mutation, because reviewer, tester and web-ux are
+all mid-flight in this shared worktree and a `cp`-restore round would silently invalidate
+their runs. That was the correct call.
+
 ### Amendment 1 — 2026-08-03, after the design-critique wave
 
 Architect, reviewer and auditor reported independently; the lead re-derived the load-bearing
