@@ -90,11 +90,36 @@ sentence beside it is.
 
 ## For this repo (uzi)
 
-Dead-code slot: `none (gap)` — there is no `deadcode`, `knip`, or `golangci-lint
-unused` here yet (PRD #103 M4 adds them), so the deletion lens is entirely
-hand-grep for now. Note that the one known dead path found this way, the legacy
-`"Task"` switch case in `web/src/components/RunEvent.tsx`, is a dead *branch*,
-which none of those tools would have caught either.
+Dead-code slot: **`task deadcode`** — run it, and read what it does *not* cover
+before you conclude anything from a green. Three tools sit in this slot now:
+`golangci-lint unused` (M3, unused **unexported** symbols **within** a Go
+package, inside `task lint:api` / `lint:controller`), `deadcode` (M4,
+cross-package reachability per Go module), and `knip` (M4, unused TS exports,
+files and dependencies). The deletion lens is no longer mostly hand-grep — but
+it still has three holes, and each one is a different shape:
+
+- **The knip export tier is staged at `warn`, so it PRINTS and does not gate.**
+  22 findings on `web` and 53 on `agent` as of 2026-08-02. If a change orphans
+  an export, knip will say so on every run and the pipeline will stay green —
+  that is exactly the residue this section exists for, so report it rather than
+  trusting the exit code. Unused files and dependencies gate at zero.
+- **`unused` is ratcheted** (`new-from-merge-base: origin/main` in
+  `.golangci.yml`), so it will not surface pre-existing dead code in files the
+  MR does not touch. `deadcode` is **not** ratcheted: its baselines are
+  committed and EMPTY, so both Go modules are held at zero outright.
+- **Dead *branches* are invisible to all three.** The known instance is still
+  the legacy `"Task"` switch case in `web/src/components/RunEvent.tsx` — a dead
+  branch inside a live function, which no tool in this slot can reach. That
+  half of the lens is still yours.
+
+One more thing worth knowing when a change deletes a caller: **the gating Go
+invocation carries `-test`, so a function whose only remaining caller is a test
+is LIVE to it** and `unused` misses it too if it is exported.
+`task deadcode:api:all` / `deadcode:controller:all` drop `-test` and print that
+class (43 and 4, re-derived 2026-08-03 at `1076b133`) — they always exit 0, so
+read the output, not the status. *(PRD #103 M4, 2026-08-02: this paragraph opened "Dead-code slot:
+`none (gap)`", which M4 made false. M3 had already had to correct this same file
+on this same point.)*
 
 Authoring rules to enforce: root `CLAUDE.md` and `ARCHITECTURE.md` (read it for any
 cross-service review). Load-bearing invariants to check against: `main` is never touched
