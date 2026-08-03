@@ -139,6 +139,15 @@ func flatten(s string) string {
 // parallel-dispatch prose (PRD #43 M1), one assertion per behavior so a future
 // reword that silently drops a behavior fails loudly. These are the contract
 // the run's fan-out depends on, not incidental wording.
+//
+// THESE FOURTEEN ARE WHOLE-BODY AND ARE NOT REGION-SCOPED. `splitLeadRegions`
+// further down this file scopes the OTHER eight pins to their section of the
+// template; it does not apply here, so a phrase below satisfies its assertion
+// from anywhere in `lead.md`. Measured: moving one of these constraints out of
+// its bullet and up into the plan-turn paragraph — across the boundary that
+// test splits on — leaves both sets green. Narrow in practice, since these
+// phrases nearly all live in the bullets and have nowhere misleading to go, but
+// do not read this file's region machinery as covering this test.
 func TestLeadParallelDispatchPhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
@@ -171,6 +180,24 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Region-scoped phrase pins for `lead` (issue #205). What follows splits the
+// rendered template in two and asserts each pinned phrase against its own half,
+// so a rule MOVED between the plan-turn paragraph and the post-implementation
+// bullet reds instead of satisfying its pin from the wrong section.
+//
+// Three sentences carry more weight than their length suggests, and none of
+// them is an assertion: `leadRegionBoundary` and the two landmarks below are
+// ordinary prose of `lead.md`, and editing any one of them fatals every
+// assertion here. THE WARNING CANNOT LIVE NEXT TO THE PROSE IT PROTECTS:
+// `Render` writes `PromptBody` verbatim (render.go) and that body IS the system
+// prompt shipped to every user's lead agent, so a "do not reword, a test
+// depends on this" note in `lead.md` would be read by the agent as an
+// instruction; and frontmatter is no escape either, since `parse` rejects any
+// unknown key (builtins.go, `unknown frontmatter key`). Hence it is here, and
+// hence the length of what follows.
+// ---------------------------------------------------------------------------
 
 // leadRegionBoundary splits the rendered `lead` template into its two halves:
 // everything before it states what the lead must do BEFORE `submit_plan`, and
@@ -377,9 +404,10 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // ENTIRE new exposure, not one item among several. What that exposure is, is
 // the third item below.
 //
-// FOUR THINGS THIS DOES NOT DO — the first two deliberate, the third the price
-// of the first, the fourth simply out of scope and stated so it is not assumed
-// away:
+// FOUR THINGS THIS DOES NOT DO. The first is a deliberate semantic change; the
+// second is a hard limit of every substring instrument, not a choice; the third
+// and the first are both what the split costs; the fourth is an open gap in this
+// same file that this change makes HARDER to see:
 //
 //  1. IT IS A STRICTER CONTRACT THAN BEFORE, and that is a real semantic change
 //     rather than a refactor. A relocated-but-still-present rule is stated
@@ -447,6 +475,14 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	// The wave that runs AFTER an implementation unit lands. Kept as its own
 	// region so that a plan-turn clause moved down here, or this one moved up,
 	// reds rather than satisfying the other region's case.
+	//
+	// THIS ONE CASE IS ALSO LOAD-BEARING FOR THE SPLIT, which is not visible
+	// from here and is why it is repeated here rather than only at the guard.
+	// Its phrase is the first sentence after the boundary, so it is what reds
+	// when the boundary moves PARTWAY down into this bullet — a position no
+	// guard clause covers (see splitLeadRegions). Retire it, reword it, or add
+	// a second bullet case ahead of it, and that window widens with nothing
+	// structural behind it.
 	bulletCases := []pin{
 		{"post-implementation wave is retained and is a REPEAT", "fans out again after an implementation unit lands"},
 	}
