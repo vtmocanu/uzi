@@ -2,6 +2,39 @@
 
 Generated 2026-07-03 by the `agent-team` skill (roster adapted from the example-app team).
 
+> **🔴 HOW TO ADD TO THIS FILE, because its growth rate is now the thing most likely
+> to make it useless.** Measured by SHA, so it stays true: **782 lines at
+> `5712a0d4` (2026-07-21) → 1948 at `31a36412` (2026-08-02)**, about 2.5x in twelve
+> days. *(A reflect pass reported "163 → 1948, 12x in thirteen days"; the lead was
+> about to write that in, agreed with the conclusion, and checked the number only
+> because this file's own rule says to. `163` does not reproduce at any commit —
+> the real figure is 782. **That is this section's own subject happening inside the
+> edit that added it**, and it is the fifth instance in one session: a sound
+> conclusion, a decorative number, nobody checking because everybody agreed. The
+> conclusion survives; the multiplier was never load-bearing.)* Meanwhile
+> `grep -rn 'agent-team.md'
+> .claude/agents/*.md` returns **one** hit, a passing citation, and the skill's own
+> dispatch step states that teammates cold-start and never read this file. **Every
+> rule that lives only here is unenforced on teammates by construction.** That is
+> not hypothetical: on PRD #103 M2 two rules already in this file — *STAGE BY PATH,
+> never `git add -A`* and *the credibility is borrowed from the neighbour* — were
+> violated and independently re-derived, in the same session, by agents that had
+> never read them.
+>
+> Three rules follow, and they are about where text goes, not about writing less:
+>
+> 1. **Lead each section with its OPERATIVE sentence; evidence below it.** A reader
+>    who stops after one line should still have the rule.
+> 2. **A rule that has failed TWICE migrates; it does not grow.** Move its operative
+>    sentence into the role body of whoever must keep it (the skills-repo
+>    `roles.yaml`, which reaches every repo), and leave the evidence here with a
+>    pointer. A third paragraph in a file nobody must read cannot fix a rule that is
+>    already in it.
+> 3. **This file is the ARCHIVE, the role tails are the OPERATIVE copy.** Where both
+>    carry a gate slot, the tail holds the command plus the live limits; the full
+>    correction history stays here. Compressing both is how the history gets lost —
+>    check the pointer's target actually holds the thing before you move anything.
+
 ## Team roster
 
 | Role | Subagent type | Model | Tools |
@@ -103,9 +136,24 @@ CONCLUSIONS YOU AGREE WITH.** Re-deriving everything is not affordable, so the
 useful question is where unchecked claims accumulate — and it is not under
 contested conclusions. Those get argued and therefore checked. It is under
 **sound conclusions, in the corroborating detail nobody reads adversarially
-because the point it supports is already accepted.** Measured on PRD #103 M2
-(2026-08-02), where every false statement that reached the tree or a commit
-message had that exact shape:
+because the point it supports is already accepted.**
+
+> **This file already carried the mechanism, under *Apply the screen PER CLAIM,
+> not per comment block* — "the credibility is borrowed from the neighbour",
+> written 2026-07-21 for PRD #98.** A reviewer on PRD #103 M2 re-derived it from
+> scratch off its own two misses and reported it as a new finding, having never
+> read it. That is not a duplicate to merge: **it is the measurement that the
+> channel is broken.** No role file points a teammate at this manifest (one
+> passing citation across eleven), and the skill's own dispatch step says
+> teammates cold-start and never read it — so a rule living only here is
+> unenforced by construction, however well written, and this file more than
+> doubled over the same fortnight (see the growth note in this file's header, and
+> read that note's own parenthetical). The operative sentence belongs
+> in the role body of whoever must keep it. Read the two together; do not
+> reconcile them into one.
+
+Measured on PRD #103 M2 (2026-08-02), where every false statement that reached
+the tree or a commit message had that exact shape:
 
 - The `gofmt -w` retirement was sound on **vacuity alone** — after the reformat,
   an intersection against an empty set can never fail. A second reason was added,
