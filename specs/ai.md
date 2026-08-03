@@ -16303,9 +16303,10 @@ asserts — whatever context the phrase does or does not carry.
 - **The phrases shrink because the region carries the position.** Measured on the shipped
   template, **666 → 376 bytes** — independently re-derived from the shipped tables by both
   the auditor and the tester. (Stated raw rather than as a percentage on purpose: the same
-  measurement rounds to −44% or −43% depending which way it is taken, and two roundings in
-  two places read as a discrepancy to anyone who meets them apart. Raw figures cannot
-  disagree with themselves. **Bytes rather than "characters" for the same reason, and the
+  shrink gives **−44% in bytes and −43% in runes** — `(666−376)/666 = 43.54%` against
+  `(662−376)/662 = 43.20%`, one unit each, each rounded once, **not one measurement rounded
+  two ways** — and two figures in two places read as a discrepancy to anyone who meets them
+  apart. Raw figures cannot disagree with themselves. **Bytes rather than "characters" for the same reason, and the
   unit is not cosmetic here**: the anchored set carried two em dashes, 3 bytes each in
   UTF-8, so it is 666 bytes against **662 runes**. The ambiguous unit diverges on exactly
   one of the two figures, which is the shape that turns one measurement into an apparent
@@ -16386,7 +16387,9 @@ asserts — whatever context the phrase does or does not carry.
 - **"Relocation fails by construction" reaches exactly as far as the BOUNDARY, and the
   independent rounds bounded it in three directions.** (a) The plan region is everything
   *before* the boundary — frontmatter plus both intro paragraphs — not the plan-critique
-  paragraph: **1655 bytes of region against 889 of paragraph**, so ~766 bytes of room above
+  paragraph: **1655 bytes of region against 889 of paragraph** (889 takes the paragraph
+  through its trailing space, which the boundary `Cut` leaves behind; trimming it gives
+  888/767 — a one-byte delimitation choice, not a disagreement), so 766 bytes of room above
   it. Measured, hoisting the relay clause into the intro reworded as *"as a general habit"*
   gives **rc=0, no guard, no red**, with the clause out of the section that gives it
   meaning. Relocation *across* the boundary fails by construction; relocation *within* the
