@@ -9,7 +9,6 @@ audience: operator
 
 - Docker + Docker Compose v2 (`docker compose`, not the standalone `docker-compose` v1).
 - `openssl` (to generate secrets).
-- `git` (submodules).
 
 Everything else (Go, Node, PostgreSQL) runs inside containers; nothing needs to be installed locally.
 
@@ -18,10 +17,9 @@ Everything else (Go, Node, PostgreSQL) runs inside containers; nothing needs to 
 ```sh
 git clone <repo-url> uzi
 cd uzi
-git submodule update --init
 ```
 
-The submodule step pulls `inspiration/bottega`, `inspiration/multica` and `inspiration/dot-agent-deck` — reference projects the design was compared against (see [auth-design.md](auth-design.md)). They are not built or run; skip the step if you only want to run the stack.
+The design was compared against three external reference projects — [bottega](https://github.com/vdaubry/bottega), [multica](https://github.com/multica-ai/multica) and [dot-agent-deck](https://github.com/vfarcic/dot-agent-deck) (see [auth-design.md](auth-design.md)). They were vendored here as git submodules under `inspiration/` until 2026-08-03. Nothing in the stack builds or runs them, so **running uzi needs no setup step at all**. If you want the prior art to hand while working on uzi, `./scripts/link-inspiration.sh` clones the three once outside the repo and symlinks them into a gitignored `inspiration/`.
 
 ## Configure
 
