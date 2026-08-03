@@ -198,6 +198,36 @@ clone was destroyed, recreated at the same path, and the session still resolved
       fetch-back must park the run anyway, since a park that fails is worse than a
       park that loses work.
 
+      **🔴 THE SAME FETCH-BACK MUST ALSO FIRE ON THE SHUTDOWN PATH, and that is
+      where the larger loss actually is.** A park is not the only thing that
+      re-clones: `git.ts:332`'s `fs.rm` is unconditional on EVERY claim, and a
+      requeue re-claims. Measured 2026-08-03 on run `edbc3884` (uzi issue #209):
+      the worker pod was evicted for node ephemeral-storage pressure, its
+      replacement re-registered, `Service.Register` (`workersvc/service.go:707`)
+      called `RequeueWorkerRuns`, and ~82 minutes of committed work was destroyed
+      on the re-claim. `requeue_count` went to 1 while `limit_wait_count` stayed
+      at 1 — so this was a total loss with **no usage limit involved at all**, on
+      a run whose credential had 85% headroom. Filed as
+      [#224](https://gitlab.example.com/vtmocanu/uzi/-/issues/224).
+
+      Three facts make this tractable rather than a separate design problem, and
+      each was checked rather than assumed:
+
+      - The worker already installs a SIGTERM/SIGINT handler that aborts a
+        controller (`agent/src/main.ts:200-206`), so a graceful path exists.
+      - The pod carries `terminationGracePeriodSeconds: 30`, and an eviction
+        sends SIGTERM before SIGKILL, so there is a real window. A local
+        `fetchAgentBranch` over the file transport is far inside it.
+      - **R1 does not apply here.** The PVCs are named per WORKER identity
+        (`uzi-hw-<worker-id>-data` / `-nix`), not per pod, and were observed
+        re-attaching to the new node when the replacement pod started. Same
+        worker row, same `/data`, same bare repo — so the tracking ref survives
+        an eviction that moves the pod across nodes.
+
+      Without this, M1 covers the rarer of the two causes: a park is bounded by
+      Anthropic's window, while an eviction fires on ordinary node pressure and
+      took this repo's worker twice in one day.
+
       **The reap ordering is already free, and a first draft made it a task.**
       `LimitReachedError` is thrown in `driveTurn` (`sdk-executor.ts:1489`) and
       propagates through `run()` (`:340`), whose `finally` calls `killAgentTree`
@@ -255,8 +285,14 @@ clone was destroyed, recreated at the same path, and the session still resolved
       unchanged; **both** legs of M2's rule, including the two that a uniform
       ancestor test gets wrong — first park with a MOVED default branch (tracking
       ref must win) and a pushed branch that diverged (origin must win); a failed
-      fetch-back still parks. Regression: park with local commits, resume, assert
-      the commits are present — the test that would have caught this. The home for
+      fetch-back still parks. **Shutdown path (M1's second call site): a SIGTERM
+      with local commits fetches back, and does so within the grace period rather
+      than merely eventually — a fetch-back that only completes after SIGKILL is
+      the same total loss with a passing test.** Regression: park with local
+      commits, resume, assert
+      the commits are present — the test that would have caught this; and the
+      requeue variant of the same, since a requeue re-claims without ever
+      entering the park path. The home for
       all of it is `agent/test/runner-usage-limit-park.test.ts`, which already
       holds the carve-out tests. Mind `agent/`'s per-FILE `--test-timeout`
       behaviour recorded in CLAUDE.md.
