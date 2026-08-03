@@ -283,12 +283,15 @@ component calls) and drove one real call through the app's own binding to move t
 **the live unsaved edit AND the stored drift together** — no dialog, no warning, no undo. That
 was the half of F5's argument that had only been read off `key={template.updated_at}`.
 
-**Provenance, stated rather than assumed: the measurement was taken on the DIRTY tree**, not
-on a committed SHA — `AgentDetail.tsx` had the coder's in-flight F1/F4 edits on disk. It
-transfers, and checkably: `git diff -U0 -- web/src/pages/AgentDetail.tsx` matches
+**Provenance — RETIRED, and the result is stronger than first reported.** It was taken on the
+dirty tree at 18:00:36 and originally defended by inspection (`git diff -U0` matching
 `resetAgentTemplate|setNotice|differs_from_builtin` **zero** times, so `reset()`, the notice,
-the badge condition and the remount key are untouched by that diff, and for the admin/
-shipped-twin path `shipped.kind === "ok"` yields the identical `builtin` prop.
+the badge condition and the remount key were untouched). **`2144d51c` at 18:03:09 then
+committed exactly that state**, so this is now a direct measurement OF a commit rather than of
+uncommitted work that transfers. The inspection argument still holds but is no longer
+load-bearing. Recorded this way because web-ux declared the weaker provenance rather than
+writing "measured at `b0dc8dad`", which would have been false — and the stronger claim only
+became available afterwards.
 
 #### 🔴 OPERATIONAL HAZARD FOR ANY MEASUREMENT IN THIS WORKTREE
 
@@ -302,6 +305,32 @@ The fix that worked: run patch → control → edit → click → read as **one 
 eval**, so a mid-measurement reload surfaces as MISSING counters rather than as zeros.
 Generalised: **in a worktree another agent is writing, an absence is not evidence unless you
 can show the instrument was still live when you read it.**
+
+#### 🔴 ARRIVAL TIME CARRIES NO INFORMATION ABOUT AUTHORSHIP TIME
+
+Filed as a team-process fact because it produced a wrong accusation from careful reasoning.
+Web-ux charged the lead with relaying a claim it had already retracted; the lead accepted the
+substance (the retraction went to a subset of the validators it had misinformed) and disputed
+the sequence. Web-ux then settled it against timestamps and refuted its own charge:
+
+```
+c3704d25  17:34:03   the merge
+b5fac2aa  17:40:31   HEAD stops being c3704d25 here
+25561485  17:44:20   audit findings
+76f38ae1  17:49:31   THE RETRACTION
+```
+
+The lead's message described HEAD as `c3704d25` and named no later commit, so it was composed
+in a **6.5-minute window closing 9 minutes before the retraction existed**. Not merely
+unproven — impossible.
+
+**The mechanism: message delivery here queues behind a long-running turn, so a message can
+ARRIVE long after it was written and after commits it does not mention.** Web-ux inferred
+composition order from delivery order, which is the same shape as every instrument defect this
+file records — a confident answer to a question the instrument cannot see — pointed at a
+teammate rather than at code. **Two consequences worth keeping: never date a teammate's claim
+by when you received it, and the lead's own fix stands — retract to the full list you asserted
+to, not the subset still mid-flight.**
 
 #### TWO MORE FIXES
 
