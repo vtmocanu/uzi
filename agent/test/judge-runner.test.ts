@@ -163,6 +163,10 @@ describe("JudgeRunner", () => {
     // A queryFn that never yields a terminal result — without the cap, runModel would
     // hang forever. modelTimeoutMs is injected tiny so the test is fast.
     const hung: SdkQueryFn = (() =>
+      // NEVER YIELDING IS THE FIXTURE (PRD #103 M3, oxlint eslint(require-yield)):
+      // this generator models a hung SDK query, and adding a `yield` to satisfy the
+      // rule would give runModel a terminal result and retire the test.
+      // eslint-disable-next-line require-yield
       (async function* () {
         await new Promise((r) => setTimeout(r, 60_000).unref()); // longer than the injected cap; the test itself resolves as soon as runModel's own tiny modelTimeoutMs fires, well under a second either way -- unref just keeps this abandoned timer from holding the event loop open, which is what keeps the FILE's wall time fast (measured 454ms unref'd vs 60263ms without); --test-timeout does not see this at all, since it bounds a test body, not process exit
       })()) as unknown as SdkQueryFn;

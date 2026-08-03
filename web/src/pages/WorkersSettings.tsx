@@ -162,6 +162,15 @@ export function WorkersSettings() {
     // mid-mount token REFETCH, correctly found none (the tabs are separate routes, and
     // the 10s poll re-reads workers only), and inferred the fix was merely defensive.
     // The initial [] → fetched transition is the change, and it happens every time.
+    //
+    // SUPPRESSED, NOT FIXED (PRD #103 M3). The rule wants `announce` listed. The
+    // paragraph above already records why it is not: it is a setState wrapper and
+    // is stable. What M3 adds is the suppression that makes that reasoning survive
+    // the gate, rather than a dependency whose only effect would be to re-create
+    // this callback on churn the paragraph argues cannot happen. Same treatment
+    // and same reason as Dashboard.tsx's first-load effect. Reviewed under issue
+    // #200; fix or justify permanently there.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [pooledCount],
   );
 

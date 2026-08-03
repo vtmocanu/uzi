@@ -1362,10 +1362,112 @@ format         task fmt-check      # gofmt -l over both Go modules; fails on dri
                                    # every one of the files commit 1 touched. See the
                                    # standing rule for the full retirement and for why a
                                    # naive rebuild against fmt-check:api returns empty.)
-lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
-                                   # task gate:api / gate:controller and in CI, but a
-                                   # vet is not a lint slot. (Was "go vet in CI only";
-                                   # PRD #103 M1 made the local half true too.)
+lint           task lint           # composite, all four components (M5 will append
+               task lint:api       # shell + YAML to it). Each gate:<c> already runs
+               task lint:controller
+               task lint:web       # its own lint:<c>, so a COMPONENT GATE ALREADY
+               task lint:agent     # COVERS THIS SLOT for that component -- same shape
+                                   # as the format slot above. Go is golangci-lint
+                                   # (errcheck, staticcheck, ineffassign, unused,
+                                   # unparam, nolintlint) via a pinned
+                                   # `go run ...@v2.12.2`; npm
+                                   # is oxlint 1.76.0 via each package's `npm run
+                                   # lint`. Ordering differs by component ON PURPOSE:
+                                   # lint runs AFTER build in the Go gates (it
+                                   # type-checks, so on a non-compiling tree it says
+                                   # "typechecking error" instead of the build error)
+                                   # and FIRST in the npm gates (~0.06s, not
+                                   # type-aware).
+                                   # 🔴 THE GO HALF IS RATCHETED AND TASK'S ECHO
+                                   # CANNOT SHOW IT. `issues: {new-from-merge-base:
+                                   # origin/main, whole-files: true}` lives in
+                                   # `.golangci.yml`, NOT on the command line, so the
+                                   # read-the-echo habit this block relies on for
+                                   # -race/-count=1 does not protect it -- read that
+                                   # file. Consequences you WILL hit: only findings
+                                   # your branch introduces block, `whole-files` makes
+                                   # PRE-EXISTING findings in a file you touched block
+                                   # too, and `task lint:api:all` / `lint:controller:all`
+                                   # are the unfiltered companions (reported, never
+                                   # gating, not in `task gate`).
+                                   # 🔴 AND IF `origin/main` DOES NOT RESOLVE, the run
+                                   # does NOT skip the ratchet: it reports the WHOLE
+                                   # backlog behind one buried warning line, which
+                                   # reads as a huge new regression. The targets carry
+                                   # a pre-flight that exits 2 saying so; if you see
+                                   # it, `git fetch origin main` -- do not start a
+                                   # burn-down.
+                                   # 🔴 AND golangci-lint TAKES A HOST-GLOBAL LOCK,
+                                   # not just a host-global cache. If you see
+                                   # `Error: parallel golangci-lint is running` with
+                                   # `exit status 3`, ANOTHER WORKTREE HOLDS IT --
+                                   # RE-RUN, DO NOT REPORT A RED GATE. This repo is a
+                                   # bare clone with many sibling worktrees and this
+                                   # team runs agents concurrently by design, so the
+                                   # collision is normal rather than exceptional. It
+                                   # fails SAFE (false red, never false green), but
+                                   # 🔴 THE STATUS CANNOT DISTINGUISH IT FROM A REAL
+                                   # FINDING. golangci-lint exits 3; `go run` prints
+                                   # that as the TEXT `exit status 3` and then exits
+                                   # **1** itself (measured on a 3-exiting program),
+                                   # and 1 is this file's "there are findings" code.
+                                   # So the 3 never reaches the exit code at all,
+                                   # `task` reports its usual 201, and an automated
+                                   # reader testing `!= 0` -- or even reading the
+                                   # status carefully -- records a red gate over
+                                   # code that is fine. THE ONLY DISCRIMINATOR IS
+                                   # THE MESSAGE TEXT. Read it.
+                                   # 🔴 THE SAME HOST-GLOBAL DIRECTORY HOLDS A
+                                   # RESULT CACHE THAT REPLAYS OTHER WORKTREES'
+                                   # FINDINGS, AND IT LIES IN BOTH DIRECTIONS.
+                                   # Warm entries from a sibling worktree carry ITS
+                                   # absolute paths: the RATCHETED targets then go
+                                   # falsely GREEN (the diff processor cannot match
+                                   # a foreign path and drops everything) while the
+                                   # `:all` targets go falsely LOUD. Measured
+                                   # 2026-08-02: `task lint:api:all` printed 120
+                                   # findings, every one pathed into another
+                                   # worktree, against 107 after a cache clean.
+                                   # THE TELL IS A `../` IN A FINDING'S PATH --
+                                   # that is an invalid run, not a finding. The
+                                   # `:all` targets now `cache clean` themselves;
+                                   # the gate targets deliberately do NOT (it would
+                                   # clear the cache for every concurrent agent), so
+                                   # if you are calibrating, or chasing a surprising
+                                   # green, clean first and re-run.
+                                   # 🔴 AND CLEAN **AFTER** DELETING A THROWAWAY
+                                   # WORKTREE, NOT ONLY BEFORE AN ARM. The cached
+                                   # paths OUTLIVE THE TREE. Cleaning before your
+                                   # own run protects YOU; it does nothing for
+                                   # whoever runs next, and a finding pathed into a
+                                   # directory that NO LONGER EXISTS is worse than
+                                   # one pointing at a live sibling, because nobody
+                                   # can go look at it. That is how the 120 above
+                                   # happened: a validator built a throwaway
+                                   # worktree for a cache probe, removed it, and
+                                   # left the entries behind. CAUSE, NOT ARITHMETIC
+                                   # -- the owner claimed only the mechanism, and
+                                   # "exactly how" would claim a completeness
+                                   # nobody established.
+                                   # WHAT THE SURVIVING LOG DOES SHOW, MEASURED:
+                                   # all 120 findings carried `../` paths, ZERO were
+                                   # repo-relative, and every one pointed into a
+                                   # SINGLE foreign tree. So the 120 and the 107 are
+                                   # DISJOINT POPULATIONS FROM TWO DIFFERENT RUNS --
+                                   # there is no `107 + 13` decomposition, and any
+                                   # reasoning about a 13-finding gap is about a
+                                   # model this run does not fit.
+                                   # WHY THAT TREE'S OWN COUNT WAS 120 RATHER THAN
+                                   # ~107 CANNOT BE ESTABLISHED: it is deleted and
+                                   # no log of it survives. THE EVIDENCE WAS
+                                   # DESTROYED BY THE EXACT FAILURE THIS RULE
+                                   # DESCRIBES, which is the rule's justification
+                                   # rather than a hole in it.
+                                   # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
+                                   # still runs inside gate:api / gate:controller as
+                                   # its OWN unratcheted step and is deliberately NOT
+                                   # folded in here -- folding it in would weaken it,
+                                   # since today every vet finding blocks.)
 typecheck      task typecheck:web
                task typecheck:agent
 test           task test:api
@@ -1373,7 +1475,33 @@ test           task test:api
                task test:web
                task test:agent
                task check-docs:web
-dead code      none (gap, noted 2026-07-26)
+dead code      task deadcode       # all four; or deadcode:{api,controller,web,agent}
+                                   # (Was `none (gap, noted 2026-07-26)`; PRD #103 M4
+                                   # closed it.) Go = `deadcode -test ./...` per module
+                                   # against a COMMITTED, EMPTY baseline, so both
+                                   # modules gate at ZERO. npm = knip.
+                                   # 🔴 THE npm HALF IS STAGED AND A GREEN DOES NOT MEAN
+                                   # "no unused exports". knip's exports/types family is
+                                   # at `warn`: printed in full on every run, setting NO
+                                   # exit code. 22 findings on web, 53 on agent as of
+                                   # 2026-08-02. Unused FILES and DEPENDENCIES gate at
+                                   # zero. `--max-issues` is NOT a fallback for the warn
+                                   # tier -- measured, it counts error-severity only.
+                                   # 🔴 AND NEITHER TOOL SEES A DEAD *BRANCH*. deadcode
+                                   # finds unreachable FUNCTIONS, knip finds unused
+                                   # EXPORTS/FILES/DEPS; a `case` arm nothing reaches
+                                   # inside a live function is invisible to both. The
+                                   # live example is PRD #99's `case "Task":` arms in
+                                   # web/src/components/RunEvent.tsx, which is also why
+                                   # they are NOT a valid probe for this slot -- they
+                                   # produce a clean "no findings" from a working tool.
+                                   # Dead branches stay the reviewer's job.
+                                   # CALIBRATING THIS SLOT? USE AN EXPORTED SYMBOL. An
+                                   # unexported one is caught by golangci-lint `unused`,
+                                   # which runs EARLIER in gate:api, so the gate
+                                   # fail-fasts at lint and deadcode never executes --
+                                   # measured, and it demonstrates the lint slot while
+                                   # claiming to demonstrate this one.
 coverage       none (gap, noted 2026-08-02)
 security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap, noted 2026-08-02)
@@ -1393,9 +1521,28 @@ live-wait bound, and an over-run against a stated bound is what makes an agent
 abandon a gate and report an inconclusive run as a failure** — the same failure the
 e2e exception below exists to prevent.
 
+**BOTH FIGURES ABOVE PREDATE THE LINT STEP** (PRD #103 M3 wired `lint:<component>`
+into every `gate:<component>`), so they are left standing as the samples they were
+rather than silently re-attributed. Re-measured on the post-M3 tree, 2026-08-02, in a
+long-lived worktree with a warm build cache: **`task gate` EXIT=0 in 126-213s across
+three samples** (126 / 191 / 213). That range **straddles** the 193s pre-M3 warm
+reading, which is the actual evidence here and is stronger than any single sample:
+the warm-cache run-to-run spread is wider than lint's contribution in **both**
+directions, so the honest statement is that **lint did not move this slot out of its
+envelope** — never that it made the gate faster. Quoting only the 126s would invite
+exactly that inference. The 8m31s cold budget was NOT re-measured; lint adds roughly 12s of Go work
+and 0.1s of npm work to it, which does not change how it should be read.
+
 **So scope it.** A change touching one component runs `task gate:<component>` and
-gets a complete answer in well under a minute: **api 43-66s, controller ~10s, web
-23s, agent 34s** on the same run. That is what per-component gates are FOR (PRD #103
+gets a complete answer in well under a minute. Re-measured post-M3, each with its
+lint step included: **api 51.8s, controller 6.5s, web 18.3s, agent 25.9s** — but
+🔴 **THESE ARE SINGLE SAMPLES FROM THE 126s RUN, WHICH IS THE FASTEST OF THE THREE,
+AND THEY SCALE WITH IT.** The total above ships as a range and these do not, so read
+them as the bottom of one: scaled to the 213s run, `gate:api` lands near 87s. If you
+need a per-component budget rather than an indication, take your own sample on your
+own machine — that is cheaper than any figure recorded here, which is the general
+case for every timing in this block. (The pre-M3 samples these replace read api
+43-66s, controller ~10s, web 23s, agent 34s.) That is what per-component gates are FOR (PRD #103
 Decision 2), and nothing else here tells a cold-starting teammate to prefer them.
 Reach for the full `task gate` before a release or when a change crosses components,
 and coordinate with the lead the way you would for e2e.
@@ -1702,6 +1849,27 @@ someone to "fix" the one that was already correct.
 *Also migrated from the PRD #98 checkpoint. Each keeps its incident: a rule without its
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
 compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
+
+- **PREFIX YOUR LONG-RUNNING PROBE COMMANDS WITH YOUR OWN ROLE NAME, in the echo:
+  `echo "=== [reviewer] go.mod hashes BEFORE ==="`, never `echo "=== BEFORE ==="`.**
+  Costs nothing, survives `pgrep -fl`, and it is the **positive** half of `CLAUDE.md`'s
+  process-ownership rule: that one tells you what to do when attribution FAILS (if you
+  cannot attribute a process, leave it), and nothing about making it succeed.
+  **`pgrep` output is the ONLY view another agent has of your process**, and every
+  other identifying channel on this team is shared — the shell snapshot is
+  per-CLI-session (measured 2026-08-02: three agents, one identical snapshot file),
+  cwd is a shared worktree *and* a shared scratchpad, and a log path identifies you
+  only if you happened to name it well.
+  **The incident: attribution succeeded once, by luck, and needed two coincidences** —
+  two agents happening to record their instrument choice in prose, *and* one of them
+  happening to leave a distinctive literal in argv. Its owner's own diagnosis:
+  *"the thing that actually made my argv distinctive was an echo string I wrote for
+  myself, which is an accident of style, not an identifier."* Meanwhile a wrong
+  attribution nearly landed on two different agents in turn, because the shared
+  signals do not merely fail — they **manufacture a confident match** with whoever you
+  check first. This rule turns the lucky match into a designed one. Read it as a pair
+  with the `CLAUDE.md` rule: **make your own processes attributable, and leave alone
+  the ones that are not.**
 
 - **A DELIVERED TASK DESCRIPTION CARRIES NEITHER ITS CURRENCY NOR ITS COMPLETION — check the
   task's STATUS before acting on its text.** A `TaskUpdate` wakes the named idle agent, which

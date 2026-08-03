@@ -179,7 +179,15 @@ export class Worker {
     // carries no shutdown signal — it runs to its terminal state; the container's
     // SIGKILL grace is the hard backstop and the sweeper requeues anything the kill
     // interrupts, so a stuck run can't wedge shutdown past the grace window.
-    await Promise.allSettled([...active]);
+    //
+    // The Set is passed directly rather than spread (PRD #103 M3, oxlint
+    // unicorn/no-useless-spread). Equivalent, not merely tidier: Promise.allSettled
+    // drains its iterable SYNCHRONOUSLY before any settle callback runs, so the
+    // `active.delete(run)` in the `.finally` above cannot mutate it mid-drain and
+    // the array copy was buying nothing. The `[...active, sleep(...)]` spreads in
+    // the Promise.race calls above STAY — those build a longer array and the spread
+    // is load-bearing there.
+    await Promise.allSettled(active);
   }
 
   /**
@@ -223,6 +231,7 @@ export class Worker {
       if (!claimed) await sleep(this.config.chatPollMs, signal);
     }
     // On shutdown let in-flight chats drain (each sees the abort via its own cancel).
-    await Promise.allSettled([...active]);
+    // Set passed directly, same reasoning as the run lane's drain above.
+    await Promise.allSettled(active);
   }
 }

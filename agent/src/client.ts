@@ -311,12 +311,19 @@ export class WorkerClient {
       "X-Client-Version": this.version,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    return fetch(this.baseUrl + path, {
+    // `body` is SET CONDITIONALLY rather than passed as `body: undefined` (PRD #103
+    // M3, oxlint unicorn/no-invalid-fetch-options, which flags a `body` key on a
+    // call whose method can be "GET"). Behaviourally identical — fetch treats an
+    // undefined body as no body — but the static shape now says so, and a real
+    // GET-with-a-body would become visible instead of being masked by a key that is
+    // always present.
+    const init: RequestInit = {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(this.httpTimeoutMs),
-    });
+    };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    return fetch(this.baseUrl + path, init);
   }
 
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {

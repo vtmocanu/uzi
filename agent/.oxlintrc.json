@@ -1,0 +1,33 @@
+// oxlint for agent/ (PRD #103 M3).
+//
+// JSONC, deliberately - see web/.oxlintrc.json's header for why a `"//"`
+// comment KEY does not work here.
+//
+// Run it via `task lint:agent` -> `npm run lint` -> oxlint --config THIS FILE.
+//
+// 🔴 SAME BANS AS web/.oxlintrc.json: no `jsPlugins`, no `extends`. Read that
+// file's header for the reasoning and for the residual neither ban closes.
+//
+// 🔴 `plugins` REPLACES THE DEFAULT LIST. The three defaults (unicorn,
+// typescript, oxc) are re-listed below for that reason, and they are NOT
+// decoration here: agent/'s own 10 baseline findings include 3
+// `unicorn(no-useless-spread)`, 1 `unicorn(no-invalid-fetch-options)` and 1
+// `typescript(no-this-alias)`, so a config that dropped either plugin would
+// silently retire half this package's findings.
+//
+// 🔴 `react` IS DELIBERATELY NOT LISTED, AND THAT IS A DIVERGENCE FROM
+// web/.oxlintrc.json rather than an omission. agent/ is a Node worker with no
+// React and no JSX; the plugin would load rules that can never fire. Measured
+// during PRD #103's design: agent/'s count is 10 with or without
+// --react-plugin. If this package ever grows a React surface, add "react" here
+// AND promote react-hooks/rules-of-hooks at rule level the way web/ does -
+// enabling the plugin alone does not run that rule, because it is `pedantic`
+// rather than `correctness`.
+//
+// 🔴 NOTHING HERE MAY SHIP AT "warn": a rule at warn prints its violation and
+// exits 0. The correctness tier is denied by the `-D correctness` in
+// package.json's `lint` script.
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["unicorn", "typescript", "oxc"]
+}

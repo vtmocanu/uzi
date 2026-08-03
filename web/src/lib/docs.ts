@@ -170,6 +170,11 @@ export interface RewrittenHref {
 // cannot slip past the check.
 const DANGEROUS_SCHEME = /^(?:javascript|vbscript|data|file):/i;
 export function schemeIsDangerous(url: string): boolean {
+  // 🔴 THE CONTROL-CHARACTER RANGE IS THE SECURITY GUARD, not an oversight: this
+  // strip is what stops `java\tscript:` reaching the scheme test. Do not narrow
+  // the class to satisfy the linter — that reopens the smuggling path the comment
+  // above describes.
+  // eslint-disable-next-line no-control-regex
   return DANGEROUS_SCHEME.test(url.replace(/[\x00-\x20]+/g, ""));
 }
 
