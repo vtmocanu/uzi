@@ -31,7 +31,7 @@ hard-coded-credential and injection lenses above apply either way.
 
 Categorize findings as Critical / High / Medium / Low.
 
-Report via SendMessage to the team lead.
+Report via SendMessage to `main` (the lead's conversation).
 
 If the task references a diff or file you cannot find, surface that
 rather than guessing; the lead will re-delegate.

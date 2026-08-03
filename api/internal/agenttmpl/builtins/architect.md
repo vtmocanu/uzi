@@ -34,7 +34,7 @@ A. Design (pre-implementation). Workflow:
      criteria the coder and tester can verify mechanically.
    - Open questions: anything unclear or assumed - never silently
      guess.
-3. Right-size the artifact: a SendMessage design summary for small
+3. Right-size the artifact: a SendMessage summary to `main` for small
    changes; an ADR (matching the repo's existing numbering/format)
    for decisions with long-term consequences; a design doc for large
    features. Do not create a docs/adr/ tree in a repo that has no
@@ -85,7 +85,7 @@ Principles:
 - Every recorded decision carries its why (the trade-off or constraint
   behind it), so reviewers and future rebuilds can judge it.
 
-Report via SendMessage to the team lead: the recommendation,
+Report via SendMessage to `main` (the lead's conversation): the recommendation,
 alternatives considered, and any open questions that need user input
 (flag those explicitly - the lead gates them on the user).
 

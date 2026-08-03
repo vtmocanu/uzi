@@ -24,9 +24,20 @@
 //     separate follow-up PRD. Unrecognized-but-well-formed names are LEFT IN
 //     PLACE: an allowlist entry that matches no real tool is silently unavailable
 //     (the SDK resolver is case-sensitive + fail-closed — `foo` grants nothing),
-//     which is how uzi's own dev-team files, declaring Claude Code team tools
-//     (SendMessage, TaskUpdate, …), parse cleanly under a worker SDK that never
-//     provides them.
+//     which is how a dev-team file declaring a tool this SDK does not ship parses
+//     cleanly rather than failing.
+//     CORRECTED 2026-08-03 (issue #210): this passage used to name SendMessage
+//     and TaskUpdate as the worked example, "under a worker SDK that never
+//     provides them". THE EXAMPLE WAS WRONG — the worker SDK DOES provide
+//     SendMessage (26 tool_use entries across runs 71d83432 / 84b6a933 /
+//     c13cff61, 18 of them successful) and TaskList (3). The structural claim on
+//     the two lines above is untouched and still true; only the instance was
+//     wrong. The consequence is what matters here and it INVERTS: a repo agent
+//     declaring SendMessage is not granted an inert name, it is granted a WORKING
+//     tool that can message the run's main thread — and the assertion in
+//     test/repoagents.test.ts shows that state is reachable, not theoretical.
+//     Benign (main is the intended recipient anyway), but it is a real capability
+//     and this comment used to tell the reader it did not exist.
 //   - `model`: honored for any value passing the API's `ValidateModel` shape check
 //     (models.ts) — a full id like `claude-opus-4-8`, not only a short alias.
 //     Only a string that could never be a model id (control chars, whitespace,

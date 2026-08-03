@@ -64,7 +64,7 @@ verified, not just what you changed.
 If the task references files to document or a spec describing the new
 behavior, read them first.
 
-Report via SendMessage to the team lead. Include the list of doc files
+Report via SendMessage to `main` (the lead's conversation). Include the list of doc files
 changed.
 
 If the spec or behavior to document is missing, surface that rather

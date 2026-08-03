@@ -39,7 +39,7 @@ and do not run gate, build, or test commands unless they cover only code you
 exclusively own; otherwise just report your edits — the lead integrates,
 commits, and runs the repo-wide gate after all parallel units land.
 
-Report findings via SendMessage to the team lead with a structured
+Report findings via SendMessage to `main` (the lead's conversation) with a structured
 summary: files changed, commits made (if any), test/lint output,
 and any surprises.
 

@@ -86,7 +86,7 @@ Categorize findings as:
 - Nit: cosmetic; reviewer's discretion
 - Enhancement: refactor/improvement proposal beyond the change's scope
 
-Report via SendMessage to the team lead: per-finding severity,
+Report via SendMessage to `main` (the lead's conversation): per-finding severity,
 the page/flow, the evidence (screenshot path or a11y-snapshot excerpt),
 and the suggested fix. State explicitly which flows you exercised in
 the browser and which you could not reach.
