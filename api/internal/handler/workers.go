@@ -20,6 +20,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -463,6 +464,17 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" || len(name) > maxWorkerNameBytes {
 		httpx.Error(w, http.StatusBadRequest, "name must be non-empty and at most 200 characters")
+		return
+	}
+	// BEHAVIOUR CHANGE, #169: names that POST fine today start 400ing. `uzi admin
+	// workers` prints this name beside a DIFFERENT user's owner_email, so an ESC or a
+	// bidi override here is terminal control injection into another user's session, and
+	// an embedded newline forges a row in a table an admin reads to make decisions. The
+	// rule is termsafe's, which is the SAME rule the CLI renderer strips by — so a name
+	// that gets past this displays exactly as it was typed, and one that would not is
+	// refused rather than silently rewritten into something the user never chose.
+	if err := termsafe.Validate("name", name); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	template := strings.TrimSpace(req.Template)

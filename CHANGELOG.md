@@ -6,6 +6,57 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Subagents no longer have the ordinary route to write files during a run's
+  plan turn**, the phase before you approve a plan. Every subagent's `Edit`,
+  `Write`, `MultiEdit` and `NotebookEdit` tools are removed for that turn
+  only; the implement turn is unaffected, so a role that needs to write is
+  exactly as able to once the plan is approved. This is a hygiene control,
+  not a guarantee: the turn still runs under `Bash`, and nothing at the
+  guardrail layer denies a shell-based write (`echo >`, `sed -i`, `tee`), so
+  what changes is the tool a model reaches for by default and its awareness
+  that one exists, on top of the prompt instruction that was previously the
+  only thing saying not to. Actually catching a worktree change no matter how
+  it was made is tracked separately as issue #212 (issue #203).
+
+- **Worker names and CLI-token names are now validated on write, and reject
+  terminal-unsafe characters that were accepted before.** `POST
+  /api/workers`, the hosted-worker provisioning path, and both the
+  CLI-token mint and device-start flows now return 400 for control
+  characters, Unicode format characters (bidi overrides, zero-widths, the
+  BOM, the soft hyphen), and invalid UTF-8; names are still trimmed of
+  leading and trailing whitespace before that check, unchanged from before.
+  These names are read back in cross-tenant admin listings beside a
+  different user's account, so an unvalidated one was terminal control
+  injection into another user's session, and an embedded newline could
+  forge a whole table row in a listing an admin reads to make decisions.
+  Existing stored names are untouched by this change and stay covered by
+  the render-side fix instead (issue #180), which strips the same
+  characters on the way out (issue #169).
+
+
+### Fixed
+
+- **Subagents in ten of the eleven builtin agent templates now reach the team
+  lead when they report back.** Each template's "report via SendMessage"
+  instruction named the recipient "the team lead," but the only address
+  reachable from a builtin body is `main`: the lead's own template runs as the
+  main thread, not as an invokable subagent, so a call addressed to "the team
+  lead" (or a bare "lead") failed with "No agent named 'lead' is reachable."
+  Measured across three real runs, 8 of 26 SendMessage reports failed this
+  way. Five subagents recovered by resending to `main`, each costing a
+  regenerated report of several kilobytes plus a few tool round-trips; the
+  other three gave up on SendMessage entirely and returned their findings
+  through a different channel, each prefixed with an apology about uzi's own
+  plumbing that a human then read in the report. The thirteen recipient
+  instructions across the ten templates now name `main` explicitly; the role
+  is still called "the team lead" in surrounding prose, since a blanket
+  rename there would misread as proposing action to the tool address rather
+  than describing the role. **Operators:** the fix does not reach an install
+  that has already booted, since builtin seeding never overwrites an existing
+  template row. An admin must open each of the ten affected templates and
+  click **Reset to default** to pick it up (issue #210).
 ### Security
 
 - **The `uzi` CLI no longer renders server-supplied text on your terminal
@@ -22,6 +73,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   of the stripped characters, so a multi-part emoji built from one (a family
   emoji) now renders as its separate members instead of the joined glyph; a
   single-codepoint emoji is unaffected (issue #180).
+
+### Fixed
+
+- **Release tooling: the CHANGELOG coverage gate could block a good release,
+  about once every dozen runs, and a retry made it go away.** It reported a
+  merge as uncited while the section cited it on the line the check had just
+  matched. Cause: `printf '%s' "$SECTION" | grep -q <pattern>` under
+  `set -o pipefail`. `grep -q` exits the instant it matches and closes the pipe;
+  bash's `printf` builtin writes line-buffered, so an 8.5 KB section leaves the
+  shell as 72 separate writes and is still writing when grep goes; the next
+  write takes SIGPIPE and `pipefail` reports 141 for a pipeline whose grep
+  succeeded. Every `grep` in the script now reads a file, which has no writer to
+  kill. Present since the gate was first added, on the issue-number lookup and
+  on both escape hatches, not only on the short-SHA citation added the same day
+  it was found (`19ad63c3` was the merge it flagged; job 134884 failed, retry
+  134892 passed on the identical commit). Developer-facing only: no change to
+  how uzi behaves.
 
 ## [0.14.0] - 2026-08-03
 

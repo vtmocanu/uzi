@@ -16177,11 +16177,28 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
   declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
   path hook only JAILS writes to the worktree rather than denying them
-  (`guardrails.ts:757`). `architect.md:37` compounds it by offering "a SendMessage design
+  (`guardrails.ts:757`). ~~`architect.md:37` compounds it by offering "a SendMessage design
   summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
   `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
   unavailable, naming `SendMessage` as the case — so that role's remaining options are both
-  writes. A plan-turn write is an uncommitted change the human never saw, which the first
+  writes.~~ *(**Corrected 2026-08-03, issue #210: `SendMessage` DOES exist in a uzi run, so
+  this bullet's premise AND its conclusion are both false.** Offering an option that EXISTS
+  does not compound a write risk, it relieves it, so the first clause falls with the second.
+  The quoted phrase is retired too: `4fde2088` dropped the word "design" and `98cabb06` made
+  it "a summary via SendMessage to `main`", so the quotation was stale as well as the
+  inference. Measured on three run traces:
+  `71d83432`, `84b6a933`, `c13cff61` carry 26 `SendMessage` `tool_use` entries, 18 of which
+  returned `{"success":true,"message":"Message queued for the main conversation's next
+  turn."}`; `ToolSearch` resolved `select:SendMessage` six times, which is direct proof the
+  SDK provides it independently of any send succeeding. `architect.md:4` declares
+  `SendMessage` and `agents.ts:110` honours a non-empty allowlist verbatim, so architect has
+  a real non-writing route and its remaining options are NOT both writes. What survives is
+  the `repoagents.ts` STRUCTURAL claim — an allowlist entry matching no real tool grants
+  nothing — which the traces bear on not at all; only the choice of `SendMessage` as an
+  instance of it was wrong. The bullet's own conclusion (relay the no-write rule at dispatch)
+  is unaffected: it rests on the plan-turn-write argument below, not on this premise. Scope
+  note: `TaskList` is also observed (3 calls); `TaskUpdate` and `TaskGet` are UNOBSERVED,
+  not observed absent.)* A plan-turn write is an uncommitted change the human never saw, which the first
   implement commit then sweeps in: it weakens the APPROVAL GATE, not a guardrail layer.
   (c) Any bar is stated over the plan the lead produced, never over the issue.
   `PlanPromptInput` (`prompt.ts:498-518`) carries **nine** fields, and none of them is a
@@ -16320,10 +16337,28 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   read-only validators" and does not mention `architect` at all (measured: zero
   occurrences). That is not an oversight and it follows from D5 rather than contradicting
   it — `architect` declares `Edit, Write`, so it is not a read-only validator and the
-  wording excludes it. It joins the plan-turn wave when **#203** removes its write tools,
-  not before. Recorded because an unstated omission becomes a surprise; note it does not
-  weaken the relay requirement, since `tester` also declares `Edit, Write` and *is* named a
-  read-only validator by the product's own docs.
+  wording excludes it. Recorded because an unstated omission becomes a surprise.
+
+  **Amended 2026-08-03 (#203 landed).** Two things this bullet asserted have changed, and
+  the conclusion survives both:
+
+  - It said architect "joins the plan-turn wave when #203 removes its write tools, not
+    before." #203 removed them **from the plan turn's assembled map**
+    (`agents.ts planTurnSubagents`, wired at `sdk-executor.ts`'s `baseOptions.agents`)
+    while `architect.md` still **declares** them, because they remain correct on the
+    implement turn. So the precondition is met, but not in the form this sentence
+    describes: there is no frontmatter edit to point at. **Whether architect actually
+    enters the plan-time wave is still open and deliberately deferred** — it widens the
+    wave against the re-entry ceiling the next bullet quantifies, which is a scope
+    decision, not an architecture one. `lead.md` is unchanged and still does not mention
+    `architect`.
+  - It closed by arguing the omission "does not weaken the relay requirement, since
+    `tester` also declares `Edit, Write` and *is* named a read-only validator by the
+    product's own docs." That last clause was true and is now **false by construction**:
+    #203's docs half removed the "read-only subagent (`reviewer`, `auditor`, `tester`,
+    `fact-checker`)" enumeration from `docs/agent-templates.md`, which was the naming it
+    cited. The relay requirement stands on its own terms; the supporting appeal to that
+    line does not, and is retracted rather than repointed at a replacement.
 - **The wave is bounded on REPETITION, not only on width.** A planning turn re-enters from
   two loops: `QUESTION_MAX` (default 5, `config.go:664`) allows up to six planning turns per
   gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —

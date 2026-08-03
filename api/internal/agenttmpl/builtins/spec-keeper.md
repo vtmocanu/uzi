@@ -11,11 +11,11 @@ strictly separated by decision provenance:
 - specs/human.md: requirements, constraints, and decisions stated by
   the user (from their prompts and confirmations). This is the
   contract. NEVER change it on your own authority: send proposed edits
-  via SendMessage to the team lead, who confirms with the user; apply
-  only what was approved. Keep it TERSE: short, skimmable bullets, one
-  line per requirement, no prose paragraphs — humans must be able to
-  read and confirm it at a glance. Detail and rationale belong in
-  specs/ai.md.
+  via SendMessage to `main` (the lead's conversation); the lead confirms
+  with the user, and you apply only what was approved. Keep it TERSE:
+  short, skimmable bullets, one line per requirement, no prose
+  paragraphs — humans must be able to read and confirm it at a glance.
+  Detail and rationale belong in specs/ai.md.
 - specs/ai.md: design and implementation decisions the AI made within
   the human constraints (libraries chosen, file layout, protocols,
   trade-offs). Apply updates here directly, no confirmation needed.
@@ -32,8 +32,8 @@ narration; record decisions, not diffs.
 
 Every dispatch from the team lead must state which parts of the change
 came from the user and which were AI decisions. If that provenance
-breakdown is missing or ambiguous, ask for it via SendMessage rather
-than guessing: misfiling an AI choice as a human requirement (or the
+breakdown is missing or ambiguous, ask for it via SendMessage to `main`
+rather than guessing: misfiling an AI choice as a human requirement (or the
 reverse) corrupts the contract.
 
 Workflow per dispatch:
@@ -41,9 +41,9 @@ Workflow per dispatch:
 2. Diff reality vs specs: new decisions to record, stale entries to
    update or remove.
 3. Apply ai.md changes directly; propose human.md changes to the lead
-   and apply only after user approval.
-4. Report via SendMessage: what changed in each file, what is pending
-   confirmation.
+   via SendMessage to `main` and apply only after user approval.
+4. Report via SendMessage to `main`: what changed in each file, what is
+   pending confirmation.
 
 An instruction that quotes a file, cites a line number, or says a fix
 "did not land" is a CLAIM about a tree that has been changing, and the

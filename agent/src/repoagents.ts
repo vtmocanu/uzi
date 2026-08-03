@@ -24,21 +24,47 @@
 //     separate follow-up PRD. Unrecognized-but-well-formed names are LEFT IN
 //     PLACE: an allowlist entry that matches no real tool is silently unavailable
 //     (the SDK resolver is case-sensitive + fail-closed — `foo` grants nothing),
-//     which is how uzi's own dev-team files, declaring Claude Code team tools
-//     (SendMessage, TaskUpdate, …), parse cleanly under a worker SDK that never
-//     provides them.
+//     which is how a dev-team file declaring a tool this SDK does not ship parses
+//     cleanly rather than failing.
+//     CORRECTED 2026-08-03 (issue #210): this passage used to name SendMessage
+//     and TaskUpdate as the worked example, "under a worker SDK that never
+//     provides them". THE EXAMPLE WAS WRONG — the worker SDK DOES provide
+//     SendMessage (26 tool_use entries across runs 71d83432 / 84b6a933 /
+//     c13cff61, 18 of them successful) and TaskList (3). The structural claim on
+//     the two lines above is untouched and still true; only the instance was
+//     wrong. The consequence is what matters here and it INVERTS: a repo agent
+//     declaring SendMessage is not granted an inert name, it is granted a WORKING
+//     tool that can message the run's main thread — and the assertion in
+//     test/repoagents.test.ts shows that state is reachable, not theoretical.
+//     Benign (main is the intended recipient anyway), but it is a real capability
+//     and this comment used to tell the reader it did not exist.
 //   - `model`: honored for any value passing the API's `ValidateModel` shape check
 //     (models.ts) — a full id like `claude-opus-4-8`, not only a short alias.
 //     Only a string that could never be a model id (control chars, whitespace,
 //     over-length) is ignored, and the agent inherits the run default.
 //
-// The Agent/deferral denial here is DEFENCE-IN-DEPTH (layer 1). The load-bearing
-// guarantee is structural and lives in the assembly path M3 routes repo agents
-// through: `agents.ts` sets `disallowedTools:[Agent]` on EVERY subagent (whether
-// or not it declared `tools`), and `sdk-executor.ts` disallows the deferral tools
-// globally — `disallowedTools` is applied first and wins over any declared
-// allowlist. So an agent that omits `tools:` (inherit-all) still cannot get
-// `Agent`. This parser strip only spares the SDK from ever seeing the denied name.
+// The Agent/deferral denial here is DEFENCE-IN-DEPTH (layer 1). The structural
+// layer lives in the assembly path M3 routes repo agents through: `agents.ts`
+// sets `disallowedTools:[Agent]` on EVERY subagent (whether or not it declared
+// `tools`), and `sdk-executor.ts` disallows the deferral tools globally.
+//
+// RETRACTION (#203). This comment used to continue "`disallowedTools` is applied
+// first and wins over any declared allowlist", and called that the real
+// guarantee. That precedence is UNPROVEN and unprovable from here, and the rest
+// of the repo says so in four other places (agents.ts, signals.ts twice,
+// test/ask-user.test.ts): `sdk.d.ts:44-50` documents both fields on
+// `AgentDefinition` with no ordering between them, the precedence sentence
+// (`sdk.d.ts:1391-1393`, "even if they would otherwise be allowed") is attached
+// to the top-level `Options.disallowedTools` — a different field — and resolution
+// happens inside the compiled `claude` binary, which is not in node_modules. No
+// test here can settle it; every executor test fakes the SDK.
+//
+// The CONCLUSION survives, on narrower ground. The case that matters is an agent
+// that omits `tools:` (inherit-all): there is no allowlist for the denial to lose
+// to, so `Agent` is denied regardless of precedence. Where a file DOES declare
+// `tools`, this parser strip is what removes the denied name — which is why it is
+// not merely sparing the SDK a lookup. Both layers are load-bearing; neither is
+// "the real one".
 //
 // A file that is over-cap, unparseable, or duplicate-named is skipped with a
 // run-message note. Detection NEVER fails a run.
@@ -60,8 +86,11 @@ import { isValidModel } from "./models.js";
  *  deferral tools, all of which are ALSO structurally denied for every subagent in
  *  the assembly path (agents.ts, sdk-executor.ts). WebFetch/WebSearch are
  *  deliberately absent — Bash egress makes denying them theatre (see the header).
- *  Stripping here is layer-1 defence-in-depth; the real guarantee is
- *  `disallowedTools` winning in M3. Compared on CANONICAL names (see canonicalTool). */
+ *  Stripping here is layer-1 defence-in-depth over the assembly path's structural
+ *  `disallowedTools`; that this strip is REDUNDANT rests on a `disallowedTools`-
+ *  over-`tools` precedence the SDK does not document, so neither layer is "the
+ *  real guarantee" (see the header's RETRACTION, #203). Compared on CANONICAL
+ *  names (see canonicalTool). */
 export const REPO_AGENT_DENIED_TOOLS: readonly string[] = [NESTED_AGENT_TOOL, ...ASYNC_DEFERRAL_TOOLS];
 
 /** The SDK canonicalizes a handful of tool aliases before it resolves them (e.g.

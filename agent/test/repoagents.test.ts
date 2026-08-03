@@ -215,8 +215,11 @@ describe("detectRepoAgents", () => {
     );
     const { agents, notes } = await detectRepoAgents(clone);
     // Only Agent + the deferral tools are stripped. WebFetch/WebSearch are HONORED
-    // (user decision: Bash egress makes denying them theatre). SendMessage is
-    // unknown to the worker SDK — kept, silently unavailable.
+    // (user decision: Bash egress makes denying them theatre). SendMessage is kept
+    // too — and, corrected 2026-08-03 (issue #210), it is NOT "silently unavailable"
+    // as this comment used to say: the worker SDK provides it, so a repo agent that
+    // declares it gets a working channel to the run's main thread. The assertion is
+    // unchanged; only the reason it survives was stated wrongly.
     assert.deepEqual(agents[0]!.tools, ["Read", "WebFetch", "WebSearch", "SendMessage"]);
     for (const denied of REPO_AGENT_DENIED_TOOLS) {
       assert.ok(!agents[0]!.tools!.includes(denied), `${denied} must never survive`);
