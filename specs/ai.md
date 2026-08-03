@@ -15839,8 +15839,10 @@ changing nothing.
 
 - **Why a build-tooling milestone is recorded here at all.** Almost every section in this file
   rests on a gate having actually executed, and four flags are the only thing that makes that
-  true: `-count=1` (both Go modules), `-race` (api), `-p 1` (store-it), `--test-timeout=30000`
-  (agent). Each is a separately measured fix **whose absence is invisible in the output** — the
+  true: `-count=1` (both Go modules), `-race` (api), `-p 1` (store-it), `--test-timeout=120000`
+  (agent — **raised from `30000` on 2026-08-03 in `48689619`; it was binding in CI and nowhere
+  else, see the `test:agent` bullet below**). Each is a separately measured fix **whose absence
+  is invisible in the output** — the
   suite still prints `ok`, still exits 0. Relocating them into a new file *is* the "a future
   simplify-the-gate edit" the `test:api` comment already named as the live threat. So the
   invariants below constrain any rebuild; **the target list does not and is deliberately not
@@ -15901,12 +15903,30 @@ changing nothing.
   contributor's lever.
 - **npm targets delegate to the existing `package.json` script and must keep doing so.** A target
   written `npm test` inherits whatever flags the script encodes; one that reimplements the command
-  drops them **silently**. The live instance is `test:agent`, where `--test-timeout=30000` lives in
+  drops them **silently**. The live instance is `test:agent`, where `--test-timeout=120000` lives in
   the script and node's own default is *no* timeout. *(Corrected 2026-08-02, hours after this
   section was written: a spelled-out `node --import tsx --test` does not reproduce a hang on node
   v26.4.0 — measured identical to `npm test`. The cap stays live regardless — a 3s test body under
-  `--test-timeout=1000` is cancelled — so delegating is insurance against a future slow test, not a
-  fix for a present hang.)*
+  `--test-timeout=1000` is cancelled.)*
+
+  *🔴 **AND THE CONCLUSION THAT PARENTHETICAL DREW IS NOW FALSE, WHICH MATTERS MORE THAN THE
+  DIGITS.** It closed "delegating is insurance against a **future** slow test, not a fix for a
+  **present** hang" — and on 2026-08-03 the cap bound for real, in CI, at the value this file
+  was quoting. `48689619` raised it `30000 → 120000` after `test:agent` went **fail, fail, pass
+  on three retries of ONE UNCHANGED COMMIT** (pipeline 20258, `duration_ms: 30003`,
+  `runner.test.ts`). The hang was present, not future; it was simply not present **here**.*
+
+  *The mechanism is the durable part and it generalises past this flag: **what
+  `--test-timeout` governs differs by node major**, so a per-test cap silently becomes a
+  per-FILE cap when isolation changes — which is why the local measurement that produced the
+  wrong conclusion ("every body in this suite finishes in under a second") was **true and
+  useless**. Local and CI were not measuring the same quantity. So the safe reading of any
+  timeout is **the tightest thing it might bind**, checked against whichever environment runs
+  the slowest node. Two consequences this file already knows in other clothes: the failure
+  reports as `cancelled` with `fail 0` and a SHRUNK TAP plan (`1..207` → `1..202`), which is
+  §464's own "absence is invisible in the output" arriving as a wrong VALUE rather than a
+  missing flag; and **the only control that settled it was re-running one unchanged commit**,
+  because a diff that cannot explain a failure invites inventing a mechanism.*
 - **CI must PROVIDE each tool, and anything fetched at job time is version- and sha256-pinned.**
   "Provide" means a digest-pinned image, a pinned `go run …@vX.Y.Z`, an npm devDependency, or a
   pinned `before_script` install — never devbox. **The checksum is a literal at its use site, not a
