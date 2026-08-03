@@ -260,3 +260,13 @@ Measured 2026-08-03, M5 MR-B. The lead ran `git add -f <brief> && git add <probe
 **The fix is a pathspec-limited commit** — `git commit -- <paths>` — or reading `git status` for foreign staged entries before committing. The second is the weaker form for the usual reason: it depends on remembering to look, at exactly the moment you are thinking about something else.
 
 Filed by the coder whose file was swept, unprompted, while reporting an unrelated fix.
+
+## 21. PREDICT THE COUNT BEFORE YOU RUN — it is the one control an output cannot satisfy by accident
+
+M5's tester hit the same 19-versus-20-character token trap **twice**. The second time, in a four-way partition run, two probes were silently never matched and the first read showed `leaks found: 4` with an **empty** NOT GATING section — one step from being reported as *"the non-gating bucket does not work"*.
+
+**The wrapper's output was entirely consistent with that wrong conclusion.** Every banner, every section, every exit code fit. What did not fit was a number the tester had **committed to in advance**: how many secrets it had planted.
+
+So the rule, which is sharper than "demand a positive observation" and cheaper than a second instrument: **before a run, write down the number you expect and why. Reconcile the tool's own count against it afterwards.** A predicted count is the one control an output cannot satisfy by coincidence, because it was fixed before the output existed — where any assertion *derived from* the output can be satisfied by a broken run that is internally consistent.
+
+Companion to item 17 (four non-controls, all failing toward "looks fine") and to the *uniform result across every cell is an instrument failure* rule: uniformity catches a dead harness, a predicted count catches a **live harness measuring the wrong thing**.
