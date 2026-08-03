@@ -17410,6 +17410,14 @@ constraint the team supplied.** Most JS diff libraries return **HTML strings** b
 comments saying not to. Structured hunks into React text nodes instead. Install with
 `--ignore-scripts`, per the repo-wide rule about what a plain npm install does to this host.
 
+> **This is a USER decision recorded in the AI file, deliberately, and it is not a misfiling to
+> correct.** A `human.md` bullet carrying it was drafted and **struck by the owner on 2026-08-03**,
+> who read it as an implementation choice rather than a durable product constraint — the same
+> filter §448-§454 applied to PRD #175. So `human.md` is silent on the library by decision, and
+> this paragraph is the only record of both the choice and the constraint it was made under. A
+> future rebuild may pick a different library; what it may **not** do is pick one that returns
+> HTML strings.
+
 **Criterion 7 is a PROPERTY — ZERO CALL SITES — and never a count**, which is why no number for
 those comments appears above. Every count in circulation during the milestone was correct in a
 unit nobody stated (files versus occurrences), and because the two were adjacent integers the
