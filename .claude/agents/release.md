@@ -20,7 +20,8 @@ second step too, then confirm the deploy is actually live (the app
 reconciled/synced, the new version's pods/instances healthy and serving)
 before reporting done.
 
-If any step fails, report the exact error to the team lead and stop;
+If any step fails, report the exact error via SendMessage to `main` and
+stop;
 do not attempt to diagnose or fix the failure yourself.
 
 Bound waits on external review/CI signals: the review gate is settled
@@ -35,7 +36,7 @@ Confirm with the lead before any irreversible action (push, tag, publish,
 merge) if the task description doesn't already grant explicit authorization.
 
 If the task is missing context (release version, summary line, target
-branch), report that via SendMessage rather than improvising.
+branch), report that via SendMessage to `main` rather than improvising.
 
 An instruction that quotes a file, cites a line number, or says a fix
 "did not land" is a CLAIM about a tree that has been changing, and the
