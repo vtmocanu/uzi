@@ -88,11 +88,24 @@ sentence beside it is.
 
 ## For this repo (uzi)
 
-Security-scan slot: `none (gap)`. Private GitLab repo; CI (`.gitlab-ci.yml`) runs
-validate/test/build across api/controller/web/agent but has NO secret scanner
-(gitleaks/trufflehog), no `govulncheck` and no `npm audit`. PRD #103 M5 adds them,
-so the absence is already recorded — treat this as a `noted` gap and audit by
-reading, not by reporting the gap again. Hot spots: secrets reach processes via
+Security-scan slot: **secrets are covered as of PRD #103 M5 MR-B; dependency
+vulnerabilities are not.** `task scan:secrets` (gitleaks) runs inside
+`gate:repo`, inside `task gate`, wrapped in `scripts/scan-secrets.sh` — which
+plants its own canary tokens and exits 2 if either goes undetected, so a
+disarmed or misconfigured scanner fails loud rather than reporting a false
+clean. **It is now the tester's slot, not yours**: it runs on every `task gate`
+the tester already runs, unlike the general case above where a scanner exists
+but nothing else invokes it. `govulncheck` and `npm audit` still do not exist
+(PRD #103's MR-C, not yet landed), so **Success Criterion 5 — which names
+gitleaks *and* `govulncheck` *and* `npm audit` in one sentence — is not yet
+met.** Treat the dependency-vulnerability half as a `noted` gap and audit by
+reading, not by re-reporting it; do not report the secrets half as a gap, it
+has a scanner now. One thing worth knowing before you read a gate log rather
+than a report: gitleaks does not honour `.gitignore`, so in an agent worktree
+it prints an untracked, non-gating NOTE for `.entire/…/full.jsonl` (the
+harness's own session transcript) — that is not a finding, see
+`docs/dev-conventions.md`. Private GitLab repo; CI (`.gitlab-ci.yml`) runs
+validate/test/build across api/controller/web/agent. Hot spots: secrets reach processes via
 env only (never argv/images/committed files); `api/internal/secretbox` seals forge PATs +
 per-user Anthropic tokens (AES-256-GCM keyed by `UZI_SECRET_KEY`, refuse-to-start on a
 placeholder key); every forge error passes a PAT-scrubbing redactor; outbound base URLs

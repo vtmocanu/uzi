@@ -1530,7 +1530,50 @@ dead code      task deadcode       # all four; or deadcode:{api,controller,web,a
                                    # measured, and it demonstrates the lint slot while
                                    # claiming to demonstrate this one.
 coverage       none (gap, noted 2026-08-02)
-security scan  none (gap, noted 2026-07-21)
+security scan  task scan:secrets   # gitleaks, inside gate:repo, inside `task gate`
+                                   # (PRD #103 M5 MR-B). THIS IS NOW THE TESTER'S
+                                   # SLOT, NOT THE AUDITOR'S -- it runs inside the
+                                   # gate the tester already runs on every change,
+                                   # so "none (gap, noted 2026-07-21)" (this line)
+                                   # went stale the moment the check entered
+                                   # `task gate`.
+                                   # 🔴 WRAPPED IN A CANARY, AND THE CANARY IS THE
+                                   # CONTROL. `scripts/scan-secrets.sh` plants two
+                                   # known tokens (scripts/gitleaks-canary.txt and
+                                   # api/internal/config/gitleaks_canary_test.go) and
+                                   # asserts BOTH are reported before trusting a
+                                   # clean run. `.gitleaks.toml` auto-discovers from
+                                   # the scan root, so a contributor can silently
+                                   # disarm the scanner in the same commit that adds
+                                   # a secret; a missing canary is what catches that.
+                                   # READ THE "canaries DETECTED" LINE, not just
+                                   # rc=0 -- a clean run that does not print it is
+                                   # unproven, not clean.
+                                   # GATING SCOPE IS THE INDEX, FILTERED FROM THE
+                                   # REPORT, NOT PASSED AS TARGETS: `gitleaks dir`
+                                   # silently widens to `.` on two or more targets,
+                                   # so the wrapper scans everything and filters the
+                                   # report against `git ls-files` afterward.
+                                   # TRACKED findings gate (exit 1). UNTRACKED or
+                                   # gitignored findings (gitleaks does not honour
+                                   # `.gitignore`) print under a "NOTE -- N
+                                   # finding(s) ... NOT GATING" banner, capped at 10,
+                                   # and exit 0 -- read that as neither a pass that
+                                   # found nothing nor as a finding. A secret in a
+                                   # git SUBMODULE is classified untracked (only the
+                                   # gitlink is indexed) and does not gate -- none
+                                   # exist here today (inspiration/ was unvendored
+                                   # 2026-08-03).
+                                   # NO SKIP BRANCH, unlike lint:shell/yaml/formula
+                                   # above: gitleaks arrives through the same
+                                   # mandatory Go toolchain gate:api already `go
+                                   # run`s two pinned modules through, so anyone who
+                                   # cannot obtain it cannot run gate:api either.
+                                   # 13 `//gitleaks:allow` directives cover fake
+                                   # secrets in test fixtures, each per-instance
+                                   # with a written reason -- never a
+                                   # `.gitleaks.toml [allowlist] paths` regex, which
+                                   # would silently exempt every file it matches.
 pre-commit     none (gap, noted 2026-08-02)
 long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
                ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
