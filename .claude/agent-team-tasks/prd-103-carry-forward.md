@@ -195,3 +195,41 @@ This is item 1's own camouflage recurring **one level down, inside the correctio
 **The cheap discriminator, which needs no second run:** a linter coming to rest on **exactly 50** once the fold is lifted is the cap binding, not a finding total. `50` is `--max-issues-per-linter`'s default, and a real count landing on a round default is the tell.
 
 **And the discipline that goes with it:** when a measurement comes from a probe config that differs from the shipped one, do not import its figures into a document about the shipped config. Carry the direction, the mechanism and the discriminator; leave the numbers where they were measured. A family of figures from a `goconst`+`govet`-enabled probe was already mislabelled once as "M3's linter set".
+
+---
+
+# ADDENDUM — 2026-08-03, from M5's MR-A. **M6 INHERITS THIS SECTION IN FULL.**
+
+## 16. THE SWEEP-DISCIPLINE FAMILY — four rules, all discovered the hard way in one milestone
+
+M5 spent four separate rounds re-learning that a text sweep is an instrument with two failure directions. Item 8 already carries the first rule; the other three are new, and together they are the checklist.
+
+**(a) Sweep for the CLAIM, not the wording** *(item 8, unchanged)*. A literal search for one phrasing misses a paraphrase of the same claim elsewhere.
+
+**(b) A CLAIM-sweep over-reaches exactly where a WORDING-sweep under-reaches.** Measured on the false *"web image context is trimmed to `web/` + `docs/`"* claim: the sweep found five hits, of which **two were live and three were lookalikes** — two a different claim entirely (which agent wrote where; which PRD's *scope* was web+docs), one **past tense about a past commit**, which this repo's convention explicitly preserves. A blanket search-and-replace destroys all three. The same judgement is needed in both directions, and neither direction is the safe default.
+
+**(c) THE CORRECTION IS ALWAYS A HIT.** A literal grep for a retired string still matches inside **the comment that quotes it in order to retire it**. Measured twice in one MR: `lint-shell.sh` carries the old exit-code gloss at two lines *after* the fix, both inside the correction block; `check-docs.mjs` carries the retired build-context wording for the same reason. Two agents independently concluded "the fix has not landed" from such a hit. **The discriminator is whether the hit sits inside an `echo`/assertion or inside a comment** — check that before concluding anything:
+
+```
+awk '/<start of the correction block>/,/<end>/' <file> | grep -E '^\s*echo'
+```
+
+**(d) WHEN YOU RESTATE A MEASURED CLAIM SOMEWHERE IT WILL BE READ FASTER, CHECK WHETHER YOU WIDENED IT.** The mirror of (a), and the one that produced M5's only *live* code defect. Three instances, all by the lead or someone paraphrasing the lead, never by the agent that took the original measurement:
+
+```
+bad --severity value        ->  bad usage                    (script header -> printed error message)
+whichever of these fits     ->  options in preference order  (PRD -> a brief's Hard constraint)
+a NEW devDependency         ->  any dependency change        (carry-forward -> a brief's Hard constraint)
+```
+
+Each time **the precise version survives at the original site and the widened one is what a reader hits first** — a printed error at the moment of diagnosis, a Hard constraint at the top of a brief. The third inverted a failure mode from loud-red to silent-green.
+
+## 17. FOUR NON-CONTROLS IN ONE ROUND, ALL FAILING TOWARD "LOOKS FINE"
+
+Self-reported by M5's coder, and none visible in a diff: a reporting expression that ate its own `$?`; a throwaway `PATH` directory that **gained eleven tools between creation and use**, flipping a negative arm into a positive one that returned "clean"; a control loop that killed its own probe under `set -e` and produced no output for a whole section; and a `gsed` mutation that failed on quoting, leaving an **unmutated** run reporting rc=0 *as a control*.
+
+**A broken control and a passing control are the same shape on the way past.** Only an assertion that the control *observed something specific* separates them. This is `CLAUDE.md`'s "a control that produces no output is not a control", and the useful addition is the frequency: four instances in one round, by a careful agent, in a milestone about gate liveness.
+
+## 18. AN AGENT ASKED TO EDIT ITS OWN OPERATING INSTRUCTIONS SHOULD REFUSE, EVEN WHEN THE EDIT IS RIGHT
+
+M5's coder declined to correct a stale claim in `.claude/agents/coder.md` and in `CLAUDE.md`, on the ground that it would not rewrite its own operating instructions because a teammate asked. **Both edits were genuinely correct** — and that is the point: correctness is not something the agent could establish from inside the request. Route such edits to a role that owns doc surfaces and holds no authority over the file's description of itself, or to the lead.
