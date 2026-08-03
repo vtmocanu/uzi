@@ -38,9 +38,12 @@ CPU and 3.7 of 8 GiB.
 
 Independently reproduced by the fact-check to within 2 seconds on every cell.
 **"Peak 4" is an OBSERVED MAXIMUM, not a budget** — #209 had **11** agent roles
-allocated and no configured subagent-concurrency cap exists anywhere in
-`agent/src/` or `api/internal/`. So the idle capacity during the 2175s solo M1 is
-larger than "three slots", and SC4 must not treat 4 as a ceiling.
+allocated, and a search of `agent/src/` and `api/internal/` found no configured
+subagent-concurrency cap. *(That is a failed search, not a proof of absence —
+this repo's own convention is that a failed grep is not evidence. Treat it as
+"no cap located", and if one matters to SC4, find it rather than infer it.)* So
+the idle capacity during the solo M1 is larger than "three slots", and SC4 must
+not treat 4 as a ceiling.
 
 **63% of #209's wall clock had one subagent or none.** Three structures produce
 it, all written down in `lead.md`.
@@ -78,7 +81,10 @@ though it were a measurement"), `:185`, and `:571`.*⟩
 ### 3. A contract unit runs solo while its dependents wait
 
 `lead.md:52` — "When in doubt … run them serially." #209's `M1 server: seeded
-plan contract` ran **2175s alone = 38% of the run**. #78's M1 ran 1322s alone.
+plan contract` ran **2175s alone** — 38% of the 5685s sampled. ⟨*The seconds are
+the number to carry: they need no denominator. The percentage moves, because the
+run was still going — at the 7347s it had reached when the fact-check sampled,
+the same interval is 29.6%.*⟩ #78's M1 ran 1322s alone.
 The dependents genuinely needed M1's contract; the serialization is not wrong,
 it is *coarser than the dependency*.
 
@@ -140,11 +146,26 @@ raised to 20000 because "under full-suite CPU contention, THREE unrelated tests
 each timed out once across ~20 runs", and which notes "A 1-in-10 red trains
 people to re-run instead of read, which is the actual damage".
 
-This PRD's own R3 measured overlap pushing gate commands from 16.3s to 43.1s and
-`npm test` from 34s to 68s on an unchanged tree — i.e. toward the very timeouts
-that were raised because of contention. **A gate that reddens intermittently is
-weaker verification**, because the documented human response is to re-run and the
-retry destroys the evidence.
+The measured cost, at the precision the evidence supports ⟨*corrected — the
+first draft of this section cited gate commands at "16.3s vs 43.1s" and `npm
+test` "from 34s to 68s on an unchanged tree". The tree was **not** unchanged
+(those three runs reported 1407, 1455 and 1522 tests, 70 minutes apart with
+coders editing between them), and the gate pair is **confounded**: a longer
+command is mechanically more likely to intersect another interval, and the
+"alone" set is dominated by ~108 short commands. PRD #216 carried this
+correction and #215 did not — a merge gap, and it mattered here because these
+figures are load-bearing for a **blocking** scoping decision.*⟩:
+
+- Gate commands: **16.3s alone vs 43.1s overlapping** (47.6s vs 12.2s on an
+  independent classification). Direction only, for the confound above.
+- `npm test` at a **constant suite tally**, which is the clean comparison:
+  **36.1 / 43.7 / 43.9 / 52.6 / 73.3 / 79.8 s** at `tests=1474` (2.2x), and
+  **33.8 / 34.2 / 34.4 / 43.4 / 50.4 / 69.4 / 78.1 / 89.6 s** at `tests=1541`
+  (2.65x).
+
+Both push toward the very timeouts that were raised because of contention.
+**A gate that reddens intermittently is weaker verification**, because the
+documented human response is to re-run and the retry destroys the evidence.
 
 So the gate keeps its blocking authority *and* the cost is real. M4 overlaps it
 with the **read-only wave only** (D3), and M7 reports red-then-green-on-retry
@@ -220,7 +241,9 @@ differ.
 row (builtin or admin-edited) is **never overwritten**"
 (`agent_templates_builtins.go:29-33`, `ON CONFLICT DO NOTHING` at `:66-85`), and
 templates reach the worker from DB rows at claim time
-(`workersvc/claim.go:249-270`). **So shipping an edited `lead.md` changes nothing
+(`workersvc/claim.go:249-270`'s `agentsFromTemplates`, fed by
+**`service.go:1363`'s `ListClaimAgentTemplates`** — cite both, since the DB query
+is the half that makes the argument airtight independently of the reconcile). **So shipping an edited `lead.md` changes nothing
 on any existing deployment.** The reset route exists
 (`handler/agent_templates.go:396`, wired at `handler.go:735`, reachable from
 `web/src/pages/AgentDetail.tsx:58`) and `is_builtin` is immutable on update
@@ -263,10 +286,15 @@ M4 and M5 each need a mechanism first.
       `TestLeadParallelDispatchPhrases` (`:151`, 14 whole-body pins) and
       `TestLeadPlanCritiquePhrases` (`:458`, 8 region-scoped pins behind a
       three-clause guard, `splitLeadRegions` `:322`). `leadBulletLandmark`
-      (`:231`, "Do not name a fixed reviewer-then-auditor pair") sits **inside**
-      the bullet M2 rewrites — move or reword it and all eight region assertions
-      fatal at guard 3, and `render_test.go:484-490` records that pin as
-      load-bearing for the split itself. So this milestone re-derives the guard's
+      (`:231`, "Do not name a fixed reviewer-then-auditor pair") sits at
+      `lead.md:34`, **inside** the bullet M2 rewrites — move or reword it and all
+      eight region assertions fatal at guard 3 (`:336-356`) before any of them
+      runs, and `render_test.go:484-490` records that pin as load-bearing for the
+      split itself. **M1 therefore replaces TWO COUPLED THINGS at once**: if M2
+      *deletes* rather than rewords that sentence there is no constant to update,
+      so `leadBulletLandmark` must be re-derived from whatever prose sits at the
+      new bullet's edge — and the bullet-region pin at `:492` is itself a string
+      M2 retires. `:488-490` states what happens if only one is replaced. So this milestone re-derives the guard's
       fold measurements and applies `CLAUDE.md`'s retire-a-string sweep (grep the
       old strings across the test tree; check each negative assertion for a
       pairing).
@@ -297,8 +325,11 @@ M4 and M5 each need a mechanism first.
       running factory, covering all four gaps in D10: the destructive-reset
       caveat written down, a **drift query** ("which rows are behind the shipped
       builtin?"), a CLI path or a stated reason there is none, and the same
-      treatment for builtin **skills**. Includes reading the live `lead` row back
-      and seeing the new body. **Hard prerequisite for M7** — without it the PRD
+      treatment for builtin **skills** — note the drift query needs **two**
+      implementations, because `skills_builtins.go:94-97` records a deliberate
+      divergence: builtin-ness there is the `scope` value keyed on
+      `(name, scope='builtin')`, not an `is_builtin` flag. Includes reading the
+      live `lead` row back and seeing the new body. **Hard prerequisite for M7** — without it the PRD
       lands as a no-op that looks shipped.
 - [ ] **M7 — Measured validation.** Re-run M0 over post-M6 runs. Report: wall
       clock, avg concurrency, **gate invocation count and total gate wall time**

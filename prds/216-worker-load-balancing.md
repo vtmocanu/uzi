@@ -268,25 +268,33 @@ fix-the-doc at `:554` to present- vs past-tense claims). `ListAllWorkers`
       discriminate (docker worker × allowlisted repo, × non-allowlisted repo, ×
       repo-less judge run, non-docker × non-allowlisted); **(c) concurrency** —
       N workers claiming M runs simultaneously, no run unclaimed, none twice.
-      Via `./e2e/run-store-it.sh`, which picks a random port and a PID-unique
-      container (so concurrent sweeps do not collide) and **already hardcodes
-      `-p 1`** at `e2e/run-store-it.sh:72` — it is not an argument to pass.
+      Via `./e2e/run-store-it.sh`, which picks a random port (`:24`) and a
+      PID-unique container (`:23`) and **already hardcodes `-p 1`** at `:72` — it
+      is not an argument to pass. Collision freedom there is *probabilistic*, not
+      guaranteed: the port is drawn from a 20000-wide range with no bind-retry.
       **Note (b) cannot be exercised on the current fleet**: both workers are
       `docker: true` and `DockerRepoAllowlist` (`service.go:817`) takes no worker
       or user argument — it is one global settings read — so per-run eligibility
       only diverges on a mixed docker/non-docker fleet. The matrix must be
       synthetic, or it will "confirm" D5 against a fleet that cannot exhibit it.
-- [ ] **M3 — Worker-side confirmation.** Expected answer is **no change needed**:
-      a deferral returns 204 and `worker.ts:176` already sleeps a poll on a
-      non-claim. Stated as an expected finding so the milestone is falsifiable.
+- [ ] **M3 — Worker-side confirmation.** Answer is **no change needed**, and it
+      is confirmed end-to-end rather than expected: `service.go:833` returns
+      `nil, nil` on `ErrNoRows`, `handler/worker_protocol.go:335-337` turns that
+      into **204**, `agent/src/client.ts:112` maps 204 to `null`, and
+      `worker.ts:176` sleeps a poll on a null claim. Kept as a milestone so the
+      chain is re-checked against the shipped predicate, not re-derived.
 - [ ] **M4 — Make a deferral distinguishable from an idle queue.** Today it is
       not: `Service.Claim` turns `pgx.ErrNoRows` into `nil, nil` → 204
       (`service.go:833-838`), so the worker, the API log and the operator all
       see "empty queue". Worse, the health detector then **mis-labels** it —
       a past-threshold queued run is flagged `waiting_worker`, "waiting for a
       worker to pick up this run" (`workersvc/health.go:48,63-64,203-210`),
-      which is actively wrong when a worker asked and the server refused. Needs
-      a mechanism, not a log line: either a diagnostic query on the `ErrNoRows`
+      which is actively wrong when a worker asked and the server refused. **The
+      mis-label is GUARANTEED, not merely possible**: `queuedReason`
+      (`health.go:432-445`) returns `reasonNoWorker` only when
+      `CountOnlineWorkersForUser == 0`, and in a deferral the peer is by
+      definition online, so it returns `reasonWaitingWorker` every time. Needs a
+      mechanism, not a log line: either a diagnostic query on the `ErrNoRows`
       path when the user has queued runs, or a reason column returned by the
       claim statement. Both change the claim path's query count, so the choice
       is a Decision-Log addition.
@@ -348,17 +356,40 @@ fix-the-doc at `:554` to present- vs past-tense claims). `ListAllWorkers`
   integer cross-multiplication (`peer.active * mine.cap < mine.active * peer.cap`)
   — exact, no float ties, no division. `00055` has no CHECK, so do not rely on
   the handler's clamp from SQL.
-- **R4 — Deferring to a peer with a broken credential converts imbalance into a
-  DEAD RUN.** A peer pinned to a deleted or undecryptable Anthropic credential
-  does not merely fail to claim; it claims and fails the run terminally
-  (`errCredentialUnavailable` → `MarkRunFailedByID`, `service.go:857-866`). This
-  is the one eligibility dimension where deferring wrongly is worse than not
-  spreading. Treat it as part of D5's predicate.
-- **R5 — Double deferral windows on requeue.** `RequeueRunsOfStaleWorkers` keeps
-  `worker_id` and bumps `updated_at`, restarting the affinity grace
-  (`WORKER_AFFINITY_GRACE`, 2m). A requeued run can then serve an affinity hold
-  *and* a spread deferral back to back. D4's time bound is what keeps the total
-  finite.
+- **R4 — A terminally-failing peer is a SINK, not a window. ⟨narrowed and
+  sharpened⟩** The mechanism is confirmed: `ClaimRun` succeeds, `assembleClaim`
+  (`service.go:838`) then fails, and `recoverClaimAssembly` maps
+  `errCredentialUnavailable` (and `errToolPackagesRejected`) to
+  `MarkRunFailedByID` — `service.go:852-853` calls it **terminal** in its own
+  words. So a peer claims and kills rather than declining.
+
+  **Narrower than the first draft said**, on three counts none of which it read:
+  credential resolution is **per-claim, not per-worker** (`service.go:1310-1312`);
+  PRD #104 D14 already installs a **fallback retry** for exactly this hazard on
+  the auto path (`service.go:1317-1349`, scoped to `choice.autoPicked()` at
+  `:1342`, so a **pinned** binding still fails terminally); and **no worker in
+  the current fleet can exhibit it** — both report `anthropic_secret_id: null`
+  and `anthropic_bind_mode: "auto"`, and the auto path resolves the *user's*
+  default, identical for every worker, so a broken credential breaks the fleet
+  equally and spreading cannot make it worse. It therefore has the same status as
+  D5's docker case: a real design constraint that is **not currently
+  observable**, and M2's fixtures must be synthetic to reach it.
+
+  **And worse than the first draft said, in the way that matters here**: a worker
+  whose every claim dies terminally **never accumulates `active_runs`**, so it
+  permanently reads as the emptiest peer in the fleet and permanently wins the
+  deferral. The predicate would *systematically select the broken worker*. That
+  is a sink, not a race window, and D4's `@spread_cutoff` bounds each run's
+  exposure without fixing the selection. Treat it as part of D5's predicate.
+- **R5 — Double deferral windows on requeue, bounded tighter than D4.**
+  `RequeueRunsOfStaleWorkers` (`runtime.sql:1151-1164`) keeps `worker_id`
+  (`:1153`, "worker_id kept for affinity") and bumps `updated_at` (`:1158`),
+  restarting the affinity grace (`WORKER_AFFINITY_GRACE`, 2m, `config.go:670`).
+  A requeued run can then serve an affinity hold *and* a spread deferral back to
+  back. **The tighter bound is the requeue counter, not D4**: the same statement
+  increments `requeue_count` (`:1154`) gated by `@max_requeues` (`:1160`), fed by
+  `RUN_MAX_REQUEUES` **default 1** (`config.go:666`), so this path fires at most
+  once per run by default.
 - **R6 — Roll/upgrade state is not an eligibility input.** A worker mid-roll
   heartbeats until its pod goes, so D6 does not exclude it. Accepted as a
   non-goal (self-corrects on the next poll) rather than omitted silently. The
