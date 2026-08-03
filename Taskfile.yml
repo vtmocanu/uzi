@@ -469,7 +469,10 @@ tasks:
       # DSL passes; and `publish_brew` seds the `tag:` line before pushing to the
       # tap, so this validates the pre-sed source rather than the shipped artifact.
       # Both limits are argued in the script's header. What makes it worth gating is
-      # that `publish_brew` sits in *publish_needs and copies this file VERBATIM
+      # that `publish_brew` CARRIES `needs: *publish_needs` -- it is a CONSUMER of
+      # that list, not an element of it, and this line said "sits in" until the
+      # fact-check caught it; the repo uses that phrasing for genuine members
+      # elsewhere, so the distinction is live -- and copies this file VERBATIM
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
 

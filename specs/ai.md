@@ -1257,16 +1257,21 @@ the only gate).
   (`.git` present), so the containerized build stays green. Repo-root targets
   (`../ARCHITECTURE.md`, `../plan.md`) are therefore unvalidated in the image by
   design — the viewer rewrites them to GitLab anyway.
-  *(Corrected 2026-08-03, PRD #103 M5. This read "the web image context is trimmed
-  to `web/` + `docs/`, so repo-root targets are absent there", which is FALSE:
-  `.dockerignore` excludes a NAMED LIST — `.git`, `.gitignore`, `.gitmodules`,
-  `.env*`, `inspiration/`, `api/`, `agent/`, `e2e/`, `web/node_modules`,
-  `web/dist` — so the context is the repo root MINUS that list and still contains
-  `prds/`, `adr/`, `specs/`, `controller/`, `deploy/` and `Formula/`. What keeps
-  the image build green is `.git` being excluded, which makes `fullCheckout` false
-  so the whole outside-`docs/` block never runs there. The conclusion was right and
-  the stated mechanism was not — and the mechanism is the half a reader reasons
-  from when deciding whether adding a directory to `extraLinkFiles` is safe.)*
+  The mechanism is `web/Dockerfile`'s **COPY set**: `WORKDIR /app/web`,
+  `COPY web/ ./`, `COPY docs/ /app/docs/`, so `/app` holds exactly `web/` and
+  `docs/` while the checker resolves its repo root to `/app`. `/app/.git` therefore
+  cannot exist and `fullCheckout` is false; `/app/prds` and `/app/adr` do not exist
+  either. `.dockerignore` trims the build **context** (and keeps
+  `web/node_modules`/`web/dist` out of `COPY web/ ./`), but it is not what makes
+  this true — delete its `.git` line and the image build is still green.
+  *(Corrected twice on 2026-08-03, PRD #103 M5. This first read "the web image
+  context is trimmed to `web/` + `docs/`" — the wrong noun, since the CONTEXT is
+  the repo root minus a named list and still contains `prds/`, `adr/` and `specs/`.
+  The first correction fixed the noun and attributed the effect to `.dockerignore`
+  excluding `.git`, which is also wrong: it is redundant for this purpose. Both
+  versions reached the right conclusion from a mechanism that does not carry it,
+  and the mechanism is the half a reader reasons from when deciding whether adding
+  a directory to `extraLinkFiles` is safe.)*
 
 ## 59. Screenshots: placeholders now, real captures as one final commit
 

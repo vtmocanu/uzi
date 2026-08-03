@@ -163,7 +163,15 @@ fi
 # returns 1 when it eats every line, which is indistinguishable from "no matches",
 # and this host's grep is ugrep (negated classes misbehave in POSIX modes). Letting
 # git do the filtering removes the instrument entirely.
-FILES="$(git ls-files -- '*.yml' '*.yaml' ':(exclude)deploy/chart/templates/*')" || exit 2
+# 🔴 `.yamllint` IS NAMED EXPLICITLY BECAUSE IT HAS NO EXTENSION. The config that
+# governs this gate is a tracked YAML file, and the two globs miss it -- so the
+# gated set excluded the one file whose validity the gate depends on. That breaks a
+# symmetry this milestone is otherwise emphatic about: `lint-shell.sh`'s header
+# says "this file is in scope", and self-linting is the whole argument for
+# committed scripts over inline recipes. Not a hole (a malformed config makes
+# yamllint exit 255, which the wrapper maps to instrument-broken) but a gap, and it
+# is one line to close.
+FILES="$(git ls-files -- '*.yml' '*.yaml' '.yamllint' ':(exclude)deploy/chart/templates/*')" || exit 2
 
 if [ -z "$FILES" ]; then
   echo "lint-yaml: the tracked-YAML pathspec matched nothing under $ROOT." >&2

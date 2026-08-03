@@ -58,6 +58,16 @@
 # whose command substitution fails can be made to exit) rather than copied for its
 # first.
 #
+# THE NON-EMPTY ASSERTION HERE IS DEFENCE IN DEPTH, NOT THE THING HOLDING THE LINE
+# -- and lint-yaml.sh's identically-shaped guard IS load-bearing, so do not read
+# across. Measured by deleting each (parse-checked first): without its guard THIS
+# script still exits 2, because shellcheck's rc 3 for "no files" falls through to
+# the catch-all arm below. Without its guard `lint-yaml.sh` exits 1 -- "there are
+# findings" -- over a usage error, because yamllint's usage status is 2 and
+# `--strict` also spends 2 on warnings-only. Same idiom, two different loads.
+# The bare `| xargs` one-liner above remains fail-open regardless; that is what
+# both guards exist for.
+#
 # 🔴 TOOL ABSENT IS A SKIP; TOOL PRESENT AT THE WRONG VERSION IS A HARD FAIL. The
 # distinction is the whole design and the two halves answer different questions.
 # The version pin above is about someone who HAS shellcheck and would get a
@@ -369,7 +379,17 @@ case "$rc" in
     ;;
   *)
     echo "lint-shell: shellcheck exited $rc, which is neither 0 (clean) nor 1 (findings)." >&2
-    echo "  2 = a file could not be read, 3 = no files were given, 4 = bad usage." >&2
+    # 🔴 THIS GLOSS IS THE ONE A READER SEES AT DIAGNOSIS TIME, SO IT MUST NOT BE A
+    # PARAPHRASE OF THE HEADER'S. It used to read "3 = no files were given, 4 = bad
+    # usage", which widened both halves: 3 is ALSO every unrecognised flag -- so the
+    # commonest bad usage, a typo'd flag, returned 3 and this line sent the reader
+    # to "no files were given", the one failure the non-empty assertion above
+    # guarantees cannot happen. And 4 is not bad usage generally; it is an invalid
+    # VALUE for a RECOGNISED option. Re-derived at 0.11.0: unrecognised long flag 3,
+    # unrecognised short flag 3, bad --severity value 4, nonexistent file 2,
+    # no files 3.
+    echo "  2 = a file could not be read; 3 = no files given OR an unrecognised flag;" >&2
+    echo "  4 = a recognised flag given an invalid value." >&2
     echo "  This is an INSTRUMENT failure over $# paths, not a lint result." >&2
     exit 2
     ;;

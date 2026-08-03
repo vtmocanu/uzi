@@ -67,27 +67,36 @@ function extractTargets(md) {
 
 const isExternal = (t) => /^[a-z][a-z0-9+.-]*:/i.test(t) || t.startsWith("//");
 
-// WHAT MAKES THE CONTAINERIZED BUILD SAFE IS `.git` BEING ABSENT, NOT A TRIMMED
-// CONTEXT. This comment said (here and again above extraLinkFiles below) that
-// "the web image build context is trimmed to web/ + docs/". Measured 2026-08-03
-// (PRD #103 M5) against the root .dockerignore, whose entire non-comment content
-// is `.git .gitignore .gitmodules .env .env.* **/.env **/.env.* inspiration/
-// api/ agent/ e2e/ web/node_modules web/dist`: the context is the repo root MINUS
-// that named list, so it still CONTAINS prds/, adr/, specs/, controller/,
-// deploy/, Formula/, fixtures/, .claude/, CLAUDE.md and ARCHITECTURE.md.
+// 🔴 WHAT MAKES THE CONTAINERIZED BUILD SAFE IS THE Dockerfile's COPY SET. Not a
+// trimmed build context, and not `.dockerignore`. Three protections exist and only
+// the first is a cause; the other two are its consequences:
 //
-// The conclusion below is unchanged and the mechanism is not. `.git` is excluded,
-// so `fullCheckout` is false in the image build and the whole outside-docs block
-// is skipped there regardless of what else the context carries. A reader
-// reasoning from the trimmed-context version would conclude that the existsSync
-// guards are what keep the image build green and that adding a directory to
-// extraLinkFiles could break it. Neither is true: the guards only make each entry
-// optional, and nothing under `if (fullCheckout)` runs in the image at all.
+//   (a) web/Dockerfile does `WORKDIR /app/web`, `COPY web/ ./` and
+//       `COPY docs/ /app/docs/`, so /app contains EXACTLY web/ and docs/. This
+//       file resolves repoRoot as `<scriptDir>/../..` = /app.
+//   (b) therefore /app/.git cannot exist, so `fullCheckout` is false and the whole
+//       outside-docs block below never runs there;
+//   (c) therefore /app/prds and /app/adr do not exist either, so the extraLinkFiles
+//       loop's existsSync guards find nothing to add.
 //
-// Links resolving INSIDE docs/ (doc->doc, doc->img) are always in context and
-// always checked; targets OUTSIDE docs/ are only checked in a full checkout.
-// Repo-root link targets (../ARCHITECTURE.md, ../plan.md) are absent from the
-// viewer's view by design either way — the viewer rewrites them to GitLab.
+// Nothing COPYs `.git`, `prds/` or `adr/` into /app, so (b) and (c) hold WHATEVER
+// `.dockerignore` says — delete its `.git` line and `fullCheckout` is still false.
+// `.dockerignore`'s real job here is the BUILD CONTEXT: it keeps the upload small
+// and, load-bearing for `COPY web/ ./` specifically, keeps `web/node_modules` and
+// `web/dist` out of the image.
+//
+// (Corrected twice, 2026-08-03, PRD #103 M5, and the second correction is the
+// instructive one. This comment first said "the web image build context is trimmed
+// to web/ + docs/ (see the root .dockerignore + Dockerfile)" — WRONG NOUN, RIGHT
+// CITATIONS. The first fix corrected the noun and dropped the Dockerfile half,
+// which was the true half, leaving a single causal claim resting on the one input
+// that does not carry the weight. Both were mechanism errors in a comment about a
+// mechanism error.)
+//
+// Links resolving INSIDE docs/ (doc->doc, doc->img) are always present and always
+// checked; targets OUTSIDE docs/ are only checked in a full checkout. Repo-root
+// link targets (../ARCHITECTURE.md, ../plan.md) are absent from the viewer's view
+// by design either way — the viewer rewrites them to GitLab.
 const fullCheckout = existsSync(path.join(repoRoot, ".git"));
 
 const files = readdirSync(docsDir)
@@ -170,9 +179,9 @@ for (const file of files) {
 // ARCHITECTURE.md alone. These files carry no frontmatter and no `order`, so
 // only the link check applies to them.
 //
-// Gated on fullCheckout for the same reason as the doc->outside case above —
-// read that comment for the mechanism, which is `.git` being absent from the
-// image build context rather than the context being trimmed to web/ + docs/.
+// Gated on fullCheckout for the same reason as the doc->outside case above — read
+// that comment for the mechanism, which is the Dockerfile's COPY set (/app holds
+// only web/ and docs/), NOT `.dockerignore` and NOT a trimmed context.
 //
 // prds/ and adr/ joined specs/ here in PRD #103 M5. They are the two remaining
 // heavy PRD-linking populations. adr/ is small but concentrated: an ADR's number

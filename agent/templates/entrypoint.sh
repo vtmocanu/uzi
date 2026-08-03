@@ -208,8 +208,11 @@ for d in runner agent-home provision; do
   # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
   # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
   # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
-  # digest-pinned node:22-alpine with an exec-form ENTRYPOINT (render.go sets no
-  # `command:`, so k8s uses the same interpreter). There /bin/sh is busybox ash
+  # digest-pinned node:22-alpine with an exec-form ENTRYPOINT
+  # (controller/internal/kube/render.go sets no `Command:` ON THE WORKER CONTAINER,
+  # so k8s uses the image's own ENTRYPOINT. That file has five `Command:` fields on
+  # OTHER containers, so the unqualified version of this sentence invited a reader
+  # to grep, find them, and doubt the paragraph). There /bin/sh is busybox ash
   # 1.37.0, which implements `-O` with correct semantics -- measured 2026-08-03,
   # with a control proving the probe could have detected an unsupported operator
   # (`[ -Q dir ]` -> rc=2 "unknown operand").

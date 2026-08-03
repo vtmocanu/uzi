@@ -1025,12 +1025,25 @@ which previously prescribed only the fail-open form.
       Same rule for every tool a later milestone adds: **the CI job must
       provide it — never devbox.** "Provide" means whichever of these fits:
       baked into a digest-pinned image (the lint jobs can use the official
-      `golangci/golangci-lint`, `koalaman/shellcheck-alpine` and `gitleaks`
-      images rather than installing into `golang:1.26`), fetched at job time
+      `golangci/golangci-lint` or `gitleaks` images rather than installing into
+      `golang:1.26`), fetched at job time
       via a pinned `go run …@vX.Y.Z` (the `sqlc@v1.30.0` precedent in
       `validate:api`, and how M4 will invoke `deadcode`), installed as an npm
       devDependency by the existing `npm ci` (knip, oxlint), or a
       `before_script` install.
+
+      *(`koalaman/shellcheck-alpine` was struck from that list on 2026-08-03
+      during M5, on measured grounds: it ships no `git`, and `lint:shell`'s scope
+      IS `git ls-files`, so the job could not enumerate its own inputs; and every
+      distro-packaged shellcheck is 0.10.0, which does not emit SC3067 at all and
+      is therefore a different gate rather than the same one. M5 ships a pinned
+      tarball into `golang:1.26` instead. Struck here so the PRD stops offering a
+      route its own milestone ruled out. Note also that this list is explicitly
+      "whichever of these fits" and is NOT a ranking — the preference order lives
+      in the PRD #103 carry-forward, item 6, with the measured reason: the official
+      `golangci/golangci-lint` image ships Go 1.26.2 with `GOTOOLCHAIN=auto`
+      against both modules' `go 1.26.4`, so it would be the pipeline's first
+      unpinned effective toolchain.)*
 
       **Anything fetched in a `before_script` must be version- and
       sha256-pinned**, matching what `e2e:kind-smoke` already does for
@@ -1793,14 +1806,16 @@ which previously prescribed only the fail-open form.
       `CLAUDE.md` and `specs/*.md` via the `extraLinkFiles` list. The
       gap is `prds/` and `adr/` as link *sources*. Adding them to that list is a
       small change; a parallel checker would have different semantics and would
-      have to rediscover why the existing one is gated on `fullCheckout` (the
-      web image build context excludes `.git`, so `fullCheckout` is false there).
-      *(Corrected 2026-08-03 during M5: this parenthetical read "the web image
-      build context is trimmed to `web/` + `docs/`", which `.dockerignore`
-      disproves — it excludes a named list, so the context is the repo root minus
-      that list and still carries `prds/`, `adr/` and `specs/`. Same wrong
-      mechanism M5 corrected at both of its sites in `check-docs.mjs`; the
-      conclusion is unchanged.)*
+      have to rediscover why the existing one is gated on `fullCheckout`
+      (`web/Dockerfile` COPYs only `web/` and `docs/` into `/app`, which is what
+      the checker resolves as its repo root, so `/app/.git` cannot exist).
+      *(Corrected twice on 2026-08-03 during M5. It first read "the web image
+      build context is trimmed to `web/` + `docs/`" — wrong noun: `.dockerignore`
+      excludes a named list, so the CONTEXT is the repo root minus that list and
+      still carries `prds/`, `adr/` and `specs/`. The first correction then
+      attributed it to `.dockerignore` excluding `.git`, which is redundant here —
+      nothing COPYs `.git` into `/app` regardless. The COPY set is the cause; the
+      conclusion was never in doubt.)*
 
       **Calibration**: add an unquoted `$var` in a scoped script and confirm
       shellcheck fires; add a broken relative link in a `prds/` file and confirm
