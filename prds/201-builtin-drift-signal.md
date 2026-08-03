@@ -217,9 +217,18 @@ a route (architect), shipped fields on the detail response only (auditor), and a
 `builtin` object on the DTO (reviewer). The route wins on two grounds the others each fail
 one of: it matches the existing `/{id}/rendered` sub-resource precedent, and it keeps the
 ~44 KB shipped corpus out of the LIST response, which the DTO-field form would carry on
-every row. *(The lead also argued the nested form goes stale after a save; the reviewer's
-NB4 shows update/reset responses would refresh it, so that argument is weaker than stated and
-is not what decided this.)*
+every row.
+
+*Staleness, scored per variant, because "refuted" does NOT cover all three and a later
+revisit would misread it that way.* The objection is that the shipped copy goes stale after a
+save unless the client refetches. It is **refuted for the reviewer's nested-DTO form**:
+`templateDTO` is shared by update (`:367`) and reset (`:438`), so a nested field refreshes
+itself — the reviewer's NB4, resting on the architect's own five-call-site enumeration. It
+**stands for the auditor's detail-response-only form**, where the shipped body rides outside
+the DTO and is therefore absent from every write response. The lead relayed this objection as
+the architect's and against nesting; it was the architect's against the detail-only variant,
+and the lead's own against nesting. **The decision is unaffected either way** — the route
+wins on payload and precedent.
 
 **§2 — jsdiff, rendered as React elements. Owner decision.** `web/package.json` carries no
 diff library. **The auditor's constraint is binding: most JS diff libraries return HTML
