@@ -662,7 +662,11 @@ The split:
 - **The block keeps a one-line "why" for each load-bearing flag**, even though
   teammates no longer type them: `-count=1` (both Go modules, cross-module
   fixtures), `-race` (api, PRD #108 M4), `-p 1` (store-it),
-  `--test-timeout=30000` (agent). They must still recognise one going missing.
+  `--test-timeout=120000` (agent). They must still recognise one going missing.
+  *(The agent cap read `30000` through M1-M4 and was raised on `main` in
+  `48689619`, "it was binding in CI and nowhere else". Recorded because this
+  list is what a teammate checks a gate's echo against: a stale value here
+  makes the correct output look wrong.)*
 - **Every non-command slot stays verbatim**: the `none (gap)` lines and their
   `noted` markers, the do-not-record-a-gofmt-count warning, the e2e timing
   samples. The Taskfile has no home for any of it.
@@ -980,7 +984,13 @@ which previously prescribed only the fail-open form.
       | `test:api` | `-race` | PRD #108 M4; see the comment block above the `test:api` job |
       | `test:controller` | `-count=1` | cross-module goldens under `api/internal/hostedsvc/testdata/` |
       | store-it | `-p 1` | package binaries race one shared database |
-      | `test:agent` | `--test-timeout=30000` | node's default is *no* timeout; `agent/test/judge-runner.test.ts:167` is written against the cap |
+      | `test:agent` | `--test-timeout=120000` | node's default is *no* timeout; `agent/test/judge-runner.test.ts:167` is written against the cap |
+
+      *(M1 shipped this as `30000`; `main` raised it to `120000` in `48689619`
+      after it turned out to be **binding in CI and nowhere else** — the value in
+      this table is the one the target must carry, not a record of M1's, so it
+      tracks. This branch hit the old cap twice while merging, on `runner.test.ts`
+      in pipelines 20266 and 20260, which is the same finding from the outside.)*
 
       **`test:api` must carry `-race` AND `-count=1` or M1 silently weakens the
       api gate** while its own text claims it adds no new checks. This is the
