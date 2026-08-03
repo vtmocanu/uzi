@@ -926,3 +926,106 @@ code** — the same wrong model, reached independently by two agents.
 - **Its first mutation run printed no test output at all** — `grep -c` returned 0, exited
   1, and short-circuited the `&&` chain before `go test` ran. *"Empty output read as a
   clean run for about ten seconds."* A control that produces no output is not a control.
+
+---
+
+## 14. AMENDMENT 9 — audit round. NO BLOCKING FINDINGS at `f2f778d6`.
+
+Every round-1 finding (H1-H5) closed, each **verified by execution rather than by reading**,
+in pristine `git archive` extracts. Harness: CLI built with
+`-ldflags "-X main.version=v0.11.8"` — an unstamped build short-circuits and never probes —
+driven at a hostile `/api/version`, every run carrying a `curl` positive control.
+
+### The sharpest single piece of evidence on this branch
+
+**The cache file on disk contains `"version":"0.14.0\r"` — the raw control character,
+unsanitized.** That is the *positive proof* H4(c) is satisfied: a write-time stripper would
+have removed it there and did not. Then, with the hostile server **shut down** (`pgrep`
+control confirming it), the cache-read path prints 213 bytes, valid UTF-8, no control
+bytes. **Raw `\r` on disk, clean bytes on the terminal, on a run that touched no network.**
+
+Same measurement answers the `RecordServerVersion` 256-rune question: it is a storage bound
+and is **not** being leaned on as a sanitizer — if it were, the `\r` could not be in the file.
+
+Other closures worth recording: H1 — nine payloads at both sinks, **not one control byte or
+bidi codepoint** at either, on any payload. H2 — the 1 MiB string yields **255 bytes** of
+stdout, longest line 219 (round 1: 1048628 / 1048596). H4(b) — `grep -c hunter2` and
+`grep -c 127.0.0.1` on the cache both **0**, before and after 6c added `cli_version`.
+
+### 🔴 THE MOVING TREE CORRUPTED A RESULT, AND IT WAS NEARLY REPORTED
+
+The auditor built a binary from the **shared worktree** after `git status` showed clean but
+after the coder had begun editing. It measured `uzi auth status` → **0 probes** and was
+about to record "correctly exempt". **It is not exempt at `ea71a367`** — it had unknowingly
+built the coder's uncommitted fix. Static reading said *not exempt*, the binary said
+*exempt*, and **only that contradiction exposed it**.
+
+This is the lead's scheduling failure from §13's preamble arriving at a second agent.
+Relayed to reviewer and tester as a claim to check. **Process fix the auditor asks for, and
+it is right: give validators a frozen SHA that is not also the coder's live worktree.**
+
+### Amendment 6b falsified a second time, independently — and the two counts DIFFER LEGITIMATELY
+
+| SHA | mutation | rows reddening at the warning path |
+|---|---|---|
+| `ea71a367` | auditor's Mutation A | **4** (trailing CR, leading CR, trailing newline, trailing tab) |
+| `f2f778d6` | coder's re-run | **5** (the four above + `unbounded_build_metadata`) |
+
+**Both are correct for the SHA each was measured at** — `f2f778d6` adds that row to the
+table. §13 recorded 5 citing the coder; this is not a discrepancy to reconcile and the two
+numbers are kept side by side deliberately. At `serverRows` the auditor measured **5**, not
+the 4 the prediction stated, so **6b undercounted at both sinks.**
+
+### Two new findings, both real at `ea71a367`, both ALREADY FIXED at `f2f778d6`
+
+- **MEDIUM — `uzi auth status` probed AND warned at `ea71a367`.** Measured matrix:
+  `auth status probes=1 warned=1` against `auth token 0/0`, `logout 0/0`, `whoami 1/1`,
+  `token list 1/1` (correct). `ea71a367` implemented the **enumerated list**, not the rule —
+  precisely the trap §11 6a documented. **Plus a prose falsification in the same commit**:
+  the doc comment read *"`logout` and `auth token` are **the two** commands that make NO
+  network call today."* False; `auth status` is a third.
+- **LOW — the length bound was unpinned at the warning sink at `ea71a367`.** Narrowest
+  possible mutation (leave the control-stripper, change only `compactText`'s `max`) reddened
+  only tests on *other* sinks. The risk was concrete, not theoretical: `SkewWarning`'s own
+  doc invites the refactor (*"Sanitizing here as well would be free defence-in-depth"*), and
+  anyone acting on it with a control-only stripper would have put 1 MiB on stderr with
+  nothing failing.
+
+**The auditor found both only because the tip moved.** Its own words: *"had I stopped at my
+assigned scope I would have reported two open findings that were already closed."*
+
+### Ungraded — two are actionable and route to the coder
+
+1. **`version.go`'s comment overstates its own mechanism.** It says the `--json` path is safe
+   because *"the structural encoder escapes what matters there"*. Measured: `encoding/json`
+   escapes C0 and U+2028/29 but **not U+202E and not DEL**. **The decision is fine; narrow
+   the sentence, not the behaviour.**
+2. **`compactText` slices at 200 BYTES (`len(s)`), not runes, and can cut mid-rune.** Output
+   stays valid UTF-8 only because `cellText`'s outer `strings.Map` re-encodes the orphan as
+   U+FFFD — probed with 199 ASCII + `€€€€`: 257 bytes, valid UTF-8. **The safety is emergent
+   from the ORDERING and nothing pins it.** A refactor swapping that order, or using
+   `compactText` alone, emits invalid UTF-8 from attacker-chosen input.
+3. Informational: the 1 MiB payload goes silent because `cellText` appends U+2026, illegal in
+   build metadata. Fail-closed and correct, but anyone later making the truncation
+   semver-safe silently inverts that test row's expectation.
+4. Informational: the cache is 0644 holding a SHA-256 and a timestamp — strictly less than
+   `config.toml` already exposes.
+
+### Scan slot + gates
+
+Slot is `none (gap, noted 2026-07-21)`; marker present, not re-raised. Tools of the
+auditor's own choosing, labelled as such. **`govulncheck` exit 3 → 0 verified independently**
+in a pristine extract — and the zero is discriminating rather than vacuous: it still reports
+*1 vulnerability in a required module the code does not call*, which a silently no-op'd
+scanner could not produce. `gitleaks` over the code commit: clean.
+
+**The auditor deliberately did NOT run `task gate:api`**, correctly: the shared worktree held
+another writer's staged changes for most of the audit, and `golangci-lint` takes a
+host-global lock that would have risked killing the tester's run. It ran the package tests in
+pristine extracts instead (`EXIT=0` at both `ea71a367` and `d96b6fe8`).
+
+**One incidental result worth keeping:** its first extract was `api/`-only, and
+`TestInstructionEvidenceIsWellFormed` **failed closed** — *"cannot read e2e/run-e2e.sh …
+an unverifiable check must fail rather than pass quietly"* — catching the harness error. That
+test is behaving exactly as designed, and it is a live instance of the
+fixtures-across-the-module-boundary shape `CLAUDE.md` documents.
