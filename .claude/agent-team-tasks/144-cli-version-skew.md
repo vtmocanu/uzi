@@ -2090,3 +2090,89 @@ tester's; two harnesses are on adjacent ports.
 **That is the uniform-result rule catching a third distinct instrument failure on this branch**
 — and the fix is the same shape every time: make the control prove the instrument is *yours*,
 not merely that something responded.
+
+---
+
+## 30. AMENDMENT 23 — review re-validation at `84b75153`. All holds. ONE new non-blocking, and it corrects §26.
+
+Every measurement from `git archive` extracts; the shared worktree was never built from. Gate
+in an isolated extract: `gofmt -l` empty, `go vet` rc=0, **`RUN=589 PASS=589 FAIL=0 SKIP=0`**
+(up from 486 — `termsafe` is now in scope), `deadcode -test` 0 findings against an empty
+baseline. `lint:api` **not run and it says so** — ratcheted against `origin/main`, which cannot
+resolve in a detached archive.
+
+### Both controls confirmed independently, and the merge is exactly one line
+
+```
+CONTROL A  naive merge: version.go local cellText -> uzicli.CellText
+           FAIL TestVersionCommandSanitizesServerBuildInfo/unbounded
+CONTROL B  M26: compactText's max -> 1<<30
+           FAIL .../unbounded  +  FAIL TestSkewWarningSanitizesTheServerString/unbounded_build_metadata
+```
+
+Restores verified with `diff -r` against a **fresh** extract, rc=0 both times.
+`git diff 136d976a 84b75153 -- api/cmd/uzi/version.go` shows the merge dropped **exactly one
+line** from `main`: that call. `hostile_server_test.go` and `sanitize.go` untouched.
+
+### The interaction that most needed checking: N-1 and B2 pull in OPPOSITE directions
+
+A fix implemented as *"don't record on failure"* would have silently reopened B2 (the
+negative cache that stops an offline laptop re-probing every command). It was not, and both
+are separately pinned. Mutation `if prev, ok := …; ok` → `ok && false`:
+
+```
+uzicli    FAIL TestVersionCacheFailedProbeKeepsTheLastKnownVersion
+cmd/uzi   FAIL TestSkewWarningSurvivesATransientProbeFailure
+          FAIL TestSkewWarningStaleCachePlusFailedProbeKeepsWarning
+negative-cache tests under the same fold:  rc=0, STILL GREEN
+```
+
+**Three tests, one more than the coder reported** — the hook half from `e3d87d1b`. The
+green negative-cache tests are the load-bearing half: B2 is not what paid for the fix.
+
+B2's own discriminator is sharper this round: a server that hangs **only** on `/api/version`,
+isolating the probe cost — `2.13s / 0.08s / 0.09s / 0.06s`, cumulative reqs stuck at 1.
+
+### The `termsafe` correction verified a THIRD time, with a column nobody else had
+
+```
+U+2028 / U+2029 escaped : true under BOTH default and SetEscapeHTML(false)
+```
+
+**That column matters and was not in the eight-row table.** Had U+2028/9 escaping been gated
+on `SetEscapeHTML`, the corrected parenthetical would be config-dependent. It is not, so the
+sentence is sound as written rather than sound-by-luck.
+
+### 🔴 N-5 (non-blocking) — §26 OVERSTATES, and the overstatement is the lead's
+
+§26 says *"our branch now carries the bound"*. **It carries it for TWO sinks** —
+`version.go`'s `serverRows` and the skew warning. **Three sibling sites in the same package
+still pass server-controlled strings through the non-truncating `uzicli.CellText`:**
+
+- `api/cmd/uzi/root.go:103` — `uzicli.CellText(err.Error())`
+- `api/cmd/uzi/login.go:72` — `uzicli.CellText(start.UserCode)`
+- `api/cmd/uzi/login.go:175` — `uzicli.CellText(res.User.Email)`
+
+Measured on the first, with a stub returning a 1 MiB error body:
+
+```
+branch 84b75153   stderr = 1,048,582 bytes
+main   136d976a   stderr = 1,048,582 bytes      <- BYTE-IDENTICAL
+```
+
+**Pre-existing, not a regression, and out of #144's scope.** The two `login.go` sites were
+**not executed** (they need the device-auth flow) and the reviewer says so rather than
+implying coverage — they are server-controlled by inspection.
+
+**Why it earns a line rather than silence:** `version.go:91-109` now carries a long comment
+arguing `uzicli.CellText` is the unsafe choice *because it does not truncate*, and three call
+sites in the same tree make exactly that choice on server-controlled input. **A reader of that
+comment will ask why the bound stopped at one line.** §26's wording is corrected here; whether
+to file the siblings is with the user.
+
+### Deletion lens — nothing orphaned, checked by hand because H1 was dropped wholesale
+
+`deadcode` 43 on both trees, none added, none removed. `uzicli.CellText` retains three
+production callers (the branch removed one of `main`'s four); the local `cellText` has 27 call
+sites across 11 files; `sanitizeTTY` survives as a delegating wrapper. `Store.Dir()` still
+test-only, unchanged by this branch.
