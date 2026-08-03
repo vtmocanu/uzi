@@ -246,6 +246,117 @@ Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4
 
 ## Amendments
 
+### Amendment 4 — 2026-08-03, browser pass. ONE new blocking item and ONE conflict the lead resolved.
+
+Mock build, real Chromium, read-only. All nine fixture cases verified **from the DOM rather
+than from the source**: the five per-column drifts badge, and the four that must not
+(`t-coder` pristine, `t-spec-keeper` no shipped twin, `t-release-notes` global, `t-my-coder`
+user-scope collision) do not. Criterion 7 verified **at runtime**, not just at grep level: a
+markup payload typed into a description renders escaped, `window.__pwn` null.
+
+#### 🔴 CONFLICT BETWEEN TWO ACCEPTED FINDINGS — RESOLVED HERE, DO NOT RE-DECIDE
+
+**F2 (Amendment 3) says assert `querySelectorAll("ins, del")` is empty as the XSS canary.
+F8 below says the word-diff needs `<ins>`/`<del>` for accessibility. Adopting both destroys
+the canary**, because its whole discriminating power is that `convertChangesToXML` emits
+exactly those tags.
+
+**RESOLUTION: use sr-only span markers for F8, NOT `ins`/`del` elements.** The canary keeps
+its shape and WCAG 1.4.1 is satisfied. If anyone later has a strong reason to prefer the
+semantic elements, F2's canary must be reshaped in the SAME commit and the reason recorded —
+it must never be quietly dropped, because a canary deleted to make an unrelated change
+compile is how this class of guard dies. Found by web-ux, which flagged the coordination need
+rather than filing its half in isolation.
+
+#### BLOCKING — added to Amendment 3's F1 and F2
+
+**F5. The diff and the Reset button can NEVER be co-visible, so the milestone's own premise is
+not met.** Measured at 1280×633 on `/agents/t-tester`: diff panel bottom **871px**, Reset
+button top **1524px** — a **653px gap against a 633px viewport**, with the full-body
+"Rendered subagent file (preview)" `<pre>` sitting between them. The mock body is 11 lines;
+real builtins are **27-138** (`architect.md` 138, `tester.md` 137), so in production the gap
+is several viewport heights. *(That extrapolation is from line counts, not a browser
+measurement — web-ux flagged the distinction itself.)*
+
+`reset()` (`AgentDetail.tsx:77-88`) has **no confirmation**: one click, unconditional, and it
+discards unsaved form edits because the editor is keyed `key={template.updated_at}` and
+remounts.
+
+**Severity, since web-ux correctly left the call to the lead:** the unconfirmed Reset is
+**pre-existing and not M4a's**. What M4a changed is that the justifying evidence now exists
+and sits where it cannot inform the click. **Graded BLOCKING for M4a specifically**, because
+"the diff view is what makes Reset safe to press" is this milestone's entire argument for
+shipping ahead of M4b — see the top of this file. Shipping the artifact without the outcome
+would leave that argument false.
+
+*Fix (either):* a Reset control inside the "Differs from shipped" panel, or a confirm on the
+existing button naming the changed columns. The second also closes the pre-existing gap and is
+the smaller change.
+
+#### SHOULD-FIX — from the browser pass
+
+**F6. Badge and diff panel state contradictory things after an unsaved edit.** On
+`t-documenter`, set Model back to "Inherit" without saving: the header badge still reads
+"differs from shipped" while the panel reads "Matches the shipped definition". The panel
+compares shipped vs **current form state** (`AgentTemplateEditor.tsx:241-250`); the badge
+reflects the **stored** DTO. Nothing on screen is false — both sentences are true of
+different subjects — but the panel is ~370px below the badge, so the admin reads "Matches"
+with no contradicting signal in view and navigates away leaving the row drifted. **This is
+the LIVE instance of the contradiction Amendment 2 records as latent**; that one needs padded
+frontmatter no revision has, this one needs one select change.
+
+**F7. `LineDiff` renders byte-identical text as both removed and added on a trailing-newline
+mismatch**, with no whitespace indicator. Reproduced on the pristine control by appending one
+`\n`: two rows, identical text, one green one red. jsdiff's `diffLines` keeps the newline in
+the token. Reachable on real data — `prompt_body` is submitted verbatim and a textarea adds
+no trailing newline, so an admin who retypes the last line gets a permanent unexplained
+"changed" line. *Fix:* normalize both sides to exactly one trailing `\n` before `diffLines`
+(a terminator, not content, so it hides no real edit), or emit git's
+`\ No newline at end of file` marker.
+
+**F7b (FIXTURE, trivial, do it with F7).** `builtinBody` (`web/src/mocks/data.ts:1534-1535`)
+produces a body with **no trailing newline**; every real builtin `.md` ends with one. So F7's
+phantom row is the FIRST thing in the diff on `t-tester`, the demo's flagship case — **the
+mock makes the diff look broken in a way real data would not.** Append `\n`.
+
+**F8. The tools-ORDER diff reads as "Bash removed, Bash added".** `t-reviewer` renders
+`- Bash` / `Read` / `+ Bash` / rest. Correct as a sequence diff, unreadable as an answer to
+"what changed" — and this is the one case the brief says nothing else pins. *Fix:* use the
+two-line before/after shape the MODEL diff already uses, which web-ux rates by far the most
+legible of the four.
+
+**F9. The description word-diff carries meaning in COLOUR ALONE** (WCAG 1.4.1): five spans,
+no `+`/`-` prefix, no `title`, no sr-only text, differing only by `text-ok` vs `text-danger`.
+`LineDiff` and `ToolsDiff` both carry prefixes, so it is an internal inconsistency too.
+Contrast itself is fine and needs no work (green 8.09:1, red 6.13:1, muted 7.33:1 against
+`bg-ink`). **Fix with sr-only markers per the conflict resolution above.**
+
+**F10. Both drift badges are `title`-only** — `aria-describedby`, `tabindex` and `role` all
+null. The list badge's title is the **only** place "Open it to see the diff" exists, so it
+reaches mouse users only. In-repo precedent is `web/src/components/RunCredential.tsx:64-73`
+(`title` + `aria-describedby` → sr-only span), and `Badge` already accepts
+`aria-describedby` (`ui.tsx:240`). **Fix together with F4** (Amendment 3), which changes that
+same copy. Web-ux scoped this honestly: the adjacent `shadowed` badge has the identical gap,
+so it is page-wide, not a regression this change introduced — fix both.
+
+#### ENHANCEMENTS — relayed to the owner, NOT scheduled
+
+E1 a count + filter on the list ("10 of 11 builtin templates differ from shipped"), which
+turns #210 recovery from a scan into a worklist. E2 deep-link the badge to `/agents/:id#diff`,
+which also reduces F5's distance problem. E3 fall back from `diffWords` on a wholesale
+rewrite, which currently renders as interleaved soup. E4 name the diff region
+(`role="region"` + `aria-labelledby`, `aria-live="polite"`). **E5 extract
+`InlineDiff`/`LineDiff`/`ToolsDiff`/`DiffField` into `components/Diff.tsx`** — M4b surfaces
+the same shipped-vs-stored question, and §5's argument about a duplicated *comparison* covers
+the *renderer* equally; it also gives F2's widened test somewhere to mount all four.
+
+#### Scope web-ux stated rather than let be inferred
+
+It filed **no** finding about whether the comparison is CORRECT: `mockApi.sameContent` is a
+deliberate second implementation, so its agreement with the fixtures proves nothing about the
+server. That is the tester's matrix. F7b is explicitly a finding about the fixture, not the
+renderer.
+
 ### Amendment 3 — 2026-08-03, THE FIX LIST. Reviewer + auditor both reported; this is what the coder does.
 
 Round 1 of findings. The severity bar is NOT armed: this round's deliverable is executable
