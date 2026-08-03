@@ -43,6 +43,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (editing a builtin is admin-only; everyone else gets a 403). Reset re-applies
   the shipped body verbatim, so re-apply any local customization on top. See
   [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
+- **Contributor tooling: the `agent` suite's per-test timeout is 120000, and its
+  largest test file was split into seven.** The cap was binding in CI and nowhere
+  else — node isolates test files in a child process per file on the CI image but
+  shares one process locally, so the same flag caps a whole *file* there and each
+  *suite* here, and a file running 96s locally passed a 30s cap while failing it
+  in CI. Splitting the file is what removed the knife edge; the raised cap only
+  bought margin. Cut the whole agent suite from 112s to 46s locally
+  (`37eefea6`, `32ff4bcf`). Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: the three prior-art projects are no longer vendored as
+  git submodules.** `./scripts/link-inspiration.sh` clones them once to a shared
+  directory outside the repo and symlinks them into a gitignored `inspiration/`,
+  so a fresh clone no longer drags the corpus along. Note `rg` and `grep -r` do
+  not follow symlinked directories, so a repo-wide sweep silently returns nothing
+  from it — search it by explicit path or with `-L` (`19ad63c3`). Developer-facing
+  only: no change to how uzi behaves, and a worker container never had access to
+  the corpus either way.
+
 - **Contributor tooling: both Go modules are now `gofmt`-clean and a format check
   runs in the gate.** `task fmt-check` fails on any formatting drift and names the
   files; it also runs first inside `task gate:api` / `task gate:controller` and
