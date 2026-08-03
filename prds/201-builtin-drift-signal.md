@@ -310,6 +310,60 @@ executions. It deliberately did not run the mutation, because reviewer, tester a
 all mid-flight in this shared worktree and a `cp`-restore round would silently invalidate
 their runs. That was the correct call.
 
+**A3 (Medium) — BLOCKING. The XSS positive control passes, fully green, against the exact
+unsafe implementation its own comment names.** Verified by the lead against the pinned,
+installed artifact.
+
+`AgentDetail.test.tsx:149-154` says a diff library returning an HTML string — naming
+`diff2html` and **jsdiff's `convertChangesToXML`** — would make the payload "a real element".
+That is false for the second one. In `web/node_modules/diff@9.0.0/dist/diff.js`,
+`convertChangesToXML` (`:2251`) pushes `escapeHTML(change.value)` (`:2261`), and `escapeHTML`
+(`:2271-2278`) replaces `<` and `>`. The payload dies before it can become an element, so
+BOTH assertions still pass against an unsafe `dangerouslySetInnerHTML` built on it:
+`querySelector("img")` is null because escaping meant no element was ever created, and the
+`onerror` text is present because a `<span dangerouslySetInnerHTML>` carries it in
+`textContent`.
+
+**Be precise about what it does catch**, because it is not worthless: against unescaped
+concatenation (`__html: \`<span>${p.value}</span>\``) a real `<img>` appears and the first
+assertion fails. That is the more dangerous form. The defect is that the comment claims both
+and delivers one.
+
+**Second, structural narrowing.** The fixture differs only in `prompt_body` (`row()` is the
+pristine baseline, proved by the sibling test asserting "Matches the shipped definition"), so
+`changedFields` is `["prompt body"]` and **`LineDiff` is the only renderer mounted**.
+`InlineDiff` (description, `diffWords`), the model span and `ToolsDiff` (`diffArrays`) never
+render, and no other test feeds markup anywhere. **1 of 4 renderers covered**, with
+`description` admin-editable on exactly the same footing as `prompt_body`.
+
+*Fix:* assert `container.querySelectorAll("ins, del")` is empty — that catches
+`convertChangesToXML` by its output shape, which escaping cannot hide — and widen the fixture
+so all four columns differ, with markup in `description` and in a tool name. Also correct the
+comment's framing: it calls itself "the positive control behind criterion 7's grep", but the
+grep is **strictly stronger** (both forms, every renderer). This test is a narrower
+complement, and stated backwards it will let a future reader widen the grep's exceptions
+believing the test still covers them.
+
+*Live risk today is nil* — the shipped renderer uses structured `Change[]` into text nodes and
+`web/src` has zero call sites. This is a finding about the GUARD, whose whole job is the
+future regression.
+
+**LEAD CORRECTION — "the merge altered no M4a file" was FALSE and was relayed to three
+validators.** `git diff --name-only 10970920..c3704d25` includes ten
+`api/internal/agenttmpl/builtins/*.md` bodies, `recipient_test.go`, and
+`web/src/mocks/mockApi.ts`. The lead verified five hand-picked paths and generalised from
+them. The builtin bodies are **inputs to the drift comparison**, so this was not a harmless
+over-statement. Retracted to the reviewer and the tester directly; the auditor caught it.
+The conclusion it supported still holds — no M4a *behaviour* moved, and `10970920` remains an
+ancestor — which is exactly why the sentence was dangerous rather than obviously wrong.
+
+**Corpus delta, measured by the auditor with a non-zero byte control:** 10 files, 139 body
+lines, **zero frontmatter lines**, so the whitespace-hygiene invariant is untouched.
+**Consequence worth stating before web-ux and the CHANGELOG land: on an already-seeded
+install, 10 of 11 builtins report `differs_from_builtin: true` immediately on deploy.** That
+is the #210 recovery path working as designed, not a defect — but the badge firing on nearly
+the whole roster at once will surprise someone.
+
 ### Amendment 1 — 2026-08-03, after the design-critique wave
 
 Architect, reviewer and auditor reported independently; the lead re-derived the load-bearing
