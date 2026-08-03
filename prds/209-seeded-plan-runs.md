@@ -2,10 +2,12 @@
 
 **Issue**: [#209](https://gitlab.example.com/vtmocanu/uzi/-/issues/209) · **Label**: PRD · **Priority**: Medium
 **Area**: `agent/src/runner.ts` + `agent/src/sdk-executor.ts` + `agent/src/executor.ts` (the three-way plan state) · `api/internal/handler/workers.go` + `api/internal/workersvc/service.go` + `api/internal/store/queries/runtime.sql` (create-time seeding, the `plan_approved` disjunct, the `SetRunRunning` guard) · **two** migrations on `runs` (M1's `plan_source` + plan/selection columns; M4's planned-against commit) · `web/src/pages/RunView.tsx` (M5 is a new renderer, not a copy tweak) · `api/cmd/uzi/run.go` + `api/internal/uzicli/skill/SKILL.md` (the CLI surface).
-**Line references** are against `5ea4d2f8`.
+**Line references** are against `5ea4d2f8`. They still resolve: the commits since (`31d0d75f`, `8dd67db0`) changed only `api/internal/uzicli/skill/SKILL.md` — cited by name, never by line — and this file. Stated so the next reader can read that rather than re-derive it.
 **Status**: not started. **M1 and M2 are the whole feature**; M3-M8 are surface and proof.
 **Reviewed** 2026-08-03, two adversarial passes (16 citations re-derived against `5ea4d2f8`, then a second pass over the M8/PRDLESS additions). Thirteen findings; all applied below. The blocking one is folded into D8 — the design as first written had **no path to `plan_approved: true`**, which made D4 row 2 unreachable. Sections carrying a review finding are marked ⟨R⟩.
-**Not yet audited**: the repairs made in response to those findings. The second pass reported lines 1-160 as "byte-identical" and reviewed the additions only — but the repairs had already landed and the file was 299 lines by then, so that premise was false and the repair audit did not happen. D8, the D7 rewrite, the revised open question 1 and the M1-M6 edits are **unreviewed**. Treat their citations as first-hand (each was verified at edit time) but unconfirmed by a second reader.
+**Third pass** (repair audit) delivered six further findings, all applied. It found no misstatement in how the earlier findings were transcribed, but it **escalated D8's `awaiting_approval` bullet from a liveness bug to a safety one** — the run does not die at the gate, it gets requeued and re-claimed carrying a worker-authored `plan_md` with `plan_approved` still true. That is the second time this design's central mechanism turned out to be wrong in the direction of "does something bad silently" rather than "does nothing". Worth knowing before implementing M1.
+
+**Standing caveat**: every pass was a static read. Nothing here has been executed — no test, no live-DB sweep, no judge run. D8's requeue chain in particular is reasoned from four guards and has not been reproduced; **M1 should reproduce it before fixing it**, since a fix for an unobserved bug is its own risk.
 
 ## Problem
 
@@ -150,21 +152,58 @@ criterion demands be empty. Implement M1 as first written and the claim ships
 `plan_approved: false`, making row 2 unreachable and the feature inert.
 
 So the one load-bearing server change is a third disjunct
-(`run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == "seeded"`), and it
-is not a detail — it is the mechanism. Two consequences that must land with it:
+(`run.AutoApprove || rc.HumanPlanApproved || run.PlanSource.String == "seeded"`),
+and it is not a detail — it is the mechanism. ⟨R⟩ **Note the `.String`**: M1's DDL
+below declares `plan_source` nullable, and sqlc types a nullable text column as
+`pgtype.Text`, so the bare `== "seeded"` form does not compile. Both precedents sit
+in the very struct this edits — nullable `agent_source` is read as
+`run.AgentSource.Valid`/`.String` (`api/internal/workersvc/agent_selection.go:263`),
+while NOT NULL-with-default `auto_approve` is a plain bool (`service.go:1422`).
+**M1 therefore declares the column `NOT NULL DEFAULT 'agent'`**, which the default
+makes safe to backfill, and this disjunct reads a plain string. Two consequences
+that must land with it:
 
 - **It extends the 🔴 invariant at `runtime.sql:511-530`.** That block's soundness
   argument is "a revise round sits at `awaiting_approval`, which `SetRunRunning`
   refuses to leave without a consumed `approve_plan`". A seeded run is a fourth
   case that argument does not cover and needs its own clause written there.
-- **`awaiting_approval → running` has no seeded escape hatch** (`runtime.sql:606-618`).
-  Normally harmless: a seeded run goes `claimed → running` and the guard explicitly
-  narrows only the `awaiting_approval` source status. But `sdk-executor.ts:576`
-  requires `!!ctx.approvedPlan?.trim()`, so **a plan that D5's scrub reduces to
-  whitespace falls through to the gate** — and is then trapped there permanently,
-  dying on the plan-approval deadline. Make a scrub-to-empty a **create-time 422**
-  rather than a stored blank plan; that is cheaper and more honest than widening
-  the guard.
+- **🔴 A seeded run that falls through to the gate comes back ARMED. This is a
+  safety bug, not the liveness bug it was first written as.** ⟨R⟩ The chain, every
+  link re-derived:
+  1. `plan_source='seeded'` ⇒ `plan_approved: true` via the third disjunct.
+  2. `sdk-executor.ts:576` requires `!!ctx.approvedPlan?.trim()`, so a plan D5's
+     scrub reduces to whitespace makes `preApproved` false ⇒ the run **plans and
+     gates**.
+  3. `SetRunAwaitingApproval` writes `plan_md = @plan_md` (`runtime.sql:709`) — the
+     worker's **own** Phase-1 plan. Its WHERE (`:746-747`) is
+     `id`/`worker_id`/`status NOT IN (terminal)`, with **no `plan_source` guard**.
+     The row now holds an unreviewed plan while `plan_source` is still `'seeded'`.
+  4. The worker's heartbeat goes stale ⇒ `RequeueRunsOfStaleWorkers`
+     (`runtime.sql:1154-1164`), whose source set at `:1159` includes
+     `awaiting_approval` ⇒ back to `queued`. It is a **direct UPDATE**, so
+     `SetRunRunning`'s consumed-`approve_plan` guard never executes on this path.
+  5. Re-claim: `plan_approved` still true, `plan_md` now worker-authored and
+     unreviewed, session possibly gone ⇒ **D4 row 2 ⇒ implement a plan no human
+     ever saw, with no gate.**
+
+  That is precisely what `runtime.sql:511-530` exists to prevent (*"it would tell
+  the worker to skip Phase 1 and IMPLEMENT AN UNREVIEWED plan_md — the same
+  residual with a materially worse blast radius"*), reached by a path its argument
+  does not contemplate. **And the reason it cannot protect is sharper than "needs
+  its own clause": the invariant reads "NO awaiting_approval REPORT REWRITES
+  plan_md AFTER THE CONSUMED approve_plan THAT MADE human_plan_approved TRUE"
+  (`:527-528`) — and a seeded run has no consumed `approve_plan`, so that sentence
+  is VACUOUS. It cannot be violated, which is exactly why it cannot hold.** The
+  root cause is that the third disjunct decouples `plan_approved` from `plan_md`'s
+  provenance: `plan_source` describes the row's **birth**, while `plan_md` stays
+  **mutable**.
+
+  **Fix, and it is one column in an existing statement**: have
+  `SetRunAwaitingApproval` set `plan_source = 'agent'` in the same UPDATE that
+  rewrites `plan_md`, so the disjunct tracks provenance rather than birth. The
+  create-time 422 on a scrub-to-empty plan stays — but it closes only the blank-plan
+  *entry* path, and any other fall-through to the gate reopens the hole without
+  this. **Both, not either.**
 
 Also for M1: `CreateRun`'s INSERT lists its columns explicitly
 (`runtime.sql:302-303`), and its own 🔴 comment at `:295-301` warns that an omitted
@@ -221,7 +260,7 @@ implied.
 
 ## Milestones
 
-- [ ] **M1 ⟨R⟩ — Seeded plan reaches the worker.** Migration adds `plan_source text CHECK (plan_source IN ('agent','seeded'))` (default `'agent'`) to `runs`; `POST /api/repos/{id}/runs` accepts optional `plan_md` + `agent_selection`, size-capped and scrubbed (D5), persisted with the selection through the same columns the human gate writes, and **columns added explicitly to `CreateRun`'s INSERT** (`runtime.sql:302-303`, per its own 🔴 warning at `:295-301`). A scrub-to-empty plan is a **422 at create time**, never a stored blank (D8). The `plan_approved` third disjunct lands here (D8) — it is the mechanism, not a detail. **Validated by**: a live-DB test showing the claim for a seeded run carries `plan_md`, `plan_approved: true` and the selection, with no `approve_plan` input row anywhere. That assertion is the one that would have caught the D8 hole, so it is the milestone's real gate.
+- [ ] **M1 ⟨R⟩ — Seeded plan reaches the worker.** Migration adds `plan_source text NOT NULL DEFAULT 'agent' CHECK (plan_source IN ('agent','seeded'))` to `runs` — **`NOT NULL` deliberately** (D8: it keeps the disjunct a plain string compare rather than a `pgtype.Text` unwrap, and the `DEFAULT` makes the backfill safe) — plus the `plan_source = 'agent'` write in `SetRunAwaitingApproval` that D8's safety fix requires; `POST /api/repos/{id}/runs` accepts optional `plan_md` + `agent_selection`, size-capped and scrubbed (D5), persisted with the selection through the same columns the human gate writes, and **columns added explicitly to `CreateRun`'s INSERT** (`runtime.sql:302-303`, per its own 🔴 warning at `:295-301`). A scrub-to-empty plan is a **422 at create time**, never a stored blank (D8). The `plan_approved` third disjunct lands here (D8) — it is the mechanism, not a detail. **Validated by**: a live-DB test showing the claim for a seeded run carries `plan_md`, `plan_approved: true` and the selection, with no `approve_plan` input row anywhere. That assertion is the one that would have caught the D8 hole, so it is the milestone's real gate.
 - [ ] **M2 — The worker implements it.** The three-way discriminator of D4 lands in `runner.ts` and both executors; a feed line records that the plan was supplied externally, so it is visible in the transcript rather than inferable. Also in scope, all three from the review: the `priorWork` decision of D7; the first implement turn currently opens *"Your plan was approved"* (`agent/src/prompt.ts:612`) when nobody approved a seeded plan, which needs a decision even if the answer is "leave it"; and `agent/src/executor.ts:592-596` **goes stale the moment this lands** — it asserts "a run whose transcript was dropped never reaches this branch", which row 2 falsifies. Per the repo's fix-the-doc rule that correction ships in the same commit. **Validated by**: all four rows of D4's table exercised as tests, row 3 (approved, no session, not seeded ⇒ re-plans) as a named regression test. The harness already exists — `agent/test/sdk-executor.test.ts:2016-2030` is a table-driven "each condition ALONE must not skip" loop whose first row is literally the no-session case; adding a `seeded` axis extends it directly. Stub side: `agent/test/executor.test.ts:295/:328/:346`. **Gap to close**: those are all executor-level, and `runner.ts:461` needs its own row-3 test (hook: `agent/test/runner.test.ts:2155-2242`, `plantTranscript`).
 - [ ] **M3 — CLI surface.** `uzi run create --plan-file <path>` (`-` for stdin), plus `--agent-source` / `--exclude-agents` reusing `approveSelection`'s existing validation (`api/cmd/uzi/run.go:461-473`). Exit codes per the documented contract; `--exclude-agents` without `--agent-source` stays a usage error. Bundled `SKILL.md` updated, drift test green.
 - [ ] **M4 ⟨R⟩ — Staleness guard.** The client sends the commit it planned against; the worker compares it to the clone's resolved base (`runnerClone.baseCommit`, `runner.ts:439` — the field exists and is already forwarded into `RunContext`) and surfaces a divergence. **This needs its own migration and its own claim field**: there is no column, no claim field and no request field for a *client-supplied* commit anywhere in the tree today. **Open question 3** decides refuse-vs-warn.
@@ -326,13 +365,13 @@ rather than reproduced.
 
 ## Open questions
 
-1. **Does a seeded run still offer a gate? ⟨R⟩** Skipping it entirely is the point of the feature. But the gate is also where the server validates the selection against the run's **live** roster — which the local planner cannot know, since it reads `.claude/agents/` on the laptop rather than in the clone. *The first recommendation here was self-contradictory and half of it was unimplementable*: it proposed create-time validation **and** a clone-time fallback for the same check, and create-time validation of `--agent-source repo` **cannot work**. `validateSelection` refuses `repo` against an empty roster (`api/internal/workersvc/agent_selection.go:122`), `rosterFor` reads `run.RepoAgents` (`service.go:2409-2418`), and `runs.repo_agents` is written **only** by the worker's post-checkout report (`runtime.sql:600`) — at create time it is NULL. So the PRD's own headline command on line 72 would 400, and exclusions fail harder still (every name misses `known[name]` at `agent_selection.go:138`). *Revised recommendation*: skip the gate by default, accept the selection at create time **unvalidated**, and validate once at the post-checkout boundary where the roster actually exists, falling back to `own` with a feed note. That is one check, in the one place it can run.
+1. **Does a seeded run still offer a gate? ⟨R⟩** Skipping it entirely is the point of the feature. But the gate is also where the server validates the selection against the run's **live** roster — which the local planner cannot know, since it reads `.claude/agents/` on the laptop rather than in the clone. *The first recommendation here was self-contradictory and half of it was unimplementable*: it proposed create-time validation **and** a clone-time fallback for the same check, and create-time validation of `--agent-source repo` **cannot work**. `validateSelection` refuses `repo` against an empty roster (`api/internal/workersvc/agent_selection.go:122`), `rosterFor` reads `run.RepoAgents` (`service.go:2409-2418`), and `runs.repo_agents` is written **only** by the worker's post-checkout report (`runtime.sql:600`) — at create time it is NULL. So the PRD's own headline command on line 72 would be rejected (the status code is not readable from the code — no create-time selection check exists yet, and `ErrInvalidSelection`'s only current mapping is on the SubmitInput path), and exclusions fail harder still (every name misses `known[name]` at `agent_selection.go:138`). *Second recommendation, also wrong* ⟨R⟩: it named "the post-checkout boundary" server-side, which is `runningStateParams` (`api/internal/workersvc/service.go:2365`) — and that function can do **neither** half. It **errors rather than degrades** (`:2387-2392`, both failure arms are bare `return p, err`, mapped to an HTTP error at `handler/workers.go:907`; no fallback arm, no feed emit), and it **cannot see a create-time selection at all** (`:2379`, `if req.AgentSelection == nil { return p, nil }` — it validates only what the worker sent in *this* request, and on the pre-approved path the worker sends none). *Third recommendation, and the machinery for it already exists* **worker-side**: `sdk-executor.ts:876-884` computes `repoAvailable` from the clone's roster, calls `resolveAgentSelection`, and emits `resolved.note` to the feed. What is missing is a branch — `resolveAgentSelection`'s `"ok"` arm (`protocol.ts:836-838`) returns the selection as sent, with no roster check. So: accept unvalidated at create time, and add a **"well-formed but unsatisfiable against this clone's roster"** arm that falls back to `own` and returns a note. One process, one function, and the emit path is already wired. Left unhandled, `selectSubagents(source="repo", …, ctx.repoAgents ?? [], …)` (`sdk-executor.ts:890-897`) yields an empty subagent map against an empty clone roster — exactly what `agent_selection.go:112-114` names: *"a broken run rather than a deliberate lead-only one."*
 2. **Structured plan or free text?** D7 makes self-sufficiency a documented constraint, which is the weakest possible enforcement. A schema (goal / files / steps / done-when) would make it checkable at create time. *Recommendation*: ship free text in M1-M3 — it is what the executor already consumes — and let M6's e2e tell us whether cold-start quality is actually a problem before inventing a format.
 3. **Base-commit mismatch: refuse or warn?** Refusing is safe and will be infuriating on a busy `main`. *Recommendation*: warn into the feed by default, `--require-base` to refuse. Decided in M4.
 
 ## Risks
 
-- **Cold start produces worse work than a warm plan.** Mitigated by this being the proven resume shape, and measured by M6 rather than argued.
+- **Cold start produces worse work than a warm plan.** ⟨R⟩ *This bullet's mitigation used to read "this being the proven resume shape" — the exact sentence D7 above now retracts, left standing after D7 was rewritten. A reader arriving at Risks first would have taken the retracted claim as current.* The real mitigation is D7's answer: carry `priorWork` into the implement prompt, or state the limitation, and measure it in M6 rather than arguing it.
 - **A stale local plan describes files that moved.** M4, open question 3.
 - **New untrusted input path.** D5. Bounded, but it is genuinely new surface and should be reviewed as such rather than waved through because the guardrails hold.
 - **`auto_approve` overload creeps back in.** D3 exists because it is the cheap-looking wrong answer; a reviewer should check the diff does not quietly take it.
