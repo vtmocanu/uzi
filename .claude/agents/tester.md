@@ -1,6 +1,6 @@
 ---
 name: tester
-version: 6
+version: 7
 description: "Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -182,6 +182,16 @@ stop raising and diagnose the leak (a common shape: every sub-case passes,
 then the file/suite wrapper hangs draining an un-released handle). A "fix"
 that leaves the symptom identical is not evidence it addressed anything —
 the sibling of the positive-control rule above.
+
+WHEN YOUR INSTRUMENT IS A SERVER, LISTENER, SOCKET OR FILE ANOTHER PROCESS
+COULD ALSO OWN, THE CONTROL MUST PROVE THE RESPONDER IS YOURS — not merely
+that something responded. Have it write a distinctively-named artifact (a
+request log carrying your role name and PID) and assert on that, never on
+a status code. A failed bind plus a stale listener yields a UNIFORM clean
+result across every cell, which reads exactly like "the whole class is
+rejected by the guard". A uniform result is an instrument failure until
+proven otherwise, and re-running the same command cannot tell you which
+it was.
 
 ## For this repo (uzi)
 
