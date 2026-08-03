@@ -1252,11 +1252,21 @@ the only gate).
   convention is inline-links-only; broken relative doc→doc / doc→img links; any
   `docs/img/*` over the **300 KB** per-image budget (ships to every visitor).
 - **Warns only** on a `user` page over the 60-line budget.
-- **Context-aware link checks**: the web image context is trimmed to `web/` + `docs/`,
-  so repo-root targets (`../ARCHITECTURE.md`, `../plan.md`) are absent there by
-  design (the viewer rewrites them to GitLab anyway). Links resolving **inside**
-  `docs/` are always checked; targets **outside** `docs/` are checked **only in a
-  full checkout** (`.git` present), so the containerized build stays green.
+- **Context-aware link checks**: links resolving **inside** `docs/` are always
+  checked; targets **outside** `docs/` are checked **only in a full checkout**
+  (`.git` present), so the containerized build stays green. Repo-root targets
+  (`../ARCHITECTURE.md`, `../plan.md`) are therefore unvalidated in the image by
+  design — the viewer rewrites them to GitLab anyway.
+  *(Corrected 2026-08-03, PRD #103 M5. This read "the web image context is trimmed
+  to `web/` + `docs/`, so repo-root targets are absent there", which is FALSE:
+  `.dockerignore` excludes a NAMED LIST — `.git`, `.gitignore`, `.gitmodules`,
+  `.env*`, `inspiration/`, `api/`, `agent/`, `e2e/`, `web/node_modules`,
+  `web/dist` — so the context is the repo root MINUS that list and still contains
+  `prds/`, `adr/`, `specs/`, `controller/`, `deploy/` and `Formula/`. What keeps
+  the image build green is `.git` being excluded, which makes `fullCheckout` false
+  so the whole outside-`docs/` block never runs there. The conclusion was right and
+  the stated mechanism was not — and the mechanism is the half a reader reasons
+  from when deciding whether adding a directory to `extraLinkFiles` is safe.)*
 
 ## 59. Screenshots: placeholders now, real captures as one final commit
 

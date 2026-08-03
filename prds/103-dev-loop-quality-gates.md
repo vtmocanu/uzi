@@ -1794,7 +1794,13 @@ which previously prescribed only the fail-open form.
       gap is `prds/` and `adr/` as link *sources*. Adding them to that list is a
       small change; a parallel checker would have different semantics and would
       have to rediscover why the existing one is gated on `fullCheckout` (the
-      web image build context is trimmed to `web/` + `docs/`).
+      web image build context excludes `.git`, so `fullCheckout` is false there).
+      *(Corrected 2026-08-03 during M5: this parenthetical read "the web image
+      build context is trimmed to `web/` + `docs/`", which `.dockerignore`
+      disproves — it excludes a named list, so the context is the repo root minus
+      that list and still carries `prds/`, `adr/` and `specs/`. Same wrong
+      mechanism M5 corrected at both of its sites in `check-docs.mjs`; the
+      conclusion is unchanged.)*
 
       **Calibration**: add an unquoted `$var` in a scoped script and confirm
       shellcheck fires; add a broken relative link in a `prds/` file and confirm
