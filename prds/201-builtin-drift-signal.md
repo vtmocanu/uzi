@@ -296,7 +296,31 @@ a real escape hatch, measured** — `resetAgentTemplate: 0`, unsaved marker inta
 unchanged), F12, S3, S4, S6. **Criterion 9's client half still holds** after two commits moved
 the file: reset 1, all three reads 0, positive control first so the zeros are observations.
 
-**S5 — HALF fixed, and the honest scoping is the agent's own.** The sr-only markers close the
+#### F15 — CLOSE S5's VISUAL HALF. Owner-approved 2026-08-03.
+
+**The behaviour:** `InlineDiff` must distinguish shipped from current by something a sighted
+colour-blind user can see, not by tint alone. `LineDiff` and `ToolsDiff` already carry visible
+`+`/`-`; this is an internal inconsistency as much as a WCAG 1.4.1 gap.
+
+**🔴 THE ONE CONSTRAINT, AND IT IS THE TRAP: DO NOT REACH FOR `<ins>`/`<del>`.** They are the
+semantically obvious elements and they are banned here — F2's XSS canary asserts
+`querySelectorAll("ins, del")` is EMPTY, because that is exactly what `convertChangesToXML`
+emits and it is the only assertion that discriminates an HTML-string renderer (the `img`
+assertion passes under all three unsafe forms, measured). **Adopting them silently deletes the
+canary.** Amendment 4 resolved this once already toward sr-only markers; this is the same
+conflict arriving from the visual side. Use visible text markers, a prefix, a border, weight,
+underline style, anything that is not those two tags.
+
+**Acceptance:**
+1. The description diff is readable with colour removed. Say how you checked, not that you did.
+2. **`querySelectorAll("ins, del")` still returns empty** and F2's control still discriminates.
+   Re-run it; do not assume the change was orthogonal.
+3. The existing sr-only markers stay — this ADDS the visual half, it does not replace the
+   screen-reader half.
+
+Keep it small. It is one renderer.
+
+**S5 — HALF fixed as of `261e9f9b`, and the honest scoping is the agent's own.** The sr-only markers close the
 screen-reader half; the **visual** half is unchanged, since an sr-only span is clipped to 1px.
 `LineDiff` and `ToolsDiff` carry visible `+`/`-`; `InlineDiff` still does not, so a sighted
 colour-blind user has only the tints. **WCAG 1.4.1 is about VISUAL means, so it is not
