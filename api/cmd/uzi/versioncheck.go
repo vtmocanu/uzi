@@ -138,14 +138,19 @@ func maybeWarnVersionSkew(cmd *cobra.Command, env Env, gf *globalFlags) {
 	now := time.Now()
 	serverVersion, fresh := env.Store.CachedServerVersion(s.URL, now, uzicli.VersionCheckTTL)
 	if !fresh {
-		serverVersion = ""
+		var probed string
 		if info := serverBuildInfo(cmd.Context(), env, gf); info != nil {
-			serverVersion = info.Version
+			probed = info.Version
 		}
-		// Records the ATTEMPT: an empty version is the negative cache entry that
+		// Records the ATTEMPT: an empty probe result is the negative cache entry that
 		// stops an offline laptop re-probing on every command. The error is ignored
 		// deliberately — a read-only $HOME must not break `uzi run list --json`.
-		_ = env.Store.RecordServerVersion(s.URL, serverVersion, version, now)
+		//
+		// Take the RETURNED version, not `probed`. On a failed probe the store keeps
+		// the last known-good reading and hands it back, so a transient outage does
+		// not silence this warning for the rest of the TTL — see RecordServerVersion,
+		// where that rule lives so both call sites inherit it.
+		serverVersion, _ = env.Store.RecordServerVersion(s.URL, probed, version, now)
 	}
 	warnVersionSkew(env, serverVersion)
 }
@@ -161,6 +166,14 @@ func maybeWarnVersionSkew(cmd *cobra.Command, env Env, gf *globalFlags) {
 //
 // srv == nil is the every-failure case serverBuildInfo documents; it still records,
 // because a failed probe is an observation worth caching (see versionCheckEntry).
+//
+// 🔴 IT READS THE CACHE AS WELL AS WRITING IT, AND THAT IS THE POINT OF THE READ.
+// This command probes live on every invocation — it has to, since it PRINTS the
+// server's build info — so it was the one command that wrote the cache and never
+// consulted it. That made `uzi version`, the command a user runs precisely when they
+// suspect something is wrong, the one that stayed silent about skew exactly when the
+// server was having a bad moment. Taking RecordServerVersion's returned version means
+// a failed live probe falls back to the last known-good reading instead of to nothing.
 func recordAndWarnVersionSkew(env Env, gf *globalFlags, srv *apitypes.BuildInfoDTO) {
 	if !versionCheckEnabled(env, gf) {
 		return
@@ -171,7 +184,7 @@ func recordAndWarnVersionSkew(env Env, gf *globalFlags, srv *apitypes.BuildInfoD
 	}
 	if env.Store != nil {
 		if s, err := resolveSettings(env, gf); err == nil && strings.TrimSpace(s.URL) != "" {
-			_ = env.Store.RecordServerVersion(s.URL, serverVersion, version, time.Now())
+			serverVersion, _ = env.Store.RecordServerVersion(s.URL, serverVersion, version, time.Now())
 		}
 	}
 	warnVersionSkew(env, serverVersion)
@@ -202,6 +215,16 @@ func recordAndWarnVersionSkew(env Env, gf *globalFlags, srv *apitypes.BuildInfoD
 // Print with fmt.Fprintf, NOT uzicli.Printer: govulncheck traces GO-2026-5970
 // (x/text infinite loop on invalid input) through Printer.Println, and this path
 // takes the most hostile string in the CLI. The plain path does not reach it.
+//
+// 🔴 HOW MUCH ATTACKER TEXT CAN REACH stderr IS DECIDED IN run.go, NOT HERE.
+// Measured: a server version carrying 150 characters of SemVer build metadata (157
+// total) is printed, so ~157 characters of attacker-chosen text land on a line
+// prefixed `uzi:` — stripped of controls and Cf by cellText, so spacing and letters,
+// never a cursor effect. Above compactText's 200-char cap the truncation appends
+// U+2026, which is outside SemVer's build-metadata charset, the version stops parsing
+// and the warning vanishes entirely. That silence is therefore a property of a
+// COSMETIC CONSTANT in another file: raise or remove that cap and this bound moves
+// with it, with nothing here to notice.
 func warnVersionSkew(env Env, serverVersion string) {
 	if serverVersion == "" {
 		return

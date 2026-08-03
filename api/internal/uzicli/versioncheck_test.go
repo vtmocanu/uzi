@@ -192,7 +192,7 @@ const testURL = "https://uzi.example.com"
 func TestVersionCacheRoundTrip(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	v, fresh := s.CachedServerVersion(testURL, now.Add(time.Minute), VersionCheckTTL)
@@ -204,7 +204,7 @@ func TestVersionCacheRoundTrip(t *testing.T) {
 func TestVersionCacheExpires(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now.Add(-2*time.Hour)); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now.Add(-2*time.Hour)); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if v, fresh := s.CachedServerVersion(testURL, now, VersionCheckTTL); fresh {
@@ -218,7 +218,7 @@ func TestVersionCacheExpires(t *testing.T) {
 func TestVersionCacheRejectsFutureTimestamp(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now.Add(time.Hour)); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now.Add(time.Hour)); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if v, fresh := s.CachedServerVersion(testURL, now, VersionCheckTTL); fresh {
@@ -232,7 +232,7 @@ func TestVersionCacheRejectsFutureTimestamp(t *testing.T) {
 func TestVersionCacheIsKeyedPerServer(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion("https://a.example", "0.14.0", "v0.11.8", now); err != nil {
+	if _, err := s.RecordServerVersion("https://a.example", "0.14.0", "v0.11.8", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if v, fresh := s.CachedServerVersion("https://b.example", now, VersionCheckTTL); fresh {
@@ -246,7 +246,7 @@ func TestVersionCacheIsKeyedPerServer(t *testing.T) {
 func TestVersionCacheKeyNormalisesTrailingSlash(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion("https://x.example/", "0.14.0", "v0.11.8", now); err != nil {
+	if _, err := s.RecordServerVersion("https://x.example/", "0.14.0", "v0.11.8", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if v, fresh := s.CachedServerVersion("https://x.example", now, VersionCheckTTL); !fresh || v != "0.14.0" {
@@ -259,7 +259,7 @@ func TestVersionCacheKeyNormalisesTrailingSlash(t *testing.T) {
 func TestVersionCacheRecordsFailedProbe(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion(testURL, "", "v0.11.8", now); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "", "v0.11.8", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	v, fresh := s.CachedServerVersion(testURL, now.Add(time.Minute), VersionCheckTTL)
@@ -268,6 +268,82 @@ func TestVersionCacheRecordsFailedProbe(t *testing.T) {
 	}
 	if v != "" {
 		t.Fatalf("version = %q, want empty", v)
+	}
+}
+
+// 🔴 THE REGRESSION TEST FOR THE ONE DEFECT THIS BRANCH SHIPPED AND THEN FIXED.
+//
+// A failed probe used to write "" over a real reading. Because an empty-and-fresh
+// entry is indistinguishable from a real one to the caller, every later command took
+// the cache-hit path, never re-probed, and printed nothing — for up to a full TTL
+// AFTER the server recovered. Silence, not a wrong answer, which is why nothing
+// caught it.
+//
+// Both halves are asserted, because the fix is only correct if it keeps BOTH: the
+// known-good version survives the failure, AND checked_at still moves so the entry
+// stays fresh and no re-probe storm replaces the outage.
+func TestVersionCacheFailedProbeKeepsTheLastKnownVersion(t *testing.T) {
+	s := NewStore(t.TempDir())
+	now := time.Now()
+
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now); err != nil {
+		t.Fatalf("record success: %v", err)
+	}
+	// The probe fails a minute later.
+	eff, err := s.RecordServerVersion(testURL, "", "v0.11.8", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+	if eff != "0.14.0" {
+		t.Errorf("returned effective version %q, want %q — a transient failure erased a good reading", eff, "0.14.0")
+	}
+	v, fresh := s.CachedServerVersion(testURL, now.Add(2*time.Minute), VersionCheckTTL)
+	if v != "0.14.0" {
+		t.Errorf("cached version %q, want %q — the outage poisoned the entry", v, "0.14.0")
+	}
+	if !fresh {
+		t.Error("entry is not fresh after a failed probe; every command would re-probe")
+	}
+}
+
+// The other half of the same rule: with NO prior reading, a failed probe still
+// records the negative entry. This is the offline-laptop case and it must not
+// regress while fixing the one above.
+func TestVersionCacheFailedProbeWithNoPriorStaysEmpty(t *testing.T) {
+	s := NewStore(t.TempDir())
+	now := time.Now()
+	eff, err := s.RecordServerVersion(testURL, "", "v0.11.8", now)
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if eff != "" {
+		t.Errorf("returned %q from a first-contact failure, want empty", eff)
+	}
+	v, fresh := s.CachedServerVersion(testURL, now.Add(time.Minute), VersionCheckTTL)
+	if !fresh || v != "" {
+		t.Fatalf("got (%q, %v), want (\"\", true) — the negative cache is gone", v, fresh)
+	}
+}
+
+// A structurally valid file whose map is null. loadVersionCheckState handles it, but
+// the corrupt-file test above covers only UNPARSEABLE bytes, so this arm was unpinned.
+func TestVersionCacheNullServersMapIsAMiss(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, versionCheckFile), []byte(`{"servers":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); fresh {
+		t.Fatalf("null map read fresh: (%q, %v)", v, fresh)
+	}
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
+		t.Fatalf("record over a null map: %v", err)
+	}
+	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); !fresh || v != "0.14.0" {
+		t.Fatalf("got (%q, %v) after writing over a null map", v, fresh)
 	}
 }
 
@@ -284,7 +360,7 @@ func TestVersionCacheCorruptFileIsAMiss(t *testing.T) {
 		t.Fatalf("corrupt cache read fresh: (%q, %v)", v, fresh)
 	}
 	// And a write over a corrupt file must still succeed.
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
 		t.Fatalf("record over corrupt file: %v", err)
 	}
 	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); !fresh || v != "0.14.0" {
@@ -298,7 +374,7 @@ func TestVersionCacheIsBounded(t *testing.T) {
 	const n = maxVersionCheckEntries + 1
 	for i := range n {
 		// Ascending timestamps, so entry 0 is the oldest and is the one evicted.
-		if err := s.RecordServerVersion(fmt.Sprintf("https://h%02d.example", i), "0.14.0", "v0.11.8", base.Add(time.Duration(i)*time.Second)); err != nil {
+		if _, err := s.RecordServerVersion(fmt.Sprintf("https://h%02d.example", i), "0.14.0", "v0.11.8", base.Add(time.Duration(i)*time.Second)); err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
 	}
@@ -328,7 +404,7 @@ func TestVersionCacheIsBounded(t *testing.T) {
 func TestVersionCacheDoesNotPersistTheURL(t *testing.T) {
 	s := NewStore(t.TempDir())
 	const hostile = "http://alice:hunter2@127.0.0.1:8080"
-	if err := s.RecordServerVersion(hostile, "0.14.0", "v0.11.8", time.Now()); err != nil {
+	if _, err := s.RecordServerVersion(hostile, "0.14.0", "v0.11.8", time.Now()); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(s.Dir(), versionCheckFile))
@@ -353,7 +429,7 @@ func TestVersionCacheDoesNotPersistTheURL(t *testing.T) {
 func TestVersionCacheRecordsCLIVersionButDoesNotKeyOnIt(t *testing.T) {
 	s := NewStore(t.TempDir())
 	now := time.Now()
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", now); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(s.Dir(), versionCheckFile))
@@ -381,7 +457,7 @@ func TestVersionCacheRecordsCLIVersionButDoesNotKeyOnIt(t *testing.T) {
 
 func TestVersionCacheFileMode(t *testing.T) {
 	s := NewStore(t.TempDir())
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	fi, err := os.Stat(filepath.Join(s.Dir(), versionCheckFile))
@@ -399,7 +475,7 @@ func TestVersionCacheFileMode(t *testing.T) {
 func TestVersionCacheBoundsAHugeVersion(t *testing.T) {
 	s := NewStore(t.TempDir())
 	huge := strings.Repeat("A", 1<<20)
-	if err := s.RecordServerVersion(testURL, huge, "v0.11.8", time.Now()); err != nil {
+	if _, err := s.RecordServerVersion(testURL, huge, "v0.11.8", time.Now()); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	fi, err := os.Stat(filepath.Join(s.Dir(), versionCheckFile))
@@ -425,7 +501,7 @@ func TestVersionCacheNilStore(t *testing.T) {
 	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); fresh || v != "" {
 		t.Errorf("nil store returned (%q, %v)", v, fresh)
 	}
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err == nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err == nil {
 		t.Error("nil store recorded without error")
 	}
 }
@@ -438,7 +514,7 @@ func TestVersionCacheWriteFailureIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewStore(filepath.Join(blocker, "uzi"))
-	if err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err == nil {
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err == nil {
 		t.Error("write into an unusable directory returned nil; the caller could not tell")
 	}
 	// And the read side degrades to a miss rather than an error.

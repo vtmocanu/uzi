@@ -237,18 +237,39 @@ func (s *Store) CachedServerVersion(url string, now time.Time, ttl time.Duration
 	return e.Version, true
 }
 
-// RecordServerVersion stores the outcome of a probe ATTEMPT. version == "" records a
-// failed probe (see versionCheckEntry). The returned error is expected to be
-// IGNORED by the CLI: a read-only $HOME must never break `uzi run list --json`. The
-// cost of ignoring it is a probe per command, capped at the 2s probe timeout, and
-// UZI_VERSION_CHECK=0 is the documented remedy.
+// RecordServerVersion stores the outcome of a probe ATTEMPT and returns the server
+// version now IN EFFECT for url — the probed version when the probe succeeded, the
+// preserved last-known-good when it failed, and "" when neither exists.
+//
+// 🔴 A FAILED PROBE MOVES checked_at AND DOES NOT CLEAR A KNOWN-GOOD VERSION. Getting
+// this wrong is not a missed warning, it is a SILENT one for the full TTL, and it was
+// live on this branch: a probe failure wrote "" over a real reading, and because an
+// empty-and-fresh entry is indistinguishable from a real one to the caller, every
+// later command took the cache-hit path, never re-probed, and printed nothing — for up
+// to an hour AFTER the server came back. Measured: warn / (server down) / silent, with
+// the server healthy again by the third command.
+//
+// Both properties survive, which is why the fix is here rather than at either caller.
+// The TTL still suppresses re-probing, because checked_at moves on every attempt — so
+// an offline laptop still pays one 2s probe per hour and not one per command. And the
+// last real reading survives the outage, so the warning stays correct through it.
+//
+// The preserved version is kept regardless of how OLD the entry it came from is. A
+// month offline therefore keeps warning against a month-old reading, which is
+// deliberate: the value only moves when the SERVER is upgraded, and this comparison is
+// recomputed against the live binary every run, so the direction that self-heals is
+// the one users act on.
+//
+// The returned error is expected to be IGNORED by the CLI: a read-only $HOME must
+// never break `uzi run list --json`. The effective version is returned even when the
+// write fails, because it is correct for THIS invocation either way.
 //
 // cliVersion is taken as a PARAMETER rather than read here because this package has
 // no access to the binary's ldflags stamp — the same reason NewSkillInstaller takes
 // it. It is written and never read; see versionCheckEntry.
-func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Time) error {
+func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Time) (string, error) {
 	if s == nil {
-		return errors.New("no config store")
+		return version, errors.New("no config store")
 	}
 	if r := []rune(version); len(r) > maxCachedVersionRunes {
 		version = string(r[:maxCachedVersionRunes])
@@ -257,7 +278,14 @@ func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Ti
 		cliVersion = string(r[:maxCachedVersionRunes])
 	}
 	st := s.loadVersionCheckState()
-	st.Servers[versionCheckKey(url)] = versionCheckEntry{
+	key := versionCheckKey(url)
+	if version == "" {
+		// Failed probe: keep whatever version we last learned for this server.
+		if prev, ok := st.Servers[key]; ok {
+			version = prev.Version
+		}
+	}
+	st.Servers[key] = versionCheckEntry{
 		Version:    version,
 		CheckedAt:  now.UTC(),
 		CLIVersion: cliVersion,
@@ -265,15 +293,15 @@ func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Ti
 	pruneVersionCheck(st.Servers)
 	b, err := json.Marshal(st)
 	if err != nil {
-		return err
+		return version, err
 	}
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
-		return err
+		return version, err
 	}
 	// 0644, like config.toml: this file holds a public version string and a hash.
 	// Written through writeFileAtomic rather than os.WriteFile — the rename REPLACES
 	// a symlink instead of following it, which a hand-rolled write would not.
-	return writeFileAtomic(s.versionCheckPath(), b, 0o644)
+	return version, writeFileAtomic(s.versionCheckPath(), b, 0o644)
 }
 
 // pruneVersionCheck drops the oldest entries until at most maxVersionCheckEntries

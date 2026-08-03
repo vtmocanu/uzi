@@ -242,6 +242,41 @@ func TestSkewWarningCachesAFailedProbe(t *testing.T) {
 	}
 }
 
+// 🔴 END-TO-END REGRESSION FOR THE ONE DEFECT THIS BRANCH SHIPPED: a transient outage
+// used to silence the warning for the rest of the TTL, and the recovery did not
+// restore it. Reproduced exactly as it was found — warn, blip, warn — and the third
+// command is the assertion.
+//
+// The store-level test covers the mechanism; this covers the WIRING, which is where
+// it actually bit: the hook took its own local `probed` variable rather than what the
+// store handed back, so the fix was invisible from the library's own tests.
+func TestSkewWarningSurvivesATransientProbeFailure(t *testing.T) {
+	withVersion(t, "v0.11.8")
+	env := skewEnv(t, nil)
+
+	up := behindServer()
+	env.NewClient = func(uzicli.Settings) uzicli.Client { return up }
+	_, err1, _ := runCLI(t, env, "run", "list", "--url", skewURL)
+	if !strings.Contains(err1, "is behind server 0.14.0") {
+		t.Fatalf("baseline command did not warn, so the rest proves nothing:\n%q", err1)
+	}
+
+	// The server has a bad moment, and `uzi version` is the amplifier: it writes the
+	// cache on every invocation regardless of freshness, so it is the most likely
+	// thing to poison it — and the command a user runs when they suspect trouble.
+	down := &uzicli.FakeClient{BuildErr: uzicli.Exitf(uzicli.ExitUnreachable, "dial tcp: connection refused")}
+	env.NewClient = func(uzicli.Settings) uzicli.Client { return down }
+	runCLI(t, env, "version", "--url", skewURL)
+
+	// Server healthy again — but the cache is still fresh, so nothing re-probes. The
+	// warning must come back from the preserved reading.
+	env.NewClient = func(uzicli.Settings) uzicli.Client { return behindServer() }
+	_, err3, _ := runCLI(t, env, "run", "list", "--url", skewURL)
+	if !strings.Contains(err3, "is behind server 0.14.0") {
+		t.Errorf("a transient probe failure silenced the warning for the rest of the TTL:\n%q", err3)
+	}
+}
+
 // Two servers, two truths. An unkeyed cache would apply one server's version to the
 // other, silently and plausibly, and this warning is a factual claim about the server
 // you are talking to.
@@ -433,6 +468,15 @@ func TestSkewWarningSanitizesTheServerString(t *testing.T) {
 		{"leading CR", "\r0.14.0", true},
 		{"trailing newline", "0.14.0\n", true},
 		{"trailing tab", "0.14.0\t", true},
+		// 🔴 THE TRIM HALF OF THE CLASS. Every row above is ALSO stripped by
+		// sanitizeTTY (they are unicode.IsControl), so all of them stay green with
+		// the trimming removed entirely — the guard they appear to pin is in fact
+		// unpinned by them. U+2028 (Zl) and U+00A0 (Zs) are NEITHER IsControl nor
+		// Cf, so sanitizeTTY leaves them alone and TrimSpace is the only thing
+		// standing between them and stderr. These two rows are the ones that
+		// discriminate.
+		{"trailing line separator", "0.14.0\u2028", true},
+		{"trailing no-break space", "0.14.0\u00a0", true},
 		// Valid semver by construction — the validity guard cannot help here.
 		{"unbounded build metadata", "0.14.0+" + strings.Repeat("A", 1<<20), false},
 	} {
@@ -563,18 +607,27 @@ func nonEmptyLines(s string) []string {
 	return out
 }
 
-// assertNoControlChars fails if s carries anything a terminal would act on: C0/C1
-// controls, DEL, or a Unicode format character (the bidi overrides among them).
-// Newline is the line separator and tab is spared by sanitizeTTY by design; cellText
-// folds tab to a space, so neither should reach a cell here.
+// assertNoControlChars fails if s carries anything a terminal would act on or that
+// would silently restructure the line: C0/C1 controls, DEL, Unicode format characters
+// (the bidi overrides among them), and any whitespace other than the plain ASCII
+// space and the newline that separates lines.
+//
+// 🔴 THE WHITESPACE ARM IS NOT TIDINESS — it is what gives the U+2028 and U+00A0 rows
+// any power at all. Those two are Zl/Zs: sanitizeTTY does not touch them, so they are
+// held ONLY by TrimSpace, and a control-character-only assertion cannot see one
+// surviving. Neither can the one-line check, since Go splits lines on \n and a
+// U+2028 is not one.
+//
+// Every string this is used on is ASCII prose plus a version, so the plain space is
+// the only whitespace that legitimately appears.
 func assertNoControlChars(t *testing.T, s string) {
 	t.Helper()
 	for i, r := range s {
-		if r == '\n' {
+		if r == '\n' || r == ' ' {
 			continue
 		}
-		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
-			t.Errorf("control character %U at byte %d survived into output:\n%q", r, i, s)
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) || unicode.IsSpace(r) {
+			t.Errorf("control or exotic-whitespace character %U at byte %d survived into output:\n%q", r, i, s)
 			return
 		}
 	}
