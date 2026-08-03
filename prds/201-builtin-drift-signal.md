@@ -193,12 +193,22 @@ implementation on everything it covers.
 - `auditor`: reported — design wave at `a24961bf`. Found the user-scope name-collision case
   and the `dangerouslySetInnerHTML` constraint; confirmed the boot path.
 - `coder`: **delivered.** `bcd67c72` (api) + `10970920` (web), then `c3704d25` merging
-  `origin/main`. Re-gated green on the merged result. Three caveats carried forward, all
-  self-reported: criterion 5 is proved only BELOW the row fetch (`h.q` is a concrete
-  `*store.Queries`, so the wire path needs a live DB); the `dangerouslySetInnerHTML` sweep is
-  now 12 comment hits rather than 11, with still zero call sites, the 12th being its own
-  comment explaining the ban; and this worktree's `web/node_modules` is a real directory
-  rather than a symlink into `main/`, because `npm install` replaced it.
+  `origin/main`. Re-gated green on the merged result. Now mid-fix-round on Amendments 3-4.
+  Three self-reported caveats, two of which the reviewer then SHARPENED rather than confirmed:
+  - **Criterion 5's residual is FOUR LINES WITH NO BRANCHES**, not "everything below the row
+    fetch". `h.q` is a concrete `*store.Queries` (`handler.go:38`) so no fake substitutes
+    without a database — but what that leaves untested is `loadTemplateForWrite`, which is
+    **pre-existing, route-agnostic, and already carries three production write handlers**
+    (Update, Delete, Reset). Every decision the new route makes — authz, its ordering before
+    the builtin check, the 400, the 409, the 200 body — is below the split and pinned by
+    `TestWriteBuiltinDefinitionStatusMatrix`. The true gap is only that
+    `GetBuiltinAgentTemplate` wires the two together in that order, which nothing pins. The
+    original wording understated how little is actually below and should not be repeated.
+  - The `dangerouslySetInnerHTML` count — see Amendment 3 R4; every number was right in a
+    unit nobody stated.
+  - This worktree's `web/node_modules` is a real directory rather than a symlink into
+    `main/`, because `npm install` replaced it. (Not a hazard: `web/` has no `agent-browser`
+    dependency, so CLAUDE.md's clobber warning is about `agent/` and does not apply.)
 - `reviewer`: dispatched at `10970920`, re-pointed to `c3704d25`.
 - `auditor`: dispatched at `10970920`, re-pointed to `c3704d25`.
 - `tester`: dispatched at `10970920`, re-pointed to `c3704d25`. Given the six behaviours to
@@ -439,11 +449,29 @@ the reference). Nothing mutates in place today and the per-column fixture assert
 catch it — filed because a shared-baseline fixture whose two sides can move together is the
 exact failure the separate-constant design exists to remove.
 
-**R4. LEAD CORRECTION, off by one:** the roster's caveat says the `dangerouslySetInnerHTML`
-sweep is "12 comment hits". Measured at `c3704d25` it is **13 OCCURRENCES across 12 FILES**
-(`RunEvent.tsx` carries two), all comments, zero call sites. The change added two, not one.
-Criterion 7 holds either way because the property is *zero call sites*, not a count — which is
-the reason to state the unit rather than the number.
+**R4. THE `dangerouslySetInnerHTML` COUNT: every number in circulation was correct, in a unit
+nobody stated.** Measured by the reviewer across four refs, both units:
+
+```
+ref                        files   occurrences
+25ebcd39 (branch base)        10            11
+541c2c0b (scope base)         10            11
+10970920 (scope tip)          12            13
+b0dc8dad (committed tip)      12            13
+```
+
+The brief's original "11 hits" was an **occurrence** count; the coder's "now 12" is a **file**
+count. Both true. The sentence comparing them crosses units, and because 11 and 12 are
+adjacent it reads as "+1" when the change actually added **two files and two occurrences** —
+`RunEvent.tsx` carrying two is the whole discrepancy. The reviewer's own N1 ("13, off by one
+from 12") made the same error in the opposite direction, comparing its occurrence count to a
+file count *in a finding about unit confusion*, and retracted it.
+
+**Criterion 7 is unaffected by all of this, because the property is ZERO CALL SITES, not any
+count.** Confirmed independently, and the first instrument used was itself unsound: a negated
+bracket expression under `grep -E` on a host where `grep` is ugrep is the documented defect,
+so it was calibrated against a two-line fixture holding one real call site and one comment
+before being trusted. **Report the property; state the unit whenever a count appears at all.**
 
 ### Amendment 2 — 2026-08-03, audit findings at `c3704d25` (ACCEPTED, fix not yet dispatched)
 
