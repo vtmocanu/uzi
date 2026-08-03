@@ -308,28 +308,61 @@ distills all 11 library roles, and its missing-builtin check goes red on
   SHA. Explicitly states that a stamp bump without a body port is the one thing
   no tooling here can catch (Decision 2).
 
+### Phase 2 — reaching a running install (folded in from #201, 2026-08-03)
+
+M1-M7 above get the **right role bodies into the repo**. They do not get them into
+anybody's uzi. `agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <> 'user'
+DO NOTHING` and `agent_templates_builtins.go` says it plainly — *an existing row
+(builtin or admin-edited) is never overwritten* — so a shipped prompt change is
+**inert on every install that has booted once**, including dev-cluster. The recovery
+today is admin-only per-template **Reset to default**, verbatim, no merge.
+
+That was filed as **#201** and is folded here because the two halves are one pipeline
+(library → repo → running install) and neither delivers the actual goal alone. Folding
+also puts the whole thing under one Decision Log, which is what would have prevented
+the duplicate #202 was.
+
+**These are gated behind M1 and ship as independent MRs, the way PRD #103's milestones
+did** — folding does not make this one large change.
+
+- [ ] **M8 — `version` persisted.** Migration adding the column to
+  `agent_templates` (Decision 8 previously deferred exactly this), plus the DTO and
+  the reconcile path that writes it on insert. **`lead` stays unstamped per M2** and is
+  covered by M9's hash instead.
+- [ ] **M9 — A content hash beside the version, because a version is not sufficient.**
+  A **version** answers *which library revision is this body derived from*; a **hash**
+  answers *has this row been touched*. **An admin editing a stored prompt bumps no
+  version**, so drift detection cannot work on versions alone — and the hash is also
+  what covers `lead`, which has no upstream number to carry. Establish both at reconcile
+  time.
+- [ ] **M10 — The drift signal.** Admin-visible: this builtin has an upstream change
+  pending. Today the only way to know is to have read a changelog, which is why #197's
+  fix is sitting unapplied.
+- [ ] **M11 — The update policy, and this is the hard part, not the schema.** What
+  happens to a row an admin has edited. The cheapest defensible shape, using M9's hash:
+  **auto-update rows still byte-identical to the shipped default** — provably
+  uncustomized, which is most installs — and **flag the rest for a manual diff**, never
+  overwriting anyone's work. Decide it in the Decision Log before writing the migration;
+  the edit-preserving behaviour in `ON CONFLICT … DO NOTHING` is **correct** and must not
+  simply be reversed. A third option between *never update* and *discard everything* is
+  the entire product of this phase.
+
 ## Out of Scope
 
 - **Generic-body / `## For this repo` tail split for builtins** — dropped, see
   Decision 1.
-- **Persisting `version` to `agent_templates`, the API DTO, the admin UI, or the
-  CLI** — Decision 8. **The follow-up is now filed: #201** (a shipped builtin
-  prompt change never reaches an already-seeded install, because
-  `agent_templates.sql:74` is `ON CONFLICT (name) … DO NOTHING`). M1 here is its
-  prerequisite, and #201 is where the schema column, the drift signal and the
-  policy call about admin-edited rows belong.
+- ~~**Persisting `version` to `agent_templates`, the API DTO, the admin UI, or the
+  CLI**~~ — **no longer out of scope. Folded in as Phase 2 (M8-M11) on 2026-08-03**,
+  along with issue **#201**, which was the "follow-up issue to file" this entry
+  called for. Decision 8 deferred it when nobody had costed it; the cost turned out
+  to be four milestones that ship independently behind M1, and splitting the pipeline
+  across two artifacts is what produced the duplicate #202. See Phase 2 above for the
+  version-versus-hash distinction and the update-policy question, which is the real
+  work there.
 
-  **Note for #201, established 2026-08-03: a version is not sufficient on its
-  own and #201 will need a content hash as well.** M2 leaves `lead` unstamped,
-  which is right — `lead` has no library counterpart, so there is no honest
-  number to give it. But the deeper reason the gap does not matter is that the
-  two artifacts answer different questions: a **version** answers *which library
-  revision is this derived from*, and a **hash** answers *has this row been
-  touched*. An admin editing a stored prompt bumps no version, so drift
-  detection needs the hash regardless — at which point an unstamped `lead` is
-  covered by the same mechanism as an edited `coder`. Duplicate issue #202
-  proposed giving `lead` a uzi-owned `version: 1` instead; that was filed
-  without reading this PRD and is superseded by M2.
+  Duplicate issue **#202** separately proposed giving `lead` a uzi-owned
+  `version: 1`; that was filed without reading this PRD and is superseded by M2's
+  deliberately-unstamped `lead`, with M9's hash covering it instead.
 - **Byte-comparing builtin bodies against library bodies** — Decision 2/5;
   it would permanently redden four deliberately-adapted roles.
 - **Automating the port itself** (a generator that writes builtins from
