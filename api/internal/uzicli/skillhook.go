@@ -71,9 +71,6 @@ func (hm *HookManager) dir() string {
 func (hm *HookManager) settingsPath() string { return filepath.Join(hm.dir(), settingsFileName) }
 func (hm *HookManager) backupPath() string   { return filepath.Join(hm.dir(), settingsBackupName) }
 
-// SettingsPath is where the managed settings.json is (or would be).
-func (hm *HookManager) SettingsPath() string { return hm.settingsPath() }
-
 // HookInstallResult reports what InstallHook did.
 type HookInstallResult struct {
 	Path           string `json:"path"`
@@ -206,7 +203,7 @@ func sessionStartArray(root map[string]any) []any {
 	if !ok {
 		return nil
 	}
-	arr, _ := hooks["SessionStart"].([]any)
+	arr, _ := hooks[hookEvent].([]any)
 	return arr
 }
 
@@ -271,7 +268,7 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 		hooks = m
 	}
 	var sessionStart []any
-	if v, present := hooks["SessionStart"]; present {
+	if v, present := hooks[hookEvent]; present {
 		arr, ok := v.([]any)
 		if !ok {
 			return res, errSettingsMalformed
@@ -279,7 +276,7 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 		sessionStart = arr
 	}
 	sessionStart = append(sessionStart, canonicalMatcherObject())
-	hooks["SessionStart"] = sessionStart
+	hooks[hookEvent] = sessionStart
 	root["hooks"] = hooks
 
 	out, err := encodeSettings(root)
@@ -330,7 +327,7 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 	if !ok {
 		return res, nil
 	}
-	sessionStart, ok := hooks["SessionStart"].([]any)
+	sessionStart, ok := hooks[hookEvent].([]any)
 	if !ok {
 		return res, nil
 	}
@@ -369,9 +366,9 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 
 	// Prune empty containers, preserving all siblings.
 	if len(kept) == 0 {
-		delete(hooks, "SessionStart")
+		delete(hooks, hookEvent)
 	} else {
-		hooks["SessionStart"] = kept
+		hooks[hookEvent] = kept
 	}
 	if len(hooks) == 0 {
 		delete(root, "hooks")

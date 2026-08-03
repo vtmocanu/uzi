@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "check-docs": "node scripts/check-docs.mjs",
+    "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src",
+    "knip": "knip",
     "build": "npm run check-docs && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -26,6 +28,8 @@
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "jsdom": "^25.0.1",
+    "knip": "6.31.0",
+    "oxlint": "1.76.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.6.3",

@@ -102,7 +102,16 @@
 # RUNS, and python's code was reported as task's. Reporting-failure form (1) in
 # CLAUDE.md's gate-status entry, committed inside a note about exit codes.)
 #
-# NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
+# NO DEPENDENCY INSTALL STEP, DELIBERATELY - WITH ONE EXCEPTION SINCE PRD #103 M3,
+# NAMED HERE BECAUSE AN UNQUALIFIED CLAIM IS WORSE THAN A QUALIFIED ONE.
+# `lint:api` / `lint:controller` invoke `go run …golangci-lint@v2.12.2`, which on a
+# cold cache FETCHES AND BUILDS that tool's whole dependency tree - 51.6s measured,
+# recorded beside the target. It is a pinned, sumdb-verified, module-scoped fetch
+# that writes nothing to either go.mod (the same shape as validate:api's
+# `sqlc@v1.30.0`), so it does not install a PROJECT dependency and nothing below
+# changes. But "installs nothing" is now false as stated, and a reader trusting it
+# will be surprised by a 51.6s first run. Everything else still holds:
+# no `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
@@ -152,7 +161,7 @@ tasks:
       - task: gate:agent
 
   gate:api:
-    desc: api - fmt-check, vet, build, test
+    desc: api - fmt-check, vet, build, lint, deadcode, test
     cmds:
       # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
       # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
@@ -161,26 +170,65 @@ tasks:
       - task: fmt-check:api
       - task: vet:api
       - task: build:api
+      # lint AFTER build and BEFORE test, and the ordering is asymmetric with the
+      # npm gates below on purpose (PRD #103 M3). AFTER build because
+      # golangci-lint TYPE-CHECKS: on a tree that does not compile it reports
+      # `typechecking error` instead of the build error, which is a worse message
+      # for the same defect. BEFORE test because it is seconds against test:api's
+      # -race run.
+      - task: lint:api
+      # deadcode AFTER lint, and the ordering has a CALIBRATION consequence that
+      # is not obvious from the cost (PRD #103 M4). golangci-lint's `unused`
+      # reports unused UNEXPORTED symbols; deadcode reports unreachable functions
+      # whether exported or not. So an unexported dead function reddens `lint:api`
+      # first and THIS TARGET NEVER RUNS - anyone calibrating the dead-code slot
+      # with one demonstrates M3's linter while believing they demonstrated M4's.
+      # Measured 2026-08-02: on a two-function scratch module, `unused` reports
+      # only the unexported one and deadcode reports both. Calibrate with an
+      # EXPORTED symbol. (After build, for the same reason lint is: deadcode
+      # loads and type-checks packages, and on a tree that does not compile it
+      # exits 1 with a load error rather than a build error.)
+      - task: deadcode:api
       - task: test:api
 
   gate:controller:
-    desc: controller - fmt-check, vet, build, test
+    desc: controller - fmt-check, vet, build, lint, deadcode, test
     cmds:
       - task: fmt-check:controller
       - task: vet:controller
       - task: build:controller
+      # Same ordering and the same reasons as gate:api above, including why
+      # deadcode sits after lint.
+      - task: lint:controller
+      - task: deadcode:controller
       - task: test:controller
 
   gate:web:
-    desc: web - check-docs, typecheck, test
+    desc: web - lint, deadcode, check-docs, typecheck, test
     cmds:
+      # lint FIRST here, which is the MIRROR IMAGE of the Go gates above and is
+      # deliberate rather than inconsistent (PRD #103 M3). oxlint is measured at
+      # ~0.06s, two orders of magnitude cheaper than anything else in this gate,
+      # and unlike golangci-lint it is NOT type-aware - so it has no ordering
+      # dependency on a build and nothing is gained by deferring it. Same reason
+      # M2 put fmt-check first in gate:api.
+      - task: lint:web
+      # knip SECOND, on the same cheap-first principle: ~1-3s WALL, against
+      # ~5s for typecheck and ~10s for vitest. It has no ordering dependency on
+      # a build or a typecheck either - knip 6 resolves with oxc-resolver and
+      # does not run tsc.
+      - task: deadcode:web
       - task: check-docs:web
       - task: typecheck:web
       - task: test:web
 
   gate:agent:
-    desc: agent - typecheck, test
+    desc: agent - lint, deadcode, typecheck, test
     cmds:
+      # lint first, same reason as gate:web (~0.05s here).
+      - task: lint:agent
+      # knip second, same reason as gate:web (~1-3s wall here too).
+      - task: deadcode:agent
       - task: typecheck:agent
       - task: test:agent
 
@@ -203,6 +251,44 @@ tasks:
     cmds:
       - task: fmt-check:api
       - task: fmt-check:controller
+
+  lint:
+    # EXTENSIBLE, NOT CLOSED — and it composes MORE than fmt-check above does, so
+    # do not copy that target's scope along with its shape. `fmt-check` composes
+    # TWO targets because only the Go modules have a format check; `lint` composes
+    # ALL FOUR components today, and PRD #103 M5 appends `lint:shell` and
+    # `lint:yaml` to this same list. Fail-fast for the same reason every other
+    # composed target here is.
+    desc: lint all four components today (extensible - M5 appends shell and YAML)
+    cmds:
+      - task: lint:api
+      - task: lint:controller
+      - task: lint:web
+      - task: lint:agent
+
+  deadcode:
+    # ONE SLOT, ONE PREFIX, FOUR COMPONENTS (PRD #103 M4). The npm half is knip
+    # rather than `deadcode`, and `deadcode:web` is therefore slightly imprecise -
+    # knip also reports unused FILES and unused DEPENDENCIES. That is the same
+    # imprecision `lint:web` already carries (oxlint is not golangci-lint), and it
+    # is preferred to a second prefix: the `dead code` row of the paste-block in
+    # `.claude/agent-team.md` is ONE line, and a `knip:web` target would split one
+    # slot across two prefixes for a reader who has to type both.
+    #
+    # WHAT THIS SLOT DOES NOT COVER, stated here because the alternative is a slot
+    # implying coverage it lacks: DEAD BRANCHES. `deadcode` finds unreachable
+    # FUNCTIONS and knip finds unused EXPORTS/FILES/DEPS; neither can see a `case`
+    # arm that nothing reaches inside a live function. The known live example is
+    # PRD #99's legacy `case "Task":` arms in `web/src/components/RunEvent.tsx`,
+    # still present, and NOT a valid probe for this slot for exactly that reason -
+    # it would produce a clean "no findings" from a working tool. Dead branches
+    # stay the reviewer's job.
+    desc: dead-code detection across all four components (deadcode + knip)
+    cmds:
+      - task: deadcode:api
+      - task: deadcode:controller
+      - task: deadcode:web
+      - task: deadcode:agent
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
@@ -316,6 +402,318 @@ tasks:
     cmds:
       - go build ./...
 
+  lint:api:
+    desc: golangci-lint over the api module (RATCHETED to origin/main - see .golangci.yml)
+    dir: api
+    cmds:
+      # 🔴 READ `.golangci.yml` BEFORE THIS TARGET. THE LOAD-BEARING CONFIGURATION
+      # IS NOT VISIBLE IN TASK'S ECHO, AND THAT IS THIS MILESTONE'S ONE DELIBERATE
+      # WEAKENING OF A MECHANISM THIS FILE RELIES ON. The header above says the
+      # echo is how a teammate notices a load-bearing flag going missing; for the
+      # RATCHET that property is now absent, because
+      # `issues: {new-from-merge-base: origin/main, whole-files: true}` lives in
+      # `.golangci.yml` rather than on the command line. Traded deliberately: the
+      # CLI form would have to be spliced into this line (banned by the header) or
+      # set in the CI job only (which makes local and CI disagree about what a
+      # finding IS - the exact divergence PRD #103 Success Criterion 1 exists to
+      # prevent). One recipe, byte-identical locally and in CI, was worth the echo.
+      #
+      # PRE-FLIGHT, AND IT IS NOT DEFENSIVE PADDING. If the ratchet cannot resolve
+      # its base, golangci-lint does NOT skip it and does NOT error: it emits ONE
+      # line - `level=warning msg="[runner] Can't process results by diff
+      # processor…"` - and then reports the ENTIRE unfiltered backlog with exit 1.
+      # It fails CLOSED, loudly, and in the most misleading possible way: the first
+      # reader sees ~107 findings, concludes the branch broke something enormous,
+      # and starts a burn-down when the fix is one `git fetch`. This line converts
+      # that misleading red into an accurate one.
+      #
+      # 🔴 THE PREDICATE IS `git merge-base`, NOT `git rev-parse`, AND THE
+      # DIFFERENCE IS A REAL HOLE THAT SHIPPED FIRST. This guard was originally
+      # `git rev-parse --verify -q "origin/main^{commit}"`, which asks whether the
+      # REF EXISTS. What golangci-lint needs is a REACHABLE COMMON ANCESTOR - its
+      # own error text is `error executing "git merge-base origin/main HEAD"` - and
+      # those are not the same question on a SHALLOW clone, which is exactly what
+      # CI produces. Measured in a CI-shaped scratch repo (feature branch cloned
+      # --depth 1, then the lint job's own explicit fetch of main):
+      #
+      #   shallow?                                     YES
+      #   git rev-parse --verify origin/main^{commit}  rc=0   <- GUARD SATISFIED
+      #   git merge-base origin/main HEAD              rc=1   <- no common ancestor
+      #   after `git fetch --unshallow`                rc=0
+      #
+      # So the ref resolved, the old guard passed, and the run took precisely the
+      # misleading path the guard exists to prevent. `merge-base` STRICTLY SUBSUMES
+      # the old check rather than adding to it: on a MISSING ref it exits 128
+      # (measured), so the case rev-parse did catch is still caught, and it also
+      # catches the shallow case rev-parse cannot see. One predicate, both failures.
+      # Do not "restore" the rev-parse form or add it alongside - it tests a weaker
+      # premise than the thing it is guarding.
+      #
+      # `exit 2` NOT `exit 1`, matching fmt-check:api's convention above:
+      # 2 = the instrument is broken, 1 = there are findings. `task`'s own rc is
+      # 201 for both, so the recipe is the only place that distinction can live.
+      #
+      # LITERAL REF, NEVER A VARIABLE. `git check-ref-format --branch` accepts
+      # `a;b`, `a$b`, backticks, `a|b`, `a&b`, `a(b)` as branch names - only a
+      # space is rejected - and anyone who can open an MR chooses the target
+      # branch, so `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen
+      # string with live metacharacters. Quoted here even though it is a literal.
+      - 'git merge-base "origin/main" HEAD >/dev/null 2>&1 || { echo "lint: no merge-base between origin/main and HEAD - either the ref is missing, or this is a SHALLOW clone whose history does not reach a common ancestor. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fix the history first (CI: GIT_DEPTH=0 plus an explicit git fetch; locally: git fetch origin main, and git fetch --unshallow origin if the clone is shallow)." >&2; exit 2; }'
+      # `config verify` AHEAD OF THE RUN: it is the positive control on the config
+      # this target's whole behaviour is delegated to. Exits 0 SILENTLY on a valid
+      # file and 3 with a named error otherwise - measured 2026-08-02 at 2.12.2, a
+      # bogus sibling key gives rc=3 and `additional properties 'no-such-key' not
+      # allowed`, so the green means something rather than merely meaning the
+      # parser did not crash. Cheap: ~0.9s warm.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
+      # PINNED `go run`, NOT A PREINSTALLED BINARY AND NOT THE OFFICIAL IMAGE.
+      # Written out in full rather than through a Taskfile var, deliberately: the
+      # header's echo property is what makes a version pin going missing VISIBLE,
+      # and it is the only such property this target still has (see the ratchet
+      # note at the top of this comment).
+      #   - Same shape as the `sqlc@v1.30.0` precedent already in validate:api.
+      #   - It pins the version IDENTICALLY local and in CI, which is what kills
+      #     the unpinned-local-binary divergence: a contributor's brew
+      #     golangci-lint drifts on its own schedule and would disagree with CI
+      #     about what a finding is.
+      #   - It does NOT touch api/go.mod. `go run pkg@version` resolves in its own
+      #     module context; verified, `git status -- api/go.mod api/go.sum` is
+      #     clean after a run. `go get -tool` would instead write golangci-lint's
+      #     whole dependency tree into api/go.mod, and this repo keeps that file
+      #     deliberately clean - the separate controller module exists precisely so
+      #     k8s.io/client-go stays out of it.
+      #   - NOT the official golangci/golangci-lint image: it ships Go 1.26.2 with
+      #     GOTOOLCHAIN=auto against both modules' `go 1.26.4`, so it would make
+      #     lint the first job in this pipeline whose effective toolchain is
+      #     FETCHED rather than pinned. The golang:1.26 image CI already pins is
+      #     1.26.4 with GOTOOLCHAIN=local.
+      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64 with isolated
+      # GOMODCACHE+GOCACHE: 51.6s COLD (first build of the dependency tree), then
+      # 1.77s and 0.89s WARM. CI persists both caches via .go_job's `cache:` keyed
+      # on api/go.sum, so the cold cost is per-cache-key, not per-pipeline.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+
+  lint:api:all:
+    desc: api - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
+    dir: api
+    cmds:
+      # 🔴 "NEVER GATING" MEANS NOT WIRED INTO ANYTHING - IT DOES NOT MEAN THIS
+      # TARGET EXITS 0. golangci-lint exits 1 whenever it reports a finding, so on
+      # a module with a backlog this target returns `task` rc=201, every time, by
+      # design. The two claims are independent and the `desc:` used to assert only
+      # the first, which reads as the second. Anyone who wraps this target, or adds
+      # a reporting job around it later, gets a red pipeline from something
+      # documented as non-gating - so if you build such a job, it needs an explicit
+      # `|| true` (or `allow_failure: true`) and a comment saying why.
+      #
+      # NOT IN `gate`, NOT IN THE COMPOSITE `lint`, NOT A CI JOB.
+      # `new-from-merge-base` reports nothing on a
+      # `main` pipeline (the merge-base of main with itself is main), so without
+      # this target the debt the ratchet defers would be uncountable.
+      #
+      # 🔴 THE FLAG NAME IS COUPLED TO THE CONFIG KEY AND THE TWO MOVE TOGETHER.
+      # An EMPTY `--new-from-merge-base=` is what clears a `new-from-merge-base`
+      # set in .golangci.yml. The two obvious alternatives DO NOT CLEAR IT and fail
+      # silently - measured 2026-08-02 on this tree against the shipped config:
+      #
+      #   --new-from-merge-base=  (empty)   rc=1   106 findings   <- cleared
+      #   --new-from-rev=         (empty)   rc=0     0 findings   <- STILL RATCHETED
+      #   --whole-files=false               rc=0     0 findings   <- STILL RATCHETED
+      #
+      # Neither of the last two errors. They yield a "full debt report" that is
+      # still filtered, so a companion target written either way reports `0 issues`
+      # over a module carrying 106 - the exact silent-green shape PRD #103 exists
+      # to remove. If the config key is ever renamed, rename this flag with it.
+      #
+      # 🔴 BOTH CAP FLAGS OR THE NUMBER IS A CAP READING. Defaults are 50 per
+      # linter and 3 per repeated message. THEY COMPOSE IN ORDER; NEITHER "OWNS" A
+      # LINTER. Measured on the shipped config, `cache clean` first, each flag
+      # isolated:
+      #
+      #   --new-from-merge-base=                            55   errcheck 36  staticcheck 13
+      #   + --max-issues-per-linter=0                       55   errcheck 36  staticcheck 13
+      #   + --max-same-issues=0                             77   errcheck 50  staticcheck 21
+      #   both                                             106   errcheck 79  staticcheck 21
+      #
+      # RE-DERIVED 2026-08-03 AT 1076b133 with a private GOLANGCI_LINT_CACHE (zero
+      # foreign paths in any cell); `controller` reads 5 in every cell, then and
+      # now. EVERY PER-LINTER FIGURE IS UNCHANGED - the totals each dropped by one
+      # because 6ea98493 wired up `const hookEvent` and consumed a pre-existing
+      # `unused` finding, so the tail is now unparam 4 + unused 2 = 6 against 7
+      # when M3 measured. The 120-vs-107 INCIDENT NARRATIVE further down keeps its
+      # own numbers on purpose: it describes one dated run, not the current tree.
+      #
+      # `--max-same-issues` folds duplicate MESSAGES first; `--max-issues-per-linter`
+      # then truncates the survivors at 50. So on this config `--max-issues-per-
+      # linter=0` ALONE IS A COMPLETE NO-OP - nothing exceeds 50 until the fold is
+      # lifted - and the per-linter flag's real effect here is ERRCHECK 50 -> 79,
+      # which exists only after the other flag has fired. Cite that pair, not
+      # 36 -> 79: no single flag produces 36 -> 79.
+      #
+      # AND `issues.uniq-by-line` DEFAULTS TO TRUE, DEDUPPING ACROSS LINTERS, so a
+      # single linter's count depends on which OTHERS are enabled: 106 becomes 107
+      # with `--uniq-by-line=false` (staticcheck 21 -> 22, that cell RE-RUN at
+      # 1076b133 rather than shifted on paper). One finding today, noted
+      # for M4/M5 because they add linters - this is how a staticcheck finding
+      # vanishes from an "unfiltered" total with nobody touching staticcheck.
+      #
+      # 🔴 WHICH MAKES THE OBVIOUS "IS THE SECOND FLAG LOAD-BEARING?" CHECK A TRAP.
+      # Add `--max-issues-per-linter=0` on its own, see 55 -> 55, conclude it does
+      # nothing, delete it: errcheck then reads 50 forever, which is exactly the cap
+      # reading this paragraph exists to prevent.
+      #
+      # 🔴 THE COMMIT MESSAGE THAT INTRODUCED THIS COMMENT (490df687) STILL CARRIES
+      # THE WRONG VERSION AND IS IMMUTABLE. If you find "errcheck 36→79 is
+      # --max-same-issues" in `git log`, THIS is the correction. Named explicitly so
+      # the history stays honest rather than merely contradicting itself, and so a
+      # reader who greps the log lands here instead of on two disagreeing sources.
+      #
+      # (Corrected 2026-08-02. This comment first read "errcheck 36→79 is
+      # --max-same-issues, staticcheck 13→21 is --max-issues-per-linter",
+      # attributing each delta to one flag from a 2-cell measurement that could not
+      # separate them. Refuted by a 2x2 and re-derived by the lead in the matrix
+      # above. The wrong version propagated out of THIS FILE into a PRD carry-forward
+      # before anyone re-measured, which is the real cost: a comment is a citation
+      # source, so an unsupported figure here does not stay here.)
+      #
+      # `controller` reads 5 EITHER WAY, AND THAT IS THE CAMOUFLAGE - anyone who
+      # sanity-checks "do the caps matter?" on the cheap module concludes no.
+      #
+      # No `origin/main` pre-flight here, deliberately: this target does not use
+      # the ref, so the guard would fail a run that is not exposed to the hazard.
+      #
+      # 🔴 `cache clean` FIRST, AND IT IS NOT HYGIENE - WITHOUT IT THIS TARGET
+      # REPORTS ANOTHER WORKTREE'S FINDINGS AS THIS ONE'S. golangci-lint's result
+      # cache is HOST-GLOBAL (~/Library/Caches/golangci-lint), shared by every
+      # sibling worktree of this bare clone exactly like the Go build cache. A warm
+      # entry from worktree B replays B's ABSOLUTE paths, and this target has no
+      # diff processor to drop them, so they are simply ADDED to the report.
+      # Measured 2026-08-02, with a validator's throwaway worktree warm in the
+      # cache: this target printed 120 findings, EVERY ONE carrying a path like
+      # `../../../../../../../../private/tmp/.../wt-r3/api/internal/...`; after
+      # `cache clean` it printed 107, all repo-root-relative. The recorded backlog
+      # figure is the 107.
+      #
+      # THE TWO ARE DISJOINT POPULATIONS FROM TWO RUNS, NOT 107 REAL PLUS 13 STALE.
+      # Measured from the surviving log: of the 120, ZERO were repo-relative and all
+      # pointed into a SINGLE foreign tree. So do not reason about a 13-finding gap;
+      # there is no decomposition. Why that tree's own count was 120 rather than the
+      # ~107 an identical checkout would give CANNOT BE ESTABLISHED - it was deleted
+      # and no log of it survives, which is the failure this whole paragraph is about
+      # arriving in the evidence for it.
+      #
+      # NOTE THE DIRECTION, because the documented version of this trap is the
+      # OPPOSITE one: a poisoned cache makes the RATCHETED target go falsely GREEN
+      # (the diff processor cannot match a foreign path against `git diff` and
+      # drops everything), while it makes THIS target falsely LOUD. Same cache, two
+      # inverted symptoms, and the quiet one is the dangerous half.
+      #
+      # IN THE RECIPE RATHER THAN IN A DOC, on purpose: this is a RECORDING target
+      # whose entire output is a number somebody writes down, so "remember to clean
+      # first" is the kind of discipline this repo removes rather than relies on.
+      # THE COST IS REAL AND SHARED: the cache is host-global, so this clears it for
+      # every concurrent agent and worktree too, and the next `lint:api` runs cold
+      # (~6-8s). That is why the clean lives HERE and NOT on `lint:api` /
+      # `lint:controller`, which run in the gate and on every MR.
+      #
+      # 🔴 RUNNING THIS BY HAND? SET `GOLANGCI_LINT_CACHE=<a private dir>` INSTEAD
+      # OF CLEANING. It gives the SAME isolation as `cache clean` with none of the
+      # shared cost the paragraph above concedes - nobody else's warm cache is
+      # touched, so a concurrent agent does not silently pay ~6-8s for your
+      # measurement. Verified honoured by golangci-lint 2.12.2, and it is what
+      # produced PRD #103 M4's re-derived isolation matrix with zero foreign paths
+      # in any cell. The `cache clean` stays IN THIS RECIPE because a target has to
+      # be correct for someone who sets no environment at all.
+      #
+      # THE TELL, if you ever see this target's output without the clean: any path
+      # containing `../`. A `../` in a finding is an invalid run, not a finding.
+      #
+      # 🔴 EXCEPT THAT THE TELL HAS A FALSE-POSITIVE MODE, and stated as a bare
+      # `../` check it has already made a validator DISCARD A VALID MEASUREMENT.
+      # golangci-lint bases every path on its CONFIG FILE'S directory, so a run
+      # driven by a config outside the repo prints `../` on EVERY path while being
+      # perfectly valid (the header of `.golangci.yml` documents the same mechanism
+      # from the other side). THE DISCRIMINATOR IS WHERE THE PATH LANDS, NOT THE
+      # PRESENCE OF `../`: resolve it, and ask whether it lands in this worktree or
+      # in a foreign tree.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+  deadcode:api:
+    desc: api - unreachable functions, gated against api/.deadcode-baseline (EMPTY)
+    cmds:
+      # 🔴 A SCRIPT, NOT AN INLINE RECIPE, AND THE ARGUMENT IS M5's. PRD #103 M5
+      # adds `shellcheck` over `git ls-files '*.sh'`, so a committed script gets
+      # LINTED and an inline Taskfile recipe gets nothing - yamllint checks YAML,
+      # not shell embedded in a `cmds:` string. Precedent in this repo:
+      # `scripts/assert-chart-render.sh`, invoked from the `helm_chart` job.
+      #
+      # 🔴 AND THE WRAPPER IS NOT ABOUT THE BASELINE. Both baselines ship EMPTY
+      # (see api/.deadcode-baseline's header). It exists because `deadcode` EXITS
+      # 0 WHETHER IT FINDS 0, 1 OR 44 DEAD FUNCTIONS - rc=1 only on a load error,
+      # and on that path stdout is 0 BYTES, so a naive additions-only diff reads
+      # a non-compiling module as clean and passes GREEN. The script reads rc
+      # before it reads output. Read its header before editing this target.
+      #
+      # THE PIN IS AN ARGUMENT RATHER THAN A SCRIPT DEFAULT, so this file's echo
+      # still shows it. The header calls that echo the mechanism by which a
+      # teammate notices a version pin going missing, and `lint:api` already
+      # spends one deliberate exception on it (the ratchet lives in
+      # `.golangci.yml`, invisible here). One is enough.
+      #
+      # PINNED `go run`, same shape as `sqlc@v1.30.0` in validate:api and
+      # `golangci-lint@v2.12.2` above: identical version local and in CI, and it
+      # writes nothing to api/go.mod. v0.48.0 is the current release; v0.38.0 was
+      # measured independently on this tree and gave IDENTICAL counts (1 for api,
+      # 0 for controller), which is worth more than a figure from one version.
+      #
+      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64: 2.7-3.2s warm, ~25s
+      # on a cold GOCACHE (x/tools' own dependency tree). deadcode has NO result
+      # cache of its own - checked for one, and cold and warm runs were
+      # byte-identical - so carry-forward item 4's poisoned-cache hazard, where
+      # golangci-lint replays a sibling worktree's absolute paths, has no analogue
+      # here. Neither does its host-global LOCK: three concurrent runs, no
+      # contention.
+      - ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+
+  deadcode:api:all:
+    desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
+    dir: api
+    cmds:
+      # 🔴 THIS TARGET EXITS 0 EVEN WHEN IT REPORTS, WHICH IS THE OPPOSITE OF
+      # `lint:api:all`. Read both `desc:` lines together: golangci-lint exits 1
+      # on a finding, deadcode exits 0 on any number of them. That asymmetry is
+      # precisely why the gating target above goes through a wrapper and this one
+      # does not need to - and it is why "the output is the signal here" has to be
+      # said out loud rather than left to be inferred from a green.
+      #
+      # WHY IT EXISTS AT ALL, given the baseline is the full record for the gating
+      # invocation: `-test ./...` makes a PRODUCTION-DEAD function invisible the
+      # moment any test calls it, and `golangci-lint unused` does not catch it
+      # either. Measured on a scratch module:
+      #
+      #   deadcode       ./...   ExportedNoCaller + unexportedNoCaller
+      #   deadcode -test ./...   <EMPTY>
+      #   golangci-lint unused   "0 issues."
+      #
+      # That is the commonest way dead code enters a repo with a testing culture -
+      # write the function, write its test, never wire it up - and it is a class
+      # the gating invocation cannot see at all, so the baseline is NOT the full
+      # record for it. `-test` is still the right GATING default: 32 of api's
+      # 43-finding delta are `FakeClient.*` methods on a test double, correctly
+      # suppressed.
+      #
+      # THE POSITIVE PAIR (carry-forward item 5): as of 2026-08-03 at 1076b133
+      # this prints 43 where `task deadcode:api` reports 0. A companion that
+      # reports one number needs the other to mean anything.
+      #
+      # THE SHA IS PART OF THE FIGURE, NOT DECORATION. This line read 44 for a
+      # day: 44 was measured before 6ea98493 deleted `HookManager.SettingsPath`,
+      # and the commit that WROTE the 44 landed after the one that invalidated
+      # it. A date cannot separate two commits landed the same afternoon, and
+      # both of these were. See PRD #103 Decision 10.
+      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
     dir: api
@@ -400,6 +798,70 @@ tasks:
     cmds:
       - go build ./...
 
+  lint:controller:
+    desc: golangci-lint over the controller module (RATCHETED to origin/main - see .golangci.yml)
+    dir: controller
+    cmds:
+      # Same recipe, same config, same reasons - READ lint:api's comment before
+      # editing either, INCLUDING the paragraph on why the pre-flight predicate is
+      # `git merge-base` and not `git rev-parse`. One root .golangci.yml serves both
+      # modules: golangci-lint
+      # walks UP from its working directory, and `dir:` here is what puts it inside
+      # the module. Verified from BOTH module directories before this shipped -
+      # `golangci-lint config path` prints `../.golangci.yml` from each, and the
+      # control run matters as much: before the file existed the same command
+      # printed `No config file detected`, so nothing stray was being resolved from
+      # outside the repo.
+      #
+      # This module ships with a SMALL backlog, not an empty one: 5 findings
+      # uncapped (3 staticcheck, 2 errcheck) as of 2026-08-02. Ratcheted it reports
+      # 0 today, which is not the same thing as there being nothing there - run
+      # `task lint:controller:all` to see it.
+      - 'git merge-base "origin/main" HEAD >/dev/null 2>&1 || { echo "lint: no merge-base between origin/main and HEAD - either the ref is missing, or this is a SHALLOW clone whose history does not reach a common ancestor. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fix the history first (CI: GIT_DEPTH=0 plus an explicit git fetch; locally: git fetch origin main, and git fetch --unshallow origin if the clone is shallow)." >&2; exit 2; }'
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+
+  lint:controller:all:
+    desc: controller - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
+    dir: controller
+    cmds:
+      # Exits nonzero whenever it reports anything, exactly like lint:api:all -
+      # read that target's first paragraph before wrapping either, and its
+      # `cache clean` paragraph before deleting the line below as redundant.
+      #
+      # See lint:api:all for why the empty `--new-from-merge-base=` is the only
+      # spelling that clears the config's ratchet, and why both cap flags are
+      # required. THIS is the module where the caps make no difference (5 either
+      # way) - which is exactly why a "do the caps matter?" check must be run
+      # against `api`, not here.
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+  deadcode:controller:
+    desc: controller - unreachable functions, gated against controller/.deadcode-baseline (EMPTY)
+    cmds:
+      # Same script, same pin, same reasons - read deadcode:api's comment before
+      # editing either. This module reported ZERO findings under the gating
+      # invocation when M4 landed, so nothing was deleted to reach zero here; the
+      # target exists to keep it there. An empty backlog is not the same thing as
+      # a no-op (fmt-check:controller shipped under the same argument).
+      - ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0
+
+  deadcode:controller:all:
+    desc: controller - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
+    dir: controller
+    cmds:
+      # Exits 0 even when it reports - see deadcode:api:all's first paragraph, and
+      # do not "fix" that by wrapping this target.
+      #
+      # THIS MODULE IS THE ONE THAT MAKES THE COMPANION'S CASE. It reads 0 under
+      # the gate and FOUR here (`SpecHashOf`, `SizeNames`, `TemplateNames`,
+      # `keys`), and all four are the write-it/test-it/never-wire-it shape: three
+      # are exported, so `golangci-lint unused` does not report them, and the
+      # fourth is called by two of the other three within its own package, so
+      # `unused` considers it used. Nothing else in the gate sees them.
+      - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+
   test:controller:
     desc: controller unit tests (-count=1)
     dir: controller
@@ -414,6 +876,90 @@ tasks:
       - go test -count=1 ./...
 
   # ------------------------------------------------------------- web (npm) ----
+  lint:web:
+    desc: oxlint over web/src (correctness + react-hooks/rules-of-hooks)
+    dir: web
+    cmds:
+      # DELEGATES TO package.json's `lint` SCRIPT, as this file's header requires
+      # of every npm target: a target that reimplements the command drops whatever
+      # flags the script encodes, SILENTLY. Here that is not hypothetical - the
+      # script carries BOTH halves of this gate's severity, and each is a documented
+      # silent-no-op if dropped:
+      #
+      #   --config .oxlintrc.json   oxlint WALKS UP for .oxlintrc.json, so without
+      #                             an explicit --config a stray root config would
+      #                             silently govern both packages; and with the file
+      #                             renamed or deleted, a bare `oxlint src` reverts
+      #                             to the WARNING tier and exits 0 on a real
+      #                             violation, while --config exits 1 with
+      #                             `Failed to parse config … NotFound`.
+      #   -D correctness            🔴 `oxlint src` EXITS 0 WHILE REPORTING
+      #                             FINDINGS. correctness defaults to WARNING
+      #                             severity and warnings do not set the exit code,
+      #                             so a target without this flag is a lint job that
+      #                             CAN NEVER FAIL. Measured: the bare invocation
+      #                             exits 0 on web's 6 findings.
+      #   --report-unused-disable-directives-severity=error
+      #                             🔴 A SUPPRESSION THAT NO LONGER SUPPRESSES
+      #                             ANYTHING IS INVISIBLE WITHOUT THIS, and it reads
+      #                             to every later reviewer as a live, justified
+      #                             one. That is the vacuous-negative class arriving
+      #                             through a COMMENT instead of an assertion - the
+      #                             same shape .claude/agent-team.md records for a
+      #                             negative assertion on retired copy. This MR ships
+      #                             11 new directives, so the exposure is its own.
+      #                             Measured on this tree: a directive for a rule
+      #                             that does not fire gives rc=1 and `Unused
+      #                             eslint-disable directive (no problems were
+      #                             reported)`, while the SAME tree without the flag
+      #                             gives rc=0 and prints nothing. The plain
+      #                             `--report-unused-disable-directives` form only
+      #                             WARNS, and a warning does not set the exit code
+      #                             here either - the `-severity=error` suffix is
+      #                             the whole point. Verified it does not fire on
+      #                             any of the 13 live directives in this repo.
+      #
+      # AND THIS FLAG IS NOT THE GUARD FOR `rules-of-hooks`, which is what this
+      # milestone exists for: that rule is `pedantic`, not `correctness`, so
+      # `-D correctness` cannot reach it. Its severity is promoted at RULE level in
+      # web/.oxlintrc.json. Read that file; Task's echo shows only `npm run lint`,
+      # so neither of these lives anywhere the echo can protect.
+      #
+      # NEVER A BARE `npx oxlint`: npx FETCHES FROM THE NETWORK when the dep is
+      # missing, which a gate may not do. `npm run` puts node_modules/.bin on PATH
+      # and fails closed with `command not found` instead.
+      - npm run lint
+
+  deadcode:web:
+    desc: knip over web - unused files, exports, deps (see web/knip.jsonc for staging)
+    dir: web
+    cmds:
+      # DELEGATES TO package.json's `knip` SCRIPT, as this file's header requires of
+      # every npm target. That script is a BARE `knip` on purpose: every flag lives
+      # in `web/knip.jsonc`, so there is nothing here for a rewrite to drop
+      # silently, and `web/package.json` (a documented three-way contention point
+      # across this PRD's milestones) carries the smallest possible line.
+      #
+      # NEVER A BARE `npx knip`: npx fetches from the network when the dep is
+      # missing, which a gate may not do. `npm run` puts node_modules/.bin on PATH
+      # and fails closed with `command not found`.
+      #
+      # 🔴 WHAT GATES AND WHAT DOES NOT, because a green here does NOT mean "no
+      # unused exports". `web/knip.jsonc` stages `exports`/`types` and the rest of
+      # that family at `warn`, and WARN-SEVERITY ISSUES ARE PRINTED IN FULL AND DO
+      # NOT SET THE EXIT CODE. As of 2026-08-02 that is 22 findings on this package
+      # (9 exports + 13 exported types), reported on every run and gating nothing;
+      # unused FILES and DEPENDENCIES gate at zero. `--max-issues` is NOT a fallback
+      # for the warn tier - measured, it counts error-severity issues only and exits
+      # 0 with the warn findings printed. Burning the export tier down and promoting
+      # it to `error` is issue #206, not this milestone.
+      #
+      # 🔴 AND NEVER ADD `--fix`. knip's fix mode edits files in the repo (it strips
+      # `export` keywords, and with --allow-remove-files deletes files). Nothing in
+      # the gate may be a fixing variant - the same rule that makes the format slot
+      # `fmt-check` rather than `fmt`.
+      - npm run knip
+
   check-docs:web:
     desc: docs frontmatter + relative-link lint
     dir: web
@@ -436,6 +982,37 @@ tasks:
       - npm test
 
   # ----------------------------------------------------------- agent (npm) ----
+  lint:agent:
+    desc: oxlint over agent/src and agent/test (correctness tier)
+    dir: agent
+    cmds:
+      # Delegates to package.json's `lint` script for the same reasons lint:web
+      # does - read that target's comment, both flags are load-bearing there too.
+      # One difference worth knowing before you copy this: agent/.oxlintrc.json
+      # does NOT list the `react` plugin, because this package has no React. Its
+      # findings come from the unicorn/typescript/oxc defaults, which that file
+      # re-lists because `plugins` REPLACES the default list rather than extending
+      # it.
+      #
+      # Scoped `src test` rather than `src`: unlike web/, this package's tests live
+      # OUTSIDE src/, and 7 of its 10 baseline findings are in test/.
+      - npm run lint
+
+  deadcode:agent:
+    desc: knip over agent - unused files, exports, deps (see agent/knip.jsonc for staging)
+    dir: agent
+    cmds:
+      # Same delegation, same bans, same staging - read deadcode:web's comment
+      # before editing either. Two differences specific to this package:
+      #
+      #   - the debt is LARGER: 53 warn-tier findings as of 2026-08-02 (35 exports +
+      #     18 exported types) against web's 22.
+      #   - `agent-browser` is in `ignoreDependencies`, because it is resolved BY
+      #     PATH at runtime rather than by an import. `agent/knip.jsonc` states why;
+      #     deleting that line makes knip demand the removal of a dependency the
+      #     worker image genuinely needs.
+      - npm run knip
+
   typecheck:agent:
     desc: tsc --noEmit over agent
     dir: agent

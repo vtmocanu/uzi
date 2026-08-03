@@ -14637,6 +14637,43 @@ across all remotes"**, swept at write time, then re-derived above the live head 
 landing per the goose-style renumber rule. The 447–454 gap here is intended; closing
 it recreates the collision.
 
+**🔴 AND THE LAYOUT RULE, WHICH THE PARAGRAPH ABOVE LEAVES UNSAID AND WHICH THIS VERY
+BLOCK IS THE COUNTER-EXAMPLE TO: THIS FILE IS *NOT* ORDERED BY SECTION NUMBER. New
+sections are APPENDED AT THE TAIL, in LANDING order.** Numbers ascend within any
+contiguous run of appends because *allocation* is monotonic — not because anything
+sorts them, and nothing ever re-sorts them. Read the file from §446 and you get
+**446 → 455-460 → 447-454 → 461-463**, which is not a mistake and must not be
+"tidied": §455-460 (this block) were written while 447-454 were **reserved but not yet
+landed**, so when those later landed they appended at what was by then the tail —
+**below** the block that had skipped over them. That is the paragraph above happening
+one level down, and it is permanent.
+
+**Two consequences worth having before you touch the tail.** *Numeric order is a
+property of the recent tail, not of the file*, so a merge that interleaves two branches'
+sections numerically is right only when allocation order happens to agree — it does
+whenever neither branch allocated below the other, and it will not the first time one
+does. *(Checked at the `origin/main` merge into `feature/prd-103-m3-m6`, `88f0bde7`:
+ours 468-471 + 473-474 against main's 467 + 472, allocation and numeric order
+coincided, so the union is in both orders at once and settles nothing about the
+general case.)* And **a section's position is not evidence of anything** — not of
+recency, not of topic, **and the `# <topic>` H1 above it is not evidence either.** An
+H1 marks where a topic block *began*; everything appended afterwards inherits it
+regardless of subject, because append-at-tail does not consult it. Measured at HEAD:
+`# PRD #88` covers §455-460 (PRD #88), §447 (**Issue #177**), §448-454 (**PRD #175**)
+and §461-463 (**PRD #119**) — four subjects under one heading — and `# PRD #103` does
+the same to §465, §467 and §472. **The only reliable topic signal is the section's own
+title**, which always names its PRD or issue. *(This clause first read "use the H1
+headings … for that", which pointed the reader at a second unreliable instrument for
+exactly the reason the first one is unreliable. Caught before it left this worktree,
+by checking a claim that had just been agreed to rather than the one under dispute.)*
+Use the titles and their cross-references; §444's title points forward at §447 across an intervening stretch that
+includes the whole of this PRD #88 block, which is how this file carries a relation it
+cannot express by adjacency. *(Deliberately not "across N sections". That count is a
+tally over a population this file exists to grow, and the first draft of this sentence
+said **five** where the answer was **eight** — caught by re-checking a number the
+author had carried from their own previous commit rather than derived. The immutable
+version is in `88f0bde7`'s merge message; this is the correction it points to.)*
+
 ## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
 
 - **A new status, not a reuse.** The obvious economy — park a question in
@@ -15802,8 +15839,10 @@ changing nothing.
 
 - **Why a build-tooling milestone is recorded here at all.** Almost every section in this file
   rests on a gate having actually executed, and four flags are the only thing that makes that
-  true: `-count=1` (both Go modules), `-race` (api), `-p 1` (store-it), `--test-timeout=30000`
-  (agent). Each is a separately measured fix **whose absence is invisible in the output** — the
+  true: `-count=1` (both Go modules), `-race` (api), `-p 1` (store-it), `--test-timeout=120000`
+  (agent — **raised from `30000` on 2026-08-03 in `48689619`; it was binding in CI and nowhere
+  else, see the `test:agent` bullet below**). Each is a separately measured fix **whose absence
+  is invisible in the output** — the
   suite still prints `ok`, still exits 0. Relocating them into a new file *is* the "a future
   simplify-the-gate edit" the `test:api` comment already named as the live threat. So the
   invariants below constrain any rebuild; **the target list does not and is deliberately not
@@ -15864,12 +15903,30 @@ changing nothing.
   contributor's lever.
 - **npm targets delegate to the existing `package.json` script and must keep doing so.** A target
   written `npm test` inherits whatever flags the script encodes; one that reimplements the command
-  drops them **silently**. The live instance is `test:agent`, where `--test-timeout=30000` lives in
+  drops them **silently**. The live instance is `test:agent`, where `--test-timeout=120000` lives in
   the script and node's own default is *no* timeout. *(Corrected 2026-08-02, hours after this
   section was written: a spelled-out `node --import tsx --test` does not reproduce a hang on node
   v26.4.0 — measured identical to `npm test`. The cap stays live regardless — a 3s test body under
-  `--test-timeout=1000` is cancelled — so delegating is insurance against a future slow test, not a
-  fix for a present hang.)*
+  `--test-timeout=1000` is cancelled.)*
+
+  *🔴 **AND THE CONCLUSION THAT PARENTHETICAL DREW IS NOW FALSE, WHICH MATTERS MORE THAN THE
+  DIGITS.** It closed "delegating is insurance against a **future** slow test, not a fix for a
+  **present** hang" — and on 2026-08-03 the cap bound for real, in CI, at the value this file
+  was quoting. `48689619` raised it `30000 → 120000` after `test:agent` went **fail, fail, pass
+  on three retries of ONE UNCHANGED COMMIT** (pipeline 20258, `duration_ms: 30003`,
+  `runner.test.ts`). The hang was present, not future; it was simply not present **here**.*
+
+  *The mechanism is the durable part and it generalises past this flag: **what
+  `--test-timeout` governs differs by node major**, so a per-test cap silently becomes a
+  per-FILE cap when isolation changes — which is why the local measurement that produced the
+  wrong conclusion ("every body in this suite finishes in under a second") was **true and
+  useless**. Local and CI were not measuring the same quantity. So the safe reading of any
+  timeout is **the tightest thing it might bind**, checked against whichever environment runs
+  the slowest node. Two consequences this file already knows in other clothes: the failure
+  reports as `cancelled` with `fail 0` and a SHRUNK TAP plan (`1..207` → `1..202`), which is
+  §464's own "absence is invisible in the output" arriving as a wrong VALUE rather than a
+  missing flag; and **the only control that settled it was re-running one unchanged commit**,
+  because a diff that cannot explain a failure invites inventing a mechanism.*
 - **CI must PROVIDE each tool, and anything fetched at job time is version- and sha256-pinned.**
   "Provide" means a digest-pinned image, a pinned `go run …@vX.Y.Z`, an npm devDependency, or a
   pinned `before_script` install — never devbox. **The checksum is a literal at its use site, not a
@@ -16290,6 +16347,463 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   `task gate:api` **and** `task gate:web` (the doc edit runs under `check-docs:web`), not
   `task gate`.
 
+**Numbering note for the four M3 sections below.** They start at 468, not 467, because 467 was
+already held by the then-unmerged `fix/197-lead-design-critique-wave` branch — found by
+sweeping every sibling worktree of this bare clone at write time, which is the local form of
+the *"first free across all remotes"* rule stated in the numbering note above §455, and the
+same discipline §464 applied for the same reason one milestone earlier. *(That branch has since
+merged, at `8dd67db0`, and §467 now sits directly above this note — so the gap the sweep left
+was filled by exactly the section it was left for. The note stays because it records the
+mechanism, and because a reader who finds these four starting at 468 with no gap in sight has
+no other way to learn that the number was reserved rather than picked. The same sweep is why
+§473-474 sit above main's §472 rather than colliding with it.)*
+
+## 468. PRD #103 M3 — the Go ratchet lives in the CONFIG, which closes the ref question by construction, and the pre-flight guards `merge-base` rather than `rev-parse`
+
+M3 gives this repo its first linter. **`human.md` untouched and no entry proposed**, for the
+reason M1 and M2 proposed none: contributor tooling, no API, no schema, no worker behaviour,
+no UI. The linter *set* is `.golangci.yml`'s to state and is deliberately not recorded here —
+what a rebuild must reproduce is the placement decisions, every one of which was settled by
+running the tool and every one of which has a quieter failure on the other side.
+
+- **The ratchet is `issues: {new-from-merge-base: origin/main, whole-files: true}` in
+  `.golangci.yml`, NOT a flag on a command line — and the cost is written down rather than
+  absorbed.** §464 records that `Taskfile.yml`'s echo of each command is how a teammate
+  notices a load-bearing flag going missing; for this slot **that property is simply absent**,
+  and it is the one place M3 weakens a mechanism this repo relies on. It was traded knowingly:
+  the CLI form would need either a variable spliced into a `cmds:` line (banned) or a flag set
+  in the CI job only, and the second makes local and CI **disagree about what a finding is** —
+  the exact divergence Success Criterion 1 exists to prevent. One recipe, byte-identical in
+  both places, was worth the echo. The compensation is that the target's comment and **both**
+  slot-table copies name `.golangci.yml` as where the ratchet lives.
+- **The ref is `origin/main`, and the question is closed BY CONSTRUCTION rather than by
+  judgement: golangci-lint does not expand environment variables in config values.** Measured
+  with a positive control, which is what makes it a property of the tool rather than a broken
+  key — `new-from-rev: ${MB_REF}` reaches git verbatim (`fatal: bad revision '${MB_REF}'`,
+  then the full unfiltered set) while the same key holding a literal SHA works. So
+  `CI_MERGE_REQUEST_DIFF_BASE_SHA` is not *worse* than a static ref here, it is **impossible**;
+  it would force the ratchet onto the CLI in CI only, which is the asymmetry the config
+  placement exists to remove. Between the two static candidates, a bare `main` resolves in
+  this bare-clone-with-worktrees layout and does **not** resolve in GitLab's detached-HEAD
+  checkout — a check that works on your machine and degrades in CI. `origin/main` resolves in
+  both, and a contributor whose copy is stale ratchets against an older base and therefore
+  sees **more** findings, so the error direction is conservative.
+- **🔴 The pre-flight predicate is `git merge-base`, NOT `git rev-parse`, and the weaker
+  version SHIPPED FIRST.** `rev-parse` asks whether the ref *exists*; what golangci-lint needs
+  is a **reachable common ancestor**, and on a shallow clone — which is exactly what CI
+  produces — those are different questions. Measured in a CI-shaped scratch repo (feature
+  branch cloned `--depth 1`, then the lint job's own explicit fetch of main): `rev-parse
+  --verify origin/main^{commit}` returns 0 and **satisfies the old guard**, while `merge-base
+  origin/main HEAD` returns 1. `merge-base` strictly **subsumes** the old check rather than
+  adding to it — on a missing ref it exits 128 — so one predicate covers both failures and the
+  rev-parse form must not be restored alongside it.
+- **What the guard converts is a fail-CLOSED-but-MISLEADING run, not a fail-open one, and the
+  label is load-bearing.** An unresolvable base does not skip the ratchet and does not error:
+  golangci-lint emits **one** `level=warning msg="[runner] Can't process results by diff
+  processor…"` and then reports the **entire unfiltered backlog** at exit 1. The first reader
+  concludes the branch broke something enormous and opens a burn-down when the fix is one
+  `git fetch`. An earlier design note called this "fail-open into noise"; that label is wrong
+  and dangerous, because it sends the next reader hunting a silent green that does not exist.
+  The guard exits **2**, matching `fmt-check:api`'s convention — 2 = the instrument is broken,
+  1 = there are findings — because `task`'s own rc is 201 for both and the recipe is the only
+  place that distinction can live.
+- **The ref is a LITERAL in every one of the three places it appears.** `git check-ref-format
+  --branch` accepts `;`, `$`, backticks, `|`, `&` and parentheses in a branch name — only a
+  space is rejected — and anyone who can open an MR chooses the target branch, so
+  `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` is an attacker-chosen string with live
+  metacharacters. Never interpolated, quoted even where it is a constant.
+- **ONE ROOT `.golangci.yml` SERVES BOTH MODULES BY WALK-UP, AND THE PER-MODULE `dir:` ON EACH
+  TARGET IS FORCED RATHER THAN STYLISTIC.** From the repo root the tool cannot run at all:
+  `directory prefix . does not contain main module or its selected dependencies`. Two
+  properties a rebuild must not lose, both re-derived here rather than relayed. **Config
+  resolution picks the NEAREST file and does not merge**, so a per-module `.golangci.yml` would
+  shadow the root one entirely — verified by planting an empty one in `api/`, watching
+  `config path` resolve to it, and watching resolution walk back up to `../.golangci.yml` once
+  it was removed. And the config must be reached **by walk-up, not by an absolute `--config`
+  path**: passed absolutely from outside the tree, findings print with six levels of `../`,
+  which destroys the names-the-file property the format gate was built for. The control that
+  makes the walk-up claim mean something is that before this file existed, the same command
+  from both module directories printed `No config file detected` — so nothing stray was being
+  picked up from outside the repo.
+- **Two linters are OFF, each carrying a one-line justification in the file (git-manager's
+  convention, adopted here), and the two reasons are opposites worth keeping distinct.**
+  `govet` is disabled because `vet:api` / `vet:controller` already run `go vet ./...`
+  **unratcheted**, in the gate and in CI: folding it in would be a **net weakening**, since
+  today every vet finding blocks and ratcheted only new ones would. It is a golangci-lint
+  default, which is precisely the premise ("the tool enables it by default") that will
+  motivate re-adding it — the answer is that the check is not missing, it is elsewhere and
+  stricter. `goconst` is disabled on evidence: measured at golangci-lint 2.12.2 /
+  go1.26.5 darwin/arm64 **with both cap flags cleared**, it is 1178 findings in `api` and 33 in
+  `controller` — **1211 of 1322 combined, 91.60%**, against a non-goconst backlog of `api` 106
+  + `controller` 5 on **M3's five-linter enable set** (`errcheck`, `staticcheck`,
+  `ineffassign`, `unused`, `unparam`) — of which 247 are
+  outside `_test.go` in `api`, spread over 86 files; the non-test findings visible in the
+  capped run **across both modules** were read by hand, plus a 1-in-20 re-sample across all 86
+  non-test files **in `api`**, and none is a defect — only CLI subcommand names, JSON field
+  names and the
+  `queued → claimed → running` run-state vocabulary, which is a goconst finding at every
+  switch arm. **The decisive argument is `whole-files`**, not the count: with a blast radius of
+  86 non-test files, touching any one of them for any reason would demand extracting
+  `"status"` into a constant. That is the ratchet's sharpest edge aimed at the linter with the
+  least signal. **This contradicts the PRD's own M3 bullet, which listed `goconst` among the
+  linters to enable — the bullet was amended, not worked around.**
+
+  *🔴 **THE ENABLE SET IS PART OF THE FIGURE, AND SO IS THE SHA.** Re-derived independently
+  2026-08-03 at **`8f3c4bb5`** with a private `GOLANGCI_LINT_CACHE` (zero `../` in any run):
+  goconst `api` 1178 / `controller` 33, non-goconst `api` **106** / `controller` **5**. It read
+  `1211 of 1323, 91.5%` until then, from a figure taken hours earlier and invalidated the same
+  afternoon by `6ea98493`, which wired up `const hookEvent` and consumed a pre-existing
+  `unused` finding — the api backlog went 107 → 106 with every PER-LINTER figure unchanged.
+  **A date cannot separate two commits landed the same afternoon; a tree-derived figure
+  carries the SHA it was run at** (PRD #103 M4's amendment to Decision 10). The Go tree at
+  `8f3c4bb5` is byte-identical to `1076b133`, where the PRD's matrix was taken — the five
+  commits between them touch no `.go` file — so the two records agree rather than compete.
+  **And "106" is the FIVE-linter set, not the shipped one**: `nolintlint` was added on
+  2026-08-03 and reads 108 unratcheted on the same tree (the 2 extra are bare `//nolint`
+  directives in `api/internal/store/revise_cap_{integration,repro}_test.go`). Quoting a total
+  without naming its enable set is the same defect one axis over.*
+
+  *One subtlety in the denominator, because this section is the one that insists on naming a
+  population: **1322 is ADDITIVE — goconst and non-goconst measured in separate runs and
+  summed.** A single run with `goconst` enabled reads **1321** in `api` + `controller`
+  (1283 + 38), because `uniq-by-line` drops one `staticcheck` finding that shares a line with
+  a goconst one; `staticcheck` reads 21 without goconst and **20** with it. The ratio is
+  91.60% additively and 91.67% single-run, so the argument is untouched either way — but the
+  two numbers are both correct and will not reconcile unless you know which run produced
+  which. Same mechanism as §471's `uniq-by-line` bullet, arriving in a denominator.*
+- **One per-linter test-file exclusion survives, and it was never goconst's.** `unparam` is
+  excluded in `_test.go`: 22 of its 26 findings were test helpers of one shape (a parameter
+  that today has a single call site), which is how a test stays readable and is a one-line
+  change to widen later.
+- **Delivery is a pinned `go run …@v2.12.2`, which is the same shape as the `sqlc@v1.30.0`
+  precedent already inside `validate:api`, and the version pin is identical local and in CI.**
+  That is what kills the unpinned-local-binary divergence: a contributor's brew-installed
+  golangci-lint drifts on its own schedule and would disagree with CI about what a finding is.
+  It writes nothing to either `go.mod` — verified, not assumed — where `go get -tool` would
+  write golangci-lint's whole dependency tree into `api/go.mod`, the file the separate
+  `controller` module exists to keep `k8s.io/client-go` out of. **The official
+  `golangci/golangci-lint` image was rejected on a measurement**: it ships Go 1.26.2 with
+  `GOTOOLCHAIN=auto` against both modules' `go 1.26.4`, so it would make lint the first job in
+  this pipeline whose effective toolchain is **fetched** rather than pinned, where the
+  `golang:1.26` image CI already uses is 1.26.4 with `GOTOOLCHAIN=local`. Cost, measured
+  2026-08-02 with isolated `GOMODCACHE`+`GOCACHE`: **51.6s cold, then under 2s warm**, and CI
+  persists both caches, so the cold cost is per-cache-key rather than per-pipeline.
+- **The backlog stays countable through `:all` companion targets, and clearing a config-set
+  ratchet has exactly one spelling.** `new-from-merge-base` reports nothing on a `main`
+  pipeline (the merge-base of `main` with itself is `main`), so without these the deferred
+  debt would be unmeasurable. An **empty** `--new-from-merge-base=` is what clears it; the two
+  obvious alternatives do not error and do not work — measured against the shipped config,
+  `--new-from-rev=` and `--whole-files=false` both return a still-filtered "full debt report"
+  reading 0 issues over a module carrying 106. **The flag name is coupled to the config key
+  and the two move together.** These targets are in no gate and no CI job, but *not gating*
+  does not mean *exits 0*: golangci-lint exits 1 whenever it reports anything, so anyone
+  wrapping them later needs an explicit `|| true` and a comment saying why.
+
+## 469. PRD #103 M3 — oxlint: every guard is a SILENT no-op if it moves, and the 16-finding debt is FIXED rather than baselined
+
+The npm half needed no ratchet, because its whole debt was 16 findings and M3 cleared them.
+What it needed instead was a configuration in which the rule the milestone exists for actually
+runs — and every way of getting that wrong is silent. The Go half's failures are loud and
+misleading; this half's are quiet, which is why the config file carries the measurements in
+its own header rather than deferring to a doc.
+
+- **Severity is pinned in `.oxlintrc.json`, never on the command line, and
+  `react-hooks/rules-of-hooks` needs RULE-level promotion — a category cannot reach it.** It is
+  `pedantic`, not `correctness`. Measured 2026-08-02 at oxlint 1.76.0: `--react-plugin` alone
+  exits 0 silently on a genuine conditional `useState`, **and so does `--react-plugin -D
+  correctness`**. That second row is the entire milestone going green over the rule it exists
+  for, and it is the configuration a careful reader arrives at after being told "the plugin is
+  off by default". The `-D correctness` flag stays, for the correctness *tier*, with a comment
+  saying it is **not** the guard for this rule.
+- **🔴 Naming a rule without declaring its plugin is a SILENT no-op; a typo in the rule name is
+  LOUD.** `{plugins:["react"], rules:{"react-hooks/rules-of-hooks":"error"}}` exits 1 and
+  fires; the same rules block **without** the plugin exits 0 and does nothing; the same config
+  with the rule misspelled exits 1 naming the unknown rule. That asymmetry makes the **plugin
+  list** the load-bearing half rather than the rules block, and it is exactly the case a
+  reviewer reading the config would pass, because the file visibly names the rule.
+- **`plugins` REPLACES the default list, it does not extend it.** All three defaults
+  (`unicorn`, `typescript`, `oxc`) are re-listed alongside `react` for that reason. Measured on
+  `web/src`: `["react"]` reports 5 findings, `["react","unicorn","typescript","oxc"]` reports
+  6. **Both exit 1, so the narrowing is invisible in the verdict** — it shows up only in a
+  count nobody re-derives. In `agent/` the same trap is worse in proportion: five of its ten
+  baseline findings come from `unicorn` and `typescript`, so a config dropping either would
+  silently retire half the package's findings.
+- **`--config` is passed explicitly, closing two holes at once.** oxlint walks up for
+  `.oxlintrc.json`, so a stray root config would silently govern both packages; and with the
+  file renamed or deleted a bare invocation reverts to the warning tier and exits 0 on a real
+  violation, where `--config` fails loudly with `Failed to parse config … NotFound`.
+- **`--report-unused-disable-directives-severity=error` is on both scripts, and it is the
+  vacuous-negative class arriving through a COMMENT instead of an assertion.** A suppression
+  that no longer suppresses anything reads to every later reviewer as live and justified.
+  Measured on this tree: a directive for a rule that does not fire gives rc=1 and `Unused
+  eslint-disable directive (no problems were reported)`, while the same tree **without** the
+  flag gives rc=0 and prints nothing. The plain `--report-unused-disable-directives` form only
+  *warns*, and a warning does not set the exit code here either — **the `-severity=error`
+  suffix is the whole point.** This milestone ships eleven new directives, so the exposure is
+  its own.
+
+  *🔴 **THE GO HALF SHIPPED WITHOUT THE ANALOGUE AND NOBODY NOTICED FOR A DAY.** A bare
+  `//nolint` silenced all five Go linters with no warning and exit 0 — the identical hole, in
+  the same MR, with the fix already written on the other side of it. Closed 2026-08-03 by
+  enabling `nolintlint` (`allow-unused: false`, `require-explanation: true`,
+  `require-specific: true`), with the user's explicit approval since M3 had frozen the enable
+  set. **Treat "every enabled linter set owes a suppression-lint" as the invariant a rebuild
+  must satisfy, not as two independent flags**: the asymmetry was invisible precisely because
+  each half was reviewed against its own tool's conventions. Calibrated with a positive
+  control first — a directive where nothing fires and no directive at all are otherwise
+  indistinguishable, which is the same reason this bullet's own measurement needed the
+  without-the-flag arm.*
+- **Nothing ships at `"warn"`.** A rule at warn **prints its violation and exits 0**, which is
+  a report that always passes — the silent-green shape this PRD exists to remove.
+- **The npm targets DELEGATE to a `package.json` `lint` script rather than calling the binary,
+  because `Taskfile.yml`'s header requires it of every npm target**: a target that
+  reimplements a command drops whatever flags the script encodes, silently. Here that is not
+  hypothetical — the script carries both halves of this gate's severity. **Never a bare `npx
+  oxlint`**: npx fetches from the network when the dep is missing, which a gate may not do,
+  while `npm run` puts `node_modules/.bin` on PATH and fails closed with `command not found`.
+  The consequence to state in the target's comment is that Task's echo shows only
+  `npm run lint`, so **neither** load-bearing flag lives anywhere the echo can protect — the
+  same weakening §468 records for the Go ratchet, arriving by a different route.
+- **`agent/.oxlintrc.json` deliberately omits `react`, and that divergence from `web/`'s copy
+  is recorded as a decision rather than left to look like an omission.** The agent is a Node
+  worker with no React and no JSX; the plugin would load rules that can never fire, and its
+  count is 10 with or without it.
+- **The 16 findings were FIXED, not baselined (Decision 4): five real changes, eleven
+  suppressions each carrying its reason at the site.** The distribution matters more than the
+  total, because it is the argument against a baseline file: most of this debt was *code that
+  is deliberately what the rule objects to* — four control-character regexes whose entire job
+  is matching control characters (one of them the security strip that stops `java\tscript:`
+  reaching a scheme test), three never-yielding async generators that model a hung SDK query,
+  a `captured = this` that **is** the fixture, and a conditional spread that omits a key rather
+  than setting it undefined. **Every suppression was verified load-bearing rather than
+  assumed**: stripping the disable comments brings all findings back with a nonzero exit, and
+  restoring them returns both packages to green.
+- **One finding was a real bug and was fixed as one, explicitly, rather than folded into the
+  sweep.** `eslint(no-unsafe-optional-chaining)` on `(sent[0]?.payload as X).content` in an
+  agent test: on an empty `sent` the optional chain threw a `TypeError` instead of failing an
+  assertion. Same coverage, readable failure. The rule's advice to *read it before fixing it*
+  is the durable half — a lint sweep is the wrong place to change behaviour by accident.
+- **🔴 Two `react-hooks/exhaustive-deps` findings are SUPPRESSED rather than fixed, and the
+  ruling is a CONSISTENCY argument, not a convenience.** Adding a dependency changes identity
+  churn and therefore when downstream effects re-run — on a first-load effect that is a
+  behavioural change to page load, not a lint fix. **That is the same argument M3's scope
+  ruling uses to exclude the 119 type-aware `onClick={asyncHandler}` findings**, and admitting
+  these two while excluding those would be inconsistent. Both carry the reason at the site and
+  a pointer to issue #200 for the behavioural review. The general form: **a tooling milestone
+  may not change runtime behaviour under cover of a lint fix**, which is also why type-aware
+  linting (`oxlint-tsgolint`) and the React Compiler rule family are out of scope here — the
+  latter because this repo is on React 18.3.1 and does not run the compiler.
+
+## 470. PRD #103 M3 — where the checks are WIRED: an asymmetric CI shape, gate ordering that differs by component, and two anchor lists that turned out not to be a membership rule
+
+- **The Go half opens its own `lint`-stage jobs; the npm half folds into the existing
+  `validate:web` / `validate:agent`. That is a PARTIAL deviation from the PRD's Decision 3 and
+  is recorded there rather than worked around.** The asymmetry is not a compromise between two
+  readings — each half has its own reason. The Go jobs need `GIT_DEPTH: "0"` for the
+  merge-base ratchet: putting that on the shared Go template would hand a full-history clone
+  to every job extending it for a check only two need, and folding lint into `validate:api`
+  instead would hand it to the one job whose `sqlc generate` + `git diff --exit-code` already
+  makes its git state load-bearing. A dedicated job isolates the clone-strategy change to the
+  job that needs it. The npm checks measure ~0.06s and ~0.05s against a ~30s `npm ci` in each
+  job, so a separate job would pay a 500× setup overhead — and would add a name to both anchor
+  lists where the existing job already sits. **Depth alone is not sufficient**: merge-base
+  needs the *ref*, and whether `origin/main` exists after a clone is a property of the
+  runner's refspec rather than of the CI file, so each Go lint job also fetches it explicitly.
+  `publish:assert-changelog` is the in-repo precedent — the only other job setting
+  `GIT_DEPTH: 0`, and it still runs an explicit `git fetch`.
+- **🔴 `.gate_needs` and `.publish_needs` enumerate gate jobs BY NAME, so a gate job absent
+  from both is a TAG-TIME hole behind a green MR pipeline.** The lists are consumed by the
+  kaniko build template and `e2e:kind-smoke`, and by the publish-image template and
+  `publish:chart`. A missing name means a `v*` tag pushes every image and the OCI chart to
+  Harbor **while that job is failing**: the pipeline reddens afterwards and the artifacts are
+  already out. **A new gate job goes into both lists in the commit that creates it.** These
+  two lists are a second single-hot-line merge contention that the PRD's Parallelization
+  section does not name, and they are worse than `stages:` in one respect — **appending
+  resolves the merge but not the omission**.
+- **M3 shipped that rule while an existing job was violating it, which is what turns it from a
+  membership rule into a completeness property.** `test:api-store-it` — `stage: test`, no
+  `rules:` of its own, so it runs on tag pipelines — had been absent from **both** lists since
+  the commit that introduced it, with no reason recorded anywhere. So a `v*` tag published
+  while the **sole CI coverage of the LiveDB suite** was failing: the one job that catches a
+  `+goose`-poisoned migration, whose blast radius is every later migration staying unapplied
+  at API boot on every upgraded instance. M3 added it to both and corrected the list's own
+  header, whose *"The full validate+test+helm gate set"* admits one reading and was false
+  while that job was missing.
+- **🔴 The completeness check is by RESOLVED STAGE, never by job-name shape — and the
+  name-based check is what produced a false all-clear over this live hole.** A filter keyed on
+  `validate:*` / `test:*` / `lint:*` per component is satisfied by `test:api-store-it` in name
+  and slips past it in practice. **Enumerate every job whose resolved `stage` is `validate`,
+  `lint` or `test` — resolving `stage` through `extends` — and assert each appears in both
+  lists.** On the post-M3 tree that holds, with the two lists differing only by the two
+  `publish:assert-*` entries, which is the property to re-derive rather than a count to quote.
+- **The `.gate_needs` half of that fix carries an UNMEASURED latency cost, taken deliberately,
+  and its revisit criterion needs no baseline.** That list's consumers put a `postgres:17`
+  service container on every MR's validation-build path for no correctness gain there — the
+  release-integrity argument is entirely about `.publish_needs`. It was added to both anyway,
+  because granting an exception on an *unmeasured* cost is the inversion this PRD exists to
+  correct, and because an asymmetry between two adjacent lists invites a future "fix" in
+  either direction. The criterion: the build template starts when the **slowest** of the
+  needed jobs finishes, so compare `test:api-store-it`'s duration against the **max** of the
+  others — if it is not the max it added exactly zero, and if it is, the cost is its duration
+  minus the runner-up's. Read it on a warm pipeline, since a cold `lint` cache would otherwise
+  confound it.
+- **Each Go lint job takes its OWN cache key prefix over the same `go.sum`.** golangci-lint is
+  fetched by a pinned `go run`, so its build artifacts land in `GOCACHE` — and the sibling
+  jobs share the module's key **without ever building them**, so whichever finished last would
+  decide whether the next pipeline's lint job is warm or cold. A distinct prefix removes the
+  race in both directions.
+- **`needs: []` is inherited, so the `lint` stage is ORGANISATIONAL, not ordering.** The new
+  jobs start at pipeline T+0 like every other gate; the stage groups them, it does not sequence
+  them behind `validate`.
+- **Ordering inside `gate:*` differs by component ON PURPOSE, and the asymmetry is documented
+  where a reader would otherwise call it inconsistent.** Go runs lint **after** `build`,
+  because golangci-lint type-checks: on a tree that does not compile it reports
+  `typechecking error` instead of the build error, a worse message for the same defect — and
+  **before** `test`, because it is seconds against a `-race` run. Web and agent run lint
+  **first**: measured ~0.06s and ~0.05s, two orders of magnitude cheaper than anything else in
+  those gates, and oxlint is not type-aware so it has no ordering dependency. Same reason M2
+  put `fmt-check` first.
+- **The composite `lint` is EXTENSIBLE, not closed, and its `desc:` says so.** It composes all
+  four components today where the neighbouring `fmt-check` composes two (only the Go modules
+  have a format check), so a coder copying that target's shape would copy its scope; M5 appends
+  shell and YAML to this same list.
+- **The gate-timing figures in both slot-table copies were RE-MEASURED rather than left bare,
+  and the honest reading is a straddle.** They are used prescriptively ("a complete answer in
+  well under a minute"), so wiring lint into every `gate:*` invalidated them. Re-measured
+  2026-08-02 on a warm long-lived worktree, `task gate` EXIT=0 across three samples spanning
+  126-213s, which **straddles** the pre-M3 warm reading: the run-to-run spread is wider than
+  lint's contribution in both directions, so the defensible statement is that **lint did not
+  move this slot out of its envelope** — never that it made the gate faster. Quoting only the
+  fastest sample would invite exactly that inference.
+
+## 471. PRD #103 M3 — the two instruments that report a wrong number: the cap flags compose IN ORDER, and the result cache is HOST-GLOBAL and lies in BOTH directions
+
+Every figure in this milestone came from an instrument that had to be calibrated first, and
+three separate people published a wrong number before the calibration existed. These are
+properties of golangci-lint, not of this repo, and they outlive M3 — M4 and M5 add linters to
+the same runner.
+
+- **🔴 Any golangci-lint figure carries `--max-issues-per-linter=0 --max-same-issues=0`, or it
+  is a CAP READING.** Defaults are 50 per linter and 3 per repeated message. The tell in this
+  milestone was `goconst` reporting **exactly 50** — and that is the tell nobody looks at,
+  because 50 is a plausible number.
+- **The two flags COMPOSE IN ORDER and neither "owns" a linter, which is what makes the
+  obvious drop-one check a trap.** Isolation matrix over `api` on M3's five-linter enable set,
+  each cell run in a private `GOLANGCI_LINT_CACHE`:
+
+  ```
+  --new-from-merge-base=                            55   errcheck 36  staticcheck 13
+  + --max-issues-per-linter=0                       55   errcheck 36  staticcheck 13
+  + --max-same-issues=0                             77   errcheck 50  staticcheck 21
+  both                                             106   errcheck 79  staticcheck 21
+  ```
+
+  *Re-derived 2026-08-03 at **`8f3c4bb5`** (zero `../` in any cell); `controller` reads **5**
+  in every cell, then and now. This block read 56 / 56 / 78 / 107 until then, and the four
+  totals are each one lower for the reason §468's goconst bullet gives — `6ea98493` consumed a
+  pre-existing `unused` finding, so the tail is `unparam 4 + unused 2 = 6` against 7 when M3
+  measured. **Every per-linter figure is unchanged**, which is the useful part: the flags'
+  behaviour is what this matrix exists to establish, and that did not move. Three tracked
+  copies of this matrix exist (`Taskfile.yml`'s `lint:api:all` comment, the PRD's M3 status
+  block, here) and the two totals columns are what drift — they are the only cells that depend
+  on the tree rather than on the tool.*
+
+  `--max-same-issues` folds duplicate **messages** first; `--max-issues-per-linter` then
+  truncates the survivors at 50. So on this config **`--max-issues-per-linter=0` alone is a
+  complete no-op** — nothing exceeds 50 until the fold is lifted — and its real effect is
+  **errcheck 50→79**, visible only after the other flag has fired. Run cell two, see 56→56,
+  conclude the flag is dead weight and delete it, and errcheck reads 50 forever. **Cite the
+  pair, never a single flag's delta**: no one flag produces 36→79, and both this file's
+  ancestors in `Taskfile.yml` and the PRD once claimed it did, from a 2-cell measurement that
+  cannot separate them.
+- **🔴 AND "FLAG X IS A NO-OP HERE" IS A CLAIM ABOUT THE DATA, NOT ABOUT THE FLAG.** The no-op
+  above follows from the **mechanism**, not from the flag: two caps sit in series, the fold
+  runs first, and the per-linter cap can only bite on what survives it. So whether lifting it
+  alone changes anything depends entirely on whether some linter's folded count reaches 50 —
+  a property of the finding distribution. On the shipped set nothing does, which is why it
+  reads as dead weight; on a config enabling `goconst` it cannot possibly hold, since 1178
+  uncapped findings do not survive a per-linter cap of 50 unscathed. Confirmed by re-running
+  the same 2×2 there, and its figures are deliberately **not** carried into this record — they
+  are not the shipped set, and importing them is the mislabel this section exists to prevent.
+  **The tell that separates the two readings is where a count LANDS**: a linter coming to rest
+  on exactly `50` once the fold is lifted is the per-linter cap binding, not a finding total.
+  This is the `controller` camouflage below recurring one level down — inside the correction
+  to it, on the flags themselves.
+- **`controller` reads the same number either way, and THAT is the camouflage.** A sanity
+  check of "do the caps matter?" run against the cheap module concludes no. The general form
+  is the one worth carrying: **a warning in one section does not protect a later section when
+  the underlying run is shared** — the camouflage was written down and then walked into two
+  sections later, by a different person reading the same capped output.
+- **`issues.uniq-by-line` defaults to TRUE, dedupping ACROSS linters, so any single linter's
+  count depends on which OTHERS are enabled.** On this tree the **106 becomes 107** with
+  `--uniq-by-line=false` (staticcheck **21 → 22**) — that cell **re-run** at `8f3c4bb5`, not
+  shifted on paper, which is the whole point of an entry about numbers that move underneath
+  you. One finding today; recorded because **M4 and M5 add linters**, and
+  this is how a staticcheck finding disappears from an "unfiltered" total with nobody touching
+  staticcheck.
+
+  *And the prediction it makes was checked and holds: enable `goconst` on the same tree and
+  **staticcheck falls 21 → 20**, because one of its findings now shares a line with a goconst
+  one. That is why §468's `1211 / 1322` denominator is an ADDITIVE construction and a single
+  run of the same population reads **1321** (`api` 1283 + `controller` 38). Neither figure is
+  wrong; they answer "how big is each population" and "how many records does one run print",
+  and the gap is exactly this bullet. A reader who reconciles them by picking the tidier
+  number loses the mechanism.*
+- **🔴 Name the POPULATION or the counts will not reconcile — a wrapped record makes three
+  denominators all defensible.** Two `goconst` records quote a string literal containing a
+  newline, so each wraps across two output lines. The tool's own tally is 1178; well-formed
+  single-line records are 1176; and a `(goconst)$`-anchored grep also returns 1178 **by
+  coincidence**, counting the two pathless continuation lines while missing the two headers
+  that lost their suffix. Hand-splitting the wrong one puts both wrapped records in the
+  non-test bucket. Both are in `_test.go`, so the non-test figures hold either way. This cost
+  three people a wrong number.
+- **🔴 The result cache is HOST-GLOBAL and poisons across sibling worktrees IN TWO OPPOSITE
+  DIRECTIONS. The quiet direction is the dangerous one.** It lives outside the repo, shared by
+  every worktree of this bare clone exactly like the Go build cache, and a warm entry replays
+  the **absolute paths** of the tree that warmed it. The **ratcheted** targets then go falsely
+  **GREEN** — the diff processor cannot match a foreign path against `git diff` output, so it
+  drops everything — while the `:all` targets go falsely **LOUD**, since they have no diff
+  processor and the foreign findings are simply added. Measured 2026-08-02 with a validator's
+  throwaway worktree warm in the cache: `lint:api:all` printed 120 findings, every one pathed
+  into another tree, against 107 after a clean. **The tell is a `../` in a finding's path: that
+  is an invalid run, not a finding.** Two worktrees at the same SHA is the normal state of a
+  fresh worktree and is exactly the configuration of a calibration run.
+  *(**This narrative keeps its own numbers on purpose, and the 107 here must NOT be swept to
+  106 with the matrix above.** It describes one dated run against one tree, not the current
+  one — a past-tense claim about a past state, which the standing rule says is a typo only
+  when the identifier was wrong when written. It was not.)*
+- **The `:all` targets clean IN-RECIPE; the gate targets deliberately do NOT, and the split is
+  the decision.** The `:all` targets are *recording* targets whose entire output is a number
+  someone writes down, so "remember to clean first" is discipline this repo removes rather
+  than relies on. The gate targets run on every MR and in every component gate, and the clean
+  is **host-global** — it would clear the cache for every concurrent agent and worktree, which
+  this team has by design. So calibration cleans; the gate does not.
+- **And clean AFTER deleting a throwaway worktree, not only before an arm. The cached paths
+  OUTLIVE THE TREE.** Cleaning before your own run protects you and does nothing for whoever
+  runs next, and a finding pathed into a directory that no longer exists is worse than one
+  pointing at a live sibling, because nobody can go look at it. That is precisely how the 120
+  above happened.
+- **🔴 The same directory holds a host-global LOCK whose failure is INDISTINGUISHABLE from a
+  finding by status alone.** Concurrent runs give `Error: parallel golangci-lint is running`
+  and golangci-lint exits **3** — but the pinned `go run` prints that as the *text*
+  `exit status 3` and then exits **1** itself, which is this repo's "there are findings" code,
+  and `task` reports its usual 201 regardless. So the 3 never reaches the exit code, and an
+  automated reader testing `!= 0` — or even reading the status carefully — records a red gate
+  over code that is fine. **The only discriminator is the message text.** It fails safe (false
+  red, never false green), and the correct response is to re-run rather than to report a red
+  gate; on a bare clone with many sibling worktrees and agents running concurrently by design,
+  the collision is normal rather than exceptional.
+- **That flattening is GENERAL, not a property of the lock, which is the durable half.** The
+  pinned `go run` collapses **every** distinct golangci-lint status onto its own exit 1,
+  printing the real one only as text. Re-derived on a second, unrelated status: invoked from
+  the repo root, golangci-lint exits **7** (`directory prefix . does not contain main module`)
+  and the observed exit is **1**, with `exit status 7` as output. So the tool's status codes —
+  3 for a lock collision, 7 for a wrong working directory, 1 for findings — are **not
+  observable through this repo's shipped invocation at all**, and any rule keyed on them is
+  keyed on something no caller can read. This is the price of the delivery choice in §468 and
+  is worth paying; what it costs is that the *message text* is the only channel, for every
+  golangci-lint failure mode, not just the one this list names.
+
 ## 472. Issue #205 — the phrase pins are scoped to a REGION, which closes relocation by construction and retires §467's anchors
 
 §467 closed the *quality* half of the anchoring problem (the `anchor` field plus four
@@ -16432,3 +16946,247 @@ asserts — whatever context the phrase does or does not carry.
   guard and a tester onto the instrument. Two of the divergences above (edge landmarks, and
   the clause-3 correction) came out of the author folding its own work, which is evidence
   that folding it is worth doing, not evidence that it is sufficient.
+
+## 473. PRD #103 M4 — the dead-code gate ships EMPTY baselines gating at ZERO, the wrapper survives for the EXIT CODE, and `-test` hides the very class the `:all` companions exist to report
+
+M4 closes the `dead code` slot both slot-table copies had carried as `none (gap)` since
+2026-07-26. **`human.md` untouched and no entry proposed**, for the reason M1-M3 proposed none:
+contributor tooling, no API, no schema, no worker behaviour, no UI. What a rebuild must
+reproduce is not the tool — it is the placement decisions below, every one of which was settled
+by running something and every one of which has a **silent green** on the other side.
+
+- **🔴 THE MILESTONE'S OWN PREMISE WAS FALSE, AND THE ANSWER WAS TO INVERT THE DESIGN RATHER
+  THAN IMPLEMENT IT.** Decision 4 specified a ratchet against a committed baseline because the
+  first run was expected to produce a large finding list. It produced **one** finding in `api`
+  (`HookManager.SettingsPath`, an exported one-line wrapper over the unexported `settingsPath()`
+  beside it, zero callers) and **zero** in `controller`. So the function was **deleted**, both
+  `.deadcode-baseline` files ship **empty**, and both Go modules gate at **ZERO** — strictly
+  stronger than gate-on-new, and it *removes* the baseline-rot problem instead of managing it.
+  A rebuild whose first run is large may legitimately need a populated baseline; what it must
+  keep is the meaning those files were given here — **a baseline is a suppression list, one
+  stated reason per entry, not a debt ledger.** Both headers say so, and the two legitimate
+  suppressions are named (`//go:linkname`, which deadcode's own doc says it cannot follow, and
+  a platform-gated file).
+- **🔴 THE WRAPPER IS NOT ABOUT THE BASELINE. It exists for the EXIT CODE, and deleting it on
+  the (correct) observation that the baselines are empty reopens a fail-open hole.** `deadcode`
+  exits **0** whether it finds 0, 1 or 43 dead functions, and **1** only when the packages fail
+  to load — **and on that path stdout is 0 bytes.** So the obvious wrapper,
+  `run | sort > cur; comm -13 baseline cur; fail on additions`, is **silent green on a module
+  that does not compile**: the empty result set diffs as removals-only, there are no additions,
+  the gate passes. That
+  is **§466's `test -z "$(gofmt -l .)"` hole arriving through a different door** — an empty
+  result set indistinguishable from a clean one — and the two are worth reading as one class,
+  because the second was built by people who had just written the first down.
+  `scripts/deadcode-gate.sh` therefore **reads `$?` before it looks at the output**, and takes
+  the exit convention M2 and M3 already set: **2 = the instrument is broken** (load error,
+  missing baseline, bad usage), **1 = findings**, **0 = clean**. `task`'s own rc is 201 for all
+  three, so the script is the only place that distinction can live. A missing baseline file is
+  a **2**, not a clean module.
+
+  *Re-derived here at `8f3c4bb5` by planting `func zzSpecKeeperBroken( {` in
+  `api/internal/uzicli/` and removing it after (`git status` clean, gate green again): raw
+  `deadcode -test ./...` gives **rc=1 with stdout exactly 0 bytes** and the parse error on
+  stderr, the shipped script gives **rc=2** naming it a LOAD ERROR, and `task` reports **201**
+  for both that and an ordinary finding — which is the whole reason the 2/1/0 convention has to
+  live inside the script rather than be read off `task`.*
+- **A stale baseline entry is FATAL, not a warning.** An entry whose symbol is no longer
+  reported is a live suppression for a name that can be re-introduced later and silently pass —
+  the vacuous-negative class this repo keeps paying for, and "a warning nobody must act on" is
+  what Decision 3 rejects outright. With an empty baseline the branch cannot fire on an ordinary
+  deletion; it fires only when a deliberate suppression has become unnecessary, where removing
+  it in the same commit is hygiene rather than an imposition.
+- **🔴 THE BASELINE KEY IS POSITION-FREE, AND THE DEFAULT OUTPUT FORMAT IS NOT USABLE AS ONE.**
+  `deadcode` prints `path:line:col: unreachable func: Name`. Measured: inserting **one comment
+  line** above a baselined symbol moved `skillhook.go:75:24` → `:76:24`, so a baseline built
+  from raw output reports a **spurious addition AND a spurious removal** on any unrelated edit
+  above any baselined symbol — which is how a gate stops being run. A `-f` template keys on
+  **(import path, function name)** and carries `file:line:col` as a third field that is printed
+  for the human and **never compared**. Two properties ride with it: comment/blank stripping is
+  unambiguous because no import path and no Go identifier can contain `#`; and **`LC_ALL=C` on
+  both sorts is part of the file's contract, not an implementation detail** — deadcode's output
+  is deterministic but **not lexicographic** (packages by import path, then functions by file
+  and *line number*, which its own source explains as keeping `(T).Marshal` beside
+  `(*T).Unmarshal`), so `sort` is not idempotent over tool output and `comm` requires one
+  collation.
+- **🔴 THE PACKAGE PATTERN IS `./...` FROM THE MODULE ROOT AND MUST NOT BE NARROWED — the
+  natural "just our code" edit adds 85 phantom findings AT rc=0.** Only `main` packages are
+  call-graph roots, so scoping to `./internal/...` orphans everything reachable only from
+  `cmd/` and reports them all, **with no error of any kind**. This is the one edit to this gate
+  that looks like tightening and is the opposite.
+
+  *The **delta is the durable figure, not the pair**: M4 measured `1 → 86` on the pre-deletion
+  tree, and re-derived at `8f3c4bb5` it is **`0 → 85`** — the same **+85**, moved by the one
+  function M4 deleted. Cited this way because the left-hand number is whatever the module's real
+  backlog is on the day you read it, and only the right-hand inflation is a property of the
+  pattern.*
+- **🔴 `-test` IS THE RIGHT GATING DEFAULT AND THE WRONG RECORDING ONE, WHICH IS WHY THERE ARE
+  TWO INVOCATIONS AND ONLY ONE OF THEM GATES.** Under `-test ./...` a production-dead function
+  becomes invisible the moment any test calls it — **write it, test it, never wire it up**,
+  which is the commonest way dead code enters a repo with a testing culture. It is still the
+  right gate: 32 of `api`'s 43-finding delta are `FakeClient.*` methods on a test double,
+  correctly treated as live. So `deadcode:api:all` / `deadcode:controller:all` run **without**
+  `-test`, **reported and never gating**. Measured at `8f3c4bb5`: the `:all` targets print
+  **43** and **4** while the gating targets report **0** and **0** — a companion that reports
+  one number needs the other to mean anything.
+
+  **And `golangci-lint unused` does not cover the difference, which is the reason this pair is
+  not redundant with §468.** `controller`'s four are the worked example: three (`SpecHashOf`,
+  `SizeNames`, `TemplateNames`) are **exported**, which `unused` does not report at all, and the
+  fourth, unexported `keys`, is called by two of the other three *inside its own package* and is
+  therefore "used" by `unused`'s definition. The class is invisible to both the gating
+  invocation and the linter.
+- **The two `:all` companions ALWAYS EXIT 0, which is the exact OPPOSITE of `lint:api:all`, and
+  both `desc:` lines have to be read together.** golangci-lint exits 1 on any finding; deadcode
+  exits 0 on any number of them. So `lint:api:all` is a target documented as non-gating that
+  returns `task` rc=201 every time, and `deadcode:api:all` is a target that reports 43 problems
+  and returns 0. **The output is the signal here, and that has to be said out loud rather than
+  inferred from a green** — anyone wrapping either one later needs an explicit `|| true` on the
+  first and must not read the second's zero as clean.
+- **Three smaller placements, each of which a rebuild would otherwise re-litigate.** The gate is
+  a **committed script** rather than an inline `cmds:` recipe, because M5's `shellcheck` runs
+  over `git ls-files '*.sh'` — a committed script gets linted, shell embedded in a YAML string
+  gets nothing (precedent: `scripts/assert-chart-render.sh`). The version pin is passed **as an
+  argument** rather than defaulted inside the script, so `task`'s echo still shows it; §464
+  calls that echo the mechanism by which a teammate notices a pin going missing, and §468
+  already spends this repo's one deliberate exception on the ratchet living in `.golangci.yml`.
+  And `--write` (regenerate the baseline) is **deliberately not a Taskfile target**: a fixing
+  variant of a gate is exactly what testers are told to refuse, so it lives in the script where
+  the baseline header can name one command instead of restating an invocation that would then
+  drift from it.
+- **The cross-platform agreement is a property of THIS REPO, not of the tool, and it is one
+  `//go:build` away from ending.** darwin/arm64 and linux/amd64 give byte-identical results for
+  both modules today — but deadcode's own doc says the analysis is valid for a **single**
+  GOOS/GOARCH/`-tags` configuration, and the agreement holds only because no non-test `.go` file
+  in either Go module carries a build constraint. Add one and the entry it produces is
+  platform-specific and the committed baseline differs between laptop and CI. Recorded in
+  `api/.deadcode-baseline`'s header rather than discovered later.
+- **What this gate CANNOT see, stated because a slot that implies coverage it lacks is worse
+  than an admitted gap: DEAD BRANCHES.** `deadcode` finds unreachable **functions** and knip
+  finds unused **exports/files/deps**; neither can see a `case` arm nothing reaches inside a
+  live function. The live example is PRD #99's two `case "Task":` arms in
+  `web/src/components/RunEvent.tsx`, still present. Dead branches stay the reviewer's job, which
+  is why the skills-repo change gives the reviewer a deletion lens rather than relying on
+  tooling.
+
+## 474. PRD #103 M4 — knip's `warn` tier is a REPORT with no budget available to it, all seventeen rule names are written out, and the whole slot adds ZERO CI jobs
+
+The npm half of the same slot, plus the wiring decision both halves share. Same `human.md`
+position as §473.
+
+- **🔴 `--max-issues` IS INERT FOR A `warn` TIER, so the PRD's "regression budget in the
+  meantime" was STRUCK rather than qualified — there is no intermediate between "reported, gates
+  nothing" and "gates at zero".** It counts **error-severity** issues only. Measured
+  independently more than once, and re-measured here at `8f3c4bb5` on knip **6.31.0**:
+  `knip --max-issues 0` over `web` exits **0** with 22 warn findings printed in full. That
+  closes the option the milestone was designed around, and the consequence is stated rather than
+  absorbed: the export tier **genuinely gates nothing** until it is burned down and promoted, so
+  the burn-down carries its counts into issue #206 — **web 22** (9 exports + 13 exported types)
+  and **agent 53** (35 + 18), both measured at `8f3c4bb5`, both rc=0 — precisely so that
+  Decision 3's "a warning nobody must act on" does not become the end state by default.
+- **🔴 ALL SEVENTEEN RULE NAMES ARE LISTED, INCLUDING THE ONES THAT WOULD LAND ON KNIP'S OWN
+  DEFAULT, AND A MISTYPED ONE IS A NEAR-SILENT NO-OP.** A rule left out is a severity decided by
+  a default the reader cannot see. A rule *misspelled* prints
+  `WARNING: Ignored unknown issue type "..."` **among the findings** and does **not** change the
+  exit code — and `treatConfigHintsAsErrors` does not cover it either, which is the part that
+  makes enumeration the only defence. The names were taken from `node_modules/knip/schema.json`
+  (`.properties.rules.properties`), not from memory, and calibrated with three cells one
+  character apart. `error` at zero from day one: `files`, `dependencies`, `devDependencies`,
+  `optionalPeerDependencies`, `unlisted`, `binaries`, `unresolved`, `duplicates`, `catalog`,
+  `catalogReferences`. `warn`: `exports`, `types`, `nsExports`, `nsTypes`, `enumMembers`,
+  `namespaceMembers`. **`cycles` is `off`, and it is the one entry that is a SCOPE decision
+  rather than a debt decision** — circular imports are module-graph hygiene with their own
+  burn-down, written explicitly so nobody reads its absence as an oversight.
+- **`treatConfigHintsAsErrors` + `treatTagHintsAsErrors`, because without them a config that has
+  STOPPED MATCHING degrades silently to "no findings".** If an `entry` glob stops resolving or a
+  tag hint goes stale, knip prints a hint and exits **0** — a green gate over a config that is no
+  longer doing anything, which is this repo's signature failure shape and the same one §469
+  records for oxlint's directive guard.
+- **`includeEntryExports: true`, because its default OFF is a real hole rather than a
+  preference.** With it off, an unused export in an **entry** file is never reported at all —
+  and `web`'s entry set includes `src/main.tsx`, the vite config and the docs/mock loaders.
+  Turning it on makes the warn tier honest about the size of the debt instead of hiding part of
+  it, which matters precisely because that tier is the one being burned down against a number.
+- **`knip.jsonc`, not `knip.json`: every suppression carries its reason inline.** Resolved
+  natively by 6.31.0. An `ignore` entry with no stated reason is indistinguishable from a
+  mistake, and this repo has paid for suppressions nobody could evaluate.
+- **🔴 THE SHAPE OF EACH SUPPRESSION IS A DECISION, NOT A FORMALITY — the narrower key keeps the
+  rest of the checks alive.** `scripts/gen-favicon-png.mjs` is declared `entry` rather than
+  `ignore`, because an entry keeps its imports and its own dependencies in scope where an ignore
+  silently drops everything it reaches. `agent-browser` is `ignoreDependencies` rather than
+  `ignore`, so the package stays in scope for `unlisted`/`binaries` and a *different* mistake
+  about it is still caught. That one is high-consequence: it is resolved **by path at runtime**
+  through `agent/bin/agent-browser`, so knip cannot see it, and "fixing" the finding by removing
+  the dependency would strip the browser CLI from the worker image **while every test that does
+  not exercise the image kept passing.** The discriminator for the third case is worth keeping
+  too: `scripts/check-docs.mjs` needs no entry line because knip's package.json-scripts plugin
+  reaches it through the `check-docs` npm script — the property is *reachable from a
+  package.json script*, not *is a script*.
+- **`--fix` is banned from every gate target, script and CI job.** It edits files in the repo:
+  it strips `export` keywords, and with `--allow-remove-files` it deletes files. Same rule that
+  makes the format slot `fmt-check` and not `fmt`.
+- **Every flag lives in the config file, so the npm script is a bare `knip` and the Taskfile
+  target delegates to the script.** Two reasons that happen to agree: `Taskfile.yml`'s header
+  requires npm targets to delegate (a target that reimplements a command drops whatever flags
+  the script encodes, silently), and `web/package.json` is a documented three-way contention
+  point across this PRD's milestones, so the smallest possible line there is the one least
+  likely to conflict. **Never a bare `npx knip`** — npx fetches from the network when the
+  dependency is missing, which a gate may not do; `npm run` puts `node_modules/.bin` on PATH and
+  fails closed with `command not found`.
+- **🔴 ZERO NEW CI JOBS, AND THE TWO HALVES REACH THAT FROM DIFFERENT ARGUMENTS THAT CONVERGE ON
+  ONE INVARIANT.** For the **Go** half the reason is the **cache key**, not cost:
+  `go run golang.org/x/tools/cmd/deadcode@v0.48.0` builds x/tools into `GOCACHE`, and
+  `validate:api` and `test:api` share `.go_job`'s key **without ever building it**, so a new
+  lint-stage job on the default key would put a third writer on that cache and decide their
+  warmth — the lint jobs already carry their **own** cache prefix for exactly that reason, and
+  golangci-lint's tree subsumes x/tools' anyway. For the **npm** half the reason is **cost**:
+  knip is **sub-second against each job's ~30s `npm ci`**, so a separate job would pay the whole
+  setup overhead for the check. Both land on the same place: **`.gate_needs` and
+  `.publish_needs` stay at 12 and 14 with their two-element delta intact** — verified by
+  **parsing**, not grepping, per §470. A job in neither list is invisible to them, and on a `v*`
+  tag that means every image and the OCI chart publish **while it is failing**. Adding no job
+  cannot open that hole. Note also that `deadcode:api` needs none of `lint:api`'s git setup (no
+  `GIT_DEPTH`, no fetch, no merge-base): it is not ratcheted and its baseline is a committed
+  file, so it is a passenger on that job rather than a dependent of it.
+
+  *🔴 **AND THAT PASSENGER CHANGED WHAT THE CACHE HOLDS, WHICH IS WHY THE LINT KEY IS NOW
+  PARTITIONED BY REF TRUST.** The prefix is `lint-$CI_COMMIT_REF_PROTECTED`, so protected refs
+  read `lint-true-<sum>` and unprotected ones `lint-false-<sum>`. The argument is not tidiness:
+  that cache now holds a **compiled** golangci-lint and, through `deadcode:api`, a compiled
+  x/tools binary — and **Go trusts a cached object blindly, never re-verifying it against
+  source**. With a ref-free key, anyone able to open an MR writes into the cache a **tag**
+  pipeline later reads, in a job that is a `needs:` predecessor of every publish path. Cost is
+  one cold run per side. `policy: pull` was the other candidate and is worse: it makes every
+  lint run cold **forever** (`lint:controller` measured 364s cold). **`.go_job`'s own key stays
+  ref-free deliberately** — it caches no compiled tool, which is the property that makes this
+  one sharper, and collapsing the two would lose that distinction. Landed on this branch as
+  `2f3cb71c` while §473-474 were being written, which is why this paragraph exists: the
+  sentence above it said `prefix: lint` and was one commit stale by the time it was committed.*
+
+  *🔴 **THE COST FIGURE IS STATED AS AN ORDER OF MAGNITUDE HERE ON PURPOSE, BECAUSE THE
+  MILLISECOND ONE IS A SELF-REPORTED METRIC THAT DOES NOT REPRODUCE.** `Taskfile.yml`,
+  `.gitlab-ci.yml` and M4's brief all quote **244ms (web) / 152ms (agent) "measured"**. Traced
+  to `probes/prd-103-m4-architect.txt:254`, those came from `knip -u` — and `-u` is
+  **`--duration`, knip's own internal total**, not wall clock. Re-measured at `8f3c4bb5` on
+  darwin/arm64: knip self-reports **597ms / 387ms** (≈2.4x the recorded figures) while
+  `/usr/bin/time` reads **1.0-2.7s wall**, since node startup and module load sit outside what
+  knip counts. **The ARGUMENT is untouched** — sub-second-to-two-seconds against a ~30s `npm ci`
+  still says fold it into the existing job — which is exactly why the number should not have
+  been carried at that precision: a figure quoted to the millisecond invites a reader to treat
+  it as the job's contribution to pipeline time, and it is neither that quantity nor
+  reproducible. Same family as §471's cap readings: an instrument answering a slightly different
+  question, reported as though it answered this one.*
+- **One prefix for all four components, accepting a name that is slightly wrong for two of
+  them.** `deadcode:web` is knip, which also reports unused **files** and **dependencies** — the
+  same imprecision `lint:web` already carries, since oxlint is not golangci-lint. It was
+  preferred to a second prefix because the `dead code` row of `.claude/agent-team.md`'s
+  paste-block is **one line**, and a `knip:web` target would split one slot across two prefixes
+  for a reader who then has to type both.
+- **The residual is now the same in seven files and closed in none of them.** `.golangci.yml`,
+  both `.oxlintrc.json`, both `knip.jsonc` and both `.deadcode-baseline` each let a branch
+  author neuter their own gate **from that same file** — widen an `ignore`, drop a rule to
+  `warn`, add a `ignoreDependencies`, baseline a genuinely dead function — with the pipeline
+  staying green because the tool honestly found nothing gating. The comment-with-a-reason
+  convention every one of them carries is a **review aid, not an enforced one**: nothing in CI
+  reads it. **CODEOWNERS on those seven files is the only structural fix, and there is no
+  CODEOWNERS file anywhere in this tree.** M3 recorded this for three files; M4 quadrupled the
+  surface and each new file states it for itself rather than inheriting it by pointer.

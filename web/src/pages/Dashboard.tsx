@@ -126,6 +126,14 @@ export function Dashboard() {
     return () => {
       cancelled = true;
     };
+    // SUPPRESSED, NOT FIXED, and deliberately (PRD #103 M3). The rule wants
+    // `user.is_admin` in the deps. Adding it would make this FIRST-LOAD effect
+    // re-run whenever the auth context re-resolves — a behavioural change to page
+    // load, not a lint fix. That is the same argument M3's scope ruling uses to
+    // keep 119 `onClick={asyncHandler}` type-aware findings out of a tooling MR,
+    // and admitting this one while excluding those would be inconsistent.
+    // Reviewed under issue #200; fix or justify permanently there.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Liveness: re-fetch only the volatile endpoints (runs, workers) every 10s while
