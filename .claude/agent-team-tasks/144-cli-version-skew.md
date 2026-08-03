@@ -1549,3 +1549,62 @@ is pre-existing, harmless without `t.Parallel()`, and in a file outside this cha
 It had reported §15's N-4 bound as though the mechanism were new to it; it is the **third**
 independent derivation, and the reviewer's actual contribution is the **boundary** (150
 metadata chars warn, 400 silent). Volunteered, unprompted, about its own report.
+
+---
+
+## 21. AMENDMENT 16 — tester reconciliation. Data CLEAN by discriminator; the mutation counts are ONE MEASUREMENT IN THREE UNITS.
+
+### The contamination check was answered decisively, not by assurance
+
+The tester proved its detached tree held `ea71a367` **using the test that would have broken
+if it had not**:
+
+- At `ea71a367`, `exemptFromVersionCheck` carries `case "token":` only, and
+  `versioncheck_test.go:347` lists `{"auth","status"}` under **`notExempt`**.
+- Its `ea71a367` baseline was **`RUN=475 PASS=475 FAIL=0 SKIP=0`**.
+
+**A green suite with `auth status` in `notExempt` is only possible on a tree where
+`auth status` is NOT exempt.** Had it built the coder's uncommitted fix,
+`TestExemptFromVersionCheck` would have failed. It did not. That is the exact inverse of the
+auditor's 0-probes reading, and it is a *positive* discriminator rather than an absence.
+
+Structural reason it could not have happened: `git worktree add --detach` materialises from
+the object database, with `git status --short` empty and `git rev-parse HEAD` recorded at
+every checkout. **The one thing it ran in the shared tree was the `task gate:api` that died
+at `vet`, and it refused to report that as a gate result.**
+
+### Its verdict already covers the SHA I asked for
+
+```
+git merge-base --is-ancestor f2f778d6 a4a18c0d              -> YES
+git diff --stat f2f778d6..a4a18c0d -- api/ e2e/ deploy/ scripts/  -> EMPTY
+```
+`f2f778d6..a4a18c0d` is **docs-only**, so the gate and all 30 mutations measure `f2f778d6`'s
+code exactly — and it re-ran the *whole* programme at the new tip rather than only the
+flagged arms.
+
+### 🔴 THE 4 / 5 / 6 COUNTS ARE ONE MEASUREMENT IN THREE UNITS — do not read them as a discrepancy
+
+| SHA | subtest ROWS | tester's named-FAIL LINES |
+|---|---|---|
+| `ea71a367` | **4** | 5 |
+| `a4a18c0d` | **5** (+`unbounded_build_metadata`) | 6 |
+
+The auditor's **4** and the coder's **5** are each right for their own SHA (§14), **and the
+tester reproduces both.** Its own figures run one higher because its grep counts the
+**parent** `--- FAIL: TestSkewWarningSanitizesTheServerString` line as well as the subtests.
+**Read its 5/6 as their 4/5.**
+
+This is `CLAUDE.md`'s own lines-vs-rows trap — the same shape as the `--- PASS` indentation
+entry there — arriving in a place where it would have looked like a *third* independent
+measurement disagreeing with the first two. Recorded because reconciling it after the fact is
+much harder than noting the unit now.
+
+### Third independent derivation of the ellipsis mechanism, and the counter-intuitive parts hold
+
+The tester traced the build-metadata payload's **silence** to `compactText` appending `…`
+without having seen §13. It also reproduces the two results that read as wrong until the
+mechanism is known: the auditor's **sharpest** payload (mid-line `\r`) is silent at the
+warning path because `TrimSpace` strips only the **edges**; and plain 1 MiB `AAA…` is silent
+because it is not valid semver — **only `0.14.0+<1 MiB>` gets through, at 1,048,673 bytes on
+stderr.**
