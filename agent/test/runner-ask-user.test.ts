@@ -22,7 +22,7 @@ import type { AskUserQuestion, UserInput } from "../src/protocol.js";
 /**
  * PRD #88 M6 — the `RunRunner` layer of the clarification park.
  *
- * Deliberately a separate file from `runner.test.ts`, and deliberately NOT in
+ * Deliberately a separate file from the `runner-*.test.ts` set, and deliberately NOT in
  * `ask-user.test.ts`. D-S: every M1 coverage finding converged on one layer —
  * `RunRunner.askUser` is where the mechanism lives and where nothing tested it. A
  * `SteeringChannel` test cannot observe its caller, so a bare-channel fixture is the

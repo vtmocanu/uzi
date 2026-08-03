@@ -1051,4 +1051,12 @@ tasks:
       # unbounded) while giving the worst real file ~4x headroom. Do not tune it
       # back down to "just above the current worst" -- that is how it became a
       # knife-edge. If a file legitimately approaches this, split the file.
+      #
+      # And that is what happened, the same day: runner.test.ts was split into
+      # seven runner-*.test.ts files sharing test/runner-harness.ts. The raised
+      # cap bought margin; the SPLIT is what removed the knife-edge, and it cut
+      # the agent suite from 112s to 46s wall locally because those seven suites
+      # had been serial inside one file and now run as seven parallel files.
+      # The unit is the lesson, not the number: under node's per-file cap a large
+      # test file is a serialization point that no timeout value fixes.
       - npm test

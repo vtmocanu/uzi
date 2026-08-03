@@ -219,7 +219,8 @@ describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
 // The RUN lane's slot semaphore (PRD #42 M2, Decision 1): the loop executes up to
 // WORKER_MAX_CONCURRENT_RUNS runs as tracked promises, slot-before-claim, releasing
 // a slot only when its run settles. These are worker-level unit tests with a faked
-// RunRunner — the real plan-gate/executor path is covered in runner.test.ts; here
+// RunRunner — the real plan-gate/executor path is covered in runner-plan-gate.test.ts
+// and its sibling runner-*.test.ts files (split out of runner.test.ts 2026-08-03); here
 // the subject is purely the semaphore (cap, backoff, release, drain).
 describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
   it("runs up to WORKER_MAX_CONCURRENT_RUNS concurrently, logs at capacity, and does not claim while full", async () => {
