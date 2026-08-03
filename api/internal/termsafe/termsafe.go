@@ -66,8 +66,11 @@
 // eight rows): C0 ESC U+001B is escaped, and DEL U+007F, C1 CSI U+009B, bidi RLO
 // U+202E, zero-width space U+200B, ZWJ U+200D, BOM U+FEFF and soft hyphen U+00AD are
 // all NOT. So encoding/json escapes the C0 range (plus U+2028/U+2029) and passes every
-// other member of Unsafe through untouched — neither half of Cf, and two thirds of the
-// control half.
+// other member of Unsafe through untouched: none of Cf at all, and two of the three
+// control families. Stated by FAMILY, and deliberately not as a fraction — DEL and C1
+// pass through entire while C0 is escaped entire, so per CODEPOINT it is 33 of 65,
+// about half. A fraction here would pair a range unit with a family denominator, which
+// is the imprecision this very paragraph exists to correct.
 //
 // The decision point 3 supports is unaffected, and the correction arguably serves it
 // better: what a forensic reader wants is the exact bytes the server sent, which is
