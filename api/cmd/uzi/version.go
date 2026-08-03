@@ -19,6 +19,11 @@ import (
 // (Formula/uzi-cli.rb, scripts/brew-local-test.sh). A 30s stall there is a failed
 // release. Two seconds is long enough for a laptop compose stack or a LAN
 // deployment and short enough that a human never wonders whether it hung.
+//
+// SECOND CONSUMER since the version-skew warning (issue #144): serverBuildInfo is
+// also called from the root PersistentPreRun hook, once per TTL per server, where
+// this cap is what bounds the added latency of every uzi command. It is a
+// PER-REQUEST cap, not a per-invocation budget — it reads like a total and is not.
 const serverProbeTimeout = 2 * time.Second
 
 // versionOut is the --json shape (PRD #175 M4, OQ-B).
@@ -55,6 +60,13 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := env.printer(gf)
 			srv := serverBuildInfo(cmd.Context(), env, gf)
+			// This command is exempt from the PersistentPreRun skew hook and warns
+			// here instead, from the live probe it was already making — see
+			// exemptFromVersionCheck for why a cached warning would visibly
+			// contradict the `server version` line printed below. It also warms the
+			// shared cache, so the next command hits it. Before the JSON return, so
+			// both output modes carry the warning on stderr.
+			recordAndWarnVersionSkew(env, gf, srv)
 
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(versionOut{Version: version, Server: srv})
@@ -66,12 +78,26 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// anchored at the start of the WHOLE stdout — stricter than the Formula's
 			// substring assert_match. A header line, a "uzi " label, or a leading
 			// blank line passes the Formula and fails the script.
-			fmt.Fprintln(env.Stdout, version)
+			// Write errors dropped explicitly here and below: this command's whole
+			// contract is that it reports the CLI version and exits 0 regardless of
+			// anything else. (Made explicit for errcheck, which gates this file now
+			// that the branch touches it.)
+			_, _ = fmt.Fprintln(env.Stdout, version)
 			if srv == nil {
 				return nil
 			}
 			for _, row := range serverRows(*srv) {
-				fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], row[1])
+				// cellText, not the raw value. These are server-controlled strings
+				// bound for a TTY and this sink PREDATES the skew warning: `version`
+				// carries no server-side constraint at all, so a `\r` in it erases
+				// the `server version ` label this line prints and an attacker
+				// sentence appears to come from uzi. Four such attacks were executed
+				// against this exact line (erase-display, line-overwrite, OSC 8
+				// hyperlink, bidi override), all exit 0. Sanitizing at PRINT time
+				// leaves --json byte-exact, which is the repo's standing rule: the
+				// structural encoder escapes what matters there and agents decode it
+				// verbatim.
+				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], cellText(row[1]))
 			}
 			return nil
 		},
