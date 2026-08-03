@@ -16,6 +16,16 @@
 // 🔴 `knip --fix` MODIFIES FILES IN THE REPO (it deletes `export` keywords and can
 // delete whole files with --allow-remove-files). It must never appear in a gate
 // target, a package.json script, or CI. Nothing in the gate may be a fixing variant.
+//
+// 🔴 AND THE WEAKER SIBLING HAS NO CI ANSWER, exactly as `.golangci.yml` and both
+// `.oxlintrc.json` files record for themselves: a branch author can NEUTER this
+// gate from this same file — widen `ignore`, drop a rule to `warn`, or add an
+// `ignoreDependencies` entry — and the pipeline stays green, because knip
+// genuinely found nothing gating. CODEOWNERS on the seven gate-config files
+// (this one, agent/knip.jsonc, .golangci.yml, both .oxlintrc.json, and both
+// .deadcode-baseline) is the only structural fix. THERE IS NO CODEOWNERS FILE
+// ANYWHERE IN THIS TREE TODAY, so the residual is open for all seven; it is
+// recorded in the MR rather than closed here.
 {
   // ---- SUPPRESSIONS. Three day-one findings, each verified against the tree. ----
 

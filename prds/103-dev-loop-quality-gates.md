@@ -1276,6 +1276,31 @@ which previously prescribed only the fail-open form.
       convention) applied to both Go modules with per-linter test-file
       exclusions.
 
+      *(**`nolintlint` was ADDED to that set on 2026-08-03**, during M4's
+      validation wave and with the user's explicit approval — a deliberate
+      change to an enable set M3 had frozen, recorded here rather than made
+      quietly. **The hole it closes: a bare `//nolint` silences all five linters
+      above with no warning and exit 0, unreported forever.** The auditor
+      measured four arms with a positive control first, and the two that matter
+      — a directive where nothing fires, versus no directive at all — are
+      otherwise indistinguishable. `.golangci.yml`'s own residual paragraph does
+      **not** cover this: it names CODEOWNERS as the structural fix for
+      neutering the gate **from the config file**, and a `//nolint` lives in the
+      `.go` file. The decisive argument is symmetry inside one MR — the npm half
+      already shipped the exact analogue,
+      `--report-unused-disable-directives-severity=error`, and the Go half of
+      the same milestone had no such guard. Settings:
+      `allow-unused: false, require-explanation: true, require-specific: true`.
+      **Adoption cost, measured not estimated at `9073eb23`: `task lint:api`
+      stays at 0 issues on an untouched tree**; unratcheted it adds 2 findings,
+      both the bare `//nolint` in `api/internal/store/revise_cap_{integration,
+      repro}_test.go`, which `whole-files` blocks only when someone next touches
+      those files. Calibrated with four cells including a negative control —
+      `probes/prd-103-m4-calibration.txt`'s 2026-08-03 appendix. Note the
+      knock-on, which is Decision 10's amendment demonstrating itself: enabling
+      it takes `api`'s **unratcheted** total from 106 to 108, so the isolation
+      matrix above is the M3 five-linter set and is labelled with its SHA.)*
+
       *(**`goconst` was struck from that list during M3 implementation**, 2026-08-02,
       and the disabled-linter convention above is where its justification now lives.
       Amended rather than worked around, per the rule this document applies to
@@ -1494,10 +1519,21 @@ which previously prescribed only the fail-open form.
       >   issues only), so it is struck rather than merely qualified. What
       >   shipped: `exports`/`types`/`nsExports`/`nsTypes`/`enumMembers`/
       >   `namespaceMembers` at `warn` — **reported on every run, gating
-      >   nothing** — with `files`/`dependencies`/`devDependencies`/`unlisted`/
-      >   `binaries`/`unresolved`/`duplicates` and the catalog pair at `error`,
-      >   gating at zero. The export burn-down (web 22, agent 53) is
+      >   nothing** — with `files`/`dependencies`/`devDependencies`/
+      >   `optionalPeerDependencies`/`unlisted`/`binaries`/`unresolved`/
+      >   `duplicates` and the catalog pair at `error`, gating at zero, and
+      >   `cycles` at **`off`** (circular imports are module-graph hygiene with
+      >   their own burn-down, not dead code; explicit rather than omitted so
+      >   nobody reads its absence as an oversight). That is all **seventeen**
+      >   rule names, which is the point: a rule left out is a severity decided
+      >   by a default the reader cannot see, and a MISTYPED one is a near-silent
+      >   no-op. The export burn-down (web 22, agent 53) is
       >   **issue #206**, not this milestone.
+      >
+      >   *(This enumeration omitted `optionalPeerDependencies` and `cycles`
+      >   until 2026-08-03 — not false as written, but a reader reconciling it
+      >   against `knip.jsonc` found two names unaccounted for, in the one
+      >   paragraph whose argument is that every name is listed.)*
       > - **The wrapper was not the milestone.** `deadcode -test ./...` finds 1
       >   in `api` and 0 in `controller`. The function was deleted, both
       >   baselines ship **empty**, and both Go modules gate at **zero**. The
@@ -1547,9 +1583,20 @@ which previously prescribed only the fail-open form.
       > `probes/prd-103-m4-calibration.txt`; design-wave evidence:
       > `probes/prd-103-m4-{architect,reviewer}.txt`.
       >
+      > **🔴 THE TRANSCRIPT IS TWO RUNS AT TWO TIPS, and its first section was
+      > taken at `2e2e756a` — three commits below the tip this block cites it
+      > from.** Its original six arms covered **`api` and `web` only**:
+      > `deadcode:controller`, `deadcode:agent`, both `:all` companions and all
+      > three knip suppressions had no recorded arm, so three suppressions that
+      > each silently disable a real finding class if wrong shipped unproven.
+      > They are proven now — the transcript's 2026-08-03 appendix runs all six
+      > at `9073eb23`, each suppression stripped and restored, plus the four
+      > `nolintlint` cells. Do not read the two sections as one run.
+      >
       > **Success Criterion 8 is met, six arms**, each with the four-property bar
       > (non-zero exit, the finding's **identity** in the output, a
-      > repo-relative path, green on restore verified with `git status`):
+      > **sane path** — see the path note below, this is NOT "repo-relative" —,
+      > green on restore verified with `git status`):
       > an exported dead Go function (`deadcode:api` exit 1 naming it, while
       > `lint:api` says "0 issues." on the same tree); an unused TS **file**
       > (`deadcode:web` exit 1 naming it); the mistyped-rule-name control, three
@@ -1559,6 +1606,24 @@ which previously prescribed only the fail-open form.
       > shift **with a control showing the default positional output moved
       > 452 → 453 across the same two trees**. Restores were `cp`-based, never
       > `git checkout --`.
+      >
+      > **🔴 THE PATH PROPERTY IS "A SANE PATH", NOT "A REPO-RELATIVE PATH", AND
+      > THE THREE SLOTS GENUINELY DISAGREE.** This clause read "repo-relative"
+      > and was borrowed from M3, where it is correct. Measured from both sides
+      > (tester and fact-checker, independently):
+      >
+      > | slot | invocation | path printed |
+      > |---|---|---|
+      > | `lint:api` | golangci-lint, `dir: api` | `api/internal/uzicli/…:4:6` — **repo-root-relative** |
+      > | `deadcode:api` | the script `cd`s into the module | `internal/uzicli/…:7:6` — **module-relative** |
+      > | `deadcode:web` | knip, `dir: web` | `src/lib/…` — **package-relative** |
+      >
+      > **M3's "repo-root-relative" is CORRECT and must not be swept along with
+      > this fix.** golangci-lint bases paths on the config file's directory, and
+      > `.golangci.yml` sets no `relative-path-mode`, so that is the tool's v2
+      > default rather than a repo choice. Two tools, two conventions, one
+      > sentence borrowed across them — assert the path is *sane for its slot*,
+      > and know which slot you are in.
       >
       > **Success Criterion 4 is met for this slot in FIVE files, not the three
       > M4's brief listed.** The two it missed are the two already missed once:

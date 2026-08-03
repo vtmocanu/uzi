@@ -181,7 +181,7 @@ format         task fmt-check      # gofmt -l over both Go modules. CHECK, never
                                    #   - IT DETECTS DRIFT, NOT A SWEEP. A directory-wide
                                    #     `gofmt -w` that pulls foreign files into a commit
                                    #     leaves the tree clean, so this slot PASSES.
-                                   # This slot's own correction history (the 26/25/19
+                                   # This slot's own correction history (the 26/25
                                    # tally and why no count is recorded, the retired
                                    # `comm -12` idiom and why it went for VACUITY rather
                                    # than for being broken) lives in .claude/agent-team.md
@@ -195,7 +195,10 @@ lint           task lint           # composite, all four components (M5 will app
                task lint:agent     # COVERS THIS SLOT for that component -- same shape
                                    # as the format slot above. Go is golangci-lint
                                    # (errcheck, staticcheck, ineffassign, unused,
-                                   # unparam) via a pinned `go run ...@v2.12.2`; npm
+                                   # unparam, nolintlint -- the last lints the
+                                   # SUPPRESSIONS: a bare or vacuous `//nolint`
+                                   # is itself a finding) via a pinned
+                                   # `go run ...@v2.12.2`; npm
                                    # is oxlint 1.76.0 via each package's `npm run
                                    # lint`. Ordering differs by component ON PURPOSE:
                                    # lint runs AFTER build in the Go gates (it
@@ -260,6 +263,29 @@ lint           task lint           # composite, all four components (M5 will app
                                    # the gate targets deliberately do NOT, so clean
                                    # first before every calibration arm and assert
                                    # the finding path is repo-root-relative.
+                                   # 🔴 BUT DO NOT `cache clean` -- USE A PRIVATE
+                                   # CACHE. `GOLANGCI_LINT_CACHE=<your own dir>`
+                                   # gives the SAME isolation and clears nothing
+                                   # for anyone else. `cache clean` is host-global
+                                   # (this file says so two paragraphs up: it
+                                   # "clears it for every concurrent agent and
+                                   # worktree too"), so the documented hygiene step
+                                   # is itself destructive to sessions running
+                                   # beside you. The private cache is what produced
+                                   # the M4 wave's clean isolation matrix -- zero
+                                   # foreign paths in any cell, nobody else's run
+                                   # disturbed.
+                                   # 🔴 AND THE `../` TELL HAS A FALSE-POSITIVE
+                                   # MODE, which already cost a validator a GOOD
+                                   # measurement it threw away. Run golangci-lint
+                                   # with a config OUTSIDE the repo and it bases
+                                   # every path on that config's directory, so
+                                   # EVERY path starts with `../` on a perfectly
+                                   # valid run. THE DISCRIMINATOR IS WHERE THE PATH
+                                   # LANDS, NOT THAT IT CONTAINS `../`: resolve it
+                                   # and ask whether it lands in THIS worktree or
+                                   # in a foreign tree. Stated as the bare presence
+                                   # of `../`, the rule discards valid runs.
                                    # 🔴 AND CLEAN **AFTER** DELETING A THROWAWAY
                                    # WORKTREE, NOT ONLY BEFORE AN ARM -- this one
                                    # is YOURS to keep, since building and removing
@@ -299,6 +325,17 @@ dead code      task deadcode       # all four; or deadcode:{api,controller,web,a
                                    # `deadcode -test ./...` per module against a
                                    # committed, EMPTY baseline, so both Go modules gate
                                    # at ZERO. npm = knip.
+                                   # 🔴 PATHS HERE ARE MODULE- / PACKAGE-RELATIVE, NOT
+                                   # repo-root-relative, because the gate `cd`s into the
+                                   # component: `internal/uzicli/...` not
+                                   # `api/internal/uzicli/...`, `src/lib/...` not
+                                   # `web/src/lib/...`. THAT IS THE OPPOSITE OF THE LINT
+                                   # SLOT BELOW, where golangci-lint bases paths on the
+                                   # config file's directory and prints
+                                   # `api/internal/...`. Both measured. When you
+                                   # calibrate, assert a path that is SANE FOR THIS
+                                   # SLOT -- a bar written "repo-relative" was borrowed
+                                   # from the lint slot and is wrong here.
                                    # 🔴 A GREEN DOES NOT MEAN "no unused exports". The
                                    # knip exports/types family is staged at `warn`:
                                    # printed on every run, setting NO exit code -- 22

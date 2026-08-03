@@ -7,8 +7,14 @@
 #
 # READ `api/.deadcode-baseline`'s HEADER before adding anything here. It carries
 # the full rules (format, when a suppression is legitimate, how to regenerate,
-# and why the key is position-free); they are identical for both modules and are
-# not restated so the two cannot drift apart.
+# why the key is position-free, and the CODEOWNERS residual this file shares);
+# they are identical for both modules and are not restated so the two cannot
+# drift apart.
+#
+# 🔴 THE RESIDUAL IN ONE LINE, because it is the one rule a reader must not have
+# to follow a pointer for: a branch author can baseline a genuinely dead function
+# in this file and the pipeline stays green, since the gate fails on ADDITIONS
+# rather than on entries. There is no CODEOWNERS file anywhere in this tree today.
 #
 # REGENERATE WITH (by hand):
 #     ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0 --write

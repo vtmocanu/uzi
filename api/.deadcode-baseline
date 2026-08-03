@@ -18,6 +18,18 @@
 # `scripts/deadcode-gate.sh` treats an entry that is NO LONGER REPORTED as a
 # failure, so a suppression cannot outlive the finding it covers.
 #
+# 🔴 AND THE WEAKER SIBLING HAS NO CI ANSWER, exactly as `.golangci.yml` and both
+# `.oxlintrc.json` files record for themselves. That stale-entry rule is what
+# stops a suppression rotting; it is NOT what stops one being added. A branch
+# author can baseline a genuinely dead function here, in this same file, and the
+# pipeline stays green because the gate finds no ADDITION — which is the whole
+# design. The comment-with-a-reason convention above is a review aid, not an
+# enforced one: nothing in CI reads it. CODEOWNERS on the seven gate-config files
+# (both baselines, `.golangci.yml`, both `.oxlintrc.json`, both `knip.jsonc`) is
+# the only structural fix, and THERE IS NO CODEOWNERS FILE ANYWHERE IN THIS TREE
+# TODAY, so the residual is open for all seven. Recorded in the MR, not closed
+# here.
+#
 # FORMAT: one entry per line, TAB-separated:
 #     <package import path>\t<function name>
 # Position-free ON PURPOSE (PRD #103 Decision 11). deadcode's default output is

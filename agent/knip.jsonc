@@ -10,6 +10,11 @@
 //
 // 🔴 `knip --fix` MODIFIES FILES IN THE REPO. Never in a gate target, a package.json
 // script, or CI.
+//
+// 🔴 AND THE WEAKER SIBLING HAS NO CI ANSWER: a branch author can neuter this gate
+// from this same file and the pipeline stays green. See `web/knip.jsonc`'s header
+// for the full statement and the seven files it covers; there is no CODEOWNERS
+// file anywhere in this tree today, so the residual is open.
 {
   // ---- THE ONE SUPPRESSION, AND IT IS A HIGH-CONSEQUENCE ONE. ------------------
   //

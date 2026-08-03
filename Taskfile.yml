@@ -617,8 +617,26 @@ tasks:
       # (~6-8s). That is why the clean lives HERE and NOT on `lint:api` /
       # `lint:controller`, which run in the gate and on every MR.
       #
+      # 🔴 RUNNING THIS BY HAND? SET `GOLANGCI_LINT_CACHE=<a private dir>` INSTEAD
+      # OF CLEANING. It gives the SAME isolation as `cache clean` with none of the
+      # shared cost the paragraph above concedes - nobody else's warm cache is
+      # touched, so a concurrent agent does not silently pay ~6-8s for your
+      # measurement. Verified honoured by golangci-lint 2.12.2, and it is what
+      # produced PRD #103 M4's re-derived isolation matrix with zero foreign paths
+      # in any cell. The `cache clean` stays IN THIS RECIPE because a target has to
+      # be correct for someone who sets no environment at all.
+      #
       # THE TELL, if you ever see this target's output without the clean: any path
       # containing `../`. A `../` in a finding is an invalid run, not a finding.
+      #
+      # 🔴 EXCEPT THAT THE TELL HAS A FALSE-POSITIVE MODE, and stated as a bare
+      # `../` check it has already made a validator DISCARD A VALID MEASUREMENT.
+      # golangci-lint bases every path on its CONFIG FILE'S directory, so a run
+      # driven by a config outside the repo prints `../` on EVERY path while being
+      # perfectly valid (the header of `.golangci.yml` documents the same mechanism
+      # from the other side). THE DISCRIMINATOR IS WHERE THE PATH LANDS, NOT THE
+      # PRESENCE OF `../`: resolve it, and ask whether it lands in this worktree or
+      # in a foreign tree.
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
       - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
