@@ -172,6 +172,172 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 	}
 }
 
+// TestLeadPlanCritiquePhrases pins the plan-time half of the lead's dispatch
+// contract (issue #197): the plan must cite the code it asserts, and the wave
+// that produces those citations runs before `submit_plan`, reads the plan text
+// rather than a diff, and writes nothing.
+//
+// It is a SEPARATE case set from TestLeadParallelDispatchPhrases on purpose.
+// The ordering this issue changed was entirely unpinned — `after an
+// implementation unit lands` appeared nowhere in this file — so a mutant that
+// deleted the post-implementation ordering and replaced it with a plan-time
+// wave kept all 14 of those pins green by reusing the one clause they share
+// (`send all allocated read-only validators together in one wave`), which is
+// deliberately prefix-agnostic. The first case below fixes the wave that
+// happens AFTER implementation; the rest fix the one that happens BEFORE
+// `submit_plan`, so no single sentence can satisfy both meanings.
+//
+// Three properties of this set are load-bearing, all three found by folds that a
+// deletion-only control cannot produce:
+//
+//  1. A phrase that does not NAME ITS OWN TURN is relocation-blind. Deleting a
+//     clause is not the only way to lose it: move it into the other wave's bullet
+//     and a pin quoting only the clause stays green while the behaviour is gone
+//     from the turn it bound. Seven phrases (not seven pins — the unit here is
+//     the quoted phrase) failed this across two rounds, each after passing its
+//     own deletion fold. The fix is semantic, not length: every phrase below
+//     carries a token that states which turn it binds — `after an implementation
+//     unit lands`, `submit_plan`, `the plan text`, `you send over the plan`,
+//     `during the plan turn`, `re-planning turn`, `the plan you produced`.
+//     WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE PIN CLAIMS, and getting this
+//     backwards is how two people fold the same mutation and report opposite
+//     verdicts. For a DESCRIPTIVE pin the behaviour is *the template states rule
+//     R*, so a relocated sentence still states it: green is correct there and
+//     relocation cannot produce a disconfirming answer at all — REVERSION (put
+//     the original site back to its un-anchored wording) is the fold that can.
+//     For a pin about something the lead must DO AT A PARTICULAR MOMENT, the
+//     behaviour is constituted by where the sentence sits, relocation destroys
+//     it, and relocation is still required. The tell is inside the phrase: a pin
+//     is relocation-proof exactly when nothing in it takes its meaning from a
+//     neighbouring sentence.
+//     The `anchor` field is that token, and the audit below asserts it is
+//     actually inside the phrase. Two rounds of hand-checking missed a
+//     freshly-anchored phrase each time; this is a manual property with nothing
+//     enforcing it, so it is enforced here — but see property 4 for what that
+//     enforcement does and does not cover.
+//  2. A constraint the lead must TRANSMIT has to be pinned as a transmission,
+//     and the phrase has to NAME ITS RECIPIENTS. A subagent's system prompt is
+//     its own template body and the lead cannot alter it, so the dispatch prompt
+//     is the only channel; `architect` and `tester` both ship with `Edit, Write`.
+//     This pin read `tell each of them …` for two rounds, and `each of them`
+//     took its referent from the preceding sentence: relocated, it silently
+//     re-resolved to the post-implementation validators while the plan dispatch
+//     was told nothing — a behaviour destroyed and a different one created, with
+//     the pin green. Naming the recipients (`each validator you send over the
+//     plan`) removes the referent rather than anchoring around it, which is what
+//     makes this pin expressible as a substring at all.
+//  3. NONE OF THIS DETECTS AN INSERTION, and no amount of it ever will.
+//     `strings.Contains` is monotone under insertion: adding text can only turn
+//     a false into a true, never the reverse. So a paragraph inserted above this
+//     one declaring the whole thing optional — "skip it and call `submit_plan`
+//     straight away" — neutralises every behaviour here with all pins byte-intact.
+//     That is a property of substring-presence as an instrument, not a bad choice
+//     of phrases, and no anchoring, widening or region-scoping closes it. The
+//     obvious patch, a negative assertion on the inserted wording, is the
+//     vacuous-negative trap (it guards a string nothing renders). Anchoring
+//     closed RELOCATION; insertion stays open and is caught by reading the diff.
+//  4. THE AUDIT IS A SYNTACTIC CONTAINMENT CHECK, and neither semantic property
+//     it would need is expressible as a substring relation. One root, two
+//     consequences, both open:
+//     (a) it cannot check the anchor NAMES A TURN — only that the declared token
+//     is present. Measured on this table: `anchor: ""` passes, because
+//     `Contains(x, "")` is always true, and so does a vague token like `again`.
+//     Applies to every pin; a better-chosen anchor fixes any instance, so this
+//     is a quality gap. A turn-token allowlist was considered and REJECTED — it
+//     would catch the vague token, leave (b) untouched, and go stale, so the
+//     audit would look stronger with the load-bearing hole in place.
+//     (b) it cannot check the behaviour is ANCHORABLE AT ALL. For a pin whose
+//     phrase carries a context-bound referent, no anchor fixes it. Measured
+//     against the previous commit's relay pin, which had a genuine anchor and
+//     nothing else changed: relocating that clause left the pin AND every audit
+//     assertion green over a template where the plan-turn dispatch is told
+//     nothing and the relocated `each of them` re-resolves to the
+//     post-implementation validators. That is why the fix here was to delete the
+//     referent (property 2) rather than anchor around it. Unfixable inside the
+//     anchor model; the model is provisional and #205 replaces it.
+//
+// Deleting a whole sentence reddens every case living in that sentence, and
+// sentence granularity is how anyone actually folds prose: measured, 2 for the
+// `submit_plan` sentence, 3 for the long dispatch sentence, 1 for each of the
+// other three. Any other multiplicity is a bug, not this trade.
+// The spans themselves are pairwise disjoint and each occurs exactly once
+// — both audited below, because `strings.Contains` is per-occurrence and two pins
+// satisfied by two different occurrences of overlapping text prove less than they
+// appear to.
+func TestLeadPlanCritiquePhrases(t *testing.T) {
+	lead, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("lead builtin missing")
+	}
+	body := flatten(string(Render(lead)))
+
+	cases := []struct {
+		behavior string
+		phrase   string
+		// anchor names the turn the behavior binds to and MUST appear inside
+		// phrase — see property 1 above.
+		anchor string
+	}{
+		{"post-implementation wave is retained and is a REPEAT",
+			"Read-only work fans out again after an implementation unit lands",
+			"after an implementation unit lands"},
+		{"the citation property is due before submit_plan",
+			"Before you call `submit_plan`, make the plan carry its own evidence",
+			"submit_plan"},
+		{"every asserted mechanism is cited by file and line",
+			"`submit_plan`, make the plan carry its own evidence: for every mechanism it asserts, name the file that implements it and quote the line",
+			"submit_plan"},
+		{"the wave reviews the plan text, not a diff",
+			"the artifact under review is the plan text, not a diff",
+			"the plan text"},
+		{"the no-write rule is RELAYED to each dispatched validator",
+			"tell each validator you send over the plan that it must not change anything in the worktree",
+			"you send over the plan"},
+		{"the no-write rule binds the PLAN TURN specifically",
+			"an edit made during the plan turn is a change nobody saw when approving it",
+			"during the plan turn"},
+		{"re-planning re-cites only what changed",
+			"On any re-planning turn, re-cite only the mechanisms that changed",
+			"re-planning turn"},
+		{"the bar is a property of the plan, never of the issue text",
+			"follows from the plan you produced — how many mechanisms it asserts — never as a judgement about the issue text",
+			"the plan you produced"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(body, c.phrase) {
+			t.Errorf("lead template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+
+	// Audit, not a behavior pin: these assert properties OF THE CASE TABLE, so
+	// they fail on a badly-written pin rather than on a changed template.
+	for _, c := range cases {
+		if !strings.Contains(c.phrase, c.anchor) {
+			t.Errorf("pin %q is unanchored: phrase %q does not contain its turn anchor %q",
+				c.behavior, c.phrase, c.anchor)
+		}
+		if n := strings.Count(body, c.phrase); n > 1 {
+			t.Errorf("pin %q matches %d occurrences; a per-occurrence match cannot say which one satisfied it", c.behavior, n)
+		}
+	}
+	for i, a := range cases {
+		for j, b := range cases {
+			if i != j && strings.Contains(a.phrase, b.phrase) {
+				t.Errorf("pin %q contains pin %q, so the contained one can never fail alone", a.behavior, b.behavior)
+			}
+		}
+	}
+	// The 14 pins in TestLeadParallelDispatchPhrases are a separate set and must
+	// stay independently falsifiable: an earlier version of the first case here
+	// swallowed `send all allocated read-only validators together in one wave`
+	// whole, which silently retired that pin.
+	for _, c := range cases {
+		if strings.Contains(c.phrase, "send all allocated read-only validators together in one wave") {
+			t.Errorf("pin %q contains a TestLeadParallelDispatchPhrases phrase, retiring it", c.behavior)
+		}
+	}
+}
+
 // TestCoderParallelModeContract pins the coder's parallel-mode contract (PRD #43
 // M1): the hard file-scope boundary, stop-and-report on out-of-scope or shared
 // files, no commit in parallel mode, and gate only what it exclusively owns.
