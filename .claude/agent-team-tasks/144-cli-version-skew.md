@@ -2176,3 +2176,75 @@ to file the siblings is with the user.
 production callers (the branch removed one of `main`'s four); the local `cellText` has 27 call
 sites across 11 files; `sanitizeTTY` survives as a delegating wrapper. `Store.Dir()` still
 test-only, unchanged by this branch.
+
+---
+
+## 31. AMENDMENT 24 — tester re-run at `84b75153`. GREEN. 35 folds, 2 survivors, both known and non-actionable.
+
+`task gate:api` EXIT=0. Positive control **`RUN=534 PASS=534 FAIL=0 SKIP=0`** (486 → 534;
+`internal/termsafe` is now in our gate at 8.535s). `check-docs:web` **re-run rather than
+carried over**, because the merge touched `docs/cli.md` and `docs/agent-templates.md`.
+
+**The CVE bumps survived the merge — checked explicitly**, *"because a merge is exactly where
+they would silently revert to `main`'s side"*: branch `x/text v0.39.0` + `goldmark v1.7.17`
+against `main`'s `v0.38.0` / `v1.7.8`. That check was nobody's instruction.
+
+### 🔴 M30 IS NOW PINNED — the tester's own should-fix from last round is closed
+
+`TestSkewWarningStaleCachePlusFailedProbeKeepsWarning` catches it. Survivors down to two.
+
+### The old `M26` would have become a SILENT NO-OP, and it was caught
+
+At `57db471f`, `M26` was a hand-rolled `noCapProbe` helper stripping `IsControl || Cf`.
+Post-merge that predicate lives in `termsafe.Unsafe` — which the tester checked is
+**literally** `unicode.IsControl(r) || unicode.In(r, unicode.Cf)`, so the old helper was not
+confounded **"by luck rather than design"**. It would have kept passing while no longer
+standing for the production predicate. Dropped and re-expressed as `compactText`'s
+`const max = 200` → `1 << 30`, which is **wider** — it also reddens
+`TestLimitWaitLineSanitizesTheRateLimitType`, a `main`-side test sharing `compactText`.
+
+**This is exactly the "which folds went void" question, and the answer is that none went void
+TEXTUALLY while one went void SEMANTICALLY.** A fold that still applies and still passes, but
+no longer stands for the thing it was written to stand for, is invisible to every check except
+someone re-reading what it targets.
+
+### 🔴 M32 — THE SAME TRAP AT THE WARNING PATH, WHICH NOBODY HAD CHECKED
+
+§26, §27 and every report discussed only `version.go`'s call site. The warning path has the
+identical one-letter hazard — and it is also pinned:
+
+```
+M31  serverRows  cellText -> uzicli.CellText   FAIL .../unbounded  (stdout 1048627 bytes)
+M32  warning     cellText -> uzicli.CellText   FAIL .../unbounded_build_metadata
+```
+
+**Both sinks are guarded against the naive resolution, not just the one that conflicted.**
+The reason `version.go` got scrutiny is that **git flagged it**; `versioncheck.go` merged
+cleanly and was the unexamined half. Attention followed the conflict markers, not the risk.
+
+### M33 — our suite now rests transitively on `main`'s predicate, and the dependency is measured
+
+Weakening `termsafe.Unsafe` to drop its `Cf` half:
+
+```
+our packages     40 FAIL lines / 23 subtest rows   incl. our own .../bidi_override (U+202E is Cf)
+termsafe's own   15 FAIL lines                     incl. TestValidateAgreesOverEveryRune, a fuzz target
+```
+
+**Our bidi row is no longer proved by our code — it is proved by a package we do not own**,
+and `termsafe`'s pins are stronger than ours were. If that invariant ever weakens our suite
+reddens too, so we find out. That is the property you want from a dependency, stated as a
+named risk rather than assumed.
+
+### Survivors — both previously known
+
+- **`M2a`** — the inert server-side `IsValid` guard. Re-derived post-merge: **grid=1521,
+  server guard changes 0, CLI guard changes 378.** Unchanged, comment already correct.
+- **`M12b`** — the `cliVersion` cap, unpinned but unreachable (both call sites pass the
+  compile-time ldflags stamp). LOW.
+
+### Not reached, stated
+
+`./e2e/run-e2e.sh` not run (unstamped harness binary short-circuits the hook; `bash -n`
+clean). No live server, no k8s. Only `api/` gated. **`govulncheck` is the auditor's slot and
+the tester did not re-run it — §29's clean result is the auditor's, not corroborated.**
