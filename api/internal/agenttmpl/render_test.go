@@ -285,9 +285,13 @@ const (
 // region instead — measured, that reports `leaked into the other region` with
 // the boundary count still 1, which is the fold that proves the branch live.
 //
-// All three are Fatalf rather than Errorf on purpose: once the split is not
-// trustworthy, the assertions below report on regions that are not the regions
-// they name, so their reds are noise that buries the real message.
+// All three are Fatalf rather than Errorf ON PURPOSE, and this is the severity
+// choice, not a style one. Once the split is untrustworthy the assertions below
+// report on regions that are not the regions they name. Under Errorf a broken
+// split prints all eight results anyway — a screenful of authoritative-looking
+// output computed from a split already known to be invalid, with the one line
+// that explains it scrolled off the top. Stop at the guard; nothing below it
+// means anything until the split is fixed.
 func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 	t.Helper()
 
@@ -356,11 +360,14 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // in the round before, once on the very pin guarding the previous round's
 // blocking fix. Three rounds of careful people missing it is the signature of a
 // discipline, not of a defect. The region carries the position now, so the
-// phrase only has to carry the meaning: the phrases below total 376 characters
+// phrase only has to carry the meaning: the phrases below total 376 BYTES
 // against the 666 of the anchored ones they replace, none contains another, and
 // each occurs exactly once. (Raw figures rather than a percentage, deliberately
 // — the same measurement rounds two ways, and two roundings in two files read
-// as a discrepancy to whoever meets them apart.)
+// as a discrepancy to whoever meets them apart. Bytes rather than "characters"
+// for the same reason: the anchored set carried two em dashes, so its rune
+// count is 662 against 666 bytes, while this set has none and is 376 either
+// way. The ambiguous unit diverges on exactly one of the two numbers.)
 //
 // It cannot LOSE detection relative to the whole-body form it replaces, and
 // that is a proof rather than a measurement: each region is a substring of the
