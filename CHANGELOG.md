@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Worker names and CLI-token names are now validated on write, and reject
+  terminal-unsafe characters that were accepted before.** `POST
+  /api/workers`, the hosted-worker provisioning path, and both the
+  CLI-token mint and device-start flows now return 400 for control
+  characters, Unicode format characters (bidi overrides, zero-widths, the
+  BOM, the soft hyphen), and invalid UTF-8; names are still trimmed of
+  leading and trailing whitespace before that check, unchanged from before.
+  These names are read back in cross-tenant admin listings beside a
+  different user's account, so an unvalidated one was terminal control
+  injection into another user's session, and an embedded newline could
+  forge a whole table row in a listing an admin reads to make decisions.
+  Existing stored names are untouched by this change and stay covered by
+  the render-side fix instead (issue #180), which strips the same
+  characters on the way out (issue #169).
+
 ## [0.14.0] - 2026-08-03
 
 ### Added
