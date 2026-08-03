@@ -841,3 +841,88 @@ Accepted cost: the cache file is not human-readable. It is a cache, not configur
   ratchet adoption cost, not scope creep.
 - First `task gate:api` run died on `Error: parallel golangci-lint is running` — a
   host-global lock held by a sibling worktree, not a failure. Re-ran green.
+
+---
+
+## 13. AMENDMENT 8 — §11 6b's TEST CONSEQUENCE IS REFUTED. Implementation at `f2f778d6`.
+
+Refuted by the coder, re-derived independently by the lead against `x/mod@v0.38.0`.
+**The binding is unaffected and strengthened; only the INSTRUMENT was wrong.**
+
+### What 6b said, and why it is wrong
+
+> *"With `cellText` removed — at the warning path, **only the 1 MiB row should redden**.
+> If all four redden at the warning path, the guard order is not what the design
+> specifies."*
+
+**All five redden at the warning path. The guard order IS what the design specifies.**
+The missing mechanism is `normSemver`'s `strings.TrimSpace`.
+
+Measured, lead's run, on the literal payloads:
+
+```
+input                        IsValid   reaches the message?
+erase display                false     no
+line overwrite               false     no
+osc8                         false     no
+bidi                         false     no
+1 MiB plain                  false     no
+1 MiB BUILD METADATA         true      YES
+trailing CR   "0.14.0\r"     true      YES
+leading  CR   "\r0.14.0"     true      YES
+trailing LF   "0.14.0\n"     true      YES
+trailing TAB  "0.14.0\t"     true      YES
+```
+
+`\r`, `\n` and `\t` are `unicode.IsSpace`, so `TrimSpace` strips them **for the validity
+check and the comparison** while `SkewWarning` interpolates the **verbatim** original.
+**There is a whole second class the guard cannot see — larger than the size class, and it
+contains the sharpest payload in the audit**: `0.14.0\r` erases uzi's own prefix mid-line.
+
+**CORRECTED INSTRUMENT SIGNATURE**, replacing 6b's: with `cellText` removed, at the
+**warning** path the four whitespace-edge rows **and** the build-metadata row redden
+(5); at **`serverRows`**, all four auditor payloads redden. Coder's re-run: **10 of 10**.
+
+**Anyone using 6b's stated signature as an instrument would read a correct implementation
+as broken.** That is why this is recorded rather than quietly dropped — 6b was written
+into the brief by the lead, and both the auditor and the tester were dispatched to test it.
+
+### The sub-finding, where the LEAD was wrong and the coder was right
+
+The 1 MiB build-metadata row produces **SILENCE**, not a truncated warning. `compactText`
+(`run.go:1006-1014`) cuts at 200 and **appends `"…"`**; `…` is not in SemVer's
+build-metadata charset `[0-9A-Za-z-]`, so the truncated string is invalid and the verdict
+is silent. Safer than a truncated warning, but a **different assertion**: that row pins
+`wantWarning: false` plus a byte count, and the mutation control turns it into a
+one-megabyte line on stderr.
+
+**The lead's first re-derivation contradicted the coder here and was wrong** — it modelled
+the cap as a plain `s[:200]` slice with no ellipsis, which stays valid semver and would
+print. Reading `compactText` settled it in one command. Recorded because the coder's own
+first draft asserted *"warning printed AND bounded"* and went **red against correct
+code** — the same wrong model, reached independently by two agents.
+
+### Also landed in `f2f778d6`
+
+- **6a** — `auth status` exempt. The set is **exhaustive, not enumerated**: counting
+  `RunE:` against client constructions per file, every file matches except `auth.go`
+  (3 RunE / 1 client), `login.go` (2/1), `skill.go` (4/0) — which accounts for every
+  local-only command in the tree. **No fourth surprise.** `auth.go`'s single `env.client(`
+  is at `:150` inside `newWhoamiCmd`, which is exactly §11 6a's "insufficient in the other
+  direction" case. The switch matches the two `auth` leaves **by parent**, so a future
+  network-bound `uzi auth <verb>` is not swept in and `uzi token list` / `uzi skill status`
+  keep their status despite sharing leaf names.
+- **6c** — `cli_version` recorded, never read back; freshness keys on `checked_at` alone.
+  It had to become a **parameter** because `uzicli` has no access to the ldflags stamp —
+  same reason `NewSkillInstaller` takes it.
+- **6e** — the coder corrected a comment **its own first commit introduced**, which had
+  claimed the skew hook would fire under the e2e harness. It would not: no `-ldflags`, so
+  the binary is `dev` and short-circuits.
+
+### Two process notes from the coder, both shapes this repo documents
+
+- A greedy regex mangled `versioncheck_test.go` mid-edit; caught by the compiler, restored
+  from HEAD, redone with anchored literal replacements.
+- **Its first mutation run printed no test output at all** — `grep -c` returned 0, exited
+  1, and short-circuited the `&&` chain before `go test` ran. *"Empty output read as a
+  clean run for about ten seconds."* A control that produces no output is not a control.
