@@ -104,7 +104,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   either). **A shellcheck that IS present must be exactly 0.11.0**: the version
   is asserted and a mismatch exits 2 rather than quietly grading differently,
   because 0.10.0 does not report one of the diagnostics this repo relies on. CI
-  always runs all three. See
+  always runs all three. **Adding an `ignore` key to `.yamllint` — top-level,
+  `ignore-from-file`, or an indented per-rule `ignore` inside a `rules:`
+  block — is refused at exit 2, before yamllint even runs**, because it would
+  silently narrow what gets read while the gate's success line still reports
+  the tracked-file count from its own separate query, so the two would quietly
+  disagree. Disabling a *rule* is still a legitimate, deliberate suppression —
+  it leaves that count truthful, only an ignore key breaks the agreement
+  between what was counted and what was checked. The clean-run line now says
+  files were **handed to yamllint** rather than **checked**, which is the
+  claim the script can actually make good on. See
   [docs/dev-conventions.md](docs/dev-conventions.md).
 
 - **Contributor tooling: the repo is now scanned for secrets on every gate run
