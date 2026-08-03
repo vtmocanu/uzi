@@ -156,6 +156,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/agent-templates/", noLimiter},
 	{"GET", "/api/agent-templates/allocations", noLimiter},
 	{"GET", "/api/agent-templates/{id}", noLimiter},
+	// The shipped builtin definition (issue #201 M4a). noLimiter, like every
+	// sibling here: it is a read of data embedded in the binary — no database
+	// query beyond the row fetch the neighbours already do, no external call, and
+	// it is gated to callers who pass the template WRITE authz.
+	{"GET", "/api/agent-templates/{id}/builtin", noLimiter},
 	{"GET", "/api/agent-templates/{id}/rendered", noLimiter},
 	{"GET", "/api/agent-templates/{id}/skills", noLimiter},
 	{"GET", "/api/auth/cli/request/{id}", noLimiter},

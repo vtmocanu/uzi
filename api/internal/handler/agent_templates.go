@@ -62,24 +62,30 @@ type agentTemplateDTO struct {
 	// flag kept in lockstep with Scope=='builtin' by builtin_scope_ck; the UI reads
 	// Scope for badges and the "my agents" grouping. UserID is set only for
 	// scope='user' rows (the owner).
-	Scope     string    `json:"scope"`
-	UserID    *string   `json:"user_id"`
-	UpdatedBy *string   `json:"updated_by"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Scope     string  `json:"scope"`
+	UserID    *string `json:"user_id"`
+	UpdatedBy *string `json:"updated_by"`
+	// DiffersFromBuiltin is COMPUTED per request and stored nowhere (issue #201
+	// M4a): whether this row's content still matches the definition this binary
+	// ships under the same name. See differsFromBuiltin for what "content" means
+	// and for the three ways it is false.
+	DiffersFromBuiltin bool      `json:"differs_from_builtin"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 func templateDTO(t store.AgentTemplate) agentTemplateDTO {
 	dto := agentTemplateDTO{
-		ID:          t.ID.String(),
-		Name:        t.Name,
-		Description: t.Description,
-		Tools:       decodeTools(t.Tools),
-		PromptBody:  t.PromptBody,
-		IsBuiltin:   t.IsBuiltin,
-		Scope:       t.Scope,
-		CreatedAt:   t.CreatedAt.Time,
-		UpdatedAt:   t.UpdatedAt.Time,
+		ID:                 t.ID.String(),
+		Name:               t.Name,
+		Description:        t.Description,
+		Tools:              decodeTools(t.Tools),
+		PromptBody:         t.PromptBody,
+		IsBuiltin:          t.IsBuiltin,
+		Scope:              t.Scope,
+		DiffersFromBuiltin: differsFromBuiltin(t),
+		CreatedAt:          t.CreatedAt.Time,
+		UpdatedAt:          t.UpdatedAt.Time,
 	}
 	if t.Model.Valid {
 		dto.Model = &t.Model.String
@@ -123,6 +129,120 @@ func templateToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 		d.Model = t.Model.String
 	}
 	return d
+}
+
+// differsFromBuiltin reports whether a stored row's content has drifted from the
+// definition THIS BINARY ships under the same name (issue #201 M4a). It is
+// computed on every read and stored nowhere: there is no column, no hash and no
+// migration behind it, so it can never go stale against the shipped corpus.
+//
+// It is false in three distinct situations, and the third conflates two states
+// with opposite Reset outcomes:
+//
+//  1. The row is not a builtin. A global template, or a user template whose name
+//     merely COLLIDES with a builtin (00048 explicitly allows a user to own a
+//     'coder' beside the builtin one), has no shipped counterpart to differ from.
+//     Keying on name alone would badge that user's private row and advertise a
+//     Reset that answers 400 "only builtin templates can be reset".
+//  2. The row is a builtin and matches the shipped definition.
+//  3. The row is a builtin with NO shipped definition — a builtin removed from a
+//     later release. Nothing to compare against, so it reports false even though
+//     Reset would answer 409. That distinction reaches the UI through
+//     GET /agent-templates/{id}/builtin rather than through a tri-state here.
+//
+// The scope check reads `scope` rather than `is_builtin`; 00048's
+// `CHECK (is_builtin = (scope = 'builtin'))` makes the two a provable
+// biconditional, so this is a style choice and no fixture can tell them apart.
+//
+// templateToDefinition supplies the normalization — it is the existing mapping of
+// a stored row onto the very type BuiltinByName returns, so both sides of the
+// comparison are agenttmpl.Definition and the jsonb tools column is decoded, not
+// byte-compared. Do NOT add drift-specific behaviour to it: it is on the
+// /rendered export path that writes into an agent workspace.
+func differsFromBuiltin(t store.AgentTemplate) bool {
+	if t.Scope != "builtin" {
+		return false
+	}
+	def, ok := agenttmpl.BuiltinByName(t.Name)
+	if !ok {
+		return false
+	}
+	return !agenttmpl.SameContent(templateToDefinition(t), def)
+}
+
+// builtinDefinitionDTO is the JSON view of a shipped builtin definition served by
+// GetBuiltinAgentTemplate. Field names and null semantics mirror
+// agentTemplateDTO's (model null = inherit, tools null = inherit all) so the
+// editor diffs like against like; the row-only fields (id, scope, timestamps)
+// have no meaning for a definition that lives in the binary.
+type builtinDefinitionDTO struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Model       *string  `json:"model"`
+	Tools       []string `json:"tools"`
+	PromptBody  string   `json:"prompt_body"`
+}
+
+func builtinDefinitionView(def agenttmpl.Definition) builtinDefinitionDTO {
+	dto := builtinDefinitionDTO{
+		Name:        def.Name,
+		Description: def.Description,
+		Tools:       def.Tools,
+		PromptBody:  def.PromptBody,
+	}
+	if def.Model != "" {
+		m := def.Model
+		dto.Model = &m
+	}
+	return dto
+}
+
+// GetBuiltinAgentTemplate serves the definition this binary ships for a builtin
+// row, so the editor can show a shipped-vs-stored diff BEFORE anyone presses
+// Reset — the destructive act the diff exists to make safe. Until this route
+// existed, BuiltinByName had one non-test caller (ResetAgentTemplate), so the
+// shipped body reached a client only AFTER it had already overwritten the row.
+//
+// Read-only and additive: nothing here writes. It is a sub-resource of {id},
+// matching the /{id}/rendered precedent, which also keeps the ~44 KB shipped
+// corpus out of the list response a nested DTO field would have put it on.
+func (h *Handler) GetBuiltinAgentTemplate(w http.ResponseWriter, r *http.Request) {
+	actor, t, ok := h.loadTemplateForWrite(w, r)
+	if !ok {
+		return
+	}
+	writeBuiltinDefinition(w, actor, t)
+}
+
+// writeBuiltinDefinition is the whole of GetBuiltinAgentTemplate below the row
+// fetch, split out so the status matrix is exercisable without a database.
+//
+// Authorization mirrors ResetAgentTemplate exactly, including its ordering: the
+// row is loaded unfiltered and authorized FIRST, so a template the caller may not
+// see returns 404 rather than a 400/409 that would confirm the id exists. The
+// gate is the WRITE gate on purpose — this endpoint exists to make Reset safe to
+// press, and its audience is exactly the callers who can press it.
+//
+// The two refusals reuse ResetAgentTemplate's semantics rather than inventing
+// new ones: a non-builtin row has no shipped definition (400, as reset answers),
+// and a builtin whose definition this release no longer ships is the 409 case
+// reset already names. That 409 is also how the UI learns not to offer Reset for
+// a removed builtin — a state differs_from_builtin reports as false.
+func writeBuiltinDefinition(w http.ResponseWriter, actor store.User, t store.AgentTemplate) {
+	if status, ok := authorizeTemplateWrite(actor, t); !ok {
+		httpx.Error(w, status, templateWriteDenyMessage(status))
+		return
+	}
+	if !t.IsBuiltin {
+		httpx.Error(w, http.StatusBadRequest, "only builtin templates have a shipped definition")
+		return
+	}
+	def, ok := agenttmpl.BuiltinByName(t.Name)
+	if !ok {
+		httpx.Error(w, http.StatusConflict, "no builtin definition to reset to")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"builtin": builtinDefinitionView(def)})
 }
 
 // templateWriteRequest is the create/update body. name and scope are only read
@@ -200,7 +320,7 @@ func (h *Handler) ListAgentTemplates(w http.ResponseWriter, r *http.Request) {
 // GetAgentTemplate returns one template by id, subject to the same visibility
 // rule as the list (404 when the caller may not see it).
 func (h *Handler) GetAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	_, t, ok := h.loadTemplateForViewer(w, r)
+	t, ok := h.loadTemplateForViewer(w, r)
 	if !ok {
 		return
 	}
@@ -211,7 +331,7 @@ func (h *Handler) GetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 // for a template (any authenticated user). PRD #4 writes this straight into an
 // agent workspace, so it is served as raw Markdown, not a JSON envelope.
 func (h *Handler) GetRenderedAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	_, t, ok := h.loadTemplateForViewer(w, r)
+	t, ok := h.loadTemplateForViewer(w, r)
 	if !ok {
 		return
 	}
@@ -440,17 +560,23 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 
 // loadTemplateForViewer resolves the {id} path param, requires auth, and fetches
 // the row through the visibility filter (a template the caller may not see is
-// 404). Used by the read handlers. Returns the actor and row.
-func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) (store.User, store.AgentTemplate, bool) {
+// 404). Used by the read handlers. Returns the row.
+//
+// It deliberately does NOT return the actor, unlike loadTemplateForWrite: the
+// visibility filter has already applied it, so a read handler has nothing left to
+// decide and both callers discarded it. (Dropped while landing issue #201 M4a —
+// unparam had flagged it in the backlog for a while, and the lint ratchet's
+// whole-files rule surfaced it the moment this file was touched.)
+func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) (store.AgentTemplate, bool) {
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
-		return store.User{}, store.AgentTemplate{}, false
+		return store.AgentTemplate{}, false
 	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid template id")
-		return store.User{}, store.AgentTemplate{}, false
+		return store.AgentTemplate{}, false
 	}
 	t, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
 		ID:       id,
@@ -460,13 +586,13 @@ func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "template not found")
-			return store.User{}, store.AgentTemplate{}, false
+			return store.AgentTemplate{}, false
 		}
 		slog.Error("get agent template", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return store.User{}, store.AgentTemplate{}, false
+		return store.AgentTemplate{}, false
 	}
-	return actor, t, true
+	return t, true
 }
 
 // loadTemplateForWrite resolves the {id} path param, requires auth, and fetches
