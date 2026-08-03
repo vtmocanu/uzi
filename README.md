@@ -5,7 +5,6 @@ AI dark factory. Local laptop demo: Go API + React SPA + PostgreSQL, run via doc
 ## Quick Start
 
 ```sh
-git submodule update --init      # pulls inspiration/ (bottega, multica, dot-agent-deck)
 cp .env.example .env
 # set JWT_SECRET, UZI_SECRET_KEY and POSTGRES_PASSWORD in .env, e.g.:
 #   openssl rand -hex 64      -> JWT_SECRET

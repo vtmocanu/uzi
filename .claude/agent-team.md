@@ -898,11 +898,32 @@ expression).
 
 ## Inspiration-first rule
 
-Before implementing something, check the submodules under `inspiration/`
-(bottega, multica, dot-agent-deck) for prior art. Match the better
-implementation, and beat it where we can. Reviewer and fact-checker
-cross-check our work against these; verify "we do it better than X" claims
-against the actual submodule code, not from memory.
+Before implementing something, check the three prior-art projects — bottega
+(<https://github.com/vdaubry/bottega>), multica
+(<https://github.com/multica-ai/multica>), dot-agent-deck
+(<https://github.com/vfarcic/dot-agent-deck>) — for the same or a similar
+feature. Match the better implementation, and beat it where we can.
+
+**They were git submodules under `inspiration/` until 2026-08-03 and are not
+vendored any more.** Run `./scripts/link-inspiration.sh` once per worktree: it
+clones them to `~/repos/external/` (shared, cloned at most once)
+and symlinks them into a **gitignored** `inspiration/`. Do not re-clone into
+the repo and never `git add -f` those links.
+
+**🔴 A REPO-WIDE `rg` OR `grep -r` CANNOT SEE THROUGH THOSE SYMLINKS, AND SAYS
+SO BY PRINTING NOTHING.** Measured 2026-08-03: neither follows a symlinked
+directory during recursive traversal, so the sweep exits 0 with no output —
+`rg <pattern> inspiration/` (explicit path) or `rg -L` is what actually
+searches it. This is exactly the *instrument that cannot produce the
+disconfirming answer* case below, and it is worse than most because the
+question ("has anyone already built this?") is the one everybody asks by
+sweeping. **An empty repo-wide sweep is not evidence of no prior art.**
+
+Reviewer and fact-checker still cross-check "we do it better than X" claims
+against X's actual code. What changed is where the code lives, not the
+standard: "not checked" is a legitimate finding; "from memory" is still not.
+uzi's own worker containers have no host filesystem and so no symlinks — the
+product's path is to clone from the URLs above on demand.
 
 ## Two negative results from instruments that share an assumption are ONE negative result
 
@@ -1587,10 +1608,14 @@ the output of any run you make:
 - **`-p 1`** on `./e2e/run-store-it.sh` (which is a script, not a target) — the two
   live-DB packages share one database and, run concurrently, race goose into
   "relation already exists" and TRUNCATE each other's fixtures. Both observed.
-- **`--test-timeout=30000`** inside `agent/package.json`'s `test` script, which
-  `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
-  `node --test` does not reproduce a hang today (measured, node v26.4.0:
-  identical pass/fail counts to `npm test`); the cap is still live and worth
+- **`--test-timeout=120000`** inside `agent/package.json`'s `test` script, which
+  `task test:agent` invokes — node's own default is NO timeout. It was `30000`
+  until 2026-08-03, where it was **binding in CI and nowhere else**: what the cap
+  governs depends on the node major, so it bounds each top-level SUITE locally
+  (node v26.4.0, files share a process) and each FILE in CI (node:22-alpine,
+  child process per file). `runner.test.ts` sums to ~96s locally and passed a 30s
+  cap; in CI it lands ~25-30s and flaked. Read `CLAUDE.md`'s `--test-timeout`
+  block before touching the number. The cap is live and worth
   carrying as insurance against a future slow test, not as a fix for a current
   hang.
 
@@ -1644,7 +1669,9 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
   use `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
-- Inspiration submodules: `inspiration/{bottega,multica,dot-agent-deck}`
+- Prior art (external, not vendored since 2026-08-03): bottega, multica,
+  dot-agent-deck — `./scripts/link-inspiration.sh` gives you a gitignored
+  `inspiration/` of symlinks; a recursive grep does not follow them
 - Slash commands the orchestrator may invoke between delegations: none
   project-specific
 

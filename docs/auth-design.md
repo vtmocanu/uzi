@@ -5,7 +5,7 @@ audience: design
 
 # Auth design
 
-uzi's auth is a hand-rolled email+password flow, deliberately compared against the two inspiration projects (`inspiration/bottega`, `inspiration/multica`) and designed to beat both. No OTP, no email verification for password accounts, for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope"). SSO is covered separately below (PRD #45).
+uzi's auth is a hand-rolled email+password flow, deliberately compared against two of the external reference projects ([bottega](https://github.com/vdaubry/bottega), [multica](https://github.com/multica-ai/multica) — vendored as submodules under `inspiration/` when this was written, removed 2026-08-03) and designed to beat both. No OTP, no email verification for password accounts, for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope"). SSO is covered separately below (PRD #45).
 
 ## Comparison with the inspirations
 

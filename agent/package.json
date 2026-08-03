@@ -10,7 +10,7 @@
     "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
     "knip": "knip",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-timeout=30000 test/*.test.ts"
+    "test": "node --import tsx --test --test-timeout=120000 test/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.219",

@@ -318,7 +318,7 @@ typecheck      task typecheck:web
 test           task test:api               # -race -count=1
                task test:controller        # -count=1
                task test:web               # vitest
-               task test:agent             # node --test via tsx, --test-timeout=30000
+               task test:agent             # node --test via tsx, --test-timeout=120000
                task check-docs:web
 dead code      task deadcode       # all four; or deadcode:{api,controller,web,agent}
                                    # (Was `none (gap)`; PRD #103 M4 closed it.) Go =
@@ -380,11 +380,16 @@ and read by the sweeper, and measured by deleting that lock, the test reddens 3/
 under `-race` and only 2/3 without it. **`-p 1`** belongs to `./e2e/run-store-it.sh`
 (a script, not a target): the two live-DB packages share one database and, run
 concurrently, race goose into "relation already exists" and TRUNCATE each other's
-fixtures. **`--test-timeout=30000`** lives in `agent/package.json`'s `test` script,
-which `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
-`node --test` does not reproduce a hang today (measured, node v26.4.0: identical
-pass/fail counts to `npm test`); the cap is still live and worth carrying as
-insurance against a future slow test, not as a fix for a current hang.
+fixtures. **`--test-timeout=120000`** lives in `agent/package.json`'s `test` script,
+which `task test:agent` invokes — node's own default is NO timeout. It was `30000`
+until 2026-08-03, when it was found to be **binding in CI and nowhere else**: the
+cap bounds each top-level SUITE locally (node v26.4.0) and each FILE in CI
+(node:22-alpine, child process per file), so `runner.test.ts` summed to ~96s
+locally under a 30s cap and passed, while landing ~25-30s in CI and flaking.
+**A file killed by the cap reports `cancelled`, not `fail`** — the summary reads
+`fail 0` on a red job — so read the exit code and the TAP plan (it shrinks, with
+the file named in place of its suites), never the tally. See `CLAUDE.md`'s
+`--test-timeout` block before touching the number.
 
 `-count=1` on the two Go test targets is part of the gate, not a habit: Go's test cache
 hashes only files INSIDE the module root, and this repo reads test inputs across
