@@ -1,6 +1,6 @@
 ---
 name: tester
-version: 5
+version: 6
 description: Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer.
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -38,6 +38,37 @@ in check mode for this reason; if a slot is marked `(rewrites files)` —
 unrunnable-as-a-check. If a slot's command looks like a fixing variant
 (`--write`, `--fix`, `gofmt -w`, a bare `fmt` target), treat it the same
 way and say so rather than guessing at a check-mode equivalent.
+
+**A FOLD IS A WRITE, so never apply one in a worktree you share.** Mutation
+testing dirties the tree for as long as the run takes, and "I restored it
+afterwards" is an end-state proof that says nothing about the interval —
+ten folds is ten windows in which another agent's gate run reddens on your
+mutation, or its read of a file returns your fold. Create a throwaway
+detached worktree at the SHA you were given (`git worktree add --detach
+<tmp> <sha>`), fold and run there, and remove it when you finish. Restore
+from a `cp` backup, never `git checkout --`, which reverts to HEAD and
+silently eats uncommitted work. If you cannot get an isolated tree, say so
+BEFORE you start rather than after.
+
+**Which fold discriminates depends on what the assertion claims, and a
+substring check has a floor no fold reaches.** Deleting the thing under
+test is the obvious mutation and it is often the weakest: it proves the
+assertion is live, not that it is bound to the behaviour. Where an
+assertion pins a rule that must hold *in a particular place*, MOVE the rule
+elsewhere in the artifact instead of deleting it — a check that matches
+anywhere follows it and stays green while the behaviour is gone from where
+it bound. And a presence check is **monotone under insertion**: if the text
+is there, it is still there in every superstring, so no amount of anchoring
+or scoping detects an ADDITION that neutralises the behaviour around it.
+That is a floor of the instrument, not a gap in the assertions — document
+it rather than patching it with a negative assertion, which goes vacuous
+the moment the wording changes.
+
+**Several controls that share an assumption are ONE control.** Deletion
+folds and word-level weakenings are both *presence* mutations, so running
+both and getting the same answer is one reading, not two. Before reporting
+a clean result, say what class of change your folds could not have
+produced.
 
 The security-scan slot belongs to the auditor, not to you. Skip it.
 
