@@ -1479,3 +1479,73 @@ diagnostic misdescribes why.
 
 **Re-run offered at ~6 minutes** once a frozen SHA exists, harness already built. **Taking
 it** — the branch will have a fourth commit.
+
+---
+
+## 20. AMENDMENT 15 — `d23599bb`. N-1/N-3/N-4/§17 closed. THE OUTSTANDING LIST IS BELOW AND IT IS THE WHOLE OF IT.
+
+### 🔴 OUTSTANDING — four items, one commit, then FREEZE FOR THE RE-RUN
+
+A `run.go` approval crossed the coder mid-turn and was re-proposed as though undecided.
+**This section is the authoritative list so a crossing cannot lose one again.** Nothing else
+is owed after these four.
+
+1. **`run.go` `sanitizeTTY` doc — USER-APPROVED 2026-08-03, comment fix ONLY.** Correct the
+   claim that JSON escapes C0, C1, DEL and all of Cf (false for three of four, §18), plus the
+   four mechanical `_, _ = fmt.Fprint*` edits at `:189`, `:202`, `:434`, `:582`.
+   **🔴 DO NOT rune-slice `compactText`** — the user considered it and declined: it is a
+   shared helper behind run/steer/TUI rendering and this MR has not tested those surfaces.
+   `TestVersionCommandOutputStaysValidUTF8` **stays a pin rather than becoming a
+   redundancy**, and that is the accepted outcome, not an oversight.
+   Wording precision: *"`encoding/json` does not escape U+009B"* is measured; *"a terminal
+   honours it as CSI"* is **not** — do not write the second.
+2. **§19 N1 — the server-side `IsValid` guard comment.** Say it is redundant *given the
+   current direction test* and retained so that changing that test cannot silently open the
+   invalid-server path. Refuted by a 1521-row cross product; the code stays as it is.
+3. **§19 N2 — pin the `writeFileAtomic` symlink property** (lead ruling). Symlink
+   `version-check.json` at a file outside the store dir, write, assert the target is
+   unchanged. Today `os.WriteFile` substitutes for it fully green.
+4. **§19 N3 — `versioncheck_test.go:458`'s comment credits the wrong assertion.** The
+   `len(errOut) > 4096` check never executes for the build-metadata row; `wantWarning`
+   catches it at `:443`.
+
+**Then report the SHA and STOP WRITING.** The tester holds a built harness and re-runs the
+full 30-mutation programme against a frozen tree in ~6 minutes. Three agents have had results
+contaminated by building from this worktree mid-edit; the freeze closes it for all of them.
+
+### What `d23599bb` landed
+
+**N-1 fixed IN THE STORE, so both write sites inherit it.** A failed probe now moves
+`checked_at` and **keeps any previously recorded version**; `RecordServerVersion` returns the
+version now in effect, so neither caller re-reads. **That is also the whole N-3 fix** —
+`uzi version` simply takes the returned value.
+
+**Both constraints survive, and the control proves the right one paid.** Removing the
+preserve block reddens the store-level test **and** the end-to-end one while **both
+negative-cache tests stay green** — so the offline-laptop property is not what paid for the
+fix. That was the thing worth checking, because preserving-on-failure and negative-caching
+pull in opposite directions.
+
+**Why the wiring mattered, and it is a general point:** the hook read its own local `probed`
+variable, so a store-only fix would have been **invisible from the library's own tests**.
+Hence an end-to-end test as well as a store-level one.
+
+**§17 reproduced rather than trusted.** Removing both `TrimSpace` calls reddens exactly
+`trailing_line_separator` (U+2028, Zl) and `trailing_no-break_space` (U+00A0, Zs) while
+tab/CR/LF stay **green** — precisely the auditor's claim, that the rows which look like they
+pin the trimming do not. The coder added U+00A0 alongside the U+2028 the lead specified,
+since one row would have pinned only half the predicate.
+
+**And `assertNoControlChars` had to widen or the new rows would have been decoration** — it
+skipped whitespace entirely, and the one-line check splits on `\n`, which U+2028 is not. A
+new test row that cannot fail is the shape this branch has now caught three times.
+
+Also closed: the reviewer's nit 2 (`{"servers":null}` — structurally valid JSON with a nil
+map, previously unpinned). **Not taken, correctly:** `withVersion`'s package-level mutation
+is pre-existing, harmless without `t.Parallel()`, and in a file outside this change.
+
+### Coder's self-correction, recorded because the pattern is the point
+
+It had reported §15's N-4 bound as though the mechanism were new to it; it is the **third**
+independent derivation, and the reviewer's actual contribution is the **boundary** (150
+metadata chars warn, 400 silent). Volunteered, unprompted, about its own report.
