@@ -1,0 +1,192 @@
+// @vitest-environment jsdom
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { AgentDetail } from "./AgentDetail";
+import { ApiError, api, type AgentTemplate, type BuiltinDefinition, type User } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
+
+vi.mock("../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    api: {
+      getAgentTemplate: vi.fn(),
+      getBuiltinAgentTemplate: vi.fn(),
+      updateAgentTemplate: vi.fn(),
+      resetAgentTemplate: vi.fn(),
+      deleteAgentTemplate: vi.fn(),
+      // The skills panel renders alongside the editor; stub its reads so an
+      // unhandled rejection there cannot look like a failure of this page.
+      listSkills: vi.fn().mockResolvedValue({ skills: [] }),
+      getTemplateSkills: vi.fn().mockResolvedValue({ skills: [] }),
+    },
+  };
+});
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+const mockApi = vi.mocked(api);
+const mockUseAuth = vi.mocked(useAuth);
+
+const ADMIN: User = {
+  id: "u-admin",
+  email: "vlad@uzi.local",
+  display_name: "Vlad",
+  is_admin: true,
+  is_active: true,
+  autopilot_enabled: false,
+  judge_enabled: false,
+  wait_on_limit: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
+  created_at: "2026-01-01T00:00:00Z",
+  last_login: null,
+};
+
+const SHIPPED: BuiltinDefinition = {
+  name: "coder",
+  description: "Implements features.",
+  model: null,
+  tools: ["Bash", "Read"],
+  prompt_body: "You are the coder.\nStay in the repo you were given.\nNever touch main.\n",
+};
+
+function row(over: Partial<AgentTemplate> = {}): AgentTemplate {
+  return {
+    id: "t-coder",
+    name: "coder",
+    description: SHIPPED.description,
+    model: SHIPPED.model,
+    tools: SHIPPED.tools,
+    prompt_body: SHIPPED.prompt_body,
+    is_builtin: true,
+    scope: "builtin",
+    user_id: null,
+    updated_by: null,
+    differs_from_builtin: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    ...over,
+  };
+}
+
+// The drifted row: one edited line in the prompt body plus a changed description,
+// so the diff has something to show in two of the four columns.
+const DRIFTED = row({
+  differs_from_builtin: true,
+  description: "Implements features, carefully.",
+  prompt_body: "You are the coder.\nStay in the repo you were given.\nAlways run the gate.\n",
+});
+
+function renderPage() {
+  return render(
+    <MemoryRouter initialEntries={["/agents/t-coder"]}>
+      <Routes>
+        <Route path="/agents/:id" element={<AgentDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
+  it("badges a drifted builtin and shows a shipped-vs-stored diff", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: DRIFTED });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+
+    expect(await screen.findByText("differs from shipped")).toBeTruthy();
+    // The diff names which columns moved...
+    expect(await screen.findByText(/description, prompt body/)).toBeTruthy();
+    // ...and carries both sides as TEXT NODES. The shipped line the edit removed
+    // is only obtainable from the /builtin read, so its presence proves the diff
+    // is against the shipped definition and not against the row itself.
+    // The selector is needed because every ancestor's textContent contains the
+    // line too; matching the leaf span is what proves the line is its own node.
+    expect(screen.getByText(/Never touch main\./, { selector: "span" })).toBeTruthy();
+    expect(screen.getByText(/Always run the gate\./, { selector: "span" })).toBeTruthy();
+  });
+
+  it("says so, instead of diffing, when the row matches the shipped definition", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row() });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+
+    expect(await screen.findByText(/Matches the shipped definition/)).toBeTruthy();
+    expect(screen.queryByText("differs from shipped")).toBeNull();
+  });
+
+  it("clears the badge from the reset RESPONSE, with no refetch", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: DRIFTED });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+    mockApi.resetAgentTemplate.mockResolvedValue({
+      template: row({ updated_at: "2026-01-03T00:00:00Z" }),
+    });
+
+    renderPage();
+    expect(await screen.findByText("differs from shipped")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+
+    await waitFor(() => expect(screen.queryByText("differs from shipped")).toBeNull());
+    expect(await screen.findByText(/Matches the shipped definition/)).toBeTruthy();
+    // The interaction an admin judges this by: the badge goes away because the
+    // reset response IS the DTO, not because the page reloaded the row. It holds
+    // only while reset keeps returning the template.
+    expect(mockApi.getAgentTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders diffed markup as TEXT, never as elements", async () => {
+    // The positive control behind criterion 7's grep. A diff library returning an
+    // HTML string (diff2html, jsdiff's convertChangesToXML) would need
+    // dangerouslySetInnerHTML, and template bodies are admin-editable text — so
+    // the tag below would become a real element. Asserting the absence of the
+    // element AND the presence of the literal text is what tells a sanitized
+    // render apart from one that simply dropped the content.
+    const markup = '<img src=x onerror="alert(1)">';
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({
+        differs_from_builtin: true,
+        prompt_body: `You are the coder.\n${markup}\n`,
+      }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    const { container } = renderPage();
+
+    expect(await screen.findByText("differs from shipped")).toBeTruthy();
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getAllByText(new RegExp("onerror"), { selector: "span" }).length).toBeGreaterThan(0);
+  });
+
+  it("does not offer Reset for a builtin this release no longer ships", async () => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ id: "t-retired", name: "retired-role", differs_from_builtin: false }),
+    });
+    // The 409 the server answers for a builtin with no shipped definition — the
+    // same state Reset itself would answer 409 to.
+    mockApi.getBuiltinAgentTemplate.mockRejectedValue(
+      new ApiError(409, "no builtin definition to reset to"),
+    );
+
+    renderPage();
+
+    expect(await screen.findByText(/no longer ships a definition/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reset to default" })).toBeNull();
+    // ...and the page still renders normally: the failed shipped-definition read
+    // is not an error about the template, which loaded fine.
+    expect(screen.queryByText("differs from shipped")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeTruthy();
+  });
+});

@@ -9,6 +9,7 @@ import type {
   AgentTemplate,
   Board,
   BuildInfo,
+  BuiltinDefinition,
   CliAuthRequestMeta,
   CliToken,
   Disposition,
@@ -1530,59 +1531,207 @@ export const mockRepoToolProfiles: Record<string, string[]> = {
 
 // ── Agent templates ──────────────────────────────────────────────────────────
 
-const tmpl = (
+const builtinBody = (name: string, description: string) =>
+  `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`;
+
+// mockShippedBuiltins is the SHIPPED side of the drift comparison (issue #201
+// M4a): what this mock "release" carries under each builtin name, and what Reset
+// restores a row to.
+//
+// IT IS A SEPARATE CONSTANT FROM mockTemplates ON PURPOSE, and that separation is
+// the whole fixture design. mockTemplates holds the STORED rows; when the two
+// were the same array every row was a pristine clone of its own baseline, so
+// nothing could carry the badge on a fresh load and editing the fixture moved
+// both sides of the comparison at once. Apart, the mock computes drift honestly
+// (mockApi's sameContent) instead of hard-coding a flag, and each stored row
+// below can differ in exactly one column.
+export const mockShippedBuiltins: BuiltinDefinition[] = [
+  {
+    name: "coder",
+    description: "Implements features, fixes bugs, refactors code. Runs the project's test/lint commands before reporting done.",
+    model: null,
+    tools: null,
+    prompt_body: builtinBody("coder", "Implements features, fixes bugs, refactors code."),
+  },
+  {
+    name: "reviewer",
+    description: "Reviews code changes for correctness, style, and edge cases. Reports findings only; never modifies code.",
+    model: null,
+    tools: ["Bash", "Read", "Grep", "Glob", "WebFetch", "SendMessage", "TaskUpdate", "TaskList", "TaskGet"],
+    prompt_body: builtinBody("reviewer", "Reviews code changes for correctness, style, and edge cases."),
+  },
+  {
+    name: "auditor",
+    description: "Audits code for security vulnerabilities and unsafe patterns. Reports findings only; never modifies code.",
+    model: null,
+    tools: ["Bash", "Read", "Grep", "Glob", "WebFetch"],
+    prompt_body: builtinBody("auditor", "Audits code for security vulnerabilities and unsafe patterns."),
+  },
+  {
+    name: "tester",
+    description: "Validates changes by exercising them against representative real-world inputs and verifying observable behavior.",
+    model: null,
+    tools: null,
+    prompt_body: builtinBody("tester", "Validates changes against representative real-world inputs."),
+  },
+  {
+    name: "documenter",
+    description: "Updates documentation only. Never modifies source code.",
+    model: null,
+    tools: null,
+    prompt_body: builtinBody("documenter", "Updates documentation only."),
+  },
+  {
+    name: "fact-checker",
+    description: "Adversarially verifies factual claims in docs, specs, and teammate outputs against authoritative sources.",
+    model: null,
+    tools: ["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+    prompt_body: builtinBody("fact-checker", "Adversarially verifies factual claims against authoritative sources."),
+  },
+];
+
+// storedBuiltin builds the STORED row for a shipped builtin: a byte-for-byte
+// clone of the shipped definition, then whatever single-column edit the case
+// needs. Starting from the shipped side rather than restating it is what keeps a
+// "pristine" row genuinely pristine when the shipped text is later reworded.
+const storedBuiltin = (
   id: string,
   name: string,
-  description: string,
   opts: Partial<AgentTemplate> = {},
 ): AgentTemplate => {
-  const is_builtin = opts.is_builtin ?? true;
+  const def = mockShippedBuiltins.find((d) => d.name === name);
+  if (!def) throw new Error(`storedBuiltin: no shipped definition named ${name}`);
   return {
     id,
     name,
-    description,
-    model: null,
-    tools: null,
-    prompt_body: `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`,
-    is_builtin,
-    // scope tracks is_builtin (Decision 9): a builtin is scope 'builtin', a
-    // non-builtin demo template is a 'global' admin one unless opts say otherwise.
-    scope: opts.scope ?? (is_builtin ? "builtin" : "global"),
-    user_id: opts.user_id ?? null,
+    description: def.description,
+    model: def.model,
+    tools: def.tools,
+    prompt_body: def.prompt_body,
+    is_builtin: true,
+    scope: "builtin",
+    user_id: null,
     updated_by: null,
+    // Recomputed on every mock read; the literal is just the resting value.
+    differs_from_builtin: false,
     created_at: daysAgo(40),
     updated_at: daysAgo(40),
     ...opts,
   };
 };
 
+// mockTemplates is the STORED side: the rows the mock list endpoint returns.
+//
+// Each drifted row differs from its shipped twin in exactly ONE column, so the
+// badge, the diff and any comparison written against this data are exercised
+// per-column rather than in aggregate. mockTemplateDriftCases (below) names each
+// case and is asserted by mockApi.templateDrift.test.ts, so a later fixture edit
+// that quietly removes one goes red instead of leaving everything green over a
+// case that no longer exists.
 export const mockTemplates: AgentTemplate[] = [
-  tmpl("t-coder", "coder", "Implements features, fixes bugs, refactors code. Runs the project's test/lint commands before reporting done."),
-  tmpl("t-reviewer", "reviewer", "Reviews code changes for correctness, style, and edge cases. Reports findings only; never modifies code.", {
-    tools: ["Bash", "Read", "Grep", "Glob", "WebFetch", "SendMessage", "TaskUpdate", "TaskList", "TaskGet"],
+  // Pristine control: matches its shipped twin exactly, so it must NOT badge.
+  storedBuiltin("t-coder", "coder"),
+  // tools ORDER only — the case nothing else pins. Same members, swapped.
+  storedBuiltin("t-reviewer", "reviewer", {
+    tools: ["Read", "Bash", "Grep", "Glob", "WebFetch", "SendMessage", "TaskUpdate", "TaskList", "TaskGet"],
     updated_by: "vlad@uzi.local",
     updated_at: daysAgo(6),
   }),
-  tmpl("t-auditor", "auditor", "Audits code for security vulnerabilities and unsafe patterns. Reports findings only; never modifies code.", {
-    tools: ["Bash", "Read", "Grep", "Glob", "WebFetch"],
-  }),
-  tmpl("t-tester", "tester", "Validates changes by exercising them against representative real-world inputs and verifying observable behavior."),
-  tmpl("t-documenter", "documenter", "Updates documentation only. Never modifies source code.", {
-    model: "haiku",
-  }),
-  tmpl("t-fact-checker", "fact-checker", "Adversarially verifies factual claims in docs, specs, and teammate outputs against authoritative sources.", {
+  // tools MEMBERSHIP: an admin granted the auditor a tool it does not ship with.
+  storedBuiltin("t-auditor", "auditor", {
     tools: ["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+    updated_by: "vlad@uzi.local",
+    updated_at: daysAgo(9),
   }),
-  tmpl("t-spec-keeper", "spec-keeper", "Keeps specs/ in sync with implementation work. Maintains specs/human.md and specs/ai.md."),
-  tmpl("t-release-notes", "release-notes", "Drafts release notes from the merged MRs since the last tag.", {
-    is_builtin: false,
+  // prompt_body only.
+  storedBuiltin("t-tester", "tester", {
+    prompt_body: `${builtinBody("tester", "Validates changes against representative real-world inputs.")}\n- Always run the live-DB sweep before reporting a suite green.`,
+    updated_by: "vlad@uzi.local",
+    updated_at: daysAgo(3),
+  }),
+  // model only: shipped inherits (null), the stored row pins one.
+  storedBuiltin("t-documenter", "documenter", {
+    model: "haiku",
+    updated_by: "vlad@uzi.local",
+    updated_at: daysAgo(14),
+  }),
+  // description only.
+  storedBuiltin("t-fact-checker", "fact-checker", {
+    description: "Adversarially verifies factual claims against authoritative sources, and cites every one.",
+    updated_by: "vlad@uzi.local",
+    updated_at: daysAgo(5),
+  }),
+  // A builtin row with NO shipped twin: a role a later release dropped. It must
+  // report no drift (nothing to compare against) AND must not offer Reset, which
+  // would answer 409. Absent from mockShippedBuiltins on purpose.
+  {
+    id: "t-spec-keeper",
+    name: "spec-keeper",
+    description: "Keeps specs/ in sync with implementation work. Maintains specs/human.md and specs/ai.md.",
+    model: null,
+    tools: null,
+    prompt_body: builtinBody("spec-keeper", "Keeps specs/ in sync with implementation work."),
+    is_builtin: true,
+    scope: "builtin",
+    user_id: null,
+    updated_by: null,
+    differs_from_builtin: false,
+    created_at: daysAgo(40),
+    updated_at: daysAgo(40),
+  },
+  // A global row: no shipped counterpart, so never badged whatever its content.
+  {
+    id: "t-release-notes",
+    name: "release-notes",
+    description: "Drafts release notes from the merged MRs since the last tag.",
     model: "haiku",
     tools: ["Bash", "Read", "Grep", "Glob"],
+    prompt_body: builtinBody("release-notes", "Drafts release notes from the merged MRs since the last tag."),
+    is_builtin: false,
+    scope: "global",
+    user_id: null,
     updated_by: "vlad@uzi.local",
+    differs_from_builtin: false,
     created_at: daysAgo(11),
     updated_at: daysAgo(2),
-  }),
+  },
+  // THE CASE THAT SEPARATES A SCOPE-CHECKING IMPLEMENTATION FROM A NAME-ONLY ONE:
+  // a private template whose name collides with a builtin (00048 allows it
+  // explicitly). Its content deliberately differs from the shipped `coder`, so a
+  // comparison keyed on name alone badges it — and the badge would advertise a
+  // Reset that answers 400.
+  {
+    id: "t-my-coder",
+    name: "coder",
+    description: "My own coder: same name as the builtin, deliberately different content.",
+    model: "sonnet",
+    tools: ["Bash", "Read", "Edit"],
+    prompt_body: "You are my personal coder. Follow my house style, not the shipped one.\n",
+    is_builtin: false,
+    scope: "user",
+    user_id: mockAdmin.id,
+    updated_by: "vlad@uzi.local",
+    differs_from_builtin: false,
+    created_at: daysAgo(8),
+    updated_at: daysAgo(8),
+  },
 ];
+
+// mockTemplateDriftCases names the discriminating fixture cases above by template
+// id. It exists so the set can be ASSERTED rather than assumed: a later edit that
+// collapses two cases into one, or drops the removed-builtin row, then reds
+// instead of silently shrinking coverage while every test stays green.
+export const mockTemplateDriftCases: Record<string, string> = {
+  "t-coder": "pristine control — must not badge",
+  "t-reviewer": "tools order only",
+  "t-auditor": "tools membership",
+  "t-tester": "prompt_body only",
+  "t-documenter": "model only (shipped inherits, stored pins)",
+  "t-fact-checker": "description only",
+  "t-spec-keeper": "builtin with no shipped twin",
+  "t-release-notes": "global scope — no shipped counterpart",
+  "t-my-coder": "user scope colliding with a builtin name",
+};
 
 // ── Agent skills (PRD #16) ────────────────────────────────────────────────────
 

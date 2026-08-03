@@ -201,6 +201,19 @@ function AgentRow({
               shadowed
             </Badge>
           )}
+          {/* The copy is "differs from shipped", never "customized" or "edited"
+              (issue #201 M4a). This answers "does this row differ from the body
+              shipped in THIS release?", which a row nobody has touched can answer
+              yes to simply by predating the release. Calling it an edit would make
+              M4b's auto-update read as undoing someone's work. */}
+          {t.differs_from_builtin && (
+            <Badge
+              tone="info"
+              title="This template no longer matches the definition shipped in this release. Open it to see the diff."
+            >
+              differs from shipped
+            </Badge>
+          )}
         </span>
       </td>
       <td className="px-4 py-3">

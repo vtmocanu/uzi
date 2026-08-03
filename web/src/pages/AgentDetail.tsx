@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type AgentTemplate, type AgentTemplateInput } from "../lib/api";
+import {
+  api,
+  ApiError,
+  type AgentTemplate,
+  type AgentTemplateInput,
+  type BuiltinDefinition,
+} from "../lib/api";
 import { renderSubagent, summarizeTools } from "../lib/agentTemplates";
-import { Alert, Button, Card } from "../components/ui";
+import { Alert, Badge, Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
 import { SkillAllocationPanel } from "../components/SkillAllocationPanel";
 
@@ -19,11 +25,27 @@ export function AgentDetail() {
   const [formError, setFormError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  // builtin is the definition this release ships for this row: the shipped side
+  // of the editor's diff. null means there is none to show — either the row is
+  // not a builtin, or it is a builtin this release no longer ships (409), which
+  // is also the state where Reset would fail (issue #201 M4a).
+  const [builtin, setBuiltin] = useState<BuiltinDefinition | null>(null);
 
   const load = useCallback(async () => {
     try {
       const { template } = await api.getAgentTemplate(id);
       setTemplate(template);
+      if (template.is_builtin) {
+        try {
+          const { builtin } = await api.getBuiltinAgentTemplate(id);
+          setBuiltin(builtin);
+        } catch {
+          // A 409 (this release ships no such builtin) or a 403 (not a caller who
+          // could reset it anyway) both mean "no shipped side to show". Neither is
+          // an error worth surfacing over the template itself, which loaded fine.
+          setBuiltin(null);
+        }
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load template");
     } finally {
@@ -89,7 +111,20 @@ export function AgentDetail() {
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="font-mono text-2xl font-semibold">{template.name}</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="font-mono text-2xl font-semibold">{template.name}</h1>
+            {/* Same copy as the Agents list, and deliberately not "customized":
+                the question is whether this row matches THIS release's shipped
+                body, not whether a human edited it. */}
+            {template.differs_from_builtin && (
+              <Badge
+                tone="info"
+                title="This template no longer matches the definition shipped in this release. The diff below shows what Reset would restore."
+              >
+                differs from shipped
+              </Badge>
+            )}
+          </div>
           <p className="mt-1 text-muted">
             {template.is_builtin ? "Builtin template" : "Custom template"} · updated{" "}
             {new Date(template.updated_at).toLocaleString()}
@@ -112,6 +147,7 @@ export function AgentDetail() {
               key={template.updated_at}
               initial={template}
               nameEditable={false}
+              builtin={builtin}
               submitLabel="Save changes"
               busy={busy}
               error={formError}
@@ -120,7 +156,17 @@ export function AgentDetail() {
           </Card>
 
           <Card className="flex items-center justify-between gap-4">
-            {template.is_builtin ? (
+            {/* Reset is offered only when this release actually ships a definition
+                to reset TO. A builtin row it no longer ships answers 409 on both
+                the shipped-definition read and the reset itself, so the button was
+                previously offered and simply failed (issue #201 M4a). */}
+            {template.is_builtin && !builtin ? (
+              <p className="text-sm text-muted">
+                Builtins cannot be deleted. This release no longer ships a
+                definition for <code className="font-mono">{template.name}</code>,
+                so there is nothing to reset it to.
+              </p>
+            ) : template.is_builtin ? (
               <>
                 <p className="text-sm text-muted">
                   Builtins cannot be deleted. Reset restores this template to its

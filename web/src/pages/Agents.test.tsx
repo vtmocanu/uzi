@@ -46,6 +46,7 @@ function tmpl(over: Partial<AgentTemplate> & Pick<AgentTemplate, "id" | "name" |
     is_builtin: over.scope === "builtin",
     user_id: over.scope === "user" ? MEMBER.id : null,
     updated_by: null,
+    differs_from_builtin: false,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
     ...over,
@@ -104,5 +105,65 @@ describe("Agents page shadowed hint (PRD #18 M7/M8)", () => {
 
     const helperRow = screen.getByRole("link", { name: "unique-helper" }).closest("tr")!;
     expect(within(helperRow).queryByText("shadowed")).toBeNull();
+  });
+});
+
+describe("Agents page builtin drift badge (issue #201 M4a)", () => {
+  it("badges only the row the server says differs, and reads 'differs from shipped'", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    const templates = [
+      tmpl({ id: "b-coder", name: "coder", scope: "builtin", differs_from_builtin: true }),
+      tmpl({ id: "b-tester", name: "tester", scope: "builtin", differs_from_builtin: false }),
+    ];
+    mockApi.listAgentTemplates.mockResolvedValue({ templates });
+    mockApi.getTemplateAllocations.mockResolvedValue({
+      templates: [
+        alloc({ id: "b-coder", name: "coder", scope: "builtin" }),
+        alloc({ id: "b-tester", name: "tester", scope: "builtin" }),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    const coderRow = (await screen.findByRole("link", { name: "coder" })).closest("tr")!;
+    expect(within(coderRow).getByText("differs from shipped")).toBeTruthy();
+
+    const testerRow = screen.getByRole("link", { name: "tester" }).closest("tr")!;
+    expect(within(testerRow).queryByText("differs from shipped")).toBeNull();
+
+    // The copy is the contract, not decoration: M4b auto-updates rows this badge
+    // marks, and "customized"/"edited" would claim a human touched them.
+    expect(screen.queryByText(/customized/i)).toBeNull();
+    expect(screen.queryByText(/edited/i)).toBeNull();
+  });
+
+  it("renders the badge from the server field alone — the page never recomputes drift", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    // A user-scope row whose name collides with a builtin, flagged false by the
+    // server. A page that inferred drift from the name would badge it here.
+    const templates = [
+      tmpl({ id: "b-coder", name: "coder", scope: "builtin", differs_from_builtin: false }),
+      tmpl({ id: "u-coder", name: "coder", scope: "user", differs_from_builtin: false, prompt_body: "totally different" }),
+    ];
+    mockApi.listAgentTemplates.mockResolvedValue({ templates });
+    mockApi.getTemplateAllocations.mockResolvedValue({
+      templates: [
+        alloc({ id: "b-coder", name: "coder", scope: "builtin" }),
+        alloc({ id: "u-coder", name: "coder", scope: "user", my_override: true, effective: true, global_default: false }),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getAllByRole("link", { name: "coder" })).toHaveLength(2));
+    expect(screen.queryByText("differs from shipped")).toBeNull();
   });
 });

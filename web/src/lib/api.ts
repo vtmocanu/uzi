@@ -113,8 +113,33 @@ export interface AgentTemplate {
   scope: AgentTemplateScope;
   user_id: string | null;
   updated_by: string | null;
+  // differs_from_builtin is computed server-side per request (issue #201 M4a):
+  // whether this row's four mutable columns still match the definition the
+  // running release ships under the same name. It is false for anything that has
+  // no shipped counterpart — a global row, a user row that merely shares a
+  // builtin's name, and a builtin this release no longer ships.
+  //
+  // NON-OPTIONAL ON PURPOSE. With a `?` every mock literal stays silent and the
+  // badge never renders in mock mode, which is exactly the blindness the web-ux
+  // pass would then be unable to see. Declared required, typecheck names every
+  // literal that has to be updated.
+  differs_from_builtin: boolean;
   created_at: string;
   updated_at: string;
+}
+
+// BuiltinDefinition is the definition THIS BINARY ships for a builtin template
+// (GET /agent-templates/{id}/builtin, issue #201 M4a) — the shipped side of the
+// drift comparison, served so the editor can show a diff BEFORE Reset overwrites
+// the row. Null semantics match AgentTemplate's: model null = inherit, tools null
+// = inherit all. It carries no id, scope or timestamps: it lives in the binary,
+// not in a table.
+export interface BuiltinDefinition {
+  name: string;
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
 }
 
 // AgentTemplateInput is the create/edit shape. name and scope are only sent on
@@ -1969,6 +1994,14 @@ const realApi = {
     ),
   getAgentTemplate: (id: string) =>
     request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
+  // The shipped definition behind a builtin row. 400 when the row is not a
+  // builtin, 409 when this release no longer ships one (the state
+  // differs_from_builtin reports as false, and the signal that Reset would 409).
+  getBuiltinAgentTemplate: (id: string) =>
+    request<{ builtin: BuiltinDefinition }>(
+      "GET",
+      `/agent-templates/${id}/builtin`,
+    ),
   createAgentTemplate: (input: AgentTemplateInput) =>
     request<{ template: AgentTemplate }>("POST", "/agent-templates", input),
   updateAgentTemplate: (id: string, input: AgentTemplateInput) =>
