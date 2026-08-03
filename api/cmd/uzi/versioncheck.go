@@ -31,33 +31,51 @@ func versionCheckEnabled(env Env, gf *globalFlags) bool {
 // exemptFromVersionCheck reports whether cmd must not trigger a version probe. It
 // walks ancestors, the same shape as underSkillCmd.
 //
-// Each exemption has a reason and none of them is "it felt chatty":
+// 🔴 THE MEMBERSHIP RULE IS "MAKES NO NETWORK CALL OF ITS OWN", NOT A LIST.
+// The list below is the rule's current solution, not its definition, and stating it
+// as a list is how the third member got missed: `logout` and `auth token` came from
+// an audit, and `uzi auth status` has exactly the same property and was named by
+// nobody until it was looked for on purpose.
+//
+// Probing from a command that otherwise makes no call is not merely surprising, it
+// moves a CREDENTIAL. The /api/version ROUTE is unauthenticated, but the REQUEST
+// carries `Authorization: Bearer uzc_…` regardless — newRequest attaches the token to
+// every request whose client holds one and does not special-case this route. So a
+// probe on `uzi logout` ships the credential on the way to deleting it, and
+// contradicts that command's own Short ("does not revoke it server-side"); a probe on
+// `uzi auth token` — built so a credential never lands on argv — emits a request
+// carrying the PREVIOUS credential.
+//
+// 🔴 AND DO NOT RE-DERIVE THE SET WITH THE OBVIOUS GREP. `git grep -F 'env.client('`
+// misses `uzi login`, which builds its client directly (`login.go:53`
+// `c := env.NewClient(s)`), so that grep alone reports login as local-only and would
+// exempt it for a reason that looks right. It is on the network (device-auth flow)
+// and is NOT exempt. A file-level grep fails in the other direction too: `auth.go`
+// appears in the `env.client(` list, but that one site belongs to `whoami`, which
+// merely lives in the same file — both of `auth`'s own verbs are local.
+//
+// The derivation, per RunE rather than per file: every command file has as many
+// client constructions as RunE bodies EXCEPT `auth.go` (3 RunE / 1 client — whoami),
+// `login.go` (2 / 1 — login), and `skill.go` (4 / 0). That accounts for every
+// local-only command in the tree, so the set below is exhaustive as of this commit.
+// Re-run both greps when adding a command; a NEW command is not exempt by default,
+// which is the safe direction.
+//
+// The remaining exemptions are not about credentials:
 //
 //   - `version` is RELOCATED, not silenced. PersistentPreRun runs BEFORE RunE, so a
 //     CACHED warning would print `behind server 0.13.0` on stderr and then stdout
 //     would print `server version 0.14.0` from that command's own live probe — a
 //     visible self-contradiction inside one invocation. It warns inline instead
 //     (see version.go), from the probe it was already making.
-//   - the `skill` subtree already has this exemption for the auto-upgrade hook.
-//     These verbs touch only local files, and `uzi skill install` is machine-invoked
-//     at EVERY Claude Code session start by the opt-in hook, where an extra stderr
-//     line is pure noise in an agent's context.
+//   - the `skill` subtree already has this exemption for the auto-upgrade hook, and
+//     `uzi skill install` is machine-invoked at EVERY Claude Code session start by
+//     the opt-in hook, where an extra stderr line is pure noise in an agent context.
 //   - `__complete` / `__completeNoDesc` are cobra's shell-completion RPC, invoked on
 //     every TAB. A 2s stall there is unacceptable and stderr during completion
 //     corrupts the display in some shells.
 //   - `completion` emits a script that is `eval`'d from a shell rc file, so the
 //     warning would print at every shell start.
-//   - `logout` and `auth token` are the two commands that make NO network call today
-//     (both are pure env.Store operations). The route is unauthenticated but the
-//     REQUEST carries `Authorization: Bearer uzc_…` regardless — newRequest attaches
-//     it to every request whose client holds a token. So probing here would ship the
-//     credential on the way to deleting it, and would make `uzi auth token` — built
-//     so a credential never lands on argv — emit a request carrying the PREVIOUS
-//     credential. `logout`'s own Short says it "does not revoke it server-side",
-//     which a probe would quietly contradict.
-//
-// `uzi login` is deliberately NOT exempt: it is already on the network (device-auth
-// flow), so it introduces no new credential path.
 //
 // `--help`, `--version` and a bare non-runnable parent need no exemption at all —
 // cobra returns above the PersistentPreRun loop for each (command.go:918-993). One
@@ -68,9 +86,13 @@ func exemptFromVersionCheck(cmd *cobra.Command) bool {
 		case "skill", "version", "completion", "logout",
 			cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 			return true
-		case "token":
-			// `uzi auth token` only. `uzi token list` is a different, network-bound
-			// command that happens to share the leaf name.
+		case "token", "status":
+			// `uzi auth token` / `uzi auth status` ONLY. Both leaf names are reused
+			// elsewhere in the tree by commands that do call the API — `uzi token
+			// list` and `uzi skill status` — so the parent test is what keeps this
+			// from over-matching. Enumerating the leaves rather than the whole
+			// `auth` subtree also means a future network-bound `uzi auth <verb>` is
+			// not silently exempted.
 			if p := c.Parent(); p != nil && p.Name() == "auth" {
 				return true
 			}
@@ -123,7 +145,7 @@ func maybeWarnVersionSkew(cmd *cobra.Command, env Env, gf *globalFlags) {
 		// Records the ATTEMPT: an empty version is the negative cache entry that
 		// stops an offline laptop re-probing on every command. The error is ignored
 		// deliberately — a read-only $HOME must not break `uzi run list --json`.
-		_ = env.Store.RecordServerVersion(s.URL, serverVersion, now)
+		_ = env.Store.RecordServerVersion(s.URL, serverVersion, version, now)
 	}
 	warnVersionSkew(env, serverVersion)
 }
@@ -149,7 +171,7 @@ func recordAndWarnVersionSkew(env Env, gf *globalFlags, srv *apitypes.BuildInfoD
 	}
 	if env.Store != nil {
 		if s, err := resolveSettings(env, gf); err == nil && strings.TrimSpace(s.URL) != "" {
-			_ = env.Store.RecordServerVersion(s.URL, serverVersion, time.Now())
+			_ = env.Store.RecordServerVersion(s.URL, serverVersion, version, time.Now())
 		}
 	}
 	warnVersionSkew(env, serverVersion)

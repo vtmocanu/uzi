@@ -312,6 +312,7 @@ func TestSkewWarningExemptCommandsDoNotProbe(t *testing.T) {
 	}{
 		{"skill status", []string{"skill", "status"}},
 		{"logout", []string{"logout"}},
+		{"auth status", []string{"auth", "status"}},
 		{"completion request", []string{cobra.ShellCompRequestCmd, "run", ""}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -334,20 +335,27 @@ func TestSkewWarningExemptCommandsDoNotProbe(t *testing.T) {
 func TestExemptFromVersionCheck(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 
+	// The membership rule is "makes no network call of its own". `auth status` is the
+	// third member and was named by nobody until the rule was applied deliberately —
+	// it is `resolveSettings` plus a print, with no client at all.
 	exempt := [][]string{
 		{"version"},
 		{"skill"}, {"skill", "status"}, {"skill", "install"},
 		{"logout"},
-		{"auth", "token"},
+		{"auth", "token"}, {"auth", "status"},
 	}
 	notExempt := [][]string{
 		{"run"}, {"run", "list"}, {"run", "get"},
+		// `uzi login` builds its client with env.NewClient directly rather than
+		// env.client, so the obvious grep reports it as local-only. It is on the
+		// network (device-auth flow) and must stay unexempt.
 		{"login"},
+		// whoami merely LIVES in auth.go; it is the one client site in that file.
 		{"whoami"},
-		{"auth", "status"},
 		// `uzi token list` shares a leaf name with `uzi auth token` and must NOT
 		// inherit its exemption.
 		{"token"}, {"token", "list"},
+		{"repo"}, {"repo", "list"},
 	}
 	for _, path := range exempt {
 		if c := findPath(t, root, path); !exemptFromVersionCheck(c) {
@@ -383,33 +391,56 @@ func findPath(t *testing.T, root *cobra.Command, path []string) *cobra.Command {
 
 // 🔴 THE DISCRIMINATING SANITIZER FIXTURE, AND ITS INPUT IS NOT THE OBVIOUS ONE.
 //
-// Most attack payloads make the version string INVALID semver, so SkewWarning is
-// silent and the payload never reaches stderr at all — a test built from those
-// passes against a completely unsanitized implementation. What gets through is
-// exactly a payload whose TRIMMED form is valid semver, because normSemver calls
-// strings.TrimSpace: `\r`, `\n` and `\t` are unicode.IsSpace, so they are trimmed
-// for the COMPARISON and survive into the PRINTED string.
+// The four executed attack payloads (ESC[2J, a `\r` with a payload after it, OSC 8,
+// U+202E) all make the version string INVALID semver, so SkewWarning is silent and
+// none of them reaches stderr on THIS path at all. A fixture built from those passes
+// against a completely unsanitized warning — they belong at the serverRows sink
+// below, which has no validity guard and where all four do land.
 //
-// `\r` is the sharpest of them. Mid-line it returns the cursor to column 0 and the
-// rest of the message overwrites uzi's own prefix, so an attacker sentence appears
-// to come from uzi.
+// TWO classes get through here, and both were found by running the comparison rather
+// than by reading it:
+//
+//  1. A payload whose TRIMMED form is valid semver. normSemver calls
+//     strings.TrimSpace, and `\r`, `\n` and `\t` are unicode.IsSpace — so they are
+//     stripped for the COMPARISON and survive verbatim into the PRINTED string.
+//     `\r` is the sharpest: mid-line it returns the cursor to column 0 and the rest
+//     of the message overwrites uzi's own prefix, so an attacker sentence appears to
+//     come from uzi.
+//  2. Unbounded length. SemVer build metadata is `[0-9A-Za-z-]` with NO length limit,
+//     so `0.14.0+` followed by a megabyte of `A` is genuinely VALID semver, is
+//     genuinely behind, and reaches the message in full.
+//
+// So the validity guard is not a sanitizer and must never be mistaken for one: it
+// happens to reject one family, rejects neither of these, and protects only because
+// it precedes the interpolation — a statement-ordering property a refactor loses in
+// silence. cellText stays unconditional.
 func TestSkewWarningSanitizesTheServerString(t *testing.T) {
 	withVersion(t, "v0.11.8")
 
 	for _, tc := range []struct {
 		name    string
 		version string
+		// wantWarning is false for the unbounded row and that is not a weaker
+		// assertion, it is a different one. cellText's 200-char cap runs BEFORE the
+		// comparison, so the truncated string is no longer valid semver and the
+		// verdict is silence — a strictly safer outcome than a truncated warning.
+		// What that row pins is the byte count, and the mutation control (remove
+		// cellText) turns it into a one-megabyte line on stderr.
+		wantWarning bool
 	}{
-		{"trailing CR", "0.14.0\r"},
-		{"leading CR", "\r0.14.0"},
-		{"trailing newline", "0.14.0\n"},
-		{"trailing tab", "0.14.0\t"},
+		{"trailing CR", "0.14.0\r", true},
+		{"leading CR", "\r0.14.0", true},
+		{"trailing newline", "0.14.0\n", true},
+		{"trailing tab", "0.14.0\t", true},
+		// Valid semver by construction — the validity guard cannot help here.
+		{"unbounded build metadata", "0.14.0+" + strings.Repeat("A", 1<<20), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &uzicli.FakeClient{Build: apitypes.BuildInfoDTO{Version: tc.version, Founded: "2026-07-03"}}
 			_, errOut, _ := runCLI(t, skewEnv(t, fc), "run", "list", "--url", skewURL)
-			if !strings.Contains(errOut, "is behind server 0.14.0") {
-				t.Fatalf("no warning printed, so this test proves nothing about sanitization:\n%q", errOut)
+			warned := strings.Contains(errOut, "is behind server 0.14.0")
+			if warned != tc.wantWarning {
+				t.Fatalf("warning printed = %v, want %v:\n%.200q", warned, tc.wantWarning, errOut)
 			}
 			assertNoControlChars(t, errOut)
 			// ONE line. A newline is spared by sanitizeTTY and skipped by
@@ -417,8 +448,14 @@ func TestSkewWarningSanitizesTheServerString(t *testing.T) {
 			// newline row is a pin rather than evidence — an unsanitized `0.14.0\n`
 			// splits the warning in two, leaving a second line that reads as a
 			// standalone sentence uzi never wrote.
-			if got := len(nonEmptyLines(errOut)); got != 1 {
-				t.Errorf("stderr is %d lines, want exactly 1:\n%q", got, errOut)
+			if got := len(nonEmptyLines(errOut)); got > 1 {
+				t.Errorf("stderr is %d lines, want at most 1:\n%q", got, errOut)
+			}
+			// The length bound is what discriminates the build-metadata row: it
+			// carries no control character and stays on one line, so the two
+			// assertions above cannot see it.
+			if len(errOut) > 4096 {
+				t.Errorf("stderr is %d bytes; the server string reached it unbounded", len(errOut))
 			}
 		})
 	}

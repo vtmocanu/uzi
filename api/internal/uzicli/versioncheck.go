@@ -105,6 +105,18 @@ func SkewWarning(cliVersion, serverVersion string) (string, bool) {
 // warning on the very next command with no TTL wait. The only staleness a longer TTL
 // buys is the other direction: the server is upgraded and we stay quiet for up to an
 // hour. Silence-when-we-should-warn, never a false warning.
+//
+// 🔴 THE EXISTENCE OF A TTL IS THE MITIGATION; ITS VALUE IS NOT. /api/version has no
+// rate limiter, so the load argument reads as though a shorter TTL were safer and a
+// longer one were the real fix — it is neither. For a 50-agent fleet: no TTL is
+// ~90,000 req/h, 1 min ~3,000, 1 h ~50, 24 h ~2. The three orders of magnitude are
+// entirely between *no TTL* and *any TTL*; going 1h → 24h buys 24x against an
+// already negligible baseline and pays for it with a 24x longer silence window.
+//
+// ONE VALUE GOVERNS BOTH OUTCOMES, and a shorter TTL for the negative entry is
+// specifically rejected. A failed probe costs the full serverProbeTimeout (2s) where
+// a success costs tens of milliseconds, so re-probing failures sooner maximises the
+// cost of exactly the case it governs — the offline laptop this cache exists for.
 const VersionCheckTTL = time.Hour
 
 const (
@@ -148,9 +160,18 @@ type versionCheckState struct {
 // cleared by `brew upgrade uzi-cli`, so the user would be told to upgrade for up to
 // a TTL after they did. Recomputing against the live binary's own version each run
 // self-heals, because the CLI side is what changed.
+//
+// CLIVersion is retained for HUMAN FORENSICS and is never read back — freshness keys
+// on CheckedAt alone. Mirrors skillState (skill.go), which settled the identical
+// question the identical way. Invalidating on a CLI-version change would be the
+// right fix for a cache holding a VERDICT and is redundant here for the reason
+// above: an observation cache already self-heals on upgrade, instantly. Recording it
+// costs nothing and answers "which binary wrote this entry?" when someone is staring
+// at the file wondering why they did or did not get a warning.
 type versionCheckEntry struct {
-	Version   string    `json:"version"`
-	CheckedAt time.Time `json:"checked_at"`
+	Version    string    `json:"version"`
+	CheckedAt  time.Time `json:"checked_at"`
+	CLIVersion string    `json:"cli_version,omitempty"`
 }
 
 func (s *Store) versionCheckPath() string { return filepath.Join(s.dir, versionCheckFile) }
@@ -221,15 +242,26 @@ func (s *Store) CachedServerVersion(url string, now time.Time, ttl time.Duration
 // IGNORED by the CLI: a read-only $HOME must never break `uzi run list --json`. The
 // cost of ignoring it is a probe per command, capped at the 2s probe timeout, and
 // UZI_VERSION_CHECK=0 is the documented remedy.
-func (s *Store) RecordServerVersion(url, version string, now time.Time) error {
+//
+// cliVersion is taken as a PARAMETER rather than read here because this package has
+// no access to the binary's ldflags stamp — the same reason NewSkillInstaller takes
+// it. It is written and never read; see versionCheckEntry.
+func (s *Store) RecordServerVersion(url, version, cliVersion string, now time.Time) error {
 	if s == nil {
 		return errors.New("no config store")
 	}
 	if r := []rune(version); len(r) > maxCachedVersionRunes {
 		version = string(r[:maxCachedVersionRunes])
 	}
+	if r := []rune(cliVersion); len(r) > maxCachedVersionRunes {
+		cliVersion = string(r[:maxCachedVersionRunes])
+	}
 	st := s.loadVersionCheckState()
-	st.Servers[versionCheckKey(url)] = versionCheckEntry{Version: version, CheckedAt: now.UTC()}
+	st.Servers[versionCheckKey(url)] = versionCheckEntry{
+		Version:    version,
+		CheckedAt:  now.UTC(),
+		CLIVersion: cliVersion,
+	}
 	pruneVersionCheck(st.Servers)
 	b, err := json.Marshal(st)
 	if err != nil {
