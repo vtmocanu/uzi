@@ -6,6 +6,31 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **`uzi` now warns when the CLI you're running is older than the server it's
+  talking to.** A CLI three minors behind was silently dropping fields it
+  didn't know about — `run get --json` printed `null` for token attribution
+  that a `curl` against the same endpoint returned fine — with nothing telling
+  you why. The warning prints to stderr (never stdout, so `--json` output stays
+  parseable) and costs at most one version probe an hour. Suppress it with
+  `--quiet` or `UZI_VERSION_CHECK=0` (issue #144).
+
+### Fixed
+
+- **Server-supplied build-info strings are now sanitized before `uzi version`
+  prints them.** A hostile or compromised server could put terminal control
+  sequences, bidi overrides, or an unbounded amount of text into the version
+  string uzi prints verbatim, up to and including erasing uzi's own line and
+  substituting an attacker's.
+
+### Security
+
+- Bumped `golang.org/x/text` v0.38.0 → v0.39.0, closing `GO-2026-5970` (infinite
+  loop on invalid input), and `github.com/yuin/goldmark` v1.7.8 → v1.7.17,
+  closing `GO-2026-5320` (XSS). Both were pre-existing on `main`, caught in an
+  unrelated `govulncheck` scan and folded in here rather than filed separately.
+
 ## [0.14.0] - 2026-08-03
 
 ### Added
