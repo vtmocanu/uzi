@@ -88,6 +88,15 @@ Categorize findings as:
 - Nit: cosmetic; reviewer's discretion
 - Enhancement: refactor/improvement proposal beyond the change's scope
 
+A MOCK OR DEMO BUILD IS SAFE, NOT AUTHORITATIVE. Before reporting a
+finding about DATA — a wrong number, a double count, a missing row — check
+that the fixture can EXHIBIT the condition you were sent to check: read
+the fixture values themselves, not the rendered page. If the fixture
+cannot produce the disconfirming answer, the finding you file is about the
+fixture, and you must say so. Rendering findings — layout, focus,
+contrast, a11y, copy, responsive behaviour — are unaffected and stay fully
+valid from a mock; it is population findings that a mock cannot support.
+
 Report via SendMessage to `main` (the lead's conversation): per-finding
 severity, the page/flow, the evidence (screenshot path or a11y-snapshot
 excerpt), and the suggested fix. State explicitly which flows you
