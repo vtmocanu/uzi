@@ -284,6 +284,47 @@ changing at all.)*
 
 ## Amendments
 
+### Amendment 8 — 2026-08-03. THE LEAD MADE THE SAME ERROR TWICE. Rule, not another apology.
+
+**Instance 1:** *"the merge altered no M4a file"* — five hand-picked paths checked, generalised
+to all. Caught by the auditor. Retracted, incompletely, which then needed its own correction.
+
+**Instance 2:** *"everything after `b0dc8dad` is docs-only"* — the lead's own commits were
+docs, and it generalised over a range that also held the CODER's. Enumerated:
+`74dcb9f6`, `2144d51c`, `8e270772` and `33834a21` all touch `api/` or `web/`. **`33834a21`
+rewrote the exact surface four of the tester's web arms fold** (the diff renderers, now four
+rather than one). The tester says it plainly: had it taken the claim at face value it would
+have reported six arms as current when they were a source commit stale.
+
+**The shape is identical and it is not carelessness — it is a SAMPLE generalised to a
+POPULATION, asserted in a channel where nobody can see the sample.** Both times the sample was
+correct. Both times the generalisation reached a validator and would have corrupted a result.
+
+**THE RULE: the lead never characterises a RANGE it has not enumerated.** The check is
+mechanical and takes one command — per commit, does it touch source:
+
+```sh
+for c in $(git rev-list --reverse <base>..HEAD); do
+  git show --name-only --format= $c | grep -qE '^(api|web)/' \
+    && echo "SOURCE $(git log -1 --format='%h %s' $c)" \
+    || echo "docs   $(git log -1 --format='%h %s' $c)"
+done
+```
+
+**And never state a tip in a message; state a tip and how to check it.** Three validators have
+now told the lead its named SHA was stale on arrival — twice while the message was in flight,
+which no care in composition can prevent (see Amendment 6's arrival-vs-authorship note). The
+durable fix is the same one: **put the claim in the brief where the reader re-derives it, and
+keep the message a pointer.**
+
+#### Counting convention, before either figure gets quoted as THE number
+
+The auditor reports the `builtins/` corpus delta as **139 body lines**; the tester measures
+**+87/−56 = 143** over the same range. Neither is wrong — they count different things.
+Nothing downstream depends on it. **Pin the convention when you cite it, or two correct
+numbers become a contradiction later**, which this file already has one recorded instance of
+(the grep unit table in Amendment 3 R4).
+
 ### Amendment 7 — 2026-08-03, tester. 24 folds, and a correction to Amendment 6's headline.
 
 Gates green at both `c3704d25` and `37b4bfc0`, run serially in throwaway detached worktrees
