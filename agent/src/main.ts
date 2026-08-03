@@ -170,6 +170,13 @@ async function main(): Promise<void> {
     // HOME holds exactly one project dir. Omitted for the stub (it persists no real SDK
     // session) — the same discriminator the run lane gets for free from the stub's
     // absent per-run HOME above.
+    //
+    // The conditional-spread idiom is the point (PRD #103 M3, oxlint
+    // unicorn/no-useless-spread): it OMITS the key rather than setting it to
+    // undefined, which is what lets the stub be told apart from a worker whose
+    // sdkHomeDir happens to be unset. Rewriting it to satisfy the rule would either
+    // reintroduce the undefined key or need a mutable builder for one field.
+    // eslint-disable-next-line unicorn/no-useless-spread
     ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
   });
 

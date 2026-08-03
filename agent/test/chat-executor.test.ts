@@ -69,6 +69,10 @@ function fakeTurns(scripts: Array<SDKMessage[] | ((signal: AbortSignal) => Async
 
 function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
   return {
+    // NEVER YIELDING IS THE FIXTURE (PRD #103 M3, oxlint eslint(require-yield)):
+    // this iterator models a hung SDK query so the watchdog has something to abort.
+    // A `yield` added to satisfy the rule would hand the executor a result.
+    // eslint-disable-next-line require-yield
     async *[Symbol.asyncIterator]() {
       await new Promise<void>((resolve) => {
         if (signal.aborted) return resolve();

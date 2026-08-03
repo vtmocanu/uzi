@@ -116,6 +116,9 @@ function fakeTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Turn[] } {
 
 function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
   return {
+    // NEVER YIELDING IS THE FIXTURE — same shape and same reason as
+    // chat-executor.test.ts's copy (PRD #103 M3, oxlint eslint(require-yield)).
+    // eslint-disable-next-line require-yield
     async *[Symbol.asyncIterator]() {
       await new Promise<void>((resolve) => {
         if (signal.aborted) return resolve();

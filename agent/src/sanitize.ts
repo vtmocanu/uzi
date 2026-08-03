@@ -31,6 +31,9 @@ const REPLACEMENT = "\ufffd";
  * (their halves are in the surrogate range), so this is a cheap over-approximation:
  * it decides whether to walk, never what to replace.
  */
+// Matching U+0000 is the whole job of this guard, so the rule's advice is already
+// taken and the finding can only be stated, not fixed (PRD #103 M3).
+// eslint-disable-next-line no-control-regex
 const NEEDS_SCAN = /[\u0000\ud800-\udfff]/;
 
 export interface SanitizeCounts {

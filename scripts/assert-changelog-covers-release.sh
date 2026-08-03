@@ -130,13 +130,44 @@ EOF
   # Issue/PRD numbers this merge claims, from the branch name and the message.
   # `chore/release-0.11.10` yields nothing, by design: the `/<digits>-` form needs
   # digits immediately after the slash.
+  #
+  # BOTH greps need the `|| true`, and the second one is the easy half to miss:
+  # a merge citing no issue number is the case this gate exists to REPORT, and
+  # under `set -euo pipefail` an unguarded `grep` returning 1 makes the whole
+  # command substitution fail, which aborts an ASSIGNMENT (the POSIX distinction
+  # -- a substitution inside a simple command would not). Measured 2026-08-03
+  # cutting v0.14.0: the run died at `fix/agent-test-timeout-knife-edge`, whose
+  # message carries `!161` and `120000` but no `#`-prefixed number, printing the
+  # "Checking ..." header and then exiting 1 with nothing else -- so every merge
+  # after it in the window went unchecked and the operator was told nothing. It
+  # fails CLOSED, which is why it was survivable, but a gate that reports less
+  # than it claims is the exact defect the `--match 'v[0-9]*'` comment above
+  # exists to prevent, arriving through the shell instead of through git.
   refs="$( { printf '%s\n%s\n' "$subject" "$body" | grep -oiE '(issue[-/ ]?|prd[ -]?#?|#|/)[0-9]+' || true; } \
-           | grep -oE '[0-9]+' | sort -un )"
+           | { grep -oE '[0-9]+' || true; } | sort -un )"
+
+  short="$(git rev-parse --short "$sha")"
+
+  # THE SHORT SHA IS A SECOND, RETROACTIVE WAY TO ACCOUNT FOR A MERGE, and it is
+  # the only one that works after the fact. `Changelog: none` lives in the commit
+  # MESSAGE, so reaching for it once a merge has landed means amending -- a
+  # force-push, which this repo forbids on `main`. That made some release windows
+  # simply unreleasable, which contradicts the window this gate exists to close:
+  # merges land while a release MR is open, and those are exactly the ones nobody
+  # thought to tag with an issue number. Citing the short SHA in the section still
+  # forces a human to write down what shipped, which is the whole property; it just
+  # does not require having predicted the need before merging.
+  #
+  # Checked BEFORE the issue-number path so it also rescues a merge that cites the
+  # wrong number, and matched with `-F` -- a SHA is a literal, and this file's
+  # neighbours are full of patterns that were read as regexes.
+  if printf '%s' "$SECTION" | grep -qF "$short"; then continue; fi
 
   if [ -z "$refs" ]; then
     if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$VERSION"; fi
-    printf '  %s  %s\n' "$(git rev-parse --short "$sha")" "$subject"
-    printf '        changed %s but cites no issue number, so coverage cannot be verified\n' "$shipping_example"
+    printf '  %s  %s\n' "$short" "$subject"
+    printf '        changed %s but cites no issue number; cite #<issue> or the short SHA %s in the section\n' \
+      "$shipping_example" "$short"
     missing=$((missing + 1))
     continue
   fi
@@ -148,9 +179,9 @@ EOF
 
   if [ "$found" = 0 ]; then
     if [ "$missing" = 0 ]; then printf '\nFAIL: merges not accounted for in the [%s] section:\n\n' "$VERSION"; fi
-    printf '  %s  %s\n' "$(git rev-parse --short "$sha")" "$subject"
-    printf '        changed %s; none of #%s appears in the section\n' \
-      "$shipping_example" "$(printf '%s' "$refs" | tr '\n' ',' | sed 's/,$//; s/,/, #/g')"
+    printf '  %s  %s\n' "$short" "$subject"
+    printf '        changed %s; neither #%s nor the short SHA %s appears in the section\n' \
+      "$shipping_example" "$(printf '%s' "$refs" | tr '\n' ',' | sed 's/,$//; s/,/, #/g')" "$short"
     missing=$((missing + 1))
   fi
 done <<EOF
@@ -160,12 +191,15 @@ EOF
 if [ "$missing" -gt 0 ]; then
   cat <<MSG
 
-Add these to the [$VERSION] section, then re-tag. If a merge genuinely has nothing
-to announce, put
+Add these to the [$VERSION] section, then re-tag, citing either the issue number
+(#NNN) or the short SHA printed above. If a merge genuinely has nothing to
+announce, put
 
     Changelog: none    # and why
 
-in its commit message.
+in its commit message -- but note that only works BEFORE it merges; afterwards the
+short-SHA citation is the escape, since amending a merged message needs a
+force-push this repo does not allow.
 
 The window this closes: an MR merging WHILE a release MR is open never appears in
 that MR's diff, so no amount of reviewing the release MR can surface it.

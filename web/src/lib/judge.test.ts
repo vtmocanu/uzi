@@ -68,6 +68,9 @@ describe("coordKey (PRD #68/#94/#98)", () => {
     // grep/rg silently returned no matches on the file. Runtime behaviour was fine;
     // reviewability was not. Asserting the OUTPUT is byte-clean is what makes a
     // re-introduction fail rather than merely be discouraged by a comment.
+    // The control-character class is the assertion. Narrowing it to satisfy the
+    // linter would retire the regression guard this test exists to be.
+    // eslint-disable-next-line no-control-regex
     expect(coordKey("install_worker_tool", "rg")).not.toMatch(/[\u0000-\u001f]/);
   });
 });
