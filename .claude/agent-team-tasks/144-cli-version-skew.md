@@ -1304,3 +1304,74 @@ record exactly. Each number is right for its own SHA.
 
 **Neither changed a conclusion, because both were caught before the write-up.** Both would
 have otherwise.
+
+---
+
+## 18. AMENDMENT 13 — `e137d145`. §14's json finding UNDERSTATED it, and the origin is in `run.go`.
+
+### `encoding/json` escapes LESS than §14 said — four families, not two
+
+Measured by the coder before editing, re-derived independently by the lead:
+
+```
+family              raw survives   verdict
+C0 ESC 0x1b         false          ESCAPED
+C0 CR 0x0d          false          ESCAPED
+U+2028 line sep     false          ESCAPED
+DEL 0x7f            true           NOT escaped
+C1 CSI U+009B       true           NOT escaped   <- ANSI control introducer
+U+202E bidi         true           NOT escaped
+U+200B zero width   true           NOT escaped
+```
+
+§14 named DEL and U+202E. **C1 and the zero-widths also ride through**, and **C1 U+009B is
+the single-byte CSI introducer — the same thing `ESC [` opens.** *(Precision the lead owes
+here: "not escaped by `encoding/json`" is measured. Whether a UTF-8-encoded U+009B is
+actually honoured as CSI depends on the terminal's 8-bit control handling and was NOT
+measured — do not upgrade this to a demonstrated injection without testing it.)*
+
+**The decision is unchanged and correct** — `--json` stays byte-exact, because those bytes go
+to a **parser** and sanitizing would corrupt what an agent decodes. What changed is the
+*reason*: the justification is now the **destination**, not the encoder. The new comment
+states the measurement and names the boundary the old wording hid: **piping `--json`
+straight to a TTY is outside the guarantee.**
+
+**Nothing in the suite could ever have caught this.** The existing `--json` test uses
+`"0.14.0\r"` — CR, the one family where the old claim happened to hold. It took reading the
+sentence against the library.
+
+### Item 2 was pinned with a TEST, not a comment — and the control is the point
+
+`TestVersionCommandOutputStaysValidUTF8`: 199 ASCII + `€`×4, so the 200-**byte** boundary
+lands inside a 3-byte rune. **Control:** swapping the render sink from `cellText` to
+`compactText` — literally one of the two refactors this guards against — makes stdout
+invalid UTF-8 and reddens **only this test**, while `TestVersionCommandSanitizesServerBuildInfo`
+stays **green** (because `compactText` still strips controls). The auditor's "nothing pins
+the ordering" demonstrated rather than asserted, and proof the new test is not a duplicate.
+
+### 🔴 PROPOSED, NOT TAKEN — `run.go` carries the SAME false claim in STRONGER form, and it is the ORIGIN
+
+`sanitizeTTY`'s doc says `--json` is safe because *"structural JSON encoding already escapes
+these"* — where **"these"** is its own enumeration: C0, C1, DEL, **and the whole Cf
+category**. Measured above: **false for three of the four.**
+
+**That sentence is where the `version.go` wording came from.** The coder's own words: leaving
+it means the next reader re-derives it into new code, *"which is exactly what happened to
+me."* This is the doc-rot mechanism this branch has now hit twice — once in `CLAUDE.md`
+(§10), once here — where a wrong sentence propagates into new work rather than merely sitting
+there.
+
+**Cost measured, not guessed:** `task lint:api:all` reports **4** pre-existing `errcheck`
+findings in `run.go` (`:189`, `:202`, `:434`, `:582`), all the identical mechanical `_, _ =`
+shape already applied in `root.go`/`version.go`. So `whole-files` makes this cheap — one
+comment plus four one-token edits.
+
+The coder left it correctly: out of scope, and `CLAUDE.md` says **propose** rather than do.
+Escalated to the user in the same turn as this amendment.
+
+### Coder's own disclosure on the moving-tree problem
+
+**Both of its mutation rounds ran in the live worktree.** Internally safe (`cp` backups,
+restores verified against `git diff`), but *"anything building from this tree during those
+windows would have measured a mutated binary."* That is the other half of the auditor's and
+reviewer's contamination — **the lead's frozen-SHA process fix covers all three.**
