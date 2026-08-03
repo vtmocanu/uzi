@@ -264,6 +264,60 @@ Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4
 
 ## Amendments
 
+### Amendment 6 — 2026-08-03, criterion 9 MEASURED, and F5 upgraded from derived to observed.
+
+**Criterion 9 HOLDS, measured on the mock rather than reasoned.** Clicking Reset on
+`t-tester`: `resetAgentTemplate` 0→1, and `getAgentTemplate` / `getBuiltinAgentTemplate` /
+`listAgentTemplates` all **0→0**. Badge cleared, panel flipped to "Matches the shipped
+definition". The badge cleared **from the reset response with zero refetches**, and the change
+propagated to the list on in-app navigation.
+
+**The positive control is the part that makes it evidence.** "No refetch" is an ABSENCE, and
+an absence cannot distinguish a live instrument from a dead one — so web-ux first verified
+`(await import("/src/lib/api.ts")).api === mockApi` (the patch is on the exact object the
+component calls) and drove one real call through the app's own binding to move the counter to
+1 before zeroing and measuring.
+
+**F5 is now OBSERVED, not code-derived, and it is worse than "discards unsaved edits".** With
+`UNSAVED-MARKER-` typed into the description and not saved, one unconfirmed click discarded
+**the live unsaved edit AND the stored drift together** — no dialog, no warning, no undo. That
+was the half of F5's argument that had only been read off `key={template.updated_at}`.
+
+**Provenance, stated rather than assumed: the measurement was taken on the DIRTY tree**, not
+on a committed SHA — `AgentDetail.tsx` had the coder's in-flight F1/F4 edits on disk. It
+transfers, and checkably: `git diff -U0 -- web/src/pages/AgentDetail.tsx` matches
+`resetAgentTemplate|setNotice|differs_from_builtin` **zero** times, so `reset()`, the notice,
+the badge condition and the remount key are untouched by that diff, and for the admin/
+shipped-twin path `shipped.kind === "ok"` yields the identical `builtin` prop.
+
+#### 🔴 OPERATIONAL HAZARD FOR ANY MEASUREMENT IN THIS WORKTREE
+
+**The coder saving a file triggers a full HMR page reload, which wipes injected instrumentation
+AND re-seeds the mock's in-memory state.** Web-ux lost two observations to it, and **both
+failures presented as clean, confident zeros** — the reassuring direction. A second cause hit
+the same run: the detail page's `Back` is a `<button>`, not a link, so a "navigate away and
+back" control never navigated and also returned zeros.
+
+The fix that worked: run patch → control → edit → click → read as **one uninterruptible
+eval**, so a mid-measurement reload surfaces as MISSING counters rather than as zeros.
+Generalised: **in a worktree another agent is writing, an absence is not evidence unless you
+can show the instrument was still live when you read it.**
+
+#### TWO MORE FIXES
+
+**F12. The success notice is off the settled vocabulary.** `AgentDetail.tsx:82` says *"Reset to
+the builtin default."* while the badge says "differs from **shipped**", the panel says "Matches
+the **shipped** definition", and the reset card says "restores this template to its **shipped**
+definition". Amendment 1 §3 settled that vocabulary deliberately, because M4b's classifier
+answers a different question and the noun is what keeps the two coherent. One word.
+
+**F13. F4 as currently written does NOT address F10/S6 — confirmed against the uncommitted
+change.** It scopes the tooltip by `isAdmin`, which is right for F4's complaint, but leaves a
+bare `title` with no `aria-describedby`, so no keyboard or screen-reader user receives either
+variant. **They share one line and need one edit**; `RunCredential.tsx:64-73` does both at
+once. This is the second time web-ux has flagged the pairing — treat the third as a process
+failure rather than a reminder.
+
 ### Amendment 5 — 2026-08-03, fact-check. One new fix, and three corrections to THIS FILE.
 
 Every verdict pinned to a SHA; all probes run in `git archive` copies rather than the shared
