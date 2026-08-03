@@ -16285,3 +16285,146 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   independently by reviewer, architect and auditor. The gate widened accordingly to
   `task gate:api` **and** `task gate:web` (the doc edit runs under `check-docs:web`), not
   `task gate`.
+
+## 472. Issue #205 — the phrase pins are scoped to a REGION, which closes relocation by construction and retires §467's anchors
+
+§467 closed the *quality* half of the anchoring problem (the `anchor` field plus four
+asserted table properties) and recorded that it could not close the *expressiveness* half:
+a substring is position-independent by definition, so a phrase satisfies its pin from
+anywhere in the template. This closes that half by changing what the assertion reads, and
+**deletes the three hand-anchors §467 added** — they were expected throwaway and are.
+
+`splitLeadRegions` cuts the flattened template at
+`Dispatch independent subagents in parallel in a single turn:`; seven cases assert against
+the plan region and one against the bullet region. Relocation now fails **by construction**
+— a clause moved into the other wave's bullet is no longer inside the region its case
+asserts — whatever context the phrase does or does not carry.
+
+- **The phrases shrink because the region carries the position.** Measured on the shipped
+  template, **666 → 376 bytes** — independently re-derived from the shipped tables by both
+  the auditor and the tester. (Stated raw rather than as a percentage, **and in bytes rather
+  than "characters", for one reason**: this shrink is **−44% or −43% depending on whether it
+  is taken in bytes or runes** — `(666−376)/666 = 43.54%` against `(662−376)/662 = 43.20%`,
+  each unit's own division rounded once, since the anchored set carried two em dashes at
+  3 bytes each and so counts 666 bytes against **662 runes**. The ambiguous unit diverges on
+  exactly one of the two figures — this set carries no em dash and is 376 either way — and
+  two figures in two places read as a disagreement to anyone who meets them apart, which raw
+  figures cannot. The issue's own 717 → 375 is a third such pair, and benign: it is the
+  tester's prototype, whose phrase set predates #197's round-4 rewording, so both are right
+  for their own tree.) Everything §467 gave up to make anchoring work comes back: the spans are
+  pairwise disjoint again, each phrase occurs exactly once, the two deliberate overlaps are
+  gone with the documented consequence that one deletion reddened three cases, and
+  `D2 ⊂ P1` dissolves on its own. All of it stays machine-checked.
+- **The naive form is STRICTLY WORSE than the whole-body assertions it replaces, which is
+  why the split is guarded.** `strings.Cut` on a missing separator returns
+  `(whole, "", false)`: the plan region silently becomes the entire body, so seven
+  assertions revert to whole-body semantics — still passing, no longer scoped, nothing
+  saying so — while the bullet region goes empty and reds. One loud, correct-looking red
+  about the bullet case concealing seven quietly disarmed ones. That is the gate lying
+  rather than a claim lying, and it is worse than the blindness it replaces because the
+  blindness was at least written down. Three clauses, all `Fatalf`: exactly one boundary;
+  neither region degenerate; no cross-contamination.
+- **CORRECTION to the issue's own justification for clause 3, measured.** #205 states that
+  clause 3 is *"the only clause that catches a boundary that MOVED"* and that clauses 1 and
+  2 both miss it. **That is false, and it was the lead's sentence rather than the tester's
+  measurement.** Folded with clause 3 deleted: a boundary moved **up** still reds — seven
+  `PLAN region lost …` errors — because a shrinking plan region drops the phrases out.
+  What clause 3 uniquely buys is two narrower things, and the second is the one that
+  matters: **an honest message** (seven reds say the template lost seven behaviours, which
+  is false; one Fatal says the boundary moved, which is true), and the **down**-move, where
+  the plan region silently *widens*. That case is not hypothetical — folded end to end:
+  clause 3 deleted, boundary moved down past the first bullet, and the citation clause
+  relocated into that bullet, the citation case **does not red**, because it matches from
+  inside the bullet. The only red names the ordering case. So a relocation goes undetected
+  underneath a red pointing somewhere else, which is precisely the class this change
+  exists to close, reappearing through its own guard. **The weaker true claim ships; the
+  stronger readable one was wrong.**
+- **The guard's landmarks must come from the region EDGES, and must be asserted BOTH ways.**
+  The prototype took its bullet landmark from the *second* bullet and was measured blind to
+  the down-move above: the landmark never moves, so the guard passes. The shipped landmarks
+  are the plan region's last clause and a sentence inside the first bullet. Each is asserted
+  present in its own region **and** absent from the other — a negative-only form goes
+  vacuous the moment a landmark is reworded, which is this repo's documented
+  vacuous-negative trap wearing a guard's clothes. Neither landmark is a phrase any case
+  pins, so a guard failure and a behaviour failure are never the same message.
+- **This is a STRICTER definition of correct, not a refactor.** A relocated-but-present rule
+  is stated *somewhere* in the template and used to pass; wrong-section is now a failure.
+  Coherent for an issue about which turn the wave runs in, and declared in the test comment
+  so it is met as a decision rather than discovered from a red.
+- **INSERTION STAYS OPEN, and no scoping reaches it.** `strings.Contains` is monotone under
+  insertion: if a phrase is in a region it is in every superstring of that region. Measured
+  green under both instruments — a paragraph inserted above the plan paragraph calling the
+  whole thing "an optional pre-flight … skip it entirely and call `submit_plan` straight
+  away" neutralises every behaviour at `rc=0`. Not patched, because the obvious patch (a
+  negative assertion on the inserted wording) goes vacuous on the next copy change and then
+  guards nothing forever. Real coverage needs a semantic check on the rendered prompt and is
+  separate work. **"Regions closed relocation" must never be read as "regions closed the
+  problem."**
+- **Scoping cannot LOSE detection, and that bounds the question of what it costs.** Each
+  region is a substring of the body, so `Contains(region, p)` implies `Contains(body, p)`:
+  every fold the whole-body form reddened on this set reddens here too. A **proof**, not a
+  measurement, and worth stating because it turns *"does scoping open a new class?"* from
+  open-ended into answerable — the split is the entire new exposure. **And that exposure is
+  three prose dependencies no behaviour pin protects**: the boundary sentence and the two
+  landmarks are ordinary template prose, and a benign edit to any one fatals all eight
+  assertions at the guard. The sharpest is punctuation — the boundary's trailing colon
+  changed to a period gives `guard 1: occurs 0 times` while `TestLeadParallelDispatchPhrases`'
+  pin on that same sentence stays **green**, because it quotes the sentence without the
+  colon. One character, identical behaviour, whole instrument down. All three fail **closed
+  and self-locating**, which makes it a cost rather than a hazard, but the whole-body form
+  did not have it and it is invisible from reading the case table, since the three strings
+  sit in constants that read as configuration.
+- **Controlling clause 3 requires a DUPLICATION fold, and the obvious control cannot reach
+  it.** Each landmark is checked present-in-its-own-region first and leaked-into-the-other
+  second, both `Fatalf` — so a moved boundary always trips the presence branch and the leak
+  branch is unreachable that way. Measured: every boundary-move fold reports
+  `no longer contains its landmark`, never a leak. An auditor controlling the leak branch by
+  moving the boundary therefore concludes it is dead code and deletes a live check.
+  Duplicating a landmark into the other region reaches it, with the boundary count still 1.
+  Same family as this file's other instrument entries: the natural control answers a
+  different question, cleanly and repeatably.
+- **"Relocation fails by construction" reaches exactly as far as the BOUNDARY, and the
+  independent rounds bounded it in three directions.** (a) The plan region is everything
+  *before* the boundary — frontmatter plus both intro paragraphs — not the plan-critique
+  paragraph: **1655 bytes of region against 889 of paragraph** (889 takes the paragraph
+  through its trailing space, which the boundary `Cut` leaves behind; trimming it gives
+  888/767 — a one-byte delimitation choice, not a disagreement), so 766 bytes of room above
+  it. Measured, hoisting the relay clause into the intro reworded as *"as a general habit"*
+  gives **rc=0, no guard, no red**, with the clause out of the section that gives it
+  meaning. Relocation *across* the boundary fails by construction; relocation *within* the
+  plan region does not. Closing it needs a second cut, and the paragraph's opening sentence
+  is itself a pinned phrase, so a naive `strings.Cut` on it would remove that phrase from
+  the region and red its own case — not a one-liner, deliberately not attempted.
+  (b) A **third boundary position** exists that no guard clause covers: partway down, past
+  the ordering sentence but before the bullet landmark. Zero guards fire, and the run reds
+  with a **false message** — `BULLET region lost … missing phrase "fans out again after an
+  implementation unit lands"` while that phrase is still in the template one line above the
+  boundary. Detection holds either way, so it is a **message** gap rather than a detection
+  gap. (c) What closes that window is a **behaviour pin, not the guard**: the bullet region
+  carries exactly one case whose phrase is the first sentence after the boundary, so any
+  move past it reds. Retire or reword that pin and the window widens with nothing structural
+  behind it — a reader sees a behaviour assertion where something load-bearing for the split
+  also sits.
+- **The sibling 14-pin set is STILL whole-body, in the same file.** `TestLeadParallelDispatchPhrases`
+  asserts against the flattened body, so the class is closed for 8 pins and open for 14:
+  measured, moving a parallel-implementer constraint out of its bullet and up into the plan
+  paragraph — across the very boundary this change introduces — leaves **both sets green at
+  rc=0**. Its exposure is genuinely narrow (those phrases nearly all live in the bullets and
+  have nowhere misleading to go), so documenting rather than scoping was the call — but
+  `splitLeadRegions` sitting in that file makes it *look* scoped, and that inference is wrong
+  for 14 of its 22 pins. Scoping them is separate work.
+- **A fold harness produced six plausible, wrong results in this run, and the tell was a
+  count that could not happen.** The guard batch called its fold helper without the empty
+  insert-argument placeholder, so the `sed` expressions were *appended to the template as
+  text* instead of applied. All six folds reported `guard 1` firing — exactly what a
+  boundary fold should produce, which is why it nearly passed. The tell was
+  `occurs 2 times` / `occurs 3 times` from a fold that rewords one line. Re-run with correct
+  arity, and each fold now prints the mutated file's boundary count beside its verdict as a
+  positive control. Same family as this repo's other harness failures: the instrument, not
+  the hypothesis, is what a uniform or impossible result indicts.
+- **The author's round is not the independent one.** The guard was written and folded by the
+  same agent, which is the control-written-from-inside problem that produced #197's finding
+  in the first place — so #205 was split out of #197 precisely to get an auditor onto the
+  guard and a tester onto the instrument. Two of the divergences above (edge landmarks, and
+  the clause-3 correction) came out of the author folding its own work, which is evidence
+  that folding it is worth doing, not evidence that it is sufficient.
