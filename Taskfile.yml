@@ -517,13 +517,13 @@ tasks:
       # set in .golangci.yml. The two obvious alternatives DO NOT CLEAR IT and fail
       # silently - measured 2026-08-02 on this tree against the shipped config:
       #
-      #   --new-from-merge-base=  (empty)   rc=1   107 findings   <- cleared
+      #   --new-from-merge-base=  (empty)   rc=1   106 findings   <- cleared
       #   --new-from-rev=         (empty)   rc=0     0 findings   <- STILL RATCHETED
       #   --whole-files=false               rc=0     0 findings   <- STILL RATCHETED
       #
       # Neither of the last two errors. They yield a "full debt report" that is
       # still filtered, so a companion target written either way reports `0 issues`
-      # over a module carrying 107 - the exact silent-green shape PRD #103 exists
+      # over a module carrying 106 - the exact silent-green shape PRD #103 exists
       # to remove. If the config key is ever renamed, rename this flag with it.
       #
       # 🔴 BOTH CAP FLAGS OR THE NUMBER IS A CAP READING. Defaults are 50 per
@@ -531,10 +531,18 @@ tasks:
       # LINTER. Measured on the shipped config, `cache clean` first, each flag
       # isolated:
       #
-      #   --new-from-merge-base=                            56   errcheck 36  staticcheck 13
-      #   + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
-      #   + --max-same-issues=0                             78   errcheck 50  staticcheck 21
-      #   both                                             107   errcheck 79  staticcheck 21
+      #   --new-from-merge-base=                            55   errcheck 36  staticcheck 13
+      #   + --max-issues-per-linter=0                       55   errcheck 36  staticcheck 13
+      #   + --max-same-issues=0                             77   errcheck 50  staticcheck 21
+      #   both                                             106   errcheck 79  staticcheck 21
+      #
+      # RE-DERIVED 2026-08-03 AT 1076b133 with a private GOLANGCI_LINT_CACHE (zero
+      # foreign paths in any cell); `controller` reads 5 in every cell, then and
+      # now. EVERY PER-LINTER FIGURE IS UNCHANGED - the totals each dropped by one
+      # because 6ea98493 wired up `const hookEvent` and consumed a pre-existing
+      # `unused` finding, so the tail is now unparam 4 + unused 2 = 6 against 7
+      # when M3 measured. The 120-vs-107 INCIDENT NARRATIVE further down keeps its
+      # own numbers on purpose: it describes one dated run, not the current tree.
       #
       # `--max-same-issues` folds duplicate MESSAGES first; `--max-issues-per-linter`
       # then truncates the survivors at 50. So on this config `--max-issues-per-
@@ -544,13 +552,14 @@ tasks:
       # 36 -> 79: no single flag produces 36 -> 79.
       #
       # AND `issues.uniq-by-line` DEFAULTS TO TRUE, DEDUPPING ACROSS LINTERS, so a
-      # single linter's count depends on which OTHERS are enabled: 107 becomes 108
-      # with `--uniq-by-line=false` (staticcheck 21 -> 22). One finding today, noted
+      # single linter's count depends on which OTHERS are enabled: 106 becomes 107
+      # with `--uniq-by-line=false` (staticcheck 21 -> 22, that cell RE-RUN at
+      # 1076b133 rather than shifted on paper). One finding today, noted
       # for M4/M5 because they add linters - this is how a staticcheck finding
       # vanishes from an "unfiltered" total with nobody touching staticcheck.
       #
       # 🔴 WHICH MAKES THE OBVIOUS "IS THE SECOND FLAG LOAD-BEARING?" CHECK A TRAP.
-      # Add `--max-issues-per-linter=0` on its own, see 56 -> 56, conclude it does
+      # Add `--max-issues-per-linter=0` on its own, see 55 -> 55, conclude it does
       # nothing, delete it: errcheck then reads 50 forever, which is exactly the cap
       # reading this paragraph exists to prevent.
       #
@@ -677,9 +686,15 @@ tasks:
       # 43-finding delta are `FakeClient.*` methods on a test double, correctly
       # suppressed.
       #
-      # THE POSITIVE PAIR (carry-forward item 5): as of 2026-08-02 this prints 44
-      # where `task deadcode:api` reports 0. A companion that reports one number
-      # needs the other to mean anything.
+      # THE POSITIVE PAIR (carry-forward item 5): as of 2026-08-03 at 1076b133
+      # this prints 43 where `task deadcode:api` reports 0. A companion that
+      # reports one number needs the other to mean anything.
+      #
+      # THE SHA IS PART OF THE FIGURE, NOT DECORATION. This line read 44 for a
+      # day: 44 was measured before 6ea98493 deleted `HookManager.SettingsPath`,
+      # and the commit that WROTE the 44 landed after the one that invalidated
+      # it. A date cannot separate two commits landed the same afternoon, and
+      # both of these were. See PRD #103 Decision 10.
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
 
   test:api:

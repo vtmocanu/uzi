@@ -316,8 +316,13 @@ dead code      task deadcode       # all four; or deadcode:{api,controller,web,a
                                    # fail-fasts and deadcode never runs.
                                    # `deadcode:api:all` / `:controller:all` drop `-test`
                                    # and print what the gate cannot see (a function
-                                   # whose only caller is a test): 44 and 4 as of
-                                   # 2026-08-02. They ALWAYS EXIT 0 -- the output is the
+                                   # whose only caller is a test): 43 and 4,
+                                   # re-derived 2026-08-03 at 1076b133 -- a
+                                   # tree-derived figure carries the SHA, not just
+                                   # the date (PRD #103 Decision 10); this line read
+                                   # 44 from a run taken before the commit that
+                                   # deleted the 44th.
+                                   # They ALWAYS EXIT 0 -- the output is the
                                    # signal, not the status, which is the opposite of
                                    # `lint:*:all`.
 coverage       none (gap)

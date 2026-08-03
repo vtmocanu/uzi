@@ -116,8 +116,8 @@ One more thing worth knowing when a change deletes a caller: **the gating Go
 invocation carries `-test`, so a function whose only remaining caller is a test
 is LIVE to it** and `unused` misses it too if it is exported.
 `task deadcode:api:all` / `deadcode:controller:all` drop `-test` and print that
-class (44 and 4 as of 2026-08-02) — they always exit 0, so read the output, not
-the status. *(PRD #103 M4, 2026-08-02: this paragraph opened "Dead-code slot:
+class (43 and 4, re-derived 2026-08-03 at `1076b133`) — they always exit 0, so
+read the output, not the status. *(PRD #103 M4, 2026-08-02: this paragraph opened "Dead-code slot:
 `none (gap)`", which M4 made false. M3 had already had to correct this same file
 on this same point.)*
 

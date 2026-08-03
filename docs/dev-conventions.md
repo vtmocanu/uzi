@@ -189,7 +189,8 @@ rather than deferring to the slot.
 
 Two companion targets, `task deadcode:api:all` and `task deadcode:controller:all`,
 drop `-test` and print what the gating invocation cannot see: a function whose
-only remaining caller is a test (44 and 4 respectively as of 2026-08-02). Unlike
+only remaining caller is a test (43 and 4 respectively, re-derived 2026-08-03 at
+`1076b133`). Unlike
 `task lint:api:all`, **they always exit 0** — deadcode has no failure status of
 its own, so read their output rather than their exit code.
 

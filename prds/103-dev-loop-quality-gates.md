@@ -718,6 +718,40 @@ for any non-empty drift list. Where a decision needs a fixed-experiment
 number instead, date it and name the tool version, the way Decisions 1, 2 and
 4 do.
 
+**🔴 AMENDED 2026-08-03, M4's validation wave: A TREE-DERIVED FIGURE CARRIES THE
+SHA IT WAS RUN AT, NOT JUST A DATE.** The exemption above turns on *"a fixed
+experiment that stays true regardless of what the codebase does afterward"* — and
+that phrase silently splits into two populations the original wording treats as
+one. Decision 1's `task`-cache transcript and Decision 2's timing comparison are
+fixed experiments: the tree is not their input, so a date and a tool version pin
+them completely. **A tool run OVER THIS TREE is not one of those.** Its input is
+the tree, the tree moves, and a date cannot separate two commits landed the same
+afternoon.
+
+Both W1 and W2 of M4's wave are that defect, and **both figures were correct when
+taken** — nobody was careless:
+
+- **W1**: `deadcode:api:all` was measured at **44**. `6ea98493` then deleted
+  `HookManager.SettingsPath`, taking it to **43** — and the commit that WROTE the
+  44 (`df58b2c0`) landed *after* the one that invalidated it. Five documents
+  carried the stale figure with a correct date on it.
+- **W2**: the golangci-lint isolation matrix was measured at 56/56/78/107. The
+  same `6ea98493` wired up `const hookEvent` and consumed a pre-existing `unused`
+  finding, taking every total down one to 55/55/77/106. Every *per-linter* figure
+  survived untouched, which is precisely why nothing looked wrong.
+
+So the rule has three parts, and the third is the one the two failures actually
+needed: **date it, name the tool version, and cite the SHA — then say which
+commit's change would move it.** Both corrections above are recorded with
+`1076b133` for that reason. A figure whose SHA is older than a commit touching
+the code it counts is stale until re-run, and that is now checkable by inspection
+rather than by remembering the afternoon.
+
+*This does NOT re-ban the counts Decision 10 already exempts, and it does not
+reach a dated narrative of one past incident* — `Taskfile.yml`'s 120-vs-107
+cache-poisoning story keeps its own numbers, because it describes what one run
+printed rather than what the tree holds now.
+
 **11. No line anchor into any file this PRD's milestones edit appears in this
 document, and a commit SHA is not a provenance citation on its own.**
 
@@ -1248,13 +1282,13 @@ which previously prescribed only the fail-open form.
       itself. Three reasons, measured at golangci-lint 2.12.2 / go1.26.5
       darwin/arm64 **with `--max-issues-per-linter=0 --max-same-issues=0`**: it is
       **1178 findings in `api`** uncapped (931 of them in `_test.go`, 247 not), which
-      is **91.5%**
+      is **91.60%**
       of the combined backlog (goconst 1178 + controller's 33 = 1211, against a
-      non-goconst backlog of api 107 + controller 5 = 112; re-derived on the
+      non-goconst backlog of api 106 + controller 5 = 111; re-derived on the
       **shipped** enable set — the "90%" this previously read was computed on the
       design-wave set, whose non-goconst backlog was 134, and it was the one figure
       in the block nobody re-took when the enable set changed);
-      **the 21 non-test findings visible in the capped run
+      **the non-test findings visible in the capped run
       *across both modules* were read by hand, plus a 1-in-20 re-sample across all 86
       non-test files in `api`, and
       none is a defect** — CLI subcommand names, JSON field names, and the
@@ -1268,11 +1302,22 @@ which previously prescribed only the fail-open form.
       git-manager's CLAUDE.md saying that repo has **no CI gate at all**, so the
       lesson there is "no gate ⇒ accumulation", not "goconst has signal".*
 
+      *(**That clause used to say "the 21 non-test findings", and the number is
+      struck rather than corrected, because it CANNOT BE REPRODUCED IN PRINCIPLE.**
+      The population it counts is cap-truncated — `api` reports 50 of 1178 — so
+      WHICH 50 survive shifts whenever any file changes, and the tally moves with
+      the tree while naming no invocation that would pin it. A fact-checker
+      measured **22** under two independent reconstructions and could neither
+      confirm nor refute the 21. This is the NAME-THE-POPULATION warning three
+      paragraphs down, applied to the one figure in this block that named no
+      population at all. The ruling is unaffected: both samples found the same
+      shape.)*
+
       *Every earlier goconst figure in the M3 design record was a **cap reading**:
       the default `--max-issues-per-linter` is 50 and goconst reported exactly 50,
       which is the tell nobody looks at because 50 is a plausible number. The two cap
-      flags are not redundant — on the shipped config `api` reads **56 capped against
-      107 uncapped**, while `controller` reads **5 either way**. The smaller
+      flags are not redundant — on the shipped config `api` reads **55 capped against
+      106 uncapped**, while `controller` reads **5 either way**. The smaller
       module agreeing exactly is the camouflage.*
 
       *🔴 **THE TWO FLAGS COMPOSE IN ORDER; NEITHER "OWNS" A LINTER**, and the
@@ -1280,18 +1325,25 @@ which previously prescribed only the fail-open form.
       shipped config, `cache clean` before each cell:*
 
       ```
-      --new-from-merge-base=                            56   errcheck 36  staticcheck 13
-      + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
-      + --max-same-issues=0                             78   errcheck 50  staticcheck 21
-      both                                             107   errcheck 79  staticcheck 21
+      --new-from-merge-base=                            55   errcheck 36  staticcheck 13
+      + --max-issues-per-linter=0                       55   errcheck 36  staticcheck 13
+      + --max-same-issues=0                             77   errcheck 50  staticcheck 21
+      both                                             106   errcheck 79  staticcheck 21
       ```
+
+      *Re-derived 2026-08-03 at **`1076b133`** with a private `GOLANGCI_LINT_CACHE`
+      (zero foreign paths in any cell). **Every per-linter figure above is
+      unchanged**; the totals are each one lower than M3 measured because
+      `6ea98493` wired up `const hookEvent` and consumed a pre-existing `unused`
+      finding — today's tail is `unparam 4 + unused 2 = 6` against 7 then.
+      `controller` reads **5** in every cell, then and now.*
 
       *`--max-same-issues` folds duplicate **messages** first; `--max-issues-per-linter`
       then truncates the survivors at 50. So with `goconst` off nothing exceeds 50 until
       the fold is lifted, which makes **`--max-issues-per-linter=0` alone a complete
       no-op** — and the per-linter flag's real effect is **errcheck 50→79**, visible only
       after the other flag has fired. **That is why checking it the obvious way is a
-      trap**: run cell two, see 56→56, conclude the flag does nothing, delete it, and
+      trap**: run cell two, see 55→55, conclude the flag does nothing, delete it, and
       errcheck reads **50** forever — which is exactly the plausible-looking number this
       section exists to warn about.*
 
@@ -1306,8 +1358,9 @@ which previously prescribed only the fail-open form.
       there.)*
 
       *🔴 **AND `issues.uniq-by-line` DEFAULTS TO `true`, DEDUPPING ACROSS LINTERS**, so
-      any single linter's count depends on which others are enabled: the 107 above
-      becomes 108 with `--uniq-by-line=false` (staticcheck 21→22). One finding today,
+      any single linter's count depends on which others are enabled: the 106 above
+      becomes 107 with `--uniq-by-line=false` (staticcheck 21→22, re-run at
+      `1076b133` rather than shifted on paper). One finding today,
       recorded for **M4 and M5**, which add linters — this is how a staticcheck finding
       disappears from an "unfiltered" total without anyone touching staticcheck.*
 
@@ -1458,8 +1511,8 @@ which previously prescribed only the fail-open form.
       > wired into its `gate:<component>`; two reported-never-gating companions
       > (`deadcode:api:all`, `deadcode:controller:all`) running **without**
       > `-test`, because `-test` makes a production-dead function invisible the
-      > moment a test calls it and `unused` misses it too — 44 and 4 findings of
-      > that class today. **Zero new CI jobs**: the targets hang off `lint:api`,
+      > moment a test calls it and `unused` misses it too — 43 and 4 findings of
+      > that class today (re-derived 2026-08-03 at `1076b133`). **Zero new CI jobs**: the targets hang off `lint:api`,
       > `lint:controller`, `validate:web` and `validate:agent`, so `.gate_needs`
       > and `.publish_needs` stay at 12 and 14 with their two-element delta
       > intact (verified by parsing, not grepping).
