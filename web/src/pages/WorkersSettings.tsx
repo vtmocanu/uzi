@@ -417,17 +417,22 @@ export function WorkersSettings() {
                         other does not is how the next reader picks the wrong precedent.
 
                         F12's argument reaches the same cell from the other side and is
-                        why the helper is stripUnsafeChars rather than sanitizeLabel: a
-                        worker name is validated for LENGTH ONLY, so it has LESS
-                        protection than a token label, not more. React escapes HTML, so
-                        there is no XSS — but escaping does nothing to an RLO, which
-                        reorders the text around it and can make a worker render as one
-                        it is not, and nothing rejects a bare ESC either. sanitizeLabel
-                        is Cf-only by design (it mirrors the Go validateSecretLabel
-                        predicate for token labels); stripUnsafeChars is Cc+Cf, so it is
-                        the superset, and it is what the same field's two aria-labels
-                        below already use. The CLI's two name cells got the equivalent
-                        treatment via cellText. */}
+                        why the helper is stripUnsafeChars rather than sanitizeLabel.
+                        React escapes HTML, so there is no XSS — but escaping does
+                        nothing to an RLO, which reorders the text around it and can make
+                        a worker render as one it is not. sanitizeLabel is Cf-only by
+                        design (it mirrors the Go validateSecretLabel predicate for token
+                        labels); stripUnsafeChars is Cc+Cf, so it is the superset, and it
+                        is what the same field's two aria-labels below already use. The
+                        CLI's two name cells got the equivalent treatment via cellText.
+
+                        This used to argue from "a worker name is validated for LENGTH
+                        ONLY, so it has LESS protection than a token label" — no longer
+                        true as of #169, which put the same Cc+Cf rule on the ingest side
+                        (`termsafe.Validate` in handler/workers.go). The helper choice is
+                        unchanged, and the reason is now the stronger one: rows stored
+                        before that validator landed cannot be cleaned retroactively, so
+                        this strip still has real work to do. */}
                     <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
