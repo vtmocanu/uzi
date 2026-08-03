@@ -78,9 +78,15 @@ load-bearing for the next reader.
 Claim-bearing surfaces: `docs/*.md` (some render in-app at `/docs/:slug`), `README.md`,
 `ARCHITECTURE.md`, `prds/*.md` + `prds/done/`, `adr/*.md`, and `specs/{human,ai}.md`, plus
 report/PR prose. Authoritative sources: the Go/TS code as it lands, the docker-compose +
-e2e stack, CI status (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`), and the `inspiration/`
-submodules (bottega, multica, dot-agent-deck) for any "we do it better than X" claim —
-verify against the actual submodule code, never from memory. Prefer official upstream docs
+e2e stack, CI status (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`), and the three prior-art
+projects (bottega, multica, dot-agent-deck) for any "we do it better than X" claim — verify
+against X's actual code, never from memory. Those three were submodules under `inspiration/`
+until 2026-08-03; `./scripts/link-inspiration.sh` restores a gitignored `inspiration/` of
+symlinks locally. **Search it by explicit path** — a recursive `rg`/`grep -r` does not follow
+symlinked dirs, so a repo-wide sweep comes back empty and clean whether or not the prior art
+is there, which is the *instrument that cannot produce the disconfirming answer* trap on the
+question you most want to sweep for. "Not verified, corpus out of tree" is a valid verdict;
+a memory-based one is not. Prefer official upstream docs
 (or the context7 MCP) for external API/version claims. Doc claims rot fastest against code:
 comments and design-doc prose here have asserted mechanisms the code did not have — re-derive
 each load-bearing claim from the code at the moment you assert it.

@@ -139,6 +139,15 @@ func flatten(s string) string {
 // parallel-dispatch prose (PRD #43 M1), one assertion per behavior so a future
 // reword that silently drops a behavior fails loudly. These are the contract
 // the run's fan-out depends on, not incidental wording.
+//
+// THESE FOURTEEN ARE WHOLE-BODY AND ARE NOT REGION-SCOPED. `splitLeadRegions`
+// further down this file scopes the OTHER eight pins to their section of the
+// template; it does not apply here, so a phrase below satisfies its assertion
+// from anywhere in `lead.md`. Measured: moving one of these constraints out of
+// its bullet and up into the plan-turn paragraph — across the boundary that
+// test splits on — leaves both sets green. Narrow in practice, since these
+// phrases nearly all live in the bullets and have nowhere misleading to go, but
+// do not read this file's region machinery as covering this test.
 func TestLeadParallelDispatchPhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
@@ -172,166 +181,349 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Region-scoped phrase pins for `lead` (issue #205). What follows splits the
+// rendered template in two and asserts each pinned phrase against its own half,
+// so a rule MOVED between the plan-turn paragraph and the post-implementation
+// bullet reds instead of satisfying its pin from the wrong section.
+//
+// Three sentences carry more weight than their length suggests, and none of
+// them is an assertion: `leadRegionBoundary` and the two landmarks below are
+// ordinary prose of `lead.md`, and editing any one of them fatals every
+// assertion here. THE WARNING CANNOT LIVE NEXT TO THE PROSE IT PROTECTS:
+// `Render` writes `PromptBody` verbatim (render.go) and that body IS the system
+// prompt shipped to every user's lead agent, so a "do not reword, a test
+// depends on this" note in `lead.md` would be read by the agent as an
+// instruction; and frontmatter is no escape either, since `parse` rejects any
+// unknown key (builtins.go, `unknown frontmatter key`). Hence it is here, and
+// hence the length of what follows.
+// ---------------------------------------------------------------------------
+
+// leadRegionBoundary splits the rendered `lead` template into its two halves:
+// everything before it states what the lead must do BEFORE `submit_plan`, and
+// everything after it is the parallel-dispatch bullet list, whose first bullet
+// is the wave that runs AFTER an implementation unit lands.
+//
+// The boundary is also pinned, from the other direction, by
+// TestLeadParallelDispatchPhrases' first case (which quotes it without the
+// trailing colon). So rewording it cannot quietly move this split without also
+// reddening that set.
+const leadRegionBoundary = "Dispatch independent subagents in parallel in a single turn:"
+
+// Landmarks for guard clause 3. Three properties, each of which a fold showed
+// was needed:
+//
+//   - NOT a phrase any case pins, so a guard failure and a behavior failure are
+//     never the same message;
+//   - asserted BOTH ways — present in its own region, absent from the other.
+//     The positive half matters as much as the negative: a bare "the plan region
+//     must not contain the bullet landmark" goes vacuous the moment the landmark
+//     is reworded, which is the vacuous-negative trap wearing a guard's clothes;
+//   - taken from the region's EDGE, not its middle. A first draft used a
+//     mid-region landmark for the bullet side and measured blind to a boundary
+//     that moved DOWN past the first bullet: the landmark stayed put, the guard
+//     passed, and the plan region silently absorbed the first bullet, so a plan
+//     phrase relocated into that bullet would still have satisfied its plan
+//     case. The plan landmark is therefore the last clause of the plan region
+//     and the bullet landmark is inside the first bullet.
+const (
+	leadPlanLandmark   = "which you do not control"
+	leadBulletLandmark = "Do not name a fixed reviewer-then-auditor pair"
+)
+
+// splitLeadRegions cuts the flattened template in two and refuses to return an
+// untrustworthy split.
+//
+// EVERY CLAUSE BELOW IS LOAD-BEARING AND CLAUSE 3 IS THE ONE THAT LOOKS
+// REMOVABLE. The naive form of this function — a bare `strings.Cut` — is
+// STRICTLY WORSE than the whole-body assertions it replaces, because
+// `strings.Cut` on a missing separator returns `(whole, "", false)`:
+//
+//   - the plan region silently becomes the ENTIRE body, so every plan
+//     assertion reverts to whole-body semantics, still passing, no longer
+//     scoped, and nothing says so;
+//   - the bullet region becomes empty, so its one assertion reds.
+//
+// One loud, correct-looking red about the bullet case, concealing seven quietly
+// disarmed ones. That is the gate lying rather than a claim lying, which is
+// worse than the blindness it replaces because the blindness was at least
+// written down.
+//
+//	clause 1 — exactly one boundary. Catches an absent boundary and a duplicated
+//	           one. Both make the split undefined rather than wrong.
+//	clause 2 — neither region degenerate. Catches splits clause 1 admits: a
+//	           boundary that survives at the very top or very bottom.
+//	clause 3 — no cross-contamination. Catches a boundary that MOVED rather than
+//	           vanished, where the count is still 1 and both sizes are still
+//	           plausible. Deleting it as belt-and-braces is the suggestion to
+//	           expect; what it costs is measured below rather than asserted.
+//
+// Clause 3 is worth its keep for a narrower reason than "nothing else catches a
+// moved boundary", and the difference is worth stating because the wider claim
+// is what a reader would assume. Folded both directions:
+//
+//   - boundary moved UP, above the plan paragraph: without clause 3 the suite
+//     still reds — seven `PLAN region lost …` errors — so it is DETECTED either
+//     way. What clause 3 buys there is the message. Seven reds say the template
+//     lost seven behaviors, which is false; one Fatal says the boundary moved,
+//     which is true, and sends the reader to the one thing that changed.
+//   - boundary moved DOWN, past the first bullet: this is the one that matters,
+//     and the cost is measured rather than predicted. Without clause 3 the only
+//     red is the bullet case — correct-looking and misleading, since the
+//     ordering sentence is still in the template — while the plan region has
+//     silently GROWN to include the first bullet. Folded on that tree: move the
+//     boundary down AND relocate the citation clause into the first bullet, and
+//     the citation case does NOT red. It matched from inside the bullet. One
+//     red pointing at the wrong thing, over a scope that quietly loosened, with
+//     a relocation going undetected underneath it — which is the exact class
+//     this whole change exists to close. With clause 3 present the same tree
+//     stops at `guard 3`, before any assertion is read.
+//
+// So: clause 3 is not the sole detector of a moved boundary. It is the clause
+// that keeps a red honest, and the one that stops a region growing back into
+// the whole-body semantics this change replaced when the boundary lands past
+// the bullet landmark. Both are worth a Fatal, and the second is the one that
+// would otherwise undo the change.
+//
+// There is a THIRD boundary position and no guard clause covers it: PARTWAY
+// down, past the ordering sentence but before the bullet landmark. Measured,
+// zero guards fire — the count is 1, both regions are ample, and each landmark
+// is still on its own side — and the run reds with a message that is FALSE:
+// `BULLET region lost … missing phrase "fans out again after an implementation
+// unit lands"`, while that phrase is still in the template, one line above the
+// boundary. Detection holds (rc=1 either way), so this is a MESSAGE gap rather
+// than a detection gap — but it is the reason the sentence above says "past the
+// bullet landmark" instead of claiming every downward move.
+//
+// And the thing that closes that window is a BEHAVIOR PIN, not the guard: the
+// bullet region carries exactly one case, and its phrase is the first sentence
+// after the boundary, so any move further down than that reds it. Retire or
+// reword that pin and the partway window widens with nothing structural behind
+// it. A reader looking at the bullet case sees a behavior assertion; it is also
+// load-bearing for the split.
+//
+// CONTROLLING CLAUSE 3 NEEDS A DUPLICATION FOLD, NOT A MOVED BOUNDARY. Each
+// landmark is checked present-in-its-own-region first and leaked-into-the-other
+// second, and the first is a Fatalf — so a moved boundary ALWAYS trips the
+// presence branch and the leak branch is unreachable that way. Measured: every
+// boundary-move fold reports `no longer contains its landmark`, never a leak.
+// Anyone controlling the leak branch by moving the boundary will therefore
+// conclude it is dead code and delete it. Duplicate a landmark into the other
+// region instead — measured, that reports `leaked into the other region` with
+// the boundary count still 1, which is the fold that proves the branch live.
+//
+// All three are Fatalf rather than Errorf on purpose. Once the split is
+// untrustworthy the assertions below report on regions that are not the regions
+// they name, and under Errorf a broken
+// split prints all eight results anyway — a screenful of authoritative-looking
+// output computed from a split already known to be invalid, with the one line
+// that explains it scrolled off the top. Stop at the guard; nothing below it
+// means anything until the split is fixed.
+func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
+	t.Helper()
+
+	if n := strings.Count(body, leadRegionBoundary); n != 1 {
+		t.Fatalf("guard 1: region boundary %q occurs %d times, want exactly 1 — "+
+			"the split every assertion in this test depends on is undefined",
+			leadRegionBoundary, n)
+	}
+	plan, bullet, _ = strings.Cut(body, leadRegionBoundary)
+	const floor = 400
+	if len(plan) < floor || len(bullet) < floor {
+		t.Fatalf("guard 2: degenerate split, plan=%d bullet=%d bytes (want both >= %d)",
+			len(plan), len(bullet), floor)
+	}
+	for _, c := range []struct {
+		name     string
+		landmark string
+		in       string
+		notIn    string
+		inName   string
+	}{
+		{"plan", leadPlanLandmark, plan, bullet, "plan"},
+		{"bullet", leadBulletLandmark, bullet, plan, "bullet"},
+	} {
+		if !strings.Contains(c.in, c.landmark) {
+			t.Fatalf("guard 3: the %s region no longer contains its landmark %q — "+
+				"either the boundary moved or the landmark was reworded; fix this before "+
+				"reading any assertion below", c.inName, c.landmark)
+		}
+		if strings.Contains(c.notIn, c.landmark) {
+			t.Fatalf("guard 3: the %s landmark %q leaked into the other region — the "+
+				"boundary moved, and the regions no longer mean what they are named",
+				c.name, c.landmark)
+		}
+	}
+	return plan, bullet
+}
+
 // TestLeadPlanCritiquePhrases pins the plan-time half of the lead's dispatch
-// contract (issue #197): the plan must cite the code it asserts, and the wave
-// that produces those citations runs before `submit_plan`, reads the plan text
-// rather than a diff, and writes nothing.
+// contract (issue #197): before `submit_plan` the plan must cite the code it
+// asserts, and the wave that produces those citations reads the plan text
+// rather than a diff and writes nothing.
 //
-// It is a SEPARATE case set from TestLeadParallelDispatchPhrases on purpose.
-// The ordering this issue changed was entirely unpinned — `after an
-// implementation unit lands` appeared nowhere in this file — so a mutant that
-// deleted the post-implementation ordering and replaced it with a plan-time
-// wave kept all 14 of those pins green by reusing the one clause they share
-// (`send all allocated read-only validators together in one wave`), which is
-// deliberately prefix-agnostic. The first case below fixes the wave that
-// happens AFTER implementation; the rest fix the one that happens BEFORE
-// `submit_plan`, so no single sentence can satisfy both meanings.
+// EACH PHRASE IS ASSERTED AGAINST ITS OWN REGION, NOT THE WHOLE TEMPLATE
+// (issue #205). Moving a clause ACROSS THE BOUNDARY — out of the plan paragraph
+// and into the post-implementation bullet, or back — takes it out of the region
+// its case asserts, so the case reds by construction, whatever context the
+// phrase does or does not carry.
 //
-// Three properties of this set are load-bearing, all three found by folds that a
-// deletion-only control cannot produce:
+// "By construction" reaches exactly that far and no further. The plan region is
+// everything BEFORE the boundary — the frontmatter and both intro paragraphs,
+// not the plan-critique paragraph — so a clause moved UP within the region is
+// not moved at all as far as these assertions are concerned. Measured: the plan
+// region is 1655 bytes against the paragraph's 889, leaving 766 bytes of room
+// above it, and hoisting the relay clause into the intro reworded as "as a
+// general habit" gives rc=0, no guard and no red, with the clause out of the
+// section that gives it meaning. Closing that needs a second cut, and the
+// paragraph's opening sentence is itself a pinned phrase, so a naive
+// `strings.Cut` on it would remove it from the region and red its own case. Not
+// attempted here.
 //
-//  1. A phrase that does not NAME ITS OWN TURN is relocation-blind. Deleting a
-//     clause is not the only way to lose it: move it into the other wave's bullet
-//     and a pin quoting only the clause stays green while the behaviour is gone
-//     from the turn it bound. Seven phrases (not seven pins — the unit here is
-//     the quoted phrase) failed this across two rounds, each after passing its
-//     own deletion fold. The fix is semantic, not length: every phrase below
-//     carries a token that states which turn it binds — `after an implementation
-//     unit lands`, `submit_plan`, `the plan text`, `you send over the plan`,
-//     `during the plan turn`, `re-planning turn`, `the plan you produced`.
-//     WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE PIN CLAIMS, and getting this
-//     backwards is how two people fold the same mutation and report opposite
-//     verdicts. For a DESCRIPTIVE pin the behaviour is *the template states rule
-//     R*, so a relocated sentence still states it: green is correct there and
-//     relocation cannot produce a disconfirming answer at all — REVERSION (put
-//     the original site back to its un-anchored wording) is the fold that can.
-//     For a pin about something the lead must DO AT A PARTICULAR MOMENT, the
-//     behaviour is constituted by where the sentence sits, relocation destroys
-//     it, and relocation is still required. The tell is inside the phrase: a pin
-//     is relocation-proof exactly when nothing in it takes its meaning from a
-//     neighbouring sentence.
-//     The `anchor` field is that token, and the audit below asserts it is
-//     actually inside the phrase. Two rounds of hand-checking missed a
-//     freshly-anchored phrase each time; this is a manual property with nothing
-//     enforcing it, so it is enforced here — but see property 4 for what that
-//     enforcement does and does not cover.
-//  2. A constraint the lead must TRANSMIT has to be pinned as a transmission,
-//     and the phrase has to NAME ITS RECIPIENTS. A subagent's system prompt is
-//     its own template body and the lead cannot alter it, so the dispatch prompt
-//     is the only channel; `architect` and `tester` both ship with `Edit, Write`.
-//     This pin read `tell each of them …` for two rounds, and `each of them`
-//     took its referent from the preceding sentence: relocated, it silently
-//     re-resolved to the post-implementation validators while the plan dispatch
-//     was told nothing — a behaviour destroyed and a different one created, with
-//     the pin green. Naming the recipients (`each validator you send over the
-//     plan`) removes the referent rather than anchoring around it, which is what
-//     makes this pin expressible as a substring at all.
-//  3. NONE OF THIS DETECTS AN INSERTION, and no amount of it ever will.
-//     `strings.Contains` is monotone under insertion: adding text can only turn
-//     a false into a true, never the reverse. So a paragraph inserted above this
-//     one declaring the whole thing optional — "skip it and call `submit_plan`
-//     straight away" — neutralises every behaviour here with all pins byte-intact.
-//     That is a property of substring-presence as an instrument, not a bad choice
-//     of phrases, and no anchoring, widening or region-scoping closes it. The
-//     obvious patch, a negative assertion on the inserted wording, is the
-//     vacuous-negative trap (it guards a string nothing renders). Anchoring
-//     closed RELOCATION; insertion stays open and is caught by reading the diff.
-//  4. THE AUDIT IS A SYNTACTIC CONTAINMENT CHECK, and neither semantic property
-//     it would need is expressible as a substring relation. One root, two
-//     consequences, both open:
-//     (a) it cannot check the anchor NAMES A TURN — only that the declared token
-//     is present. Measured on this table: `anchor: ""` passes, because
-//     `Contains(x, "")` is always true, and so does a vague token like `again`.
-//     Applies to every pin; a better-chosen anchor fixes any instance, so this
-//     is a quality gap. A turn-token allowlist was considered and REJECTED — it
-//     would catch the vague token, leave (b) untouched, and go stale, so the
-//     audit would look stronger with the load-bearing hole in place.
-//     (b) it cannot check the behaviour is ANCHORABLE AT ALL. For a pin whose
-//     phrase carries a context-bound referent, no anchor fixes it. Measured
-//     against the previous commit's relay pin, which had a genuine anchor and
-//     nothing else changed: relocating that clause left the pin AND every audit
-//     assertion green over a template where the plan-turn dispatch is told
-//     nothing and the relocated `each of them` re-resolves to the
-//     post-implementation validators. That is why the fix here was to delete the
-//     referent (property 2) rather than anchor around it. Unfixable inside the
-//     anchor model; the model is provisional and #205 replaces it.
+// It replaces a per-phrase anchoring scheme, and the history is the argument
+// for the replacement. Anchoring required every phrase to quote a token naming
+// its own turn; that is a manual property with nothing checking it was applied,
+// and it was missed in three consecutive rounds — each time on phrases anchored
+// in the round before, once on the very pin guarding the previous round's
+// blocking fix. Three rounds of careful people missing it is the signature of a
+// discipline, not of a defect. The region carries the position now, so the
+// phrase only has to carry the meaning: the phrases below total 376 BYTES
+// against the 666 of the anchored ones they replace, none contains another, and
+// each occurs exactly once. (Raw figures rather than a percentage, and bytes
+// rather than "characters", for one reason: this shrink is −44% or −43%
+// depending on whether it is taken in bytes or runes, because the anchored set
+// carried two em dashes and so counts 666 bytes against 662 runes. Each
+// percentage is that unit's own division rounded once — no single number rounds
+// to both. The ambiguous unit diverges on exactly one of the two figures, since
+// this set carries no em dash and is 376 either way, and two figures in two
+// files read as a disagreement to whoever meets them apart.)
 //
-// Deleting a whole sentence reddens every case living in that sentence, and
-// sentence granularity is how anyone actually folds prose: measured, 2 for the
-// `submit_plan` sentence, 3 for the long dispatch sentence, 1 for each of the
-// other three. Any other multiplicity is a bug, not this trade.
-// The spans themselves are pairwise disjoint and each occurs exactly once
-// — both audited below, because `strings.Contains` is per-occurrence and two pins
-// satisfied by two different occurrences of overlapping text prove less than they
-// appear to.
+// It cannot LOSE detection relative to the whole-body form it replaces, and
+// that is a proof rather than a measurement: each region is a substring of the
+// body, so `Contains(region, p)` implies `Contains(body, p)`, and every fold
+// the old form reddened on this set reddens here too. Worth stating because it
+// bounds the question "does scoping open a new class?" — the split is the
+// ENTIRE new exposure, not one item among several. What that exposure is, is
+// the third item below.
+//
+// FOUR THINGS THIS DOES NOT DO. The first is a deliberate semantic change; the
+// second is a hard limit of every substring instrument, not a choice; the third
+// and the first are both what the split costs; the fourth is an open gap in this
+// same file that this change makes HARDER to see:
+//
+//  1. IT IS A STRICTER CONTRACT THAN BEFORE, and that is a real semantic change
+//     rather than a refactor. A relocated-but-still-present rule is stated
+//     SOMEWHERE in the template; this set treats being in the wrong section as a
+//     failure. Since #197 is precisely about which turn the wave happens in,
+//     placement is part of the contract here — but a future reader should meet
+//     that as a decision, not discover it from a red.
+//  2. IT DOES NOT DETECT AN INSERTION, and no substring-presence instrument
+//     ever will. `strings.Contains` is monotone under insertion: if a phrase is
+//     in a region it is in every superstring of that region. Measured under this
+//     region-scoped form and under the whole-body form it replaces, with the
+//     same result — a paragraph inserted above the plan paragraph calling the
+//     whole thing "an optional pre-flight … skip it entirely and call
+//     `submit_plan` straight away" neutralises every behavior here and the suite
+//     passes, rc=0. Regions closed relocation; they did not close the problem.
+//     Do not patch it with a negative assertion on the inserted wording — that
+//     goes vacuous the moment the copy changes and then guards nothing forever.
+//     Real coverage needs a semantic check on the rendered prompt, which is a
+//     different instrument and a separate piece of work. Until then, insertion
+//     is caught by reading the diff and by nothing in this file.
+//  3. IT ADDS THREE PROSE DEPENDENCIES THAT NO BEHAVIOR PIN PROTECTS, and this
+//     is the whole of what scoping costs. `leadRegionBoundary` and the two
+//     landmarks are ordinary sentences of the template, and a benign edit to any
+//     one of them fatals all eight assertions at the guard. The sharpest is
+//     punctuation: change the boundary's trailing colon to a period and
+//     `guard 1` reports `occurs 0 times`, while TestLeadParallelDispatchPhrases'
+//     pin on that same sentence stays GREEN, because it quotes the sentence
+//     without the colon. One character, identical behavior, whole instrument
+//     down. All three fail CLOSED and name themselves, which is what makes this
+//     a cost rather than a hazard — but the whole-body form did not have it, and
+//     it is invisible from reading the case table, because the three strings sit
+//     in constants that read as configuration rather than as assertions.
+//  4. IT DOES NOT SCOPE TestLeadParallelDispatchPhrases, WHICH STILL ASSERTS
+//     AGAINST THE WHOLE BODY. Same file, same template, fourteen pins, and the
+//     class stays open for them: measured, moving a parallel-implementer
+//     constraint out of its bullet and up into the plan paragraph — across the
+//     very boundary this test introduces — leaves both sets green at rc=0.
+//     A PIN ADDED TO THAT SET FROM NOW ON WILL BE WHOLE-BODY, and this file's
+//     own `splitLeadRegions` is what will make its author think otherwise: the
+//     class #205 exists to close, re-entering through the set this change did
+//     not touch. The exposure is narrow today — those phrases nearly all live
+//     in the bullets and have nowhere misleading to go, which is why
+//     documenting was judged enough — but that is a property of the phrases
+//     currently in the set, not of the set. Scoping them is its own piece of
+//     work if it is worth doing at all.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
 		t.Fatal("lead builtin missing")
 	}
 	body := flatten(string(Render(lead)))
+	plan, bullet := splitLeadRegions(t, body)
 
-	cases := []struct {
+	type pin struct {
 		behavior string
 		phrase   string
-		// anchor names the turn the behavior binds to and MUST appear inside
-		// phrase — see property 1 above.
-		anchor string
-	}{
-		{"post-implementation wave is retained and is a REPEAT",
-			"Read-only work fans out again after an implementation unit lands",
-			"after an implementation unit lands"},
-		{"the citation property is due before submit_plan",
-			"Before you call `submit_plan`, make the plan carry its own evidence",
-			"submit_plan"},
-		{"every asserted mechanism is cited by file and line",
-			"`submit_plan`, make the plan carry its own evidence: for every mechanism it asserts, name the file that implements it and quote the line",
-			"submit_plan"},
-		{"the wave reviews the plan text, not a diff",
-			"the artifact under review is the plan text, not a diff",
-			"the plan text"},
-		{"the no-write rule is RELAYED to each dispatched validator",
-			"tell each validator you send over the plan that it must not change anything in the worktree",
-			"you send over the plan"},
-		{"the no-write rule binds the PLAN TURN specifically",
-			"an edit made during the plan turn is a change nobody saw when approving it",
-			"during the plan turn"},
-		{"re-planning re-cites only what changed",
-			"On any re-planning turn, re-cite only the mechanisms that changed",
-			"re-planning turn"},
-		{"the bar is a property of the plan, never of the issue text",
-			"follows from the plan you produced — how many mechanisms it asserts — never as a judgement about the issue text",
-			"the plan you produced"},
 	}
-	for _, c := range cases {
-		if !strings.Contains(body, c.phrase) {
-			t.Errorf("lead template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+	// Everything the lead owes BEFORE it calls `submit_plan`.
+	planCases := []pin{
+		{"the citation property is due before submit_plan", "Before you call `submit_plan`"},
+		{"every asserted mechanism is cited by file and line", "name the file that implements it and quote the line"},
+		{"the wave reviews the plan text, not a diff", "the artifact under review is the plan text, not a diff"},
+		{"the no-write rule is RELAYED to each dispatched validator", "tell each validator you send over the plan that it must not change anything"},
+		{"the no-write rule exists to protect the approval gate", "a change nobody saw when approving it"},
+		{"re-planning re-cites only what changed", "re-cite only the mechanisms that changed"},
+		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
+	}
+	// The wave that runs AFTER an implementation unit lands. Kept as its own
+	// region so that a plan-turn clause moved down here, or this one moved up,
+	// reds rather than satisfying the other region's case.
+	//
+	// THIS ONE CASE IS ALSO LOAD-BEARING FOR THE SPLIT, which is not visible
+	// from here and is why it is repeated here rather than only at the guard.
+	// Its phrase is the first sentence after the boundary, so it is what reds
+	// when the boundary moves PARTWAY down into this bullet — a position no
+	// guard clause covers (see splitLeadRegions). Retire it, reword it, or add
+	// a second bullet case ahead of it, and that window widens with nothing
+	// structural behind it.
+	bulletCases := []pin{
+		{"post-implementation wave is retained and is a REPEAT", "fans out again after an implementation unit lands"},
+	}
+
+	for _, c := range planCases {
+		if !strings.Contains(plan, c.phrase) {
+			t.Errorf("PLAN region lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+	for _, c := range bulletCases {
+		if !strings.Contains(bullet, c.phrase) {
+			t.Errorf("BULLET region lost behavior %q: missing phrase %q", c.behavior, c.phrase)
 		}
 	}
 
-	// Audit, not a behavior pin: these assert properties OF THE CASE TABLE, so
-	// they fail on a badly-written pin rather than on a changed template.
-	for _, c := range cases {
-		if !strings.Contains(c.phrase, c.anchor) {
-			t.Errorf("pin %q is unanchored: phrase %q does not contain its turn anchor %q",
-				c.behavior, c.phrase, c.anchor)
-		}
+	// Audits, not behavior pins: these assert properties OF THE CASE TABLE, so
+	// they red on a badly-written pin rather than on a changed template.
+	all := append(append([]pin{}, planCases...), bulletCases...)
+	for _, c := range all {
 		if n := strings.Count(body, c.phrase); n > 1 {
-			t.Errorf("pin %q matches %d occurrences; a per-occurrence match cannot say which one satisfied it", c.behavior, n)
+			t.Errorf("pin %q matches %d occurrences of the template; a per-occurrence "+
+				"match cannot say which one satisfied it", c.behavior, n)
 		}
 	}
-	for i, a := range cases {
-		for j, b := range cases {
+	for i, a := range all {
+		for j, b := range all {
 			if i != j && strings.Contains(a.phrase, b.phrase) {
-				t.Errorf("pin %q contains pin %q, so the contained one can never fail alone", a.behavior, b.behavior)
+				t.Errorf("pin %q contains pin %q, so the contained one can never fail alone",
+					a.behavior, b.behavior)
 			}
 		}
 	}
-	// The 14 pins in TestLeadParallelDispatchPhrases are a separate set and must
-	// stay independently falsifiable: an earlier version of the first case here
-	// swallowed `send all allocated read-only validators together in one wave`
-	// whole, which silently retired that pin.
-	for _, c := range cases {
+	// TestLeadParallelDispatchPhrases is a separate set and must stay
+	// independently falsifiable: an earlier version of the bullet case here
+	// swallowed one of its phrases whole, silently retiring it.
+	for _, c := range all {
 		if strings.Contains(c.phrase, "send all allocated read-only validators together in one wave") {
 			t.Errorf("pin %q contains a TestLeadParallelDispatchPhrases phrase, retiring it", c.behavior)
 		}

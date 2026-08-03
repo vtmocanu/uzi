@@ -8,6 +8,8 @@ we have 3 sources of inspiration, we can implement what we want, but we also loo
 
 lets clone all 3 as submodules, before implementing something we will look at them if they implemented same thing or something similar. We will always choose a better version then them if available! We want best practice level of implementation. Some stuff we can deffer for later.
 
+> *(2026-08-03: the submodules were removed. The three projects were vendored under `inspiration/` from the start until then, and are now ordinary clones outside the repo, symlinked back into a gitignored `inspiration/` by `./scripts/link-inspiration.sh`. The look-at-them-first rule above still stands — see the Inspiration-first entries in `CLAUDE.md` and `.claude/agent-team.md`, including why a recursive grep no longer sees them.)*
+
 for agents lets see how coder is able to do docker and kind in k8s pods - maybe we replicate or steal ideeas, look also at the k8s/coder gitlab repo
 
 the initial MVP will be local laptop demo, docker-compose.

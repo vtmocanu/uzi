@@ -22,6 +22,11 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Changed
 
+- **Contributor tooling: the `lead` template's phrase pins are now scoped to the
+  region of the prompt they belong to**, so moving a rule between the plan-turn
+  paragraph and the post-implementation bullet fails the test instead of
+  satisfying it from the wrong section (issue #205). Test-only: no change to how
+  uzi behaves.
 - **The plan you approve has now been read against the code first.** The `lead`
   must back its plan with citations — for every mechanism the plan asserts, the
   file that implements it and the line — and it collects them by sending the

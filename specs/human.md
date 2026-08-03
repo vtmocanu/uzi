@@ -9,8 +9,12 @@ here must hold in any rebuild. Do not edit without user approval.
 
 ## Inspiration (prior art)
 
-- Three inspiration projects vendored as git submodules under `inspiration/`:
-  `bottega`, `multica`, `dot-agent-deck`.
+- Three inspiration projects: `bottega`, `multica`, `dot-agent-deck`.
+  They were vendored as git submodules under `inspiration/` from the start of
+  the project until **2026-08-03**, when the user had them removed from the
+  tree and kept as ordinary clones outside the repo, symlinked back into a
+  gitignored `inspiration/` for local work. The prior-art requirement below is
+  unchanged by that; only where the code lives changed.
 - Before implementing anything, check them for prior art on the same/similar feature.
 - Prefer the better implementation; beat them where possible. Best-practice bar.
 - Some scope may be deferred to later.

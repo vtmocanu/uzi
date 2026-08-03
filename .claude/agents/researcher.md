@@ -29,8 +29,12 @@ file that moves.
 ## For this repo (uzi)
 
 Start in-repo: `ARCHITECTURE.md` (the cross-service map), `prds/*.md` + `prds/done/`
-(Decision Logs), `adr/*.md`, and `specs/{human,ai}.md`. The `inspiration/` submodules
-(bottega, multica, dot-agent-deck) are the prior-art corpus — cite the actual submodule
-code for any "we do/should do it like X" comparison, never from memory. Prefer the
+(Decision Logs), `adr/*.md`, and `specs/{human,ai}.md`. bottega, multica and
+dot-agent-deck are the prior-art corpus — cite their actual code for any "we do/should do
+it like X" comparison, never from memory. Submodules under `inspiration/` until 2026-08-03;
+`./scripts/link-inspiration.sh` gives you a gitignored `inspiration/` of symlinks to shared
+clones. **A recursive `rg`/`grep -r` does not follow those symlinks and returns nothing**,
+so search by explicit path (`rg <pat> inspiration/`) — an empty repo-wide sweep says nothing
+about whether the prior art exists. Prefer the
 context7 MCP over web search for library/framework/CLI docs (training data may be stale).
 Report with file paths + line numbers so findings are checkable.
