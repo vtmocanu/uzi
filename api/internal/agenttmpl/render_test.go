@@ -253,9 +253,27 @@ const (
 //     stops at `guard 3`, before any assertion is read.
 //
 // So: clause 3 is not the sole detector of a moved boundary. It is the clause
-// that keeps a red honest, and the one that stops a region silently growing
-// back into the whole-body semantics this change replaced. Both are worth a
-// Fatal, and the second is the one that would otherwise undo the change.
+// that keeps a red honest, and the one that stops a region growing back into
+// the whole-body semantics this change replaced when the boundary lands past
+// the bullet landmark. Both are worth a Fatal, and the second is the one that
+// would otherwise undo the change.
+//
+// There is a THIRD boundary position and no guard clause covers it: PARTWAY
+// down, past the ordering sentence but before the bullet landmark. Measured,
+// zero guards fire — the count is 1, both regions are ample, and each landmark
+// is still on its own side — and the run reds with a message that is FALSE:
+// `BULLET region lost … missing phrase "fans out again after an implementation
+// unit lands"`, while that phrase is still in the template, one line above the
+// boundary. Detection holds (rc=1 either way), so this is a MESSAGE gap rather
+// than a detection gap — but it is the reason the sentence above says "past the
+// bullet landmark" instead of claiming every downward move.
+//
+// And the thing that closes that window is a BEHAVIOR PIN, not the guard: the
+// bullet region carries exactly one case, and its phrase is the first sentence
+// after the boundary, so any move further down than that reds it. Retire or
+// reword that pin and the partway window widens with nothing structural behind
+// it. A reader looking at the bullet case sees a behavior assertion; it is also
+// load-bearing for the split.
 //
 // CONTROLLING CLAUSE 3 NEEDS A DUPLICATION FOLD, NOT A MOVED BOUNDARY. Each
 // landmark is checked present-in-its-own-region first and leaked-into-the-other
@@ -314,10 +332,22 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // rather than a diff and writes nothing.
 //
 // EACH PHRASE IS ASSERTED AGAINST ITS OWN REGION, NOT THE WHOLE TEMPLATE
-// (issue #205). That is what makes this set robust to RELOCATION — moving a
-// clause from the plan paragraph into the post-implementation bullet takes it
-// out of the region its case asserts, so the case reds by construction,
-// whatever context the phrase does or does not carry.
+// (issue #205). Moving a clause ACROSS THE BOUNDARY — out of the plan paragraph
+// and into the post-implementation bullet, or back — takes it out of the region
+// its case asserts, so the case reds by construction, whatever context the
+// phrase does or does not carry.
+//
+// "By construction" reaches exactly that far and no further. The plan region is
+// everything BEFORE the boundary — the frontmatter and both intro paragraphs,
+// not the plan-critique paragraph — so a clause moved UP within the region is
+// not moved at all as far as these assertions are concerned. Measured: the plan
+// region is 1655 bytes against the paragraph's 889, leaving ~766 bytes of room
+// above it, and hoisting the relay clause into the intro reworded as "as a
+// general habit" gives rc=0, no guard and no red, with the clause out of the
+// section that gives it meaning. Closing that needs a second cut, and the
+// paragraph's opening sentence is itself a pinned phrase, so a naive
+// `strings.Cut` on it would remove it from the region and red its own case. Not
+// attempted here.
 //
 // It replaces a per-phrase anchoring scheme, and the history is the argument
 // for the replacement. Anchoring required every phrase to quote a token naming
@@ -326,9 +356,11 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // in the round before, once on the very pin guarding the previous round's
 // blocking fix. Three rounds of careful people missing it is the signature of a
 // discipline, not of a defect. The region carries the position now, so the
-// phrase only has to carry the meaning: the phrases below are roughly half the
-// length of the anchored ones they replace, none contains another, and each
-// occurs exactly once.
+// phrase only has to carry the meaning: the phrases below total 376 characters
+// against the 666 of the anchored ones they replace, none contains another, and
+// each occurs exactly once. (Raw figures rather than a percentage, deliberately
+// — the same measurement rounds two ways, and two roundings in two files read
+// as a discrepancy to whoever meets them apart.)
 //
 // It cannot LOSE detection relative to the whole-body form it replaces, and
 // that is a proof rather than a measurement: each region is a substring of the
@@ -338,8 +370,9 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // ENTIRE new exposure, not one item among several. What that exposure is, is
 // the third item below.
 //
-// THREE THINGS THIS DOES NOT DO, the first two deliberate and the third the
-// price of the first:
+// FOUR THINGS THIS DOES NOT DO — the first two deliberate, the third the price
+// of the first, the fourth simply out of scope and stated so it is not assumed
+// away:
 //
 //  1. IT IS A STRICTER CONTRACT THAN BEFORE, and that is a real semantic change
 //     rather than a refactor. A relocated-but-still-present rule is stated
@@ -372,6 +405,16 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 //     a cost rather than a hazard — but the whole-body form did not have it, and
 //     it is invisible from reading the case table, because the three strings sit
 //     in constants that read as configuration rather than as assertions.
+//  4. IT DOES NOT SCOPE TestLeadParallelDispatchPhrases, WHICH STILL ASSERTS
+//     AGAINST THE WHOLE BODY. Same file, same template, fourteen pins, and the
+//     class stays open for them: measured, moving a parallel-implementer
+//     constraint out of its bullet and up into the plan paragraph — across the
+//     very boundary this test introduces — leaves both sets green at rc=0. The
+//     exposure is genuinely narrow, since those phrases nearly all live in the
+//     bullets and have nowhere misleading to go, which is why documenting it was
+//     judged enough. But `splitLeadRegions` sitting here makes the file LOOK
+//     scoped, and that inference is wrong for 14 of its 22 pins. Scoping them is
+//     its own piece of work if it is worth doing at all.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
