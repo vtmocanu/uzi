@@ -35,6 +35,14 @@ func TestBuiltinsSetIsExactlyEleven(t *testing.T) {
 // truth, the guarantee is that every embedded file parses and carries sane
 // frontmatter: non-empty name/description, unique names, a non-empty body, and
 // a well-formed model alias when one is set.
+//
+// It additionally holds the corpus to WHITESPACE HYGIENE on the frontmatter
+// values, which is a comparison invariant rather than a cosmetic one (issue #201
+// M4a). The write path trims description (validateTemplateFields) and this
+// parser does not (strings.Cut on ": "), so a builtin shipping a padded value
+// would seed a row that flips to the trimmed form on the first no-op save and
+// then reports drift with nothing changed. Fixing it at the source keeps
+// SameContent free of a trim that would hide whitespace-only edits forever.
 func TestBuiltinsParseAndValid(t *testing.T) {
 	seen := make(map[string]bool)
 	for _, def := range Builtins() {
@@ -55,6 +63,23 @@ func TestBuiltinsParseAndValid(t *testing.T) {
 		// test-local copy that could drift from the server validator).
 		if _, err := ValidateModel(def.Model); err != nil {
 			t.Errorf("builtin %q has an invalid model %q: %v", def.Name, def.Model, err)
+		}
+		// Whitespace hygiene on every frontmatter value. Asserted per field
+		// rather than over the raw file so the message names the offender.
+		for _, f := range []struct{ field, value string }{
+			{"name", def.Name},
+			{"description", def.Description},
+			{"model", def.Model},
+		} {
+			if f.value != strings.TrimSpace(f.value) {
+				t.Errorf("builtin %q has padded %s %q: the write path trims it, so this row "+
+					"would report drift after a no-op save", def.Name, f.field, f.value)
+			}
+		}
+		for _, tool := range def.Tools {
+			if tool != strings.TrimSpace(tool) {
+				t.Errorf("builtin %q has a padded tool name %q", def.Name, tool)
+			}
 		}
 	}
 }

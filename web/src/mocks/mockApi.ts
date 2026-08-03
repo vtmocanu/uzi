@@ -14,6 +14,7 @@ import {
   type AllocatedSkill,
   type AllocationsInput,
   type AppSettings,
+  type BuiltinDefinition,
   type Chat,
   type CliAuthRequestMeta,
   type CliToken,
@@ -86,6 +87,7 @@ import {
   mockRepoToolProfiles,
   mockRunInputs,
   mockSecrets,
+  mockShippedBuiltins,
   mockSkills,
   mockTemplates,
   mockToolAllowlist,
@@ -835,6 +837,46 @@ function visibleTemplates(me: User): AgentTemplate[] {
   return templates.filter((t) => me.is_admin || t.scope !== "user" || t.user_id === me.id);
 }
 
+// shippedBuiltin is the mock's BuiltinByName: the definition this "release"
+// carries under a name, or undefined for a builtin a later release dropped.
+function shippedBuiltin(name: string): BuiltinDefinition | undefined {
+  return mockShippedBuiltins.find((d) => d.name === name);
+}
+
+// sameContent mirrors the server's agenttmpl.SameContent over the four mutable
+// columns. It is a SECOND IMPLEMENTATION of that comparison and that is
+// deliberate: the mock has no server to ask, and a hard-coded flag would make
+// every drift the fixture claims unfalsifiable. The rules it must keep in step
+// with, each of which the server states its reason for:
+//
+//   - name is never compared (it is the lookup key);
+//   - tools is order-SENSITIVE (the order is rendered), and null and [] both mean
+//     inherit-all so they compare equal;
+//   - description and prompt_body are compared exactly, never trimmed.
+function sameContent(row: AgentTemplate, def: BuiltinDefinition): boolean {
+  const a = row.tools ?? [];
+  const b = def.tools ?? [];
+  return (
+    row.description === def.description &&
+    (row.model ?? "") === (def.model ?? "") &&
+    row.prompt_body === def.prompt_body &&
+    a.length === b.length &&
+    a.every((t, i) => t === b[i])
+  );
+}
+
+// withDrift stamps the computed differs_from_builtin onto a row on its way out,
+// so the mock answers the same question the server does rather than serving a
+// stored flag. False for anything with no shipped counterpart: a non-builtin
+// scope (including a user row that merely shares a builtin's NAME) and a builtin
+// this release no longer ships.
+function withDrift(t: AgentTemplate): AgentTemplate {
+  if (t.scope !== "builtin") return { ...t, differs_from_builtin: false };
+  const def = shippedBuiltin(t.name);
+  if (!def) return { ...t, differs_from_builtin: false };
+  return { ...t, differs_from_builtin: !sameContent(t, def) };
+}
+
 // templateAllocationView resolves each visible template's allocation state for
 // me: overlay wins, else the global default.
 function templateAllocationView(me: User): TemplateAllocation[] {
@@ -1419,11 +1461,25 @@ export const mockApi = {
   getSlackStatus: async () => delay({ slack_status: "disabled" }),
 
   // ── Agent templates ─────────────────────────────────────────────────────────
-  listAgentTemplates: async () => delay({ templates: templates.map((t) => ({ ...t })) }),
+  listAgentTemplates: async () => delay({ templates: templates.map(withDrift) }),
   getAgentTemplate: async (id: string) => {
     const t = templates.find((x) => x.id === id);
     if (!t) throw new ApiError(404, "template not found");
-    return delay({ template: { ...t } });
+    return delay({ template: withDrift(t) });
+  },
+  // The shipped definition behind a builtin row, mirroring the server's status
+  // matrix: 400 for a row with no shipped counterpart (including a user template
+  // that merely shares a builtin's name) and 409 for a builtin this release no
+  // longer ships — the state the UI reads as "do not offer Reset".
+  getBuiltinAgentTemplate: async (id: string) => {
+    const t = templates.find((x) => x.id === id);
+    if (!t) throw new ApiError(404, "template not found");
+    if (t.scope !== "builtin") {
+      throw new ApiError(400, "only builtin templates have a shipped definition");
+    }
+    const def = shippedBuiltin(t.name);
+    if (!def) throw new ApiError(409, "no builtin definition to reset to");
+    return delay({ builtin: { ...def } });
   },
   createAgentTemplate: async (input: AgentTemplateInput) => {
     const me = requireSession();
@@ -1464,11 +1520,13 @@ export const mockApi = {
       updated_by: me.email,
       created_at: now,
       updated_at: now,
+      // Never a builtin, so never drifted. Recomputed on read anyway.
+      differs_from_builtin: false,
     };
     templates.push(t);
     // A new global template is a global default from creation (removable).
     if (scope === "global") templateGlobalDefaults.add(t.id);
-    return delay({ template: { ...t } });
+    return delay({ template: withDrift(t) });
   },
   getTemplateAllocations: async () => delay({ templates: templateAllocationView(requireSession()) }),
   setTemplateAllocations: async (input: TemplateAllocationsInput) => {
@@ -1507,7 +1565,7 @@ export const mockApi = {
     t.prompt_body = input.prompt_body;
     t.updated_by = requireSession().email;
     t.updated_at = new Date().toISOString();
-    return delay({ template: { ...t } });
+    return delay({ template: withDrift(t) });
   },
   deleteAgentTemplate: async (id: string) => {
     const t = templates.find((x) => x.id === id);
@@ -1520,9 +1578,20 @@ export const mockApi = {
     const t = templates.find((x) => x.id === id);
     if (!t) throw new ApiError(404, "template not found");
     if (!t.is_builtin) throw new ApiError(400, "only builtins can be reset");
-    const shipped = mockTemplates.find((x) => x.id === id)!;
-    Object.assign(t, { ...shipped, updated_at: new Date().toISOString() });
-    return delay({ template: { ...t } });
+    // The reset target is the SHIPPED definition, not the seeded row. Those were
+    // the same object before #201 M4a, which is why a "reset" could never clear a
+    // badge: it restored the drifted seed. A builtin this release no longer ships
+    // has nothing to reset to and answers 409, exactly as the server does.
+    const shipped = shippedBuiltin(t.name);
+    if (!shipped) throw new ApiError(409, "no builtin definition to reset to");
+    Object.assign(t, {
+      description: shipped.description,
+      model: shipped.model,
+      tools: shipped.tools,
+      prompt_body: shipped.prompt_body,
+      updated_at: new Date().toISOString(),
+    });
+    return delay({ template: withDrift(t) });
   },
 
   // ── Agent skills (PRD #16) ────────────────────────────────────────────────

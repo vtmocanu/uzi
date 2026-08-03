@@ -348,6 +348,54 @@ the duplicate #202 was.
 **These are gated behind M1 and ship as independent MRs, the way PRD #103's milestones
 did** — folding does not make this one large change.
 
+> ### 🔴 AMENDED 2026-08-03 by #201 M4a. READ THIS BEFORE M8-M11.
+>
+> **M10 SHIPPED, on its own, and NOT in the order below.** It is #201's M4a, merged as
+> MR !171: a computed `differs_from_builtin`, a "differs from shipped" badge, a
+> shipped-vs-stored diff, and `GET /agent-templates/{id}/builtin`. Spec of record is
+> `prds/201-builtin-drift-signal.md`; design decisions are `specs/ai.md` §476-§478.
+>
+> **1. The ORDER BELOW IS INVERTED, and following it costs a migration you do not need.**
+> M8 (`version`) is listed before M9 (hash) and both are gated behind M1's parser change.
+> **The hash needs neither.** The question delivery must answer is *"has this row been
+> edited since we seeded it"*, which is a **hash** question, not a version question — as
+> M9's own text already says: *"an admin editing a stored prompt bumps no version."*
+> Verified against the tree: `Definition` has no `Version` field, the parser rejects the
+> key, and nothing in the reconcile path reads a version. **So the drift work ships
+> without M1-M3 and without M8**, which is the difference between a milestone and a PRD.
+>
+> **2. M8 SURVIVES, for a narrower reason than it claims.** What `version` still buys is
+> M10's admin-facing *label* ("shipped is v4, yours is based on v3"). A hash yields a
+> boolean. That argues for keeping M8 as a later UX improvement, not for doing it first.
+>
+> **3. NEVER HASH `Render(def)`. Hash a canonical projection of the persisted columns.**
+> Two changes scheduled in THIS PRD each silently break a `Render`-based hash with nothing
+> reddening: **Decision 3** reorders the frontmatter, and **M2** adds a `version:` line
+> that a hash-only world can never reproduce from a row. Every stored hash would mismatch
+> and every row would reclassify as edited. A third reason found during M4a: `Render`
+> omits `tools` and `model` when empty, so a stored `tools: []` and a stored `tools: NULL`
+> render identically, which HIDES a difference the UI displays as "none" vs "all".
+>
+> **4. M11's stated policy is A NO-OP AS WRITTEN — corrected inline below.** "Auto-update
+> rows still byte-identical to **the shipped default**" describes rows that have nothing
+> to update, since a row identical to what is *currently* shipped is already current. The
+> intent is **the default it was SEEDED with**. That distinction is the whole mechanism:
+> it is what separates a pristine row that is merely behind from a row an admin edited.
+>
+> **5. M11's real hard part is the NULL-hash backfill, which is not mentioned below.**
+> Every row on an already-seeded install has no seed hash, and that is the population this
+> exists to serve. See #201's note_22449 for the embedded historical-hash design, plus D4
+> (do NOT convert `InsertBuiltinAgentTemplate` to `DO UPDATE` — it is `:execrows` and the
+> `n > 0` branch seeds a global default allocation), D5 (never fatal at boot; it runs
+> pre-listen in a hard singleton, so a returned error is CrashLoopBackOff) and D7 (a
+> misclassifying auto-update has no in-product undo, because Reset restores the shipped
+> body, which is exactly what the bad update just wrote).
+>
+> **6. Issue #223 is a PREREQUISITE for M11**, not optional cleanup: `Handler.q` is a
+> concrete `*store.Queries`, so every DB-touching handler in `agent_templates.go` is at
+> 0.0% coverage, and M4a left three implementations of the drift predicate pinned by
+> nothing. M11's classifier is the fourth consumer, and it is the one that writes.
+
 - [ ] **M8 — `version` persisted.** Migration adding the column to
   `agent_templates` (Decision 8 previously deferred exactly this), plus the DTO and
   the reconcile path that writes it on insert. **`lead` stays unstamped per M2** and is
@@ -358,14 +406,18 @@ did** — folding does not make this one large change.
   version**, so drift detection cannot work on versions alone — and the hash is also
   what covers `lead`, which has no upstream number to carry. Establish both at reconcile
   time.
-- [ ] **M10 — The drift signal.** Admin-visible: this builtin has an upstream change
+- [x] **M10 — The drift signal.** ~~Admin-visible: this builtin has an upstream change
   pending. Today the only way to know is to have read a changelog, which is why #197's
-  fix is sitting unapplied.
+  fix is sitting unapplied.~~ **DONE 2026-08-03 as #201 M4a (MR !171), ahead of M8/M9 and
+  without either.** No version, no hash, no migration: the badge compares the stored row
+  against the embedded definition at request time. See the amendment above.
 - [ ] **M11 — The update policy, and this is the hard part, not the schema.** What
   happens to a row an admin has edited. The cheapest defensible shape, using M9's hash:
-  **auto-update rows still byte-identical to the shipped default** — provably
-  uncustomized, which is most installs — and **flag the rest for a manual diff**, never
-  overwriting anyone's work. Decide it in the Decision Log before writing the migration;
+  **auto-update rows still byte-identical to the default THEY WERE SEEDED WITH** —
+  provably uncustomized, which is most installs — and **flag the rest for a manual diff**,
+  never overwriting anyone's work. *(Corrected 2026-08-03: this read "byte-identical to
+  the shipped default", which is a no-op — a row identical to what is currently shipped
+  has nothing to update. Seeded-with vs shipped-with is the entire mechanism.)* Decide it in the Decision Log before writing the migration;
   the edit-preserving behaviour in `ON CONFLICT … DO NOTHING` is **correct** and must not
   simply be reversed. A third option between *never update* and *discard everything* is
   the entire product of this phase.

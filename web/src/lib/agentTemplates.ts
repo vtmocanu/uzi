@@ -166,6 +166,45 @@ export function looseSecretWarning(text: string): string {
   return "";
 }
 
+// TemplateContent is the four mutable columns the drift comparison reads —
+// exactly the fields agenttmpl.Definition carries, minus the name, which is the
+// lookup key rather than content.
+export interface TemplateContent {
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
+}
+
+// driftedColumns names which of the four columns differ between the shipped
+// definition and a template's current values, in display order.
+//
+// IT IS THE ONLY CLIENT-SIDE COPY OF THESE RULES, and it lives here rather than
+// inside the editor so the diff panel and the Reset confirmation cannot name
+// different columns — a confirmation that undersells what it is about to discard
+// is worse than none. It applies the same rules as the server's
+// agenttmpl.SameContent, each for the reason stated there: tools compared
+// order-SENSITIVELY (the order is rendered), null and [] both meaning
+// inherit-all, and neither free-text column trimmed.
+export function driftedColumns(shipped: TemplateContent, current: TemplateContent): string[] {
+  const out: string[] = [];
+  if (shipped.description !== current.description) out.push("description");
+  if ((shipped.model ?? "") !== (current.model ?? "")) out.push("model");
+  const a = shipped.tools ?? [];
+  const b = current.tools ?? [];
+  if (a.length !== b.length || a.some((t, i) => t !== b[i])) out.push("tools");
+  if (shipped.prompt_body !== current.prompt_body) out.push("prompt body");
+  return out;
+}
+
+// toolsSummary renders one side of the tools comparison. Kept beside
+// driftedColumns because "inherit all" is the same null-means-inherit convention
+// the comparison folds, and summarizeTools below answers a different question
+// (it takes a whole row, and says "none" for an empty list).
+export function toolsSummary(tools: string[] | null): string {
+  return tools && tools.length > 0 ? tools.join(", ") : "inherit all";
+}
+
 // summarizeTools renders the allowlist for the list view: "all" for inherit,
 // else a compact join.
 export function summarizeTools(t: AgentTemplate): string {

@@ -8,6 +8,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Agent templates now flag when a builtin has drifted from what this uzi
+  version ships.** A **differs from shipped** badge appears on the Agents
+  list and on a builtin's detail page whenever its stored description,
+  model, tools, or prompt body no longer matches the shipped definition,
+  whether the drift is your own edit or a shipped update you haven't picked
+  up yet. Opening the template now shows the actual diff before you press
+  **Reset to default**, which still replaces the whole body verbatim and
+  still isn't automatic (issue #201). **Operators:** issue #210 rewrote ten
+  of the eleven builtin templates' bodies to fix an unreachable report
+  recipient (see Fixed, below); on any already-seeded install, those ten
+  will badge as differing the moment you deploy this build. That's the new
+  signal working as intended, not a defect: open each and click Reset to
+  pick it up. See
+  [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
 - **`uzi` now warns when the CLI you're running is older than the server it's
   talking to.** A CLI three minors behind was silently dropping fields it
   didn't know about — `run get --json` printed `null` for token attribution
