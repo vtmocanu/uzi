@@ -1,7 +1,9 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 implemented + fully validated, M4 implemented but its validation wave was INTERRUPTED** — both on `feature/prd-103-m3-m6`, both NOT MERGED and NOT PIPELINE-TESTED (see their status blocks; the two carry different evidential weight and the M4 block says why); M5-M6 open. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M3-M6 are now freely parallel (modulo the `web/package.json` three-way in Parallelization).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5-M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+
+*(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
 **Absorbs**: [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101) item 3 (26-file gofmt drift)
 **Review**: adversarial review 2026-07-21 (every repo claim re-checked against `main`). It caught a load-bearing factual error — Decision 4 originally specified a "committed baseline" for all four ratcheted tools, and only ESLint has one. Rewritten with per-tool mechanisms, verified against upstream docs. Also corrected: line/size counts, a wrong `-buildvcs=false` citation, M4's calibration symbol (undetectable by the tools M4 adds), Success Criterion 1's scope, and the `stages:` conflict M1 now pre-empts.
@@ -1201,8 +1203,59 @@ which previously prescribed only the fail-open form.
       gofmt's own status and keep "does not parse" distinguishable from
       "misformatted" when `task`'s own rc is 201 for both.)*
 
-- [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**:
+- [x] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**:
 
+      > **STATUS 2026-08-03: MERGED.** MR
+      > [!157](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/157),
+      > merge commit `4ebfb572` (shared with M4 — one MR carried both). Main
+      > pipeline **20285: 18 of 18 green**, `lint:api` and `lint:controller`
+      > included.
+      >
+      > **The four CI-only unknowns below were watched, and this is the record
+      > the block above asked for.** Three are confirmed; one was not obtained
+      > and says so rather than being approximated:
+      >
+      > 1. **merge-base — CONFIRMED.** The fail-loud pre-flight executed and did
+      >    not `exit 2` across five pipelines. It could have produced the
+      >    disconfirming answer and did not.
+      > 2. **`Can't process results by diff processor` — ABSENT**, with the two
+      >    controls that make an absence mean something: the trace is complete
+      >    (ends `Job succeeded`) and golangci-lint genuinely ran, printing
+      >    `0 issues.`
+      > 3. **`test:api-store-it` duration — NOT OBTAINED as specified, and not
+      >    obtainable now.** The criterion asked for a *warm* pipeline; the cache
+      >    key changed twice during landing (this milestone's own
+      >    `lint-$CI_COMMIT_REF_PROTECTED`, then `main`'s #211 fix scoping
+      >    `.go_job` too), so every later run was cold on a **new** key rather
+      >    than warm on the old one. The concern behind it is nevertheless
+      >    refuted by the data that exists: store-it ran 96.6s against a
+      >    max-of-the-other-eleven of 364.2s, 8th of 12 — never near the long
+      >    pole.
+      > 4. **`@oxlint/binding-linux-x64-musl` on alpine — CONFIRMED** by
+      >    execution in `validate:web` and `validate:agent`.
+      >
+      > **Plus the residual that could only be checked after merge**, because
+      > `main` had no `lint:*` jobs until this landed: both lint jobs read and
+      > write **`lint-true-…`** on `main` (job 134806/134807), against
+      > `lint-false-…` observed on the unprotected branch. Both sides of the
+      > trust partition are now observed rather than argued.
+      >
+      > **`nolintlint` was added after the block below was written**, on the
+      > validation wave's finding that a bare `//nolint` silenced all five
+      > enabled linters with no warning and exit 0, while the npm half of this
+      > same milestone already shipped the analogue. Adoption cost measured at
+      > zero on the ratcheted gate.
+      >
+      > **Two figures in the block below were refuted and corrected in place**:
+      > the isolation matrix and backlog are each one lower (55/55/77/106, not
+      > 56/56/78/107) and the derived share is **91.60%**, both invalidated by
+      > `6ea98493` — an M4 commit landing the same afternoon. That is the
+      > evidence behind Decision 10's amendment.
+      >
+      > *(Everything from here to the end of this block is the **pre-merge
+      > record**, kept verbatim because it is what the milestone claimed before
+      > any of the above was known.)*
+      >
       > **STATUS 2026-08-02: IMPLEMENTED, NOT MERGED. The box stays unticked
       > deliberately** — M1's own status block defines what ticking it means
       > (*"the box is now ticked for the reason it was previously left unticked:
@@ -1485,8 +1538,48 @@ which previously prescribed only the fail-open form.
       trap above, output and exit status are independent here, and a first run
       reporting nothing is indistinguishable from a linter that is not wired up.
 
-- [ ] **M4 — Dead code detection**:
+- [x] **M4 — Dead code detection**:
 
+      > **STATUS 2026-08-03: MERGED, AND THE INTERRUPTED WAVE WAS RE-RUN.** MR
+      > [!157](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/157),
+      > merge commit `4ebfb572`. Main pipeline **20285: 18 of 18 green**.
+      >
+      > **The block below refused to tick this box because every acceptance
+      > figure in it was the implementer's own. That is no longer true, and the
+      > re-run is why the box moves.** Four validators — reviewer, tester,
+      > auditor, fact-checker — ran against `bb3de70b`, plus a delta review at
+      > `88f0bde7`. Specifically, of the list the block names as unverified:
+      >
+      > - **The six calibration arms**: re-run by the tester in its own tree
+      >   with its own probes, twelve arms in total, each asserting a
+      >   discriminator rather than a red. It also **constructed the naive
+      >   fail-open wrapper** and ran it beside the shipped one over three trees
+      >   (naive `0/0/1`, shipped `2/0/1`), so `deadcode-gate.sh`'s justification
+      >   is demonstrated rather than asserted.
+      > - **The three knip suppressions**: all three proven load-bearing by
+      >   strip-and-restore, one at a time.
+      > - **The `hookEvent` byte-identity**: confirmed, and it is **six** sites,
+      >   not the four the dispatch claimed.
+      > - **The alpine/musl check**: confirmed by execution in CI.
+      > - **The anchor lists at 12 and 14**: re-derived independently by two
+      >   validators, by **parse with stage resolved through `extends`**, never
+      >   by job-name shape.
+      >
+      > **One acceptance figure was REFUTED**: `deadcode:api:all` prints **43**,
+      > not 44, in five files that asserted it as a current tally. The 44 was
+      > measured before `6ea98493` deleted `HookManager.SettingsPath` and was
+      > therefore **already stale in the commit that wrote it**. Corrected, and
+      > it is half the evidence behind Decision 10's amendment.
+      >
+      > **Zero behavioural defects were found.** Every other finding was a false
+      > or unsupported claim about code that already worked — the same result M2
+      > and M3 recorded.
+      >
+      > *(Everything from here to the end of this block is the **pre-merge
+      > record**, kept verbatim. Its central warning — that the two status blocks
+      > were not the same kind of claim — was correct when written and is what
+      > caused the wave to be re-run.)*
+      >
       > **🔴 STATUS 2026-08-02: IMPLEMENTED, NOT MERGED, AND ITS VALIDATION WAVE
       > WAS INTERRUPTED. The box is UNTICKED for two reasons, and the second is
       > the one a reader must not skip.**
