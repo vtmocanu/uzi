@@ -246,6 +246,94 @@ Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4
 
 ## Amendments
 
+### Amendment 3 — 2026-08-03, THE FIX LIST. Reviewer + auditor both reported; this is what the coder does.
+
+Round 1 of findings. The severity bar is NOT armed: this round's deliverable is executable
+content and it moved, so the raise-the-bar trigger does not apply.
+
+**Reviewer's verdict on the api half: the strongest work it has reviewed on this repo.** Every
+case in `compare_test.go` is falsified by a specific production edit (drop a column, use
+`reflect.DeepEqual`, sort the tools, add a trim, switch to a `Render` byte-compare);
+`TestNoOpSaveCreatesNoDrift` runs the real `validateTemplateFields` across all eleven builtins
+behind a `t.Fatalf` precondition; `TestWriteBuiltinDefinitionStatusMatrix`'s 404 case gates the
+existence-oracle property and fails if the `!t.IsBuiltin` check is ever moved above authz.
+Gates verified green with a real positive control — every new test named, `--- PASS`, zero
+`--- SKIP`. **The defect is one `catch` clause in the web half.**
+
+#### BLOCKING — do these two
+
+**F1. Discriminate the error status in `AgentDetail.tsx`.** Found INDEPENDENTLY by the
+auditor (A1) and the reviewer (B1); the lead verified it. Details in Amendment 2 §A1. The
+reviewer adds two things that sharpen it:
+
+- **It is a REGRESSION IN REACH, not just a swallowed error.** On `origin/main`,
+  `AgentDetail.tsx:123` offered Reset for every `is_builtin` row, so no transient failure
+  could take the button away. Now one can.
+- **The comment at `:43-45` was ACCURATE when written and went stale inside the same commit.**
+  It was true while `builtin` only fed the diff panel; it stopped being true the moment
+  `!builtin` started driving the Reset copy at `:159`.
+- The 403 half of that comment is **fine and needs no change** — `canEdit` (`:108`) is the
+  exact mirror of `authorizeTemplateWrite` (`agent_templates.go:146-164`), so the Reset card
+  only renders for callers the endpoint would not 403. The two paths cannot coincide.
+
+Fix: `err instanceof ApiError && err.status === 409` (and 403) means "no shipped side".
+Anything else leaves the Reset card at its pre-change behaviour. **Add a test asserting a 500
+leaves the button present** — without it the fix has the same hole as the defect.
+
+**F2. Make the XSS control discriminate, and widen its fixture.** Details in Amendment 2 §A3.
+Two assertions and a fixture change: add `expect(container.querySelectorAll("ins, del"))
+.toHaveLength(0)` (catches `convertChangesToXML` by output shape, which escaping cannot hide),
+and widen the fixture so all four columns differ with markup in `description` and in a tool
+name, so `InlineDiff`, the model span and `ToolsDiff` mount rather than `LineDiff` alone.
+Also correct the comment's framing: the grep is STRICTLY STRONGER than this test, not the
+other way round.
+
+#### SHOULD-FIX — cheap, and each has an in-tree pattern to copy
+
+**F3. Give the tools-order case a non-vacuity guard.** `agent_templates_drift_test.go:87-91`
+swaps tools[0] and tools[1]; if those were ever equal the swap is a no-op and the case proves
+nothing silently. Its own sibling `TestDiffersFromBuiltinPostgresCanonicalTools:183-185`
+already carries exactly this guard as a `t.Fatalf`. Three lines.
+
+**F4. Fix the Agents-list tooltip.** `Agents.tsx:210` says "Open it to see the diff", and the
+badge renders for every authenticated viewer — but a non-admin gets `ReadOnlyView`
+(`AgentDetail.tsx:190`), which has no diff panel, and `/{id}/builtin` 403s anyway. The badge
+is honest; the sentence beside it is not. Scope the copy by `is_admin` or drop the second
+sentence.
+
+#### RECORDED, NOT FOR M4a
+
+**R1. The drift predicate now has THREE implementations and nothing pins their agreement** —
+`agenttmpl.SameContent`, `mockApi.ts`'s `sameContent`, and `AgentTemplateEditor`'s
+`changedFields`. `compare.go`'s own doc comment names this as the hazard it exists to prevent.
+The reviewer **tried to construct a divergence and could not**, which is why this is not
+blocking: all three fold null/`""` and null/`[]` identically, compare tools order-sensitively,
+and never trim. The one asymmetry (`changedFields` trims `model`) is unreachable, held shut by
+`ValidateModel` rejecting whitespace AND the new `TestBuiltinsParseAndValid` assertion —
+**two independent guards, neither of which mentions this predicate.**
+
+**This is a PREREQUISITE FOR M4b, and the repo already has the pattern:** `fixtures/run-usage/`
+is read by both `api/internal/workersvc/run_usage_contract_test.go` and
+`web/src/lib/runUsageContract.test.ts`, and CLAUDE.md cites it by name. A shared JSON case
+table of (shipped, stored, expected) fed to all three would pin them to one artifact. **M4b
+adds a fourth consumer — the reconciler's classifier — which is exactly when a divergence
+stops being cosmetic and starts overwriting rows.** Do it there, not here.
+
+**R2. `templateDTO` decodes the tools jsonb twice per row** (`:76`, and again via
+`differsFromBuiltin` → `templateToDefinition`). Harmless at this scale; if R1's shared-fixture
+work ever refactors this, single-decode is the form to land on.
+
+**R3. The mock's `storedBuiltin` aliases the shipped tools array** (`tools: def.tools` copies
+the reference). Nothing mutates in place today and the per-column fixture assertion would
+catch it — filed because a shared-baseline fixture whose two sides can move together is the
+exact failure the separate-constant design exists to remove.
+
+**R4. LEAD CORRECTION, off by one:** the roster's caveat says the `dangerouslySetInnerHTML`
+sweep is "12 comment hits". Measured at `c3704d25` it is **13 OCCURRENCES across 12 FILES**
+(`RunEvent.tsx` carries two), all comments, zero call sites. The change added two, not one.
+Criterion 7 holds either way because the property is *zero call sites*, not a count — which is
+the reason to state the unit rather than the number.
+
 ### Amendment 2 — 2026-08-03, audit findings at `c3704d25` (ACCEPTED, fix not yet dispatched)
 
 Auditor verdict: **no security regression**, both design-wave blockers landed correctly. The
