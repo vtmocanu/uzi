@@ -216,13 +216,30 @@ for d in runner agent-home provision; do
   #
   # WHY THIS IS A PER-INSTANCE DISABLE AND NOT A `.shellcheckrc` LINE OR A
   # `# shellcheck shell=busybox` HEADER (PRD #103 M5, ruled): on a shell where `-O`
-  # is undefined, `[ -O x ]` is false, the `&&` short-circuits, THE CHMOD IS SKIPPED
-  # SILENTLY, and `set -eu` does not fire -- POSIX exempts the left-hand side of an
-  # AND-list from errexit. So the failure mode of changing the interpreter is a
-  # permission that is never applied, with no error anywhere. That warning belongs
-  # at the three call sites where someone would need it; an rc file would blanket
-  # all 14 tracked scripts and a whole-file dialect declaration would go on silently
-  # asserting busybox after the shebang changed.
+  # is undefined, `[ -O x ]` is false, the `&&` short-circuits, THE CHMOD IS SKIPPED,
+  # and `set -eu` does not fire -- POSIX exempts the left-hand side of an AND-list
+  # from errexit. So the failure mode of changing the interpreter is a permission
+  # that is never applied. That warning belongs at the three call sites where
+  # someone would need it; an rc file would blanket every tracked script and a
+  # whole-file dialect declaration would go on silently asserting busybox after the
+  # shebang changed.
+  #
+  # TWO BOUNDS ON THAT CLAIM, because this comment is the entire recorded
+  # justification for the ruling and an overstated one is worth less than a narrow
+  # one (both re-measured 2026-08-03 in Debian's dash, which is /bin/sh there):
+  #
+  #   * IT IS NOT LITERALLY SILENT. An unsupported operator writes one line to
+  #     stderr -- `[: -Q: unexpected operator`, 39 bytes -- which for THIS file
+  #     means it lands in the pod's logs. What is silent is the EXIT STATUS: the
+  #     same run printed `SURVIVED` at rc=0 under `sh -eu`, so nothing fails and
+  #     nothing retries. A line in a log nobody greps is not a gate.
+  #   * THE HYPOTHETICAL SHELL IS NONE OF THE OBVIOUS ONES. dash implements `-O`,
+  #     and so do bash, ksh and busybox ash -- measured, dash and bash both return
+  #     0 on `[ -O /tmp ]`. So this guards against a future interpreter that is not
+  #     any shell currently plausible here. That is a bound on the scenario, not a
+  #     refutation: the comment is explicitly conditional on the shebang or base
+  #     image moving, and the cost of being wrong is a permission mode that is
+  #     never applied on a tree nobody is looking at.
   # shellcheck disable=SC3067
   [ -O "/data/$d" ] && "$CHMOD" 2775 "/data/$d"   # only on a fresh (root-owned) dir
   "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
