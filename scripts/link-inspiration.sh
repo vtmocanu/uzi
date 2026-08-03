@@ -43,7 +43,18 @@ while IFS=$'\t' read -r name url; do
 		echo "cloning $name -> $src"
 		git clone --quiet "$url" "$src"
 	fi
-	ln -sfn "$src" "$DEST/$name"
+	# A leftover REAL directory here is the normal state in any worktree that
+	# still had the submodules checked out when they were unvendored. `ln -sfn`
+	# would silently create the link INSIDE it ($DEST/$name/$name) instead of
+	# replacing it, so refuse and say what to do -- deleting someone's tree
+	# unasked is not this script's call.
+	link="$DEST/$name"
+	if [ -d "$link" ] && [ ! -L "$link" ]; then
+		echo "refusing: $link is a real directory (leftover submodule checkout)." >&2
+		echo "          Remove it first:  rm -rf '$link'" >&2
+		exit 1
+	fi
+	ln -sfn "$src" "$link"
 	printf '%-16s -> %s\n' "$name" "$src"
 done <<<"$PROJECTS"
 
