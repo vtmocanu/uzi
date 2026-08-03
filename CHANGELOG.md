@@ -22,6 +22,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   signal working as intended, not a defect: open each and click Reset to
   pick it up. See
   [docs/agent-templates.md](docs/agent-templates.md#resetting-a-builtin-template).
+- **`uzi` now warns when the CLI you're running is older than the server it's
+  talking to.** A CLI three minors behind was silently dropping fields it
+  didn't know about — `run get --json` printed `null` for token attribution
+  that a `curl` against the same endpoint returned fine — with nothing telling
+  you why. The warning prints to stderr (never stdout, so `--json` output stays
+  parseable) and costs at most one version probe an hour. Suppress it with
+  `--quiet` or `UZI_VERSION_CHECK=0` (issue #144).
 
 ### Changed
 
@@ -52,7 +59,6 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   the render-side fix instead (issue #180), which strips the same
   characters on the way out (issue #169).
 
-
 ### Fixed
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team
@@ -74,6 +80,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   that has already booted, since builtin seeding never overwrites an existing
   template row. An admin must open each of the ten affected templates and
   click **Reset to default** to pick it up (issue #210).
+
+- **Release tooling: the CHANGELOG coverage gate could block a good release,
+  about once every dozen runs, and a retry made it go away.** It reported a
+  merge as uncited while the section cited it on the line the check had just
+  matched. Cause: `printf '%s' "$SECTION" | grep -q <pattern>` under
+  `set -o pipefail`. `grep -q` exits the instant it matches and closes the pipe;
+  bash's `printf` builtin writes line-buffered, so an 8.5 KB section leaves the
+  shell as 72 separate writes and is still writing when grep goes; the next
+  write takes SIGPIPE and `pipefail` reports 141 for a pipeline whose grep
+  succeeded. Every `grep` in the script now reads a file, which has no writer to
+  kill. Present since the gate was first added, on the issue-number lookup and
+  on both escape hatches, not only on the short-SHA citation added the same day
+  it was found (`19ad63c3` was the merge it flagged; job 134884 failed, retry
+  134892 passed on the identical commit). Developer-facing only: no change to
+  how uzi behaves.
+
+- **A hostile server can no longer flood your terminal through `uzi version`.**
+  The build-info strings uzi prints are now capped as well as stripped of
+  terminal control characters: the stripping arrived with the shared render
+  boundary (issue #180), but that boundary deliberately does not truncate, so a
+  server returning a megabyte-long version string still printed all of it. The
+  version line is bounded now (issue #144).
+
 ### Security
 
 - **The `uzi` CLI no longer renders server-supplied text on your terminal
@@ -91,22 +120,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   emoji) now renders as its separate members instead of the joined glyph; a
   single-codepoint emoji is unaffected (issue #180).
 
-### Fixed
-
-- **Release tooling: the CHANGELOG coverage gate could block a good release,
-  about once every dozen runs, and a retry made it go away.** It reported a
-  merge as uncited while the section cited it on the line the check had just
-  matched. Cause: `printf '%s' "$SECTION" | grep -q <pattern>` under
-  `set -o pipefail`. `grep -q` exits the instant it matches and closes the pipe;
-  bash's `printf` builtin writes line-buffered, so an 8.5 KB section leaves the
-  shell as 72 separate writes and is still writing when grep goes; the next
-  write takes SIGPIPE and `pipefail` reports 141 for a pipeline whose grep
-  succeeded. Every `grep` in the script now reads a file, which has no writer to
-  kill. Present since the gate was first added, on the issue-number lookup and
-  on both escape hatches, not only on the short-SHA citation added the same day
-  it was found (`19ad63c3` was the merge it flagged; job 134884 failed, retry
-  134892 passed on the identical commit). Developer-facing only: no change to
-  how uzi behaves.
+- Bumped `golang.org/x/text` v0.38.0 → v0.39.0, closing `GO-2026-5970` (infinite
+  loop on invalid input), and `github.com/yuin/goldmark` v1.7.8 → v1.7.17,
+  closing `GO-2026-5320` (XSS). Both were pre-existing on `main`, caught in an
+  unrelated `govulncheck` scan and folded in here rather than filed separately.
 
 ## [0.14.0] - 2026-08-03
 

@@ -1678,8 +1678,19 @@ pass "minted a uzc_ CLI token via POST /api/me/cli-tokens (headless \$UZI_TOKEN 
 
 # Run the CLI hermetically: HOME → the scratch rundir so it never reads/writes the
 # operator's ~/.config/uzi or ~/.claude; UZI_URL/UZI_TOKEN override any config file;
-# UZI_SKILL_AUTO_UPGRADE=0 so it drops no Claude Code skill.
-uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" UZI_SKILL_AUTO_UPGRADE=0 "$UZI_BIN" "$@"; }
+# UZI_SKILL_AUTO_UPGRADE=0 so it drops no Claude Code skill; UZI_VERSION_CHECK=0 so it
+# neither probes GET /api/version before every command nor writes a version-check.json
+# into the rundir.
+#
+# That last one is BELT-AND-BRACES TODAY, and it is worth knowing which: the build
+# above passes no -ldflags, so this binary's version is the "dev" default and the skew
+# check short-circuits on an unstamped version before it ever resolves a URL. The env
+# var is set anyway because that reason evaporates the day someone stamps the e2e
+# build — and UZI_URL IS set here, so the hook would fire the moment it does. The cost
+# of being wrong is not cosmetic: the printed-instruction assertions further down count
+# exact lines across stdout AND stderr, so one extra stderr sentence reddens a check
+# about something else entirely.
+uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@"; }
 
 # (1) `uzi run list --json` must parse AND its run-id set must equal GET /api/runs's — a
 # DTO/route drift (renamed envelope key, changed id field, moved route) makes them diverge.

@@ -56,9 +56,32 @@
 //     a listing an admin reads to make decisions). The cure re-introduces the layout
 //     half of the disease.
 //  3. The visibility argument is already served, better, by a channel that exists:
-//     --json escapes control bytes losslessly (ESC arrives as the six characters
-//     backslash-u-0-0-1-b) and is one flag away. Making the human table a second,
-//     worse forensic channel buys nothing.
+//     --json is UNSANITIZED, so it carries the server's bytes verbatim and is one flag
+//     away. Making the human table a second, worse forensic channel buys nothing.
+//
+// 🔴 ON POINT 3 — THE PROPERTY IS BYTE-PRESERVATION, NOT ESCAPING. That clause used to
+// read "--json escapes control bytes losslessly (ESC arrives as the six characters
+// backslash-u-0-0-1-b)". The ESC example is real; the generalisation from it is not.
+// Measured on encoding/json (issue #144, two independent derivations agreeing on all
+// eight rows): C0 ESC U+001B is escaped, and DEL U+007F, C1 CSI U+009B, bidi RLO
+// U+202E, zero-width space U+200B, ZWJ U+200D, BOM U+FEFF and soft hyphen U+00AD are
+// all NOT. So encoding/json escapes the C0 range (plus U+2028/U+2029) and passes every
+// other member of Unsafe through untouched: none of Cf at all, and two of the three
+// control families. Stated by FAMILY, and deliberately not as a fraction — DEL and C1
+// pass through entire while C0 is escaped entire, so per CODEPOINT it is 33 of 65,
+// about half. A fraction here would pair a range unit with a family denominator, which
+// is the imprecision this very paragraph exists to correct.
+//
+// The decision point 3 supports is unaffected, and the correction arguably serves it
+// better: what a forensic reader wants is the exact bytes the server sent, which is
+// what being unsanitized delivers, and an encoder escaping only some of them would be
+// the lossy option.
+//
+// The corollary, stated because the old wording hid it: --json is byte-preserving, NOT
+// terminal-safe. A caller piping it straight to a terminal is outside everything this
+// package provides. (An escaping fact only — whether a terminal HONOURS a UTF-8-encoded
+// U+009B as a CSI introducer depends on its 8-bit control handling, and is not tested
+// here.)
 //
 // TARGET IS CONTROL CHARACTERS, NOT "NON-ASCII". Both tests in Unsafe are Unicode
 // CATEGORY predicates over runes, so accented Latin, CJK and emoji pass through

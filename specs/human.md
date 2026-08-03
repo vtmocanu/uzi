@@ -612,6 +612,17 @@ for the whole of #201; this milestone (M4a) is the drift signal only.
 
 Every other decision on this feature is the team's and lives in `specs/ai.md`
 §476-§478.
+## Feature #144 (item 1) — Warn when the CLI is behind the server
+
+Tracked as GitLab issue vtmocanu/uzi#144 (item 1). Scoped MR, no PRD [user 2026-08-03].
+Completes Feature #64/#175: `uzi version` reported both versions and never compared them.
+
+- Every uzi command warns when the CLI is older than the server it talks to — not
+  just `uzi version`, except commands that make no network call of their own.
+  [user 2026-08-03, chosen from three placements]
+- The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
+- The server's version is probed on a cache, never once per command. [user 2026-08-03]
+- The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
 
 ## Startup admin seed
 
