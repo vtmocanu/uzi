@@ -924,7 +924,7 @@ function rejectInvisibleLabel(label: string): void {
   if (/\p{Cf}/u.test(label)) {
     throw new ApiError(
       400,
-      "Label must not contain invisible formatting characters (zero-width spaces and joiners, bidirectional overrides, the byte-order mark): they let two different tokens look identical, or make a label read as a different account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one of these characters. Use a plain name.",
+      "Label must not contain invisible formatting characters (zero-width spaces and joiners, bidirectional overrides, the byte-order mark): they let two different tokens look identical, or make a label read as a different account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one of these characters, so use a plain name instead",
     );
   }
 }

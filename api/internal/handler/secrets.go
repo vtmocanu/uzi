@@ -715,11 +715,11 @@ func validateSecretLabel(raw string) (string, error) {
 			return "", errors.New("label must not contain control characters")
 		}
 		if unicode.In(r, unicode.Cf) {
-			return "", errors.New("Label must not contain invisible formatting characters " +
+			return "", errors.New("label must not contain invisible formatting characters " +
 				"(zero-width spaces and joiners, bidirectional overrides, the byte-order mark): " +
 				"they let two different tokens look identical, or make a label read as a different " +
 				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one " +
-				"of these characters. Use a plain name.")
+				"of these characters, so use a plain name instead")
 		}
 	}
 	return label, nil
