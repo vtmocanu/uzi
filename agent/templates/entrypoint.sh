@@ -205,6 +205,25 @@ migrate_tree /data "$WORKER_OWNER"
 RUNNER_TREE_OWNER=worker:runner
 for d in runner agent-home provision; do
   "$MKDIR" -p "/data/$d"
+  # 🔴 SC3067 IS A TRUE PORTABILITY STATEMENT AND A FALSE BUG REPORT AGAINST THIS
+  # IMAGE, AND IT STOPS BEING FALSE THE MOMENT THE SHEBANG OR THE BASE IMAGE MOVES.
+  # This file is `#!/bin/sh` and both worker Dockerfiles ship it on the same
+  # digest-pinned node:22-alpine with an exec-form ENTRYPOINT (render.go sets no
+  # `command:`, so k8s uses the same interpreter). There /bin/sh is busybox ash
+  # 1.37.0, which implements `-O` with correct semantics -- measured 2026-08-03,
+  # with a control proving the probe could have detected an unsupported operator
+  # (`[ -Q dir ]` -> rc=2 "unknown operand").
+  #
+  # WHY THIS IS A PER-INSTANCE DISABLE AND NOT A `.shellcheckrc` LINE OR A
+  # `# shellcheck shell=busybox` HEADER (PRD #103 M5, ruled): on a shell where `-O`
+  # is undefined, `[ -O x ]` is false, the `&&` short-circuits, THE CHMOD IS SKIPPED
+  # SILENTLY, and `set -eu` does not fire -- POSIX exempts the left-hand side of an
+  # AND-list from errexit. So the failure mode of changing the interpreter is a
+  # permission that is never applied, with no error anywhere. That warning belongs
+  # at the three call sites where someone would need it; an rc file would blanket
+  # all 14 tracked scripts and a whole-file dialect declaration would go on silently
+  # asserting busybox after the shebang changed.
+  # shellcheck disable=SC3067
   [ -O "/data/$d" ] && "$CHMOD" 2775 "/data/$d"   # only on a fresh (root-owned) dir
   "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
 done
@@ -222,9 +241,25 @@ done
 WORKER_TMPDIR=/tmp/uzi-worker
 RUNNER_TMPDIR=/tmp/uzi-runner
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
+# SC3067: `-O` is undefined in POSIX sh and implemented by busybox ash 1.37.0, the
+# /bin/sh this file actually runs under in the pinned node:22-alpine (measured
+# 2026-08-03, with an unsupported-operator control). Per-instance rather than an rc
+# entry because the hazard is LOCAL: change the interpreter and `[ -O ... ]` goes
+# false, the `&&` short-circuits, this chmod never runs, and `set -eu` cannot see it
+# (POSIX exempts the left of an AND-list from errexit). A 0700 that silently became
+# 0755 is the whole point of the line. See the (a2) block above for the full argument.
+# shellcheck disable=SC3067
 [ -O "$WORKER_TMPDIR" ] && "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
 # runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
 # reach it (0700 grants the group nothing); true per-uid isolation.
+# SC3067: same operator, same shell, same reason as the line above -- busybox ash
+# 1.37.0 in the pinned node:22-alpine implements `-O` (measured 2026-08-03 with an
+# unsupported-operator control), POSIX does not. Per-instance because a changed
+# interpreter turns this into a SKIPPED chmod with no error: `[ -O ... ]` is false,
+# `&&` short-circuits, and errexit does not apply to the left of an AND-list. Here
+# that would leave the runner's private tmp readable by the worker uid, which is the
+# isolation this line exists to create.
+# shellcheck disable=SC3067
 [ -O "$RUNNER_TMPDIR" ] && "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
