@@ -16301,10 +16301,15 @@ the plan region and one against the bullet region. Relocation now fails **by con
 asserts — whatever context the phrase does or does not carry.
 
 - **The phrases shrink because the region carries the position.** Measured on the shipped
-  template, **666 → 376 characters**. (Stated raw rather than as a percentage on purpose:
-  the same measurement rounds to −44% or −43% depending on which way it is taken, and two
-  numbers in two places read as a discrepancy to anyone who meets them apart. Raw figures
-  cannot disagree with themselves.) (The issue quotes 717 → 375 from the tester's
+  template, **666 → 376 bytes** — independently re-derived from the shipped tables by both
+  the auditor and the tester. (Stated raw rather than as a percentage on purpose: the same
+  measurement rounds to −44% or −43% depending which way it is taken, and two roundings in
+  two places read as a discrepancy to anyone who meets them apart. Raw figures cannot
+  disagree with themselves. **Bytes rather than "characters" for the same reason, and the
+  unit is not cosmetic here**: the anchored set carried two em dashes, 3 bytes each in
+  UTF-8, so it is 666 bytes against **662 runes**, while the region-scoped set carries none
+  and is 376 either way. The ambiguous unit diverges on exactly one of the two figures,
+  which is the shape that turns one measurement into an apparent disagreement.) (The issue quotes 717 → 375 from the tester's
   prototype, whose phrase set predates #197's round-4 rewording; both are right for their
   own tree.) Everything §467 gave up to make anchoring work comes back: the spans are
   pairwise disjoint again, each phrase occurs exactly once, the two deliberate overlaps are
