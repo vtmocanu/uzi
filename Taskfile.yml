@@ -156,10 +156,17 @@ tasks:
     desc: The whole gate, repo-wide checks then every component, serially
     cmds:
       # gate:repo FIRST (PRD #103 M5), on the same cheap-first principle gate:web
-      # already states for oxlint: these three checks are seconds against a Go
-      # module's -race compile, and none of them needs a build, a node_modules or a
-      # toolchain warm-up. A contributor who has broken a shell script learns it
-      # before test:api starts rather than four minutes later.
+      # already states for oxlint: none of its checks needs a build, a node_modules
+      # or a toolchain warm-up, so a contributor who has broken a shell script
+      # learns it before test:api starts rather than four minutes later.
+      #
+      # THE "SECONDS" HALF OF THAT ARGUMENT NARROWED WHEN MR-B ADDED `scan:secrets`,
+      # and it is narrowed here rather than left reading as it did: three of the
+      # four are sub-second, the gitleaks pass measured 5.7-42s across runs on one
+      # host. It stays first because the cheap three still run first WITHIN
+      # gate:repo and the expensive one is ordered last there -- so the fast
+      # feedback is unchanged and the cost lands before, not instead of, a 43-66s
+      # `gate:api`.
       #
       # AND IT IS A LIST MEMBER RATHER THAN A NEW SLOT INSIDE EACH gate:*, because
       # its checks are FUNCTIONS OF THE TREE and have no component. Splitting
@@ -186,16 +193,29 @@ tasks:
     # They are appended there too (it is the right entry point), but THIS is the
     # edge that makes them gate.
     #
-    # SEAM FOR MR-B: `scan:secrets` (gitleaks) joins this list and nothing else has
-    # to change -- not `gate`, not the `lint:repo` CI job, which invokes this target
-    # rather than its members. Deliberate: a new repo-wide check should cost one
-    # line here, not another two-list `needs:` edit, which is the omission this
-    # repo's signature failure shape is made of.
-    desc: repo-wide checks that belong to no component (shell, YAML, formula)
+    # THE SEAM HELD. `scan:secrets` (gitleaks, PRD #103 M5 MR-B) joined this list
+    # and nothing else changed -- not `gate`, not the `lint:repo` CI job, which
+    # invokes this target rather than its members, and not either `needs:` list.
+    # That was the design claim when the seam was written and it is recorded here
+    # as having been paid off, because a one-line extension point that turns out to
+    # need a two-list `needs:` edit is this repo's signature failure shape.
+    #
+    # 🔴 ORDER IS CHEAPEST-FIRST AND `scan:secrets` IS LAST BECAUSE IT DOMINATES.
+    # Measured across seven runs on one host 2026-08-03: the three lint targets are
+    # sub-second each, and gitleaks' pass over the 1464 tracked files ranged 5.7s to
+    # 42s -- an eightfold spread on an UNCHANGED tree, so it tracks the filesystem
+    # cache rather than anything a reader can act on. Do not treat any single
+    # figure here as the number; the SHAPE (three that are instant, one that is not)
+    # is what decides the order. So `gate:repo` is no longer "three checks that are
+    # seconds", and `gate` above still calls it FIRST: a contributor with a broken
+    # shell script still learns it in the first second, and the scan's cost lands
+    # before rather than instead of a 43-66s `gate:api`.
+    desc: repo-wide checks that belong to no component (shell, YAML, formula, secrets)
     cmds:
       - task: lint:shell
       - task: lint:yaml
       - task: lint:formula
+      - task: scan:secrets
 
   gate:api:
     desc: api - fmt-check, vet, build, lint, deadcode, test
@@ -309,6 +329,12 @@ tasks:
     # `lint:formula` is here too even though the old sentence did not name it. It
     # is a lint of a tracked file with no component, which is the same shape as the
     # other two.
+    #
+    # `scan:secrets` is deliberately NOT here, and this line exists so its absence
+    # reads as a decision rather than an omission: it is a secret scan, not a lint,
+    # and it is seconds-to-tens-of-seconds where the three repo-wide lints are
+    # sub-second. `gate:repo` is where the four repo-wide checks are composed; this
+    # list is the seven LINTS.
     desc: lint the four components plus the three repo-wide checks (M5)
     cmds:
       - task: lint:api
@@ -344,13 +370,19 @@ tasks:
       - task: deadcode:agent
 
   # ------------------------------------------------- repo-wide (no component) --
-  # The three checks below are FUNCTIONS OF THE WHOLE TREE. They take their scope
+  # The four checks below are FUNCTIONS OF THE WHOLE TREE. They take their scope
   # from the git INDEX rather than from a directory, so adding a script or a YAML
   # file puts it in scope with no edit here -- which is the property a
   # hand-maintained list cannot have, and the reason PRD #103 M5 rejected
   # `e2e/*.sh` + `scripts/*.sh` (those two miss 4 of the 18 tracked shell scripts,
   # including agent/templates/entrypoint.sh, the worker entrypoint that runs in
   # every hosted worker pod).
+  #
+  # `scan:secrets` takes the index rule furthest: its scope is `git ls-files` with
+  # no filter at all. That is not symmetry for its own sake -- gitleaks does NOT
+  # honour `.gitignore` (measured), so the obvious `gitleaks dir .` would scan a
+  # contributor's `web/dist`, local `.env` and stale build output, none of which
+  # exists in CI's checkout. Index scope is what makes the two agree.
   #
   # 🔴 AND `git ls-files '*.sh'` IS NOT ENOUGH EITHER -- IT WAS ALREADY STALE WHEN
   # M5 SHIPPED IT. An extension is a naming convention; a shebang is what the kernel
@@ -370,6 +402,18 @@ tasks:
   # different question and keeps its exit 2: it is about someone who HAS the tool and
   # would get a different gate from CI's.
   #
+  # 🔴 THAT PARAGRAPH IS ABOUT THREE OF THE FOUR. `scan:secrets` HAS NO SKIP BRANCH
+  # AND NO `*_REQUIRED` VARIABLE, and the asymmetry is the ruling rather than an
+  # oversight. shellcheck, yamllint and ruby are brew/pip/system tools a
+  # contributor may simply not have; gitleaks arrives through `go run pkg@version`,
+  # the Go toolchain is mandatory here, and `gate:api` ALREADY `go run`s two pinned
+  # remote modules. So the population that cannot obtain gitleaks is the population
+  # that cannot run `gate:api` either -- a skip would buy nobody anything while
+  # putting a fail-open branch in the one check where fail-open is worst. And a
+  # `UZI_SCAN_SECRETS_REQUIRED` guarding a branch that does not exist would be the
+  # vacuous-directive class this milestone is about, so `lint:repo` does not set
+  # one. If a skip is ever added here, that variable is added in the same commit.
+  #
   # 🔴 EACH DELEGATES TO A COMMITTED `scripts/*.sh` RATHER THAN INLINING THE
   # RECIPE, AND THE ARGUMENT IS M5's OWN. M5 adds shellcheck over every tracked
   # script, so a committed script GETS LINTED and an inline `cmds:` string gets
@@ -385,8 +429,11 @@ tasks:
   # verdicts, and the lying half is the contributor's -- Success Criterion 1's exact
   # failure mode. Read the scripts' headers before simplifying any of them.
   #
-  # WHAT IS NOT HERE YET: `scan:secrets` (gitleaks) is MR-B. It appends to
-  # `gate:repo` above and needs no other edit anywhere.
+  # THE FOURTH ONE IS `scan:secrets`, BELOW `lint:formula` RATHER THAN IN THIS
+  # `lint:` RUN, because it is a scan and not a lint -- see its own comment. This
+  # block used to end "WHAT IS NOT HERE YET: `scan:secrets` (gitleaks) is MR-B. It
+  # appends to `gate:repo` above and needs no other edit anywhere." MR-B landed and
+  # that prediction held exactly, including the "no other edit" half.
   lint:shell:
     desc: shellcheck over every tracked shell script (severity=warning, pinned 0.11.0)
     cmds:
@@ -475,6 +522,47 @@ tasks:
       # elsewhere, so the distinction is live -- and copies this file VERBATIM
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
+
+  scan:secrets:
+    desc: gitleaks over every tracked file, with a canary proving the scanner ran
+    cmds:
+      # 🔴 A `scan:` PREFIX AND NOT `lint:`, AND IT IS DELIBERATELY ABSENT FROM THE
+      # COMPOSED `lint` TARGET ABOVE. This is not a lint: a lint reports on how code
+      # is written and its findings are opinions the tree can be edited to satisfy,
+      # while this reports that a CREDENTIAL may be in the repository. Folding it
+      # into `lint` would also put a tens-of-seconds check behind a target
+      # contributors run for sub-second style feedback. `gate:repo` is what gates it;
+      # `task scan:secrets` is how you run it alone. If you came here to "fix" the
+      # omission from `lint`, this paragraph is the reason not to.
+      #
+      # 🔴 BOTH ARGUMENTS ARE LOAD-BEARING AND BOTH ARE HERE SO THIS FILE'S ECHO
+      # SHOWS THEM MOVING, the same reason `lint:shell` carries its severity and
+      # its version pin rather than defaulting them inside the script.
+      #
+      # THE VERSION IS THE ONLY VERSION RECORD THERE IS. Under `go run`, gitleaks'
+      # own `version` subcommand prints the literal string "version is set by build
+      # process" -- measured 2026-08-03 -- because the release workflow stamps it
+      # with ldflags and a source build does not. So NOTHING CAN ASSERT THE RUNNING
+      # BINARY'S VERSION the way `lint:shell` asserts shellcheck's; this line is the
+      # pin, and a `gitleaks version` assertion written against it would compare a
+      # sentence to a number. Pinned `go run` for the reason carry-forward item 6
+      # gives for golangci-lint: the official image would be this pipeline's first
+      # unpinned effective toolchain.
+      #
+      # THE CANARY PATH IS AN ARGUMENT for the reason `lint:yaml` passes its config
+      # path: it is a separate tracked file that can be deleted, moved or edited,
+      # and this is where a reader sees which one is in play. Delete the argument
+      # and the script exits 2 on a usage error rather than quietly scanning
+      # without a control. The canary must also be TRACKED -- the scope below is
+      # the git index -- so `git rm --cached` on it is caught too, by the same
+      # branch and with the same message.
+      #
+      # SCOPE IS `git ls-files`, NOT `dir .`, and the reason is measured: gitleaks
+      # does NOT honour `.gitignore`, so `dir .` scans whatever is lying in a
+      # contributor's worktree (`web/dist`, a local `.env`, stale build output) and
+      # CI's checkout has none of it. Same index-scoped rule as `lint:shell` and
+      # `lint:yaml`; argued in full in the script.
+      - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:
