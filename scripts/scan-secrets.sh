@@ -203,11 +203,20 @@ if ! command -v go >/dev/null 2>&1; then
   exit 2
 fi
 
-REPORT="$(mktemp -t uzi-scan-secrets)" || {
+# 🔴 AN EXPLICIT `XXXXXX` TEMPLATE, NOT `mktemp -t <name>`. The `-t` form is not
+# portable and it fails in the direction that only CI can show you: BSD/macOS
+# mktemp treats the argument as a PREFIX and appends randomness, while GNU
+# coreutils treats it as a TEMPLATE and requires at least three X's. So
+# `mktemp -t uzi-scan-secrets` succeeds on a contributor's mac and dies on the
+# Debian-based CI image with `too few X's in template`. Measured: that is
+# exactly how this job failed on its first ever pipeline run (MR !175,
+# pipeline 20332), after every other step in it had passed. A full template
+# path is accepted by both implementations.
+REPORT="$(mktemp "${TMPDIR:-/tmp}/uzi-scan-secrets.XXXXXX")" || {
   echo "scan-secrets: mktemp failed" >&2
   exit 2
 }
-TRACKED="$(mktemp -t uzi-scan-tracked)" || {
+TRACKED="$(mktemp "${TMPDIR:-/tmp}/uzi-scan-tracked.XXXXXX")" || {
   echo "scan-secrets: mktemp failed" >&2
   exit 2
 }
