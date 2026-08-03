@@ -1249,8 +1249,9 @@ which previously prescribed only the fail-open form.
       >
       > **Deviations from this document, all recorded in place rather than worked
       > around**: `goconst` is OFF (Decision 4's enable list amended — measured at
-      > 1211 of 1344 combined findings, and under `--whole-files` its blast radius
-      > is 87 non-test files in `api`); `govet` is OFF because `vet:*` already runs
+      > **1211 of 1322** combined findings on the M3 five-linter set, and under
+      > `--whole-files` its blast radius is **86** non-test files in `api`);
+      > `govet` is OFF because `vet:*` already runs
       > it **unratcheted**, so folding it into a ratcheted run is a net weakening;
       > and Decision 3 is **partially** deviated from — Go opens `lint`-stage jobs
       > while the npm half folds into `validate:web`/`validate:agent`, because
