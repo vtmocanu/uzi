@@ -1920,3 +1920,69 @@ Every measurement in §14 through §25 was taken against helpers that have now m
 the merged tip.** A green gate on a merge is not evidence that a pinned property survived
 the merge — that is the *fixture-across-a-boundary* shape this repo documents, arriving via
 someone else's refactor instead of via a cache.
+
+---
+
+## 28. AMENDMENT 21 — merge landed at `b00ecc83`. A SIXTH instance of the class, and it is `main`'s.
+
+True merge, two parents (`804f2f1a` + `136d976a`), **no SHA rewritten** — so every pinned
+measurement in §14-§25 still refers to a reachable commit. Gate EXIT=0, `lint:api` 0 issues,
+`deadcode-gate` clean, `govulncheck` over `cmd/uzi` + `uzicli` + `termsafe` finds nothing.
+**§26 and §27 were accurate**: three conflicts, exactly the predicted files.
+
+### The H2 trap was avoided, and BOTH controls fire on the merged tree
+
+The resolution keeps `main`'s #180 comment and reverts the **call** to the local truncating
+`cellText`, which reaches the same `termsafe` predicate through `compactText` and adds the
+200-char cap on top.
+
+```
+naive merge (local cellText -> uzicli.CellText)   TestVersionCommandSanitizesServerBuildInfo/unbounded  RED
+M26 (drop compactText's 200 cap)                  unbounded_build_metadata AND unbounded                RED
+```
+
+**The tester's mandated control still holds after the helpers moved underneath it** — which
+is the thing a green gate on a merge could never have told us.
+
+### 🔴 SIXTH INSTANCE, AND THE FIRST THAT IS NOT OURS
+
+Two sites landed by #180 claim `--json` escapes what `termsafe` strips. Measured on
+`encoding/json` by the coder, **re-derived independently by the lead** — the two runs agree
+on all eight rows:
+
+```
+                          Cf     Control  json-escaped
+C0 ESC U+001B             false  true     true
+DEL U+007F                false  true     FALSE
+C1 CSI U+009B             false  true     FALSE
+bidi RLO U+202E           true   false    FALSE
+zero-width space U+200B   true   false    FALSE
+ZWJ U+200D                true   false    FALSE
+BOM U+FEFF                true   false    FALSE
+soft hyphen U+00AD        true   false    FALSE
+```
+
+- **`api/internal/termsafe/termsafe.go:59`** — *"--json escapes control bytes losslessly"*.
+- **`CHANGELOG.md:103`**, user-facing and released — *"`--json` output is deliberately
+  untouched, since it already escapes those bytes"*, where *those bytes* is its own
+  enumeration: *"terminal control characters and Unicode format characters (the bidi
+  overrides, zero-widths, the BOM)"*. **Every Cf family it names is unescaped.** One of
+  eight rows is true.
+
+**The decision is right and the reason is wrong** — identical to our own §18 finding.
+`--json` is safe because its destination is a **parser**, not because of any encoder
+property. And this is the **load-bearing third argument** in `termsafe`'s strip-not-escape
+rationale, so the wrong sentence is doing work.
+
+**USER DECISION 2026-08-03: fix `termsafe.go:59` in this MR; FILE the CHANGELOG line as a
+GitLab issue** rather than silently rewriting another issue's released user-facing prose.
+
+**What makes this the finding rather than an anecdote:** it landed in a freshly-reviewed
+shared **security** package during the same week this branch found five of its own. That is
+evidence the pattern is a property of this codebase's commenting culture, not of this
+branch. The coder said so first, about work that was not its own.
+
+### Still owed
+
+Full re-validation against `b00ecc83`: the 32-mutation programme, review, audit. Every
+measurement in §14-§25 was taken against helpers that have moved.
