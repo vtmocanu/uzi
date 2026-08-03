@@ -16707,7 +16707,7 @@ position as §473.
   `go run golang.org/x/tools/cmd/deadcode@v0.48.0` builds x/tools into `GOCACHE`, and
   `validate:api` and `test:api` share `.go_job`'s key **without ever building it**, so a new
   lint-stage job on the default key would put a third writer on that cache and decide their
-  warmth — `lint:api` already carries its own `prefix: lint` for exactly that reason, and
+  warmth — the lint jobs already carry their **own** cache prefix for exactly that reason, and
   golangci-lint's tree subsumes x/tools' anyway. For the **npm** half the reason is **cost**:
   knip is **sub-second against each job's ~30s `npm ci`**, so a separate job would pay the whole
   setup overhead for the check. Both land on the same place: **`.gate_needs` and
@@ -16717,6 +16717,20 @@ position as §473.
   cannot open that hole. Note also that `deadcode:api` needs none of `lint:api`'s git setup (no
   `GIT_DEPTH`, no fetch, no merge-base): it is not ratcheted and its baseline is a committed
   file, so it is a passenger on that job rather than a dependent of it.
+
+  *🔴 **AND THAT PASSENGER CHANGED WHAT THE CACHE HOLDS, WHICH IS WHY THE LINT KEY IS NOW
+  PARTITIONED BY REF TRUST.** The prefix is `lint-$CI_COMMIT_REF_PROTECTED`, so protected refs
+  read `lint-true-<sum>` and unprotected ones `lint-false-<sum>`. The argument is not tidiness:
+  that cache now holds a **compiled** golangci-lint and, through `deadcode:api`, a compiled
+  x/tools binary — and **Go trusts a cached object blindly, never re-verifying it against
+  source**. With a ref-free key, anyone able to open an MR writes into the cache a **tag**
+  pipeline later reads, in a job that is a `needs:` predecessor of every publish path. Cost is
+  one cold run per side. `policy: pull` was the other candidate and is worse: it makes every
+  lint run cold **forever** (`lint:controller` measured 364s cold). **`.go_job`'s own key stays
+  ref-free deliberately** — it caches no compiled tool, which is the property that makes this
+  one sharper, and collapsing the two would lose that distinction. Landed on this branch as
+  `2f3cb71c` while §473-474 were being written, which is why this paragraph exists: the
+  sentence above it said `prefix: lint` and was one commit stale by the time it was committed.*
 
   *🔴 **THE COST FIGURE IS STATED AS AN ORDER OF MAGNITUDE HERE ON PURPOSE, BECAUSE THE
   MILLISECOND ONE IS A SELF-REPORTED METRIC THAT DOES NOT REPRODUCE.** `Taskfile.yml`,
