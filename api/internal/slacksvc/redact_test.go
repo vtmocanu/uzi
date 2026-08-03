@@ -39,7 +39,7 @@ func TestScrubSecretsCoversAllFamilies(t *testing.T) {
 	// uziToken is a fake uzi CLI credential (uzc_ + a ≥16-char body): the scrub must
 	// strip it (PRD #64 Risk 14 — UZI_TOKEN lives in a GitLab CI variable and could
 	// echo into a status/title string bound for Slack), never a real secret.
-	const uziToken = "uzc_A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow
+	const uziToken = "uzc_A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow // fake uzi CLI credential fixture: the value ScrubSecrets must strip below, never a real secret
 	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key glpat-not-a-real-pat " + uziToken + " end"
 	got := ScrubSecrets(in)
 	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", "glpat-not-a-real-pat", uziToken} {
@@ -56,7 +56,7 @@ func TestScrubSecretsCoversAllFamilies(t *testing.T) {
 // "uzc_a1b2" display stub (a non-secret, only 4 body chars) is NOT over-matched.
 func TestScrubSecretsUziTokenFamily(t *testing.T) {
 	for _, prefix := range []string{"uzc_", "uza_", "uzw_"} {
-		tok := prefix + "A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow
+		tok := prefix + "A1b2C3d4E5f6G7h8i9j0k1"
 		if got := ScrubSecrets("using " + tok + " now"); contains(got, tok) {
 			t.Errorf("ScrubSecrets left %q in %q", tok, got)
 		}
