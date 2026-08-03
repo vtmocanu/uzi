@@ -281,6 +281,41 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
     expect(screen.getByText("differs from shipped")).toBeTruthy();
   });
 
+  it("distinguishes the description diff WITHOUT colour, and still emits no ins/del", async () => {
+    // F15 acceptance 1, checked literally rather than by eye: textContent carries
+    // no colour, no class and no style, so if the direction is recoverable from
+    // the text ALONE then removing colour loses nothing. That is the whole of
+    // WCAG 1.4.1 here, and it is why the assertion reads the string rather than
+    // the tint classes — asserting on `text-ok`/`text-danger` would pass on a
+    // colour-only implementation, which is the defect.
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    // A REPLACEMENT, not an append: the first fixture tried here only appended
+    // words, so diffWords produced an added run and no removed one, and the
+    // assertion on the shipped marker failed for want of anything to mark. Both
+    // directions have to be exercised or half the claim is untested.
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ differs_from_builtin: true, description: "Audits security." }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    const { container } = renderPage();
+    await screen.findByText("differs from shipped");
+
+    const descriptionPre = screen
+      .getByText("Description", { selector: "span" })
+      .parentElement!.querySelector("pre")!;
+    const text = descriptionPre.textContent ?? "";
+
+    // git's --word-diff convention: [-shipped-] {+current+}. Direction survives
+    // in plain text, and each side's words sit inside their own marker.
+    expect(text).toMatch(/\[-[^\]]*Implements[^\]]*-\]/);
+    expect(text).toMatch(/\{\+[^}]*Audits[^}]*\+\}/);
+
+    // F15 acceptance 2: re-run rather than assume orthogonality. The visible
+    // markers are spans, so the canary must be untouched.
+    expect(container.querySelectorAll("ins, del")).toHaveLength(0);
+  });
+
   it("warns about UNSAVED edits too, not only the saved row's drift", async () => {
     // F14's acceptance case, and it is built to fail before the fix: the stored
     // row differs ONLY in prompt_body, and the description edit exists only in

@@ -449,23 +449,60 @@ function DiffField({ label, children }: { label: string; children: ReactNode }) 
 // how this class of guard dies.
 const SR_MARKER = { added: "now: ", removed: "shipped: " } as const;
 
+// WORD_MARK wraps a changed run in git's `--word-diff` delimiters. This is the
+// VISIBLE half of the distinction (issue #201 M4a F15): an sr-only span is
+// clipped to 1px, so before this a sighted colour-blind reader had nothing but
+// the tints, while LineDiff and ToolsDiff both carried visible +/-.
+//
+// A word diff runs INSIDE a sentence, so it cannot take a line prefix the way its
+// two siblings do — hence delimiters rather than a leading +/-. The direction
+// still reads the same way round: `-` is shipped, `+` is current.
+//
+// 🔴 NOT `<ins>`/`<del>`, which are the semantically obvious elements and are
+// banned here. F2's canary asserts the rendered diff contains ZERO ins/del,
+// because that is precisely what convertChangesToXML emits and it is the only
+// assertion that discriminates an HTML-string renderer — the img assertion passes
+// under every unsafe form. Adopting them would delete the guard silently. This is
+// the same conflict Amendment 4 resolved for the screen-reader half, arriving
+// from the visual side.
+const WORD_MARK = {
+  added: ["{+", "+}"],
+  removed: ["[-", "-]"],
+} as const;
+
 // InlineDiff renders a word-level diff as text nodes: shipped-only words in the
-// shipped tone, current-only words in the edited tone, each announced by an
-// sr-only marker so the distinction survives without colour.
+// shipped tone, current-only words in the edited tone, each carrying BOTH a
+// visible delimiter and an sr-only marker.
+//
+// The two channels are deliberately disjoint. The delimiters are aria-hidden, so
+// a screen reader gets the clean "shipped:"/"now:" wording instead of hearing
+// "bracket minus"; a sighted reader gets the marks and never the sr-only text.
+// Neither channel is colour.
 function InlineDiff({ parts }: { parts: Change[] }) {
   return (
     <>
-      {parts.map((p, i) => (
-        <span
-          key={i}
-          className={p.added ? "bg-danger/15 text-danger" : p.removed ? "bg-ok/15 text-ok" : "text-muted"}
-        >
-          {(p.added || p.removed) && (
-            <span className="sr-only">{p.added ? SR_MARKER.added : SR_MARKER.removed}</span>
-          )}
-          {p.value}
-        </span>
-      ))}
+      {parts.map((p, i) => {
+        const kind = p.added ? "added" : p.removed ? "removed" : null;
+        if (!kind) {
+          return (
+            <span key={i} className="text-muted">
+              {p.value}
+            </span>
+          );
+        }
+        const [open, close] = WORD_MARK[kind];
+        return (
+          <span
+            key={i}
+            className={kind === "added" ? "bg-danger/15 text-danger" : "bg-ok/15 text-ok"}
+          >
+            <span className="sr-only">{SR_MARKER[kind]}</span>
+            <span aria-hidden="true">{open}</span>
+            {p.value}
+            <span aria-hidden="true">{close}</span>
+          </span>
+        );
+      })}
     </>
   );
 }
