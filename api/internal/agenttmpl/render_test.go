@@ -312,9 +312,9 @@ const (
 // region instead — measured, that reports `leaked into the other region` with
 // the boundary count still 1, which is the fold that proves the branch live.
 //
-// All three are Fatalf rather than Errorf ON PURPOSE, and this is the severity
-// choice, not a style one. Once the split is untrustworthy the assertions below
-// report on regions that are not the regions they name. Under Errorf a broken
+// All three are Fatalf rather than Errorf on purpose. Once the split is
+// untrustworthy the assertions below report on regions that are not the regions
+// they name, and under Errorf a broken
 // split prints all eight results anyway — a screenful of authoritative-looking
 // output computed from a split already known to be invalid, with the one line
 // that explains it scrolled off the top. Stop at the guard; nothing below it
@@ -393,8 +393,8 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // — the same measurement rounds two ways, and two roundings in two files read
 // as a discrepancy to whoever meets them apart. Bytes rather than "characters"
 // for the same reason: the anchored set carried two em dashes, so its rune
-// count is 662 against 666 bytes, while this set has none and is 376 either
-// way. The ambiguous unit diverges on exactly one of the two numbers.)
+// count is 662 against 666 bytes. The ambiguous unit diverges on exactly one of
+// the two figures.)
 //
 // It cannot LOSE detection relative to the whole-body form it replaces, and
 // that is a proof rather than a measurement: each region is a substring of the
@@ -444,12 +444,15 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 //     AGAINST THE WHOLE BODY. Same file, same template, fourteen pins, and the
 //     class stays open for them: measured, moving a parallel-implementer
 //     constraint out of its bullet and up into the plan paragraph — across the
-//     very boundary this test introduces — leaves both sets green at rc=0. The
-//     exposure is genuinely narrow, since those phrases nearly all live in the
-//     bullets and have nowhere misleading to go, which is why documenting it was
-//     judged enough. But `splitLeadRegions` sitting here makes the file LOOK
-//     scoped, and that inference is wrong for 14 of its 22 pins. Scoping them is
-//     its own piece of work if it is worth doing at all.
+//     very boundary this test introduces — leaves both sets green at rc=0.
+//     A PIN ADDED TO THAT SET FROM NOW ON WILL BE WHOLE-BODY, and this file's
+//     own `splitLeadRegions` is what will make its author think otherwise: the
+//     class #205 exists to close, re-entering through the set this change did
+//     not touch. The exposure is narrow today — those phrases nearly all live
+//     in the bullets and have nowhere misleading to go, which is why
+//     documenting was judged enough — but that is a property of the phrases
+//     currently in the set, not of the set. Scoping them is its own piece of
+//     work if it is worth doing at all.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
