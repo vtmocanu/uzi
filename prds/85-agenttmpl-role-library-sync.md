@@ -263,15 +263,25 @@ distills all 11 library roles, and its missing-builtin check goes red on
   `name`, omitted when zero. `TestRenderFieldOrderAndOmission` extended with a
   stamped and an unstamped case. `cd api && go test ./internal/agenttmpl/`
   green. **Freezes the contract** the rest depends on.
-- [ ] **M2 — The nine library-derived builtins are stamped.** Each version read
-  from `roles.yaml` at `a6ae17e` and **confirmed against that role's body**, not
-  copied from this PRD's table. `lead` deliberately unstamped. Round-trip
-  byte-match green for all 10.
-- [ ] **M3 — `release` and `web-ux` mirrored in.** Ported from `roles.yaml` v2
-  (stamped `version: 2`, `tools` kept verbatim per Decision 9) with
-  tail-referencing prose adapted (Decision 1) and `web-ux`'s
-  browser-unavailable / no-ad-hoc-install branch added (Decision 7). Roster is
-  12.
+- [ ] **M2 — The ten library-derived builtins are stamped.** Each version read
+  from `roles.yaml` **at implementation time** and **confirmed against that
+  role's body**, not copied from this PRD's table and not from `a6ae17e`, which
+  is now far behind — several roles moved during a single day's work on
+  2026-08-02 (`coder` went 4 → 5 within hours). `lead` deliberately unstamped;
+  see the note under M1 for why that is still right. Round-trip byte-match green
+  for all 11.
+- [ ] **M3 — `release` mirrored in.** Ported from `roles.yaml` (stamped at its
+  then-current version, `tools` kept verbatim per Decision 9) with
+  tail-referencing prose adapted (Decision 1). Roster is 12.
+
+  *(Updated 2026-08-03: M2 said "nine … all 10" and M3 said "`release` and
+  `web-ux`". **`web-ux` landed independently**, along with `architect` and
+  `researcher`, after this PRD was written on 2026-07-21 — `builtins/` is now
+  **11** (`architect auditor coder documenter fact-checker lead researcher
+  reviewer spec-keeper tester web-ux`) and `release` is the only library role
+  still missing. So ten are library-derived, the round-trip covers eleven, and
+  M3's target roster of 12 is unchanged. Decision 7's `web-ux` browser-degraded
+  branch should be checked against the shipped file rather than re-applied.)*
 - [ ] **M4 — Vendored manifest + drift check.** All 11 library roles in the
   manifest; test fails on behind-stamp / missing-builtin / unknown-version.
   Verified by temporarily bumping one manifest entry and watching it go red (a
@@ -303,7 +313,23 @@ distills all 11 library roles, and its missing-builtin check goes red on
 - **Generic-body / `## For this repo` tail split for builtins** — dropped, see
   Decision 1.
 - **Persisting `version` to `agent_templates`, the API DTO, the admin UI, or the
-  CLI** — Decision 8; follow-up issue to file.
+  CLI** — Decision 8. **The follow-up is now filed: #201** (a shipped builtin
+  prompt change never reaches an already-seeded install, because
+  `agent_templates.sql:74` is `ON CONFLICT (name) … DO NOTHING`). M1 here is its
+  prerequisite, and #201 is where the schema column, the drift signal and the
+  policy call about admin-edited rows belong.
+
+  **Note for #201, established 2026-08-03: a version is not sufficient on its
+  own and #201 will need a content hash as well.** M2 leaves `lead` unstamped,
+  which is right — `lead` has no library counterpart, so there is no honest
+  number to give it. But the deeper reason the gap does not matter is that the
+  two artifacts answer different questions: a **version** answers *which library
+  revision is this derived from*, and a **hash** answers *has this row been
+  touched*. An admin editing a stored prompt bumps no version, so drift
+  detection needs the hash regardless — at which point an unstamped `lead` is
+  covered by the same mechanism as an edited `coder`. Duplicate issue #202
+  proposed giving `lead` a uzi-owned `version: 1` instead; that was filed
+  without reading this PRD and is superseded by M2.
 - **Byte-comparing builtin bodies against library bodies** — Decision 2/5;
   it would permanently redden four deliberately-adapted roles.
 - **Automating the port itself** (a generator that writes builtins from
