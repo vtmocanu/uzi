@@ -19,11 +19,24 @@ controller     41 capped      41 uncapped     <- identical. THIS IS THE CAMOUFLA
 **The two flags are not redundant, and they COMPOSE IN ORDER rather than each owning a linter.** Measured by the lead 2026-08-02 on the shipped `goconst`-off config, `cache clean` first, each flag isolated:
 
 ```
-A  --new-from-merge-base=                                 56   errcheck 36  staticcheck 13
-B  --new-from-merge-base= --max-issues-per-linter=0       56   errcheck 36  staticcheck 13   <- NO CHANGE
-C  --new-from-merge-base= --max-same-issues=0             78   errcheck 50  staticcheck 21
-D  --new-from-merge-base= both                           107   errcheck 79  staticcheck 21
+A  --new-from-merge-base=                                 55   errcheck 36  staticcheck 13
+B  --new-from-merge-base= --max-issues-per-linter=0       55   errcheck 36  staticcheck 13   <- NO CHANGE
+C  --new-from-merge-base= --max-same-issues=0             77   errcheck 50  staticcheck 21
+D  --new-from-merge-base= both                           106   errcheck 79  staticcheck 21
 ```
+
+**Re-derived 2026-08-03 at `1076b133`**, with a private `GOLANGCI_LINT_CACHE` rather than
+`cache clean`. This matrix is the **M3 five-linter set** (`errcheck`, `staticcheck`,
+`ineffassign`, `unused`, `unparam`) — W5 later enables `nolintlint`, which takes row D to
+**108**, so quoting any total here without naming the enable set and the SHA reproduces the
+defect this carry-forward exists to prevent.
+
+*(Every total was one higher until 2026-08-03: `56/56/78/107`, measured during M3's design
+wave and invalidated the same afternoon by `6ea98493`, an M4 commit that wired up
+`const hookEvent` and consumed a pre-existing `unused` finding. **Every per-linter figure is
+unchanged** — the whole delta is `unused 2` against 3. This is the worked example behind
+Decision 10's amendment: a tree-derived figure carries the SHA it was run at, because a date
+cannot separate two commits landed the same afternoon and these were.)*
 
 `--max-same-issues` folds duplicate messages **first**; `--max-issues-per-linter` then truncates the survivors at 50. So on this config `--max-issues-per-linter=0` **alone is a complete no-op** (nothing exceeds 50 until the fold is lifted), and errcheck only clears 50 once the other flag has fired.
 
@@ -129,13 +142,21 @@ It fails in the safe direction (false red, never false green) but three things m
 Defaults to **true**. So a linter's reported count depends on **which other linters are enabled**:
 
 ```
-shipped config, both cap flags cleared                        107   staticcheck 21
-  ... plus --uniq-by-line=false                               108   staticcheck 22
-with goconst additionally enabled, uniq on                   1284   staticcheck 20
-with goconst additionally enabled, uniq off                  1622   staticcheck 22
+shipped config, both cap flags cleared                        106   staticcheck 21   <- re-derived 1076b133
+  ... plus --uniq-by-line=false                               107   staticcheck 22   <- re-derived 1076b133
+with goconst additionally enabled, uniq on                   1284   staticcheck 20   <- NOT re-derived
+with goconst additionally enabled, uniq off                  1622   staticcheck 22   <- NOT re-derived
 ```
 
-One finding of 108 today, which is why M3 did not restate its figure. **The reason it matters is M4 and M5, which add linters**: this is exactly how a `staticcheck` finding disappears from an "unfiltered" total without anyone touching staticcheck. Three folds now, not two — quote a count with all three cleared, or say which are not.
+**Rows 1-2 were re-run on 2026-08-03 at `1076b133`** (they read 107 and 108 until then, for the
+same `6ea98493`-shaped reason as the matrix above). **Rows 3-4 were NOT re-run and are left at
+their design-wave values on purpose.** They are almost certainly one lower too, and "almost
+certainly" is exactly what this document forbids writing down as a measurement: whether the
+`unused` finding that disappeared survives `uniq-by-line` dedup once goconst is enabled is a
+question about the dedup, not arithmetic, and nobody has asked it. Re-run them or quote them
+as design-wave figures; do not decrement them by inspection.
+
+One finding of separation in rows 1-2, which is why M3 did not restate its figure. **The reason it matters is M4 and M5, which add linters**: this is exactly how a `staticcheck` finding disappears from an "unfiltered" total without anyone touching staticcheck. Three folds now, not two — quote a count with all three cleared, or say which are not.
 
 ## 12. A NEW devDependency SILENTLY BREAKS EVERY EXISTING CHECKOUT'S GATE
 
