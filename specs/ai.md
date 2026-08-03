@@ -16516,3 +16516,233 @@ the same runner.
   keyed on something no caller can read. This is the price of the delivery choice in §468 and
   is worth paying; what it costs is that the *message text* is the only channel, for every
   golangci-lint failure mode, not just the one this list names.
+
+## 473. PRD #103 M4 — the dead-code gate ships EMPTY baselines gating at ZERO, the wrapper survives for the EXIT CODE, and `-test` hides the very class the `:all` companions exist to report
+
+M4 closes the `dead code` slot both slot-table copies had carried as `none (gap)` since
+2026-07-26. **`human.md` untouched and no entry proposed**, for the reason M1-M3 proposed none:
+contributor tooling, no API, no schema, no worker behaviour, no UI. What a rebuild must
+reproduce is not the tool — it is the placement decisions below, every one of which was settled
+by running something and every one of which has a **silent green** on the other side.
+
+- **🔴 THE MILESTONE'S OWN PREMISE WAS FALSE, AND THE ANSWER WAS TO INVERT THE DESIGN RATHER
+  THAN IMPLEMENT IT.** Decision 4 specified a ratchet against a committed baseline because the
+  first run was expected to produce a large finding list. It produced **one** finding in `api`
+  (`HookManager.SettingsPath`, an exported one-line wrapper over the unexported `settingsPath()`
+  beside it, zero callers) and **zero** in `controller`. So the function was **deleted**, both
+  `.deadcode-baseline` files ship **empty**, and both Go modules gate at **ZERO** — strictly
+  stronger than gate-on-new, and it *removes* the baseline-rot problem instead of managing it.
+  A rebuild whose first run is large may legitimately need a populated baseline; what it must
+  keep is the meaning those files were given here — **a baseline is a suppression list, one
+  stated reason per entry, not a debt ledger.** Both headers say so, and the two legitimate
+  suppressions are named (`//go:linkname`, which deadcode's own doc says it cannot follow, and
+  a platform-gated file).
+- **🔴 THE WRAPPER IS NOT ABOUT THE BASELINE. It exists for the EXIT CODE, and deleting it on
+  the (correct) observation that the baselines are empty reopens a fail-open hole.** `deadcode`
+  exits **0** whether it finds 0, 1 or 43 dead functions, and **1** only when the packages fail
+  to load — **and on that path stdout is 0 bytes.** So the obvious wrapper,
+  `run | sort > cur; comm -13 baseline cur; fail on additions`, is **silent green on a module
+  that does not compile**: the empty result set diffs as removals-only, there are no additions,
+  the gate passes. That
+  is **§466's `test -z "$(gofmt -l .)"` hole arriving through a different door** — an empty
+  result set indistinguishable from a clean one — and the two are worth reading as one class,
+  because the second was built by people who had just written the first down.
+  `scripts/deadcode-gate.sh` therefore **reads `$?` before it looks at the output**, and takes
+  the exit convention M2 and M3 already set: **2 = the instrument is broken** (load error,
+  missing baseline, bad usage), **1 = findings**, **0 = clean**. `task`'s own rc is 201 for all
+  three, so the script is the only place that distinction can live. A missing baseline file is
+  a **2**, not a clean module.
+
+  *Re-derived here at `8f3c4bb5` by planting `func zzSpecKeeperBroken( {` in
+  `api/internal/uzicli/` and removing it after (`git status` clean, gate green again): raw
+  `deadcode -test ./...` gives **rc=1 with stdout exactly 0 bytes** and the parse error on
+  stderr, the shipped script gives **rc=2** naming it a LOAD ERROR, and `task` reports **201**
+  for both that and an ordinary finding — which is the whole reason the 2/1/0 convention has to
+  live inside the script rather than be read off `task`.*
+- **A stale baseline entry is FATAL, not a warning.** An entry whose symbol is no longer
+  reported is a live suppression for a name that can be re-introduced later and silently pass —
+  the vacuous-negative class this repo keeps paying for, and "a warning nobody must act on" is
+  what Decision 3 rejects outright. With an empty baseline the branch cannot fire on an ordinary
+  deletion; it fires only when a deliberate suppression has become unnecessary, where removing
+  it in the same commit is hygiene rather than an imposition.
+- **🔴 THE BASELINE KEY IS POSITION-FREE, AND THE DEFAULT OUTPUT FORMAT IS NOT USABLE AS ONE.**
+  `deadcode` prints `path:line:col: unreachable func: Name`. Measured: inserting **one comment
+  line** above a baselined symbol moved `skillhook.go:75:24` → `:76:24`, so a baseline built
+  from raw output reports a **spurious addition AND a spurious removal** on any unrelated edit
+  above any baselined symbol — which is how a gate stops being run. A `-f` template keys on
+  **(import path, function name)** and carries `file:line:col` as a third field that is printed
+  for the human and **never compared**. Two properties ride with it: comment/blank stripping is
+  unambiguous because no import path and no Go identifier can contain `#`; and **`LC_ALL=C` on
+  both sorts is part of the file's contract, not an implementation detail** — deadcode's output
+  is deterministic but **not lexicographic** (packages by import path, then functions by file
+  and *line number*, which its own source explains as keeping `(T).Marshal` beside
+  `(*T).Unmarshal`), so `sort` is not idempotent over tool output and `comm` requires one
+  collation.
+- **🔴 THE PACKAGE PATTERN IS `./...` FROM THE MODULE ROOT AND MUST NOT BE NARROWED — the
+  natural "just our code" edit adds 85 phantom findings AT rc=0.** Only `main` packages are
+  call-graph roots, so scoping to `./internal/...` orphans everything reachable only from
+  `cmd/` and reports them all, **with no error of any kind**. This is the one edit to this gate
+  that looks like tightening and is the opposite.
+
+  *The **delta is the durable figure, not the pair**: M4 measured `1 → 86` on the pre-deletion
+  tree, and re-derived at `8f3c4bb5` it is **`0 → 85`** — the same **+85**, moved by the one
+  function M4 deleted. Cited this way because the left-hand number is whatever the module's real
+  backlog is on the day you read it, and only the right-hand inflation is a property of the
+  pattern.*
+- **🔴 `-test` IS THE RIGHT GATING DEFAULT AND THE WRONG RECORDING ONE, WHICH IS WHY THERE ARE
+  TWO INVOCATIONS AND ONLY ONE OF THEM GATES.** Under `-test ./...` a production-dead function
+  becomes invisible the moment any test calls it — **write it, test it, never wire it up**,
+  which is the commonest way dead code enters a repo with a testing culture. It is still the
+  right gate: 32 of `api`'s 43-finding delta are `FakeClient.*` methods on a test double,
+  correctly treated as live. So `deadcode:api:all` / `deadcode:controller:all` run **without**
+  `-test`, **reported and never gating**. Measured at `8f3c4bb5`: the `:all` targets print
+  **43** and **4** while the gating targets report **0** and **0** — a companion that reports
+  one number needs the other to mean anything.
+
+  **And `golangci-lint unused` does not cover the difference, which is the reason this pair is
+  not redundant with §468.** `controller`'s four are the worked example: three (`SpecHashOf`,
+  `SizeNames`, `TemplateNames`) are **exported**, which `unused` does not report at all, and the
+  fourth, unexported `keys`, is called by two of the other three *inside its own package* and is
+  therefore "used" by `unused`'s definition. The class is invisible to both the gating
+  invocation and the linter.
+- **The two `:all` companions ALWAYS EXIT 0, which is the exact OPPOSITE of `lint:api:all`, and
+  both `desc:` lines have to be read together.** golangci-lint exits 1 on any finding; deadcode
+  exits 0 on any number of them. So `lint:api:all` is a target documented as non-gating that
+  returns `task` rc=201 every time, and `deadcode:api:all` is a target that reports 43 problems
+  and returns 0. **The output is the signal here, and that has to be said out loud rather than
+  inferred from a green** — anyone wrapping either one later needs an explicit `|| true` on the
+  first and must not read the second's zero as clean.
+- **Three smaller placements, each of which a rebuild would otherwise re-litigate.** The gate is
+  a **committed script** rather than an inline `cmds:` recipe, because M5's `shellcheck` runs
+  over `git ls-files '*.sh'` — a committed script gets linted, shell embedded in a YAML string
+  gets nothing (precedent: `scripts/assert-chart-render.sh`). The version pin is passed **as an
+  argument** rather than defaulted inside the script, so `task`'s echo still shows it; §464
+  calls that echo the mechanism by which a teammate notices a pin going missing, and §468
+  already spends this repo's one deliberate exception on the ratchet living in `.golangci.yml`.
+  And `--write` (regenerate the baseline) is **deliberately not a Taskfile target**: a fixing
+  variant of a gate is exactly what testers are told to refuse, so it lives in the script where
+  the baseline header can name one command instead of restating an invocation that would then
+  drift from it.
+- **The cross-platform agreement is a property of THIS REPO, not of the tool, and it is one
+  `//go:build` away from ending.** darwin/arm64 and linux/amd64 give byte-identical results for
+  both modules today — but deadcode's own doc says the analysis is valid for a **single**
+  GOOS/GOARCH/`-tags` configuration, and the agreement holds only because no non-test `.go` file
+  in either Go module carries a build constraint. Add one and the entry it produces is
+  platform-specific and the committed baseline differs between laptop and CI. Recorded in
+  `api/.deadcode-baseline`'s header rather than discovered later.
+- **What this gate CANNOT see, stated because a slot that implies coverage it lacks is worse
+  than an admitted gap: DEAD BRANCHES.** `deadcode` finds unreachable **functions** and knip
+  finds unused **exports/files/deps**; neither can see a `case` arm nothing reaches inside a
+  live function. The live example is PRD #99's two `case "Task":` arms in
+  `web/src/components/RunEvent.tsx`, still present. Dead branches stay the reviewer's job, which
+  is why the skills-repo change gives the reviewer a deletion lens rather than relying on
+  tooling.
+
+## 474. PRD #103 M4 — knip's `warn` tier is a REPORT with no budget available to it, all seventeen rule names are written out, and the whole slot adds ZERO CI jobs
+
+The npm half of the same slot, plus the wiring decision both halves share. Same `human.md`
+position as §473.
+
+- **🔴 `--max-issues` IS INERT FOR A `warn` TIER, so the PRD's "regression budget in the
+  meantime" was STRUCK rather than qualified — there is no intermediate between "reported, gates
+  nothing" and "gates at zero".** It counts **error-severity** issues only. Measured
+  independently more than once, and re-measured here at `8f3c4bb5` on knip **6.31.0**:
+  `knip --max-issues 0` over `web` exits **0** with 22 warn findings printed in full. That
+  closes the option the milestone was designed around, and the consequence is stated rather than
+  absorbed: the export tier **genuinely gates nothing** until it is burned down and promoted, so
+  the burn-down carries its counts into issue #206 — **web 22** (9 exports + 13 exported types)
+  and **agent 53** (35 + 18), both measured at `8f3c4bb5`, both rc=0 — precisely so that
+  Decision 3's "a warning nobody must act on" does not become the end state by default.
+- **🔴 ALL SEVENTEEN RULE NAMES ARE LISTED, INCLUDING THE ONES THAT WOULD LAND ON KNIP'S OWN
+  DEFAULT, AND A MISTYPED ONE IS A NEAR-SILENT NO-OP.** A rule left out is a severity decided by
+  a default the reader cannot see. A rule *misspelled* prints
+  `WARNING: Ignored unknown issue type "..."` **among the findings** and does **not** change the
+  exit code — and `treatConfigHintsAsErrors` does not cover it either, which is the part that
+  makes enumeration the only defence. The names were taken from `node_modules/knip/schema.json`
+  (`.properties.rules.properties`), not from memory, and calibrated with three cells one
+  character apart. `error` at zero from day one: `files`, `dependencies`, `devDependencies`,
+  `optionalPeerDependencies`, `unlisted`, `binaries`, `unresolved`, `duplicates`, `catalog`,
+  `catalogReferences`. `warn`: `exports`, `types`, `nsExports`, `nsTypes`, `enumMembers`,
+  `namespaceMembers`. **`cycles` is `off`, and it is the one entry that is a SCOPE decision
+  rather than a debt decision** — circular imports are module-graph hygiene with their own
+  burn-down, written explicitly so nobody reads its absence as an oversight.
+- **`treatConfigHintsAsErrors` + `treatTagHintsAsErrors`, because without them a config that has
+  STOPPED MATCHING degrades silently to "no findings".** If an `entry` glob stops resolving or a
+  tag hint goes stale, knip prints a hint and exits **0** — a green gate over a config that is no
+  longer doing anything, which is this repo's signature failure shape and the same one §469
+  records for oxlint's directive guard.
+- **`includeEntryExports: true`, because its default OFF is a real hole rather than a
+  preference.** With it off, an unused export in an **entry** file is never reported at all —
+  and `web`'s entry set includes `src/main.tsx`, the vite config and the docs/mock loaders.
+  Turning it on makes the warn tier honest about the size of the debt instead of hiding part of
+  it, which matters precisely because that tier is the one being burned down against a number.
+- **`knip.jsonc`, not `knip.json`: every suppression carries its reason inline.** Resolved
+  natively by 6.31.0. An `ignore` entry with no stated reason is indistinguishable from a
+  mistake, and this repo has paid for suppressions nobody could evaluate.
+- **🔴 THE SHAPE OF EACH SUPPRESSION IS A DECISION, NOT A FORMALITY — the narrower key keeps the
+  rest of the checks alive.** `scripts/gen-favicon-png.mjs` is declared `entry` rather than
+  `ignore`, because an entry keeps its imports and its own dependencies in scope where an ignore
+  silently drops everything it reaches. `agent-browser` is `ignoreDependencies` rather than
+  `ignore`, so the package stays in scope for `unlisted`/`binaries` and a *different* mistake
+  about it is still caught. That one is high-consequence: it is resolved **by path at runtime**
+  through `agent/bin/agent-browser`, so knip cannot see it, and "fixing" the finding by removing
+  the dependency would strip the browser CLI from the worker image **while every test that does
+  not exercise the image kept passing.** The discriminator for the third case is worth keeping
+  too: `scripts/check-docs.mjs` needs no entry line because knip's package.json-scripts plugin
+  reaches it through the `check-docs` npm script — the property is *reachable from a
+  package.json script*, not *is a script*.
+- **`--fix` is banned from every gate target, script and CI job.** It edits files in the repo:
+  it strips `export` keywords, and with `--allow-remove-files` it deletes files. Same rule that
+  makes the format slot `fmt-check` and not `fmt`.
+- **Every flag lives in the config file, so the npm script is a bare `knip` and the Taskfile
+  target delegates to the script.** Two reasons that happen to agree: `Taskfile.yml`'s header
+  requires npm targets to delegate (a target that reimplements a command drops whatever flags
+  the script encodes, silently), and `web/package.json` is a documented three-way contention
+  point across this PRD's milestones, so the smallest possible line there is the one least
+  likely to conflict. **Never a bare `npx knip`** — npx fetches from the network when the
+  dependency is missing, which a gate may not do; `npm run` puts `node_modules/.bin` on PATH and
+  fails closed with `command not found`.
+- **🔴 ZERO NEW CI JOBS, AND THE TWO HALVES REACH THAT FROM DIFFERENT ARGUMENTS THAT CONVERGE ON
+  ONE INVARIANT.** For the **Go** half the reason is the **cache key**, not cost:
+  `go run golang.org/x/tools/cmd/deadcode@v0.48.0` builds x/tools into `GOCACHE`, and
+  `validate:api` and `test:api` share `.go_job`'s key **without ever building it**, so a new
+  lint-stage job on the default key would put a third writer on that cache and decide their
+  warmth — `lint:api` already carries its own `prefix: lint` for exactly that reason, and
+  golangci-lint's tree subsumes x/tools' anyway. For the **npm** half the reason is **cost**:
+  knip is **sub-second against each job's ~30s `npm ci`**, so a separate job would pay the whole
+  setup overhead for the check. Both land on the same place: **`.gate_needs` and
+  `.publish_needs` stay at 12 and 14 with their two-element delta intact** — verified by
+  **parsing**, not grepping, per §470. A job in neither list is invisible to them, and on a `v*`
+  tag that means every image and the OCI chart publish **while it is failing**. Adding no job
+  cannot open that hole. Note also that `deadcode:api` needs none of `lint:api`'s git setup (no
+  `GIT_DEPTH`, no fetch, no merge-base): it is not ratcheted and its baseline is a committed
+  file, so it is a passenger on that job rather than a dependent of it.
+
+  *🔴 **THE COST FIGURE IS STATED AS AN ORDER OF MAGNITUDE HERE ON PURPOSE, BECAUSE THE
+  MILLISECOND ONE IS A SELF-REPORTED METRIC THAT DOES NOT REPRODUCE.** `Taskfile.yml`,
+  `.gitlab-ci.yml` and M4's brief all quote **244ms (web) / 152ms (agent) "measured"**. Traced
+  to `probes/prd-103-m4-architect.txt:254`, those came from `knip -u` — and `-u` is
+  **`--duration`, knip's own internal total**, not wall clock. Re-measured at `8f3c4bb5` on
+  darwin/arm64: knip self-reports **597ms / 387ms** (≈2.4x the recorded figures) while
+  `/usr/bin/time` reads **1.0-2.7s wall**, since node startup and module load sit outside what
+  knip counts. **The ARGUMENT is untouched** — sub-second-to-two-seconds against a ~30s `npm ci`
+  still says fold it into the existing job — which is exactly why the number should not have
+  been carried at that precision: a figure quoted to the millisecond invites a reader to treat
+  it as the job's contribution to pipeline time, and it is neither that quantity nor
+  reproducible. Same family as §471's cap readings: an instrument answering a slightly different
+  question, reported as though it answered this one.*
+- **One prefix for all four components, accepting a name that is slightly wrong for two of
+  them.** `deadcode:web` is knip, which also reports unused **files** and **dependencies** — the
+  same imprecision `lint:web` already carries, since oxlint is not golangci-lint. It was
+  preferred to a second prefix because the `dead code` row of `.claude/agent-team.md`'s
+  paste-block is **one line**, and a `knip:web` target would split one slot across two prefixes
+  for a reader who then has to type both.
+- **The residual is now the same in seven files and closed in none of them.** `.golangci.yml`,
+  both `.oxlintrc.json`, both `knip.jsonc` and both `.deadcode-baseline` each let a branch
+  author neuter their own gate **from that same file** — widen an `ignore`, drop a rule to
+  `warn`, add a `ignoreDependencies`, baseline a genuinely dead function — with the pipeline
+  staying green because the tool honestly found nothing gating. The comment-with-a-reason
+  convention every one of them carries is a **review aid, not an enforced one**: nothing in CI
+  reads it. **CODEOWNERS on those seven files is the only structural fix, and there is no
+  CODEOWNERS file anywhere in this tree.** M3 recorded this for three files; M4 quadrupled the
+  surface and each new file states it for itself rather than inheriting it by pointer.
