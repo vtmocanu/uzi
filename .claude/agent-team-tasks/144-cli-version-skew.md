@@ -121,9 +121,33 @@ Binding constraints from that choice:
 `v0.14.0` (leading `v`, stamped by `-ldflags -X main.version=v#{version}` in
 `Formula/uzi-cli.rb:48`) while `/api/version` returns bare `0.14.0`
 (`apitypes.BuildInfoDTO.Version` doc: *"bare — the Dockerfile strips a leading v"*).
-`CLAUDE.md` documents the consequence: `golang.org/x/mod/semver` treats every
-invalid version as equal, so `Compare("0.11.0","0.11.7") == 0` and an
-un-normalised comparison is silently dead.
+
+**🔴 AMENDED 2026-08-03 (design wave, reviewer N10 + lead re-derivation). THE EXAMPLE
+THIS PARAGRAPH ORIGINALLY CARRIED HAD THE WRONG SHAPE, AND THE RIGHT ONE IS WORSE.**
+It quoted `CLAUDE.md`'s **both-bare** case, `Compare("0.11.0","0.11.7") == 0`. The live
+pair is **one prefixed, one bare**. Measured against `golang.org/x/mod@v0.38.0`, twice
+independently (reviewer in a throwaway module, lead re-derived in the scratchpad — all
+six rows agreed):
+
+```
+Compare("v0.11.8",         "0.14.0")  =  1   IsValid true/false   <- THE LIVE PAIR
+Compare("v0.11.8",         "v0.14.0") = -1   IsValid true/true    <- what a fixture "naturally" writes
+Compare("0.11.0",          "0.11.7")  =  0   IsValid false/false  <- the both-bare case, wrong shape here
+Compare("vdev",            "v0.14.0") = -1   IsValid false/true   <- see B1 below
+Compare("v0.14.0",         "vdev")    =  1   IsValid true/false
+Compare("v0.14.0+g2d60c57","v0.14.0") =  0   IsValid true/true    <- build metadata is comparison-neutral (§10)
+```
+
+**A `< 0` gate on the un-normalised live pair returns `1`, i.e. "the CLI is AHEAD", so
+it is SILENT on exactly the bug §1 opens with.** The conclusion (an un-normalised
+compare is silently dead) survives; the example did not support it.
+
+**Consequence for the test fixtures, and it is the sentence that makes them
+discriminate:** §5's rule *"the fixture must be genuinely BEHIND"* is necessary and
+**not sufficient**. A behind-fixture written `("v0.11.8","v0.14.0")` passes against an
+implementation that forgets to normalise the **server** side, because the fixture
+already normalised it. **The fixture must feed the server version in its bare wire
+form (`"0.14.0"`), exactly as `/api/version` serves it.**
 
 - **In-repo precedent that gets it right**: `api/internal/forge/forgejo.go`,
   `checkForgejoVersion` — re-prefix with `v`, guard on `semver.IsValid`, then
@@ -191,3 +215,108 @@ restate its recipe. The lint slot is ratcheted against `origin/main` — if
 burn-down.
 
 `test:api` carries `-race -count=1`. Live-DB tests are not in scope here.
+
+---
+
+## 6. Design-wave findings — AMENDMENT 1, 2026-08-03
+
+Round 1 of the design-critique wave. **Reviewer reported; architect and auditor are
+still in flight, so this section is OPEN and will gain an Amendment 2 before the brief
+freezes.** The coder is not spawned until it does.
+
+Reviewer's citation pass came back **10 of 10 CONFIRMED** — no claim in §4 was refuted,
+and `underSkillCmd:191` / `maybeAutoUpgradeSkill:204` are exact. Three findings are
+blocking on the DESIGN.
+
+### B1 — 🔴 THE NAMED PRECEDENT INVERTS THE SAFE DIRECTION, AND THE DEFAULT CLI VERSION IS UNPARSEABLE
+
+`api/cmd/uzi/root.go:16` is `var version = "dev"`. Measured (above): an **invalid**
+version sorts BELOW a valid one, so `Compare("vdev","v0.14.0") = -1`.
+
+**The natural rule — warn when `Compare(cli, srv) < 0` — warns on every binary built
+with `go build ./cmd/uzi`.** That is every developer running from source, every
+`runCLI` test, and the coder's own gate runs, each told to `brew upgrade uzi-cli`.
+
+§4 points at `checkForgejoVersion` as the precedent, and **copying it literally is what
+produces the bug**. Forgejo *refuses* on unparseable (`forgejo.go:178-180`), and its own
+doc argues refusing is the safer failure mode — true there, because it is a feature gate
+at connect time. Here "refuse" maps to "warn", which is the **wrong direction**: a
+build-info probe that cannot be parsed must be **SILENT**.
+
+**Binding:** re-prefix BOTH sides, require `semver.IsValid` on BOTH, and state in code
+that a failed validity check is silence. The precedent is the *shape* (re-prefix →
+IsValid → Compare), not the disposition.
+
+### B2 — 🔴 CACHING ONLY SUCCESSES VIOLATES BINDING CONSTRAINT 3
+
+§3.3 forbids a per-invocation probe. But "cache the server's version" leaves **nothing
+to store when the probe fails**, and `serverBuildInfo` returns `nil` for every failure
+(`version.go:93/97/107`) without distinguishing "no URL" from "connection refused".
+
+So a user with `UZI_URL` set and the server unreachable — VPN off, offline, compose
+stack down, dev cluster restarting — takes a **cache miss on every invocation** and pays
+`serverProbeTimeout` (2s) before every command. That is the per-invocation probe
+constraint 3 forbids, and it is strictly worse than today, where `serverBuildInfo` is
+reached only by an explicit `uzi version`.
+
+**Binding:** the cache must hold a NEGATIVE observation (probe failed at T) with its own
+TTL.
+
+### B3 — 🔴 KEY THE CACHE ON THE RESOLVED URL
+
+`resolveSettings` (`root.go:155-174`) lets the URL change per invocation: `--url` beats
+`$UZI_URL` beats the config file. An unkeyed cache applies server A's version to server
+B — and the warning is a *factual claim about the server you are talking to*. Prod plus
+the dev cluster is the normal shape here (`CLAUDE.md`: "we mostly test in k8s now"), not
+a corner case.
+
+**Binding:** key on the resolved URL, or store `url → {version, checked_at}`.
+
+### Non-blocking, carried into the implementation
+
+- **N1** Cache the OBSERVATION, never the VERDICT. A cached `skew: true` is not cleared
+  by `brew upgrade uzi-cli`, so the user is told to upgrade for up to a TTL *after they
+  did*. Storing `{url, server_version, checked_at}` and recomputing against `version`
+  each run self-heals, because the CLI side is what changed. Write the reason down or
+  someone "optimises" it into a boolean.
+- **N2** Put the cache in `uzicli` beside `Store`, not in `main` via `Dir()`:
+  `writeFileAtomic` (`config.go:187`) and the 0700 `MkdirAll` discipline are
+  **unexported**. Agents run uzi in parallel, so the atomic rename is wanted.
+- **N3** "Every command" is not what the seam delivers. Measured against cobra v1.10.2:
+  `--help` (`:934`), `--version` (`:945`), a non-runnable command (`:956`) and a failed
+  `ValidateArgs` (`:970`) all return **before** the PersistentPreRun loop (`:982`). So
+  **`uzi --version` never warns while `uzi version` does.** Decide it deliberately.
+- **N4** The seam is single-occupancy: cobra `break`s at the first ancestor with a
+  `PersistentPreRun` and `EnableTraverseRunHooks` is unset. This MR makes it a
+  two-consumer seam; a future subcommand adding its own hook silently disables BOTH with
+  nothing failing. One comment at `root.go:109` closes it.
+- **N5** `--quiet` is undecided and the precedent does not answer it —
+  `maybeAutoUpgradeSkill` takes no `gf` and ignores it, while 20 other sites honour it.
+  `gf.quiet` IS reachable at the hook. Lead's call: **`--quiet` suppresses the warning**
+  (it is non-essential output by definition). Implement that.
+- **N6** Gate the hook on an `Env` field, true in `DefaultEnv`, false in `fakeEnv` —
+  mirroring `AutoUpgradeSkill`. Otherwise every existing command test starts calling
+  `FakeClient.BuildInfo`.
+- **N7** `e2e/run-e2e.sh:1682`'s `uzi_cli()` sets `UZI_URL`, so the hook probes there.
+  The new opt-out env var belongs on that line **in this MR**, beside the existing
+  `UZI_SKILL_AUTO_UPGRADE=0`, which sits there for exactly this class of side effect.
+  Note the printed-instruction rows assert exact counts over stdout AND stderr
+  (`:3293-3296`, `:3355-3360`).
+- **N8** `uzi version` would probe twice (`version.go:57` already calls
+  `serverBuildInfo`). Exempt it from the hook, or share the cache.
+- **N9** The probe carries the bearer token (`client.go:97-112`, gated by
+  `credentialSafeBase`). No new exposure class, but it moves credential traffic from
+  "once per explicit `uzi version`" to "once per TTL per command stream". Flagged for
+  the auditor.
+- **N11** A new env var owes **`docs/cli.md`** (which documents `UZI_SKILL_AUTO_UPGRADE`
+  at `:547`) as well as `SKILL.md:327`. `skill_drift_test.go` extracts only `--flags`
+  and command paths — **env vars are gated by nothing in either direction**, so both
+  files are by hand.
+- **N12** State the TTL's failure direction: with an observation cache, staleness means
+  **server upgraded → no warning for up to a TTL**. Silence-when-you-should-warn, never
+  a false warning. That is the argument for 1h; record it so the next reader can tell it
+  was reasoned.
+- **n1** The proposed message escapes the printed-instruction extractor for a reason one
+  character wide, twice: `instructionRE` needs `uzi ` with a SPACE, and the message has
+  `uzi:` (colon) and `uzi-cli` (hyphen). Measured, not read. **Rewording it to mention
+  `uzi version` re-arms a kindRuntime registry entry** requiring execution evidence.
