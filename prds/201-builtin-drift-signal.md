@@ -171,6 +171,12 @@ and are corrected here.** Line numbers are at `25ebcd39`.
 9. **Reset clears the badge with no refetch** — `templateDTO` is the reset response
    (`:438`) and `AgentDetail.tsx:59` sets state from it. Assert it; it is the interaction an
    admin judges the feature by, and it holds only while reset keeps returning the DTO.
+   **PARTIALLY MET — see Amendment 7 F-T2.** The CLIENT half is measured twice over: a
+   browser run with counters (reset 0→1, all three reads 0→0) and a same-visible-outcome fold
+   proving the no-refetch assertion fires on its own channel. **The SERVER half is unpinned:**
+   `ResetAgentTemplate` is 0.0% covered, and folding it to return the pre-reset row — so the
+   badge never clears — compiles and leaves the handler package green. Do not report this
+   criterion as met without that qualifier.
 10. `task gate:api` and `task gate:web` green, run **SERIALLY** (concurrent gates manufacture
     a known flake, #198). `task` exits 201 on any failure, so test for non-zero, never a
     number. If `golangci-lint` reports `parallel golangci-lint is running`, another worktree
@@ -278,7 +284,79 @@ changing at all.)*
 
 ## Amendments
 
-### Amendment 6 — 2026-08-03, criterion 9 MEASURED, and F5 upgraded from derived to observed.
+### Amendment 7 — 2026-08-03, tester. 24 folds, and a correction to Amendment 6's headline.
+
+Gates green at both `c3704d25` and `37b4bfc0`, run serially in throwaway detached worktrees
+with a private `GOLANGCI_LINT_CACHE` — never in `prd-201`, and it confirmed it made no write
+there. Baselines carried positive evidence (`RUN=45 PASS=45 FAIL=0 SKIP=0`). **Its instrument
+produced the disconfirming answer twice**, which is the property that makes the rest of it
+worth reading.
+
+**Behaviour 1 is pinned by EIGHT folds with EIGHT DISJOINT failure sets.** The one that matters
+most: sorting tools reddens **only** the order case while membership stays green, and dropping
+tools entirely reddens **both** — so order and membership are independently pinned, which is
+the case Amendment 3 F3 worried about and nothing else reaches.
+
+**Behaviour 5 was pinned on its own channel, not by outcome.** The obvious fold (discard the
+response and `load()`) reddens the badge — ambiguous, because two assertions could be firing
+as one. So it ran a fold with an **identical visible outcome**: keep `setTemplate` from the
+reset response and add one redundant `getAgentTemplate`. That reddens `expected "spy" to be
+called 1 times, but got 2 times`. The no-refetch assertion is live independently of the badge
+assertion.
+
+#### 🔴 CORRECTION TO AMENDMENT 6: "criterion 9 measured" was the CLIENT half only
+
+**F-T2 (should-fix, new).** `ResetAgentTemplate` is at **0.0% coverage**. Folding it to return
+`templateDTO(t)` — the **pre-reset** row it already loaded, so `differs_from_builtin` stays
+`true` and the badge never clears — **compiles and leaves the whole handler package green.**
+So criterion 9's own caveat (*"it holds only while reset keeps returning the DTO"*) is
+unpinned on the server: the contract is held today only by the web test's **mock** of
+`resetAgentTemplate` and by `mockApi`, neither of which observes the server.
+
+**Amendment 6 and `b9a16078` say "criterion 9 measured" without that qualifier. The measurement
+was real and remains valid — it is the CLIENT half.** Criterion 9 is therefore **partially
+met**: the client provably clears the badge from whatever the response carries, and nothing
+pins that the server puts the right thing in it.
+
+**F-T1 (should-fix) — and it revises the coder's self-report UPWARD.** The coder reported
+criterion 5's gap as "the row fetch is unreachable without a database". Measured, it is larger:
+`GetBuiltinAgentTemplate` is at **0.0% coverage** — the entire function body is unexecuted, and
+rewriting it to serve `templateDTO(t)` (the **stored** row rather than the shipped definition)
+leaves the package green. `writeBuiltinDefinition` itself is **100%**. So the residual is not
+the fetch but the **WIRING** — that the handler delegates at all, and that it passes
+`loadTemplateForWrite`'s actor and row rather than the viewer loader's. **The split was the
+right call and reached everything it could; "criterion 5 covered" is what must not be said.**
+
+**Both are one structural fact:** `h.q` is a concrete `*store.Queries`, so **every** DB-touching
+handler here is 0%-covered, `ListAgentTemplates` included, pre-existing. **Not M4a's to fix** —
+routed to M4b or its own issue alongside R1's shared-fixture work, since both want the same
+seam. Recorded rather than left to inference.
+
+#### The `IssueView` flake — NOT reproduced, and the negative is properly bounded
+
+Five full web-suite runs across both tips: **1652/1652 then 1655/1655, zero failures, IssueView
+green every time**, 1425-3318ms against a 5000ms `asyncUtilTimeout`. The mechanism the coder
+named is the one `web/src/test-setup.ts` already documents across ~25 runs, two failing *"right
+on the default"* — and that file frames the class as suite-wide rather than a fixed file set.
+
+**It then checked the one way M4a could touch an unrelated file, because "it is a documented
+flake" is the answer that stops people looking.** `web/src/lib/api.ts:10` **statically** imports
+`../mocks/mockApi`, so `data.ts` — which M4a grew by 174 lines — is in every test file's module
+graph including IssueView's. Real mechanism, measured: IssueView alone, 3× at pre-M4a
+`541c2c0b` vs 3× at `c3704d25` → **453/938/315ms vs 362/897/699ms**. Ranges overlap both ways;
+the effect is below the instrument's noise floor. **Verdict: not reproduced, mechanism
+plausible and pre-existing, no measurable M4a contribution — and five clean runs cannot
+disprove a 1-in-N flake, which is the honest limit.**
+
+#### The NO-BREAK SPACE, hit independently by two agents
+
+`AgentTemplateEditor.tsx:466` is `{r.text || " "}` with a **`c2 a0`**, not a space. Read and
+Grep both render it as an ordinary space, so a literal anchor there matches nothing and `gsed`
+reports success having changed zero bytes. The tester's diff-line-count assertion caught it;
+the fact-checker hit the same byte and caught it by traceback. **Without an assert-it-landed
+control, that arm is a green run over unmutated code reported as a pinned criterion.**
+
+### Amendment 6 — 2026-08-03, criterion 9 MEASURED **on the client**, and F5 upgraded from derived to observed.
 
 **Criterion 9 HOLDS, measured on the mock rather than reasoned.** Clicking Reset on
 `t-tester`: `resetAgentTemplate` 0→1, and `getAgentTemplate` / `getBuiltinAgentTemplate` /
