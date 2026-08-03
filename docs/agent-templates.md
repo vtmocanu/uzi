@@ -135,19 +135,27 @@ click **Reset to default**. It re-applies the shipped builtin body
 (say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
 uzi version, your customization is gone, not folded into the new body.
 
+A **differs from shipped** badge on the Agents list and on a builtin's
+detail page tells you when its stored description, model, tools, or prompt
+body no longer matches what this uzi version ships for it, whether that's
+your own edit or a shipped update you haven't picked up. Open the template
+before resetting: the editor shows exactly what's different, so you're not
+resetting blind.
+
 That's also why a shipped change to a builtin's prompt doesn't reach you
 automatically: it seeds into a fresh database on first boot, but an
 already-seeded row is never silently overwritten (that's what keeps your
-customizations durable across every other upgrade). Reset is the only
-automatic path that pulls in a newer builtin body for an existing deployment,
-and it's all-or-nothing — the alternative is pasting the new body in by hand,
-below.
+customizations durable across every other upgrade). The badge above is what
+tells you an update is waiting; picking it up is still manual. Reset is the
+only automatic path that pulls in a newer builtin body for an existing
+deployment, and it's all-or-nothing — the alternative is pasting the new
+body in by hand, below.
 
 To pick up a new builtin body without losing your own edits:
 
-1. Compare your current template body against the new one shipped in this
-   version (its git history is `api/internal/agenttmpl/builtins/` in the uzi
-   repo, or ask whoever deployed the upgrade).
+1. Open the template and read the shipped-vs-stored diff to see exactly
+   what changed (or check `api/internal/agenttmpl/builtins/`'s git history
+   in the uzi repo, or ask whoever deployed the upgrade).
 2. Reset the template.
 3. Re-apply your customization on top of the new body.
 
