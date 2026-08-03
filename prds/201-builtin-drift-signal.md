@@ -16,32 +16,49 @@ only name the section that moved.
 
 ## Why M4a ships alone, and first
 
-`ResetAgentTemplate` is all-or-nothing. An admin pressing **Reset to default** on a row they
-have edited loses that edit with no diff shown anywhere. So the drift signal is a **strict
-prerequisite** for M4b's auto-update, not a nicety: the diff view is what makes Reset safe
-to press, and it is the surface an unclassifiable row needs in M4b. Without it, M4b delivers
-auto-update for the provably-pristine half and nothing at all for the hard half.
+`ResetAgentTemplate` (**`api/internal/handler/agent_templates.go:396-439`** — it is a
+HANDLER; earlier revisions of this file said `api/internal/store/agent_templates.go`, which
+does not exist) is all-or-nothing: `:425-432` is one unconditional `UpdateAgentTemplate` of
+description, model, tools and prompt_body from the embedded definition. No merge, no
+per-field option. An admin pressing **Reset to default** on a row they have edited loses that
+edit with no diff shown anywhere. So the drift signal is a **strict prerequisite** for M4b's
+auto-update: the diff view is what makes Reset safe to press, and it is the surface an
+unclassifiable row needs in M4b.
 
-Concrete stakes: issue #210 (in flight on !168) fixes ten builtin templates that named an
-unreachable recipient, measured at 8 of 26 SendMessage calls failing across three real runs.
-That fix does not reach dev-cluster. Its CHANGELOG entry tells an admin to open ten
-templates and click Reset. Today they must do that blind.
+Concrete stakes: issue #210 fixes ten builtin templates that named an unreachable recipient,
+measured at 8 of 26 SendMessage calls failing across three real runs. That fix does not reach
+dev-cluster; its CHANGELOG entry tells an admin to open ten templates and click Reset, blind.
+
+> **#210 is IN FLIGHT on !168, not merged.** note_22449 says "#210 shipped on 2026-08-03 …
+> The fix is merged"; `glab mr view 168` returns `state: open`. This file is correct and the
+> issue comment is wrong. Do not "correct" this back.
 
 ## Scope
 
-**In:** a computed, never-stored `differs_from_builtin` on the template DTO; a badge on
-`web/src/pages/Agents.tsx` and `web/src/pages/AgentDetail.tsx`; a shipped-vs-stored diff in
-`web/src/components/AgentTemplateEditor.tsx`.
+**In:**
+1. A computed, never-stored `differs_from_builtin` on the template DTO.
+2. **`GET /agent-templates/{id}/builtin`** — a new read-only route serving the shipped
+   `Definition`, gated to callers passing `authorizeTemplateWrite`, returning **409** with
+   `ResetAgentTemplate`'s existing "no builtin definition to reset to" semantics for a
+   removed builtin. **Added 2026-08-03 by owner decision; see Amendment 1.**
+3. A badge on `web/src/pages/Agents.tsx` and `web/src/pages/AgentDetail.tsx`.
+4. A shipped-vs-stored diff in `web/src/components/AgentTemplateEditor.tsx`, using **jsdiff**
+   rendered as **React elements**. See Amendment 1 for why the HTML-string form is banned.
 
 **Out, and deliberately:** no migration, no schema change, no boot-path change, no hash, no
 historical-hash set, no auto-update, no kill switch. All of those are M4b. If M4a finds
-itself needing a column, that is a signal the design drifted, not a reason to add one.
+itself needing a DATABASE column, that is a signal the design drifted, not a reason to add
+one.
 
-## Mechanisms this brief asserts — VERIFY EACH BEFORE IT IS BUILT
+**🔴 Nothing may be added to `agenttmpl`'s package `init()`.** It runs before `main`, and a
+parse failure there panics (`api/internal/agenttmpl/builtins.go:41-43`). On a hard singleton
+that is CrashLoopBackOff. This is the one way M4a could silently violate criterion 7.
 
-Every claim below is a claim about code that already exists at `25ebcd39` and can be read
-now. The design wave's required deliverable is a **citation per numbered claim**: the file
-that implements it and the line. Refute freely; several of these were read quickly.
+## Mechanisms — SETTLED by the design wave, 2026-08-03
+
+The claims below were verified by architect + reviewer + auditor independently, and the
+lead re-derived the load-bearing ones. **Claims 3, 4 and 5 as originally written were wrong
+and are corrected here.** Line numbers are at `25ebcd39`.
 
 1. **The shipped definition is available in-process by name.**
    `api/internal/agenttmpl/builtins.go:58` exposes `BuiltinByName(name string) (Definition, bool)`.
@@ -54,63 +71,129 @@ that implements it and the line. Refute freely; several of these were read quick
    every response that goes through it — **confirm that is actually every list and detail
    response, and name any handler that builds a template response some other way.**
 
-3. **Comparison is over the five persisted columns**, per the issue brief's D2: name,
-   description, model, tools, prompt_body. **Never `Render(def)`** — #85 Decision 3 reorders
-   the frontmatter and #85 M2 adds a `version:` line, either of which silently reclassifies
-   every row while nothing reddens.
+3. **CORRECTED — compare FOUR mutable columns, not five.** `description`, `model`, `tools`,
+   `prompt_body`. **`name` is the LOOKUP KEY, never a compared value**: the shipped side is
+   obtained by `BuiltinByName(t.Name)` whose loop condition is `d.Name == name`
+   (`builtins.go:60`), so `def.Name == t.Name` holds by construction, and `name` is immutable
+   anyway (`UpdateAgentTemplate`, `agent_templates.go:354-361`, does not carry it). A
+   five-column comparison contains one unfalsifiable term and sends the tester hunting a
+   fifth case that cannot exist.
 
-4. **`model` and `tools` need normalization before comparison, and this is the likeliest
-   defect in M4a.** `Definition.Model` is `string` with empty meaning inherit, while the DTO
-   carries `*string`. `Definition.Tools` is `[]string` with empty meaning inherit-all, and
-   the stored column is jsonb written via `json.Marshal` (`builtinColumns`, in
-   `api/internal/store/agent_templates_builtins.go`) which Postgres re-serializes with
-   different spacing. **A naive comparison here reports drift on every row, and the failure
-   is loud rather than silent — but a comparison that over-normalizes (trimming, sorting
-   tools, coercing nil to empty) can hide a real edit.** Say which direction each
-   normalization errs in.
+   **Never `Render(def)`.** Two reasons, and only the second one holds for M4a:
+   - ~~#85 Decision 3 reorders the frontmatter~~ — **INERT here.** M4a renders both sides
+     with the SAME binary at the same instant, so a reorder cancels. That argument is
+     correct in note_22449's D2, where the stored *hash* was written by an older binary.
+     It does not transfer.
+   - #85 M2 stamps `version:` (`prds/85-agenttmpl-role-library-sync.md:266`), which would
+     appear on the shipped side and never on the stored side (there is no version column),
+     so every stamped builtin reports drift forever, silently.
+   - **The strongest reason, missed originally:** `Render` OMITS `tools` and `model` when
+     empty (`render.go:39-44`), so a stored `tools: []` and a stored `tools: NULL` render
+     identically — a `Render`-based comparison HIDES a difference the UI displays as
+     "none" vs "all" (`web/src/lib/agentTemplates.ts:172-174`).
 
-5. **Only `scope='builtin'` rows can drift.** For any other row there is no shipped
-   counterpart, so the field is `false`. **An admin row that SHADOWS a builtin name**
-   (`is_builtin=false`, same name — the case `ReconcileBuiltinTemplates` already warns about
-   at `api/internal/store/agent_templates_builtins.go`, the `n == 0` branch) must NOT report
-   drift: it is not a builtin and Reset does not apply to it. Confirm the DTO can tell these
-   apart, and that `scope` rather than `is_builtin` is the right discriminator.
+4. **REFUTED AS WRITTEN. The normalization already exists; do not write new normalization.**
+   `templateToDefinition` (`api/internal/handler/agent_templates.go:112-124`) already maps a
+   stored row onto an `agenttmpl.Definition` — the exact type `BuiltinByName` returns. It
+   runs `decodeTools` (`:99-110`, a `json.Unmarshal`) and folds `pgtype.Text{Valid:false}` to
+   `""`. So the comparison is `Definition` vs `Definition` and the `*string`/`[]string`
+   mismatch never arises; the DTO is not an input to it.
 
-6. **A builtin row with no shipped counterpart is possible** — a builtin removed from the
-   repo while its seeded row survives. `BuiltinByName` returns `false`. That is not drift;
-   decide and state what the field reports, and make sure it is not `true`.
+   The jsonb hazard is **real but only for a raw-byte comparison** — measured by the reviewer
+   on a throwaway Postgres: `json.Marshal` gives 23 bytes, pgx reads back 25
+   (`["Read", "Write", "Bash"]`), `bytes.Equal` false, decoded slices equal. Nothing in scope
+   needs that form. Note a byte comparison would redden **9 of 11** builtins, not all of them
+   (`coder.md` and `lead.md` carry no `tools:` line, so both sides are empty) — a partial red
+   reads like genuine drift, so that failure is QUIET, the opposite of what this claim said.
+
+   | column | rule | direction if you get it wrong |
+   |---|---|---|
+   | `model` | exact `==` on the folded `Definition.Model` | — (exact; `""` is unreachable in the column, `validateModel:578-580`) |
+   | `tools` | `slices.Equal(decodeTools(t.Tools), def.Tools)` | — |
+   | `tools` — **never sort** | order is rendered (`render.go:41` joins in order) and the editor preserves it | sorting **HIDES a real edit** |
+   | `tools` — **`slices.Equal`, never `reflect.DeepEqual`** | `slices.Equal(nil, []string{})` is true, which is correct: both mean inherit-all | `DeepEqual` reports **FALSE DRIFT** on a semantically identical row |
+   | `prompt_body` | exact, **never trim** | trimming HIDES a real edit; the trailing newline is pinned by the parse→Render round-trip test |
+   | `description` | exact, **never trim** — see Amendment 1 §4 | trimming hides whitespace-only edits permanently |
+
+5. **CORRECTED — `scope` vs `is_builtin` is unpinnable, and the separable case is a
+   USER-scope name collision, not the admin shadow row.**
+   `00048_agent_template_scopes.sql:22` adds `CHECK (is_builtin = (scope = 'builtin'))` over
+   two NOT NULL columns, so the two discriminators are a **provable biconditional**. No
+   fixture can distinguish an implementation using one from an implementation using the
+   other. Use `scope` for style; do not spend time "confirming" it.
+
+   The case that IS separable, per `00048:26-27` in its own words — *"A user may therefore
+   own a 'coder' that coexists with the builtin 'coder'"* — is a **user-scope template whose
+   name matches a builtin**. Any authenticated non-admin can create one; only `lead` names
+   are reserved (`agent_templates.go:252`). A name-keyed implementation with no scope check
+   reports `differs_from_builtin: true` on that user's private template, and
+   `ResetAgentTemplate` returns **400 "only builtin templates can be reset"** (`:408-411`) —
+   the badge advertises an action that fails. **This case must be in the fixture set.**
+
+6. **CONFIRMED, with an in-tree precedent for the answer.** `BuiltinByName` returns `false`
+   for a removed builtin (`builtins.go:64`), and `ResetAgentTemplate` already handles that
+   state at `:412-418` with **409 "no builtin definition to reset to"**. The field reports
+   `false`. It therefore conflates two states with OPPOSITE Reset outcomes (200 vs 409) —
+   which is why the removed-builtin state reaches the UI through the new route's 409 rather
+   than through a tri-state DTO field. Pre-existing and worth knowing:
+   `AgentDetail.tsx:123-131` currently offers Reset to any `is_builtin` row, so today it
+   offers a button that 409s.
 
 ## Acceptance criteria
 
 1. `differs_from_builtin` is computed per request and stored nowhere. No migration in the diff.
-2. A pristine builtin row reports `false`; a row whose description, model, tools or
-   prompt_body was edited reports `true`. Each of the four columns is covered — an
-   implementation comparing only `prompt_body` passes a one-column test.
-3. A `user`/`global`-scope row, and an admin row shadowing a builtin name, both report `false`.
-4. A builtin row with no shipped counterpart reports `false`, not `true`.
-5. The badge appears on both pages, and the editor shows a shipped-vs-stored diff.
-6. `task gate:api` and `task gate:web` green, run SERIALLY. `task` exits 201 on any failure,
-   so test for non-zero, never a number.
-7. No change to `ReconcileBuiltinTemplates` or anything `api/cmd/server/main.go` calls before
-   the HTTP listener starts.
+2. A pristine builtin row reports `false`; a row edited in **any one** of the four mutable
+   columns reports `true`. **All four are covered separately** — an implementation comparing
+   only `prompt_body` must go red.
+3. **A `user`-scope row whose name matches a builtin reports `false`.** This is the case that
+   separates a scope-checking implementation from a name-only one; the admin shadow row does
+   not (claim 5). A `global`-scope row also reports `false`.
+4. A builtin row with no shipped counterpart reports `false`, not `true`, and the UI does not
+   offer Reset for it.
+5. `GET /agent-templates/{id}/builtin` returns the shipped definition to a caller passing
+   `authorizeTemplateWrite`, **403** to one who does not, and **409** for a removed builtin.
+6. The badge appears on both pages and reads **"differs from shipped"** — never "customized"
+   or "edited". See Amendment 1 §3.
+7. The editor shows a shipped-vs-stored diff rendered as React elements. **`git grep -F
+   dangerouslySetInnerHTML -- web/src` must still return zero call sites afterwards** (it
+   returns 11 hits today, every one a comment saying not to).
+8. **A no-op save creates no drift**: open a pristine builtin, submit the editor unchanged,
+   assert still `false`. This is the single test that catches a seed-path/write-path
+   asymmetry in any of the four columns, and nothing else reaches it.
+9. **Reset clears the badge with no refetch** — `templateDTO` is the reset response
+   (`:438`) and `AgentDetail.tsx:59` sets state from it. Assert it; it is the interaction an
+   admin judges the feature by, and it holds only while reset keeps returning the DTO.
+10. `task gate:api` and `task gate:web` green, run **SERIALLY** (concurrent gates manufacture
+    a known flake, #198). `task` exits 201 on any failure, so test for non-zero, never a
+    number. If `golangci-lint` reports `parallel golangci-lint is running`, another worktree
+    holds a host-global lock — re-run, do not report a red gate.
+11. No change to `ReconcileBuiltinTemplates`, to anything `api/cmd/server/main.go` calls
+    before the listener at `:684`, or to `agenttmpl`'s package `init()`.
 
-**Not required for M4a:** any live-DB test. The jsonb-normalization hazard that makes a
-live-DB test mandatory in M4b applies to a *stored* hash. M4a stores nothing. If the
-implementation turns out to need one, that is a finding worth reporting, not a silent add.
+**Not required for M4a:** any live-DB test. The jsonb hazard is pinnable **without** a
+database by handing the comparison a `store.AgentTemplate` whose `Tools []byte` holds the
+Postgres-canonical `["a", "b"]` form directly (the reviewer measured that exact byte string).
+**That case must be in the unit fixture**, or the suite agrees with a byte-comparison
+implementation on everything it covers.
 
 ## Roster
 
-- `architect`: dispatched — design wave, `25ebcd39`.
-- `reviewer`: dispatched — design wave, `25ebcd39`.
-- `auditor`: dispatched — design wave, `25ebcd39`.
-- `coder`: pending — spawns only after the design wave settles and this brief is rewritten.
+- `architect`: reported — design wave at `a24961bf`. Refuted claim 4; found the missing diff
+  transport; §5's `agenttmpl` placement is its call.
+- `reviewer`: reported — design wave at `a24961bf`. Found the nonexistent-file citation, the
+  unfalsifiable `name` term, and measured the jsonb round-trip on a throwaway Postgres.
+- `auditor`: reported — design wave at `a24961bf`. Found the user-scope name-collision case
+  and the `dangerouslySetInnerHTML` constraint; confirmed the boot path.
+- `coder`: dispatched — against this brief as amended.
 - `tester`: pending — spawns after the coder's FIRST commit, never at kickoff.
-- `web-ux`: pending — M4a lands a user-facing badge and a diff view, so it is dispatched on
-  the wave where those land. **Blocker to name first: the mock fixtures must contain a
-  template that actually differs from its builtin, or the pass validates rendering and is
-  structurally blind to the badge.**
-- `documenter`: pending — `docs/agent-templates.md:122-125` states the current no-auto-update
-  behaviour and CHANGELOG needs an entry.
+- `web-ux`: pending — dispatched on the wave where the badge and diff land. **Blocker named
+  in Amendment 1 §7: on a fresh mock load every row is a pristine clone of its shipped twin,
+  so nothing carries the badge and the pass is structurally blind to it. The fixture work is
+  a prerequisite, not a nicety.**
+- `documenter`: pending — `docs/agent-templates.md:121-135` (NOT `122-125`, which this file
+  inherited from the issue body and which lands on the reset-is-verbatim paragraph). Both the
+  reset paragraph and the no-auto-update paragraph at `129-135` need editing. CHANGELOG entry
+  under `[Unreleased]`.
 - `fact-checker`: pending — this brief and the eventual comments carry mechanism claims.
 - `spec-keeper`: pending — `specs/` exists; sync after blocking findings clear.
 - `researcher`: closed — no external research needed; every mechanism is in-tree.
@@ -118,4 +201,101 @@ implementation turns out to need one, that is a finding worth reporting, not a s
 
 ## Amendments
 
-_None yet._
+### Amendment 1 — 2026-08-03, after the design-critique wave
+
+Architect, reviewer and auditor reported independently; the lead re-derived the load-bearing
+citations. Claims 3, 4 and 5 above are rewritten in place. What follows is what the wave
+added that is not a claim correction.
+
+**§1 — The diff had no data source, and Scope now authorizes one.** All three derived this
+independently by different enumerations: a boolean says *that* a row differs, and nothing in
+the API serves the shipped text. `BuiltinByName` has one non-test caller
+(`agent_templates.go:412`, inside `ResetAgentTemplate`), so today the shipped body reaches a
+client only AFTER Reset has already overwritten the row — the destructive act the diff exists
+to prevent. **Owner decision: a new route, not a nested DTO field.** The three proposals were
+a route (architect), shipped fields on the detail response only (auditor), and a nullable
+`builtin` object on the DTO (reviewer). The route wins on two grounds the others each fail
+one of: it matches the existing `/{id}/rendered` sub-resource precedent, and it keeps the
+~44 KB shipped corpus out of the LIST response, which the DTO-field form would carry on
+every row. *(The lead also argued the nested form goes stale after a save; the reviewer's
+NB4 shows update/reset responses would refresh it, so that argument is weaker than stated and
+is not what decided this.)*
+
+**§2 — jsdiff, rendered as React elements. Owner decision.** `web/package.json` carries no
+diff library. **The auditor's constraint is binding: most JS diff libraries return HTML
+strings by default** (`diff2html`, jsdiff's own `convertChangesToXML`), and using one would
+introduce the FIRST `dangerouslySetInnerHTML` in `web/src`, which today has zero call sites
+and eleven comments saying not to. Use structured hunks rendered as React text nodes.
+**Install with `npm install --ignore-scripts`** — per CLAUDE.md a plain install in this repo
+rewrites `/opt/homebrew/bin/agent-browser` host-wide, and npm 11.17 prints an `allow-scripts`
+warning that reads as though it skipped them when it did not.
+
+**§3 — Badge copy is "differs from shipped".** M4a answers *"does this row differ from the
+body shipped in THIS binary?"*. M4b's classifier answers a different question: *"does this
+row differ from the body it was SEEDED with?"*. A row that is pristine-as-seeded but behind
+the current release answers **true** to the first and **pristine** to the second — M4b will
+auto-update it and the badge will vanish. Coherent only if the badge never claims a human
+edited it. Getting this wrong makes M4b's fix a copy change, and CLAUDE.md documents at
+length what a copy change does to the negative assertions guarding it.
+
+**§4 — The `description` trim asymmetry: fix at the SOURCE, do not normalize.** The write
+path trims (`validateTemplateFields:513`) and the builtin parser does not
+(`builtins.go`, `strings.Cut(line, ": ")`), so a builtin `.md` with trailing whitespace on a
+frontmatter line would seed a row that flips to a trimmed value on the first no-op save and
+report drift with nothing changed. **Latent, not live** — all three agents scanned the 11
+builtins and found no padded frontmatter value. The wave split on the fix: the reviewer said
+trim both sides; the architect and auditor said never trim. **Decision: never trim.** Add the
+whitespace-hygiene assertion to `TestBuiltinsParseAndValid`
+(`api/internal/agenttmpl/render_test.go:38-60`), which already validates name/description/
+body. That makes it a corpus invariant instead of a permanent comparison blind spot, and
+criterion 8's no-op-save test catches it either way.
+
+**§5 — Land the canonical comparison in `agenttmpl`, not in `handler`.** Something of the
+shape `func SameContent(a, b Definition) bool`. `Definition` holds a `[]string` so it is not
+`==`-comparable and a helper is needed regardless; the only question is which package owns
+it. `agenttmpl` has no DB dependency and BOTH `handler` and `store` already import it.
+**This is the highest-value decision in the milestone**: M4b's classifier answers the same
+question over the same columns, and if M4a writes ad-hoc comparisons inside `handler`, M4b
+must reimplement in `store` or refactor under time pressure. The moment there are two, the
+badge and the auto-updater can disagree — the UI says customized while the reconciler
+overwrites it. **Do not add drift-specific behaviour to `templateToDefinition`**: it is on
+the `/rendered` export path that writes into an agent workspace.
+
+**§6 — Make `differs_from_builtin` NON-optional in the TS type.** `AgentTemplate`
+(`web/src/lib/api.ts:105-118`) has no optional fields today. Declared `differs_from_builtin:
+boolean`, `task typecheck:web` goes red at every literal until each is updated
+(`mocks/data.ts` `tmpl()` factory, `mockApi.ts` create literal, two sites in
+`Agents.test.tsx`). Declared with a `?`, the mocks stay silent and the badge never renders in
+mock mode — the structural blindness the roster line warns about, arriving through one
+character.
+
+**§7 — The mock is a SECOND IMPLEMENTATION of the comparison, and one drifted fixture is not
+enough.** `mockApi.ts:212` clones `mockTemplates` into the mutable `templates`, and
+`resetAgentTemplate` already treats `mockTemplates` as the shipped baseline — a working seam,
+so the mock CAN compute drift honestly rather than hardcoding a flag. But on a fresh load
+every row is a pristine clone, so **nothing carries the badge until someone edits**, and
+editing `mockTemplates` does nothing because it is both sides of the comparison. Seed a
+drifted row against a baseline constant separate from `mockTemplates`, or have the initial
+clone apply one edit. Fixture cases that actually discriminate: `prompt_body`-only,
+`description`-only, `model`-only (shipped null vs stored set), `tools` membership, **`tools`
+ORDER only** (nothing else pins "do not sort"), a pristine control, a `global` row, a
+**`user`-scope row colliding with a builtin name** (missing today), and a **builtin with no
+shipped twin** (missing today). Add a test asserting the fixture set still contains each, or
+a later fixture edit silently removes a case and everything stays green. A golden snapshotted
+from the mock data is the trap here: it agrees on everything it covers and locks in the blind
+spot.
+
+**§8 — Discharged.** CLI: **no change**, verified independently by all three
+(`git grep -i -F 'agent-template' -- api/cmd/uzi/` is empty; the command set is
+`root.go:141-155` and `admin.go` exposes users/runs/workers/usage/rate-limits/cli-tokens).
+State it in the MR description the way PRD #85 Decision 8 did. Two other template-shaped
+serializers exist and must NOT gain the field: `templateAllocationDTO`
+(`template_allocations.go:22-31`, no content columns; `Agents.tsx` renders rows from the
+templates list, so the badge reaches that page through `templateDTO`) and `ClaimAgent`
+(`workersvc/claim.go:191-203`, the worker wire contract, pinned by a golden — adding drift
+there leaks an admin-UI concept into a contract the worker parses).
+
+**§9 — Boot path re-confirmed.** `api/cmd/server/main.go:159` is `ReconcileBuiltinTemplates`;
+the server is constructed at `:633` and `ListenAndServe` is at `:684`, so pre-listen ordering
+holds. Hard singleton confirmed in the chart (`api-deployment.yaml:12-16` `type: Recreate`,
+`values.yaml:62-63` `replicaCount: 1`).
