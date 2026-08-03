@@ -1807,3 +1807,64 @@ not tested run/steer/TUI. Those live in §475 as reasons, where they stay useful
 
 **QUEUED, not dispatched:** the coder holds the writer slot for §24's two items. Spec-keeper
 goes immediately after it reports.
+
+---
+
+## 26. 🔴 STOP BEFORE THE MR — `main` ADVANCED 34 COMMITS AND OVERLAPS THIS BRANCH
+
+Found by the lead at `3d8d2d9e`, checking a `main..HEAD` diffstat that read **2234
+deletions** — which are not deletions at all. They are files that exist on `main` and not
+here, i.e. **`main` moved**. Branch point is still `2d60c573`; `main` is now `136d976a`.
+
+**Do NOT open the MR against this state.**
+
+### What landed on `main`, and it is in our exact problem domain
+
+- **`api/internal/termsafe/`** — a NEW leaf package holding *"uzi's terminal-safety
+  predicate: the one place that decides which runes are allowed to reach a terminal"*.
+  It cites **issue #180**, whose threat model names *"a server the user pointed `--url` at
+  supplies … error messages and **build info**, and the CLI printed all of it raw"* — the
+  auditor's H1, found independently, fixed independently, while we were working.
+- **`api/internal/uzicli/sanitize.go`** — delegates `SanitizeTTY`/`CellText` to `termsafe`.
+- **`api/cmd/uzi/hostile_server_test.go`** — `TestHostileServerCannotDriveTheTerminal`,
+  which is the auditor's hostile-server harness as a committed test.
+- Plus `fix/169-name-validator`, and `fb85e732 chore(lint): satisfy errcheck and ST1018 in
+  the uzi CLI` — **the same errcheck edits our coder made**.
+
+### 🔴 THE HALVES SPLIT, AND THE NAMING IS A TRAP
+
+**H1 (injection) is FIXED on `main` and our fix is redundant.** `main`'s
+`api/cmd/uzi/version.go:79` already reads
+`fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], uzicli.CellText(row[1]))`, citing #180.
+
+**H2 (unbounded length) is NOT fixed on `main`, and ours is still needed.**
+`uzicli.CellText` → `termsafe.CellText`, whose own doc says it **"deliberately does not
+truncate"**. So a 1 MiB version string still prints in full on `main` today.
+
+**The trap:** there are now TWO functions one letter apart with different behaviour —
+`api/cmd/uzi`'s local `cellText` (truncates, via `compactText`'s `const max = 200`) and
+`uzicli.CellText` (does not). **A naive merge that keeps `main`'s call site silently
+reopens H2**, and everything about the name says it is the safe one.
+
+### Merge surface — three conflicts, measured with `git merge-tree`, nothing touched
+
+```
+CONFLICT  CHANGELOG.md
+CONFLICT  api/cmd/uzi/root.go
+CONFLICT  api/cmd/uzi/version.go
+auto      api/cmd/uzi/run.go, CLAUDE.md, specs/ai.md
+```
+
+### What survives and what does not
+
+| our work | status against `main` |
+|---|---|
+| the skew warning (the feature) | **unaffected in substance**; should consume `termsafe` rather than the local helper |
+| H1 sanitization of build info | **REDUNDANT** — `main` did it, as a shared package with a Unicode-wide biconditional invariant, which is better than ours |
+| H2 length bound | **STILL NEEDED** — `main` left it open |
+| the two CVE bumps | **STILL OURS ALONE** — `main` is on `x/text v0.38.0`, `goldmark v1.7.8` |
+| the `run.go` comment fix | needs re-reading: `main` restructured the surface it describes |
+| `CLAUDE.md`, `specs/*`, CHANGELOG | intact, CHANGELOG needs a conflict resolution |
+
+**This is the documented default-branch-drift hazard**, and the reason it was caught is a
+diffstat that did not look right — not a check anyone had scheduled.
