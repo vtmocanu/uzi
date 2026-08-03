@@ -2248,3 +2248,66 @@ named risk rather than assumed.
 `./e2e/run-e2e.sh` not run (unstamped harness binary short-circuits the hook; `bash -n`
 clean). No live server, no k8s. Only `api/` gated. **`govulncheck` is the auditor's slot and
 the tester did not re-run it — §29's clean result is the auditor's, not corroborated.**
+
+---
+
+## 32. 🔒 BRANCH COMPLETE at `6453cbd6`. Eight code commits, all validator-pinned SHAs reachable.
+
+Lead-verified: tree clean, never pushed (0 remote refs), and **every SHA any validator pinned
+a measurement to is still an ancestor of HEAD** — `ea71a367`, `f2f778d6`, `e137d145`,
+`d23599bb`, `57db471f`, `e3d87d1b`, `b00ecc83`, `84b75153`. The plain-merge decision in §27
+is what preserved that; a rebase would have voided every one.
+
+### The final fix, and why it closed rather than patched
+
+The coder re-derived the fraction over **every rune in Unicode** rather than inferring from
+the eight-row table:
+
+```
+unicode.IsControl codepoints  65
+json-escaped                  32   (C0 0x00-0x1F, entire)
+NOT escaped                   33   (DEL 1 + C1 32)  = 50.8%
+```
+
+Families split **2 of 3**; codepoints split **about half**. It now says *"two of the three
+control families"* **and states 33-of-65 beside it** — so the fraction cannot be restored
+later by someone who reads the family form and thinks it imprecise. **That is the difference
+between fixing an instance and closing it.** It also tightened the adjacent *"neither half of
+Cf"* → *"none of Cf at all"* (Cf has no halves, same sentence, same looseness, its own).
+
+### 🔴 THE GENERALISATION WORTH CARRYING OFF THIS BRANCH — the coder's, not the lead's
+
+Seven instances of one defect: a confident sentence stating *why* something is safe,
+describing a mechanism nobody had executed.
+
+**The sixth and seventh are both in text written to fix the fifth.**
+
+> *"Not 'we keep being imprecise', but that **corrective text is itself high-risk** — because
+> it is written with confidence, under time pressure, by someone who has just been proven
+> wrong once and is trying not to be again."*
+
+That reframes every earlier entry in this brief. The class is not carelessness; it is
+concentrated **precisely where care is highest**. Corroborating instances from this branch,
+all recorded above and none noticed as a pattern at the time: §13's 6b prediction was written
+into the brief *to guard against* an untested mechanism and was itself untested; §23's N3
+assertion credited itself in its own comment; §30's §26 overstatement was the lead's, in a
+section written to correct someone else.
+
+**Practical form:** a correction deserves the same measurement bar as the thing it corrects,
+and the moment of highest risk is the sentence written immediately after being caught.
+
+### What no gate can see
+
+`task gate:api` reads none of this. `check-docs.mjs` validates frontmatter and links, not
+prose. **Every one of the seven was caught by a person running the mechanism the sentence
+described** — never by a tool, never by review-by-reading, and three of the seven survived
+multiple careful readings by different agents first.
+
+### Filed rather than swept in
+
+- **#219** — `main`'s CHANGELOG carries the same `--json` claim (unreleased, still fixable).
+- **#220** — three unbounded server-controlled sinks in `cmd/uzi`, pre-existing.
+- **#221** — `controller/`'s three reachable vulnerabilities, its own `go.mod`, all traces
+  through `internal/apiclient/client.go:142`.
+
+Next and last: push, and open the MR.
