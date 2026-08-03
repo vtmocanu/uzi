@@ -479,3 +479,127 @@ bump reaches it — verify rather than assume).
 **Scope boundary that did NOT move:** this remains a scoped MR against issue #144. No new
 PRD. Nothing else gets swept in — if the dep bump cascades into unrelated churn, stop and
 report rather than widening further.
+
+---
+
+## 9. AMENDMENT 4 — architect's design, one conflict ruling, and the FREEZE
+
+Full design: `.claude/agent-team-tasks/144-design.md` (architect). Its citation pass was
+**8 of 8 CONFIRMED**, independently of the reviewer's 10 of 10. Read it — the eight
+settled points below are the short form, not a replacement.
+
+### 🔴 THE SEMVER DEFECT IS NOT "WRONG ON SOME PAIRS". IT IS **INERT**.
+
+The architect measured against this project's real shipped shapes rather than inheriting
+CLAUDE.md's example, and the result is stronger than anything in §4. Lead re-derived it
+over a 5×5 grid of realistic pairs:
+
+```
+rows = 25   rows where Compare(cli, srv) < 0, i.e. would warn = 0
+```
+
+**Zero. `cli=v0.1.0` against `srv=99.0.0` — 98 majors behind — still returns +1.** The
+CLI is always the valid operand and the server always the invalid one, so an
+un-normalised `< 0` gate **can never fire, for anyone, ever**. §4 said it was silent on
+the live pair; it is silent on the entire input space.
+
+**AND THE TWO FAILURE MODES SIT AT DIFFERENT STAGES, IN OPPOSITE DIRECTIONS.** This is
+the thing to get right:
+
+| stage | implementation | behaviour |
+|---|---|---|
+| 0 | naive `Compare(cli, srv) < 0` | **INERT** — never warns (25/25 above) |
+| 1 | re-prefix BOTH sides, no `IsValid` guard | **OVER-FIRES** — `Compare("vdev","v0.14.0") = -1`, so every `go build` binary is told to `brew upgrade` |
+| 2 | re-prefix + `IsValid` on BOTH + silent on invalid | correct |
+
+So **B1 bites the fix, not the bug.** An implementer who adds normalisation without the
+guard moves from never-warns to always-warns-in-dev. A test suite that only proves
+"it warns when behind" passes at stage 1.
+
+### CONFLICT RULING — `logout` and `auth token` ARE probe-exempt
+
+The architect and the auditor disagreed, and this is the lead settling it rather than
+averaging it.
+
+- **Architect**: *"`login`/`auth token` are not exempt (endpoint is unauth)."*
+- **Auditor**: measured, with a canary token, that the **request carries
+  `Authorization: Bearer uzc_…`** even though the route is unauthenticated.
+
+They answered two different questions — *is the ROUTE authenticated?* (no) and *does the
+REQUEST carry the credential?* (yes). Only the second bears on the exemption. **The
+architect's own citation pass states the token is carried**, so its conclusion
+contradicts its own evidence; the execution wins.
+
+Lead re-derived both commands at `1279efd8`: `logout` (`login.go:184-200`) and
+`auth token` (`auth.go:31-49`) are **pure `env.Store` operations — no `env.client`, no
+network**. And `logout`'s own `Short` reads *"Remove the locally stored CLI credential
+**(does not revoke it server-side)**"* — a probe there would make it contact the server,
+contradicting its documented contract.
+
+**BINDING: exempt `logout` and `auth token`.** Note the command sets differed — the
+architect wrote `login`, the auditor `logout`. **`uzi login` is already on the network**
+(device-auth flow) and needs no exemption; the exempt pair is `logout` + `auth token`.
+
+### The architect's eight settled points, short form
+
+1. **Boundary** — `api/internal/uzicli/versioncheck.go` = pure comparison + cache (no
+   cobra, no I/O, **no `time.Now()`** in the library); `api/cmd/uzi/versioncheck.go` =
+   hook + exemptions, reusing the **existing** `serverBuildInfo` rather than a second
+   probe function.
+2. **Cache** — `~/.config/uzi/version-check.json`, 0644, atomic write, keyed on a **map
+   of normalised base URL**. Stores the last **attempt** (empty version = probe failed),
+   and the **server's version, never the verdict**. Nil store → skip. Corrupt → miss.
+   Future timestamp → not fresh. Write failure → silent.
+3. **TTL 1h**, with the argument: too-long only delays hearing about a *server* upgrade;
+   the CLI-upgrade direction is instant by (2).
+4. **Exemptions** — `skill` subtree, `__complete`/`__completeNoDesc`, `completion`, plus
+   the ruling above. **`uzi version` is RELOCATED, not exempt**: it warns inline from its
+   own live probe, because `PersistentPreRun` runs *before* `RunE` and a cached warning
+   would visibly contradict the `server version` line printed later in the same
+   invocation. `--help`, `--version` and non-runnable parents need no exemption — cobra
+   returns above the hook loop (`command.go:918-993`).
+5. **Message clears the extractor with zero new registry entries** — established by
+   reading `instructionRE`, matching the reviewer's independent measurement. Two rules:
+   never name a `uzi <verb>` in this message, and **if a test reddens, reword — never
+   register**.
+6. **`UZI_VERSION_CHECK=0`**, same `== "0"` test as `UZI_SKILL_AUTO_UPGRADE`.
+7. **Tests** — assert both channels explicitly; pin `--json` by asserting
+   `json.Unmarshal(stdout)` **succeeds** rather than by a negative string check (this
+   repo has a documented vacuous-negative case); pin the exit code **differentially**
+   (same invocation, check on vs off, equal codes) on a success path *and* a 404 path,
+   never hardcoded to 0. Needs a `BuildInfoCalls` counter on `FakeClient`, without which
+   the no-double-probe and cache-hit claims are **unobservable**.
+8. **Declined** — no `--check` flag, no `uzi upgrade`, no server-is-behind warning, no
+   background probe, no `api/internal/verscmp` extraction (a third `normSemver` copy is
+   accepted; extracting it would touch `forge` and `workersvc` inside an issue-scoped MR).
+
+### Lead decisions on the architect's two open questions
+
+Both had sensible defaults; neither needed the user.
+
+- **One line.** The two-line hanging indent in the user-facing preview was a **mockup
+  wrap, not a spec**. Every other stderr warning in this package is one line, and
+  hard-wrapping is wrong at every width but one.
+- **Document `UZI_VERSION_CHECK=0` in BOTH `SKILL.md` and `docs/cli.md`**, framing the
+  warning as actionable. An undocumented escape hatch is worse than a documented one:
+  agents can read it out of the source either way, and only the user loses by not knowing
+  it exists. Note `skill_drift_test.go` gates **neither** file for env vars (reviewer
+  N11) — both are by hand.
+
+---
+
+# 🔒 THE BRIEF IS FROZEN AS OF THIS AMENDMENT (`1279efd8` + this commit)
+
+Design wave closed: architect, reviewer, auditor, all three citation passes clean, three
+blocking design findings and one HIGH resolved into bindings above. The coder spawns
+ONCE against this text.
+
+**From here, a DESIGN change is a new wave, not a message.** A pre-flag (a finding the
+coder can absorb without re-deciding anything) may still be forwarded mid-implementation.
+Anything that re-decides something already built on gets an Amendment 5 and an explicit
+"work in flight is invalidated".
+
+Outstanding and NOT blocking the freeze: the fact-checker is still ruling on whether
+`CLAUDE.md`'s *"EVERY VERSION THIS PROJECT SHIPS IS BARE"* is itself wrong. That is a
+**doc** question about `CLAUDE.md`, not a design question — the measurements this brief
+relies on are already independent of it, taken from the shipped stamps directly.
