@@ -1662,3 +1662,70 @@ Auditor, reviewer and coder each had results produced from the shared worktree m
 coder's own disclosure closes it: *"anything building from this tree during those windows
 measured a mutated binary."* **The freeze closes it for all three, and the standing fix is:
 validators get a frozen SHA that is not also the coder's live worktree.**
+
+---
+
+## 23. AMENDMENT 18 — tester re-run at `57db471f`. GREEN, 32 mutations, 3 survivors, ONE SHOULD-FIX.
+
+Fresh detached worktree, clean at checkout and teardown, private `GOLANGCI_LINT_CACHE`.
+`task gate:api` **EXIT=0** in 1m13s, all populated slots. Positive control:
+**`RUN=486 PASS=486 FAIL=0 SKIP=0`** (478 at `a4a18c0d`, 475 at `ea71a367`).
+
+**N2 CLOSED** — `M23` (`writeFileAtomic` → `os.WriteFile`) now reddens
+`TestVersionCacheWriteDoesNotFollowASymlink`. It survived at both earlier SHAs. The pin the
+lead ruled in does the work it was ruled in for.
+
+### 🔴 M30 (SHOULD-FIX) — THE HOOK HALF OF THE N-1 FIX IS UNPINNED, AND LOSING IT LOSES THE WARNING
+
+The N-1 fix has two halves. The **store** half is well pinned (`M29` reddens two tests). The
+**hook** half is not: fold `maybeWarnVersionSkew:153` back to ignoring the returned value and
+**the entire suite stays green** — which is precisely what the commit message warns against
+(*"Take the RETURNED version, not `probed`"*).
+
+**Why the shipped test misses it, and this is the instructive part:**
+`TestSkewWarningSurvivesATransientProbeFailure` drives its outage through **`uzi version`**'s
+call site (`:187`), not the hook's (`:153`), and its third step reads a **fresh** cache — so
+`fresh == true` and the hook never calls `RecordServerVersion` at all. **The mutated line is
+never exercised where its return value matters.**
+
+**Measured as a real behavioural regression, not a no-op**, on the scenario the test cannot
+reach (stale cache + failed probe + prior good reading — the offline laptop the next morning):
+
+```
+ARM 1  57db471f      probeCalls=1  warned=true   "uzi: CLI v0.11.8 is behind server 0.14.0…"
+ARM 2  M30 applied   probeCalls=1  warned=false  stderr=""      <- WARNING LOST
+```
+
+The tester's probe **asserts its own precondition** (that the seeded entry is genuinely
+stale) before concluding, so an accidentally-fresh cache fails loudly rather than passing
+vacuously. **LEAD RULING: fix it.** One test. It is the half a user actually feels and it is
+one careless refactor from silent — and this branch has ruled the same way twice already
+(§19 N2, §17).
+
+### The 4-vs-6 count settled, and the tester's own prediction was wrong
+
+At `57db471f` the §19 N3 positive control reddens **6** rows at **exactly 96 bytes each**;
+at `a4a18c0d` it was 4. The delta is the two new Zl/Zs rows. **The tester predicted 97/98
+bytes** for U+2028 (3 bytes) and U+00A0 (2 bytes) **and says so: that was wrong.** `cellText`
+strips those characters entirely, so all six print the identical clean `0.14.0` line. **The
+assertion measures sanitized OUTPUT, not input** — which is the whole point of it, and a
+reader predicting from the payload size would mis-set the threshold.
+
+### The other two survivors, neither actionable
+
+- **`M2a`** — the inert server-side guard. Re-derived at `57db471f`: **grid=1521, server
+  guard changes 0, CLI guard changes 378.** Unchanged, as expected since the code did not
+  move. Comment already corrected in `57db471f`. **No action.**
+- **`M12b` (LOW, new)** — the second size cap, on `cliVersion` (`RecordServerVersion:292`),
+  is unpinned. **Unlike the server-version cap it guards nothing reachable**: both call sites
+  pass the package-level `version` (`root.go:16`), a compile-time ldflags stamp no user or
+  server controls. Defence-in-depth mirroring its neighbour. **Recorded so nobody later reads
+  its greenness as coverage.** No action.
+
+### Not reached, stated rather than implied
+
+`./e2e/run-e2e.sh` not run (`e2e/` unchanged since `a4a18c0d`, `bash -n` clean, harness binary
+is `dev` so the hook short-circuits — §11 6e's belt-and-braces claim). No live server, no k8s;
+all `FakeClient`, and the bare-`0.14.0` wire shape is inherited from §1 rather than
+re-derived. Only `api/` was gated; `docs/` and `e2e/` verified statically at their unchanged
+state.
