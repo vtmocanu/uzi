@@ -403,6 +403,29 @@ export class GitCache {
       : (args: string[]) => this.tryGit(repoPath, args).then(() => undefined);
     await run(["config", "maintenance.auto", "false"]);
     await run(["config", "gc.auto", "0"]);
+    // `core.fsmonitor=false` closes a SECOND detached daemon that the two keys above do
+    // not touch. `git fsmonitor--daemon run --detach` is spawned by any git command in a
+    // repo where core.fsmonitor is true, reparents to init, and then WATCHES THE
+    // DIRECTORY for as long as it lives — so unlike the maintenance child, which holds
+    // its lock for milliseconds, this one holds handles indefinitely. Measured
+    // 2026-08-03 on this host: a fixture created 2026-07-13 still had its daemon alive
+    // 21 DAYS later, holding `data/worktrees/.../issue-55`, which is why `fs.rmSync`
+    // left a file-free directory skeleton behind rather than removing the tree.
+    //
+    // It reaches these repos through `gitEnv()`'s deliberate GIT_CONFIG_GLOBAL
+    // passthrough: with the var unset (an ordinary dev shell) git falls back to
+    // ~/.gitconfig, and `core.fsmonitor = true` there is a common and reasonable
+    // setting. The fixture ORIGIN is already shielded because makeFixture pins
+    // GIT_CONFIG_GLOBAL=/dev/null; the repos THIS module creates are not, which is
+    // exactly the residue issue #127's retry was left to absorb.
+    //
+    // Control, same host, same git: a repo carrying only the two keys above spawned 1
+    // daemon that held the directory; adding this key spawned 0. Safe by construction —
+    // fsmonitor is a `git status` optimisation for large trees, never a correctness
+    // input, and these clones are short-lived and small. In a worker container the
+    // daemon would die with the container anyway, so this is a no-op there and a leak
+    // fix locally.
+    await run(["config", "core.fsmonitor", "false"]);
   }
 
   /** Commits reachable from `sha` but not from the repo's default branch. Best-effort:
