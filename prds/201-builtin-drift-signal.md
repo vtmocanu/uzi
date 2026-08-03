@@ -233,10 +233,18 @@ implementation on everything it covers.
 
 ## Rebasing onto the moved main — REQUIRED before the MR, and it is the CODER's to run
 
-This branch is based on `25ebcd39`. `origin/main` is now `d367653b`, **22 commits ahead**,
-because all three previously-in-flight MRs merged at ~13:57 on 2026-08-03. **A green gate on
-a stale base says nothing about the merged result**, so `git merge origin/main` and re-gate
-before the MR opens.
+This branch is based on `25ebcd39`. `origin/main` is `d367653b`, **22 commits ahead**. The
+merges into `main` across that range are `78ad89b9` (13:15:35Z), `10f7b6a5` (13:21:39Z),
+`9ac80056` (13:49:28Z) and `d367653b` (13:53:27Z). **A green gate on a stale base says nothing
+about the merged result**, so `git merge origin/main` and re-gate before the MR opens.
+
+> **CORRECTED.** This read *"because all three previously-in-flight MRs merged at ~13:57"* —
+> wrong twice. **FOUR** MRs merged, not three: !170 was created at 13:33Z, after the sentence's
+> premise was formed, and it alone contributes **3** of the 22 commits, so the set named could
+> not produce the count given. And no merge happened at ~13:57; the latest is 13:53:27Z.
+> **The mechanism, which outlives this instance: an in-flight MR set is a fact with a shelf
+> life and a commit count is not.** State the count, name the merge SHAs, and drop the MR
+> tally — which is what the paragraph above now does.
 
 **The merge belongs to the coder, not the lead** — ref-moving commands (`merge`, `rebase`,
 `reset`, `checkout`, `stash`, `push`) are never run by the lead in a worktree holding a live
@@ -255,6 +263,82 @@ Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4
   hardcodes a builtin body, so this should not bite — **if you wrote one, it will.**
 
 ## Amendments
+
+### Amendment 5 — 2026-08-03, fact-check. One new fix, and three corrections to THIS FILE.
+
+Every verdict pinned to a SHA; all probes run in `git archive` copies rather than the shared
+worktree. It **measured** what the reviewer and auditor re-derived: mutating
+`AgentDetail.test.tsx`'s `ApiError(409, …)` to `ApiError(500, "internal error")` in an
+isolated copy gives **`Tests 5 passed (5)`, exit 0**, identical to baseline. F1's vacuous
+test is now a measurement, not an argument. It also re-ran both of `bcd67c72`'s control folds
+and reproduced them.
+
+#### NEW FIX — add to the round in flight
+
+**F11. `api/internal/agenttmpl/compare.go:33` names a test that does not exist.** Verified by
+the lead: `TestBuiltinsFrontmatterIsUnpadded` appears **exactly once repo-wide — in the
+comment that names it**. The invariant is really asserted inside `TestBuiltinsParseAndValid`
+(`render_test.go:46`, block `:67-83`), which **the very next sentence of the same comment
+names correctly**. So the comment cites a fictional mechanism and then the real one, and a
+reader chasing the first concludes the guard was deleted. *Fix: delete the invented name,
+keep the second sentence.* Note the surrounding claim is TRUE and `bcd67c72`'s commit message
+gets the name right — the dangerous shape this file keeps meeting, where only the mechanism
+is wrong.
+
+#### CORRECTIONS TO THIS FILE
+
+**C1. Claim 5's "no fixture can separate `scope` from `is_builtin`" is AMBIGUOUS, and false in
+the reading that matters to a tester.** Under "fixture = a row Postgres can hold" it is true —
+the CHECK at `00048:22` is total, both columns verified NOT NULL. But **M4a mandates no
+live-DB test, so every fixture is a Go struct literal, and a literal is not subject to a
+CHECK.** Probed with a control: on `{IsBuiltin: true, Scope: "user"}` the scope-keyed and
+is_builtin-keyed implementations disagree, while agreeing on a constraint-obeying row. The
+brief's own next words — *"do not spend time confirming it"* — address someone writing unit
+fixtures, i.e. the false reading. **The conclusion still holds** (reading 1 governs
+production). Reword to: *no fixture representing a row Postgres can hold can separate them; a
+Go literal can, so a test that separates them is testing an unreachable state.*
+
+**C2. The rebase section's MR/commit arithmetic** — corrected in place above.
+
+**C3. `7784c037`'s "All eleven `.claude/agents/*.md` told their role to report to 'the team
+lead'" is FALSE under the literal reading its own quotation marks invite.** Ten files carried
+that string; `tester.md` used the hyphenated `team-lead`. The SUBSTANCE is true — !168's
+description lists `team-lead` as a bare address among the four forms `recipient_test.go`
+rejects — so all eleven did name an unreachable recipient, in two different strings. Immutable
+in a commit message; recorded because !168 says "ten of the eleven" about its own roster and
+two documents disagreeing about one defect is the contradiction-later problem.
+
+#### RECORDED — mechanisms worth keeping
+
+**N3. `SameContent` is exported, so its "the shipped side is always `BuiltinByName(row.Name)`"
+comment is a claim about all future callers.** True today (one caller), but
+`SameContent(Builtins()[i], templateToDefinition(row))` compiles and would silently compare
+mismatched names. **The name-is-unfalsifiable argument is a property of the CALL SITE, not of
+the function.** To make it a property of the function, unexport it or have it take the row's
+name. Relevant to M4b, which adds the second caller.
+
+**N4. Four line RANGES in this file start or end outside the symbol they name** — claim 2's
+`:53-75` clips `templateDTO`; claim 4's `:112-124` starts on `decodeTools`'s closing brace;
+`decodeTools` is `:102-112` not `:99-110`; `render.go:41` is the closing brace, the join is
+`:40`. Each names a real symbol, so these are notes — flagged because **this is the shape the
+nonexistent-file citation hid inside for three readings.** A range starting on the previous
+function's `}` is the one to fix first.
+
+**N5. `bcd67c72`'s control claim is stated in COLUMNS and reads as TEST NAMES.** "Exactly the
+other three columns and the order case" is right per column; a reader re-running the fold sees
+**five** failing top-level tests, because the description column reddens both
+`TestSameContentDetectsEachMutableColumn/description` and `TestSameContentDoesNotTrim`.
+
+**N6. `TestNoOpSaveCreatesNoDrift` SIMULATES the write path.** It calls
+`validateTemplateFields` then hand-assembles the row `UpdateAgentTemplate` would write. Right
+call under "no live-DB test", and the test's own comment is honest — but the commit message's
+"a no-op editor resubmit" reads as end-to-end. It does cover all eleven builtins.
+
+**Unverifiable, stated rather than left silent:** the "8 of 26 SendMessage calls" figure is a
+run-trace measurement whose traces are not in the repo (the *attribution* to !168's
+description is verified); `roles.yaml` is outside this repo; Amendment 2's `npm audit` figures
+were not re-derived, deliberately, because that is a network call in a worktree three agents
+were writing to.
 
 ### Amendment 4 — 2026-08-03, browser pass. ONE new blocking item and ONE conflict the lead resolved.
 
