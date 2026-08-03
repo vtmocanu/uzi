@@ -29,9 +29,17 @@ Concrete stakes: issue #210 fixes ten builtin templates that named an unreachabl
 measured at 8 of 26 SendMessage calls failing across three real runs. That fix does not reach
 dev-cluster; its CHANGELOG entry tells an admin to open ten templates and click Reset, blind.
 
-> **#210 is IN FLIGHT on !168, not merged.** note_22449 says "#210 shipped on 2026-08-03 …
-> The fix is merged"; `glab mr view 168` returns `state: open`. This file is correct and the
-> issue comment is wrong. Do not "correct" this back.
+> **#210 MERGED at ~13:57 on 2026-08-03, while this milestone was being designed.** It is on
+> `origin/main` at `d367653b` (`86c43fcd`, `f108d739`), and `api/internal/agenttmpl/recipient_test.go`
+> — a 430-line guard on the recipient wording — landed with it.
+>
+> **This block previously said the opposite, and said "do not correct this back".** That was
+> right when written: the reviewer ran `glab mr view 168` during the design wave and got
+> `state: open`, refuting note_22449's "the fix is merged" — which was itself written before
+> the merge. All three statements were true at the moment each was made. The instruction not
+> to correct it is what did not survive, and it is preserved here rather than deleted because
+> a confident "do not change this" outliving its evidence is the failure this file is about.
+> **Re-derive a merge state at the moment you assert it; never inherit one from this file.**
 
 ## Scope
 
@@ -198,6 +206,29 @@ implementation on everything it covers.
 - `spec-keeper`: pending — `specs/` exists; sync after blocking findings clear.
 - `researcher`: closed — no external research needed; every mechanism is in-tree.
 - `release`: closed — M4a is not a release.
+
+## Rebasing onto the moved main — REQUIRED before the MR, and it is the CODER's to run
+
+This branch is based on `25ebcd39`. `origin/main` is now `d367653b`, **22 commits ahead**,
+because all three previously-in-flight MRs merged at ~13:57 on 2026-08-03. **A green gate on
+a stale base says nothing about the merged result**, so `git merge origin/main` and re-gate
+before the MR opens.
+
+**The merge belongs to the coder, not the lead** — ref-moving commands (`merge`, `rebase`,
+`reset`, `checkout`, `stash`, `push`) are never run by the lead in a worktree holding a live
+writer, because uncommitted work is invisible to the person reaching in. Do it after a commit,
+never on a dirty tree.
+
+Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4a's files:
+
+- **`api/internal/handler/agent_templates.go` — UNTOUCHED.** M4a's primary surface is clean.
+- **`web/src/pages/{Agents,AgentDetail}.tsx`, `web/src/components/AgentTemplateEditor.tsx`,
+  `web/src/lib/api.ts` — UNTOUCHED.**
+- **`.claude/agents/` — UNTOUCHED**, so the roster sync at `7784c037` merges clean.
+- `web/src/mocks/mockApi.ts` — one line changed. Trivial, but it is a file M4a edits.
+- **Ten `api/internal/agenttmpl/builtins/*.md` bodies changed** (#210's recipient fix), and
+  `api/internal/agenttmpl/recipient_test.go` is new, 430 lines. M4a adds no fixture that
+  hardcodes a builtin body, so this should not bite — **if you wrote one, it will.**
 
 ## Amendments
 
