@@ -1461,10 +1461,14 @@ the output of any run you make:
 - **`-p 1`** on `./e2e/run-store-it.sh` (which is a script, not a target) — the two
   live-DB packages share one database and, run concurrently, race goose into
   "relation already exists" and TRUNCATE each other's fixtures. Both observed.
-- **`--test-timeout=30000`** inside `agent/package.json`'s `test` script, which
-  `task test:agent` invokes — node's own default is NO timeout. A hand-rolled
-  `node --test` does not reproduce a hang today (measured, node v26.4.0:
-  identical pass/fail counts to `npm test`); the cap is still live and worth
+- **`--test-timeout=120000`** inside `agent/package.json`'s `test` script, which
+  `task test:agent` invokes — node's own default is NO timeout. It was `30000`
+  until 2026-08-03, where it was **binding in CI and nowhere else**: what the cap
+  governs depends on the node major, so it bounds each top-level SUITE locally
+  (node v26.4.0, files share a process) and each FILE in CI (node:22-alpine,
+  child process per file). `runner.test.ts` sums to ~96s locally and passed a 30s
+  cap; in CI it lands ~25-30s and flaked. Read `CLAUDE.md`'s `--test-timeout`
+  block before touching the number. The cap is live and worth
   carrying as insurance against a future slow test, not as a fix for a current
   hang.
 
