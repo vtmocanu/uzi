@@ -91,9 +91,9 @@
 #
 # EXIT CODES (the convention `fmt-check:api`, `lint:api`, deadcode-gate.sh and the
 # three `lint-*.sh` scripts set):
-#     2 = the instrument is broken (a canary missing from the report, scanner
-#         disarmed or narrowed, config arriving by a route that is not reviewable,
-#         gitleaks itself failing)
+#     2 = the instrument is broken (a canary missing from the report, a canary
+#         missing from the INDEX, scanner disarmed or narrowed, config arriving by
+#         a route that is not reviewable, gitleaks itself failing)
 #     1 = there are findings in TRACKED files
 #     0 = clean, and every canary was seen
 # `task`'s own rc is 201 for all of them.
@@ -273,6 +273,38 @@ if grep -q '^"' "$TRACKED"; then
   echo "  untracked and would stop gating. Rename it." >&2
   exit 2
 fi
+
+# 🔴 EVERY CANARY MUST BE IN THE INDEX, AND THIS IS NOT THE SAME CHECK AS THE
+# `-f` PRE-FLIGHT ABOVE. A canary that exists on disk but is not tracked is still
+# walked by `dir -- .` and still reported, so it still says "DETECTED" -- while
+# the population it attests for has changed underneath it. Measured 2026-08-03:
+# `git rm --cached` on the corpus canary, file untouched on disk, gave rc=0,
+# "canaries DETECTED", "clean", with the index count quietly falling 1467 -> 1466.
+#
+# THE FRAMING IS WHAT MAKES THIS WORTH A GUARD RATHER THAN A NOTE. Findings in
+# untracked files do not gate here, so a canary outside the index attests LIVENESS
+# OVER THE NON-GATING POPULATION. The green is then signed by a witness that no
+# longer speaks for anything that was gated -- precisely the substitution the
+# canaries exist to make impossible.
+#
+# Neither guard above covers it: the `-f` test asks whether the file is on disk,
+# and the two below it ask about the index as a whole (empty, C-quoted), never
+# about these paths' membership in it. Low severity in practice, because CI checks
+# out from git so the file is simply ABSENT there and takes the `-f` branch --
+# local-green / CI-red, the safe direction. It is still a green that means less
+# than it says, on the one check whose entire job is to make a green mean
+# something.
+for _c in "$@"; do
+  if ! grep -q -F -x -e "$_c" -- "$TRACKED"; then
+    echo "scan-secrets: canary is NOT TRACKED: $_c" >&2
+    echo "  It is on disk, so gitleaks still scans and reports it -- but findings" >&2
+    echo "  in untracked files do not gate here, so this canary would be attesting" >&2
+    echo "  liveness over the population this gate IGNORES. A green signed by that" >&2
+    echo "  witness says nothing about what was gated." >&2
+    echo "  \`git add $_c\` (or restore it from git if it was removed on purpose)." >&2
+    exit 2
+  fi
+done
 
 # 🔴 `dir`, NEVER `git`. History mode ran past 25 minutes on this repo's 2471
 # commits without finishing, and in CI it would read only the shallow clone that

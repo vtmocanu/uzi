@@ -556,8 +556,11 @@ tasks:
       # path: they are separate tracked files that can be deleted, moved or edited,
       # and this is where a reader sees which ones are in play. Drop them and the
       # script exits 2 on a usage error rather than quietly scanning without a
-      # control. They must also be TRACKED -- the gating scope is the git index --
-      # so `git rm --cached` on one is caught too, by the same branch.
+      # control. They must also be TRACKED, and the script asserts that SEPARATELY
+      # from asserting they exist: a canary on disk but out of the index is still
+      # walked and still reported, so it reports DETECTED while attesting liveness
+      # over the population this gate does not gate on. `git rm --cached` on one
+      # was measured green before that assertion existed.
       #
       # 🔴 TWO OF THEM, IN TWO REGIONS, AND THAT IS THE POINT RATHER THAN
       # REDUNDANCY. The `scripts/` one dies with any allowlist broad enough to
