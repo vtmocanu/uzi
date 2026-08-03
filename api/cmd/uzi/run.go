@@ -185,7 +185,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				if run.Status == statusLimitWait {
 					if !parked {
 						parked = true
-						fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
+						_, _ = fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
 							args[0], limitWaitLine(run, time.Now()))
 					}
 				} else if parked {
@@ -198,7 +198,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a
 					// premise that line disowns, is not a defensible split.
-					fmt.Fprintf(env.Stderr, "run %s resumed (%s)\n", args[0], cellText(run.Status))
+					_, _ = fmt.Fprintf(env.Stderr, "run %s resumed (%s)\n", args[0], cellText(run.Status))
 				}
 				select {
 				case <-cmd.Context().Done():
@@ -430,7 +430,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					if run.Kind == "chat" {
 						// N3: a chat run's queue is every chat turn. Note it only when it
 						// actually applies, so an issue run's output stays clean.
-						fmt.Fprintln(env.Stderr, "note: chat run — this queue lists every chat turn as a follow-up (chat has its own web composer, unaffected)")
+						_, _ = fmt.Fprintln(env.Stderr, "note: chat run — this queue lists every chat turn as a follow-up (chat has its own web composer, unaffected)")
 					}
 				}
 			}
@@ -578,7 +578,7 @@ func inputOutcome(kind string, serverSide bool) string {
 // create time so an agent that queues then polls is not left blind on the first read.
 func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO) error {
 	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
-		fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
+		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
 	}
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {

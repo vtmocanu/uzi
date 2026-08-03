@@ -66,7 +66,7 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// anchored at the start of the WHOLE stdout — stricter than the Formula's
 			// substring assert_match. A header line, a "uzi " label, or a leading
 			// blank line passes the Formula and fails the script.
-			fmt.Fprintln(env.Stdout, version)
+			_, _ = fmt.Fprintln(env.Stdout, version)
 			if srv == nil {
 				return nil
 			}
@@ -76,7 +76,7 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// SanitizeTTY: %-8s pads a column, and a newline or tab in `version` or
 			// `commit` would break the label rail these six lines share.
 			for _, row := range serverRows(*srv) {
-				fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], uzicli.CellText(row[1]))
+				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], uzicli.CellText(row[1]))
 			}
 			return nil
 		},

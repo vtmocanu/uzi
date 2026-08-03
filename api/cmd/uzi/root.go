@@ -89,7 +89,7 @@ func Main(env Env, args []string) int {
 		// CellText, not SanitizeTTY: this is a one-line report with a fixed "uzi: "
 		// prefix, so a newline in a server error would print a second line that carries
 		// no prefix and reads as the CLI's own voice.
-		fmt.Fprintln(env.Stderr, "uzi:", uzicli.CellText(err.Error()))
+		_, _ = fmt.Fprintln(env.Stderr, "uzi:", uzicli.CellText(err.Error()))
 	}
 	return uzicli.ExitCodeFor(err)
 }

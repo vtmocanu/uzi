@@ -262,7 +262,7 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 	// fixture on which the broken and the correct implementation AGREE, reading as
 	// proof of something it never tested. Worth expecting a third.
 	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
-		{ID: "s1", Kind: "anthropic_token", Label: "safe‮dnetsop\x1b[31m\nnext\tcell", CreatedAt: time.Unix(1784000000, 0)},
+		{ID: "s1", Kind: "anthropic_token", Label: "safe\u202ednetsop\x1b[31m\nnext\tcell", CreatedAt: time.Unix(1784000000, 0)},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
 	if code != uzicli.ExitOK {
@@ -270,7 +270,7 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 	}
 	// The first two are the shared floor (either helper satisfies them); the last two
 	// are what tell cellText and sanitizeTTY apart.
-	for _, bad := range []string{"‮", "\x1b", "\nnext", "\tcell"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext", "\tcell"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q: %q", bad, out)
 		}

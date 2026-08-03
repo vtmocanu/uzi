@@ -65,16 +65,16 @@ func runLogin(cmd *cobra.Command, env Env, gf *globalFlags) error {
 	consentURL := strings.TrimRight(s.URL, "/") + "/cli-auth?request=" + url.QueryEscape(start.RequestID)
 	// Instructions go to stderr so stdout stays clean for --json; the user_code and
 	// URL are essential, so they print even with --quiet. The token is NEVER printed.
-	fmt.Fprintf(env.Stderr, "\nTo authorize this login, open:\n\n    %s\n\n", consentURL)
+	_, _ = fmt.Fprintf(env.Stderr, "\nTo authorize this login, open:\n\n    %s\n\n", consentURL)
 	// user_code is server-supplied and printed outside the Printer (#180). consentURL
 	// beside it needs nothing: its server-supplied half is url.QueryEscape'd, which
 	// percent-encodes every control byte.
-	fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", uzicli.CellText(start.UserCode))
+	_, _ = fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", uzicli.CellText(start.UserCode))
 	if err := openBrowser(consentURL); err != nil {
-		fmt.Fprintln(env.Stderr, "(could not open a browser automatically — open the URL above)")
+		_, _ = fmt.Fprintln(env.Stderr, "(could not open a browser automatically — open the URL above)")
 	}
 	if !gf.quiet {
-		fmt.Fprintln(env.Stderr, "Waiting for approval...")
+		_, _ = fmt.Fprintln(env.Stderr, "Waiting for approval...")
 	}
 
 	res, err := pollUntilDone(ctx, c, start, verifier)
@@ -172,7 +172,7 @@ func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAut
 	}
 	if !gf.quiet {
 		// Server-supplied email, outside the Printer (#180).
-		fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context default.\n", uzicli.CellText(res.User.Email))
+		_, _ = fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context default.\n", uzicli.CellText(res.User.Email))
 	}
 	return nil
 }
@@ -195,7 +195,7 @@ func newLogoutCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			if cur, ok := creds.Contexts["default"]; !ok || cur.Token == "" {
 				if !gf.quiet {
-					fmt.Fprintln(env.Stdout, "No stored credential for context default.")
+					_, _ = fmt.Fprintln(env.Stdout, "No stored credential for context default.")
 				}
 				return nil
 			}
@@ -204,7 +204,7 @@ func newLogoutCmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitGeneric, "%v", err)
 			}
 			if !gf.quiet {
-				fmt.Fprintln(env.Stdout, "Removed the stored credential for context default (not revoked server-side).")
+				_, _ = fmt.Fprintln(env.Stdout, "Removed the stored credential for context default (not revoked server-side).")
 			}
 			return nil
 		},
