@@ -233,3 +233,18 @@ Self-reported by M5's coder, and none visible in a diff: a reporting expression 
 ## 18. AN AGENT ASKED TO EDIT ITS OWN OPERATING INSTRUCTIONS SHOULD REFUSE, EVEN WHEN THE EDIT IS RIGHT
 
 M5's coder declined to correct a stale claim in `.claude/agents/coder.md` and in `CLAUDE.md`, on the ground that it would not rewrite its own operating instructions because a teammate asked. **Both edits were genuinely correct** — and that is the point: correctness is not something the agent could establish from inside the request. Route such edits to a role that owns doc surfaces and holds no authority over the file's description of itself, or to the lead.
+
+## 19. 🔴 THIS WORKTREE'S `node_modules` ARE SYMLINKS INTO `main` — AN INSTALL WRITES THROUGH THEM
+
+Verified 2026-08-03 in the PRD #103 M5 worktree:
+
+```
+web/node_modules   -> …/uzi/main/web/node_modules
+agent/node_modules -> …/uzi/main/agent/node_modules
+```
+
+Placed deliberately so validators can run `gate:web` / `gate:agent` **without installing** — which is the standing remedy item 7 prescribes for the `agent-browser` clobber. The consequence nobody had written down: **`npm ci` or `npm install` in such a worktree does not create a local tree, it writes THROUGH the symlink into `main`**, mutating the reference tree that every other worktree and session shares. In `agent/` it also fires `agent-browser`'s postinstall, rewriting `/opt/homebrew/bin/agent-browser` host-wide.
+
+**They are gitignored, so `git status` shows nothing and no diff can reveal them.** The only tell is `ls -ld`. Check before any npm operation in a PRD worktree, and treat "I need to install" as a reason to stop and ask rather than proceed.
+
+Handed over by M5's outgoing coder at shutdown, unprompted — the class of knowledge that dies with an agent's context unless it is asked for or volunteered.
