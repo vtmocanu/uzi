@@ -14,12 +14,20 @@ import (
 // The first canary (`scripts/gitleaks-canary.txt`) catches a scanner that has
 // been switched OFF: any `.gitleaks.toml` allowlist broad enough to hide a real
 // secret hides that canary too. It cannot catch a scanner that has been NARROWED.
-// Measured 2026-08-03 with one planted secret in a tracked `_test.go`: with an
-// `[allowlist]` whose `paths` entry is the regex `.*_test\.go` (in gitleaks' own
-// triple-single-quoted TOML form, which is not written literally here because
-// gofmt rewrites three consecutive apostrophes inside a comment into a
-// typographic quote), the scan went from exit 1 with the finding named to exit 0
-// with the first canary still cheerfully reported, and
+//
+// AND THE NARROWING THAT MATTERS IS THE ONE WRITTEN CORRECTLY. A bare
+// `[allowlist] paths` REPLACES gitleaks' ruleset, so nothing loads at all, every
+// canary dies, and that spelling was caught before this file existed. Put
+// `[extend] useDefault = true` above it -- what a careful contributor writes --
+// and the rules stay loaded while only the named paths go unread. That is the
+// form measured below.
+//
+// Measured 2026-08-03 with one planted secret in a tracked `_test.go`: with
+// `[extend] useDefault = true` plus an `[allowlist]` whose `paths` entry is the
+// regex `.*_test\.go` (in gitleaks' own triple-single-quoted TOML form, which is
+// not written literally here because gofmt rewrites three consecutive apostrophes
+// inside a comment into a typographic quote), the scan went from exit 1 with the
+// finding named to exit 0 with the first canary still cheerfully reported, and
 // the only trace was the byte counter dropping 28.24 MB -> 24.40 MB. That
 // allowlist is the tempting disposal for this repo's fake-token fixtures, and it
 // turns off secret scanning for every test file forever.

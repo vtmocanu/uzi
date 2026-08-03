@@ -24,6 +24,20 @@ disappears too. So the wrapper does not need to inspect, parse or trust the
 config at all -- it asks one question of the report ("is the canary in here?")
 and every way of switching the scanner off answers it "no".
 
+THIS IS ONE OF TWO. The other is `api/internal/config/gitleaks_canary_test.go`,
+and the split is deliberate: this file catches a scanner that has been switched
+OFF, and could not see one that had merely been NARROWED.
+
+The narrowing that matters is the one written CORRECTLY, which is the part worth
+remembering. A bare `[allowlist] paths` REPLACES gitleaks' ruleset outright, so
+no rule loads, every canary dies, and the wrapper catches it. Add
+`[extend] useDefault = true` above it -- which is what a careful contributor
+writes -- and the rules stay loaded while the named paths simply go unread. With
+a `paths` regex matching `_test.go`, secret scanning is off for every test file
+in the repo and this canary, sitting in `scripts/`, goes on reporting happily.
+The second canary lives inside the test corpus so that config dies loudly. Two
+canaries cover two regions and no more; read the wrapper's header for the limit.
+
 WHAT BREAKS IF YOU TOUCH THIS FILE
 --------------------------------------------------------------------------------
 * Delete it, move it, or rename it        -> `task scan:secrets` exits 2.

@@ -378,11 +378,14 @@ tasks:
   # including agent/templates/entrypoint.sh, the worker entrypoint that runs in
   # every hosted worker pod).
   #
-  # `scan:secrets` takes the index rule furthest: its scope is `git ls-files` with
-  # no filter at all. That is not symmetry for its own sake -- gitleaks does NOT
-  # honour `.gitignore` (measured), so the obvious `gitleaks dir .` would scan a
-  # contributor's `web/dist`, local `.env` and stale build output, none of which
-  # exists in CI's checkout. Index scope is what makes the two agree.
+  # `scan:secrets` takes its GATING scope from the index too, but it gets there
+  # the other way round: gitleaks walks the whole tree and the wrapper filters the
+  # REPORT against `git ls-files`. It has to, because `gitleaks dir` honours one
+  # target and silently widens to `.` on two or more, so a file list cannot be
+  # handed to it. The index rule still earns its place -- gitleaks does NOT honour
+  # `.gitignore` (measured), so gating on the walk would gate on a contributor's
+  # `web/dist`, local `.env` and stale build output, none of which is in CI's
+  # checkout. Findings outside the index are printed and do not gate.
   #
   # 🔴 AND `git ls-files '*.sh'` IS NOT ENOUGH EITHER -- IT WAS ALREADY STALE WHEN
   # M5 SHIPPED IT. An extension is a naming convention; a shebang is what the kernel
@@ -549,20 +552,39 @@ tasks:
       # gives for golangci-lint: the official image would be this pipeline's first
       # unpinned effective toolchain.
       #
-      # THE CANARY PATH IS AN ARGUMENT for the reason `lint:yaml` passes its config
-      # path: it is a separate tracked file that can be deleted, moved or edited,
-      # and this is where a reader sees which one is in play. Delete the argument
-      # and the script exits 2 on a usage error rather than quietly scanning
-      # without a control. The canary must also be TRACKED -- the scope below is
-      # the git index -- so `git rm --cached` on it is caught too, by the same
-      # branch and with the same message.
+      # THE CANARY PATHS ARE ARGUMENTS for the reason `lint:yaml` passes its config
+      # path: they are separate tracked files that can be deleted, moved or edited,
+      # and this is where a reader sees which ones are in play. Drop them and the
+      # script exits 2 on a usage error rather than quietly scanning without a
+      # control. They must also be TRACKED -- the gating scope is the git index --
+      # so `git rm --cached` on one is caught too, by the same branch.
       #
-      # SCOPE IS `git ls-files`, NOT `dir .`, and the reason is measured: gitleaks
-      # does NOT honour `.gitignore`, so `dir .` scans whatever is lying in a
-      # contributor's worktree (`web/dist`, a local `.env`, stale build output) and
-      # CI's checkout has none of it. Same index-scoped rule as `lint:shell` and
-      # `lint:yaml`; argued in full in the script.
-      - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt
+      # 🔴 TWO OF THEM, IN TWO REGIONS, AND THAT IS THE POINT RATHER THAN
+      # REDUNDANCY. The `scripts/` one dies with any allowlist broad enough to
+      # DISARM the scanner. It could not see a NARROWING -- and the dangerous
+      # spelling is the CORRECT one, which is the part to carry away: a bare
+      # `[allowlist] paths` REPLACES the ruleset, so nothing loads, every canary
+      # dies and it was caught already; `[extend] useDefault = true` plus the same
+      # `paths` leaves the rules loaded and only the named files unread. Measured
+      # with the second spelling and a regex matching `_test.go`: a planted secret
+      # went from exit 1 to exit 0 with the `scripts/` canary still cheerfully
+      # reported, the only trace being the byte counter falling 28.54 -> 24.70 MB.
+      # The second canary lives inside the test corpus, so that config now exits 2
+      # naming exactly it. It closes the MEASURED instance, not narrowing in
+      # general -- an allowlist scoped to a directory holding no canary still slips
+      # past both, and the script's header says so rather than papering over it.
+      #
+      # 🔴 SCOPE: gitleaks is handed exactly ONE target (`.`) and the WRAPPER
+      # filters its report against `git ls-files`. Not a style choice. `gitleaks
+      # dir` honours ONE target and SILENTLY WIDENS TO `.` on two or more --
+      # measured on a three-file fixture, two targets reported the third, byte
+      # count identical to `dir -- .` -- so the earlier "pass the whole index as
+      # targets" form scanned everything while claiming the index. Filtering the
+      # report makes the claim true AND checkable. Gating on the index rather than
+      # on the walk is what keeps a contributor's verdict equal to CI's, since
+      # gitleaks does not honour `.gitignore`; findings in untracked files are
+      # printed and do NOT gate.
+      - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
 
   # ------------------------------------------------------------- api (Go) -----
   fmt-check:api:

@@ -2,37 +2,70 @@
 # Scan the working tree for secrets with gitleaks, and PROVE THE SCANNER WAS LIVE
 # before believing its verdict (PRD #103 M5).
 #
-# usage: scripts/scan-secrets.sh <gitleaks-version> <canary-path>
-#   e.g. scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt
+# usage: scripts/scan-secrets.sh <gitleaks-version> <canary-path>...
+#   e.g. scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt \
+#          api/internal/config/gitleaks_canary_test.go
 #
 # A SCRIPT, NOT AN INLINE `cmds:` LINE, for the reason recorded in full at
 # scripts/lint-shell.sh: M5 adds shellcheck over every tracked script, so a
 # committed script is linted and an inline Taskfile recipe is not.
 #
-# 🔴 THE CANARY IS THE WHOLE POINT OF THIS FILE, AND IT IS NOT DEFENSIVE PADDING.
-# gitleaks AUTO-DISCOVERS `.gitleaks.toml` OUT OF THE TREE IT IS SCANNING, so the
-# scanner's configuration is an ordinary tracked file that anyone who can open a
-# merge request can add or widen -- and that merge request's own `scan:secrets`
-# job then reads it. Measured 2026-08-03, same directory, same two planted
-# secrets, no `-c` in either run: config absent -> 2 leaks; a config carrying
-# `[allowlist] regexes = ['''.*''']` -> "no leaks found", exit 0. Re-measured
-# against the explicit-file-list form this script actually uses, because the
-# discovery rule is written in terms of the target path and a file list is not a
-# directory: a root `.gitleaks.toml` STILL applies. The hole is not closed by the
-# scope choice below and must not be assumed to be. A scanner a contributor can
-# switch off in the same commit that adds the secret is worse than no scanner,
-# because it reports GREEN.
+# 🔴 THE CANARIES ARE THE WHOLE POINT OF THIS FILE, AND THEY ARE NOT DEFENSIVE
+# PADDING. gitleaks AUTO-DISCOVERS `.gitleaks.toml` OUT OF THE TREE IT IS
+# SCANNING, so the scanner's configuration is an ordinary tracked file that anyone
+# who can open a merge request can add or widen -- and that merge request's own
+# `scan:secrets` job then reads it. Measured 2026-08-03, same directory, same two
+# planted secrets, no `-c` in either run: config absent -> 2 leaks; a config
+# carrying `[allowlist] regexes = ['''.*''']` -> "no leaks found", exit 0. A
+# scanner a contributor can switch off in the same commit that adds the secret is
+# worse than no scanner, because it reports GREEN.
 #
 # What closes it is that EVERY ALLOWLIST BROAD ENOUGH TO BLIND THE SCANNER ALSO
-# BLINDS THE CANARY -- measured on that same pair of runs, the canary's own finding
-# disappeared under the disarming config. So this script never reads, parses or
-# trusts a config. It asks the REPORT one question ("is the canary in here?"), and
-# every way of switching the scanner off answers it "no". That makes the check a
-# property of the recipe rather than of anyone's discipline, and it is the only
-# mechanism in this milestone that satisfies CLAUDE.md's "a control that produces
-# no output is not a control" for a check whose healthy state is silence: a clean
-# run PRINTS the canary it detected, so a green here is a positive observation
-# rather than an absence of complaint.
+# BLINDS THE CANARIES -- measured on that same pair of runs, the canary's own
+# finding disappeared under the disarming config. So this script never reads,
+# parses or trusts a config. It asks the REPORT one question ("are the canaries in
+# here?"), and every way of switching the scanner off answers it "no". That makes
+# the check a property of the recipe rather than of anyone's discipline, and it is
+# the only mechanism in this milestone that satisfies CLAUDE.md's "a control that
+# produces no output is not a control" for a check whose healthy state is silence:
+# a clean run PRINTS the canaries it detected, so a green here is a positive
+# observation rather than an absence of complaint.
+#
+# 🔴 TWO CANARIES, IN TWO DIFFERENT REGIONS OF THE TREE, and the second one closes
+# a hole the first cannot see. A DISARMING allowlist kills any canary. A NARROW
+# one does not -- and BE PRECISE ABOUT WHICH NARROW ONE, because the two spellings
+# behave oppositely and the dangerous one is the CORRECT one:
+#
+#     [allowlist] paths = [...]                      <- no `[extend]`: REPLACES the
+#                                                       whole ruleset, so nothing
+#                                                       loads, every canary dies,
+#                                                       and this is CAUGHT at 2
+#     [extend] useDefault = true + [allowlist] paths <- rules still load, only the
+#                                                       named paths go unread. THIS
+#                                                       is the one that slipped
+#
+# So the form a contributor writes first, and the form the error text below warns
+# against, was already caught; the form a careful contributor writes was not. With
+# `[extend]` present and `paths` matching `_test.go` -- the tempting disposal for
+# this repo's fake-token fixtures -- secret scanning is off for every test file
+# forever while a canary living in `scripts/` reports happily. Measured
+# 2026-08-03 as a discriminating pair, one planted secret in a tracked `_test.go`:
+#     no config          -> exit 1, the finding named, 28.24 MB scanned
+#     that paths= config -> exit 0, canary still detected, 24.40 MB scanned
+# The 3.84 MB the second run did not read is the whole test corpus, and NOTHING IN
+# THE OUTPUT SAID SO. So the second canary lives INSIDE the test corpus, and with
+# it that config takes this script to exit 2 instead of 0.
+#
+# 🔴 THAT CLOSES THE MEASURED INSTANCE, NOT NARROWING IN GENERAL, and the limit is
+# written here rather than papered over: an allowlist scoped to, say,
+# `api/internal/config/` still slips past both canaries. A canary can only see the
+# regions it is planted in. `.gitleaks.toml` is deliberately still PERMITTED --
+# it is visible in a diff, so narrowing is a review question rather than a silent
+# one, and that reason settles it on its own. (An earlier version of this comment
+# gave a second reason, "banning it would make the canary's failure branch
+# unreachable". That was REFUTED: with no config anywhere, mutating a canary's
+# token takes this script to exit 2, so the branch is reachable without one. The
+# canary file's own "WHAT BREAKS IF YOU TOUCH THIS FILE" list said so already.)
 #
 # 🔴 AND IT CANNOT BE REPLACED BY READING GITLEAKS' EXIT CODE. Measured
 # 2026-08-03: clean 0, findings 1, `-c` pointing at a missing file 1, `-c` at a
@@ -41,26 +74,6 @@
 # shares the other. The 2/1/0 convention this repo uses is not derivable from it,
 # which is why `--exit-code 0` is passed (gitleaks' status is deliberately taken
 # out of the decision) and the report is what is read.
-#
-# 🔴 WHAT THE CANARY DOES NOT COVER, MEASURED RATHER THAN LEFT TO BE DISCOVERED.
-# A NARROW allowlist -- `[allowlist] paths = ['''.*_test\.go''']`, the tempting
-# disposal for this repo's fake-token fixtures -- turns off secret scanning for
-# every test file forever and leaves the canary (a .txt under scripts/) reporting
-# happily. Measured 2026-08-03 as a discriminating pair, one planted secret in a
-# tracked `_test.go`:
-#     no config          -> exit 1, the finding named, 28.24 MB scanned
-#     that paths= config -> exit 0, canary still detected, 24.40 MB scanned
-# The 3.84 MB the second run did not read is the whole test corpus, and NOTHING IN
-# THE OUTPUT SAYS SO -- the byte counter is the only tell and it takes two runs to
-# read. So: the canary catches DISARM, not NARROWING.
-#
-# `.gitleaks.toml` is deliberately NOT banned here even so, for two reasons. It is
-# visible in a diff, which makes narrowing a review question rather than a silent
-# one; and banning it would make the canary's own failure branch UNREACHABLE, so
-# nobody could ever demonstrate that the mechanism this file is built around
-# works. A guard that forecloses its own calibration is worth less than the hole
-# it closes. The two routes that are NOT visible in a diff are refused outright
-# below.
 #
 # 🔴 NO SKIP BRANCH, WHICH IS A DELIBERATE ASYMMETRY WITH THE OTHER THREE
 # `gate:repo` CHECKS. shellcheck, yamllint and ruby print a loud SKIP and exit 0
@@ -78,31 +91,34 @@
 #
 # EXIT CODES (the convention `fmt-check:api`, `lint:api`, deadcode-gate.sh and the
 # three `lint-*.sh` scripts set):
-#     2 = the instrument is broken (canary missing from the report, scanner
-#         disarmed, config arriving by a route that is not reviewable, gitleaks
-#         itself failing)
-#     1 = there are findings
-#     0 = clean, and the canary was seen
+#     2 = the instrument is broken (a canary missing from the report, scanner
+#         disarmed or narrowed, config arriving by a route that is not reviewable,
+#         gitleaks itself failing)
+#     1 = there are findings in TRACKED files
+#     0 = clean, and every canary was seen
 # `task`'s own rc is 201 for all of them.
 set -eu
 
 VERSION="${1:-}"
-CANARY="${2:-}"
-
-if [ -z "$VERSION" ] || [ -z "$CANARY" ]; then
-  echo "usage: scripts/scan-secrets.sh <gitleaks-version> <canary-path>" >&2
-  echo "  e.g. scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt" >&2
+if [ "$#" -lt 2 ] || [ -z "$VERSION" ]; then
+  echo "usage: scripts/scan-secrets.sh <gitleaks-version> <canary-path>..." >&2
+  echo "  e.g. scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt \\" >&2
+  echo "         api/internal/config/gitleaks_canary_test.go" >&2
   exit 2
 fi
+shift
+# Remaining positionals are the canary paths. Kept as "$@" rather than folded into
+# a string: a space-joined variable is the zsh trap CLAUDE.md documents, and this
+# list is what the gate's liveness rests on.
 
-# 🔴 THE RULE THE CANARY MUST TRIP, AND WHY IT IS PINNED RATHER THAN "any finding
-# in the canary file". A TARGETED allowlist -- one that silences `gitlab-pat` and
-# nothing else -- would leave `generic-api-key` firing on the canary's token line,
-# so a File-only assertion would pass while the rule that matters most in a repo
-# whose forge is GitLab had been switched off. Asserting the rule ID closes that.
-# The cost is that a gitleaks release renaming this rule exits 2 -- which is the
-# instrument changing under us, exactly what 2 means, and the version is pinned by
-# the caller so it can only happen on a deliberate bump.
+# 🔴 THE RULE THE CANARIES MUST TRIP, AND WHY IT IS PINNED RATHER THAN "any
+# finding in a canary file". A TARGETED allowlist -- one that silences
+# `gitlab-pat` and nothing else -- would leave `generic-api-key` firing on a
+# canary's token line, so a File-only assertion would pass while the rule that
+# matters most in a repo whose forge is GitLab had been switched off. Asserting
+# the rule ID closes that. The cost is that a gitleaks release renaming this rule
+# exits 2 -- which is the instrument changing under us, exactly what 2 means, and
+# the version is pinned by the caller so it can only happen on a deliberate bump.
 CANARY_RULE="gitlab-pat"
 
 # The report template is a committed file rather than a heredoc: it is what keeps
@@ -113,12 +129,12 @@ TEMPLATE="scripts/gitleaks-report.tmpl"
 # Run from the repo root whatever the caller's directory. Two reasons, and neither
 # is tidiness. `git ls-files` invoked from a subdirectory silently narrows to that
 # subtree (lint-shell.sh's header states the same). And gitleaks' File field is the
-# scan target AS SPELLED -- a target given as `scripts/x` is reported as
-# `scripts/x`, one given as `/abs/scripts/x` as `/abs/scripts/x`. The canary
-# assertion below compares that field against the path it was passed, so both the
-# working directory and the spelling of the targets have to be fixed for the
-# comparison to mean anything. Same measurement that rules out `.gitleaksignore`
-# fingerprints, which are built from that field.
+# scan target AS SPELLED -- scanning `.` from the root yields repo-relative paths
+# (`scripts/gitleaks-canary.txt`), while `dir /abs/path` yields absolute ones. Both
+# the canary assertion and the tracked-set filter below compare that field against
+# repo-relative paths, so the working directory and the spelling of the target have
+# to be fixed for either comparison to mean anything. Same measurement that rules
+# out `.gitleaksignore` fingerprints, which are built from that field.
 ROOT="$(git rev-parse --show-toplevel)" || {
   echo "scan-secrets: not inside a git work tree (git rev-parse --show-toplevel failed)" >&2
   exit 2
@@ -148,7 +164,7 @@ fi
 # `/abs/prod.go:gitlab-pat:3`, `dir ./prod.go` gives `./prod.go:gitlab-pat:3` --
 # three spellings, three baselines, so one generated locally does not match CI's.
 # It is also POSITION-dependent: inserting one unrelated line above a baselined
-# finding makes it reappear. Unlike a `.gitleaks.toml` the canary cannot see it
+# finding makes it reappear. Unlike a `.gitleaks.toml` the canaries cannot see it
 # (it silences named findings, never the scanner), so refusing it is the only
 # thing that stops it narrowing the scan silently. The supported disposal is a
 # per-instance `//gitleaks:allow` carrying a written justification.
@@ -161,12 +177,15 @@ if [ -e .gitleaksignore ]; then
   exit 2
 fi
 
-if [ ! -f "$CANARY" ]; then
-  echo "scan-secrets: canary file not found: $CANARY" >&2
-  echo "  Restore it from git. Without it this gate cannot tell a clean tree from" >&2
-  echo "  a scanner that was switched off, which is the only thing it is for." >&2
-  exit 2
-fi
+for _c in "$@"; do
+  if [ ! -f "$_c" ]; then
+    echo "scan-secrets: canary file not found: $_c" >&2
+    echo "  Restore it from git. Without every canary this gate cannot tell a clean" >&2
+    echo "  tree from a scanner that was switched off or narrowed, which is the only" >&2
+    echo "  thing it is for." >&2
+    exit 2
+  fi
+done
 
 if [ ! -f "$TEMPLATE" ]; then
   echo "scan-secrets: report template not found: $TEMPLATE" >&2
@@ -184,70 +203,85 @@ if ! command -v go >/dev/null 2>&1; then
   exit 2
 fi
 
-# 🔴 SCOPE IS THE GIT INDEX, NOT THE DIRECTORY TREE -- the same rule lint-shell.sh
-# and lint-yaml.sh take their scope by, and for a reason `dir .` does not satisfy:
-# GITLEAKS DOES NOT HONOUR `.gitignore`. Measured 2026-08-03 in a throwaway repo:
-# a file under a gitignored directory AND an untracked file at the top level were
-# both reported by `gitleaks dir .`. So `dir .` scans whatever happens to be lying
-# in a contributor's worktree -- `web/dist`, a local `.env`, an old build output --
-# none of which exists in CI's checkout. That is a gate whose scope differs between
-# the two places Success Criterion 1 exists to keep identical, and the local half
-# is the one that reddens on files the contributor cannot fix by editing tracked
-# code. PRD #103 Decision 2: a gate people cannot run is a gate that stops being
-# run.
-#
-# `gitleaks dir` ACCEPTS MULTIPLE PATHS, which is what makes this possible at all
-# and is not documented in its `--help` (it reads `dir [flags] [path]`, singular).
-# Measured: two targets, both scanned, each reported under its own spelling.
-#
-# THE TRADE, STATED: a brand-new file the contributor has not `git add`ed yet is
-# out of scope until they add it. That is exactly the trade lint-shell.sh already
-# makes and MR-A's calibration pinned both ways (identical bytes untracked -> not
-# in scope; `git add`ed -> in scope, finding named). One rule for all three
-# repo-wide checks beats a special case here.
-#
-# NOT A REASON, RECORDED SO NOBODY RE-DERIVES IT: `node_modules` is NOT why. It is
-# skipped by gitleaks' own default allowlist, measured directly -- a planted secret
-# under `node_modules/foo/a.go` is not reported while an identical one under
-# `src/b.go` is, and the byte counter shows the directory was never opened. It is
-# skipped by name, not by `.gitignore` and not by this scope choice.
 REPORT="$(mktemp -t uzi-scan-secrets)" || {
   echo "scan-secrets: mktemp failed" >&2
   exit 2
 }
-trap 'rm -f "$REPORT"' EXIT HUP INT TERM
+TRACKED="$(mktemp -t uzi-scan-tracked)" || {
+  echo "scan-secrets: mktemp failed" >&2
+  exit 2
+}
+trap 'rm -f "$REPORT" "$TRACKED"' EXIT HUP INT TERM
 
+# 🔴 THE GATING SCOPE IS THE GIT INDEX, AND IT IS ENFORCED HERE, ON THE REPORT --
+# NOT BY WHAT IS HANDED TO GITLEAKS. THAT DISTINCTION IS THE WHOLE OF H1.
+#
+# The first version of this script passed all 1465 tracked paths as scan targets
+# and claimed the index as its scope. `gitleaks dir` HONOURS ONE TARGET; give it
+# two or more and it silently widens to `.`. Measured on a three-file fixture,
+# with the disconfirming control the original probe lacked -- a file that is NOT a
+# target:
+#     one target      40 bytes scanned, 1 finding   (the target)
+#     TWO targets    120 bytes scanned, 3 findings  (INCLUDING the non-target)
+#     `dir -- .`     120 bytes scanned, 3 findings  (byte-identical)
+# and on this repo the 1465-target invocation scanned 28,426,804 bytes against a
+# tracked-byte sum of 22.5 MB -- 26% excess, byte-identical to `dir -- .`.
+#
+# The measurement that established multi-target support ("two targets, both
+# scanned, each reported under its own spelling") was TRUE. The inference was not:
+# both targets are scanned AND SO IS EVERYTHING ELSE. An instrument that cannot
+# produce the disconfirming answer is not evidence.
+#
+# So: hand gitleaks ONE target and filter its report. The claim then becomes true
+# rather than merely intended, and -- unlike passing a file list -- it is
+# checkable, because the filtering happens in code a reviewer can read.
+#
+# WHY THE INDEX AND NOT THE WORKING TREE. gitleaks does NOT honour `.gitignore`
+# (measured: a file under a gitignored directory and an untracked file at the top
+# level were both reported). So gating on everything it walks means gating on
+# whatever is lying in a contributor's worktree -- `web/dist`, a local `.env`,
+# stale build output -- none of which is in CI's checkout.  Same index-scoped rule
+# lint-shell.sh and lint-yaml.sh already take.
+#
+# UNTRACKED FINDINGS ARE REPORTED BUT DO NOT GATE. Dropping them silently would
+# throw away the most useful local signal there is (a secret in a file you just
+# created and have not added yet); gating on them would make a contributor's
+# verdict differ from CI's. So they are counted and named, at exit 0, under a
+# banner saying they are not gating. `git add` the file and the next run gates on
+# it.
 FILES="$(git ls-files)" || exit 2
 
 if [ -z "$FILES" ]; then
   echo "scan-secrets: the git index lists no files under $ROOT." >&2
-  echo "  An empty scope is an instrument failure, never a clean run. gitleaks with" >&2
-  echo "  no target scans the working directory, so this must never be allowed to" >&2
-  echo "  fall through to the invocation below." >&2
+  echo "  An empty tracked set is an instrument failure, never a clean run: with" >&2
+  echo "  nothing to compare the report against, every finding would be classed as" >&2
+  echo "  untracked and this gate would pass whatever gitleaks found." >&2
   exit 2
 fi
+printf '%s\n' "$FILES" > "$TRACKED"
 
-# Split on NEWLINE ONLY, globbing off -- see lint-shell.sh for why the default IFS
-# is wrong here (git does not quote spaces) and why `set -f` is needed. A path
-# containing a newline is C-quoted by git and will not stat, which makes gitleaks
-# exit non-zero into the instrument-broken branch below rather than silently
-# narrowing the scope.
-oldIFS="${IFS-}"
-IFS='
-'
-set -f
-# shellcheck disable=SC2086  # PRE-ARMED, NOT VACUOUS: SC2086 is `info`, so it does
-# not fire at this gate's `--severity=warning` -- the same directive and the same
-# reason as lint-shell.sh's and lint-yaml.sh's. Deliberate word split, see above.
-set -- $FILES
-set +f
-IFS="$oldIFS"
+# git C-QUOTES a path containing a control character, so a tracked path with a
+# newline in its name would reach $TRACKED as a literal `"a\nb"` and never match
+# the raw path gitleaks reports -- that finding would silently fall into the
+# non-gating untracked bucket. There are none today (measured: zero lines begin
+# with a quote) and this refuses to run if that changes, rather than degrading
+# quietly.
+if grep -q '^"' "$TRACKED"; then
+  echo "scan-secrets: the index contains a C-quoted path (one whose name holds a" >&2
+  echo "  control character or a newline). The tracked-set comparison below is" >&2
+  echo "  line-based and cannot match it, so such a file would be treated as" >&2
+  echo "  untracked and would stop gating. Rename it." >&2
+  exit 2
+fi
 
 # 🔴 `dir`, NEVER `git`. History mode ran past 25 minutes on this repo's 2471
 # commits without finishing, and in CI it would read only the shallow clone that
 # `GIT_DEPTH` leaves behind -- a narrowed scan that looks exactly like a pass.
 # `dir` reads the files as they are on disk, so it sees an uncommitted secret in a
 # tracked file, and its scope does not depend on how the runner cloned.
+#
+# 🔴 EXACTLY ONE TARGET. See the H1 paragraph above: a second one is not an
+# addition, it is a silent widening to `.`.
 #
 # 🔴 `--exit-code 0` IS LOAD-BEARING, NOT A CONVENIENCE. It takes gitleaks' status
 # out of the decision entirely (see the header's collapse table), so that the ONLY
@@ -269,7 +303,7 @@ go run "github.com/zricethezav/gitleaks/v8@$VERSION" dir \
   -f template \
   --report-template "$TEMPLATE" \
   --report-path "$REPORT" \
-  -- "$@" || rc=$?
+  -- . || rc=$?
 
 if [ "$rc" -ne 0 ]; then
   echo "scan-secrets: gitleaks exited $rc under --exit-code 0, so this is NOT a" >&2
@@ -282,64 +316,117 @@ fi
 
 # Parse: File<TAB>StartLine<TAB>RuleID, one finding per line. Redirected from the
 # file rather than piped so the loop runs in THIS shell and the counters survive.
-canary_hits=0
-canary_rule_hits=0
-other_count=0
-others=""
+canary_seen=""
+tracked_count=0
+tracked_list=""
+untracked_count=0
+untracked_list=""
 while IFS='	' read -r f_file f_line f_rule; do
   [ -n "$f_file" ] || continue
-  if [ "$f_file" = "$CANARY" ]; then
-    canary_hits=$((canary_hits + 1))
-    if [ "$f_rule" = "$CANARY_RULE" ]; then
-      canary_rule_hits=$((canary_rule_hits + 1))
-    fi
-    continue
-  fi
-  other_count=$((other_count + 1))
-  others="${others}  ${f_file}:${f_line}  ${f_rule}
+
+  _is_canary=0
+  for _c in "$@"; do
+    if [ "$f_file" = "$_c" ]; then
+      _is_canary=1
+      # Only a hit under the PINNED rule counts as a canary sighting. A finding on
+      # a canary file under some OTHER rule is neither a sighting nor a gating
+      # finding, so it is swallowed here deliberately: the file's whole purpose is
+      # to hold a fake credential, and reporting it as a leak would be noise.
+      if [ "$f_rule" = "$CANARY_RULE" ]; then
+        canary_seen="$canary_seen$_c
 "
+      fi
+      break
+    fi
+  done
+  [ "$_is_canary" -eq 0 ] || continue
+
+  if grep -q -F -x -e "$f_file" -- "$TRACKED"; then
+    tracked_count=$((tracked_count + 1))
+    tracked_list="${tracked_list}  ${f_file}:${f_line}  ${f_rule}
+"
+  else
+    untracked_count=$((untracked_count + 1))
+    if [ "$untracked_count" -le 10 ]; then
+      untracked_list="${untracked_list}  ${f_file}:${f_line}  ${f_rule}
+"
+    fi
+  fi
 done < "$REPORT"
 
-if [ "$canary_rule_hits" -eq 0 ]; then
+missing=""
+for _c in "$@"; do
+  case "
+$canary_seen" in
+    *"
+$_c
+"*) ;;
+    *) missing="$missing  $_c
+" ;;
+  esac
+done
+
+if [ -n "$missing" ]; then
   echo "scan-secrets: ================================================================" >&2
-  echo "scan-secrets: THE CANARY IS NOT IN THE REPORT. THE SCANNER WAS BLIND." >&2
+  echo "scan-secrets: A CANARY IS NOT IN THE REPORT. THE SCANNER WAS BLIND." >&2
   echo "scan-secrets:" >&2
-  echo "scan-secrets: $CANARY holds a fake GitLab token that gitleaks' \`$CANARY_RULE\`" >&2
-  echo "scan-secrets: rule reports on every healthy run. It is missing, so this run" >&2
-  echo "scan-secrets: proves nothing about the rest of the tree and its \"no findings\"" >&2
-  echo "scan-secrets: is NOT a clean bill of health." >&2
-  echo "scan-secrets: (findings in the canary file under other rules: $canary_hits)" >&2
+  echo "scan-secrets: Missing (each must yield a \`$CANARY_RULE\` finding):" >&2
+  printf '%s' "$missing" >&2
+  echo "scan-secrets:" >&2
+  echo "scan-secrets: Each canary holds a fake GitLab token that gitleaks reports on" >&2
+  echo "scan-secrets: every healthy run. One is missing, so this run proves nothing" >&2
+  echo "scan-secrets: about the region it lives in, and its \"no findings\" is NOT a" >&2
+  echo "scan-secrets: clean bill of health." >&2
   echo "scan-secrets:" >&2
   echo "scan-secrets: In order of likelihood:" >&2
-  echo "scan-secrets:   * a .gitleaks.toml was added or widened -- an allowlist broad" >&2
-  echo "scan-secrets:     enough to hide a secret also hides the canary, which is the" >&2
-  echo "scan-secrets:     entire reason this check exists;" >&2
-  echo "scan-secrets:   * the canary's token line was edited, or gained a" >&2
-  echo "scan-secrets:     suppression comment (the annotation matches as a substring" >&2
-  echo "scan-secrets:     of the LINE, so it would silence the canary);" >&2
+  echo "scan-secrets:   * a .gitleaks.toml was added or widened. An allowlist broad" >&2
+  echo "scan-secrets:     enough to hide a secret also hides a canary -- and if only" >&2
+  echo "scan-secrets:     ONE canary died, read WHICH: they sit in different regions" >&2
+  echo "scan-secrets:     of the tree precisely so a NARROWING shows up here;" >&2
+  echo "scan-secrets:   * a canary's token line was edited, or gained a suppression" >&2
+  echo "scan-secrets:     comment (the annotation matches as a substring of the LINE," >&2
+  echo "scan-secrets:     so it would silence that canary);" >&2
   echo "scan-secrets:   * gitleaks $VERSION renamed or dropped the \`$CANARY_RULE\` rule." >&2
   echo "scan-secrets: ================================================================" >&2
   exit 2
 fi
 
-if [ "$other_count" -gt 0 ]; then
-  echo "scan-secrets: $other_count secret finding(s) outside the canary:" >&2
-  printf '%s' "$others" >&2
-  echo "  Canary seen ($canary_rule_hits x $CANARY_RULE), so the scanner WAS live and" >&2
-  echo "  these are real reports about real lines." >&2
+if [ "$untracked_count" -gt 0 ]; then
+  echo "scan-secrets: NOTE -- $untracked_count finding(s) in UNTRACKED files. NOT GATING."
+  printf '%s' "$untracked_list"
+  if [ "$untracked_count" -gt 10 ]; then
+    echo "scan-secrets:   … and $((untracked_count - 10)) more (listing capped at 10)."
+  fi
+  echo "scan-secrets: These are outside the git index, so CI's checkout does not have"
+  echo "scan-secrets: them and gating on them would make your verdict differ from CI's."
+  echo "scan-secrets: If one is a file you are about to commit, \`git add\` it and run"
+  echo "scan-secrets: again -- it will gate then."
+fi
+
+if [ "$tracked_count" -gt 0 ]; then
+  echo "scan-secrets: $tracked_count secret finding(s) in TRACKED files:" >&2
+  printf '%s' "$tracked_list" >&2
+  echo "  Every canary was seen, so the scanner WAS live over every region they" >&2
+  echo "  cover, and these are real reports about real lines." >&2
   echo "" >&2
   echo "  If a finding is a test fixture, annotate THAT LINE with" >&2
   echo "  \`//gitleaks:allow\` FOLLOWED BY A WRITTEN JUSTIFICATION. Do not reach for" >&2
   echo "  a .gitleaks.toml \`paths\` allowlist: \`.*_test\\.go\` turns off secret" >&2
-  echo "  scanning for every test file in the repo, forever, and nothing reports" >&2
-  echo "  that it did. gitleaks has no unused-directive report either, so an" >&2
-  echo "  annotation suppresses whatever its line LATER comes to contain -- which" >&2
-  echo "  is why the justification is not paperwork." >&2
+  echo "  scanning for every test file in the repo, forever. Note WHICH spelling is" >&2
+  echo "  dangerous -- a bare [allowlist] paths replaces the whole ruleset, so every" >&2
+  echo "  canary dies and this gate exits 2; it is the CORRECT one, [extend]" >&2
+  echo "  useDefault = true plus paths, that leaves the canaries alive. The second" >&2
+  echo "  canary makes that one exit 2 too, but an allowlist scoped to a directory" >&2
+  echo "  holding no canary still slips past both. gitleaks has no unused-directive" >&2
+  echo "  report either, so an annotation suppresses whatever its line LATER comes" >&2
+  echo "  to contain -- which is why the justification is not paperwork." >&2
   exit 1
 fi
 
-echo "scan-secrets: clean -- 0 findings outside the canary over $# tracked files."
-echo "scan-secrets: canary DETECTED at $CANARY ($canary_rule_hits x $CANARY_RULE, gitleaks $VERSION)."
-echo "scan-secrets: that line is the positive observation: without it this green would"
-echo "scan-secrets: be indistinguishable from a scanner that never looked."
+tracked_total="$(wc -l < "$TRACKED" | tr -d ' ')"
+echo "scan-secrets: clean -- 0 findings in tracked files ($tracked_total in the index)."
+echo "scan-secrets: canaries DETECTED ($CANARY_RULE, gitleaks $VERSION):"
+printf '%s' "$canary_seen" | sed 's/^/scan-secrets:   /'
+echo "scan-secrets: those lines are the positive observation: without them this green"
+echo "scan-secrets: would be indistinguishable from a scanner that never looked."
 exit 0
