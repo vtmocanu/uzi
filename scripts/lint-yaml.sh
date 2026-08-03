@@ -179,7 +179,10 @@ oldIFS="${IFS-}"
 IFS='
 '
 set -f
-# shellcheck disable=SC2086  # deliberate word split; see the paragraph above.
+# shellcheck disable=SC2086  # PRE-ARMED, NOT VACUOUS: SC2086 is `info`, so it does
+# not fire at this gate's `--severity=warning` -- strip-and-restore gives rc=0 and
+# zero hits with or without it. It fires at `-S info`/`-S style`, which is the
+# burn-down deferred to its own follow-up. Deliberate word split, see above.
 set -- $FILES
 set +f
 IFS="$oldIFS"
