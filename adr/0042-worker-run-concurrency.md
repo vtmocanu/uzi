@@ -3,7 +3,7 @@
 **Status**: Proposed (accepted when PRD #42 is approved)
 **Date**: 2026-07-10
 **Deciders**: Vlad + three-agent research panel (codebase map, prior art, industry practice); adversarially reviewed by a second three-agent panel (design, security, fact-check)
-**PRD**: [prds/42-worker-run-concurrency.md](../prds/42-worker-run-concurrency.md) (GitLab issue [vtmocanu/uzi#42](https://gitlab.example.com/vtmocanu/uzi/-/issues/42)) — the PRD carries the implementation design and milestones; this ADR carries the decision and its rationale.
+**PRD**: [prds/done/42-worker-run-concurrency.md](../prds/done/42-worker-run-concurrency.md) (GitLab issue [vtmocanu/uzi#42](https://gitlab.example.com/vtmocanu/uzi/-/issues/42)) — the PRD carries the implementation design and milestones; this ADR carries the decision and its rationale.
 
 ## Decision (summary)
 
