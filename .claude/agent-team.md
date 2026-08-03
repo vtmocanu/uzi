@@ -1435,6 +1435,24 @@ lint           task lint           # composite, all four components (M5 will app
                                    # clear the cache for every concurrent agent), so
                                    # if you are calibrating, or chasing a surprising
                                    # green, clean first and re-run.
+                                   # 🔴 BUT DO NOT `cache clean` FOR AN ORDINARY
+                                   # DISPATCH -- IT IS HOST-GLOBAL AND CLEARS THE
+                                   # WARM CACHE FOR EVERY OTHER CONCURRENT AGENT
+                                   # AND WORKTREE TOO. SET A PRIVATE
+                                   # `GOLANGCI_LINT_CACHE=<your own dir>` INSTEAD;
+                                   # it gives the same isolation with none of the
+                                   # shared cost. Two live collisions on one
+                                   # branch: a first `task gate:api` run died on
+                                   # `Error: parallel golangci-lint is running`
+                                   # because a sibling worktree held the lock
+                                   # (re-ran green, nothing wrong); on the same
+                                   # branch a reviewer declined to run `lint:api`
+                                   # at all, partly to avoid contending with a
+                                   # tester's concurrent run, and reported that
+                                   # slot as resting on the coder's word rather
+                                   # than its own. A private cache dir removes the
+                                   # collision instead of dodging or re-running
+                                   # around it.
                                    # 🔴 AND CLEAN **AFTER** DELETING A THROWAWAY
                                    # WORKTREE, NOT ONLY BEFORE AN ARM. The cached
                                    # paths OUTLIVE THE TREE. Cleaning before your
