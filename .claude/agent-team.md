@@ -898,11 +898,32 @@ expression).
 
 ## Inspiration-first rule
 
-Before implementing something, check the submodules under `inspiration/`
-(bottega, multica, dot-agent-deck) for prior art. Match the better
-implementation, and beat it where we can. Reviewer and fact-checker
-cross-check our work against these; verify "we do it better than X" claims
-against the actual submodule code, not from memory.
+Before implementing something, check the three prior-art projects — bottega
+(<https://github.com/vdaubry/bottega>), multica
+(<https://github.com/multica-ai/multica>), dot-agent-deck
+(<https://github.com/vfarcic/dot-agent-deck>) — for the same or a similar
+feature. Match the better implementation, and beat it where we can.
+
+**They were git submodules under `inspiration/` until 2026-08-03 and are not
+vendored any more.** Run `./scripts/link-inspiration.sh` once per worktree: it
+clones them to `~/repos/external/` (shared, cloned at most once)
+and symlinks them into a **gitignored** `inspiration/`. Do not re-clone into
+the repo and never `git add -f` those links.
+
+**🔴 A REPO-WIDE `rg` OR `grep -r` CANNOT SEE THROUGH THOSE SYMLINKS, AND SAYS
+SO BY PRINTING NOTHING.** Measured 2026-08-03: neither follows a symlinked
+directory during recursive traversal, so the sweep exits 0 with no output —
+`rg <pattern> inspiration/` (explicit path) or `rg -L` is what actually
+searches it. This is exactly the *instrument that cannot produce the
+disconfirming answer* case below, and it is worse than most because the
+question ("has anyone already built this?") is the one everybody asks by
+sweeping. **An empty repo-wide sweep is not evidence of no prior art.**
+
+Reviewer and fact-checker still cross-check "we do it better than X" claims
+against X's actual code. What changed is where the code lives, not the
+standard: "not checked" is a legitimate finding; "from memory" is still not.
+uzi's own worker containers have no host filesystem and so no symlinks — the
+product's path is to clone from the URLs above on demand.
 
 ## Two negative results from instruments that share an assumption are ONE negative result
 
@@ -1497,7 +1518,9 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
   use `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
-- Inspiration submodules: `inspiration/{bottega,multica,dot-agent-deck}`
+- Prior art (external, not vendored since 2026-08-03): bottega, multica,
+  dot-agent-deck — `./scripts/link-inspiration.sh` gives you a gitignored
+  `inspiration/` of symlinks; a recursive grep does not follow them
 - Slash commands the orchestrator may invoke between delegations: none
   project-specific
 

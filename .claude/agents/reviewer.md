@@ -106,5 +106,8 @@ below the applied head bricks boot; builtin agent templates in
 `api/internal/agenttmpl/builtins/` are decoupled from `.claude/agents/`, and no test may
 assert on the `.claude/agents/` roster shape. A route/DTO/behavior change that only touches
 `web/` may leave `api/cmd/uzi/` (the CLI) silently stale — flag it. Inspiration-first:
-cross-check `inspiration/` (bottega, multica, dot-agent-deck) and flag ours where one does
-it more cleanly.
+cross-check the three prior-art projects (bottega, multica, dot-agent-deck) and flag ours
+where one does it more cleanly — not vendored since 2026-08-03, so run
+`./scripts/link-inspiration.sh` for a gitignored `inspiration/` of symlinks, and search it
+by explicit path (`rg <pat> inspiration/`): a recursive `rg`/`grep -r` does not follow
+symlinked dirs and returns a clean empty result that is not evidence of no prior art.

@@ -21,6 +21,14 @@ agent/node_modules
 node_modules
 web/dist/
 
+# Prior-art corpus (bottega, multica, dot-agent-deck). Vendored as git submodules
+# under inspiration/ until 2026-08-03, now kept as ordinary clones OUTSIDE the repo
+# and reached through per-worktree SYMLINKS -- see CLAUDE.md "Inspiration-first".
+# No trailing slash, for the same reason node_modules above has none: a symlink is
+# not a directory, so `inspiration/` would leave the links untracked-but-not-ignored
+# and one `git add -A` would commit an absolute path off this machine into the repo.
+inspiration
+
 # Go
 api/server
 api/uzi

@@ -7748,7 +7748,11 @@ CI shape.
   `main` (`publish_brew` pushes `HEAD:main`); provision `Formula/` + a README carrying the Risk 2
   caveat **before the first `v*` tag`. Risk 2: the formula clones `vtmocanu/uzi` over git-over-SSH at
   the tag and builds from source, so consumers need **group-read on the repo** (a departure from
-  example-app's no-repo-access model); Homebrew does not fetch submodules, so `inspiration/` stays out; any
+  example-app's no-repo-access model); `inspiration/` stays out of the build *(as written: because Homebrew
+does not fetch submodules. **Corrected 2026-08-03** — the conclusion holds but the reason is now moot:
+the three `inspiration/` submodules were removed from the repo that day, so there is nothing for
+Homebrew to decline to fetch. The formula gains no new exposure; a future reader should not infer from
+this line that the tree still carries submodules)*; any
   `uzi-cli-<version>` tap tag is informational only — the download pin is uzi's `v*` tag.
 - **Precondition (PRD #64 Risk 12), invisible in this repo**: `v*` protected-tag creation must stay
   **Maintainer-only** so the Developer-role bot cannot cut a `v*` tag and reach `TAP_WRITE_TOKEN`.
