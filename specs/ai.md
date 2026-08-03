@@ -16301,7 +16301,10 @@ the plan region and one against the bullet region. Relocation now fails **by con
 asserts — whatever context the phrase does or does not carry.
 
 - **The phrases shrink because the region carries the position.** Measured on the shipped
-  template, **666 → 376 characters (−44%)**. (The issue quotes 717 → 375 from the tester's
+  template, **666 → 376 characters**. (Stated raw rather than as a percentage on purpose:
+  the same measurement rounds to −44% or −43% depending on which way it is taken, and two
+  numbers in two places read as a discrepancy to anyone who meets them apart. Raw figures
+  cannot disagree with themselves.) (The issue quotes 717 → 375 from the tester's
   prototype, whose phrase set predates #197's round-4 rewording; both are right for their
   own tree.) Everything §467 gave up to make anchoring work comes back: the spans are
   pairwise disjoint again, each phrase occurs exactly once, the two deliberate overlaps are
@@ -16375,6 +16378,34 @@ asserts — whatever context the phrase does or does not carry.
   Duplicating a landmark into the other region reaches it, with the boundary count still 1.
   Same family as this file's other instrument entries: the natural control answers a
   different question, cleanly and repeatably.
+- **"Relocation fails by construction" reaches exactly as far as the BOUNDARY, and the
+  independent rounds bounded it in three directions.** (a) The plan region is everything
+  *before* the boundary — frontmatter plus both intro paragraphs — not the plan-critique
+  paragraph: **1655 bytes of region against 889 of paragraph**, so ~766 bytes of room above
+  it. Measured, hoisting the relay clause into the intro reworded as *"as a general habit"*
+  gives **rc=0, no guard, no red**, with the clause out of the section that gives it
+  meaning. Relocation *across* the boundary fails by construction; relocation *within* the
+  plan region does not. Closing it needs a second cut, and the paragraph's opening sentence
+  is itself a pinned phrase, so a naive `strings.Cut` on it would remove that phrase from
+  the region and red its own case — not a one-liner, deliberately not attempted.
+  (b) A **third boundary position** exists that no guard clause covers: partway down, past
+  the ordering sentence but before the bullet landmark. Zero guards fire, and the run reds
+  with a **false message** — `BULLET region lost … missing phrase "fans out again after an
+  implementation unit lands"` while that phrase is still in the template one line above the
+  boundary. Detection holds either way, so it is a **message** gap rather than a detection
+  gap. (c) What closes that window is a **behaviour pin, not the guard**: the bullet region
+  carries exactly one case whose phrase is the first sentence after the boundary, so any
+  move past it reds. Retire or reword that pin and the window widens with nothing structural
+  behind it — a reader sees a behaviour assertion where something load-bearing for the split
+  also sits.
+- **The sibling 14-pin set is STILL whole-body, in the same file.** `TestLeadParallelDispatchPhrases`
+  asserts against the flattened body, so the class is closed for 8 pins and open for 14:
+  measured, moving a parallel-implementer constraint out of its bullet and up into the plan
+  paragraph — across the very boundary this change introduces — leaves **both sets green at
+  rc=0**. Its exposure is genuinely narrow (those phrases nearly all live in the bullets and
+  have nowhere misleading to go), so documenting rather than scoping was the call — but
+  `splitLeadRegions` sitting in that file makes it *look* scoped, and that inference is wrong
+  for 14 of its 22 pins. Scoping them is separate work.
 - **A fold harness produced six plausible, wrong results in this run, and the tell was a
   count that could not happen.** The guard batch called its fold helper without the empty
   insert-argument placeholder, so the `sed` expressions were *appended to the template as
