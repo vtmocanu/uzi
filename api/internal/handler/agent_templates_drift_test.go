@@ -65,6 +65,16 @@ func TestDiffersFromBuiltinPerColumn(t *testing.T) {
 		t.Error("a pristine seeded builtin must not report drift")
 	}
 
+	// Non-vacuity guard for the order-only case below, which swaps the first two
+	// tools: were they ever equal, the swap would be a no-op and the case would
+	// pass against an implementation that sorts — silently, which is the failure
+	// this whole file exists to make impossible. Its sibling
+	// TestDiffersFromBuiltinPostgresCanonicalTools carries the same shape.
+	if len(withTools.Tools) < 2 || withTools.Tools[0] == withTools.Tools[1] {
+		t.Fatalf("precondition: %q ships tools %v — the order case needs two DISTINCT leading entries",
+			withTools.Name, withTools.Tools)
+	}
+
 	cases := []struct {
 		column string
 		edit   func(*store.AgentTemplate)
