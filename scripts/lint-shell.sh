@@ -58,13 +58,54 @@
 # whose command substitution fails can be made to exit) rather than copied for its
 # first.
 #
+# 🔴 TOOL ABSENT IS A SKIP; TOOL PRESENT AT THE WRONG VERSION IS A HARD FAIL. The
+# distinction is the whole design and the two halves answer different questions.
+# The version pin above is about someone who HAS shellcheck and would get a
+# different gate from CI's; it says nothing about someone who has none. `gate:repo`
+# runs FIRST inside `task gate`, so a hard fail on a missing tool means a
+# contributor cannot run ANY component gate -- `gate:api`, `gate:web` and the rest
+# never execute. That is PRD #103 Decision 2's "a gate people cannot run is a gate
+# that stops being run", and it is the same argument that produced amendment #6 for
+# `lint:formula`. So: absent -> loud skip, exit 0. Wrong version -> exit 2.
+#
+# 🔴 THE SKIP IS FAIL-OPEN, SO CI MUST NOT TAKE IT, and the guard is deliberately
+# TWO independent signals rather than one variable in one place:
+#   * `UZI_LINT_SHELL_REQUIRED` set to anything but a falsy value, which `lint:repo`
+#     assigns ON THE SCRIPT LINE. Not in a job `variables:` block: GitLab ranks
+#     PIPELINE variables (manual run, trigger, schedule) at 3 and PROJECT variables
+#     at 4, against job variables at 8, so a same-named manual-pipeline variable
+#     would DISPLACE the job's value and the job would go green having checked
+#     nothing. `.gitlab-ci.yml` already makes this exact argument about the task
+#     checksum, and `UZI_CI_DEMO_FAIL` proves manual-pipeline variables are live
+#     here rather than hypothetical.
+#   * `CI`, which GitLab (and every other runner worth naming) sets. This exists
+#     because the defect the audit found was not the variable's VALUE, it was that
+#     the whole guarantee rested on one line in one file that nothing reddens if
+#     deleted.
+# Both are read tolerantly -- `1`, `true`, `yes`, `on`, or anything else non-falsy
+# arms them -- because the first version accepted ONLY the literal `1`, so `true`,
+# `yes` and a trailing space all disarmed it SILENTLY. A guard whose failure mode is
+# to switch itself off must not be picky about spelling.
+#
 # EXIT CODES, using the convention `fmt-check:api`, `lint:api` and
 # `scripts/deadcode-gate.sh` already set:
 #
 #     2 = the instrument is broken (not a git repo, empty scope, unreadable file,
-#         bad usage, unknown severity)
+#         bad usage, unknown severity, WRONG shellcheck version, or absent-while-
+#         required)
 #     1 = there are findings
-#     0 = clean
+#     0 = clean -- or a loud, banner-printed SKIP, locally only
+#
+# 🔴 AND WHAT THIS GATE STRUCTURALLY CANNOT SEE, stated because "shellcheck now
+# gates the worker entrypoint" reads as covering injection and does not: SC2086
+# (unquoted expansion) is INFO severity, so the shipped `--severity=warning`
+# threshold excludes that whole class -- including in agent/templates/entrypoint.sh.
+# The tree has zero SC2086 today. Tightening to `info` is NOT free and is
+# deliberately deferred to its own follow-up: the `-S style` tail is 11 findings,
+# and they are 6x SC2016 (deliberate single-quoting in run-e2e.sh), 2x SC2001 and
+# 1x SC2329 -- all benign or intentional. Buying the SC2086 class at the price of
+# eleven new suppressions is a policy argument that deserves to be made on its own
+# merits, not smuggled in behind a threshold change.
 #
 # `task`'s own exit code is 201 for every one of those, so this script is the only
 # place that distinction can live. shellcheck's own statuses map cleanly onto it
@@ -112,15 +153,55 @@ ROOT="$(git rev-parse --show-toplevel)" || {
 }
 cd "$ROOT" || exit 2
 
-# 🔴 VERSION ASSERT, BEFORE ANYTHING IS LINTED. See the header for the 0.10.0 vs
-# 0.11.0 table and why an EXACT match rather than a floor. `command -v` is checked
-# separately so "no shellcheck at all" does not surface as an unparseable version.
+# Is a missing tool a hard failure? Two independent signals, both read tolerantly.
+# See the header for why this is not one variable in one place, and why "only the
+# literal 1 arms it" was itself the defect. IDENTICAL in lint-yaml.sh and
+# lint-formula.sh, deliberately duplicated: these scripts are standalone by design
+# (deadcode-gate.sh's shape), and a shared `source`d library would put the gate's
+# fail-closed property behind a file-resolution step.
+truthy() {
+  case "${1:-}" in
+    ''|0|[fF]alse|[fF]ALSE|[nN]o|[nN]O|[oO]ff|[oO]FF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+required() {
+  truthy "${UZI_LINT_SHELL_REQUIRED:-}" && return 0
+  truthy "${CI:-}" && return 0
+  return 1
+}
+
+# 🔴 TOOL ABSENT -> SKIP (or exit 2 when required). NOT the same branch as a
+# version mismatch below: see the header.
 if ! command -v shellcheck >/dev/null 2>&1; then
-  echo "lint-shell: no shellcheck on PATH (want exactly $WANT_VERSION)." >&2
-  echo "  CI installs it as a sha256-verified tarball; see the lint:repo job." >&2
-  echo "  Locally: https://github.com/koalaman/shellcheck/releases/tag/v$WANT_VERSION" >&2
-  exit 2
+  if required; then
+    echo "lint-shell: no shellcheck on PATH, and this run is REQUIRED" >&2
+    echo "  (UZI_LINT_SHELL_REQUIRED and/or CI is set)." >&2
+    echo "  In CI this means the job image no longer installs the pinned tarball;" >&2
+    echo "  the skip this replaces exists for contributor laptops only." >&2
+    exit 2
+  fi
+  echo "lint-shell: ================================================================"
+  echo "lint-shell: SKIPPED -- NO TRACKED SHELL SCRIPT WAS CHECKED."
+  echo "lint-shell: shellcheck is not on PATH. This gate is pinned to EXACTLY"
+  echo "lint-shell: $WANT_VERSION, because 0.10.0 and 0.11.0 disagree about this repo"
+  echo "lint-shell: (0.10.0 does not emit SC3067 at all), so any other build would be"
+  echo "lint-shell: a different gate rather than the same one running late."
+  echo "lint-shell:"
+  echo "lint-shell: This is FAIL-OPEN and deliberate. gate:repo runs FIRST inside"
+  echo "lint-shell: \`task gate\`, so failing here would stop gate:api, gate:web and"
+  echo "lint-shell: every other component gate from running at all. CI sets"
+  echo "lint-shell: UZI_LINT_SHELL_REQUIRED, so your scripts ARE checked on every MR."
+  echo "lint-shell:"
+  echo "lint-shell: To check them here, install the pin:"
+  echo "lint-shell:   https://github.com/koalaman/shellcheck/releases/tag/v$WANT_VERSION"
+  echo "lint-shell:   (darwin.aarch64 / darwin.x86_64 / linux.x86_64, same build as CI's)"
+  echo "lint-shell: ================================================================"
+  exit 0
 fi
+
+# 🔴 VERSION ASSERT. See the header for the 0.10.0 vs 0.11.0 table and why an EXACT
+# match rather than a floor -- and why this is exit 2 while ABSENT is a skip.
 
 # Assignment, not a pipe: `$?` after a pipe reads the LAST command, so a piped
 # form here would report sed's status and never shellcheck's.
@@ -151,11 +232,28 @@ if [ "$SC_VERSION" != "$WANT_VERSION" ]; then
   exit 2
 fi
 
-# 🔴 `git ls-files '*.sh'`, NOT `e2e/*.sh` + `scripts/*.sh`. Those two globs miss a
-# third of the tracked set, INCLUDING agent/templates/entrypoint.sh -- the worker
-# container entrypoint that runs in every hosted worker pod, i.e. the one place in
-# this repo where a shell bug reaches production. Using the index also stops the
-# scope going stale as scripts are added, which a hand-maintained glob list cannot.
+# 🔴 SCOPE IS THE INDEX PLUS A SHEBANG SCAN, NOT A GLOB, AND THE GLOB'S OWN COMMENT
+# WAS WHY. That comment claimed reading the index "stops the scope going stale as
+# scripts are added, which a hand-maintained glob list cannot" -- but `'*.sh'` IS a
+# glob, and it was already stale when it shipped: `agent/bin/agent-browser` is
+# tracked, is `#!/bin/sh`, and is `COPY --chmod=0755`d into /usr/local/bin in BOTH
+# agent/templates/base/Dockerfile and agent/templates/jvm/Dockerfile. It is the shim
+# every `agent-browser` invocation in every worker pod execs through, and it was
+# outside the gate.
+#
+# That is the SAME CLASS the design used to reject `e2e/*.sh` + `scripts/*.sh` --
+# "those globs miss part of the tracked set, INCLUDING the worker container
+# entrypoint" -- one notch smaller and inside the fix. An extension is a naming
+# convention; a shebang is what the kernel actually honours, so the shebang is the
+# thing to enumerate on.
+#
+# Cheap, because `git grep -l` narrows first: one git process yields the handful of
+# tracked files containing a shebang-shaped line ANYWHERE, and only those get their
+# real first line read. Measured on this tree: 19 candidates, of which exactly two
+# are non-`.sh` with a line-1 shebang -- agent/bin/agent-browser (`#!/bin/sh`, IN)
+# and web/scripts/check-docs.mjs (`#!/usr/bin/env node`, OUT). So the interpreter
+# filter is load-bearing rather than decorative, and that pair is its positive and
+# negative control.
 #
 # ONE CONSEQUENCE OF READING THE INDEX, and it is the same for lint-yaml.sh: A
 # BRAND-NEW SCRIPT IS OUT OF SCOPE UNTIL IT IS `git add`ed. Locally that means a
@@ -164,12 +262,56 @@ fi
 # It is not a hole in the gate: nothing reaches CI, or a reviewer, without being in
 # the index. Stated because the symptom (a script that passes and then fails the
 # pipeline) reads like a flake.
+
+# Is the first line a shebang naming a SHELL? `set --` inside a function scopes to
+# that function's own positionals, so this cannot disturb the caller's file list.
+shebang_is_shell() {
+  case "${1:-}" in '#!'*) ;; *) return 1 ;; esac
+  # shellcheck disable=SC2086  # deliberate: split the shebang into words.
+  set -- ${1#\#!}
+  [ "$#" -gt 0 ] || return 1
+  _cmd="${1##*/}"
+  # `#!/usr/bin/env bash` and `#!/bin/busybox sh` both put the real interpreter in
+  # the NEXT word.
+  case "$_cmd" in
+    env|busybox)
+      shift
+      [ "$#" -gt 0 ] || return 1
+      _cmd="${1##*/}"
+      ;;
+  esac
+  case "$_cmd" in
+    sh|bash|dash|ksh|ash|zsh) return 0 ;;
+  esac
+  return 1
+}
+
 FILES="$(git ls-files -- '*.sh')" || exit 2
 
+# `|| true`: git grep exits 1 when nothing matches, which is a legitimate state
+# here (it would just mean no extension-less scripts) and must not abort the run.
+# Read line by line rather than word-split: git does not quote SPACES in a path,
+# so an unquoted `for` over this list would split one path into two.
+CANDIDATES="$(git grep -I -l -E '^#!' -- . || true)"
+while IFS= read -r _f; do
+  [ -n "$_f" ] || continue
+  case "$_f" in *.sh) continue ;; esac
+  [ -f "$_f" ] || continue
+  # `read` returns nonzero on a file with no trailing newline but still assigns,
+  # so the status is deliberately ignored and `_first` is tested instead.
+  _first=""
+  IFS= read -r _first < "$_f" 2>/dev/null || true
+  shebang_is_shell "$_first" || continue
+  FILES="$FILES
+$_f"
+done <<CANDIDATE_LIST
+$CANDIDATES
+CANDIDATE_LIST
+
 if [ -z "$FILES" ]; then
-  echo "lint-shell: git ls-files '*.sh' matched nothing under $ROOT." >&2
+  echo "lint-shell: no tracked shell scripts found under $ROOT." >&2
   echo "  An empty scope is an instrument failure, never a clean run: this repo has" >&2
-  echo "  tracked shell scripts, so either the index is broken or the pathspec is." >&2
+  echo "  tracked shell scripts, so either the index is broken or the scan is." >&2
   exit 2
 fi
 

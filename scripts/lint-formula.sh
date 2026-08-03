@@ -62,10 +62,26 @@
 #        brew, and brew always vendors a modern ruby for its own use;
 #     3. else print a loud SKIP naming what to install, and exit 0.
 #
-# 🔴 STEP 3 IS FAIL-OPEN, SO CI MUST NOT BE ALLOWED TO TAKE IT. Setting
-# UZI_LINT_FORMULA_REQUIRED=1 turns the skip into `exit 2`, and `lint:repo` sets it.
-# CI runs Debian trixie's ruby 3.3, so a skip THERE means the image changed under
-# us -- exactly the "instrument broken" case.
+# 🔴 STEP 3 IS FAIL-OPEN, SO CI MUST NOT BE ALLOWED TO TAKE IT. CI runs Debian
+# trixie's ruby 3.3, so a skip THERE means the image changed under us -- exactly the
+# "instrument broken" case.
+#
+# TWO INDEPENDENT SIGNALS ARM IT, AND THE SECOND ONE EXISTS BECAUSE THE FIRST
+# SHIPPED IN THE WRONG PLACE. This guard was originally one variable set in
+# `lint:repo`'s `variables:` block, which the audit showed is displaceable: GitLab
+# ranks PIPELINE variables (manual run, trigger, schedule) at 3 and PROJECT
+# variables at 4, against job variables at 8 -- so a same-named manual-pipeline
+# variable displaces the job's value and the job goes green having checked nothing.
+# `.gitlab-ci.yml` already argues exactly this about the task checksum 300 lines
+# above, and `UZI_CI_DEMO_FAIL` proves manual-pipeline variables are live here.
+#   * `UZI_LINT_FORMULA_REQUIRED`, now assigned ON THE SCRIPT LINE, which nothing
+#     outside the repo can displace;
+#   * `CI`, which GitLab and every other runner sets -- because the real defect was
+#     never the variable's value, it was that the whole guarantee rested on one line
+#     in one file that nothing reddens if deleted.
+# Both are read TOLERANTLY. The first version armed on the literal `1` and ONLY
+# that, so `true`, `yes` and `1 ` with a trailing space all disarmed it silently. A
+# guard whose failure mode is to switch itself off must not be picky about spelling.
 #
 # THIS IS NOT A NEW PATTERN. It is the shape the `*LiveDB` tests already use in this
 # repo: self-skip without UZI_TEST_DATABASE_URL locally, required and asserted in
@@ -115,6 +131,20 @@ fi
 # 4.0.6) and compares SEGMENT-WISE, so it gets 2.6.10 < 3.1 right where a
 # lexicographic or float-ish shell comparison does not. Used in a CONDITION context
 # everywhere below, so errexit never pre-empts the answer.
+# Identical to lint-shell.sh's and lint-yaml.sh's -- see this script's header for
+# why there are two signals and why they are read tolerantly.
+truthy() {
+  case "${1:-}" in
+    ''|0|[fF]alse|[fF]ALSE|[nN]o|[nN]O|[oO]ff|[oO]FF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+required() {
+  truthy "${UZI_LINT_FORMULA_REQUIRED:-}" && return 0
+  truthy "${CI:-}" && return 0
+  return 1
+}
+
 ruby_at_least() {
   [ -n "${1:-}" ] || return 1
   command -v "$1" >/dev/null 2>&1 || return 1
@@ -153,11 +183,13 @@ if [ -z "$RUBY" ]; then
     FOUND="ruby $(ruby -e 'print RUBY_VERSION' 2>/dev/null || echo '<unparseable>') on PATH"
   fi
 
-  # 🔴 REQUIRED MODE: CI MUST NOT TAKE THE SKIP. `lint:repo` sets this, and its
-  # image ships ruby 3.3 -- so reaching here in CI means the image changed under us,
-  # which is the "instrument broken" case rather than a contributor's laptop.
-  if [ "${UZI_LINT_FORMULA_REQUIRED:-}" = "1" ]; then
-    echo "lint-formula: no Ruby >= $MIN_RUBY resolved, and UZI_LINT_FORMULA_REQUIRED=1." >&2
+  # 🔴 REQUIRED MODE: CI MUST NOT TAKE THE SKIP. `lint:repo` assigns the variable on
+  # the script line and every runner sets `CI` -- so reaching here in CI means the
+  # image changed under us, which is the "instrument broken" case rather than a
+  # contributor's laptop.
+  if required; then
+    echo "lint-formula: no Ruby >= $MIN_RUBY resolved, and this run is REQUIRED" >&2
+    echo "  (UZI_LINT_FORMULA_REQUIRED and/or CI is set)." >&2
     echo "  Found: $FOUND. This is an INSTRUMENT failure (exit 2), not a finding." >&2
     echo "  In CI this means the job image no longer ships the ruby it is supposed to." >&2
     echo "  The skip this replaces is fail-open and exists for contributor laptops;" >&2

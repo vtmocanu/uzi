@@ -36,8 +36,29 @@
 # Neither guard is defensive padding; delete one and this script starts reporting
 # an instrument failure as a lint result.
 #
+# 🔴 TOOL ABSENT IS A SKIP, NOT A FAILURE -- and yamllint is the worse case of the
+# three repo-wide checks, which is why this is not symmetry for its own sake. It is
+# a Python package most contributors will not have, where shellcheck at least ships
+# in brew. `gate:repo` runs FIRST inside `task gate`, so a hard failure here means a
+# contributor cannot run ANY component gate: gate:api, gate:web and the rest never
+# execute. PRD #103 Decision 2 -- a gate people cannot run is a gate that stops
+# being run -- which is the same argument that produced amendment #6 for
+# `lint:formula`, applied to the tool it bites hardest.
+#
+# NO VERSION PIN HERE, unlike lint-shell.sh, and the asymmetry is measured rather
+# than an oversight: 1.37.1 (what CI's image installs) and 1.38.0 (what brew
+# installs) were both run against the shipped `.yamllint` over this exact scope and
+# both return zero findings. shellcheck's two releases genuinely disagree about this
+# repo; yamllint's do not.
+#
+# 🔴 THE SKIP IS FAIL-OPEN, SO CI MUST NOT TAKE IT -- two independent signals,
+# `UZI_LINT_YAML_REQUIRED` (assigned by `lint:repo` ON THE SCRIPT LINE, never in a
+# job `variables:` block, which pipeline- and project-level variables outrank) and
+# `CI`. Read lint-shell.sh's header for the full argument; it is the same guard.
+#
 # EXIT CODES (the convention `fmt-check:api`, `lint:api` and deadcode-gate.sh set):
-#     2 = the instrument is broken   1 = there are findings   0 = clean
+#     2 = the instrument is broken   1 = there are findings   0 = clean, or a loud
+#     banner-printed SKIP (locally only)
 # `task`'s own rc is 201 for all of them.
 set -eu
 
@@ -56,6 +77,55 @@ ROOT="$(git rev-parse --show-toplevel)" || {
   exit 2
 }
 cd "$ROOT" || exit 2
+
+# Identical to lint-shell.sh's and lint-formula.sh's, deliberately duplicated:
+# these scripts are standalone by design and a shared `source`d library would put
+# the gate's fail-closed property behind a file-resolution step. Read tolerantly
+# because a guard whose failure mode is to switch itself off must not be picky
+# about spelling -- an exact-match-on-`1` form disarms silently on `true`, `yes`
+# or a trailing space.
+truthy() {
+  case "${1:-}" in
+    ''|0|[fF]alse|[fF]ALSE|[nN]o|[nN]O|[oO]ff|[oO]FF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+required() {
+  truthy "${UZI_LINT_YAML_REQUIRED:-}" && return 0
+  truthy "${CI:-}" && return 0
+  return 1
+}
+
+# 🔴 IS THE TOOL EVEN HERE? Asserted BEFORE anything else, and not only for the
+# skip: without this pre-flight a missing yamllint reaches the invocation, `sh`
+# returns 127, and this script's own error path reports it as
+# "yamllint exited 127 … 255 is an invalid config" -- the right exit code with a
+# message pointing at the wrong cause, which is carry-forward item 3's
+# fail-loud-but-misleading class.
+if ! command -v yamllint >/dev/null 2>&1; then
+  if required; then
+    echo "lint-yaml: no yamllint on PATH, and this run is REQUIRED" >&2
+    echo "  (UZI_LINT_YAML_REQUIRED and/or CI is set)." >&2
+    echo "  In CI this means the job image no longer installs it; the skip this" >&2
+    echo "  replaces exists for contributor laptops only." >&2
+    exit 2
+  fi
+  echo "lint-yaml: ================================================================"
+  echo "lint-yaml: SKIPPED -- NO TRACKED YAML FILE WAS CHECKED."
+  echo "lint-yaml: yamllint is not on PATH. It is a Python package, so most"
+  echo "lint-yaml: contributors will not have it until they ask for it."
+  echo "lint-yaml:"
+  echo "lint-yaml: This is FAIL-OPEN and deliberate. gate:repo runs FIRST inside"
+  echo "lint-yaml: \`task gate\`, so failing here would stop gate:api, gate:web and"
+  echo "lint-yaml: every other component gate from running at all. CI sets"
+  echo "lint-yaml: UZI_LINT_YAML_REQUIRED, so your YAML IS checked on every MR."
+  echo "lint-yaml:"
+  echo "lint-yaml: To check it here: \`brew install yamllint\` (or pipx/pip install"
+  echo "lint-yaml: yamllint). No version pin -- 1.37.1 and 1.38.0 were both measured"
+  echo "lint-yaml: against this repo's .yamllint and agree."
+  echo "lint-yaml: ================================================================"
+  exit 0
+fi
 
 # EXPLICIT `-c`, NEVER DISCOVERY, AND THE FILE'S EXISTENCE IS ASSERTED HERE.
 # yamllint auto-discovers `.yamllint` from the working directory, so a stray config

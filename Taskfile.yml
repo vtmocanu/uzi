@@ -345,12 +345,30 @@ tasks:
 
   # ------------------------------------------------- repo-wide (no component) --
   # The three checks below are FUNCTIONS OF THE WHOLE TREE. They take their scope
-  # from `git ls-files` rather than from a directory, so adding a script or a YAML
+  # from the git INDEX rather than from a directory, so adding a script or a YAML
   # file puts it in scope with no edit here -- which is the property a
-  # hand-maintained glob list cannot have, and the reason PRD #103 M5 rejected
-  # `e2e/*.sh` + `scripts/*.sh` (those two miss a third of the tracked scripts,
+  # hand-maintained list cannot have, and the reason PRD #103 M5 rejected
+  # `e2e/*.sh` + `scripts/*.sh` (those two miss 4 of the 18 tracked shell scripts,
   # including agent/templates/entrypoint.sh, the worker entrypoint that runs in
   # every hosted worker pod).
+  #
+  # 🔴 AND `git ls-files '*.sh'` IS NOT ENOUGH EITHER -- IT WAS ALREADY STALE WHEN
+  # M5 SHIPPED IT. An extension is a naming convention; a shebang is what the kernel
+  # honours. `agent/bin/agent-browser` is tracked, is `#!/bin/sh`, and is COPYd into
+  # /usr/local/bin in BOTH worker Dockerfiles -- the shim every `agent-browser` call
+  # in every worker pod execs through -- and the glob did not see it.
+  # `scripts/lint-shell.sh` therefore unions the glob with a shebang scan, and its
+  # own comment claiming a glob "cannot go stale" was corrected in the same commit.
+  #
+  # 🔴 A MISSING TOOL IS A LOUD SKIP, NOT A FAILURE; A WRONG VERSION IS STILL exit 2.
+  # `gate:repo` runs FIRST below, so a hard failure on a tool a contributor has not
+  # installed would stop `gate:api`, `gate:web` and every other component gate from
+  # running at all -- PRD #103 Decision 2's "a gate people cannot run is a gate that
+  # stops being run", the same argument that produced amendment #6 for the formula
+  # check. CI arms all three (`UZI_LINT_{SHELL,YAML,FORMULA}_REQUIRED` on the script
+  # line, plus `CI` itself) so the skip is unreachable there. The version pin is a
+  # different question and keeps its exit 2: it is about someone who HAS the tool and
+  # would get a different gate from CI's.
   #
   # 🔴 EACH DELEGATES TO A COMMITTED `scripts/*.sh` RATHER THAN INLINING THE
   # RECIPE, AND THE ARGUMENT IS M5's OWN. M5 adds shellcheck over every tracked
@@ -370,7 +388,7 @@ tasks:
   # WHAT IS NOT HERE YET: `scan:secrets` (gitleaks) is MR-B. It appends to
   # `gate:repo` above and needs no other edit anywhere.
   lint:shell:
-    desc: shellcheck over every tracked *.sh (severity=warning)
+    desc: shellcheck over every tracked shell script (severity=warning, pinned 0.11.0)
     cmds:
       # THE SEVERITY IS AN ARGUMENT SO THIS FILE'S ECHO SHOWS IT. For this check the
       # threshold IS the gate, and the header calls that echo the mechanism by which
