@@ -66,12 +66,17 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 			// anchored at the start of the WHOLE stdout — stricter than the Formula's
 			// substring assert_match. A header line, a "uzi " label, or a leading
 			// blank line passes the Formula and fails the script.
-			fmt.Fprintln(env.Stdout, version)
+			_, _ = fmt.Fprintln(env.Stdout, version)
 			if srv == nil {
 				return nil
 			}
+			// Server-supplied build strings, printed outside the Printer because line
+			// one must be the bare version and nothing else. So the uzicli boundary
+			// cannot reach them and the sanitize is explicit here (#180). CellText, not
+			// SanitizeTTY: %-8s pads a column, and a newline or tab in `version` or
+			// `commit` would break the label rail these six lines share.
 			for _, row := range serverRows(*srv) {
-				fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], row[1])
+				_, _ = fmt.Fprintf(env.Stdout, "server %-8s %s\n", row[0], uzicli.CellText(row[1]))
 			}
 			return nil
 		},

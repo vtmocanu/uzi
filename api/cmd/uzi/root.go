@@ -80,7 +80,16 @@ func Main(env Env, args []string) int {
 	root.SetArgs(args)
 	err := root.Execute()
 	if err != nil {
-		fmt.Fprintln(env.Stderr, "uzi:", err)
+		// CellText, and this one line covers more untrusted text than any other in the
+		// CLI (#180): statusError folds the server's {"error": "..."} body verbatim into
+		// the message, so EVERY failing command prints server-supplied bytes here. It
+		// does not go through the Printer, so the boundary in uzicli/output.go cannot
+		// reach it.
+		//
+		// CellText, not SanitizeTTY: this is a one-line report with a fixed "uzi: "
+		// prefix, so a newline in a server error would print a second line that carries
+		// no prefix and reads as the CLI's own voice.
+		_, _ = fmt.Fprintln(env.Stderr, "uzi:", uzicli.CellText(err.Error()))
 	}
 	return uzicli.ExitCodeFor(err)
 }
