@@ -206,10 +206,18 @@ function AgentRow({
               shipped in THIS release?", which a row nobody has touched can answer
               yes to simply by predating the release. Calling it an edit would make
               M4b's auto-update read as undoing someone's work. */}
+          {/* The tooltip is scoped by role because the diff is not universally
+              reachable: a non-admin gets ReadOnlyView on the detail page, which
+              has no diff panel, and /{id}/builtin 403s them anyway. The badge is
+              honest for everyone; only the invitation to open it is admin-only. */}
           {t.differs_from_builtin && (
             <Badge
               tone="info"
-              title="This template no longer matches the definition shipped in this release. Open it to see the diff."
+              title={
+                isAdmin
+                  ? "This template no longer matches the definition shipped in this release. Open it to see the diff."
+                  : "This template no longer matches the definition shipped in this release."
+              }
             >
               differs from shipped
             </Badge>

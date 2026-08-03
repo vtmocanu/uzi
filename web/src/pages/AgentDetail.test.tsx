@@ -2,6 +2,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { convertChangesToXML, diffWords } from "diff";
 import { AgentDetail } from "./AgentDetail";
 import { ApiError, api, type AgentTemplate, type BuiltinDefinition, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -145,18 +146,37 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
     expect(mockApi.getAgentTemplate).toHaveBeenCalledTimes(1);
   });
 
-  it("renders diffed markup as TEXT, never as elements", async () => {
-    // The positive control behind criterion 7's grep. A diff library returning an
-    // HTML string (diff2html, jsdiff's convertChangesToXML) would need
-    // dangerouslySetInnerHTML, and template bodies are admin-editable text — so
-    // the tag below would become a real element. Asserting the absence of the
-    // element AND the presence of the literal text is what tells a sanitized
-    // render apart from one that simply dropped the content.
+  it("renders diffed markup as TEXT, never as elements, in all four renderers", async () => {
+    // A NARROWER COMPLEMENT TO criterion 7's grep, not the control behind it. The
+    // grep is strictly stronger: it covers every renderer and both unsafe forms.
+    // Stated the other way round — as it was — a future reader could widen the
+    // grep's exceptions believing this test still covered them.
+    //
+    // What it catches, precisely, because the two unsafe forms are NOT alike:
+    //
+    //   - unescaped concatenation (`__html: `<span>${p.value}</span>``) creates a
+    //     real <img>, caught by the querySelector below. This is the dangerous
+    //     form.
+    //   - jsdiff's own convertChangesToXML does NOT: it escapes the value
+    //     (dist/diff.js:2261) before wrapping it, so the payload never becomes an
+    //     element and the img assertion passes against it. It gives itself away by
+    //     OUTPUT SHAPE instead — it emits <ins>/<del> wrappers UNESCAPED, which is
+    //     what the second assertion reads and what escaping cannot hide.
+    //
+    // The fixture differs in all FOUR columns, with markup in the description and
+    // in a tool name, so InlineDiff (diffWords), the model span, ToolsDiff
+    // (diffArrays) and LineDiff all mount. With only prompt_body drifted, one
+    // renderer of four was covered — while description is admin-editable on
+    // exactly the same footing.
     const markup = '<img src=x onerror="alert(1)">';
+    const toolMarkup = "<b>Bash</b>";
     mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
     mockApi.getAgentTemplate.mockResolvedValue({
       template: row({
         differs_from_builtin: true,
+        description: `Implements features. ${markup}`,
+        model: "sonnet", // SHIPPED inherits (null), so the model span mounts too
+        tools: [toolMarkup, "Read"],
         prompt_body: `You are the coder.\n${markup}\n`,
       }),
     });
@@ -165,8 +185,17 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
     const { container } = renderPage();
 
     expect(await screen.findByText("differs from shipped")).toBeTruthy();
+    // All four renderers are actually mounted — without this the assertions below
+    // could pass over a panel that rendered nothing.
+    expect(screen.getByText(/description, model, tools, prompt body/)).toBeTruthy();
+
     expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("b")).toBeNull();
+    expect(container.querySelectorAll("ins, del")).toHaveLength(0);
+    // ...and the payload is present as text rather than dropped, which is what
+    // separates a text-node render from one that merely swallowed the content.
     expect(screen.getAllByText(new RegExp("onerror"), { selector: "span" }).length).toBeGreaterThan(0);
+    expect(container.textContent).toContain(toolMarkup);
   });
 
   it("does not offer Reset for a builtin this release no longer ships", async () => {
@@ -184,9 +213,70 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
 
     expect(await screen.findByText(/no longer ships a definition/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reset to default" })).toBeNull();
+    // The 409 above must be LOAD-BEARING, not decorative. It was not: while the
+    // catch took no parameter this same test passed on a 500, a 502 or a bare
+    // Error, because every rejection produced the identical null. The 500 case
+    // below is what makes flipping this status redden.
     // ...and the page still renders normally: the failed shipped-definition read
     // is not an error about the template, which loaded fine.
     expect(screen.queryByText("differs from shipped")).toBeNull();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeTruthy();
+  });
+
+  it("the ins/del assertion can actually fire — control on the instrument, not the component", () => {
+    // AN ASSERTION THAT CANNOT PRODUCE THE DISCONFIRMING ANSWER IS NOT EVIDENCE,
+    // and the img assertion above is exactly that against one of the two unsafe
+    // forms. This builds what convertChangesToXML would put into the DOM and shows
+    // the two assertions disagreeing: no <img> (it escaped the payload), but
+    // <ins>/<del> present (it does NOT escape its own wrappers).
+    //
+    // Written as a DOM control rather than by mutating AgentTemplateEditor on
+    // purpose. The real mutation would place a genuine dangerouslySetInnerHTML in
+    // web/src, and criterion 7 is a repo-wide grep that other agents run — a
+    // transient call site would corrupt someone else's measurement, silently.
+    const markup = '<img src=x onerror="alert(1)">';
+    const unsafeHTML = convertChangesToXML(diffWords("You are the coder.", `You are ${markup}`));
+
+    const el = document.createElement("div");
+    el.innerHTML = unsafeHTML;
+
+    expect(el.querySelector("img")).toBeNull(); // escaping hides the payload...
+    expect(el.querySelectorAll("ins, del").length).toBeGreaterThan(0); // ...but not the shape
+  });
+
+  it("KEEPS Reset when the shipped-definition read merely FAILS, and claims nothing", async () => {
+    // The discriminating half of the pair above, and the reason the 409 there is
+    // not decorative. A transient failure says nothing about whether the
+    // definition exists — so the page must not print the no-longer-ships
+    // sentence, and must not withdraw the button. Before the status was bound,
+    // this exact fixture produced the same screen as the 409.
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: DRIFTED });
+    mockApi.getBuiltinAgentTemplate.mockRejectedValue(new ApiError(500, "internal error"));
+
+    renderPage();
+
+    // Reset survives: on origin/main it was offered for every builtin row, so
+    // losing it to a 500 would be a regression in reach this milestone introduced.
+    expect(await screen.findByRole("button", { name: "Reset to default" })).toBeTruthy();
+    expect(screen.queryByText(/no longer ships a definition/)).toBeNull();
+    expect(screen.getByText(/could not be loaded/)).toBeTruthy();
+    // The row's own drift verdict came from the template read and is unaffected.
+    expect(screen.getByText("differs from shipped")).toBeTruthy();
+  });
+
+  it("never asks for the shipped definition as a non-admin — the request is a guaranteed 403", async () => {
+    // canEdit for a builtin row is exactly isAdmin, mirroring the server's
+    // authorizeTemplateWrite, so a non-admin's request could only ever be refused.
+    // Firing it anyway costs a round-trip and buries a real 403 in routine ones.
+    mockUseAuth.mockReturnValue({
+      user: { ...ADMIN, id: "u-mira", is_admin: false },
+    } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: DRIFTED });
+
+    renderPage();
+
+    expect(await screen.findByText("differs from shipped")).toBeTruthy();
+    expect(mockApi.getBuiltinAgentTemplate).not.toHaveBeenCalled();
   });
 });

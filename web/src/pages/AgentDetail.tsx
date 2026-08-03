@@ -13,6 +13,29 @@ import { Alert, Badge, Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
 import { SkillAllocationPanel } from "../components/SkillAllocationPanel";
 
+// ShippedDefinition is what the page knows about the definition this release
+// ships for the row being viewed — the shipped side of the editor's diff, and the
+// input that decides whether Reset is offered.
+//
+// IT IS FOUR STATES RATHER THAN A NULLABLE VALUE BECAUSE TWO OF THEM READ
+// IDENTICALLY FROM A NULL AND MEAN OPPOSITE THINGS:
+//
+//   - "absent" is a fact about the RELEASE. This binary ships no definition under
+//     that name, Reset would answer 409, and the page may say so.
+//   - "unavailable" is a fact about ONE REQUEST. A 500, a 502 or a dropped
+//     connection says nothing at all about whether the definition exists, so the
+//     page must not claim it does not — and must leave Reset exactly where it was.
+//
+// Collapsing the two was a regression in REACH as well as a false sentence: before
+// this milestone Reset was offered for every builtin row, so no transient failure
+// could take the button away. It also made the 409 in the test that looks like it
+// pins this decorative — a parameterless catch passes identically on a 500.
+type ShippedDefinition =
+  | { kind: "none" } // not a builtin, or not a caller who could reset it: never fetched
+  | { kind: "ok"; def: BuiltinDefinition }
+  | { kind: "absent" }
+  | { kind: "unavailable" };
+
 export function AgentDetail() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
@@ -25,25 +48,32 @@ export function AgentDetail() {
   const [formError, setFormError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  // builtin is the definition this release ships for this row: the shipped side
-  // of the editor's diff. null means there is none to show — either the row is
-  // not a builtin, or it is a builtin this release no longer ships (409), which
-  // is also the state where Reset would fail (issue #201 M4a).
-  const [builtin, setBuiltin] = useState<BuiltinDefinition | null>(null);
+  const [shipped, setShipped] = useState<ShippedDefinition>({ kind: "none" });
 
   const load = useCallback(async () => {
     try {
       const { template } = await api.getAgentTemplate(id);
       setTemplate(template);
-      if (template.is_builtin) {
+      // Only a caller who could actually press Reset has any use for the shipped
+      // side, and only that caller passes the endpoint's authz — for a builtin row
+      // canEdit is exactly isAdmin, so without this guard every non-admin opening
+      // any builtin detail page fires a request guaranteed to 403. Routine authz
+      // denials are what a real one hides in.
+      if (template.is_builtin && isAdmin) {
         try {
           const { builtin } = await api.getBuiltinAgentTemplate(id);
-          setBuiltin(builtin);
-        } catch {
-          // A 409 (this release ships no such builtin) or a 403 (not a caller who
-          // could reset it anyway) both mean "no shipped side to show". Neither is
-          // an error worth surfacing over the template itself, which loaded fine.
-          setBuiltin(null);
+          setShipped({ kind: "ok", def: builtin });
+        } catch (err) {
+          // THE STATUS IS THE WHOLE POINT: 409 is a fact about the RELEASE, any
+          // other failure is a fact about ONE REQUEST, and only the first licenses
+          // the page to say the definition does not exist. 403 joins the first
+          // because it is likewise a settled answer rather than a transient one —
+          // and it is unreachable from here anyway, since the Reset card renders
+          // only for callers the endpoint would not refuse.
+          const status = err instanceof ApiError ? err.status : 0;
+          setShipped(
+            status === 409 || status === 403 ? { kind: "absent" } : { kind: "unavailable" },
+          );
         }
       }
     } catch (err) {
@@ -51,7 +81,7 @@ export function AgentDetail() {
     } finally {
       setLoading(false);
     }
-  }, [id]);
+  }, [id, isAdmin]);
 
   useEffect(() => {
     load();
@@ -147,7 +177,7 @@ export function AgentDetail() {
               key={template.updated_at}
               initial={template}
               nameEditable={false}
-              builtin={builtin}
+              builtin={shipped.kind === "ok" ? shipped.def : null}
               submitLabel="Save changes"
               busy={busy}
               error={formError}
@@ -156,11 +186,12 @@ export function AgentDetail() {
           </Card>
 
           <Card className="flex items-center justify-between gap-4">
-            {/* Reset is offered only when this release actually ships a definition
-                to reset TO. A builtin row it no longer ships answers 409 on both
-                the shipped-definition read and the reset itself, so the button was
-                previously offered and simply failed (issue #201 M4a). */}
-            {template.is_builtin && !builtin ? (
+            {/* Reset is withheld ONLY on a settled answer that this release ships
+                no such definition (409), where the button was previously offered
+                and simply failed. A failed REQUEST must not take it away: that
+                would be a new way to lose the recovery path, on exactly the page
+                #210's ten templates have to be recovered through. */}
+            {template.is_builtin && shipped.kind === "absent" ? (
               <p className="text-sm text-muted">
                 Builtins cannot be deleted. This release no longer ships a
                 definition for <code className="font-mono">{template.name}</code>,
@@ -171,6 +202,14 @@ export function AgentDetail() {
                 <p className="text-sm text-muted">
                   Builtins cannot be deleted. Reset restores this template to its
                   shipped definition.
+                  {shipped.kind === "unavailable" && (
+                    <span className="text-faint">
+                      {" "}
+                      The shipped definition could not be loaded, so no diff is
+                      shown — this says nothing about whether one exists, and Reset
+                      still works.
+                    </span>
+                  )}
                 </p>
                 <Button variant="ghost" disabled={busy} onClick={reset}>
                   Reset to default
