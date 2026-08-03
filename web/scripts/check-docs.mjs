@@ -175,10 +175,24 @@ for (const file of files) {
 // image build context rather than the context being trimmed to web/ + docs/.
 //
 // prds/ and adr/ joined specs/ here in PRD #103 M5. They are the two remaining
-// heavy PRD-linking populations, and adr/ is the worse of the two: an ADR's
-// number is its originating issue number, so every one of the five opens with a
-// `[prds/N-slug.md](../prds/N-slug.md)` line that goes stale the moment that PRD
-// is moved to prds/done/. Three such links were dead when this landed.
+// heavy PRD-linking populations. adr/ is small but concentrated: an ADR's number
+// is its TRACKING-ITEM number, which may be a PRD number or a bare issue number,
+// so THREE of the five open with a relative
+// `**PRD**: [prds/done/N-slug.md](../prds/done/N-slug.md)` line (0035, 0042,
+// 0065) and the other two open with an EXTERNAL issue link and no relative link
+// at all (0106, 0195). Two of those three relative links were dead when this
+// landed — 0042 and 0065, both `git mv … prds/done/` rot — and they are the class
+// this extension exists to catch.
+//
+// (Corrected 2026-08-03: the commit that ADDED this paragraph, in the same breath
+// as correcting a different false comment in this same file, claimed "every one of
+// the five" opens with such a line and that "three such links were dead". Both are
+// false and the first defeats itself: BECAUSE the number is an issue number, an
+// ADR need not have a PRD at all, and `adr/0106` says so in its own second line —
+// "there is no PRD" — warning that a reader assuming otherwise "will go looking
+// for prds/106-*.md and find nothing". The counterexample was inside the file the
+// sentence was about. The third dead link was in prds/66-guardrail-enforcement.md,
+// which is not an ADR opener.)
 //
 // 🔴 FLAT, NOT RECURSIVE, AND readdirSync IS WHAT MAKES IT SO. A non-recursive
 // read returns `done` and `mockups` as directory ENTRIES, and neither ends in
