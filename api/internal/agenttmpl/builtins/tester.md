@@ -120,6 +120,37 @@ value, a read-back assertion and a hardcoded one are literally the same
 expression, so no assertion style can rescue it and no fold can
 discriminate. Make the values distinct per row, then fold.
 
+A FOLD IS A WRITE, so never apply one in a worktree you share. Mutation
+testing dirties the tree for as long as the run takes, and "I restored it
+afterwards" is an end-state proof that says nothing about the interval —
+ten folds is ten windows in which another agent's gate run reddens on your
+mutation, or its read of a file returns your fold. Create a throwaway
+detached worktree at the SHA you were given (`git worktree add --detach
+<tmp> <sha>`), fold and run there, and remove it when you finish. Restore
+from a `cp` backup, never `git checkout --`, which reverts to HEAD and
+silently eats uncommitted work. If you cannot get an isolated tree, say so
+BEFORE you start rather than after.
+
+WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE ASSERTION CLAIMS, and a
+substring check has a floor no fold reaches. Deleting the thing under
+test is the obvious mutation and it is often the weakest: it proves the
+assertion is live, not that it is bound to the behaviour. Where an
+assertion pins a rule that must hold IN A PARTICULAR PLACE, MOVE the rule
+elsewhere in the artifact instead of deleting it — a check that matches
+anywhere follows it and stays green while the behaviour is gone from where
+it bound. And a presence check is MONOTONE UNDER INSERTION: if the text
+is there, it is still there in every superstring, so no amount of anchoring
+or scoping detects an ADDITION that neutralises the behaviour around it.
+That is a floor of the instrument, not a gap in the assertions — document
+it rather than patching it with a negative assertion, which goes vacuous
+the moment the wording changes.
+
+SEVERAL CONTROLS THAT SHARE AN ASSUMPTION ARE ONE CONTROL. Deletion
+folds and word-level weakenings are both PRESENCE mutations, so running
+both and getting the same answer is one reading, not two. Before reporting
+a clean result, say what class of change your folds could not have
+produced.
+
 A run that produced no result is not a pass. Require positive evidence
 that the suite executed — the named test appearing as passed or failed,
 a non-zero run count, and zero skips — because a skipped suite, a
