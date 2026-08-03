@@ -372,7 +372,7 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // everything BEFORE the boundary — the frontmatter and both intro paragraphs,
 // not the plan-critique paragraph — so a clause moved UP within the region is
 // not moved at all as far as these assertions are concerned. Measured: the plan
-// region is 1655 bytes against the paragraph's 889, leaving ~766 bytes of room
+// region is 1655 bytes against the paragraph's 889, leaving 766 bytes of room
 // above it, and hoisting the relay clause into the intro reworded as "as a
 // general habit" gives rc=0, no guard and no red, with the clause out of the
 // section that gives it meaning. Closing that needs a second cut, and the
@@ -390,8 +390,9 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // phrase only has to carry the meaning: the phrases below total 376 BYTES
 // against the 666 of the anchored ones they replace, none contains another, and
 // each occurs exactly once. (Raw figures rather than a percentage, deliberately
-// — the same measurement rounds two ways, and two roundings in two files read
-// as a discrepancy to whoever meets them apart. Bytes rather than "characters"
+// — one shrink measured in two units gives −44% in bytes and −43% in runes,
+// each rounded once, and two figures in two files read as a discrepancy to
+// whoever meets them apart. Bytes rather than "characters"
 // for the same reason: the anchored set carried two em dashes, so its rune
 // count is 662 against 666 bytes. The ambiguous unit diverges on exactly one of
 // the two figures.)
