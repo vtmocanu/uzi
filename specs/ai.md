@@ -14652,8 +14652,17 @@ does. *(Checked at the `origin/main` merge into `feature/prd-103-m3-m6`, `88f0bd
 ours 468-471 + 473-474 against main's 467 + 472, allocation and numeric order
 coincided, so the union is in both orders at once and settles nothing about the
 general case.)* And **a section's position is not evidence of anything** — not of
-recency, not of topic. Use the `# <topic>` H1 headings and the title cross-references
-for that; §444's title points forward at §447 across an intervening stretch that
+recency, not of topic, **and the `# <topic>` H1 above it is not evidence either.** An
+H1 marks where a topic block *began*; everything appended afterwards inherits it
+regardless of subject, because append-at-tail does not consult it. Measured at HEAD:
+`# PRD #88` covers §455-460 (PRD #88), §447 (**Issue #177**), §448-454 (**PRD #175**)
+and §461-463 (**PRD #119**) — four subjects under one heading — and `# PRD #103` does
+the same to §465, §467 and §472. **The only reliable topic signal is the section's own
+title**, which always names its PRD or issue. *(This clause first read "use the H1
+headings … for that", which pointed the reader at a second unreliable instrument for
+exactly the reason the first one is unreliable. Caught before it left this worktree,
+by checking a claim that had just been agreed to rather than the one under dispute.)*
+Use the titles and their cross-references; §444's title points forward at §447 across an intervening stretch that
 includes the whole of this PRD #88 block, which is how this file carries a relation it
 cannot express by adjacency. *(Deliberately not "across N sections". That count is a
 tally over a population this file exists to grow, and the first draft of this sentence
