@@ -257,6 +257,16 @@ const (
 // back into the whole-body semantics this change replaced. Both are worth a
 // Fatal, and the second is the one that would otherwise undo the change.
 //
+// CONTROLLING CLAUSE 3 NEEDS A DUPLICATION FOLD, NOT A MOVED BOUNDARY. Each
+// landmark is checked present-in-its-own-region first and leaked-into-the-other
+// second, and the first is a Fatalf — so a moved boundary ALWAYS trips the
+// presence branch and the leak branch is unreachable that way. Measured: every
+// boundary-move fold reports `no longer contains its landmark`, never a leak.
+// Anyone controlling the leak branch by moving the boundary will therefore
+// conclude it is dead code and delete it. Duplicate a landmark into the other
+// region instead — measured, that reports `leaked into the other region` with
+// the boundary count still 1, which is the fold that proves the branch live.
+//
 // All three are Fatalf rather than Errorf on purpose: once the split is not
 // trustworthy, the assertions below report on regions that are not the regions
 // they name, so their reds are noise that buries the real message.
@@ -320,7 +330,16 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // length of the anchored ones they replace, none contains another, and each
 // occurs exactly once.
 //
-// TWO THINGS THIS DOES NOT DO, both deliberate:
+// It cannot LOSE detection relative to the whole-body form it replaces, and
+// that is a proof rather than a measurement: each region is a substring of the
+// body, so `Contains(region, p)` implies `Contains(body, p)`, and every fold
+// the old form reddened on this set reddens here too. Worth stating because it
+// bounds the question "does scoping open a new class?" — the split is the
+// ENTIRE new exposure, not one item among several. What that exposure is, is
+// the third item below.
+//
+// THREE THINGS THIS DOES NOT DO, the first two deliberate and the third the
+// price of the first:
 //
 //  1. IT IS A STRICTER CONTRACT THAN BEFORE, and that is a real semantic change
 //     rather than a refactor. A relocated-but-still-present rule is stated
@@ -341,6 +360,18 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 //     Real coverage needs a semantic check on the rendered prompt, which is a
 //     different instrument and a separate piece of work. Until then, insertion
 //     is caught by reading the diff and by nothing in this file.
+//  3. IT ADDS THREE PROSE DEPENDENCIES THAT NO BEHAVIOR PIN PROTECTS, and this
+//     is the whole of what scoping costs. `leadRegionBoundary` and the two
+//     landmarks are ordinary sentences of the template, and a benign edit to any
+//     one of them fatals all eight assertions at the guard. The sharpest is
+//     punctuation: change the boundary's trailing colon to a period and
+//     `guard 1` reports `occurs 0 times`, while TestLeadParallelDispatchPhrases'
+//     pin on that same sentence stays GREEN, because it quotes the sentence
+//     without the colon. One character, identical behavior, whole instrument
+//     down. All three fail CLOSED and name themselves, which is what makes this
+//     a cost rather than a hazard — but the whole-body form did not have it, and
+//     it is invisible from reading the case table, because the three strings sit
+//     in constants that read as configuration rather than as assertions.
 func TestLeadPlanCritiquePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
