@@ -306,7 +306,21 @@ eval**, so a mid-measurement reload surfaces as MISSING counters rather than as 
 Generalised: **in a worktree another agent is writing, an absence is not evidence unless you
 can show the instrument was still live when you read it.**
 
-#### 🔴 ARRIVAL TIME CARRIES NO INFORMATION ABOUT AUTHORSHIP TIME
+#### 🔴 A HARNESS BUILT TO DEMONSTRATE A DEFECT INVERTS WHEN THE FIX LANDS
+
+Raised by web-ux before the pending re-measure, which is the only time it is cheap. The F5
+harness currently asserts the defect **reproduces** — marker present before the click and gone
+after, badge `true` while the panel reads "Matches". **Once F5 lands, a green harness means
+the defect is FIXED, and "failed to reproduce" becomes the success case rather than a null
+result.**
+
+Re-running saved assertions blind therefore reports the fix as a regression, and it does so
+confidently, because the harness is working perfectly — it is answering the question it was
+built for, which is no longer the question being asked. Same family as every instrument
+defect in this file, arriving through the passage of time rather than through a wrong tool.
+
+**Rule for the re-measure: re-derive the expected direction from the code at the named SHA
+BEFORE running the saved harness.** Applies to S1 too if F12 moves the badge or panel path.
 
 Filed as a team-process fact because it produced a wrong accusation from careful reasoning.
 Web-ux charged the lead with relaying a claim it had already retracted; the lead accepted the
