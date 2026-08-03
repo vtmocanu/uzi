@@ -1608,3 +1608,57 @@ mechanism is known: the auditor's **sharpest** payload (mid-line `\r`) is silent
 warning path because `TrimSpace` strips only the **edges**; and plain 1 MiB `AAA…` is silent
 because it is not valid semver — **only `0.14.0+<1 MiB>` gets through, at 1,048,673 bytes on
 stderr.**
+
+---
+
+## 22. AMENDMENT 17 — 🔒 CODE FROZEN AT `57db471f`. Five code commits, no outstanding items.
+
+```
+57db471f  test(cli): pin the symlink property, fix three comments crediting the wrong mechanism
+d23599bb  fix(cli): a failed probe no longer erases the cached server version   (N-1, N-3, N-4, §17)
+e137d145  docs(cli): narrow the --json safety claim, pin the UTF-8 property
+f2f778d6  absorb amendment 6 -- a third exempt command, cache forensics, TTL bounds
+ea71a367  feat(cli): warn when the CLI is behind the server, and sanitize the build info it prints
+```
+
+`task gate:api` EXIT=0, tree clean, coder has stopped writing and confirmed it. **§20's
+outstanding list is fully discharged.** Lead verified each of the four independently:
+`run.go`'s false claim now sits *inside* its own correction (house style), `compactText` is
+**not** rune-sliced (`s[:max]` intact, as the user decided), the symlink pin exists.
+
+### The N2 pin does what it was ruled in for
+
+Symlink at the cache path, assertion on the **link target**, plus a positive control that the
+cache was actually written — *"a store that writes nothing would otherwise pass."*
+Control: `writeFileAtomic` → `os.WriteFile` reddens it while `TestVersionCacheFileMode` and
+`TestVersionCacheRoundTrip` stay **green**. The property is now held rather than assumed.
+
+### 🔴 THE COUNT-DRIFT TRAP FIRED AGAIN, AND THE CODER HANDLED IT THE RIGHT WAY
+
+Re-measuring §19 N3's positive control on its own tree, the coder got **six** rows at 96
+bytes where the tester measured **four** — the two Zl/Zs rows from §17 landed in between.
+**It recorded both figures with their trees rather than overwriting the tester's**, and said
+so: *"Had I copied 'four' it would have been wrong within one commit of being written."*
+
+That is the third count on this branch that moved between measurement and write-up (§14's
+4-vs-5 by SHA, §21's 4/5/6 by unit, now this by commit). **Same lesson each time: cite the
+shape and the tree, never a bare tally.**
+
+### Three confidently-wrong comments, and why that is the finding rather than an anecdote
+
+`sanitizeTTY`'s JSON claim, `SkewWarning`'s *"both guards are load-bearing"*, and the
+coder's own `> 4096` self-credit. **All three read as authoritative, all three survived
+multiple careful readings by different people, and each was refuted the moment somebody RAN
+the thing it described.**
+
+**The `run.go` one had already propagated into new code** — it is where `version.go`'s
+wording came from — which is what separates this from a tidiness issue. Add the `CLAUDE.md`
+claim from §10 and this branch found **four** instances of one mechanism: a sentence nobody
+measured, believed because it was confident, copied forward into new work.
+
+### The contamination story is complete, and all three traces to one lead decision
+
+Auditor, reviewer and coder each had results produced from the shared worktree mid-edit. The
+coder's own disclosure closes it: *"anything building from this tree during those windows
+measured a mutated binary."* **The freeze closes it for all three, and the standing fix is:
+validators get a frozen SHA that is not also the coder's live worktree.**
