@@ -96,11 +96,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   also now validates relative links in `prds/*.md` and `adr/*.md`, which nothing
   checked before, and the three that had rotted are repaired. Part of PRD #103.
   Developer-facing only: no change to how uzi behaves. **Running `task gate`
-  locally now needs two tools on your `PATH`**: shellcheck **exactly 0.11.0** (the
-  version is asserted, because 0.10.0 does not report one of the diagnostics this
-  repo relies on, and a mismatch exits 2 rather than quietly grading differently)
-  and a **Ruby 3.1 or newer**, which macOS's own `/usr/bin/ruby` is not. See
-  [docs/dev-conventions.md](docs/dev-conventions.md).
+  locally now needs shellcheck on your `PATH`, exactly 0.11.0**: the version is
+  asserted, because 0.10.0 does not report one of the diagnostics this repo relies
+  on, and a mismatch exits 2 rather than quietly grading differently. The formula
+  check wants a Ruby 3.1 or newer, which macOS's own `/usr/bin/ruby` is not; it
+  falls back to the Ruby that Homebrew bundles for itself, and if neither is
+  present it prints a loud skip and passes rather than blocking you. CI always runs
+  it. See [docs/dev-conventions.md](docs/dev-conventions.md).
 
 ### Fixed
 

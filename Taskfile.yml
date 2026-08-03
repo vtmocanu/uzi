@@ -426,18 +426,26 @@ tasks:
   lint:formula:
     desc: ruby -c over the Homebrew formula (syntax only; needs ruby >= 3.1)
     cmds:
-      # 🔴 THIS TARGET EXITS 2 ON A STOCK macOS RUBY, AND THAT IS THE INTENDED
-      # BEHAVIOUR RATHER THAN A BUG TO ROUTE AROUND. /usr/bin/ruby is 2.6.10 and the
-      # formula uses the Ruby >= 3.1 shorthand hash value (`ldflags:`), so a naive
-      # `ruby -c` reports a SYNTAX ERROR IN A CORRECT FILE -- and the tempting fix
-      # for that red is to downgrade a formula that ships to a public tap. The
-      # script's version guard converts it into `exit 2` (the instrument is broken)
-      # with the PATH prefix for Homebrew's vendored ruby in the message.
+      # 🔴 THIS TARGET CAN SKIP, AND A SKIP IS EXIT 0. /usr/bin/ruby on macOS is
+      # 2.6.10 and the formula uses the Ruby >= 3.1 shorthand hash value
+      # (`ldflags:`), so a naive `ruby -c` reports a SYNTAX ERROR IN A CORRECT FILE
+      # -- and the tempting fix for that red is to downgrade a formula that ships to
+      # a public tap. The script therefore RESOLVES an interpreter (PATH ruby if
+      # >= 3.1, else Homebrew's vendored portable-ruby) and, if neither exists,
+      # prints a loud SKIP banner and exits 0.
       #
-      # Worth knowing before you read a red: `exit 2` here still reddens `task gate`
-      # for a contributor who has no ruby >= 3.1 on PATH. That is a real cost of the
-      # ruled design and it is honest rather than misleading; CI's image carries a
-      # modern ruby, so the check gates there unconditionally.
+      # 🔴 THAT SKIP IS FAIL-OPEN AND CI MUST NOT TAKE IT. `lint:repo` sets
+      # UZI_LINT_FORMULA_REQUIRED=1, which turns the skip into `exit 2`; its image
+      # ships ruby 3.3, so a skip THERE means the image changed under us. Same shape
+      # as the *LiveDB tests (self-skip locally, required and asserted in CI), and
+      # for the same reason the skip prints a banner: a skipped run and a passing run
+      # must not look alike in the output.
+      #
+      # The first version of this target did what the frozen design said -- assert
+      # >= 3.1, exit 2 -- and measured the cost: `task gate` was permanently red for
+      # every contributor whose only ruby is the system one. PRD #103 Decision 2 is
+      # explicit that a gate people cannot run is a gate that stops being run, so the
+      # design was amended (2026-08-03 #6) rather than the cost accepted.
       #
       # SYNTAX ONLY. `ruby -c` parses and does not evaluate, so a broken Homebrew
       # DSL passes; and `publish_brew` seds the `tag:` line before pushing to the
