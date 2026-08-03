@@ -281,6 +281,35 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
     expect(screen.getByText("differs from shipped")).toBeTruthy();
   });
 
+  it("warns about UNSAVED edits too, not only the saved row's drift", async () => {
+    // F14's acceptance case, and it is built to fail before the fix: the stored
+    // row differs ONLY in prompt_body, and the description edit exists only in
+    // the form. Computing the warning from `template` names the prompt body and
+    // says nothing about the description — which is what an admin mid-edit was
+    // told while that edit was silently discarded.
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({
+        differs_from_builtin: true,
+        prompt_body: "You are the coder.\nAn admin rewrote this.\n",
+      }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+    // The description input starts at the stored (== shipped) value, so typing
+    // here creates drift that exists ONLY in the form.
+    const descriptionInput = await screen.findByDisplayValue(SHIPPED.description);
+    fireEvent.change(descriptionInput, { target: { value: "Implements features, my way." } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+
+    const message = confirm.mock.calls[0][0] as string;
+    expect(message).toContain("description"); // the unsaved edit — the point of F14
+    expect(message).toContain("prompt body"); // and the saved drift, still named
+  });
+
   it("names only the columns that actually differ", async () => {
     // A confirmation that always listed all four would be as uninformative as a
     // generic one, and would misstate what is at stake.

@@ -1,4 +1,12 @@
-import { useMemo, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import {
+  forwardRef,
+  useImperativeHandle,
+  useMemo,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { diffLines, diffWords, type Change } from "diff";
 import type { AgentTemplateInput, BuiltinDefinition } from "../lib/api";
 import { Alert, Button, Field, Input, Select } from "./ui";
@@ -24,23 +32,19 @@ export interface EditorInitial {
   prompt_body: string;
 }
 
-// AgentTemplateEditor is the shared form for creating and editing a template.
-// name is editable only on create (the immutable subagent identity afterwards);
-// scope is chosen on create too (PRD #18 M6): any user authors a private "Mine"
-// template, and an admin can additionally publish a "Global" one. It carries a
-// live preview of the exported subagent file.
-export function AgentTemplateEditor({
-  initial,
-  nameEditable,
-  scopeEditable = false,
-  isAdmin = false,
-  builtin = null,
-  storedDiffers = false,
-  submitLabel,
-  busy,
-  error,
-  onSubmit,
-}: {
+// AgentTemplateEditorHandle exposes the form's LIVE values to whoever owns the
+// Reset button (issue #201 M4a F14). Reset discards unsaved edits, so its
+// confirmation has to name what is on screen, not what was last saved.
+//
+// A REF RATHER THAN A CALLBACK, deliberately: the value is needed at exactly one
+// instant — the click — so lifting it through an onChange would re-render the
+// page, the diff panel and the skills panel on every keystroke to serve a read
+// that happens once. A ref costs nothing until it is read.
+export interface AgentTemplateEditorHandle {
+  currentContent(): TemplateContent;
+}
+
+interface AgentTemplateEditorProps {
   initial: EditorInitial;
   nameEditable: boolean;
   scopeEditable?: boolean;
@@ -60,7 +64,31 @@ export function AgentTemplateEditor({
   busy: boolean;
   error: string;
   onSubmit: (input: AgentTemplateInput) => void;
-}) {
+}
+
+// AgentTemplateEditor is the shared form for creating and editing a template.
+// name is editable only on create (the immutable subagent identity afterwards);
+// scope is chosen on create too (PRD #18 M6): any user authors a private "Mine"
+// template, and an admin can additionally publish a "Global" one. It carries a
+// live preview of the exported subagent file.
+export const AgentTemplateEditor = forwardRef<
+  AgentTemplateEditorHandle,
+  AgentTemplateEditorProps
+>(function AgentTemplateEditor(
+  {
+    initial,
+    nameEditable,
+    scopeEditable = false,
+    isAdmin = false,
+    builtin = null,
+    storedDiffers = false,
+    submitLabel,
+    busy,
+    error,
+    onSubmit,
+  },
+  ref,
+) {
   const [name, setName] = useState(initial.name);
   // Create defaults to a personal ("user") template; admins can switch to global.
   const [scope, setScope] = useState<"global" | "user">("user");
@@ -92,6 +120,22 @@ export function AgentTemplateEditor({
       }),
     [name, description, model, tools, promptBody],
   );
+
+  // currentContent is the form's live values in the shape the comparison reads.
+  // ONE object feeds both the diff panel and the imperative handle, so the panel
+  // and the Reset confirmation cannot end up describing different states — the
+  // failure F14 is about, one level down.
+  const currentContent = useMemo<TemplateContent>(
+    () => ({
+      description,
+      model: model.trim() || null,
+      tools: tools.length ? tools : null,
+      prompt_body: promptBody,
+    }),
+    [description, model, tools, promptBody],
+  );
+
+  useImperativeHandle(ref, () => ({ currentContent: () => currentContent }), [currentContent]);
 
   const addTool = (raw: string) => {
     const parts = splitToolInput(raw);
@@ -251,12 +295,7 @@ export function AgentTemplateEditor({
         <BuiltinDiff
           shipped={builtin}
           storedDiffers={storedDiffers}
-          current={{
-            description,
-            model: model.trim() || null,
-            tools: tools.length ? tools : null,
-            prompt_body: promptBody,
-          }}
+          current={currentContent}
         />
       )}
 
@@ -274,7 +313,7 @@ export function AgentTemplateEditor({
       </Button>
     </form>
   );
-}
+});
 
 // ── Shipped-vs-stored diff (issue #201 M4a) ──────────────────────────────────
 //

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -10,7 +10,10 @@ import {
 } from "../lib/api";
 import { driftedColumns, renderSubagent, summarizeTools } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card } from "../components/ui";
-import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
+import {
+  AgentTemplateEditor,
+  type AgentTemplateEditorHandle,
+} from "../components/AgentTemplateEditor";
 import { SkillAllocationPanel } from "../components/SkillAllocationPanel";
 
 // ShippedDefinition is what the page knows about the definition this release
@@ -49,6 +52,9 @@ export function AgentDetail() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [shipped, setShipped] = useState<ShippedDefinition>({ kind: "none" });
+  // Read only when Reset is clicked — see AgentTemplateEditorHandle for why this
+  // is a ref rather than lifted state.
+  const editorRef = useRef<AgentTemplateEditorHandle>(null);
 
   const load = useCallback(async () => {
     try {
@@ -117,7 +123,16 @@ export function AgentDetail() {
     // take, not leave the user to discover it afterwards. It reads the shared
     // driftedColumns, so it can never name a different set than the panel above.
     if (template && shipped.kind === "ok") {
-      const columns = driftedColumns(shipped.def, template);
+      // COMPARE AGAINST WHAT IS ON SCREEN, NOT AGAINST THE SAVED ROW (F14).
+      // Reset overwrites the row with the shipped definition and remounts the
+      // form, so what the admin loses is the delta between what they are LOOKING
+      // AT and what will replace it — which is unsaved edits and saved drift in
+      // one set. Naming saved drift alone under-warns precisely the admin who is
+      // mid-edit: measured, the dialog said "discards the current prompt body"
+      // while silently discarding an unsaved description edit it never mentioned.
+      // Falls back to the stored row only if the form is not mounted.
+      const current = editorRef.current?.currentContent() ?? template;
+      const columns = driftedColumns(shipped.def, current);
       const warning =
         columns.length > 0
           ? `Reset "${template.name}" to the definition shipped in this release?\n\n` +
@@ -218,6 +233,7 @@ export function AgentDetail() {
               key={template.updated_at}
               initial={template}
               nameEditable={false}
+              ref={editorRef}
               builtin={shipped.kind === "ok" ? shipped.def : null}
               storedDiffers={template.differs_from_builtin}
               submitLabel="Save changes"
