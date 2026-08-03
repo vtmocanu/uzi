@@ -15,6 +15,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // maxCLITokenNameBytes bounds the human label on a CLI token, matching the worker
@@ -109,6 +110,13 @@ func (h *Handler) CreateCLIToken(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" || len(name) > maxCLITokenNameBytes {
 		httpx.Error(w, http.StatusBadRequest, "name must be non-empty and at most 200 characters")
+		return
+	}
+	// #169, same rule and same reason as CreateWorker: `uzi admin cli-tokens` prints this
+	// name beside another user's owner_email. termsafe.Validate rejects exactly what the
+	// CLI's CellText would strip, so a stored name round-trips to display unchanged.
+	if err := termsafe.Validate("name", name); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	scope := req.Scope

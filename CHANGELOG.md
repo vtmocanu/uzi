@@ -20,6 +20,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   only thing saying not to. Actually catching a worktree change no matter how
   it was made is tracked separately as issue #212 (issue #203).
 
+- **Worker names and CLI-token names are now validated on write, and reject
+  terminal-unsafe characters that were accepted before.** `POST
+  /api/workers`, the hosted-worker provisioning path, and both the
+  CLI-token mint and device-start flows now return 400 for control
+  characters, Unicode format characters (bidi overrides, zero-widths, the
+  BOM, the soft hyphen), and invalid UTF-8; names are still trimmed of
+  leading and trailing whitespace before that check, unchanged from before.
+  These names are read back in cross-tenant admin listings beside a
+  different user's account, so an unvalidated one was terminal control
+  injection into another user's session, and an embedded newline could
+  forge a whole table row in a listing an admin reads to make decisions.
+  Existing stored names are untouched by this change and stay covered by
+  the render-side fix instead (issue #180), which strips the same
+  characters on the way out (issue #169).
+
+
 ### Fixed
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team

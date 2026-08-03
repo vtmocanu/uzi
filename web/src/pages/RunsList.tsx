@@ -275,10 +275,15 @@ export function RunsList() {
                       {/* Issue #124, and this one is CROSS-PRINCIPAL: this list comes from
                           `api.adminListWorkers()` -> ListAllWorkers, which embeds every
                           user's worker row, so an admin reads names ANOTHER user chose.
-                          `handler/workers.go:388` only TrimSpaces and length-caps a name at
-                          creation -- no Cc/Cf strip -- so a bidi override in one user's
-                          worker name renders in the admin's fleet list beside a different
-                          user's `owner_email`. */}
+
+                          The ingest gap this was written against is CLOSED as of #169:
+                          `handler/workers.go` now runs `termsafe.Validate`, so a name with
+                          a bidi override or a bare ESC is a 400 rather than a stored row.
+                          The strip stays, and is not redundant, for the reason #169 gives
+                          for splitting the two halves: rows stored BEFORE that validator
+                          landed cannot be cleaned retroactively, so the render boundary is
+                          the trust boundary and the validator is defence in depth behind
+                          it -- not the other way round. */}
                       <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                       <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
                       {(w.template_reported || w.template_declared) && (
