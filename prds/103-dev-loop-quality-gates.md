@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5 two-thirds done 2026-08-03** — MR-A (shell/YAML/formula/check-docs) and MR-B (gitleaks + canary) validated and up for review; **MR-C deferred** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4). **M5 stays unticked and Success Criterion 5 unmet until MR-C lands**, since that criterion is atomic across all three security tools. **M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning; **MR-C deferred** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4). **M5 stays unticked and Success Criterion 5 unmet until MR-C lands**, since that criterion is atomic across all three security tools. **M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
 
 *(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
@@ -1773,7 +1773,29 @@ which previously prescribed only the fail-open form.
 
 - [ ] **M5 — The long tail: shell, YAML, secrets, vulns**:
 
-      > **STATUS 2026-08-03: TWO THIRDS LANDED, NOT COMPLETE.** M5 was split
+      > **STATUS 2026-08-03: MR-A AND MR-B MERGED, M5 NOT COMPLETE.** MR
+      > [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175),
+      > merge commit `d77e651b`, pipeline 20333 green 18/18 at `f0e3c438`.
+      >
+      > **The first pipeline found a real defect on its first run, which is
+      > the outcome this milestone predicted about itself.** `scan:secrets`
+      > died with `mktemp: too few X's in template` after **every other step
+      > in the job had passed** — the sha256-pinned tarball fetch, the apt
+      > installs with their version assertions, shellcheck over 20 scripts,
+      > yamllint over 11, and the formula under ruby 3.3.8. BSD/macOS `mktemp`
+      > treats `-t`'s argument as a **prefix**; GNU coreutils treats it as a
+      > **template** requiring three `X`s. So the form succeeded on every
+      > contributor's machine and could only fail in CI. Fixed in `f0e3c438`
+      > and verified **both** ways — the old form reproduces the failure
+      > inside the pinned `golang:1.26` digest, the new one works there and on
+      > macOS.
+      >
+      > `test:agent` also reddened on that first run and passed on the second:
+      > `fail 0` with `cancelled 1` at 126952 ms against the 120000 ms
+      > per-file cap — the documented flake (#198/#162), and this MR touches
+      > no agent code.
+      >
+      > M5 was split
       > into three MRs at design time because each has a different review
       > question. **MR-A** (shellcheck, yamllint, `ruby -c`, the flat
       > `prds/`+`adr/` check-docs extension) and **MR-B** (gitleaks + a
