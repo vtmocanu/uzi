@@ -1774,3 +1774,36 @@ rule explicitly permits proposing when a fix is out of scope.
 **Left alone deliberately:** `docs/cli.md` also says the warning is not shown *"when the CLI
 is newer than the server"*, where the shipped rule is ahead-**or-equal**. Not wrong — the
 "when it is behind" framing covers it — just less precise than the code. Do not churn it.
+
+---
+
+## 25. USER APPROVAL — `specs/human.md` text, 2026-08-03. QUEUED behind the coder.
+
+The user approved the spec-keeper's proposed block **as written**, to be inserted after
+Feature #175 and before `## Startup admin seed`:
+
+```markdown
+## Feature #144 (item 1) — Warn when the CLI is behind the server
+
+Tracked as GitLab issue vtmocanu/uzi#144 (item 1). Scoped MR, no PRD [user 2026-08-03].
+Completes Feature #64/#175: `uzi version` reported both versions and never compared them.
+
+- Every uzi command warns when the CLI is older than the server it talks to — not
+  just `uzi version`. [user 2026-08-03, chosen from three placements]
+- The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
+- The server's version is probed on a cache, never once per command. [user 2026-08-03]
+- The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
+```
+
+**A new section, not bullets appended to Feature #64** — the spec-keeper argued and the user
+accepted that #64's bullets are about the CLI *existing and being agent-drivable*, while this
+is a distinct behavioural contract with its own issue number.
+
+**Only the placement decision goes in.** The spec-keeper reached this independently of the
+lead and gave the sharper reason: `human.md`'s bar is that a rebuild must satisfy every item
+in it, and **a rebuild cannot satisfy "one commit"**, nor would it have any reason to inherit
+*"don't rune-slice `compactText`"* — a constraint that exists only because THIS change had
+not tested run/steer/TUI. Those live in §475 as reasons, where they stay useful.
+
+**QUEUED, not dispatched:** the coder holds the writer slot for §24's two items. Spec-keeper
+goes immediately after it reports.
