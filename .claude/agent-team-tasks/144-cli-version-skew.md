@@ -782,3 +782,62 @@ day someone stamps the e2e build.
 - **`UZI_VERSION_CHECK=0` goes in BOTH `SKILL.md` and `docs/cli.md`.** The architect notes
   H1 cuts both ways here — `SKILL.md:43` telling agents to read stderr is what makes that
   channel worth protecting *and* worth explaining. Document it, framed as actionable.
+
+---
+
+## 12. AMENDMENT 7 — lead rulings on the coder's two questions. Implementation is at `ea71a367`.
+
+### Ruling 1 — ACCEPTED. `144-design.md` §6's table is wrong in column `A`, rows 6 and 10.
+
+The coder **re-derived all three broken reference implementations against
+`x/mod@v0.38.0` rather than inheriting the table**, which is the behaviour this brief has
+been asking for since Amendment 1. Its finding: `A` (*normalised + guarded, direction
+dropped to `!= 0`*) is **silent** on row 6 (`dev`/`0.14.0`) and row 10
+(`v0.11.7.1`/`0.14.0`) because the `IsValid` guards it carries reject both operands.
+The design marks those rows `kills: G, A`; measured, they kill **G only**.
+
+The coder also checked the alternative reading (`A` = G-plus-direction, no guards) and it
+contradicts rows 7, 8 and 11 — so it is not what was meant.
+
+**No binding moves and the vacuity floor holds:** each broken reference is still killed by
+at least one row (N by 1/2/5/12/13, G by 6/10, A by 9). **`144-design.md` §6's `kills`
+column for rows 6 and 10 should read `G`.** This is a docs fix on the design document, not
+a design change. The shipped test table carries the measured flags, which is correct.
+
+### Ruling 2 — HASH STANDS. §7 H4(b) governs; §9's phrasing was a summary, not a reversal.
+
+The coder identified a genuine conflict I left unruled and resolved it the right way.
+
+- **§7 H4(b)** (auditor): *"key on a hash of the URL, or the context name. Never the raw
+  string"* — backed by **executed evidence**: `credentialSafeBase` does not strip userinfo,
+  `--url 'http://alice:hunter2@…'` is served, and this cache is the **first** write path
+  that would persist a `--url` base at all, into a **0644** file.
+- **§9 point 2** (architect short form): *"keyed on a map of normalised base URL."*
+
+§9 is later and §9 overrides where it touches the same thing — but the architect's design
+**never engages with H4(b)**, and §9's only explicit conflict ruling is the
+`logout`/`auth token` one. Silence is not reversal, especially against measured security
+evidence. **The SHA-256 of the normalised URL satisfies both readings** and passes every
+§7.2 row (URL A ≠ URL B; `https://x/` == `https://x`), pinned by
+`TestVersionCacheDoesNotPersistTheURL` against the userinfo payload.
+
+Accepted cost: the cache file is not human-readable. It is a cache, not configuration.
+
+### Noted from the coder's report, not requiring a ruling
+
+- **The discriminating sanitizer input is not the obvious one, and it was found by RUNNING
+  the attacks.** Most payloads make the version string invalid semver, so `SkewWarning`
+  goes silent and the payload never reaches stderr — meaning **a test built from
+  `ESC[2J`/bidi passes against a completely unsanitized warning path.** What gets through
+  is a payload whose *trimmed* form is valid semver: `normSemver` calls `TrimSpace`, and
+  `\r`/`\n`/`\t` are `unicode.IsSpace`, so they are stripped for the **comparison** and
+  survive into the **print**. **`0.14.0\r` is the live injection.** This is Amendment 6's
+  §6b arriving one level deeper, and it is a stronger statement of it.
+- The trailing-`\n` row needed a second assertion (stderr is exactly one line) to
+  discriminate at all — `assertNoControlChars` skips `\n` as the line separator, so
+  without it that row was **a pin, not evidence**.
+- `_, _ = fmt.Fprint*` edits in `root.go`/`version.go` are pre-existing errcheck findings
+  that `whole-files: true` made blocking once the branch touched those files. Expected
+  ratchet adoption cost, not scope creep.
+- First `task gate:api` run died on `Error: parallel golangci-lint is running` — a
+  host-global lock held by a sibling worktree, not a failure. Re-ran green.
