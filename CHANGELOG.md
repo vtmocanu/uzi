@@ -40,6 +40,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   emoji) now renders as its separate members instead of the joined glyph; a
   single-codepoint emoji is unaffected (issue #180).
 
+### Fixed
+
+- **Release tooling: the CHANGELOG coverage gate could block a good release,
+  about once every dozen runs, and a retry made it go away.** It reported a
+  merge as uncited while the section cited it on the line the check had just
+  matched. Cause: `printf '%s' "$SECTION" | grep -q <pattern>` under
+  `set -o pipefail`. `grep -q` exits the instant it matches and closes the pipe;
+  bash's `printf` builtin writes line-buffered, so an 8.5 KB section leaves the
+  shell as 72 separate writes and is still writing when grep goes; the next
+  write takes SIGPIPE and `pipefail` reports 141 for a pipeline whose grep
+  succeeded. Every `grep` in the script now reads a file, which has no writer to
+  kill. Present since the gate was first added, on the issue-number lookup and
+  on both escape hatches, not only on the short-SHA citation added the same day
+  it was found (`19ad63c3` was the merge it flagged; job 134884 failed, retry
+  134892 passed on the identical commit). Developer-facing only: no change to
+  how uzi behaves.
+
 ## [0.14.0] - 2026-08-03
 
 ### Added
