@@ -227,6 +227,23 @@ clone was destroyed, recreated at the same path, and the session still resolved
       here is prior PUSHED work."* Either correct that comment in the same commit
       or introduce a separate field — load-bearing, because M3 turns this number
       into lead-facing prompt text.
+
+      **M2 also changes which agent roster a resumed run sees.** The 8→10 move is
+      read above as a *symptom* of the default-branch leg firing; it is also a
+      product of the fix. `parseRepoAgents` re-derives the roster from whatever
+      tree the reseed chose, so after M2 run 78's first-park resume would seed off
+      the tracking ref and keep the roster its parked tree carried — `a38f7421`'s
+      8 files, which the run never edited — rather than acquiring `65496d0e`'s 10
+      (shas and counts are in the "checkable from GitLab alone" passage above).
+      Strictly it is the parked tree's roster, not the base commit's, and the two
+      coincide only because nothing in the run wrote under `.claude/`. That is
+      correct — a resume that keeps its tree should keep
+      the roster that tree was planned against — and it closes the reverse hazard,
+      where a resume adopts a half-edited or role-dropping `.claude/agents/` that
+      landed on the default branch mid-run. What moves is the SELECTED roster on
+      an `--agent-source repo` run; `parseRepoAgents` runs unconditionally either
+      way, so the detection status at `runner.ts:1011` still tracks the base even
+      on an `own`-source run.
 - [ ] **M3 — the feed states what the resume recovered.** A worker status naming
       the recovered commit count when M2's tracking-ref leg fires, and one
       admitting the loss when a resume finds neither an origin branch nor a
@@ -350,6 +367,31 @@ clone was destroyed, recreated at the same path, and the session still resolved
 - Any change to PRD #217's credential selection. The two PRDs touch the same park
   and are independent: #217 is about *which token* the resume spends, this is
   about *what tree* it resumes onto. Neither blocks the other.
+- **Steering-channel staleness — real, measured, and NOT a risk of this fix.** A
+  follow-up queued while a run is parked is drained by `pullFollowUp`
+  (`sdk-executor.ts:1048`) inside the implement loop, after the reseed's `fs.rm`,
+  so a correction written against the parked tree reaches a session that no longer
+  matches it. Measured 2026-08-03: we sent a push-your-branch follow-up to both
+  parked runs — `a146df98` (example-app #78) and `edbc3884` (**uzi #209**) — and the one
+  to `edbc3884` cites *"your fix wave (committed 15:28)"*, commits today's
+  behaviour destroys before the message is read. Both still show `consumed_at:
+  null` via `uzi run inputs --json`, so the claim is re-queryable. The instruction
+  stays correct; its premise does not, and the agent has no way to tell. It
+  belongs in its own issue rather than here on three counts: it is anchored to the
+  bug, not to anything M1/M2 introduce; it fires on any re-clone, including a
+  requeue or a dropped session, so it is not park-specific; and every post-fix
+  residual we can enumerate is already covered by R1, R3, or D2's force-update
+  note (an exhaustiveness claim we cannot prove complete, so read it as "no
+  exposure we could find" rather than a closed set). Note also that M3 cannot
+  close it as drafted:
+  the worker status is feed-facing, and `priorWork` renders only through the three
+  plan-prompt builders (`prompt.ts:528`, `:749`, `:872`), which the `preApproved`
+  resume skips entirely (`sdk-executor.ts:702-707`) — so on exactly the measured
+  path, an agent-facing emission would be new work, not a reordering. Whoever
+  picks it up has a natural home: `buildImplementPrompt` already carries
+  first-turn-only facts (`prompt.ts:608-650`), and the ordering there is free,
+  since `pullFollowUp` runs at the END of an iteration and turn 1 therefore
+  cannot structurally carry a follow-up.
 
 ## Related
 
