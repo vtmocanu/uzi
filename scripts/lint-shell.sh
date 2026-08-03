@@ -1,7 +1,39 @@
 #!/bin/sh
 # Gate every tracked shell script on shellcheck (PRD #103 M5).
 #
-# usage: scripts/lint-shell.sh <severity>      e.g. scripts/lint-shell.sh warning
+# usage: scripts/lint-shell.sh <severity> <exact-shellcheck-version>
+#        e.g. scripts/lint-shell.sh warning 0.11.0
+#
+# 🔴 THE VERSION IS ASSERTED EXACTLY, AND A MISMATCH IS `exit 2`. Decision 7 has
+# the Taskfile invoke tools BY NAME and stay indifferent to what put them on PATH,
+# so a contributor's brew shellcheck and CI's pinned build can drift apart. That
+# would be harmless if versions only differed in speed. They do not -- measured
+# 2026-08-03 over the same 14 tracked scripts:
+#
+#              -S error   -S warning   -S info   -S style
+#     0.10.0       0           1          34        36
+#     0.11.0       0           4          13        15
+#
+# 0.10.0 DOES NOT EMIT SC3067 AT ALL, and the info/style counts move in OPPOSITE
+# directions across the two, so the tiers are not nested subsets: this is a
+# different instrument, not a rounding difference. Two consequences, and the second
+# is why an exact assert beats a floor:
+#
+#   * The three per-instance `# shellcheck disable=SC3067` in
+#     agent/templates/entrypoint.sh would be VACUOUS under 0.10.0 -- suppressions
+#     for a diagnostic the tool never emits, invisible forever because shellcheck
+#     has no unused-directive report. That is carry-forward item 3's silent-no-op
+#     class, installed by the design that bans it.
+#   * Under 0.10.0 this gate reaches green at `--severity=warning` after ONE source
+#     edit instead of one plus three suppressions. That reads as easier and is
+#     strictly weaker: GREEN BY THE TOOL'S BLINDNESS RATHER THAN BY THE CODE BEING
+#     RIGHT.
+#
+# So a contributor on 0.11.1 is BLOCKED until they match, which is the correct side
+# to err on: the alternative is a local green and a CI red (or worse, the reverse)
+# with nothing in either output explaining why. CI installs the pin as a
+# sha256-verified tarball (see `lint:repo` in .gitlab-ci.yml); the same
+# `darwin.aarch64` asset exists, so a contributor can install the identical build.
 #
 # 🔴 WHY THIS IS A SCRIPT AND NOT AN INLINE `cmds:` LINE. M5 is the milestone that
 # adds shellcheck, so a committed script is LINTED BY THE CHECK IT IMPLEMENTS and
@@ -48,10 +80,12 @@
 set -eu
 
 SEVERITY="${1:-}"
+WANT_VERSION="${2:-}"
 
-if [ -z "$SEVERITY" ]; then
-  echo "usage: scripts/lint-shell.sh <severity>   (error|warning|info|style)" >&2
-  echo "  e.g. scripts/lint-shell.sh warning" >&2
+if [ -z "$SEVERITY" ] || [ -z "$WANT_VERSION" ]; then
+  echo "usage: scripts/lint-shell.sh <severity> <exact-shellcheck-version>" >&2
+  echo "  severity: error|warning|info|style" >&2
+  echo "  e.g. scripts/lint-shell.sh warning 0.11.0" >&2
   exit 2
 fi
 
@@ -77,6 +111,45 @@ ROOT="$(git rev-parse --show-toplevel)" || {
   exit 2
 }
 cd "$ROOT" || exit 2
+
+# 🔴 VERSION ASSERT, BEFORE ANYTHING IS LINTED. See the header for the 0.10.0 vs
+# 0.11.0 table and why an EXACT match rather than a floor. `command -v` is checked
+# separately so "no shellcheck at all" does not surface as an unparseable version.
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "lint-shell: no shellcheck on PATH (want exactly $WANT_VERSION)." >&2
+  echo "  CI installs it as a sha256-verified tarball; see the lint:repo job." >&2
+  echo "  Locally: https://github.com/koalaman/shellcheck/releases/tag/v$WANT_VERSION" >&2
+  exit 2
+fi
+
+# Assignment, not a pipe: `$?` after a pipe reads the LAST command, so a piped
+# form here would report sed's status and never shellcheck's.
+SC_VERSION_RAW="$(shellcheck --version 2>/dev/null)" || {
+  echo "lint-shell: 'shellcheck --version' failed." >&2
+  exit 2
+}
+# `shellcheck --version` prints four labelled lines; the one that matters reads
+# `version: 0.11.0`.
+SC_VERSION="$(printf '%s\n' "$SC_VERSION_RAW" | sed -n 's/^version: //p')"
+
+if [ -z "$SC_VERSION" ]; then
+  echo "lint-shell: could not parse a version out of 'shellcheck --version':" >&2
+  printf '%s\n' "$SC_VERSION_RAW" | sed -e 's/^/    /' >&2
+  exit 2
+fi
+
+if [ "$SC_VERSION" != "$WANT_VERSION" ]; then
+  echo "lint-shell: shellcheck $SC_VERSION is on PATH; this gate is pinned to $WANT_VERSION." >&2
+  echo "  This is an INSTRUMENT failure (exit 2), NOT a finding, and the pin is exact" >&2
+  echo "  on purpose: 0.10.0 does not emit SC3067 AT ALL, so under it the three" >&2
+  echo "  per-instance disables in agent/templates/entrypoint.sh become vacuous and" >&2
+  echo "  this gate goes green by the tool's blindness rather than by the code being" >&2
+  echo "  right. The info/style tiers also move in opposite directions between those" >&2
+  echo "  two releases, so versions are different instruments, not rounding." >&2
+  echo "  Install the pin: https://github.com/koalaman/shellcheck/releases/tag/v$WANT_VERSION" >&2
+  echo "  (darwin.aarch64 / darwin.x86_64 / linux.x86_64 assets, same build as CI's.)" >&2
+  exit 2
+fi
 
 # 🔴 `git ls-files '*.sh'`, NOT `e2e/*.sh` + `scripts/*.sh`. Those two globs miss a
 # third of the tracked set, INCLUDING agent/templates/entrypoint.sh -- the worker
@@ -131,7 +204,7 @@ shellcheck --norc --severity="$SEVERITY" -- "$@" || rc=$?
 
 case "$rc" in
   0)
-    echo "lint-shell: clean at severity=$SEVERITY ($# tracked scripts)"
+    echo "lint-shell: clean at severity=$SEVERITY, shellcheck $SC_VERSION ($# tracked scripts)"
     exit 0
     ;;
   1)

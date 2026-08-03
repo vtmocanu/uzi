@@ -385,7 +385,25 @@ tasks:
       # disables carrying the busybox measurement), so this ships gating at zero.
       # `info`/`style` are the burn-down; tightening to them is a later decision
       # with 11 findings behind it, not a flag flip.
-      - ./scripts/lint-shell.sh warning
+      #
+      # 🔴 AND `0.11.0` IS AN EXACT PIN THE SCRIPT ASSERTS, EXITING 2 ON ANYTHING
+      # ELSE. Decision 7 has this file invoke tools by NAME, indifferent to what put
+      # them on PATH -- which is right, and it means a brew shellcheck and CI's
+      # pinned build can drift. That is not a speed difference: measured over the
+      # same 14 scripts, 0.10.0 reports 1 warning where 0.11.0 reports 4 and DOES
+      # NOT EMIT SC3067 AT ALL, which would make entrypoint.sh's three disables
+      # vacuous and take this gate green by the tool's blindness. The info/style
+      # tiers move in OPPOSITE directions between the two, so they are different
+      # instruments rather than nested subsets. The version is an argument, not a
+      # script default, for the same reason the severity is: this file's echo is
+      # how a pin going missing becomes visible.
+      #
+      # THE PIN IS WRITTEN TWICE ON PURPOSE -- here, and in `lint:repo`'s tarball
+      # fetch in .gitlab-ci.yml. That duplication is SELF-CHECKING rather than a
+      # drift risk: bump one and the other's assert exits 2 with both numbers in
+      # the message. A single shared variable would have to be spliced into a
+      # `cmds:` line, which this file's header bans.
+      - ./scripts/lint-shell.sh warning 0.11.0
 
   lint:yaml:
     desc: yamllint --strict over every tracked YAML except deploy/chart/templates/
