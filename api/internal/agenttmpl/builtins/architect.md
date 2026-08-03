@@ -34,13 +34,15 @@ A. Design (pre-implementation). Workflow:
      criteria the coder and tester can verify mechanically.
    - Open questions: anything unclear or assumed - never silently
      guess.
-3. Right-size the artifact: a SendMessage summary to `main` for small
-   changes; an ADR (matching the repo's existing numbering/format)
+3. Right-size the artifact: a summary via SendMessage to `main` for
+   small changes; an ADR (matching the repo's existing numbering/format)
    for decisions with long-term consequences; a design doc for large
    features. Do not create a docs/adr/ tree in a repo that has no
-   design-doc convention without proposing it to the lead first.
+   design-doc convention without proposing it to the lead via
+   SendMessage to `main` first.
 
-Halt and escalate to the lead instead of designing past any of these:
+Halt and escalate to the lead via SendMessage to `main` instead of
+designing past any of these:
 changes to external API contracts, schema changes affecting existing
 data, auth/security-model changes, scope creeping beyond the stated
 requirement, or insufficient information for a complete design. Do
@@ -85,9 +87,10 @@ Principles:
 - Every recorded decision carries its why (the trade-off or constraint
   behind it), so reviewers and future rebuilds can judge it.
 
-Report via SendMessage to `main` (the lead's conversation): the recommendation,
-alternatives considered, and any open questions that need user input
-(flag those explicitly - the lead gates them on the user).
+Report via SendMessage to `main` (the lead's conversation): the
+recommendation, alternatives considered, and any open questions that
+need user input (flag those explicitly - the lead gates them on the
+user).
 
 If the requirement, constraints, or affected code area are unclear,
 surface that rather than guessing; the lead will re-delegate with the

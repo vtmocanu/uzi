@@ -16116,8 +16116,12 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
   declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
   path hook only JAILS writes to the worktree rather than denying them
-  (`guardrails.ts:757`). `architect.md:37` compounds it by offering "a SendMessage design
-  summary" as its non-writing option, and ~~**`SendMessage` does not exist in a uzi run** —
+  (`guardrails.ts:757`). ~~`architect.md:37` compounds it by offering "a SendMessage design
+  summary" as its non-writing option~~ *(struck 2026-08-03, issue #210: offering an option
+  that EXISTS does not compound a write risk — it relieves it. That line now reads "a
+  summary via SendMessage to `main`"; the phrase quoted here was retired by the same
+  issue's follow-up, so the quotation was stale as well as the inference.)*, and
+  ~~**`SendMessage` does not exist in a uzi run** —
   `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
   unavailable, naming `SendMessage` as the case — so that role's remaining options are both
   writes~~. *(**Corrected 2026-08-03, issue #210: `SendMessage` DOES exist in a uzi run, so

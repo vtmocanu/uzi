@@ -211,16 +211,25 @@ UI (Decision 8).
    absent, so this correction deliberately does not claim all four exist. **The
    decision's conclusion survives and its REASON INVERTS**: keep them verbatim not
    because they are inert, but because at least two are live and useful — a
-   subagent's only channel to the lead's conversation runs through `SendMessage`,
-   which is precisely what issue #210 fixes the recipient of. Recorded here rather
+   subagent's only channel to the lead's conversation **while it is still
+   running** runs through `SendMessage`, which is precisely what issue #210 fixes
+   the recipient of. The qualifier is load-bearing and was missing: the Agent
+   tool's return value is a second channel, and issue #210's own traces show three
+   subagents falling back to it (6468 / 6251 / 4400 chars, run `84b6a933` seq 337
+   / 994 / 2454). What `SendMessage` uniquely provides is reaching the lead
+   BEFORE the subagent finishes. Recorded here rather
    than silently edited so the next reader does not conclude Decision 9 was wrong
    rather than under-argued.)* But all nine existing
    library-derived builtins carry them verbatim (`builtins/auditor.md:4`,
    `builtins/reviewer.md:4`, …), and this PRD's entire thesis is that a builtin
    and its library counterpart should be diffable (Decision 3). Pruning two of
    twelve files would make those two the only ones whose `tools` line does not
-   match `roles.yaml`, to remove names that are already inert. So: **keep them
-   verbatim.** If the inert names are worth removing, that is a separate,
+   match `roles.yaml`, to remove names that are already ~~inert~~ *(struck
+   2026-08-03, issue #210: at least `SendMessage` and `TaskList` are live — see
+   the correction above. The rest of the sentence stands; the reason for pruning
+   was never strong and this removes what was left of it.)*. So: **keep them
+   verbatim.** If the ~~inert~~ *(same correction)* names are worth removing,
+   that is a separate,
    roster-wide change (all twelve at once, with the diffability cost taken
    deliberately), not a two-file exception.
 
@@ -387,7 +396,9 @@ did** — folding does not make this one large change.
   *(Corrected 2026-08-03, issue #210: "inert" is wrong for at least `SendMessage`
   and `TaskList`, both observed executing in real runs — see the correction under
   Decision 9. This stays out of scope, but the reason is now stronger rather than
-  weaker: pruning a LIVE tool would remove a subagent's only channel to the lead.)*
+  weaker: pruning a LIVE tool would remove a subagent's only channel to the lead
+  **while it is still running** — the Agent tool's return value still delivers a
+  finished report, so the qualifier is what makes the claim true.)*
 - **The dev-team ↔ product parity nudge** — issue #63, a different comparison.
 - **Prebaking a browser into the worker image** — issue #87 / PRD #87. This PRD
   ships `web-ux` degraded and says so; it does not make it functional.

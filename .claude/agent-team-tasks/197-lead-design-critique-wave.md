@@ -470,7 +470,11 @@ limitation.
 - `builtins/*.md` carry no `version:` field (0 of 11, verified three times) — the
   missing half of any propagation story.
 - `architect.md:4` declares `Edit, Write` and also `SendMessage, TaskUpdate, TaskList,
-  TaskGet`, **none of which exist in a uzi run**. Pre-existing; D5 contains it for now.
+  TaskGet`, ~~**none of which exist in a uzi run**~~. Pre-existing; D5 contains it for now.
+  *(Corrected 2026-08-03, issue #210: `SendMessage` and `TaskList` DO exist — 26 and 3
+  `tool_use` entries respectively across runs `71d83432` / `84b6a933` / `c13cff61`.
+  `TaskUpdate` and `TaskGet` are UNOBSERVED in those traces, which is not the same as
+  observed absent, so this correction deliberately does not claim all four exist.)*
 - Whether #85 grows a second track for the orchestration half.
 
 #### Standing, unchanged
@@ -502,11 +506,29 @@ a separate sentence addressed to the lead and is **not** marked for relay.
 Why that is fatal rather than untidy: a subagent's system prompt is `t.prompt_body`
 (`agents.ts:96`) and the lead cannot alter it, so **the dispatch prompt is the only
 channel**. Meanwhile `architect.md:37` tells it to "right-size" to *a SendMessage design
-summary for small changes*, an ADR, or a design doc — and **`SendMessage` does not exist
+summary for small changes*, an ADR, or a design doc — and ~~**`SendMessage` does not exist
 in a uzi run**: `repoagents.ts:25-29` states an allowlist entry matching no real tool is
 silently unavailable, naming `SendMessage` explicitly. So the non-writing branch is
-unreachable and both remaining options are writes. `tester.md`'s prohibitions are all
+unreachable and both remaining options are writes.~~ `tester.md`'s prohibitions are all
 *external* (push, merge, comment) and do not cover a local worktree write.
+
+> **Corrected 2026-08-03, issue #210 — the struck claim is FALSE and its citation now
+> points at the correction.** `SendMessage` executed 26 times across runs `71d83432` /
+> `84b6a933` / `c13cff61` (18 successful), and `ToolSearch` resolved `select:SendMessage`
+> six times, which is direct proof the SDK provides it independently of any send
+> succeeding. `repoagents.ts:25-29` is where the CORRECTION now begins, so the citation
+> was stale in the direction that inverts it. The STRUCTURAL claim on those lines — an
+> allowlist entry matching no real tool grants nothing — is untouched and still true; only
+> `SendMessage` as an instance of it was wrong. **So the non-writing branch is REACHABLE
+> and architect's remaining options are not both writes**, which weakens the argument for
+> B1 below without touching its conclusion (the no-write rule still has to be relayed,
+> on the plan-turn-write argument). The quoted phrase is also retired: `architect.md:37`
+> now reads *a summary via SendMessage to `main`*. Scope: `TaskList` is also observed
+> (3 calls); `TaskUpdate` and `TaskGet` are UNOBSERVED, not observed absent.
+>
+> This file is TRACKED and simultaneously ignored (`.gitignore:44`), so `grep -rl` cannot
+> see it and `--hidden` changes nothing — which is exactly how this seventh copy survived
+> the six-site sweep in `4fde2088`. `git grep` finds it.
 
 `lead.md:43-45` already shows the idiom the paragraph should have used: *"stated in its
 delegation prompt, and tell it not to commit"*.
