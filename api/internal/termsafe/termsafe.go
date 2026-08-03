@@ -194,7 +194,7 @@ func Validate(field, s string) error {
 				"(zero-width spaces and joiners, bidirectional overrides, the byte-order "+
 				"mark): they let two different entries look identical, or make one read as "+
 				"another. This also rules out multi-part emoji such as 👨‍👩‍👧, which are "+
-				"joined by one of these characters. Use a plain name.", field)
+				"joined by one of these characters, so use a plain name instead", field)
 		}
 	}
 	if strings.TrimSpace(s) != s {
