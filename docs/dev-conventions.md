@@ -51,7 +51,7 @@ Four things about it that are decisions rather than accidents:
 
 - **The load-bearing flags live in the targets, with their reason beside them.**
   `-race` and `-count=1` on `test:api`, `-count=1` on `test:controller`,
-  `--test-timeout=30000` inside `agent/package.json`'s `test` script. None is
+  `--test-timeout=120000` inside `agent/package.json`'s `test` script. None is
   optional and each one's absence is invisible in a passing run, which is why
   the Taskfile is not `silent:` — Task echoes every command, so you can read the
   flags in the output instead of trusting a file.
