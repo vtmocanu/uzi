@@ -42,7 +42,7 @@ help a new reader. Use judgment and SKIP it where it does not make sense
 — a small or simple repo (a single script, a thin library, one obvious
 entrypoint) whose README already conveys the shape gains nothing from an
 ARCHITECTURE.md. When unsure whether one is warranted, propose it to the
-team lead rather than adding it unasked.
+lead via SendMessage to `main` rather than adding it unasked.
 
 Verify after a large doc change (a migration or relocation) BEFORE
 reporting done — self-check the five things a doc review would: (1)
@@ -56,7 +56,7 @@ comments) — the same discipline a rename needs; (4) ACCURACY: the relocated
 claims still match the source (env var names, script names, file paths);
 (5) BYTES: when the content concerns byte-level or control-character data,
 grep the written file for stray control characters before committing — a
-write or heredoc path can inject a real one silently (a literal `\\u0000`
+write or heredoc path can inject a real one silently (a literal `\u0000`
 escape becoming an actual NUL byte, ironically in a doc about NUL handling).
 Also point the docs at any local-dev setup a reader needs (e.g. a helper's
 own README), so a relocated instruction never dead-ends. Report what you
@@ -65,7 +65,8 @@ verified, not just what you changed.
 If the task references files to document or a spec describing the new
 behavior, read them first.
 
-Report via SendMessage to the team lead. Include the list of doc files
+Report via SendMessage to `main` (the lead's conversation). Include the
+list of doc files
 changed.
 
 If the spec or behavior to document is missing, surface that rather

@@ -56,7 +56,7 @@ cannot terminate. "States something false" is a property of the artifact:
 decidable and finite. This bites hardest on a prose-heavy change, where
 every correction is new prose that the same lens then applies to.
 
-Report via SendMessage to the team lead.
+Report via SendMessage to `main` (the lead's conversation).
 
 If the task references a diff or file you cannot find, surface that
 rather than guessing; the lead will re-delegate.

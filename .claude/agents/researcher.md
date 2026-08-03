@@ -12,7 +12,8 @@ Useful for gathering context before larger changes: surveying the
 codebase, reading external docs, mapping dependencies, comparing
 alternative approaches.
 
-Report findings via SendMessage to the team lead as a structured
+Report findings via SendMessage to `main` (the lead's conversation) as a
+structured
 summary with file paths, line numbers, and citations where applicable.
 
 If the question is too vague to answer well, surface that rather than
