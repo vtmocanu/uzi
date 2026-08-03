@@ -284,6 +284,65 @@ changing at all.)*
 
 ## Amendments
 
+### Amendment 9 — 2026-08-03. Round complete at `0e1d3d79`; state of play for whoever resumes.
+
+**All thirteen fixes landed.** Code commits in order: `bcd67c72`, `10970920`, `74dcb9f6`
+(F3), `2144d51c` (F1, F2, F4), `8e270772` (F11), `33834a21` (F5-F10), `0e1d3d79` (F12), plus
+merges `c3704d25` and `20485ad0`. Tree clean, 0 behind `origin/main`, no CI-skip marker in the
+tip.
+
+#### F12 SURVIVED THIRTEEN VALIDATOR-ROUNDS BECAUSE NOTHING ASSERTED ON IT
+
+The reset notice said *"Reset to the builtin default"* while every other surface said
+**shipped**. **No test pinned the old string** — and a copy change with no POSITIVE assertion
+on it is invisible to the suite by construction. That is the same class this repo already
+documents as the vacuous-negative trap, arriving from the other side: there, a negative
+assertion goes quiet when its string is retired; here, there was never an assertion at all.
+Neither is visible to review-by-reading, and only a deliberate vocabulary sweep finds them.
+
+**It was also nearly lost to the message channel, not to the code.** The lead asked the coder
+to enumerate what remained rather than inferring it from commits. F12 was the one item the
+coder had never read: four lead messages queued and arrived together, after it had already
+worked from the file. **Asking is what caught it** — a status question costs one round trip and
+does not go stale the way an inference over a moving tree does.
+
+#### THE LEAD PROMISED A QUIET TREE AND DID NOT DELIVER ONE
+
+The lead told web-ux to fire at `3f4de962` with *"coder is idle, tree clean"*, having verified
+both. `0e1d3d79` landed at 18:28:36 — **touching `AgentDetail.tsx`, the exact file web-ux
+measures.** The claim was true when checked and false minutes later, which is the same
+moving-tree shape as Amendment 8's rule, now in its third form: not a range this time but a
+STATE. **The mitigation that worked was already in the message** — web-ux was told to verify
+the range itself rather than take the lead's summary. Say the check, not the conclusion.
+*(In the event it did not matter: web-ux hit the session cap before measuring.)*
+
+#### F13 was accurate when filed and OVERTAKEN, not missed
+
+It was filed against the coder's *uncommitted* `Agents.tsx`, where the bare `title` was real.
+The paired fix had already landed in `33834a21` by the time it was written. Recorded because
+web-ux flagged that pairing twice and asked for a third to be treated as a process failure —
+**the third did not happen.**
+
+#### PAUSED: two teammates hit the ACCOUNT-WIDE session cap at ~15:31Z, resets 20:40 EEST
+
+`web-ux` and `coder` both failed with `idleReason: failed` + session limit. **That is a usage
+cap, not a crash: they resume by name via a plain message and MUST NOT be respawned** —
+respawning costs the `-N` name suffix and their accumulated context.
+
+**Outstanding when they return:**
+1. **web-ux's re-measure never ran** — it must target **`0e1d3d79`**, not the `3f4de962` it was
+   given, since F12 moved `AgentDetail.tsx` underneath. Apply the harness-inversion rule in
+   Amendment 6: F5 and F6 are now FIXED, so a green run is the success case.
+2. **documenter (task #7)** — `docs/agent-templates.md:121-135` and a CHANGELOG entry. **Must
+   carry the operator note: on an already-seeded install 10 of 11 builtins badge immediately**
+   (every body but `lead.md`), which is the #210 recovery path working, not a defect.
+3. **spec-keeper (task #9)** — needs a user-vs-AI provenance breakdown from the lead.
+
+**Carried caveats, unchanged and routed to M4b:** criterion 5 proved below the row fetch only
+(F-T1), criterion 9 proved on the client only (F-T2), the three-implementation drift predicate
+(R1). This worktree's `web/node_modules` is a real directory and its `web/package.json` /
+`package-lock.json` differ from `main/`'s.
+
 ### Amendment 8 — 2026-08-03. THE LEAD MADE THE SAME ERROR TWICE. Rule, not another apology.
 
 **Instance 1:** *"the merge altered no M4a file"* — five hand-picked paths checked, generalised
