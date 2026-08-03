@@ -192,12 +192,26 @@ implementation on everything it covers.
   unfalsifiable `name` term, and measured the jsonb round-trip on a throwaway Postgres.
 - `auditor`: reported — design wave at `a24961bf`. Found the user-scope name-collision case
   and the `dangerouslySetInnerHTML` constraint; confirmed the boot path.
-- `coder`: dispatched — against this brief as amended.
-- `tester`: pending — spawns after the coder's FIRST commit, never at kickoff.
-- `web-ux`: pending — dispatched on the wave where the badge and diff land. **Blocker named
-  in Amendment 1 §7: on a fresh mock load every row is a pristine clone of its shipped twin,
-  so nothing carries the badge and the pass is structurally blind to it. The fixture work is
-  a prerequisite, not a nicety.**
+- `coder`: **delivered.** `bcd67c72` (api) + `10970920` (web), then `c3704d25` merging
+  `origin/main`. Re-gated green on the merged result. Three caveats carried forward, all
+  self-reported: criterion 5 is proved only BELOW the row fetch (`h.q` is a concrete
+  `*store.Queries`, so the wire path needs a live DB); the `dangerouslySetInnerHTML` sweep is
+  now 12 comment hits rather than 11, with still zero call sites, the 12th being its own
+  comment explaining the ban; and this worktree's `web/node_modules` is a real directory
+  rather than a symlink into `main/`, because `npm install` replaced it.
+- `reviewer`: dispatched at `10970920`, re-pointed to `c3704d25`.
+- `auditor`: dispatched at `10970920`, re-pointed to `c3704d25`.
+- `tester`: dispatched at `10970920`, re-pointed to `c3704d25`. Given the six behaviours to
+  pin and NOT a fold class — a control the lead designs carries the lead's blind spots to
+  every validator at once.
+- `web-ux`: dispatched. **Blocker CLEARED by the coder**, which is why the pass is worth
+  running: `mockShippedBuiltins` is now a constant separate from `mockTemplates`, the mock
+  computes drift as a deliberate second implementation, and nine cases discriminate
+  (pristine control, tools-order-only, tools-membership, prompt_body-only, model-only,
+  description-only, no-shipped-twin, global row, user row colliding with a builtin name),
+  each asserted so a later fixture edit that drops one goes red.
+- `fact-checker`: dispatched. Scoped to the seven commits, this file, and the comments the
+  feature commits added.
 - `documenter`: pending — `docs/agent-templates.md:121-135` (NOT `122-125`, which this file
   inherited from the issue body and which lands on the reset-is-verbatim paragraph). Both the
   reset paragraph and the no-auto-update paragraph at `129-135` need editing. CHANGELOG entry
