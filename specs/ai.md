@@ -17225,3 +17225,335 @@ position as §473.
   reads it. **CODEOWNERS on those seven files is the only structural fix, and there is no
   CODEOWNERS file anywhere in this tree.** M3 recorded this for three files; M4 quadrupled the
   surface and each new file states it for itself rather than inheriting it by pointer.
+
+# Issue #201 M4a — the builtin agent-template drift signal
+
+## 476. Issue #201 M4a — the comparison is ONE exported function over FOUR columns, it never renders either side, and `false` covers three states with two different Reset outcomes
+
+Serves human: Feature #201 — **PROPOSED, NOT YET RATIFIED.** The user asked for issue #201 and
+made two decisions on it (the diff library, and shipping M4a alone ahead of M4b); a `human.md`
+entry carrying those was sent to the owner for confirmation when these sections were written.
+Until it lands, `human.md` is silent on #201 and this is the only record. *(Numbering: `origin/main`
+ends at §474 and **§475 is RESERVED, not skipped** — the sibling `fix-144-cli-skew` worktree holds
+an unlanded section at that number, found by sweeping every sibling worktree of this bare clone at
+write time. Leaving the gap is the same discipline that put §473-474 above `main`'s §472 rather
+than colliding with it, and it is written down because a reader who finds these three starting at
+476 has no other way to learn the number was reserved rather than picked.)*
+
+**What ships.** A computed `differs_from_builtin` boolean on the agent-template DTO, and
+`GET /api/agent-templates/{id}/builtin` serving the definition this binary ships. Nothing else:
+no column, no hash, no historical-hash set, no migration, no boot-path change, no auto-update,
+no kill switch. Those are M4b. A rebuild that finds itself needing a DATABASE column here has
+drifted from the design rather than discovered a requirement.
+
+**Why the signal ships before the auto-update, which is the constraint the whole milestone is
+shaped by.** Reset-to-default is all-or-nothing — one unconditional update of description, model,
+tools and prompt body from the embedded definition, no merge, no per-field option — so an admin
+pressing it on a row they have edited loses that edit with no diff shown anywhere. The drift
+signal is what makes Reset safe to press. **That argument is load-bearing rather than
+motivational: it is what grades the co-visibility defect in §477 as blocking.**
+
+**The comparison is one exported function and its LOCATION is the highest-value decision in the
+milestone.** `agenttmpl.SameContent(a, b Definition) bool`, in `agenttmpl`, **not** in `handler`.
+`agenttmpl` has no database dependency and both `handler` and `store` already import it. M4b's
+reconciler answers the same question over the same columns; if M4a writes an ad-hoc comparison
+inside `handler`, M4b must reimplement it in `store` or refactor under time pressure — and the
+moment there are two, the UI can say a row is customized while the reconciler quietly overwrites
+it. Architect's call, lead accepted.
+
+**FOUR columns, not five.** `description`, `model`, `tools`, `prompt_body`. **`name` is the lookup
+key and is never a compared value**: the shipped side is always obtained by `BuiltinByName(row.Name)`,
+whose loop condition is `d.Name == name`, so equality holds by construction — and the column is
+immutable after create. A fifth term would be unfalsifiable and would send a tester hunting a case
+that cannot exist.
+
+**Nothing is normalized in either direction, and every one of those non-normalizations is
+load-bearing rather than laziness:**
+
+- **`tools` uses `slices.Equal`, never `reflect.DeepEqual`.** `slices.Equal(nil, []string{})` is
+  **true**, which is the correct answer — both mean inherit-all — where `DeepEqual` reports drift
+  on a semantically identical row.
+- **`tools` is compared ORDER-SENSITIVELY and neither side is ever sorted.** The order is
+  rendered into the subagent file, so a reordering really is a change; sorting **hides a real
+  edit**. Nothing else in the milestone pins this, which is why the fixture set carries an
+  order-only case.
+- **`description` and `prompt_body` are compared exactly, never trimmed.** A trim hides
+  whitespace-only edits permanently — a blind spot with no expiry.
+
+**The trim asymmetry that motivates the last point is fixed AT THE SOURCE, not in the comparison.**
+The write path trims `description`; the builtin parser does not. So a shipped `.md` carrying a
+padded frontmatter value would seed a row that flips to the trimmed form on the first no-op save
+and then reports drift with nothing changed. The fix is a **corpus invariant** — the builtin
+parse/validity test now asserts whitespace hygiene per frontmatter value and per tool name, naming
+the offender — rather than a trim in `SameContent`. The wave split 2-1 on this and the lead ruled
+for never-trim: a corpus invariant is checkable and free, a comparison trim is permanent.
+
+**NEVER compare `Render()` output**, which is the tempting shortcut, and note that **no test in the
+suite discriminates the two today** — which is exactly why it is written the column way now and
+would be expensive to change later. Two independent reasons:
+
+- `Render` serializes the **frontmatter**, so anything a future release stamps there enters the
+  comparison for free. PRD #85 M2 stamps a `version:` line into the builtin files; it would appear
+  on the shipped side and never on the stored side (there is no version column), so **every stamped
+  builtin would report drift forever, silently.**
+- `Render` **omits** the tools and model lines when empty, so a stored `tools: []` and a stored
+  `tools: NULL` render identically — a serialization comparison hides a difference the UI displays
+  as "none" versus "all". This function is asked about the **columns**, not about the file.
+
+*(A third argument was offered and is INERT here, recorded so a rebuild does not re-adopt it:
+"#85 reorders the frontmatter" does not apply, because M4a renders both sides with the SAME binary
+at the same instant, so a reorder cancels. It is correct for a stored HASH written by an older
+binary, which is M4b's problem.)*
+
+**The normalization already existed; do not write new normalization.** `templateToDefinition` maps
+a stored row onto the exact type `BuiltinByName` returns, decoding the jsonb tools column and
+folding a NULL text column to `""`. Both sides of the comparison are therefore `Definition`, and
+the `*string`/`[]string` mismatch never arises. **Do NOT add drift-specific behaviour to it** — it
+is on the `/rendered` export path that writes into an agent workspace.
+
+**And never byte-compare the jsonb.** Measured on a real Postgres: `json.Marshal` writes 23 bytes
+where pgx reads back 25 (`["Read", "Write", "Bash"]`), so `bytes.Equal` is false while the decoded
+slices are equal. The failure is **QUIET rather than total** — it reddens 9 of 11 builtins, because
+two carry no `tools:` line at all, and a partial red reads exactly like genuine drift. The unit
+fixture therefore hands the comparison a row whose `Tools []byte` holds that Postgres-canonical
+byte string directly, **with no database**; without that case the suite agrees with a
+byte-comparison implementation on everything it covers.
+
+**`false` means three distinct things, and the third has the OPPOSITE Reset outcome from the
+other two:**
+
+1. **The row has no shipped counterpart because it is not a builtin.** A global template, or —
+   the case that matters — a **user-scope template whose name merely collides with a builtin's**.
+   The scopes migration explicitly allows a user to own a `coder` beside the builtin `coder`, any
+   authenticated non-admin can create one, and Reset answers **400 "only builtin templates can be
+   reset"** for it. A name-keyed implementation with no scope check badges that private row and
+   **advertises an action that fails**. This is the case that separates a scope-checking
+   implementation from a name-only one; the admin shadow row does not.
+2. **The row is a builtin and matches what is shipped.**
+3. **The row is a builtin this release no longer ships.** Nothing to compare against, so `false` —
+   yet Reset answers **409**. That state reaches the UI through the new route's 409 rather than
+   through a tri-state DTO field, which is what keeps the DTO field a plain boolean.
+
+**The scope check reads `scope`, not `is_builtin`, and that is a style choice with a caveat worth
+stating.** The scopes migration's `CHECK (is_builtin = (scope = 'builtin'))` over two NOT NULL
+columns makes them a **provable biconditional**, so no row Postgres can hold separates them. But
+M4a mandates no live-DB test, so every fixture is a **Go struct literal, and a literal is not
+subject to a CHECK** — a test that separates them is testing an unreachable state, which is a
+different statement from "no fixture can separate them".
+
+**The shipped body gets its own ROUTE, and this was the user's delegation resolved under a
+best-practice bar.** Three shapes were proposed: a sub-resource route, shipped fields on the detail
+response only, and a nullable nested `builtin` object on the DTO. The route wins on two grounds
+each of the others fails one of — it matches the existing `/{id}/rendered` sub-resource precedent,
+and it keeps the **~44 KB shipped corpus out of the LIST response**, which the DTO-field form would
+carry on every row. *(The staleness objection — the shipped copy going stale after a save unless
+the client refetches — is **refuted** for the nested-DTO form, since `templateDTO` is shared by
+update and reset so a nested field refreshes itself, and **stands** for the detail-response-only
+form. It does not decide the question either way; payload and precedent do. Recorded per variant
+because "refuted" does not cover all three and a later revisit would misread it.)*
+
+**Route contract, and every clause of it mirrors `ResetAgentTemplate` deliberately:**
+
+- **Read-only and additive.** Nothing on this path writes.
+- **The row is loaded unfiltered and authorized FIRST**, so a template the caller may not see
+  returns **404** rather than a 400/409 that would confirm the id exists. That ordering is the
+  existence-oracle property, and the status-matrix test fails if the builtin check is ever moved
+  above authz.
+- **Gated by the template WRITE authz, not the read authz** — the endpoint exists to make Reset
+  safe to press and its audience is exactly the callers who can press it. **403** otherwise.
+- **400** for a non-builtin row, mirroring reset. *(Not 409, which is what the brief originally
+  specified and what a rebuild reading the issue would implement.)*
+- **409** for a builtin with no shipped definition, reusing reset's existing message.
+- **200** body is `{"builtin": {...}}` with the row DTO's null semantics — model null means
+  inherit, tools null means inherit-all — so the client diffs like against like. The row-only
+  fields (id, scope, timestamps) are absent: they have no meaning for a definition that lives in
+  the binary.
+- **No rate limiter**, like every sibling on that mount: it reads data embedded in the binary and
+  performs no query beyond the row fetch its neighbours already do.
+
+**Net exposure DECREASES.** The new route is gated *more* tightly than the data it describes:
+shipped bodies now reach admins only, while the stored bodies of the same rows have always been
+readable by every authenticated user.
+
+**Two template-shaped serializers must NOT gain the field.** The allocation DTO carries no content
+columns (the list page renders its rows from the templates list, so the badge reaches that page
+through the template DTO anyway), and the worker claim payload is a wire contract pinned by a
+golden — putting an admin-UI concept there leaks it into something the worker parses.
+
+**Everything below the row fetch is a separate function** taking the actor and the row, so the
+whole status matrix is exercisable over a real recorder **without a database**. That split reached
+everything it could; what it leaves is recorded in §478 rather than claimed.
+
+## 477. Issue #201 M4a — the client: one shared column list, a diff that could not be seen from the button it justifies, and a canary that only the output SHAPE can trip
+
+**The badge reads "differs from shipped", never "customized" or "edited", and the noun is
+load-bearing across every surface.** M4a answers *"does this row differ from the body shipped in
+THIS binary?"*. M4b's classifier answers a different question: *"does this row differ from the body
+it was SEEDED with?"*. A row that is pristine-as-seeded but behind the current release answers
+**true** to the first and **pristine** to the second — M4b will auto-update it and the badge will
+vanish. That is only coherent if the badge never claims a human edited it. The same noun is used by
+the badge, the diff panel, the reset card and the post-reset notice; getting it wrong makes M4b's
+fix a **copy change**, with everything a copy change does to the negative assertions guarding it.
+*(The post-reset notice was the one surface that missed the vocabulary and it survived thirteen
+validator rounds, because **no test asserted on it at all** — a copy string with no positive
+assertion is invisible to the suite by construction. Only a deliberate vocabulary sweep finds
+that class.)*
+
+**`differs_from_builtin` is declared NON-OPTIONAL in the client type.** Every literal then fails
+typecheck until it is updated. Declared with a `?`, the mocks stay silent, the badge never renders
+in mock mode, and the structural blindness arrives through one character.
+
+**The diff library is jsdiff rendered as REACT ELEMENTS — the user's choice, under a binding
+constraint the team supplied.** Most JS diff libraries return **HTML strings** by default
+(`diff2html`, and jsdiff's own `convertChangesToXML`), and using one would introduce the **first
+`dangerouslySetInnerHTML` in `web/src`**, which has **zero call sites** and a standing set of
+comments saying not to. Structured hunks into React text nodes instead. Install with
+`--ignore-scripts`, per the repo-wide rule about what a plain npm install does to this host.
+
+**Criterion 7 is a PROPERTY — ZERO CALL SITES — and never a count**, which is why no number for
+those comments appears above. Every count in circulation during the milestone was correct in a
+unit nobody stated (files versus occurrences), and because the two were adjacent integers the
+comparison read as "+1" when the change had added **two** of each. State the property; state the
+unit whenever a count appears at all.
+
+**The XSS canary's discriminating assertion is that the container holds no `<ins>`/`<del>`
+elements, and it is load-bearing rather than belt-and-braces.** Measured against three unsafe
+implementations: `convertChangesToXML` **escapes**, so the assertion that looks like it encodes the
+security property — querying for an injected `<img>` — is null and **passes under all three**. The
+only signal escaping cannot hide is the **output shape**. What used to redden the other assertions
+was an accident of the DOM shape changing, and the accessibility markers below preserve that shape
+by design, so the accident is gone. **Do not drop this assertion to make a refactor compile**; if
+anyone later prefers the semantic elements, the canary must be reshaped in the SAME commit with the
+reason recorded, because a canary deleted to make an unrelated change compile is how this class of
+guard dies.
+
+**Accessibility markers are sr-only spans, NOT `<ins>`/`<del>`.** This was a direct conflict
+between two accepted findings — the canary needs those tags absent, WCAG 1.4.1 needs the word-diff
+to carry meaning in something other than colour — and the lead resolved it in the canary's favour.
+sr-only markers satisfy both.
+
+**The client's column list is ONE exported function shared by the panel and the confirmation.** It
+lives in the templates lib rather than inside the editor **so the diff panel and the Reset
+confirmation can never name different columns**: a confirmation that undersells what it is about to
+discard is worse than none. It applies the same four rules as the server's comparison, each for the
+reason stated there.
+
+**The panel compares shipped against the CURRENT FORM STATE; the badge reflects the STORED row.**
+Both sentences can be true of different subjects while reading as a flat contradiction ~370px
+apart, so the panel says **which** it is talking about — unsaved edits whose saved row still
+matches, or a saved row that still differs.
+
+**THE DIFF AND THE RESET BUTTON COULD NOT BE ON SCREEN TOGETHER, WHICH FALSIFIED THE MILESTONE'S
+OWN PREMISE.** Measured at 1280×633: the diff panel ended at 871px and the Reset button began at
+1524px — a 653px gap against a 633px viewport, with the full-body rendered preview between them,
+and that was against an **11-line mock body** where real builtins run 27-138 lines. The unconfirmed
+Reset is **pre-existing and not M4a's**; what M4a changed is that the justifying evidence now
+exists and sat where it could not reach the click. **Graded BLOCKING for M4a specifically**,
+because "the diff makes Reset safe to press" is this milestone's entire argument for shipping ahead
+of M4b — shipping the artifact without the outcome would have left that argument false.
+
+**The fix is a confirmation that NAMES the drifted columns**, reading the shared column list, with
+a distinct sentence for the already-matches case. Chosen over a second Reset control inside the
+panel because it also closes the pre-existing gap and is the smaller change. One click had
+otherwise discarded **the live unsaved edit and the stored drift together** — observed, not
+derived, because the editor is keyed on the row's `updated_at` and remounts.
+
+**A trailing newline is a TERMINATOR and is normalized away for DISPLAY ONLY.** `diffLines` keeps
+the newline inside its token, so a body ending `…main.` and one ending `…main.\n` come back as one
+removed and one added line of **byte-identical text**, one green one red, with nothing on screen
+saying why. Reachable on real data rather than theoretical: every builtin file ends with a newline,
+the textarea adds none, and the body is submitted verbatim. **Nothing upstream is trimmed** — the
+shared column list and the server both still compare exactly — so a whitespace-only edit still
+badges and still lists the column, which is why that case gets its own explanatory sentence instead
+of an empty panel.
+
+**The tools diff is a two-line before/after, not a sequence diff.** A sequence diff on an
+order-only change renders as "Bash removed, Bash added": correct as a diff, unreadable as an answer
+to "what changed", and the order case is the one nothing else pins.
+
+**Non-admins never fetch the shipped side.** The condition is `is_builtin && isAdmin`, because for
+a builtin row the client's edit check is exactly the admin check; without it every non-admin
+opening any builtin detail page fires a request **guaranteed to 403**, and routine authz denials
+are what a real one hides in.
+
+**THE FETCH FAILURE IS DISCRIMINATED BY STATUS, AND THAT IS THE WHOLE POINT.** A **409** (and 403)
+is a fact about the RELEASE and licenses the page to say the definition does not exist; **anything
+else is a fact about ONE REQUEST** and must not change the copy or remove the Reset button. The
+shipped side is therefore modelled as a **four-arm discriminated union** — never-fetched, ok,
+absent, unavailable — rather than `Definition | null`, because a nullable cannot tell those apart.
+A parameterless catch mapped every rejection onto "this release no longer ships a definition for
+X", which is **a false sentence printed on exactly the recovery path this milestone exists to
+enable**, and it was a **regression in reach**: before M4a, Reset was offered for every builtin row
+and no transient failure could take the button away. The test that looked like it pinned this did
+not — it rejected with a 409 and asserted the copy, and passed identically on a 500, because
+nothing observed the status. **A fixture whose discriminating value the code cannot reach is not a
+fixture.**
+
+**The mock computes drift as a deliberate SECOND IMPLEMENTATION, against a shipped-side constant
+separate from the mock template rows.** Cloning the rows from one constant makes it both sides of
+the comparison, so nothing badges until someone edits and editing the source changes nothing. **A
+golden snapshotted from the mock data is the trap here**: it agrees on everything it covers and
+locks in the blind spot. Nine cases discriminate, each asserted so a later fixture edit that drops
+one goes red — pristine control, tools-order-only, tools-membership, prompt-body-only, model-only,
+description-only, no-shipped-twin, a global row, and a user row colliding with a builtin name.
+*(That the mock agrees with the fixtures proves nothing about the server; it is a second
+implementation, and pinning the two is §478's open item.)*
+
+**A mock fixture must also end its body with a newline**, or the trailing-newline row above is the
+first thing in the diff on the flagship demo case — the mock making the renderer look broken in a
+way real data would not.
+
+**Operator consequence, and it is the feature working rather than a defect: on an already-seeded
+install, 10 of 11 builtins badge immediately on deploy** (every body but the lead's). That is
+issue #210's recovery path — the whole reason the signal exists — but a badge firing on nearly the
+entire roster at once surprises someone, so the docs say it in advance.
+
+## 478. Issue #201 M4a — what is NOT delivered, and the three claims that must not be reported as met
+
+Written as a standing list rather than a status note, because a rebuild inherits these unmet and a
+later reader has no other way to learn that they were known.
+
+- **Criterion 5 — "the route serves the shipped definition" — is proved BELOW the row fetch
+  ONLY.** The handler function itself is at **0.0% coverage**; the part below the fetch is at
+  **100%**. So the residual is not the fetch, it is the **WIRING**: that the handler delegates at
+  all, and that it passes the write-loader's actor and row rather than the viewer loader's.
+  Rewriting it to serve the **stored** row instead of the shipped definition compiles and leaves
+  the package green. **"Criterion 5 covered" is what must not be said.**
+- **Criterion 9 — "Reset clears the badge with no refetch" — is proved on the CLIENT ONLY.** The
+  reset handler is at **0.0% coverage**, and folding it to return the **pre-reset** row it has
+  already loaded — so the badge never clears — compiles and leaves the whole handler package
+  green. The client half is measured twice over (a browser run with call counters, and a
+  same-visible-outcome fold proving the no-refetch assertion fires on its own channel); the
+  contract that the server puts the right thing in the response is held today **only** by the web
+  test's mock and by the mock API, neither of which observes the server.
+- **Both are ONE structural fact:** the handler holds a **concrete** query struct rather than an
+  interface, so no fake substitutes without a database and **every** DB-touching handler in that
+  package is 0%-covered, the template list included. Pre-existing and **not M4a's to fix** —
+  routed to M4b, which wants the same seam.
+- **The drift predicate has THREE implementations and nothing pins their agreement:** the server's
+  `SameContent`, the mock's own comparison, and the client's shared column list. A divergence was
+  **attempted and could not be constructed** — all three fold null/`""` and null/`[]` identically,
+  compare tools order-sensitively, and never trim — which is why this is recorded rather than
+  blocking. The one asymmetry is that the **editor trims `model` when it builds the current side**,
+  which is unreachable today, held shut by two independent guards (model validation rejects
+  whitespace, and the corpus whitespace assertion above), **neither of which mentions this
+  predicate**. If it were ever reachable, the badge would read "differs from shipped" while the
+  panel below it read "matches" — two contradictory sentences on one page.
+  - **This is a PREREQUISITE FOR M4b, and the repo already has the pattern:** `fixtures/run-usage/`
+    is read by a Go contract test and a TS contract test over the same artifact (§465). A shared
+    JSON case table of (shipped, stored, expected) fed to all three pins them to one file. **M4b
+    adds a FOURTH consumer — the reconciler's classifier — which is exactly when a divergence stops
+    being cosmetic and starts overwriting rows.**
+- **Out of scope by construction, and a rebuild should keep it that way:** no migration, no schema
+  change, no hash, no historical-hash set, no auto-update, no kill switch, no boot-path change, and
+  **nothing added to `agenttmpl`'s package `init()`** — it runs before `main` and a parse failure
+  there panics, which on a hard singleton is CrashLoopBackOff. **No live-DB test is required**: the
+  jsonb hazard is pinnable without a database (§476), and the endpoint's status matrix runs over a
+  recorder.
+- **The CLI needs no change**, verified independently by three agents: it exposes no agent-template
+  command.
+- **Recorded, not scheduled** — a count and filter on the list (which turns the #210 recovery from
+  a scan into a worklist), deep-linking the badge to the diff anchor, falling back from the
+  word-diff on a wholesale rewrite, naming the diff region for assistive tech, and **extracting the
+  four diff renderers into one component module**, which M4b wants for the same reason it wants the
+  single comparison.
