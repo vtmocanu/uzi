@@ -107,6 +107,27 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   always runs all three. See
   [docs/dev-conventions.md](docs/dev-conventions.md).
 
+- **Contributor tooling: the repo is now scanned for secrets on every gate run
+  and every MR**, which nothing did before. `task scan:secrets` runs gitleaks
+  (pinned to v8.30.1) over every tracked file and joins `task gate:repo`, so it
+  is part of `task gate` and of CI's `lint:repo` job. Eight fake-credential test
+  fixtures that the first scan reported are now annotated individually with a
+  written justification, rather than by excluding test files as a class. The
+  seven `gitleaks:allow` annotations this repo already carried — written before
+  anyone had run gitleaks — were each checked by removing it and re-scanning:
+  five suppress a real finding and keep their line, two suppressed nothing and
+  are gone. **The scanner's own configuration lives in the tree it scans**, so a
+  four-line `.gitleaks.toml` could switch it off in the same merge request that
+  adds a secret, and the job would report green. A committed canary closes that:
+  `scripts/gitleaks-canary.txt` holds a fake token the scan must report on every
+  run, and any allowlist broad enough to hide a real secret hides the canary too,
+  so the check exits 2 (instrument broken) instead of 0. A run that finds nothing
+  now prints the canary it did find. Part of PRD #103. Developer-facing only: no
+  change to how uzi behaves. **gitleaks needs no separate install** — it arrives
+  through `go run`, like the linters — so unlike the three checks above this one
+  has no skip and always runs. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on
