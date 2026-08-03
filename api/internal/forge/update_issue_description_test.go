@@ -101,7 +101,7 @@ func TestForgejoUpdateIssueDescriptionPreservesTheTitle(t *testing.T) {
 // read, which carries the same client and the same PAT.
 func TestUpdateIssueDescriptionRedactsTheToken(t *testing.T) {
 	t.Run("gitlab", func(t *testing.T) {
-		const token = "glpat-update-desc-redaction-probe-0123456789"
+		const token = "glpat-update-desc-redaction-probe-0123456789" //gitleaks:allow // fake PAT fixture: the value this test asserts is redacted out of the error, never a real secret
 		m := newMockGitLab(t, map[string]http.HandlerFunc{
 			"/api/v4/projects/7/issues/5": func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusForbidden)

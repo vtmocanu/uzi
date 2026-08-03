@@ -2438,7 +2438,7 @@ func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
 // the server at claim time. The test drives exactly that: one worker identity,
 // three claims, three bindings.
 func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-abcdef1234567890"
+	const defaultToken = "anthropic-DEFAULT-abcdef1234567890" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove claim-time credential resolution, never a real secret
 	const consoleToken = "anthropic-CONSOLE-abcdef1234567890"
 
 	box := newBox(t)
@@ -2594,7 +2594,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 // per user (M4), not per worker. Getting this wrong would silently bill
 // retrospectives to whichever worker happened to pick them up.
 func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
-	const defaultToken = "anthropic-JUDGEDEFAULT-abcdef1234567"
+	const defaultToken = "anthropic-JUDGEDEFAULT-abcdef1234567" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove the judge lane spends the owner's default, never a real secret
 
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
@@ -2667,8 +2667,8 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 // milestone's whole point — retrospectives billed to a different account from the
 // runs they review.
 func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-judgebind-abcdef12"
-	const judgeToken = "anthropic-JUDGEKEY-judgebind-abcdef1"
+	const defaultToken = "anthropic-DEFAULT-judgebind-abcdef12" //gitleaks:allow // fake Anthropic token fixture: the credential this test asserts is NOT spent, never a real secret
+	const judgeToken = "anthropic-JUDGEKEY-judgebind-abcdef1"   //gitleaks:allow // fake Anthropic token fixture: the judge-bound credential this test asserts IS spent, never a real secret
 
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
@@ -2723,7 +2723,7 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 // default is resolved to an id and opened BY id like everything else, so "no by-id
 // lookup" now describes a claim that opened nothing at all.
 func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
-	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234"
+	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234" //gitleaks:allow // fake Anthropic token fixture: sealed into a test box below to prove an unbound judge claim falls back to the default, never a real secret
 	box := newBox(t)
 	sealedDefault, _ := box.Seal([]byte(defaultToken))
 

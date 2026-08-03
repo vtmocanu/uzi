@@ -752,7 +752,7 @@ func TestNewMethodErrorsAreRedacted(t *testing.T) {
 }
 
 func TestErrorsAreRedacted(t *testing.T) {
-	const token = "glpat-supersecret-eviltoken-XYZ"
+	const token = "glpat-supersecret-eviltoken-XYZ" //gitleaks:allow // fake PAT fixture: the mock server echoes it back so the driver's redactor is proven to strip it, never a real secret
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		// Echo the token back inside the error body — worst case: the server
 		// itself leaks it. The driver must still not surface it.

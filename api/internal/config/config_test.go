@@ -42,7 +42,7 @@ func TestLoadSecretKeyBootGuard(t *testing.T) {
 	// subtest sets. JWT_SECRET is a real (non-placeholder, long-enough) value.
 	setBase := func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
-		t.Setenv("JWT_SECRET", "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e")
+		t.Setenv("JWT_SECRET", "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e") //gitleaks:allow // fake JWT secret fixture: a non-placeholder, long-enough value so the boot guard under test fails on UZI_SECRET_KEY alone, never a real secret
 	}
 	// A real (varied-byte) 32-byte key. An all-zero key would trip the
 	// low-entropy guard, so distinct bytes are used here.
