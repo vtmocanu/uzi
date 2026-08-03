@@ -16352,6 +16352,29 @@ asserts — whatever context the phrase does or does not carry.
   guards nothing forever. Real coverage needs a semantic check on the rendered prompt and is
   separate work. **"Regions closed relocation" must never be read as "regions closed the
   problem."**
+- **Scoping cannot LOSE detection, and that bounds the question of what it costs.** Each
+  region is a substring of the body, so `Contains(region, p)` implies `Contains(body, p)`:
+  every fold the whole-body form reddened on this set reddens here too. A **proof**, not a
+  measurement, and worth stating because it turns *"does scoping open a new class?"* from
+  open-ended into answerable — the split is the entire new exposure. **And that exposure is
+  three prose dependencies no behaviour pin protects**: the boundary sentence and the two
+  landmarks are ordinary template prose, and a benign edit to any one fatals all eight
+  assertions at the guard. The sharpest is punctuation — the boundary's trailing colon
+  changed to a period gives `guard 1: occurs 0 times` while `TestLeadParallelDispatchPhrases`'
+  pin on that same sentence stays **green**, because it quotes the sentence without the
+  colon. One character, identical behaviour, whole instrument down. All three fail **closed
+  and self-locating**, which makes it a cost rather than a hazard, but the whole-body form
+  did not have it and it is invisible from reading the case table, since the three strings
+  sit in constants that read as configuration.
+- **Controlling clause 3 requires a DUPLICATION fold, and the obvious control cannot reach
+  it.** Each landmark is checked present-in-its-own-region first and leaked-into-the-other
+  second, both `Fatalf` — so a moved boundary always trips the presence branch and the leak
+  branch is unreachable that way. Measured: every boundary-move fold reports
+  `no longer contains its landmark`, never a leak. An auditor controlling the leak branch by
+  moving the boundary therefore concludes it is dead code and deletes a live check.
+  Duplicating a landmark into the other region reaches it, with the boundary count still 1.
+  Same family as this file's other instrument entries: the natural control answers a
+  different question, cleanly and repeatably.
 - **A fold harness produced six plausible, wrong results in this run, and the tell was a
   count that could not happen.** The guard batch called its fold helper without the empty
   insert-argument placeholder, so the `sed` expressions were *appended to the template as
