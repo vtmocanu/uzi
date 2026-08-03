@@ -100,15 +100,23 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				// The render site is the trust boundary and does not depend on the
 				// validator holding; hardening the validator is a separate change.
 				//
-				// 🔴 "THE CROSS-TENANT ONE" ABOVE MEANS "of the two worker-name cells",
-				// NOT "of this file". `uzi admin cli-tokens` below renders `t.Name` raw
-				// into the same kind of cross-tenant admin table, and CLI-token names get
-				// only strings.TrimSpace — no control-character check either. It is left
-				// deliberately: it is PRD #64's surface, this change does not make it
-				// worse, and render-site fixes here are scoped to the surfaces this PRD
-				// touches. It goes up as a follow-up with the worker-name validator.
-				// Named here so the next reader sees a signpost rather than two
-				// sanitized cells and a file that looks finished.
+				// 🔴 THE SIGNPOST THIS COMMENT USED TO CARRY IS DISCHARGED (#180). It read
+				// "`uzi admin cli-tokens` below renders `t.Name` raw ... it goes up as a
+				// follow-up", and that is no longer true of this file: uzicli.Printer.Table
+				// now runs CellText over every header and every cell, so the cli-tokens
+				// table below — and every other table in the CLI — is sanitized at the
+				// render boundary whether or not its call site remembers.
+				//
+				// The explicit cellText here STAYS, and not out of caution. It states at the
+				// call site that this value is untrusted, which the boundary cannot say; it
+				// is idempotent, so it costs nothing; and a per-cell call survives a
+				// refactor that stops routing through Printer.Table, which the direct
+				// writers in version.go and root.go are the standing proof of.
+				//
+				// #169's OTHER half is untouched and still open: worker names have no
+				// validator at all (handler/workers.go checks length only, and workers.name
+				// carries no CHECK), so ESC remains STORABLE in one. That is a behaviour
+				// change to a shipped endpoint and belongs in its own MR.
 				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status})
 			}
 			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS"}, rows)
