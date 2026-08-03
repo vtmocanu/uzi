@@ -6,6 +6,42 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Subagents no longer have the ordinary route to write files during a run's
+  plan turn**, the phase before you approve a plan. Every subagent's `Edit`,
+  `Write`, `MultiEdit` and `NotebookEdit` tools are removed for that turn
+  only; the implement turn is unaffected, so a role that needs to write is
+  exactly as able to once the plan is approved. This is a hygiene control,
+  not a guarantee: the turn still runs under `Bash`, and nothing at the
+  guardrail layer denies a shell-based write (`echo >`, `sed -i`, `tee`), so
+  what changes is the tool a model reaches for by default and its awareness
+  that one exists, on top of the prompt instruction that was previously the
+  only thing saying not to. Actually catching a worktree change no matter how
+  it was made is tracked separately as issue #212 (issue #203).
+
+### Fixed
+
+- **Subagents in ten of the eleven builtin agent templates now reach the team
+  lead when they report back.** Each template's "report via SendMessage"
+  instruction named the recipient "the team lead," but the only address
+  reachable from a builtin body is `main`: the lead's own template runs as the
+  main thread, not as an invokable subagent, so a call addressed to "the team
+  lead" (or a bare "lead") failed with "No agent named 'lead' is reachable."
+  Measured across three real runs, 8 of 26 SendMessage reports failed this
+  way. Five subagents recovered by resending to `main`, each costing a
+  regenerated report of several kilobytes plus a few tool round-trips; the
+  other three gave up on SendMessage entirely and returned their findings
+  through a different channel, each prefixed with an apology about uzi's own
+  plumbing that a human then read in the report. The thirteen recipient
+  instructions across the ten templates now name `main` explicitly; the role
+  is still called "the team lead" in surrounding prose, since a blanket
+  rename there would misread as proposing action to the tool address rather
+  than describing the role. **Operators:** the fix does not reach an install
+  that has already booted, since builtin seeding never overwrites an existing
+  template row. An admin must open each of the ten affected templates and
+  click **Reset to default** to pick it up (issue #210).
+
 ## [0.14.0] - 2026-08-03
 
 ### Added
