@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-03
+
 ### Added
 
 - **The run page now says when a judge is already on its way**, instead of
@@ -94,6 +96,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   model, and a recorded fixture from a real run pins them to each other from both
   sides so they cannot drift apart again (issue #195). This also unblocks the
   live cost estimate in PRD #194.
+
+- **Git repositories the worker creates no longer leave a background daemon
+  watching their directory.** Any git command in a repo where `core.fsmonitor`
+  is on spawns `git fsmonitor--daemon --detach`, which reparents to init and
+  holds directory handles for as long as it lives, so the run's cleanup deleted
+  every file and then could not remove the directory. Issue #127 removed a
+  different detached child (`git maintenance run --auto`) and could not cover
+  this one: a retry absorbs a lock held for milliseconds, not a watcher that
+  never lets go. The worker's bare clone, the runner clone and the seed
+  destination now set `core.fsmonitor=false`. **In a worker container this is a
+  no-op** — the daemon dies with the container either way — so the effect is on
+  local development, where one such daemon was found still alive 21 days after
+  its repo was created (issue #127).
+
+### Security
+
+- **The web image's SPA build stage now runs `npm ci --ignore-scripts`.** No
+  dependency in the current lockfile tree would execute a lifecycle script
+  while producing the bundle served to users; the flag keeps that true across
+  the next lockfile refresh, which is when nobody is looking. Hardening, not a
+  fix: the image built both ways is byte-identical today. Deliberately not
+  applied to the worker's base image, whose postinstall is what bakes in the
+  `agent-browser` CLI.
 
 ## [0.13.0] - 2026-07-29
 
