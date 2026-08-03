@@ -42,15 +42,31 @@ import (
 // them, because both name `main` in backticks with no "lead" on the line at all.
 //
 // The occurrence count is NOT frozen at 13, and this paragraph used to say it was,
-// in the present tense, about a loop 130 lines below. What rule A actually iterates
-// has gone 13 → 21 → 23 across the three commits of this one issue: 13 at
-// `4fde2088`, 21 at `98cabb06` (which added eight in the same commit that wrote
-// "thirteen"), and 23 here (architect 4, spec-keeper 4, documenter 3, web-ux 3,
-// coder 2, fact-checker 2, tester 2, auditor 1, researcher 1, reviewer 1, lead 0).
-// That drift is the general hazard rather than a slip: a count derived from the
-// roster goes stale the moment the roster moves — and it moves fastest in the
-// commit doing the moving. Derive it (`len(all)-2` below), or date it as this
-// paragraph now does; never state it flat.
+// in the present tense, about a loop 130 lines below. The figure has gone
+// 13 → 21 → 23 → 25 across four commits: 13 at `4fde2088`, 21 at `98cabb06` (which
+// added eight in the same commit that wrote "thirteen"), 23 at `86c43fcd`, and 25
+// as of 2026-08-03 (architect 6, spec-keeper 4, documenter 3, web-ux 3, coder 2,
+// fact-checker 2, tester 2, auditor 1, researcher 1, reviewer 1, lead 0) — issue
+// #203 added two to `architect.md`. That drift is the general hazard rather than a
+// slip: a count derived from the roster goes stale the moment the roster moves —
+// and it moves fastest in the commit doing the moving. Derive it (`len(all)-2`
+// below), or date it as this paragraph now does; never state it flat.
+//
+// Worth knowing HOW the 25 was reached, because it is the paragraph's own point
+// landing on the paragraph: #203 wrote 24 here, then rule A went red on that same
+// commit's `architect.md` for a bare `SendMessage`, and the one-word repair made
+// it 25. The figure was stale before the commit containing it was finished.
+//
+// THE METRIC IS RECORDED HERE BECAUSE RE-DERIVING IT COST MORE THAN UPDATING IT.
+// It is occurrences of the literal "SendMessage to `main`", counted with line
+// wrapping normalized away, over `builtins/*.md`. That is NOT what the loop below
+// iterates — that one counts FILES mentioning SendMessage (10 of 11) — and it is
+// not a raw `SendMessage` grep either, which returns 32 at `86c43fcd` where this
+// paragraph says 23. Both plausible readings give the wrong number, and a reader
+// who picks one concludes the paragraph is simply wrong rather than that they
+// measured something else. The normalization is load-bearing: these bodies are
+// hard-wrapped, so a line-based grep splits `web-ux`'s third occurrence across a
+// newline and returns 22.
 //
 // SCOPE, and it is narrower than "lead is unreachable in a uzi run": the repo
 // source path (`subagentsFromTemplates`, PRD #37 Decision 3) DELIBERATELY does

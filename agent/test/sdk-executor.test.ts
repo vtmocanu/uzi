@@ -2187,3 +2187,101 @@ describe("plan-turn write-tool subtraction (#203)", () => {
     assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, architectA.tools);
   });
 });
+
+// A template whose declared allowlist is ONLY write tools. Filtering alone would
+// leave it with `tools: []`, which the repo reads as inherit-all in three places —
+// so the transform drops it from the plan turn instead (#203). These tests pin the
+// three sites that must agree about that drop: the `agents` map, the Agent-guard
+// allowSet, and the plan prompt's "Available subagents" line. Keeping a name in
+// either of the latter two while the definition is gone would advertise an agent
+// the SDK cannot resolve, which is worse than the `tools: []` it replaces.
+describe("plan-turn drop of a write-only allowlist (#203)", () => {
+  const penman: AgentTemplate = {
+    name: "penman",
+    description: "writes docs",
+    prompt_body: "You write.",
+    tools: ["Edit", "Write"],
+  };
+
+  async function planAndImplement(agents: AgentTemplate[]) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { plan: turns[0]!, impl: turns[1]!, probe };
+  }
+
+  it("drops it from the plan roster, the Agent guard and the plan prompt — and restores it to implement", async () => {
+    const { plan, impl } = await planAndImplement([lead, coder, reviewer, penman]);
+
+    // 1. The map.
+    assert.deepStrictEqual(Object.keys(plan.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    // No survivor carries an empty allowlist — the state this drop exists to avoid.
+    for (const [name, def] of Object.entries(plan.options.agents ?? {})) {
+      assert.notDeepStrictEqual(def.tools, [], `${name} must not carry an empty allowlist`);
+    }
+
+    // 2. The Agent guard. `penman` must be DENIED on the plan turn: the guard's
+    //    allowSet is frozen at construction from the same names as the map, so a
+    //    drop that missed it would let the lead invoke an undefined agent.
+    const agentHook = plan.options.hooks!.PreToolUse![2]!.hooks[0]!;
+    const call = (subagent_type: string) =>
+      agentHook(
+        { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type } } as unknown as HookInput,
+        "tu",
+        { signal: new AbortController().signal },
+      );
+    assert.strictEqual(
+      ((await call("penman")) as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
+        ?.permissionDecision,
+      "deny",
+      "a dropped agent must be denied by the plan turn's Agent guard",
+    );
+    // Control: a surviving agent is still allowed, so the assertion above is about
+    // `penman` and not about a guard that denies everything.
+    assert.strictEqual(
+      ((await call("coder")) as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } })
+        .hookSpecificOutput?.updatedInput?.run_in_background,
+      false,
+      "a surviving agent is still allowed",
+    );
+
+    // 3. The plan prompt. The lead must not be told it can delegate to `penman`.
+    //    Asserted on the DELEGATES LINE, not by searching the whole prompt: a
+    //    substring search over prompt prose is not this question, and it bites —
+    //    the first draft of this test used the fixture name `scribe`, which is a
+    //    substring of "described" in the plan boilerplate, so the assertion failed
+    //    against correct code. The line is the channel; the prose is not.
+    assert.ok(plan.promptText, "the plan turn carried a prompt");
+    const delegates = plan.promptText!.split("\n").find((l) => l.startsWith("Available subagents to delegate to:"));
+    assert.ok(delegates, `no delegates line in the plan prompt:\n${plan.promptText}`);
+    assert.strictEqual(
+      delegates,
+      "Available subagents to delegate to: coder, reviewer.",
+      "the plan prompt advertises exactly the plan-turn roster",
+    );
+
+    // 4. The IMPLEMENT turn is untouched — the drop is plan-turn-scoped, and
+    //    `penman` gets its declared write tools back where writing is the job.
+    assert.deepStrictEqual(Object.keys(impl.options.agents ?? {}).sort(), ["coder", "penman", "reviewer"]);
+    assert.deepStrictEqual(impl.options.agents!.penman!.tools, ["Edit", "Write"]);
+  });
+
+  it("says so on the run feed rather than dropping it silently", async () => {
+    const { probe } = await planAndImplement([lead, coder, penman]);
+    const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+    const notice = statuses.find((t) => t.includes("penman"));
+    assert.ok(notice, `no feed notice named the dropped agent:\n${statuses.join("\n")}`);
+    assert.match(notice!, /file-writing only/);
+  });
+
+  it("emits no such notice when nothing is dropped", async () => {
+    // The control that keeps the assertion above from passing on a worker that
+    // announces a drop on every run.
+    const { probe } = await planAndImplement([lead, coder, reviewer]);
+    const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+    assert.ok(!statuses.some((t) => t.includes("file-writing only")), statuses.join("\n"));
+  });
+});

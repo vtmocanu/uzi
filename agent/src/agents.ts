@@ -13,14 +13,21 @@
 // prompt and it is NOT also registered as an invokable subagent. Every other
 // template becomes an invokable subagent.
 //
-// Read-only roles (reviewer/auditor) are enforced via each AgentDefinition's
-// `tools` allowlist — subagents inherit the parent's `bypassPermissions` mode
-// and cannot override it, so the allowlist (excluding Edit/Write in the PRD #3
-// templates for exactly those two roles) is what makes them read-only. Every
-// subagent additionally disallows the Agent tool, so no subagent can spawn
-// further nested agents. Roles that DO declare write tools (coder, architect,
-// tester, documenter, spec-keeper, plus anything inheriting all) keep them on the
-// implement turn and lose them on the PLAN turn — see planTurnSubagents (#203).
+// Read-only roles are enforced via each AgentDefinition's `tools` allowlist —
+// subagents inherit the parent's `bypassPermissions` mode and cannot override it,
+// so an allowlist that excludes Edit/Write is what makes them read-only. The
+// property is the ALLOWLIST, never the role name: reviewer/auditor are the pair
+// usually cited, and citing a pair is what made the previous version of this
+// sentence false — it said "exactly those two roles" when five qualified
+// (reviewer, auditor, fact-checker, researcher, web-ux, measured 2026-08-03).
+// Treat that list as a dated sample, not a definition; derive it from the
+// frontmatter when you need it, because the roster moves. Every subagent
+// additionally disallows the Agent tool, so no subagent can spawn nested agents.
+//
+// Roles that DECLARE write tools (architect, tester, documenter, spec-keeper)
+// keep them on the implement turn and lose them on the PLAN turn — as does
+// anything that inherits all, `coder` included, which declares no tools at all.
+// See planTurnSubagents (#203).
 //
 // null/absent/empty `tools` = INHERIT ALL (PRD #3 wire contract). We honor it by
 // leaving the allowlist UNSET, so the SDK grants the full toolset — the built-in
@@ -227,31 +234,23 @@ export function subagentsFromTemplates(
   return subagents;
 }
 
-/**
- * The subagent roster to run the IMPLEMENT phase with, given the approved
- * selection (PRD #37 Decision 5). The `lead` is NOT here — it stays uzi's builtin
- * from the claim payload under either source, so callers keep using
- * assembleAgents' leadSystemPrompt/leadModel.
- *
- *   - "own":  the owner's already-assembled subagents (lead already partitioned
- *             out by assembleAgents), minus the excluded names. Skills stay
- *             per-template — the allocations ARE the admin's scoping surface here,
- *             so this path is deliberately untouched by PRD #72 M1.
- *   - "repo": the detected repo roster mapped subagents-only (a repo `lead` stays
- *             a subagent), minus the excluded names. Every subagent gets the run's
- *             whole surviving skill set (PRD #72 M1) — see subagentsFromTemplates.
- *
- * Exclusions are re-applied here worker-side; the API validated membership (M2)
- * but the worker owns what actually reaches the SDK. An exclusion naming an agent
- * not in the chosen source is a harmless no-op (nothing to remove).
- */
+/** What a planning turn runs with (#203): the write-stripped roster, plus the
+ *  names that had to be dropped outright so the caller can report them. */
+export interface PlanTurnRoster {
+  /** The plan turn's `options.agents` map. */
+  subagents: Record<string, AgentDefinition>;
+  /** Agents whose declared allowlist consisted ONLY of write tools, in input
+   *  order. Empty on every shipped builtin; see planTurnSubagents. */
+  dropped: string[];
+}
+
 /**
  * The subagent roster to run a PLANNING turn with: the assembled map with every
  * file-write tool (`WRITE_PATH_TOOLS`) taken off every subagent (#203).
  *
  * WHY. Before the human approval gate, a subagent write is an uncommitted
  * worktree change the approver never saw, which the first implement-phase commit
- * then sweeps in. Five roles can write on the plan turn today — architect,
+ * then sweeps in. Several roles can write on the plan turn today — architect,
  * tester, documenter and spec-keeper declare write tools, and `coder` ships no
  * `tools:` line at all (inherit-all, deliberate — see the header) while being
  * invokable on that turn. So this operates on the ASSEMBLED MAP rather than on
@@ -275,6 +274,28 @@ export function subagentsFromTemplates(
  * and resolution happens inside the compiled `claude` binary. Doing both makes
  * the question stop being a dependency instead of betting on an answer.
  *
+ * AN ALLOWLIST THAT EMPTIES DROPS THE AGENT, and that case is the one exception
+ * to the paragraph above — which is exactly why it is handled rather than left to
+ * fall out. A template declaring ONLY write tools (`tools: Edit, Write`, reachable
+ * through the documented admin surface: `validateTemplateFields` enforces no tool
+ * policy) filters to `[]`, and `[]` re-opens the precedence question this function
+ * exists to close. The repo reads an empty list as INHERIT ALL in three places
+ * (this file's header, `render.go`, and `agent_templates.go` which normalizes an
+ * explicit `[]` to NULL precisely so one never persists), so emitting `tools: []`
+ * would either DISCARD the operator's restriction and hand back the full parent
+ * toolset, or grant nothing at all — decided inside the compiled binary. Neither
+ * is acceptable, and neither alternative repair works: substituting a read set
+ * invents capability the operator deliberately excluded, and deleting the key is
+ * the inherit-all widening spelled out. An agent whose entire declared toolset is
+ * writing has no coherent role in a read-only wave, so it does not attend. Note
+ * `toDefinition` never emits `tools: []` either (it requires a non-empty list);
+ * this function is the first path in the repo that could, and it does not.
+ *
+ * The DROPPED names are returned rather than logged here because this module is
+ * pure. The caller must feed `Object.keys(subagents)` — the RESULT, not the input
+ * map — to the plan turn's Agent-guard allowSet and to the plan prompt's
+ * "Available subagents" line, or it advertises an agent the SDK cannot resolve.
+ *
  * NEW OBJECTS, NEVER MUTATION. `selectSubagents`'s own-source path copies
  * REFERENCES (`out[name] = def`), so mutating a definition here would leak into
  * the implement map and strip write tools for the whole run, breaking `coder`.
@@ -287,23 +308,47 @@ export function subagentsFromTemplates(
  * human is gating, and only a `PreToolUse` deny (the recorded upgrade path)
  * would reach it. Stated, not closed.
  */
-export function planTurnSubagents(
-  subagents: Record<string, AgentDefinition>,
-): Record<string, AgentDefinition> {
+export function planTurnSubagents(subagents: Record<string, AgentDefinition>): PlanTurnRoster {
   const out: Record<string, AgentDefinition> = {};
+  const dropped: string[] = [];
   for (const [name, def] of Object.entries(subagents)) {
     const next: AgentDefinition = { ...def };
     // Filter where present only: an ABSENT `tools` is the inherit-all contract
     // (PRD #3), and materializing an allowlist here would silently narrow coder
     // to whatever this function happened to think the full toolset was.
-    if (def.tools) next.tools = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
+    if (def.tools) {
+      const kept = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
+      if (kept.length === 0) {
+        dropped.push(name);
+        continue;
+      }
+      next.tools = kept;
+    }
     const denied = def.disallowedTools ?? [];
     next.disallowedTools = [...denied, ...WRITE_PATH_TOOLS.filter((t) => !denied.includes(t))];
     out[name] = next;
   }
-  return out;
+  return { subagents: out, dropped };
 }
 
+/**
+ * The subagent roster to run the IMPLEMENT phase with, given the approved
+ * selection (PRD #37 Decision 5). The `lead` is NOT here — it stays uzi's builtin
+ * from the claim payload under either source, so callers keep using
+ * assembleAgents' leadSystemPrompt/leadModel.
+ *
+ *   - "own":  the owner's already-assembled subagents (lead already partitioned
+ *             out by assembleAgents), minus the excluded names. Skills stay
+ *             per-template — the allocations ARE the admin's scoping surface here,
+ *             so this path is deliberately untouched by PRD #72 M1.
+ *   - "repo": the detected repo roster mapped subagents-only (a repo `lead` stays
+ *             a subagent), minus the excluded names. Every subagent gets the run's
+ *             whole surviving skill set (PRD #72 M1) — see subagentsFromTemplates.
+ *
+ * Exclusions are re-applied here worker-side; the API validated membership (M2)
+ * but the worker owns what actually reaches the SDK. An exclusion naming an agent
+ * not in the chosen source is a harmless no-op (nothing to remove).
+ */
 export function selectSubagents(
   source: AgentSource,
   ownSubagents: Record<string, AgentDefinition>,

@@ -61,10 +61,10 @@ starting the next:
   before it reaches you at the approval gate, and again over the **diff** once an
   implementation unit lands. The plan-time wave is what backs up the plan's
   claims — for every mechanism the plan asserts, it names the file and quotes the
-  line — so what you approve has already been read against the code. `reviewer`
-  and `auditor` declare no file-writing tools at all, so they are read-only
-  everywhere; `tester` does declare them, because authoring tests is its job
-  during implementation.
+  line — so what you approve has already been read against the code. Of those
+  four, `reviewer`, `auditor` and `fact-checker` declare no file-writing tools at
+  all, so they are read-only everywhere; `tester` does declare them, because
+  authoring tests is its job during implementation.
 - **Nothing a subagent does before the gate can change the worktree by the
   ordinary route.** On the planning turn the worker takes the file-writing tools
   (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) off every subagent it dispatches,

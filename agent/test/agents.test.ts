@@ -286,11 +286,22 @@ describe("planTurnSubagents (#203)", () => {
     model: null,
   };
 
+  // A template whose declared allowlist is ONLY write tools. Reachable through the
+  // documented admin surface — validateTemplateFields enforces no tool policy — and
+  // the one input for which filtering alone would emit `tools: []`.
+  const writeOnly: AgentTemplate = {
+    name: "penman",
+    description: "writes",
+    prompt_body: "You write.",
+    tools: ["Edit", "Write"],
+    model: null,
+  };
+
   it("does BOTH operations unconditionally: filters `tools` where present AND unions into `disallowedTools`", () => {
     // Doing only one would leave the run's safety resting on a `disallowedTools`-vs-
     // `tools` precedence the SDK does not document and no test here can settle.
     const { subagents } = assembleAgents([architect, reviewer]);
-    const planned = planTurnSubagents(subagents);
+    const { subagents: planned } = planTurnSubagents(subagents);
 
     assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch"]);
     for (const t of WRITE_TOOLS) {
@@ -311,9 +322,48 @@ describe("planTurnSubagents (#203)", () => {
 
   it("leaves an absent `tools` absent — inherit-all survives the transform", () => {
     const { subagents } = assembleAgents([inheritCoder]);
-    const planned = planTurnSubagents(subagents);
+    const { subagents: planned } = planTurnSubagents(subagents);
     assert.strictEqual(planned.coder?.tools, undefined, "inherit-all must not be materialized into an allowlist");
     for (const t of WRITE_TOOLS) assert.ok(planned.coder?.disallowedTools?.includes(t), `${t} denied`);
+  });
+
+  it("DROPS an agent whose allowlist is only write tools — it never emits `tools: []`", () => {
+    // `[]` would re-open the very precedence question this function exists to close:
+    // the repo reads an empty list as INHERIT ALL in three places, so emitting one
+    // would either DISCARD the operator's restriction or grant nothing, decided
+    // inside the compiled binary. Dropping is the only answer that neither widens
+    // the grant nor invents capability the operator excluded.
+    const { subagents } = assembleAgents([architect, writeOnly, reviewer]);
+    const { subagents: planned, dropped } = planTurnSubagents(subagents);
+
+    assert.deepStrictEqual(dropped, ["penman"]);
+    assert.deepStrictEqual(Object.keys(planned).sort(), ["architect", "reviewer"]);
+    assert.ok(!("penman" in planned), "the dropped agent is absent from the map, not present-and-empty");
+    // The negative that actually matters, stated positively: no surviving entry
+    // carries an empty allowlist. A `tools: []` anywhere in this map is the defect.
+    for (const [name, def] of Object.entries(planned)) {
+      assert.notDeepStrictEqual(def.tools, [], `${name} must not carry an empty allowlist`);
+    }
+    // The agents that keep a non-write tool are unaffected by the drop.
+    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch"]);
+  });
+
+  it("reports every dropped name, in input order, and drops the whole roster when every agent is write-only", () => {
+    const second: AgentTemplate = { ...writeOnly, name: "typist", tools: ["MultiEdit", "NotebookEdit"] };
+    const { subagents } = assembleAgents([writeOnly, second]);
+    const { subagents: planned, dropped } = planTurnSubagents(subagents);
+    assert.deepStrictEqual(dropped, ["penman", "typist"], "input order, so the report is stable");
+    assert.deepStrictEqual(planned, {}, "an all-write roster leaves the plan turn with no subagents");
+  });
+
+  it("does NOT drop an agent that keeps even one non-write tool", () => {
+    // The boundary: one surviving tool is the difference between a narrowed agent
+    // and no agent, so it is pinned rather than left to the filter's shape.
+    const barely: AgentTemplate = { ...writeOnly, name: "barely", tools: ["Edit", "Write", "Read"] };
+    const { subagents } = assembleAgents([barely]);
+    const { subagents: planned, dropped } = planTurnSubagents(subagents);
+    assert.deepStrictEqual(dropped, []);
+    assert.deepStrictEqual(planned.barely?.tools, ["Read"]);
   });
 
   it("BUILDS NEW OBJECTS: the input map, its definitions and their arrays are untouched", () => {
@@ -326,7 +376,7 @@ describe("planTurnSubagents (#203)", () => {
     const before = structuredClone(subagents);
     const beforeDefs = Object.fromEntries(Object.entries(subagents).map(([k, v]) => [k, v]));
 
-    const planned = planTurnSubagents(subagents);
+    const { subagents: planned } = planTurnSubagents(subagents);
 
     assert.deepStrictEqual(subagents, before, "the input map is deep-equal to its pre-call snapshot");
     for (const name of Object.keys(subagents)) {
@@ -351,8 +401,15 @@ describe("planTurnSubagents (#203)", () => {
   });
 
   it("carries every other AgentDefinition field through unchanged", () => {
+    // The `model` assertion covers BOTH arms by construction, which is why the two
+    // fixtures differ: `reviewer` declares `model: "opus"` (so a transform that
+    // dropped the key reddens) and `architect` declares none (so one that INVENTED
+    // a model reddens). Neither arm is vacuous; do not "fix" this by giving both
+    // fixtures a model, which would retire the second arm.
     const { subagents } = assembleAgents([architect, reviewer]);
-    const planned = planTurnSubagents(subagents);
+    const { subagents: planned } = planTurnSubagents(subagents);
+    assert.strictEqual(subagents.reviewer?.model, "opus", "fixture guard: the non-empty model arm is real");
+    assert.strictEqual(subagents.architect?.model, undefined, "fixture guard: the absent-model arm is real");
     for (const name of Object.keys(subagents)) {
       assert.strictEqual(planned[name]?.prompt, subagents[name]?.prompt);
       assert.strictEqual(planned[name]?.description, subagents[name]?.description);
@@ -362,6 +419,6 @@ describe("planTurnSubagents (#203)", () => {
   });
 
   it("is a no-op on an empty roster", () => {
-    assert.deepStrictEqual(planTurnSubagents({}), {});
+    assert.deepStrictEqual(planTurnSubagents({}), { subagents: {}, dropped: [] });
   });
 });

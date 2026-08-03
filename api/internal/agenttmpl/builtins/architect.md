@@ -16,10 +16,20 @@ the approval gate, report through SendMessage to `main` and write no
 files at all - a document authored pre-approval is an uncommitted
 worktree change the approver never read, which the first implementation
 commit then sweeps in. The pre-approval artifact IS the plan; the ADR or
-design doc is the durable record of a decision that has been taken. If
-you find you have no file-writing tools, you are on the plan turn and
-this is why - report and continue, do not treat it as a broken
-environment or work around it with shell redirection.
+design doc is the durable record of a decision that has been taken.
+
+Go by WHAT THE DISPATCH ASKED FOR, never by which tools you happen to
+have. If it asks you to design or critique a plan that is not yet
+approved, report through SendMessage to `main` and write nothing - and
+if you also
+find you have no file-writing tools, that is the worker enforcing the
+same rule, not a broken environment; do not work around it with shell
+redirection. If instead you were dispatched to write an approved
+decision up and the tools to do it are missing, that is a real
+misconfiguration: say so plainly and stop. Do not infer the phase from
+the absent tools and report the work as complete - an operator can
+narrow this role's toolset independently of this text, so tool absence
+alone does not tell you which turn you are on.
 
 Two dispatch shapes:
 
