@@ -603,3 +603,91 @@ Outstanding and NOT blocking the freeze: the fact-checker is still ruling on whe
 `CLAUDE.md`'s *"EVERY VERSION THIS PROJECT SHIPS IS BARE"* is itself wrong. That is a
 **doc** question about `CLAUDE.md`, not a design question — the measurements this brief
 relies on are already independent of it, taken from the shipped stamps directly.
+
+---
+
+## 10. AMENDMENT 5 — CLAUDE.md correction, user-approved 2026-08-03
+
+**🔴 THIS DOES NOT TOUCH THE CODER'S SCOPE AND INVALIDATES NOTHING IN FLIGHT.** It is
+DOCUMENTER work, queued behind the coder's first commit so the worktree keeps exactly one
+writer. The frozen design in §9 is unchanged.
+
+### The finding
+
+`CLAUDE.md:166` opens **"EVERY VERSION THIS PROJECT SHIPS IS BARE"**. REFUTED by the
+fact-checker, re-derived by the lead. **4 of 17 stamp/declaration sites carry the `v`**:
+the CLI binary (`Formula/uzi-cli.rb:48`), git release tags, the tap formula's `tag:` pin,
+and `uzi version`'s own output. The `v` is **release-gated, not incidental** —
+`scripts/brew-local-test.sh:73` matches `"v$version"*` and fails the release if the CLI
+stamp is bare.
+
+**It was false when written**, verified by the lead:
+
+| | |
+|---|---|
+| `Formula/uzi-cli.rb` `v` stamp lands | `17c04352`, **2026-07-17** (PRD #64 M4) |
+| the CLAUDE.md headline lands | `e7a0cc1f`, **2026-07-26** ("migrate two repo-general rules out of PRD #113's ephemeral design doc") |
+
+The source is `prds/113-worker-upgrade-status.md:210`, where the sentence is **TRUE**
+because PRD #113's scope is the worker fleet — api image, chart, agent image, all bare.
+**The migration promoted a scope-true claim to a repo-general one without re-deriving its
+scope**, and widened it explicitly with *"Not PRD-specific; any future version comparison
+here hits it."* Issue #144 is the first instance to hit it, and it did: the lead's own
+§4 inherited the error from this sentence.
+
+**The repo already held the correction and only CLAUDE.md was left behind.** Both landed
+2026-07-28: `api/cmd/server/main.go:57-63` (commit `b81d1ede`, titled *"fix the
+bare-version line"*) and `specs/ai.md` §450. `main.go` names CLAUDE.md's sentence, states
+the counter-example six lines away, and stops short of concluding the sentence is wrong.
+**Neither file needs changing — both are already right.**
+
+### Scope, exactly two edits — do NOT widen
+
+**(1) `CLAUDE.md:166`** — replace ONLY the headline, the support sentence, and the
+measured block. **Keep everything from *"The trap that makes this survive review"* onward
+verbatim** — the `v0.11.7.1` invalid-sorts-below tooth, the `+g<sha>` build-metadata
+tooth, and the `forgejo.go` precedent were all re-derived clean and are correct.
+
+Replacement (fact-checker's wording, lead-verified; adapt only if you find an error):
+
+> **COMPARING VERSIONS? `golang.org/x/mod/semver` NEEDS A LEADING `v`, AND THIS PROJECT
+> SHIPS BOTH SHAPES — the naive compare fails SILENTLY and fails OPEN.** Not PRD-specific;
+> any future version comparison here hits it. **The server side is BARE and the CLI side
+> carries the `v`, deliberately on both counts:** `api/Dockerfile:41` stamps
+> `-X main.version=${UZI_VERSION#v}` and `deploy/chart/Chart.yaml:10-11` carries
+> `version`/`appVersion` without the `v` (Model B: served value == image tag == chart
+> appVersion), while `Formula/uzi-cli.rb:48` stamps `-X main.version=v#{version}` and
+> `scripts/brew-local-test.sh:73` **gates the release on that `v` being present**.
+> `api/cmd/server/main.go:51-63` states the split at the source: do not "fix" one side to
+> match the other. Git tags are `v`-prefixed too; the controller binary is stamped with no
+> version at all.
+
+Then a dated correction note carrying: the universal was FALSE and nine days old when
+written; the two SHAs above; that it was migrated from PRD #113 where it was true at that
+scope; that the support sentence named 2 of 17 sites while the headline quantified over
+all; the live measurement (`uzi version` → `v0.14.0` vs `/api/version` → `0.14.0`, same
+host, same release, one minute apart); and that `main.go` + `specs/ai.md` §450 already had
+it right on 2026-07-28.
+
+Then replace the measured block with the three rows that matter, **the mixed pair being
+the dangerous one**:
+
+```
+Compare("0.11.0",  "0.11.7")  =  0   IsValid false/false   <- both bare: two releases read EQUAL
+Compare("v0.11.8", "0.14.0")  = +1   IsValid true/false    <- THE LIVE CLI->SERVER PAIR: reads "AHEAD"
+Compare("v0.11.8", "v0.14.0") = -1   IsValid true/true     <- what a fixture "naturally" writes
+```
+
+plus the inertness result: **0 of 25 rows over a grid of every shipped shape would warn,
+including `v0.1.0` against `99.0.0`.** Not "wrong on some pairs" — inert across the whole
+input space. Normalise BOTH sides and `IsValid`-guard BOTH.
+
+**(2) `CLAUDE.md:500`** — cites `.gitignore:44` **twice**; line 44 is `__pycache__/` and
+the live line is **52** (`.claude/agent-team-tasks/`). Lead verified both. Same staleness
+class as (1), in the same file.
+
+### Do NOT change
+
+`specs/ai.md` §450 and `api/cmd/server/main.go` — already correct. `agent/package.json`'s
+`"0.1.0-m4"` (inert, flagged only as a note). `controller/Dockerfile`'s missing stamp
+(not a defect; nothing compares it).
