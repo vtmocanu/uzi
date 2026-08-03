@@ -1986,3 +1986,107 @@ branch. The coder said so first, about work that was not its own.
 
 Full re-validation against `b00ecc83`: the 32-mutation programme, review, audit. Every
 measurement in §14-§25 was taken against helpers that have moved.
+
+---
+
+## 29. AMENDMENT 22 — audit re-validation at `84b75153`. NO BLOCKING FINDINGS. Every property closed, withdrawn, or fixed.
+
+Both trees built side by side from `git archive` extracts — the merged tip and `origin/main`
+(`136d976a`).
+
+### 🔴 H2 IS LIVE ON `origin/main` TODAY, MEASURED ON A SHIPPING BINARY
+
+```
+payload           merged tip 84b75153     origin/main 136d976a
+1 MiB version     255 bytes               1,048,635 bytes   (line 1,048,599)
+ansi/bidi/osc8/crmid/crtail/crtail2/nltail   clean on BOTH
+```
+
+**H1 is closed on `main` too, so ours is genuinely redundant and `termsafe`'s is better** —
+a leaf package with a biconditional over every rune, where ours was a call-site convention.
+The auditor states it has no reservation about dropping its own finding's fix.
+
+*(§27 quotes 1,048,673 bytes on stderr; the auditor measured 1,048,635 on stdout via
+`uzi version`. **Different sink, slightly different payload — not a discrepancy.** Quote
+whichever names its sink. Fourth count on this branch to move for a reason other than error.)*
+
+### The one-letter trap is NOT reopened, proven by mutation rather than by reading
+
+```
+NAIVE MERGE  cellText -> uzicli.CellText   FAIL TestVersionCommandSanitizesServerBuildInfo/unbounded
+M26          drop compactText's 200 cap    FAIL .../unbounded
+                                           FAIL TestSkewWarningSanitizesTheServerString/unbounded_build_metadata
+                                           FAIL TestLimitWaitLineSanitizesTheRateLimitType
+```
+
+H3 re-checked **behaviourally** because `root.go` was a conflict file: all six exempt/non-exempt
+rows correct, warning path unchanged.
+
+### The `84b75153` correction is RIGHT, and the re-derivation is stronger than the claim
+
+The auditor re-derived **exhaustively over every rune in Unicode** rather than re-checking
+the eight rows, mirroring `termsafe.Unsafe`:
+
+```
+Unsafe family    total   json-escaped
+C0                  32      32
+DEL                  1       0
+C1                  32       0
+Cf                 170       0
+TOTAL              235      32
+U+2028 / U+2029   Unsafe=false, escaped=true   <- correctly outside Unsafe
+```
+
+**Zero of 170 Cf runes are escaped**, not zero of five sampled. And the corollary is
+demonstrated end-to-end on the shipping binary: `uzi version --json` carries RLO U+202E and
+PDF U+202C **raw**, and the 1 MiB payload at 1,048,676 bytes. So *"--json is byte-preserving,
+NOT terminal-safe"* is exactly right, and the old wording *"escapes control bytes losslessly"*
+**would have licensed piping `--json` to a terminal** — false in the direction that mattered.
+
+### 🔴 THE AUDITOR WITHDREW ITS OWN EARLIER LOW FINDING, because `main` closed it better
+
+§17's separator class (Zs/Zl/Zp — neither `IsControl` nor `Cf`, guarded only by duplicate
+`TrimSpace` calls, neither individually pinned) **is now pinned by `termsafe`'s biconditional**:
+
+```
+MUTATION: remove termsafe.CellText's TrimSpace
+FAIL TestValidateAgreesWithCellText/{leading-space, trailing-space, nbsp-tail}
+FAIL TestValidateAgreesOverEveryRune
+```
+
+`Validate`'s trim clause — whose own comment calls it *"unreachable from today's callers"* —
+is what makes the biconditional a property of the **function** rather than of caller
+discipline. **Withdrawn: #180 closed it independently and more thoroughly than the one-row
+fix this branch was about to ship.**
+
+### 🔴 AN ARGUMENT FOR LANDING THIS BRANCH THAT IS INDEPENDENT OF THE FEATURE
+
+```
+merged tip     govulncheck cmd/uzi + uzicli + termsafe   EXIT=0   0 vulnerabilities
+origin/main    same command                              EXIT=3   GO-2026-5970 + GO-2026-5320 BOTH LIVE
+gitleaks       136d976a..84b75153, 36 commits            clean
+```
+
+**`main`'s CLI path is affected by two vulnerabilities today, and this branch is the only fix
+in flight.** Stronger than §26's "the bumps are ours alone".
+
+### Precision note, below the graded bar but worth carrying
+
+`84b75153` says *"two thirds of the control half"* — **TRUE per-FAMILY** (DEL and C1 of three
+families pass) and **FALSE per-CODEPOINT** (33 of 65 = 51%). The table above it lists exactly
+three control rows so the family reading is plainly meant, but the clause pairs a *range* unit
+with a fraction whose denominator is *families*. **"two of the three control families"**
+removes it. **The CHANGELOG line in issue #219 has the same shape** — carried there.
+
+### Process — a foreign listener produced a clean-looking false result
+
+A Python listener (PID 96298) held port 27411 and was **not the auditor's**. Its server failed
+to bind, a stale one answered `curl` 200, and its first exemption matrix read `probes=0` on
+every row — **an instrument failure that looked like a clean pass.** It left the process alone
+per the ownership rule, moved to a verified-free port, and added a control requiring the server
+to write **its own distinctively-named reqlog** rather than merely answering. Probably the
+tester's; two harnesses are on adjacent ports.
+
+**That is the uniform-result rule catching a third distinct instrument failure on this branch**
+— and the fix is the same shape every time: make the control prove the instrument is *yours*,
+not merely that something responded.
