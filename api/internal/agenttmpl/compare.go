@@ -29,10 +29,9 @@ import "slices"
 //     (render.go), so a reordering really does change the rendered subagent file.
 //     Do not sort either side; sorting hides a real edit.
 //   - Description and PromptBody are compared exactly, never trimmed. Trimming
-//     would hide a whitespace-only edit permanently. The builtin corpus is held to
-//     the matching invariant by TestBuiltinsFrontmatterIsUnpadded, so the write
-//     path's TrimSpace cannot make a pristine row look drifted. See
-//     TestBuiltinsParseAndValid, which now asserts that invariant on the corpus.
+//     would hide a whitespace-only edit permanently. TestBuiltinsParseAndValid
+//     holds the builtin corpus to the matching invariant, so the write path's
+//     TrimSpace cannot make a pristine row look drifted.
 //
 // IT DOES NOT RENDER EITHER SIDE AND COMPARE THE BYTES, which is the tempting
 // shortcut, and no case in this suite discriminates the two today — which is
