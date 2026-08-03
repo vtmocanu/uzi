@@ -441,3 +441,41 @@ uses plain `fmt.Fprintln`/`Fprintf`, so the version path does not reach it today
 ### Test fixture, binding (auditor item 5)
 A well-formed `0.11.8` passes against a **completely unsanitized** implementation. The
 discriminating inputs are `\r`, `ESC[2J`, `U+202E`, and a 1 MiB version. Include all four.
+
+---
+
+## 8. USER SCOPE DECISIONS — 2026-08-03, binding
+
+Asked after Amendment 2, because the auditor's H1/H2 are **pre-existing on `main`** and
+not caused by this work. Both answers widen the scope beyond the lead's recommendation;
+both are the user's call and are binding.
+
+### D1 — The terminal-injection fix lands FOLDED IN, as ONE commit
+
+The lead recommended a separate commit in the same MR so the security fix stayed
+independently cherry-pickable to a patch release. **The user chose one commit.**
+Recorded consequence, stated once and not re-litigated: **the sanitizer cannot be
+cherry-picked to a release branch without the feature.** Implement as a single coherent
+change.
+
+### D2 — The two pre-existing dependency vulns are bumped IN THIS MR
+
+- `GO-2026-5970` — `golang.org/x/text` **v0.38.0 → v0.39.0** (infinite loop on invalid
+  input; reachable via `uzicli/output.go:169` `Printer.Println`)
+- `GO-2026-5320` — `github.com/yuin/goldmark` **v1.7.8 → v1.7.17** (XSS; reachable via
+  `cmd/uzi/tui_render.go:64` → glamour → `html.Renderer`)
+
+Neither is introduced by this branch. The lead recommended filing an issue instead;
+the user chose to bump here.
+
+**Notes for whoever does it:** goldmark is pulled through **glamour** (the TUI markdown
+renderer), so the bump is not necessarily a leaf change — check whether glamour pins it
+and whether the TUI render tests (`tui_render_test.go`) still pass. Re-run `govulncheck`
+after the bump and paste the output; **a clean `go build` is not evidence the vuln is
+gone**, and `govulncheck` exiting 3 vs 0 is the check. Both modules' gates must stay
+green (`task gate:api`; `controller/` has its own `go.mod` and is not affected unless the
+bump reaches it — verify rather than assume).
+
+**Scope boundary that did NOT move:** this remains a scoped MR against issue #144. No new
+PRD. Nothing else gets swept in — if the dep bump cascades into unrelated churn, stop and
+report rather than widening further.
