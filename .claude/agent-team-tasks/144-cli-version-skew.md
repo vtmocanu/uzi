@@ -691,3 +691,94 @@ class as (1), in the same file.
 `specs/ai.md` §450 and `api/cmd/server/main.go` — already correct. `agent/package.json`'s
 `"0.1.0-m4"` (inert, flagged only as a note). `controller/Dockerfile`'s missing stamp
 (not a defect; nothing compares it).
+
+---
+
+## 11. AMENDMENT 6 — architect revision 2. ADDITIVE. Nothing in flight is invalidated.
+
+The architect self-corrected twice against the auditor's measurements and found one thing
+neither the auditor nor the lead had. **This is a design change under §9's freeze rule, so
+it is stated as one** — but it is purely additive: the exemption list gains entries and
+the test spec gains a row. Nothing already built needs undoing.
+
+### 6a — 🔴 A THIRD EXEMPT COMMAND, AND THE RULE THAT FINDS IT
+
+Amendment 4 bound `logout` + `auth token` from the auditor's report. **`uzi auth status`
+has exactly the same property and nobody had named it.** Lead verified at
+`auth.go:63-85`: `resolveSettings` + print, **no client**.
+
+**Replace the enumerated list with the RULE** — a list stated as "the two the auditor
+found" misses the third by construction:
+
+> **Exempt every command that makes no network call of its own.**
+
+**🔴 AND THE OBVIOUS INSTRUMENT FOR THAT RULE IS WRONG. Measured by the lead:**
+
+```
+git grep -F 'env.client('     -- api/cmd/uzi   ->  34 sites
+git grep -F 'env.NewClient('  -- api/cmd/uzi   ->   2 sites, one of them login.go:53
+```
+
+**`uzi login` builds its client directly** (`login.go:53` `c := env.NewClient(s)`), so a
+grep for `env.client(` alone reports login as local-only and **would exempt it for the
+wrong reason while looking correct**. The architect flagged this; the lead re-derived the
+second grep. `login` is NOT exempt.
+
+**And a file-level grep is insufficient in the other direction too:** `auth.go` appears in
+the `env.client(` list, yet `auth status` and `auth token` — both in that file — make no
+call. **Resolve the rule per-RunE, not per-file.** Two greps, then read each command body.
+
+### 6b — THE VALIDITY GUARD STOPS H1 AND DOES NOT STOP H2
+
+The architect ran the auditor's four attack strings through
+`semver.IsValid(normSemver(v))`: **all four are rejected — and the tempting inference from
+that is still wrong.** SemVer build metadata is `[0-9A-Za-z-]` with **no length limit**, so
+`0.14.0+` followed by 1 MiB of `A` is **valid semver** and reaches the message.
+
+So: the validity guard stops the four control/bidi payloads on the *warning* path, does
+**not** stop the size payload, and does so **only because rule 2 happens to precede the
+interpolation** — a statement-ordering property a refactor loses silently.
+**`cellText` stays unconditional on both sinks.** The pre-existing `serverRows` sink has
+**no validity guard at all**, so all four land there; nothing in §7 H1 softens.
+
+**🔴 TEST CONSEQUENCE — do not get this backwards.** With `cellText` removed:
+- at the **warning** path, **only the 1 MiB row should redden**;
+- at the **`serverRows`** path, **all four should redden**.
+
+If all four redden at the warning path, the guard order is not what the design specifies.
+
+### 6c — `cli_version` in the cache is FORENSICS ONLY, never keyed on
+
+This resolves a latent conflict rather than adding scope. §7's ungraded note proposed
+including the CLI's own version and invalidating when it changes. **That is the right fix
+for a VERDICT cache and is redundant under §9's OBSERVATION cache** — recomputing against
+`version` each run already self-heals on upgrade, instantly and with no TTL wait.
+
+Mirror `skillState` (`skill.go:74-79`) verbatim, which decided this exact question with its
+reason in its own comment: *"Staleness keys on the hash …, NOT on cli_version … cli_version
+is retained for human forensics."*
+
+### 6d — TTL 1h stands, and H5's grade does NOT move
+
+The architect rebuilt the argument with two bounds. **H5's wording invites over-reading:
+the EXISTENCE of the TTL is the mitigation, its VALUE is not.** For a 50-agent fleet:
+no TTL ≈ 90,000 req/h; 1 min ≈ 3,000; **1 h ≈ 50**; 24 h ≈ 2. The three-orders-of-magnitude
+drop is entirely between *no TTL* and *any TTL*; 1h→24h buys 24× against an already
+negligible baseline and costs a 24× longer silence window.
+
+**A SHORTER negative TTL is rejected.** A failed probe costs the full 2s where a success
+costs ~50ms, so shortening it maximises the cost of exactly the case it governs. **One TTL
+value, both outcomes.**
+
+### 6e — N7 is belt-and-braces, and know which
+
+`e2e/run-e2e.sh:1665-1667` builds with **no `-ldflags`**, so the harness binary is `dev`
+and short-circuits before probing. **Add the env var anyway** — that reason evaporates the
+day someone stamps the e2e build.
+
+### Already decided; the architect asked again because it had not seen Amendment 4
+
+- **One line.** The preview's two-line form was a mockup wrap, not a spec.
+- **`UZI_VERSION_CHECK=0` goes in BOTH `SKILL.md` and `docs/cli.md`.** The architect notes
+  H1 cuts both ways here — `SKILL.md:43` telling agents to read stderr is what makes that
+  channel worth protecting *and* worth explaining. Document it, framed as actionable.
