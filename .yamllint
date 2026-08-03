@@ -27,6 +27,17 @@
 # except `deploy/chart/templates/`. Helm templates are not YAML (239 findings, the
 # first a hard syntax error), and that exclusion is argued at the script.
 #
+# 🔴 AND THAT SENTENCE IS NOW ENFORCED RATHER THAN MERELY STATED. `scripts/
+# lint-yaml.sh` refuses to run if this file contains an `ignore:`, an
+# `ignore-from-file:`, or a per-rule `ignore:` -- exit 2, before yamllint is
+# invoked. Measured: one live `trailing-spaces` error in `api/sqlc.yaml` plus an
+# ignore key naming that file gave rc=0 AND a success line still reading "11
+# tracked YAML files", while yamllint had checked ten. The count comes from the
+# script's git query, so the output asserted a number that had become false --
+# worse than printing none, because it reads as confirmation. All three spellings
+# did it. Take a file out of scope by editing the pathspec in the script, where
+# the count is computed and where a reviewer will look for it.
+#
 # WHAT STAYS AT DEFAULT, stated because a config is read for what it turns OFF and
 # the important half is what it leaves ON: `syntax` and `key-duplicates` both stay
 # at ERROR. `key-duplicates` is the one that matters operationally here -- a

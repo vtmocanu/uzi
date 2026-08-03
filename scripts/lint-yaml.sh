@@ -139,6 +139,63 @@ if [ ! -f "$CONFIG" ]; then
   exit 2
 fi
 
+# 🔴 THE CONFIG MAY NOT NARROW THE SCOPE. THIS IS A GUARD, NOT A STYLE RULE, AND
+# IT IS THE ONE THING STANDING BETWEEN A NARROWED RUN AND A SUCCESS LINE THAT
+# ASSERTS A NUMBER WHICH HAS BECOME FALSE.
+#
+# Measured 2026-08-03 on the shipped script, one live `trailing-spaces` error
+# added to `api/sqlc.yaml`:
+#     violation alone                         rc=1, the error named at 19:10
+#     violation + an ignore key naming it      rc=0, and the run PRINTED
+#                                              "clean under .yamllint
+#                                               (11 tracked YAML files, --strict)"
+# yamllint checked ten. The count is this script's own git query, so the output
+# did not merely omit the discrepancy, IT ASSERTED A NUMBER THAT HAD BECOME
+# FALSE -- which is worse than printing none, because it reads as confirmation.
+#
+# ALL THREE SPELLINGS DO IT, so the pattern below covers all three rather than the
+# obvious one. Each measured separately, each giving rc=0 with the same false
+# count:
+#     ignore: |                       (top level)
+#     ignore-from-file: <path>        (top level)
+#     rules: { <rule>: { ignore: | }} (INDENTED, inside a rule)
+# A guard anchored at `^ignore:` would catch one of the three and read as though
+# it covered the class.
+#
+# THE INVARIANT IS THE CONFIG'S OWN, NOT AN INVENTION. `.yamllint`'s header
+# states "SCOPE lives in `scripts/lint-yaml.sh`, not here", so an ignore key
+# contradicts the file's stated contract; this asserts what that sentence already
+# claims. Same move `--norc` makes for `.shellcheckrc` on the shellcheck side, and
+# the same move `scan-secrets.sh` makes when it refuses `.gitleaksignore`: turn a
+# convention into a property of the recipe.
+#
+# Comment lines are safe by construction -- a YAML comment begins with `#`, so the
+# `^[[:space:]]*ignore` anchor cannot reach one. Verified against five inputs
+# (three ignore forms match; a top-level and an indented comment MENTIONING the
+# key do not), because a guard whose own documentation would trip it is a real
+# failure mode in this repo (`+goose` in a migration comment is the recorded one).
+#
+# WHAT THIS DOES NOT COVER, stated rather than left to be found: disabling a RULE.
+# `comments-indentation: disable` also takes a live violation to green, and no
+# guard can fix that -- a config cannot be caught breaking a rule it switches off.
+# That is the floor of self-linting the config, not a defect in it. The difference
+# that makes this one guardable and that one not: disabling a rule is visible in
+# the config's diff AND changes nothing about the file COUNT, while an ignore key
+# silently decouples the printed count from what was read.
+if grep -q -E '^[[:space:]]*ignore(-from-file)?[[:space:]]*:' "$CONFIG"; then
+  echo "lint-yaml: $CONFIG contains an \`ignore\` key, and this gate refuses to run" >&2
+  echo "  with one." >&2
+  echo "  SCOPE LIVES IN THIS SCRIPT, NOT IN THE CONFIG -- $CONFIG's own header" >&2
+  echo "  says so. An ignore key narrows what yamllint reads while this script goes" >&2
+  echo "  on printing the file count from its own git query, so a run that checked" >&2
+  echo "  fewer files reports success WITH A NUMBER THAT IS NO LONGER TRUE." >&2
+  echo "  Measured: one live error plus an ignore key naming its file = rc 0 and" >&2
+  echo "  \"clean … 11 tracked YAML files\", with ten actually checked." >&2
+  echo "  To take a file out of scope, change the pathspec in this script, where" >&2
+  echo "  the count comes from and where a reviewer will look for it." >&2
+  exit 2
+fi
+
 # 🔴 SCOPE: EVERY TRACKED *.yml/*.yaml EXCEPT deploy/chart/templates/.
 #
 # WIDER THAN THE PRD ASKED FOR, deliberately. The PRD names `.gitlab-ci.yml` and
@@ -200,7 +257,14 @@ yamllint --strict -c "$CONFIG" -- "$@" || rc=$?
 
 case "$rc" in
   0)
-    echo "lint-yaml: clean under $CONFIG ($# tracked YAML files, --strict)"
+    # "HANDED TO" RATHER THAN "CHECKED", and the wording is the point. This number
+    # is this script's own git query -- what it put on yamllint's command line --
+    # not something yamllint reported back. The two can only diverge through an
+    # ignore key, which the guard above now refuses; saying "handed to" keeps the
+    # line true on its own terms rather than true only because that guard holds.
+    # Same discipline as scan-secrets.sh's "(N in the index)": label whose number
+    # it is, or assert that the two agree.
+    echo "lint-yaml: clean under $CONFIG (--strict, $# tracked YAML files handed to yamllint)"
     exit 0
     ;;
   1|2)
