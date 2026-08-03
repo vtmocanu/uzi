@@ -29,7 +29,7 @@ Classify every claim as one of:
 
 Read-only by default: never push, merge, mutate external systems, or
 edit files. If verification truly needs a write, surface the proposed
-command to `main` and wait for approval.
+command via SendMessage to `main` and wait for approval.
 
 Report via SendMessage to `main` (the lead's conversation) as a
 claim-by-claim list: claim, verdict, evidence. Lead with refuted claims.

@@ -30,10 +30,27 @@ import (
 // through the Agent tool's return value, each prefixed with an apology about
 // uzi's own plumbing.
 //
-// COUNT, corrected: the fix touched 15 recipient sites, not 13. Thirteen is the
-// number of SendMessage occurrences (rule A's iteration count); two more lines
-// name the addressee with no SendMessage token on them at all, and those are
-// precisely the two that rules A-C are blind to — see rule D.
+// Those two figure sets describe DIFFERENT populations and must never be summed:
+// 0.4-10.0 KB / 30 KB total is the five RE-SENT reports, while the three abandoned
+// ones are 6468 / 6251 / 4400 chars (run `84b6a933`, seq 337 / 994 / 2454). They
+// sit close enough on the page to be added by someone skimming.
+//
+// COUNT, corrected twice. `4fde2088` touched 15 recipient sites, not the 13 its
+// commit message claims: 13 was the number of SendMessage occurrences at that
+// commit, and two further lines name the addressee with no SendMessage token on
+// them at all. Those two are what RULE C catches — not rule D, which never sees
+// them, because both name `main` in backticks with no "lead" on the line at all.
+//
+// The occurrence count is NOT frozen at 13, and this paragraph used to say it was,
+// in the present tense, about a loop 130 lines below. What rule A actually iterates
+// has gone 13 → 21 → 23 across the three commits of this one issue: 13 at
+// `4fde2088`, 21 at `98cabb06` (which added eight in the same commit that wrote
+// "thirteen"), and 23 here (architect 4, spec-keeper 4, documenter 3, web-ux 3,
+// coder 2, fact-checker 2, tester 2, auditor 1, researcher 1, reviewer 1, lead 0).
+// That drift is the general hazard rather than a slip: a count derived from the
+// roster goes stale the moment the roster moves — and it moves fastest in the
+// commit doing the moving. Derive it (`len(all)-2` below), or date it as this
+// paragraph now does; never state it flat.
 //
 // SCOPE, and it is narrower than "lead is unreachable in a uzi run": the repo
 // source path (`subagentsFromTemplates`, PRD #37 Decision 3) DELIBERATELY does
@@ -43,8 +60,13 @@ import (
 //
 // This is a DESCRIPTION of what the SDK registers, not an invariant uzi enforces:
 // nothing constrains SendMessage's `to`, and `main` appears nowhere in agent/src/
-// because it is an SDK-supplied identity. Making it an enforced invariant (a
-// PreToolUse matcher) is a behaviour change, filed separately.
+// AS A RECIPIENT, because it is an SDK-supplied identity. The qualifier is not
+// hedging — the sole occurrence of the literal is `runner.ts:649`, the git
+// DEFAULT-BRANCH fallback, so the unqualified claim is refuted by the very
+// homograph rule A exists to separate. It was established with the qualifier and
+// lost it in transcription; a claim can degrade by being shortened rather than by
+// being wrong. Making the description an enforced invariant (a PreToolUse
+// matcher) is a behaviour change, filed separately.
 const reachableRecipient = "main"
 
 // recipientLiteral is how a template must SPELL the recipient: backticked, so it
@@ -63,10 +85,12 @@ const recipientLiteral = "`" + reachableRecipient + "`"
 // not proximity: see rule A.
 const recipientClause = " to " + recipientLiteral
 
-// channelClause is what an address-shaped mention of the role must be followed by
-// (rule D). Naming the role is fine; naming it without the channel is what leaves
-// a cold-starting agent addressing a name that does not resolve.
-const channelClause = " via SendMessage" + recipientClause
+// channelClause is the idiom that makes an address actionable: the role word plus
+// the tool plus the name the tool resolves. Rules D and E look for it somewhere in
+// the same sentence rather than immediately adjacent, because unlike rule A they
+// are not deciding what follows a token — see rule D on why that difference is
+// deliberate rather than an inconsistency.
+const channelClause = "SendMessage" + recipientClause
 
 // addressAfterTool captures the token a body addresses when it writes
 // "SendMessage to X" and X is not the reachable recipient. Anchored at the start
@@ -76,14 +100,43 @@ var addressAfterTool = regexp.MustCompile(`^ to ([^\s,.:;]+)`)
 
 // teamLeadAddress matches the defect's own spelling in address position:
 // "to the team lead", "to team-lead", and the hyphen/space variants between.
-// Deliberately case-insensitive — the phrasing is what matters, not the casing.
-var teamLeadAddress = regexp.MustCompile(`(?i)to (the )?team[- ]lead`)
+// Case-insensitive because the phrasing is what matters, not the casing.
+//
+// The trailing \b is load-bearing and was measured: without it "escalations go to
+// the team leadership channel" matches, and the failure then REPORTS the substring
+// "to the team lead" — a string the author never wrote. A pattern with no boundary
+// produces both a false positive and a diagnostic that misquotes the source, which
+// is the worse half: it sends the reader looking for text that is not there.
+var teamLeadAddress = regexp.MustCompile(`(?i)to (the )?team[- ]lead\b`)
 
 // leadAddress matches the surviving role word in address position. Unlike the
 // pattern above this one is NOT banned outright: rule D requires it to carry the
 // channel, which is how "escalate to the lead" becomes actionable rather than
 // unreachable.
 var leadAddress = regexp.MustCompile(`(?i)to the lead`)
+
+// communicativeVerb is what separates ADDRESSING the lead from merely mentioning
+// them after the word "to". Rule D fires only when one appears earlier in the same
+// sentence, and that guard was measured rather than assumed: without it, "whether
+// to widen the scope is up to the lead" and "on a tie, defer to the lead's
+// judgment" both redden, and neither instructs anyone to send anything.
+//
+// Stems plus optional suffixes rather than a word list, and the trailing \b is
+// again load-bearing: "hand" must not match inside "handle".
+var communicativeVerb = regexp.MustCompile(
+	`(?i)\b(surfac|report|propos|escalat|ask|send|hand|tell|rais|flag|submit|notif|deliver|messag)(e|es|ed|ing|s|y|ies)?\b`)
+
+// approvalGate marks a sentence that stops the agent until somebody says yes.
+// Rule E requires such a sentence to name who that somebody is; see rule E for why
+// no adjacency rule can cover this.
+var approvalGate = regexp.MustCompile(`(?i)\bwait(s|ing)? for (approval|sign-?off|permission)\b`)
+
+// sentenceEnd matches a sentence terminator only when whitespace or end-of-text
+// follows it, so `spec-keeper.md`'s "propose human.md changes to the lead …" stays
+// ONE sentence. Splitting on every "." puts the verb in the previous fragment and
+// silently disarms rule D at that site — a narrowing that reads as a refinement
+// and is a hole.
+var sentenceEnd = regexp.MustCompile(`[.;:!?](\s|$)`)
 
 // collapseWS collapses every whitespace run to a single space so an assertion
 // matches prose regardless of where the source happens to hard-wrap. Deliberately
@@ -97,13 +150,14 @@ func collapseWS(s string) string {
 
 // TestBuiltinsAddressAReachableRecipient is the regression guard for issue #210.
 //
-// FOUR rules, failing in four different ways, because the defect arrived in four
-// different phrasings and no single check caught more than one:
+// FIVE rules, failing in five different ways, because the defect arrived in that
+// many phrasings and no single check caught more than one:
 //
 //	rule A — a SendMessage not immediately followed by "to `main`"
 //	rule B — "team-lead" spelled as though it were an addressable identifier
 //	rule C — "to the team lead": the defect's own wording, in address position
-//	rule D — "to the lead" without the channel named right after it
+//	rule D — the role ADDRESSED without the channel in the same sentence
+//	rule E — an approval gate that names no approver
 //
 // Rule A REPLACED a 48-char proximity window, and the replacement is the whole
 // point of this revision. The window was satisfiable three separate ways by
@@ -121,10 +175,39 @@ func collapseWS(s string) string {
 // recipient" message for a body that named one. Here there is one rule and one
 // verdict, and `addressAfterTool` only refines the MESSAGE.
 //
-// Rules C and D exist because two changed sites are invisible to rule A: they
-// name the addressee with no SendMessage token on the line at all
-// (`fact-checker.md`'s and `tester.md`'s write-approval sentences). Reverting
-// either to "the team lead" left every earlier rule silent.
+// TWO PROPERTIES OF RULE A ARE DELIBERATE COSTS RATHER THAN OVERSIGHTS, and both
+// were argued rather than inherited.
+//
+// (1) It mandates ONE ENGLISH WORD ORDER, which is exactly what the comment on the
+// deleted window condemned ("a directional window silently demands one English
+// word order, which is a property of the assertion and not of the template").
+// `tester.md`'s own earlier phrasing, "send `main` … ONE structured message via
+// SendMessage", is red under this rule and was fine under the old one. The trade
+// was taken knowingly: a bidirectional window cannot distinguish `main`-the-branch
+// from `main`-the-recipient — that is what let three plausible sentences through —
+// while a required word order can, because "SendMessage to `main`" has no reading
+// in which `main` is a branch. Word order is a property of the assertion, and it
+// is the only property available that separates the two senses. The template pays
+// one wording constraint; the alternative was a guard that passed the defect.
+//
+// (2) It is ABSOLUTE: a body may not mention the tool at all without addressing
+// it, so a sentence like "If SendMessage fails, return the report as your final
+// message instead" is red despite being a description rather than an instruction —
+// and despite describing what three subagents actually did in these traces. The
+// obvious exemption is "a mention not preceded by via/through/using", and it was
+// rejected on inspection: that discriminator is a proximity heuristic of exactly
+// the class this revision deleted, and it fails OPEN on the most natural way to
+// reintroduce the bug. "Use SendMessage to report to the team lead" carries none
+// of those three prepositions, so the exemption would wave through a sentence that
+// is precisely the defect. The cost of absoluteness is bounded and loud: an author
+// who wants the fallback sentence writes it without the token ("if the message
+// cannot be delivered, return the report as your final message instead") and finds
+// out at gate time, with the offending text quoted. The cost of the exemption is
+// silent and unbounded.
+//
+// Rules C, D and E exist because rule A cannot see a site that never names the
+// tool — including the two `fact-checker.md` / `tester.md` write-approval
+// sentences this issue changed.
 //
 // The recipient/referent split is the reason C and D are not one rule. Prose may
 // still CALL the role "the lead" — "every dispatch from the team lead"
@@ -132,10 +215,10 @@ func collapseWS(s string) string {
 // re-delegates" (tester) are descriptions of who does what and must stay. What
 // may not survive is addressing that name, since it is not one the SDK resolves.
 //
-// Residual, stated rather than implied: rule D sees the "to the …" shape only.
-// "PROPOSE that the lead spin up …" and "ask the lead how to …" (web-ux) carry
-// the channel today because this commit put it there, and nothing here would
-// notice if it were removed.
+// Residual, stated rather than implied: rule D keys on "to the …", so an address
+// built without it — "PROPOSE that the lead spin up …", "ask the lead how to …",
+// both in `web-ux.md` — is seen by nothing here. Both carry the channel today
+// because issue #210's follow-up put it there; stripping it is green, twice.
 func TestBuiltinsAddressAReachableRecipient(t *testing.T) {
 	for _, def := range Builtins() {
 		body := collapseWS(def.PromptBody)
@@ -187,17 +270,56 @@ func TestBuiltinsAddressAReachableRecipient(t *testing.T) {
 				def.Name, body[loc[0]:loc[1]], recipientLiteral, excerpt(body, loc[0]))
 		}
 
-		// Rule D. The role word in address position must carry the channel. This
-		// is what covers an outbound imperative that never names the tool —
-		// "escalate to the lead", "propose it to the lead" — which rules A-C are
-		// all blind to.
+		// Rule D. The role word in ADDRESS position must carry the channel. This is
+		// what covers an outbound imperative that never names the tool — "escalate
+		// to the lead", "propose it to the lead" — which rules A-C are all blind to.
+		//
+		// Two narrowings separate an address from a mention, and the rule is wrong
+		// without either. A communicative verb must appear EARLIER IN THE SAME
+		// SENTENCE, because "up to the lead" and "defer to the lead's judgment" are
+		// ordinary prose that no channel belongs in. And the channel is accepted
+		// ANYWHERE in that sentence rather than immediately after, because
+		// "(the lead's conversation)" is this roster's house gloss at eight sites,
+		// so "Report to the lead's conversation via SendMessage to `main`" is a
+		// correct sentence that an adjacency test reddens.
+		//
+		// That is the same latitude rule A refuses, and the asymmetry is the point:
+		// rule A decides what may FOLLOW a token whose two senses are otherwise
+		// indistinguishable, while rule D decides whether a sentence names a channel
+		// at all. Only the first question needs word order to answer it.
 		for _, loc := range leadAddress.FindAllStringIndex(body, -1) {
-			if strings.HasPrefix(body[loc[1]:], channelClause) {
+			sentence := enclosingSentence(body, loc[0])
+			if !communicativeVerb.MatchString(body[sentence[0]:loc[0]]) {
+				continue // a mention, not an address
+			}
+			if strings.Contains(body[sentence[0]:sentence[1]], channelClause) {
 				continue
 			}
-			t.Errorf("%s: addresses the role without naming the channel; "+
-				"%q must be followed by %q\n  in: %q",
-				def.Name, body[loc[0]:loc[1]], channelClause, excerpt(body, loc[0]))
+			t.Errorf("%s: addresses the role without naming the channel; a sentence "+
+				"containing %q must also contain %q\n  in: %q",
+				def.Name, body[loc[0]:loc[1]], channelClause, body[sentence[0]:sentence[1]])
+		}
+
+		// Rule E. An approval gate names its approver.
+		//
+		// This is the one failure NO adjacency rule can reach, and it is the failure
+		// the proximity rule rule A replaced was built for: "retiring the wrong name
+		// without supplying the right one leaves the agent guessing." Both write-
+		// approval sentences (`fact-checker.md`, `tester.md`) survive DELETION of
+		// their recipient with every other rule silent — the tool token goes with
+		// it, so rule A sees nothing, and no "lead" remains for C or D. What does
+		// survive the deletion is the gate itself, so that is what this keys on.
+		//
+		// The property is not about this issue at all: an instruction to stop and
+		// wait for a yes is unusable without saying whose yes, whatever the wording.
+		for _, loc := range approvalGate.FindAllStringIndex(body, -1) {
+			sentence := enclosingSentence(body, loc[0])
+			if strings.Contains(body[sentence[0]:sentence[1]], recipientLiteral) {
+				continue
+			}
+			t.Errorf("%s: an approval gate names no approver; a sentence containing %q "+
+				"must also name %s\n  in: %q",
+				def.Name, body[loc[0]:loc[1]], recipientLiteral, body[sentence[0]:sentence[1]])
 		}
 	}
 }
@@ -207,7 +329,7 @@ func TestBuiltinsAddressAReachableRecipient(t *testing.T) {
 //
 // CLAUDE.md documents the failure this guards against: a negative assertion about
 // a retired string goes VACUOUS the moment nothing renders that string, and then
-// passes forever regardless of what the template says. Rules A-D are all negative
+// passes forever regardless of what the template says. Rules A-E are all negative
 // in that sense. This one fails if the recipient is simply absent, so the pair
 // covers both "the wrong name came back" and "no name is there at all".
 func TestBuiltinsNameTheRecipientTheyCanActuallyReach(t *testing.T) {
@@ -253,6 +375,26 @@ func allIndexes(s, sub string) []int {
 		out = append(out, off+i)
 		off += i + len(sub)
 	}
+}
+
+// enclosingSentence returns the [start, end) bounds of the sentence containing idx.
+// Rules D and E both need it, and both need the SAME bounds: the verb that makes an
+// address an address, and the channel or approver that makes it usable, are related
+// to each other by sharing a sentence and by nothing else.
+//
+// It reports bounds rather than a substring so a caller can search only the text
+// BEFORE the match (rule D wants the verb earlier in the sentence, not anywhere in
+// it — "ask the lead" and "the lead will ask you" are different claims).
+func enclosingSentence(s string, idx int) [2]int {
+	start := 0
+	for _, loc := range sentenceEnd.FindAllStringIndex(s[:idx], -1) {
+		start = loc[1]
+	}
+	end := len(s)
+	if loc := sentenceEnd.FindStringIndex(s[idx:]); loc != nil {
+		end = idx + loc[0]
+	}
+	return [2]int{start, end}
 }
 
 // excerpt returns the text around idx, so a failure names the sentence rather than

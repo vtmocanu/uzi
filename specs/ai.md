@@ -16117,15 +16117,15 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
   path hook only JAILS writes to the worktree rather than denying them
   (`guardrails.ts:757`). ~~`architect.md:37` compounds it by offering "a SendMessage design
-  summary" as its non-writing option~~ *(struck 2026-08-03, issue #210: offering an option
-  that EXISTS does not compound a write risk — it relieves it. That line now reads "a
-  summary via SendMessage to `main`"; the phrase quoted here was retired by the same
-  issue's follow-up, so the quotation was stale as well as the inference.)*, and
-  ~~**`SendMessage` does not exist in a uzi run** —
+  summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
   `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
   unavailable, naming `SendMessage` as the case — so that role's remaining options are both
-  writes~~. *(**Corrected 2026-08-03, issue #210: `SendMessage` DOES exist in a uzi run, so
-  this bullet's premise AND its conclusion are both false.** Measured on three run traces:
+  writes.~~ *(**Corrected 2026-08-03, issue #210: `SendMessage` DOES exist in a uzi run, so
+  this bullet's premise AND its conclusion are both false.** Offering an option that EXISTS
+  does not compound a write risk, it relieves it, so the first clause falls with the second.
+  The quoted phrase is retired too: `4fde2088` dropped the word "design" and `98cabb06` made
+  it "a summary via SendMessage to `main`", so the quotation was stale as well as the
+  inference. Measured on three run traces:
   `71d83432`, `84b6a933`, `c13cff61` carry 26 `SendMessage` `tool_use` entries, 18 of which
   returned `{"success":true,"message":"Message queued for the main conversation's next
   turn."}`; `ToolSearch` resolved `select:SendMessage` six times, which is direct proof the

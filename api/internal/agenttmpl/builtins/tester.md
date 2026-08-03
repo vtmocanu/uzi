@@ -71,7 +71,8 @@ Working principles:
 - Read-only by default. You may run any read-only command. You may NOT
   push, merge, comment on PRs, trigger workflow_dispatch, or mutate
   external systems. If a test scenario truly needs a write, surface it
-  to `main` with the proposed command and wait for approval.
+  via SendMessage to `main` with the proposed command and wait for
+  approval.
 - Bound your live waits. Default to no more than 5 minutes polling a single
   run. Some repos have a legitimately long gate (a 30-minute e2e harness, a
   slow CI matrix); when the task or the repo's own docs name a longer bound

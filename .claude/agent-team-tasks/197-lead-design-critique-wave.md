@@ -516,9 +516,9 @@ unreachable and both remaining options are writes.~~ `tester.md`'s prohibitions 
 > points at the correction.** `SendMessage` executed 26 times across runs `71d83432` /
 > `84b6a933` / `c13cff61` (18 successful), and `ToolSearch` resolved `select:SendMessage`
 > six times, which is direct proof the SDK provides it independently of any send
-> succeeding. `repoagents.ts:25-29` is where the CORRECTION now begins, so the citation
-> was stale in the direction that inverts it. The STRUCTURAL claim on those lines — an
-> allowlist entry matching no real tool grants nothing — is untouched and still true; only
+> succeeding. The citation is stale in the direction that inverts it: at HEAD the
+> correction begins at `repoagents.ts:29`, while `:25-28` — the lines this bullet cites —
+> still carry the STRUCTURAL claim, which is untouched and still true. Only
 > `SendMessage` as an instance of it was wrong. **So the non-writing branch is REACHABLE
 > and architect's remaining options are not both writes**, which weakens the argument for
 > B1 below without touching its conclusion (the no-write rule still has to be relayed,

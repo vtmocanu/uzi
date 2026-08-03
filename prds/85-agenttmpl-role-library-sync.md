@@ -224,12 +224,14 @@ UI (Decision 8).
    `builtins/reviewer.md:4`, …), and this PRD's entire thesis is that a builtin
    and its library counterpart should be diffable (Decision 3). Pruning two of
    twelve files would make those two the only ones whose `tools` line does not
-   match `roles.yaml`, to remove names that are already ~~inert~~ *(struck
+   match `roles.yaml`, ~~to remove names that are already inert~~ *(struck
    2026-08-03, issue #210: at least `SendMessage` and `TaskList` are live — see
-   the correction above. The rest of the sentence stands; the reason for pruning
-   was never strong and this removes what was left of it.)*. So: **keep them
-   verbatim.** If the ~~inert~~ *(same correction)* names are worth removing,
-   that is a separate,
+   the correction above. The whole purpose clause goes, not the adjective alone:
+   striking only "inert" leaves "to remove names that are already", which is why
+   this strike is wider than the one 165 lines below. The reason for pruning was
+   never strong and this removes what was left of it.)*. So: **keep them
+   verbatim.** If ~~the inert names~~ *(same correction — read: those four names)*
+   are worth removing, that is a separate,
    roster-wide change (all twelve at once, with the diffability cost taken
    deliberately), not a two-file exception.
 
