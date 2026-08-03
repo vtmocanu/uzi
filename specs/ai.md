@@ -16145,9 +16145,11 @@ running the tool and every one of which has a quieter failure on the other side.
   today every vet finding blocks and ratcheted only new ones would. It is a golangci-lint
   default, which is precisely the premise ("the tool enables it by default") that will
   motivate re-adding it — the answer is that the check is not missing, it is elsewhere and
-  stricter. `goconst` is disabled on evidence: measured 2026-08-02 at golangci-lint 2.12.2 /
+  stricter. `goconst` is disabled on evidence: measured at golangci-lint 2.12.2 /
   go1.26.5 darwin/arm64 **with both cap flags cleared**, it is 1178 findings in `api` and 33 in
-  `controller` — **1211 of 1323 combined, 91.5%**, on the shipped enable set — of which 247 are
+  `controller` — **1211 of 1322 combined, 91.60%**, against a non-goconst backlog of `api` 106
+  + `controller` 5 on **M3's five-linter enable set** (`errcheck`, `staticcheck`,
+  `ineffassign`, `unused`, `unparam`) — of which 247 are
   outside `_test.go` in `api`, spread over 86 files; the non-test findings visible in the
   capped run **across both modules** were read by hand, plus a 1-in-20 re-sample across all 86
   non-test files **in `api`**, and none is a defect — only CLI subcommand names, JSON field
@@ -16158,6 +16160,30 @@ running the tool and every one of which has a quieter failure on the other side.
   `"status"` into a constant. That is the ratchet's sharpest edge aimed at the linter with the
   least signal. **This contradicts the PRD's own M3 bullet, which listed `goconst` among the
   linters to enable — the bullet was amended, not worked around.**
+
+  *🔴 **THE ENABLE SET IS PART OF THE FIGURE, AND SO IS THE SHA.** Re-derived independently
+  2026-08-03 at **`8f3c4bb5`** with a private `GOLANGCI_LINT_CACHE` (zero `../` in any run):
+  goconst `api` 1178 / `controller` 33, non-goconst `api` **106** / `controller` **5**. It read
+  `1211 of 1323, 91.5%` until then, from a figure taken hours earlier and invalidated the same
+  afternoon by `6ea98493`, which wired up `const hookEvent` and consumed a pre-existing
+  `unused` finding — the api backlog went 107 → 106 with every PER-LINTER figure unchanged.
+  **A date cannot separate two commits landed the same afternoon; a tree-derived figure
+  carries the SHA it was run at** (PRD #103 M4's amendment to Decision 10). The Go tree at
+  `8f3c4bb5` is byte-identical to `1076b133`, where the PRD's matrix was taken — the five
+  commits between them touch no `.go` file — so the two records agree rather than compete.
+  **And "106" is the FIVE-linter set, not the shipped one**: `nolintlint` was added on
+  2026-08-03 and reads 108 unratcheted on the same tree (the 2 extra are bare `//nolint`
+  directives in `api/internal/store/revise_cap_{integration,repro}_test.go`). Quoting a total
+  without naming its enable set is the same defect one axis over.*
+
+  *One subtlety in the denominator, because this section is the one that insists on naming a
+  population: **1322 is ADDITIVE — goconst and non-goconst measured in separate runs and
+  summed.** A single run with `goconst` enabled reads **1321** in `api` + `controller`
+  (1283 + 38), because `uniq-by-line` drops one `staticcheck` finding that shares a line with
+  a goconst one; `staticcheck` reads 21 without goconst and **20** with it. The ratio is
+  91.60% additively and 91.67% single-run, so the argument is untouched either way — but the
+  two numbers are both correct and will not reconcile unless you know which run produced
+  which. Same mechanism as §471's `uniq-by-line` bullet, arriving in a denominator.*
 - **One per-linter test-file exclusion survives, and it was never goconst's.** `unparam` is
   excluded in `_test.go`: 22 of its 26 findings were test helpers of one shape (a parameter
   that today has a single call site), which is how a test stays readable and is a one-line
@@ -16181,7 +16207,7 @@ running the tool and every one of which has a quieter failure on the other side.
   debt would be unmeasurable. An **empty** `--new-from-merge-base=` is what clears it; the two
   obvious alternatives do not error and do not work — measured against the shipped config,
   `--new-from-rev=` and `--whole-files=false` both return a still-filtered "full debt report"
-  reading 0 issues over a module carrying 107. **The flag name is coupled to the config key
+  reading 0 issues over a module carrying 106. **The flag name is coupled to the config key
   and the two move together.** These targets are in no gate and no CI job, but *not gating*
   does not mean *exits 0*: golangci-lint exits 1 whenever it reports anything, so anyone
   wrapping them later needs an explicit `|| true` and a comment saying why.
@@ -16228,6 +16254,18 @@ its own header rather than deferring to a doc.
   *warns*, and a warning does not set the exit code here either — **the `-severity=error`
   suffix is the whole point.** This milestone ships eleven new directives, so the exposure is
   its own.
+
+  *🔴 **THE GO HALF SHIPPED WITHOUT THE ANALOGUE AND NOBODY NOTICED FOR A DAY.** A bare
+  `//nolint` silenced all five Go linters with no warning and exit 0 — the identical hole, in
+  the same MR, with the fix already written on the other side of it. Closed 2026-08-03 by
+  enabling `nolintlint` (`allow-unused: false`, `require-explanation: true`,
+  `require-specific: true`), with the user's explicit approval since M3 had frozen the enable
+  set. **Treat "every enabled linter set owes a suppression-lint" as the invariant a rebuild
+  must satisfy, not as two independent flags**: the asymmetry was invisible precisely because
+  each half was reviewed against its own tool's conventions. Calibrated with a positive
+  control first — a directive where nothing fires and no directive at all are otherwise
+  indistinguishable, which is the same reason this bullet's own measurement needed the
+  without-the-flag arm.*
 - **Nothing ships at `"warn"`.** A rule at warn **prints its violation and exits 0**, which is
   a report that always passes — the silent-green shape this PRD exists to remove.
 - **The npm targets DELEGATE to a `package.json` `lint` script rather than calling the binary,
@@ -16363,15 +16401,25 @@ the same runner.
   milestone was `goconst` reporting **exactly 50** — and that is the tell nobody looks at,
   because 50 is a plausible number.
 - **The two flags COMPOSE IN ORDER and neither "owns" a linter, which is what makes the
-  obvious drop-one check a trap.** Measured 2026-08-02 on the shipped config, `cache clean`
-  before each cell:
+  obvious drop-one check a trap.** Isolation matrix over `api` on M3's five-linter enable set,
+  each cell run in a private `GOLANGCI_LINT_CACHE`:
 
   ```
-  --new-from-merge-base=                            56   errcheck 36  staticcheck 13
-  + --max-issues-per-linter=0                       56   errcheck 36  staticcheck 13
-  + --max-same-issues=0                             78   errcheck 50  staticcheck 21
-  both                                             107   errcheck 79  staticcheck 21
+  --new-from-merge-base=                            55   errcheck 36  staticcheck 13
+  + --max-issues-per-linter=0                       55   errcheck 36  staticcheck 13
+  + --max-same-issues=0                             77   errcheck 50  staticcheck 21
+  both                                             106   errcheck 79  staticcheck 21
   ```
+
+  *Re-derived 2026-08-03 at **`8f3c4bb5`** (zero `../` in any cell); `controller` reads **5**
+  in every cell, then and now. This block read 56 / 56 / 78 / 107 until then, and the four
+  totals are each one lower for the reason §468's goconst bullet gives — `6ea98493` consumed a
+  pre-existing `unused` finding, so the tail is `unparam 4 + unused 2 = 6` against 7 when M3
+  measured. **Every per-linter figure is unchanged**, which is the useful part: the flags'
+  behaviour is what this matrix exists to establish, and that did not move. Three tracked
+  copies of this matrix exist (`Taskfile.yml`'s `lint:api:all` comment, the PRD's M3 status
+  block, here) and the two totals columns are what drift — they are the only cells that depend
+  on the tree rather than on the tool.*
 
   `--max-same-issues` folds duplicate **messages** first; `--max-issues-per-linter` then
   truncates the survivors at 50. So on this config **`--max-issues-per-linter=0` alone is a
@@ -16400,10 +16448,20 @@ the same runner.
   the underlying run is shared** — the camouflage was written down and then walked into two
   sections later, by a different person reading the same capped output.
 - **`issues.uniq-by-line` defaults to TRUE, dedupping ACROSS linters, so any single linter's
-  count depends on which OTHERS are enabled.** On this tree the 107 becomes 108 with
-  `--uniq-by-line=false`. One finding today; recorded because **M4 and M5 add linters**, and
+  count depends on which OTHERS are enabled.** On this tree the **106 becomes 107** with
+  `--uniq-by-line=false` (staticcheck **21 → 22**) — that cell **re-run** at `8f3c4bb5`, not
+  shifted on paper, which is the whole point of an entry about numbers that move underneath
+  you. One finding today; recorded because **M4 and M5 add linters**, and
   this is how a staticcheck finding disappears from an "unfiltered" total with nobody touching
   staticcheck.
+
+  *And the prediction it makes was checked and holds: enable `goconst` on the same tree and
+  **staticcheck falls 21 → 20**, because one of its findings now shares a line with a goconst
+  one. That is why §468's `1211 / 1322` denominator is an ADDITIVE construction and a single
+  run of the same population reads **1321** (`api` 1283 + `controller` 38). Neither figure is
+  wrong; they answer "how big is each population" and "how many records does one run print",
+  and the gap is exactly this bullet. A reader who reconciles them by picking the tidier
+  number loses the mechanism.*
 - **🔴 Name the POPULATION or the counts will not reconcile — a wrapped record makes three
   denominators all defensible.** Two `goconst` records quote a string literal containing a
   newline, so each wraps across two output lines. The tool's own tally is 1178; well-formed
@@ -16423,6 +16481,10 @@ the same runner.
   into another tree, against 107 after a clean. **The tell is a `../` in a finding's path: that
   is an invalid run, not a finding.** Two worktrees at the same SHA is the normal state of a
   fresh worktree and is exactly the configuration of a calibration run.
+  *(**This narrative keeps its own numbers on purpose, and the 107 here must NOT be swept to
+  106 with the matrix above.** It describes one dated run against one tree, not the current
+  one — a past-tense claim about a past state, which the standing rule says is a typo only
+  when the identifier was wrong when written. It was not.)*
 - **The `:all` targets clean IN-RECIPE; the gate targets deliberately do NOT, and the split is
   the decision.** The `:all` targets are *recording* targets whose entire output is a number
   someone writes down, so "remember to clean first" is discipline this repo removes rather
