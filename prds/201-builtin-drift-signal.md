@@ -1,7 +1,7 @@
 # Issue #201 — M4a: the builtin drift signal
 
 **Status:** design-critique wave, not yet implemented.
-**Branch:** `fix/201-builtin-drift`, worktree `/home/user/repos/myorg/vtmocanu/uzi/prd-201`, based on origin/main `25ebcd39`.
+**Branch:** `fix/201-builtin-drift`, worktree `/home/user/repos/myorg/vtmocanu/uzi/prd-201`. **Was** based on origin/main `25ebcd39`; merged `origin/main` at `c3704d25`, and is now **0 behind** (`git rev-list --count HEAD..origin/main` = 0). Citations below are at `25ebcd39` unless stated.
 **Spec of record:** this file. Issue #201's body states the problem; its newest comment
 (note_22449, 2026-08-03) is the settled design for the whole of #201. **This file scopes
 M4a only.** Corrections amend this file with a dated entry under `## Amendments`; messages
@@ -231,12 +231,22 @@ implementation on everything it covers.
 - `researcher`: closed — no external research needed; every mechanism is in-tree.
 - `release`: closed — M4a is not a release.
 
-## Rebasing onto the moved main — REQUIRED before the MR, and it is the CODER's to run
+## Rebasing onto the moved main — DONE at `c3704d25`. Kept as the record of why.
 
-This branch is based on `25ebcd39`. `origin/main` is `d367653b`, **22 commits ahead**. The
-merges into `main` across that range are `78ad89b9` (13:15:35Z), `10f7b6a5` (13:21:39Z),
-`9ac80056` (13:49:28Z) and `d367653b` (13:53:27Z). **A green gate on a stale base says nothing
-about the merged result**, so `git merge origin/main` and re-gate before the MR opens.
+**This section is past tense. The branch is 0 behind `origin/main`; do not act on it.** It read
+"REQUIRED before the MR" until the fact-checker pointed out that a heading marked REQUIRED,
+telling a reader to do something already done, is a wrong doc by this repo's own convention —
+the roster section had recorded the merge for hours while this one still demanded it.
+
+**What happened:** the branch **was** based on `25ebcd39`; `origin/main` moved to `d367653b`,
+**22 commits ahead** — a historical gap, correctly measured. The merges across that range were
+`78ad89b9` (13:15:35Z), `10f7b6a5` (13:21:39Z), `9ac80056` (13:49:28Z) and `d367653b`
+(13:53:27Z). The coder merged at `c3704d25` and re-gated green, because **a green gate on a
+stale base says nothing about the merged result.**
+
+**If main moves again, this becomes live again** — re-derive the gap rather than trusting the
+22, and the merge stays the coder's to run, never the lead's, in a worktree holding a live
+writer.
 
 > **CORRECTED.** This read *"because all three previously-in-flight MRs merged at ~13:57"* —
 > wrong twice. **FOUR** MRs merged, not three: !170 was created at 13:33Z, after the sentence's
@@ -589,6 +599,34 @@ and widen the fixture so all four columns differ with markup in `description` an
 name, so `InlineDiff`, the model span and `ToolsDiff` mount rather than `LineDiff` alone.
 Also correct the comment's framing: the grep is STRICTLY STRONGER than this test, not the
 other way round.
+
+> **🔴 SHARPENED BY MEASUREMENT — the `ins, del` assertion is not a nice-to-have, it is the
+> ONLY thing that will discriminate after F9.** The fact-checker mutated `LineDiff`'s call
+> site three ways. The first two reddened and **both reds were on
+> `getAllByText(/onerror/, {selector: "span"})`** — the test noticing the DOM SHAPE changed,
+> not unsafe HTML appearing. The third, which preserves `LineDiff`'s own per-row `<span>`
+> structure and pipes the body through `convertChangesToXML`, is **GREEN 5/5** against an
+> unsafe implementation. **`container.querySelector("img")` — the assertion that looks like
+> it encodes the security property — is null and passes under ALL THREE unsafe forms. It
+> never discriminates.**
+>
+> **This lands directly on my own conflict resolution.** The accidental protection came from
+> `selector: "span"` breaking; **F9's sr-only markers preserve spans by design**, so that
+> accident disappears and every existing assertion goes green on an unsafe renderer. The
+> resolution stays — sr-only over `ins`/`del` is still right — but it makes F2's new assertion
+> load-bearing rather than belt-and-braces. **Do not land F9 before F2, and do not let F2's
+> `ins, del` assertion be dropped later to make a refactor compile.**
+>
+> Two more from the same run. The overclaiming artifact is the TEST COMMENT
+> (`AgentDetail.test.tsx:151-152`, *"the tag below would become a real element"*) — false for
+> `convertChangesToXML`, which escapes. `10970920`'s commit message says only that such a
+> library *"would introduce the first `dangerouslySetInnerHTML`"*, which is true and a
+> different claim; fix the comment, not the message. And the fact-checker's own third run
+> **first reported `5 passed` from a run where the mutation had not landed** — the pattern was
+> absent because `AgentTemplateEditor.tsx:466` is `{r.text || " "}` with a **non-breaking
+> space**, indistinguishable from ASCII in a terminal. Only a visible traceback caught it.
+> Its successful run carries an assert-it-landed control (`grep -c` = 2 mutated, 1 restored),
+> which is the shape any fold here needs.
 
 #### SHOULD-FIX — cheap, and each has an in-tree pattern to copy
 
