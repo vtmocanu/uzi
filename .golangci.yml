@@ -79,7 +79,19 @@ linters:
   #        and 33 in `controller` (24 _test.go / 9 not) — 91.60% of the combined
   #        backlog, re-derived on the SHIPPED enable set rather than inherited:
   #        goconst 1178 + 33 = 1211 against a non-goconst backlog of api 106 +
-  #        controller 5 = 111, so 1211/1322. (The non-goconst api figure was 107
+  #        controller 5 = 111, so 1211/1322.
+  #        🔴 1322 IS ADDITIVE - goconst and non-goconst measured in SEPARATE runs
+  #        and summed. A SINGLE run with goconst enabled reads 1321 across both
+  #        modules (api 1283 + controller 38), because `uniq-by-line` drops one
+  #        staticcheck finding that shares a line with a goconst one: staticcheck
+  #        reads 21 without goconst and 20 with it. The ratio is 91.60% additively
+  #        and 91.67% single-run, so the ruling is untouched either way - but both
+  #        numbers are correct and WILL NOT RECONCILE unless you know which run
+  #        produced which, and a reader who re-measures in one run gets 1321 and
+  #        cannot tell whether they or this file are wrong. Same mechanism as the
+  #        uniq-by-line note in `lint:api:all`'s comment, arriving in a
+  #        denominator. specs/ai.md 468 carries the same pair.
+  #        (The non-goconst api figure was 107
   #        and the ratio 91.5% until 2026-08-03, when it was re-derived at
   #        1076b133: 6ea98493 wired up `const hookEvent` and consumed a
   #        pre-existing `unused` finding. Every PER-LINTER figure is unchanged.

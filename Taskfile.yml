@@ -214,7 +214,7 @@ tasks:
       # dependency on a build and nothing is gained by deferring it. Same reason
       # M2 put fmt-check first in gate:api.
       - task: lint:web
-      # knip SECOND, on the same cheap-first principle: 244ms measured, against
+      # knip SECOND, on the same cheap-first principle: ~1-3s WALL, against
       # ~5s for typecheck and ~10s for vitest. It has no ordering dependency on
       # a build or a typecheck either - knip 6 resolves with oxc-resolver and
       # does not run tsc.
@@ -228,7 +228,7 @@ tasks:
     cmds:
       # lint first, same reason as gate:web (~0.05s here).
       - task: lint:agent
-      # knip second, same reason as gate:web (152ms here).
+      # knip second, same reason as gate:web (~1-3s wall here too).
       - task: deadcode:agent
       - task: typecheck:agent
       - task: test:agent

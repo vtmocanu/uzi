@@ -1310,7 +1310,15 @@ which previously prescribed only the fail-open form.
       **1178 findings in `api`** uncapped (931 of them in `_test.go`, 247 not), which
       is **91.60%**
       of the combined backlog (goconst 1178 + controller's 33 = 1211, against a
-      non-goconst backlog of api 106 + controller 5 = 111; re-derived on the
+      non-goconst backlog of api 106 + controller 5 = 111 — **1322 is ADDITIVE**,
+      goconst and non-goconst measured in separate runs and summed, and a
+      **single** run with goconst enabled reads **1321** (api 1283 + controller
+      38) because `uniq-by-line` drops one `staticcheck` finding sharing a line
+      with a goconst one (`staticcheck` is 21 without goconst and **20** with
+      it); the ratio is 91.60% additively and 91.67% single-run, so the ruling is
+      untouched either way, but both are correct and will not reconcile unless
+      you know which run produced which (`specs/ai.md` §468 carries the same
+      pair); re-derived on the
       **shipped** enable set — the "90%" this previously read was computed on the
       design-wave set, whose non-goconst backlog was 134, and it was the one figure
       in the block nobody re-took when the enable set changed);
