@@ -248,3 +248,15 @@ Placed deliberately so validators can run `gate:web` / `gate:agent` **without in
 **They are gitignored, so `git status` shows nothing and no diff can reveal them.** The only tell is `ls -ld`. Check before any npm operation in a PRD worktree, and treat "I need to install" as a reason to stop and ask rather than proceed.
 
 Handed over by M5's outgoing coder at shutdown, unprompted — the class of knowledge that dies with an agent's context unless it is asked for or volunteered.
+
+## 20. "STAGE BY PATH" IS NECESSARY AND NOT SUFFICIENT — `git commit` TAKES THE WHOLE INDEX
+
+Measured 2026-08-03, M5 MR-B. The lead ran `git add -f <brief> && git add <probe> && git commit`, staging **only** its own two paths — and the commit landed a **third** file: `api/internal/config/gitleaks_canary_test.go`, which the coder had already staged and had not yet committed.
+
+**No `git add -A` was involved.** The rule everyone knows (`stage by path, never -A`) governs what *you* add; it says nothing about what is **already in the index** when you commit. In a shared worktree another agent's staged work is in that index, and `git commit` takes all of it.
+
+**The consequence is misattribution, not loss**: the file's introduction is recorded under an unrelated docs message, its author is wrong in `git log`, and a reviewer scoping by commit sees a source file inside a documentation change.
+
+**The fix is a pathspec-limited commit** — `git commit -- <paths>` — or reading `git status` for foreign staged entries before committing. The second is the weaker form for the usual reason: it depends on remembering to look, at exactly the moment you are thinking about something else.
+
+Filed by the coder whose file was swept, unprompted, while reporting an unrelated fix.
