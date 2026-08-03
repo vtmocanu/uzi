@@ -16064,12 +16064,238 @@ it. `api/internal/agenttmpl/builtins/tester.md` is deliberately **not** among th
 product template content, decoupled from `.claude/agents/` (§Conventions), and a `gofmt` grep
 surfaces it looking editable.
 
+## 467. Issue #197 — the plan critique is a PROPERTY OF THE PLAN anchored on `submit_plan`, and it supersedes §190's read-only ordering
+
+**Supersedes §190 on one point and one only.** §190 records, in the present tense, that
+read-only work fans out "after an implementation unit lands". That is now the SECOND of two
+waves rather than the only one. Everything else §190 states stands unchanged: the
+allocation-agnostic wave, package/module-level disjointness, the explicit non-overlapping
+file scope per implementer, and the integrate-then-commit-then-gate sequence.
+
+The defect, found by dogfooding on issue #195: no reviewer, auditor or tester ever saw a
+plan, so a wrong plan was discovered only once it had been built. The approval gate does not
+close it — a human approving a plan does not go and read the migration to check whether the
+mechanism the plan asserts is the mechanism in the code, which is exactly what a read-only
+agent does cheaply. `architect` shipped already and nothing sequenced it before the coder.
+
+- **Rule shape: a property of the PLAN, not a procedural step** (user decision, 2026-08-02).
+  Before `submit_plan`, every mechanism the plan asserts must name the file that implements
+  it and quote the line; the read-only wave is the MEANS of getting those citations rather
+  than a separate ritual. Rejected: the skills-repo wording *"for anything beyond a small
+  fix, dispatch a DESIGN-CRITIQUE wave"*, whose skip predicate is graded by the same lead
+  whose plan is being critiqued. The property makes cost scale with the number of mechanisms
+  asserted — a one-line change asserts one and costs nothing extra, **with no rule skipped** —
+  and makes a deficient plan legible to the human at the gate, which is the gap the issue
+  opens with.
+- **Placement is the PLAN turn, and the reason is a ROSTER ASYMMETRY, not the argument above.**
+  The two phases do not run the same set. The plan turn runs the owner's own assembled roster
+  (`sdk-executor.ts:495` `agents: assembled.subagents`, guard `:512`
+  `preToolUse(ownSubagentNames)`); implement turns are REBUILT at the gate boundary from the
+  human's selection (`:901`, `:906`), and an absent selection resolves to source `repo`
+  whenever the clone carries a roster — the executor's own comment says so at `:602-605`,
+  in a passage correcting an earlier version of itself. So in the first implement turn the
+  critique agents may not exist at all. Second reason, same direction: a repo-sourced roster
+  cannot reach the plan turn, so a plan-time wave always runs uzi's own reviewed builtins.
+- **Anchor: `submit_plan`; `lead.md` alone, and NO `prompt.ts` change.** The system prompt is
+  phase-agnostic — the lead reads the identical sentence in the plan turn and in every
+  implement turn — so relative wording ("before the implementer") is unresolvable there.
+  `submit_plan` locates its own phase, is already named in the guardrail append
+  (`prompt.ts:44`), and all three plan prompts end with it (`:559` issue, `:783`
+  self-improve, `:907`/`:913` ci_fix). Note `delegatesLine` has **four** call sites, not the
+  two the run brief first claimed: `:546`, `:621`, `:778`, `:901`, while
+  `buildRevisePlanPrompt` (`:664`) has none. A `prompt.ts` line would state the rule twice
+  and pull `gate:agent` into the gate for no new capability.
+- **Three things the dispatch must carry, each mechanical, none of them flavour.** (a) The
+  artifact is the PLAN TEXT, not a diff: `reviewer.md:43-44`, `auditor.md:36-37` and
+  `tester.md:89-90` each tell their agent to surface missing context rather than guess and
+  to wait for re-delegation, so an unqualified dispatch returns bounce-backs instead of
+  citations and is worse than no wave. Editing those three bodies was rejected as the wrong
+  lever: it triples the scope and puts three more pin sets in play. (b) Report-only, **and
+  the constraint has to be RELAYED rather than merely held by the lead**: a subagent's
+  system prompt is its own `prompt_body` (`agents.ts:94-96`) and the lead cannot alter it,
+  so the dispatch prompt is the only channel. `architect.md:4` and `tester.md:4` both
+  declare `Edit, Write`, `agents.ts` honours a template's `tools` list verbatim, and the
+  path hook only JAILS writes to the worktree rather than denying them
+  (`guardrails.ts:757`). `architect.md:37` compounds it by offering "a SendMessage design
+  summary" as its non-writing option, and **`SendMessage` does not exist in a uzi run** —
+  `repoagents.ts:25-29` records that an allowlist entry matching no real tool is silently
+  unavailable, naming `SendMessage` as the case — so that role's remaining options are both
+  writes. A plan-turn write is an uncommitted change the human never saw, which the first
+  implement commit then sweeps in: it weakens the APPROVAL GATE, not a guardrail layer.
+  (c) Any bar is stated over the plan the lead produced, never over the issue.
+  `PlanPromptInput` (`prompt.ts:498-518`) carries **nine** fields, and none of them is a
+  label or an effort estimate; the task reaches the lead as `issueTitle` and
+  `issueDescription`, which `UNTRUSTED_FRAME` (`prompt.ts:18`) declares attacker-controlled.
+  So "beyond a small fix" would be a predicate computed from hostile text. *(An earlier
+  version of this bullet said `buildPlanPrompt` "carries only the issue title and
+  description". That is false — the load-bearing half, no label and no effort field, was
+  exact. `2f0017b5`'s commit message carries the wrong version and is immutable.)*
+- **Residual, stated rather than closed: a plan that asserts ZERO mechanisms is compliant
+  and gets no wave.** The property is absolute over what the plan asserts, so there is no
+  reachable state where a plan asserts a mechanism and skips its citation — but a lead can
+  still write a mechanism-free plan and pay nothing. What that buys an attacker is a **cost
+  channel, not a safety channel**: a plan asserting nothing is also a plan the human at the
+  gate can see asserts nothing. Deliberately not closed in the prompt, because the
+  closing predicate would be another self-graded dial of the kind D2 exists to remove.
+- **Structure: a separate short paragraph above the bullet list, not a sixth bullet.** The
+  list encodes one contract (*what fans out in parallel*); the citation property is a
+  different axis (*what the plan must contain before `submit_plan`*). Mixing them in one list
+  is what let the auditor's mutant reuse a single clause for both meanings.
+- **The pins had to DISCRIMINATE — adding one would not have been enough.** Measured on the
+  pre-change tree (`480c1b02`): `always fans out`, `after an implementation unit lands` and
+  `Read-only work` each appeared **0 times** in `render_test.go`, so the ordering this issue
+  is about was entirely unpinned. The auditor's mutant deleted the post-implementation
+  ordering, replaced it with a plan-time wave reusing the pinned clause `send all allocated
+  read-only validators together in one wave`, and **all 14 pins stayed green** (control:
+  mutating one pinned phrase reds exactly 1 of 14, so the harness does discriminate). Those
+  14 are therefore kept **unedited** — the pinned clause excludes the prefix, so rewording
+  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds eight. Every fold ran
+  with all three `TestLead*` tests present as `=== RUN` (so no fold was a compile error
+  reading as silence), the template restored from a `cp` backup rather than
+  `git checkout --`, and, from round two on, in a **throwaway detached worktree** rather
+  than the branch's own tree, after three agents collided in the shared one.
+- **DELETION AND RELOCATION ARE DIFFERENT INSTRUMENTS, AND ROUND ONE USED ONLY ONE OF
+  THEM.** The coder's per-behaviour sentence deletions, the reviewer's word-level
+  weakenings and the auditor's seven mutants are all **presence** mutations. None can
+  produce the disconfirming answer, because a clause moved into the other wave's bullet is
+  still present character-for-character: measured by the tester, relocating the citation
+  clause or the no-write clause into the post-implementation bullet and deleting the
+  plan-turn sentence left the plan-turn constraint gone from the template and **all 20 pins
+  green at exit 0**. Three separate controls agreeing was three readings of one instrument.
+  That is this issue's own defect one level in: the old pins were blind to *which wave fans
+  out*, the first new set was blind to *which wave a constraint binds to*.
+  **It then took three rounds to finish anchoring, and the reason is structural rather than
+  careless: it is a per-phrase property applied by hand with nothing checking it was
+  applied**, and each round the phrase nobody re-checked was the one that was missed.
+  Counting in **phrases**, seven needed anchoring across the three rounds. The rule is now
+  enforced instead of asserted — each case carries an `anchor` field naming the turn it
+  binds to, and the test asserts the anchor is inside the phrase, that no phrase contains
+  another, that each matches exactly once, and that none swallows a phrase from the 14-set.
+  That last one is not hypothetical: round two's ordering pin had swallowed `send all
+  allocated read-only validators together in one wave` whole, silently retiring it.
+- **What anchoring buys is SEMANTIC, and WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE PIN
+  CLAIMS.** For a **descriptive** pin — *the template states rule R* — a relocated sentence
+  still states R, so green is correct and relocation cannot produce a disconfirming answer
+  at all; **reversion** (put the original site back to its un-anchored wording) is the fold
+  that can. Measured: all three formerly-blind pins red on reversion, while relocating the
+  whole anchored phrase is green. For a pin about something the lead must do **at a
+  particular moment**, position is not packaging — position is the content, relocation
+  destroys the behaviour and creates a different one, and relocation stays required.
+  **This distinction was learned the expensive way: the tester and the auditor folded the
+  same mutation and reported opposite verdicts, and both results were right — only one
+  *referent* was.** The durable form, well past this issue: *when two agents fold the same
+  mutation and disagree, settle what each of them takes "the behaviour" to be before
+  deciding which result is correct.* The reviewer's one-glance version: a pin is
+  relocation-proof exactly when its behaviour is fully determined by its own content, so
+  look for a context-bound referent inside the phrase.
+  The relay pin had one — `tell **each of them** …`, whose referent came from the preceding
+  sentence, so relocated it silently re-resolved to the post-implementation validators while
+  the plan dispatch was told nothing. **A substring is position-independent by definition,
+  so no anchor could ever have expressed that.** The fix was to delete the referent: the
+  clause now names its recipients (`tell each validator you send over the plan …`), which
+  dissolves the case rather than mitigating it. Verified by folding, and the result is worth
+  stating precisely because it contradicts the fix's own acceptance test: relocating the
+  **rewritten** clause is now **green, correctly** — the recipients travel with the sentence
+  — while reverting it to the pronoun form reds. The round-4 brief asked for a red on
+  relocation; that expectation belonged to the pre-fix pin.
+  Two corrections to how this was written down before, both of which had reached this
+  section: the earlier claim that **overlapping spans buy relocation-detection is false** —
+  `strings.Contains` is per-occurrence, so two overlapping pins can be satisfied by two
+  different occurrences and the overlap never forced contiguity at all; it only ever
+  detected deletion, which the pins already did. The spans are now pairwise disjoint and
+  audited to be. And a borrowed prefix costs a **measured false positive**: one benign
+  clarifying sentence inserted between two pinned sentences reddened a pin with both
+  behaviours fully intact.
+- **THE INSTRUMENT HAS A FLOOR, AND ANCHORING DID NOT RAISE IT: no substring-presence set
+  can detect an INSERTION.** `strings.Contains` is monotone under insertion — adding text
+  can only turn a false into a true. Measured: a paragraph inserted above this one calling
+  the whole thing "an optional pre-flight … skip it entirely and call `submit_plan`
+  straight away" neutralises every behaviour with **all pins byte-intact, `rc=0`**. This is
+  a property of the instrument, not of the phrase choices, so no anchoring, widening or
+  region-scoping closes it, and the obvious patch — a negative assertion on the inserted
+  wording — is the vacuous-negative trap this repo already documents. Recorded so that
+  "anchoring closed relocation" is never read as "the pins are now sufficient": insertion
+  is caught by reading the diff, by nothing here.
+  **The AUDIT has its own residual, one root with two consequences, and it is stated rather
+  than closed on purpose** — a known limit written up as a believed-closed property is the
+  one thing that would make this unshippable, because #205 then loses the evidence that
+  motivates it. Root: the audit is a **syntactic containment** check, and neither semantic
+  property it would need is expressible as a substring relation. **(a) Quality gap** — it
+  cannot check the anchor *names a turn*, only that the declared token is present; measured,
+  `anchor: ""` passes (`Contains(x, "")` is always true) and so does a vague token like
+  `again`. Applies to every pin, and a better-chosen anchor fixes any instance. A turn-token
+  allowlist was **rejected**: it catches the vague token, leaves (b) untouched, and goes
+  stale, so the audit would look stronger with the load-bearing hole in place. **(b)
+  Expressiveness gap** — it cannot check the behaviour is *anchorable at all*. Measured on
+  `dcf9d0f9`'s relay pin, which carried a genuine anchor and where nothing else was changed:
+  relocating that one clause left the pin and every audit assertion green over a template
+  whose plan-turn dispatch is told nothing. No anchor fixes that case; deleting the referent
+  does, which is why it is not a mitigation.
+  **Region-scoping** (assert each phrase against its region of the template rather than the
+  whole flattened body) closes relocation by construction and lets every phrase shrink, and
+  it is deliberately a **follow-up, not part of this change** — user/lead decision on the
+  tester's own recommendation. Its correctness rests on a three-clause boundary guard that
+  has had exactly one evaluation, its author's, which is the control-written-from-inside
+  problem that produced this whole task; and its naive `strings.Cut` form is *strictly
+  worse than what ships here*, since a missing boundary silently turns seven plan-turn
+  assertions into whole-body assertions while one unrelated loud red draws the eye
+  elsewhere.
+- **Reach: correct, fully gated, merged — and INERT on every install that has booted once.**
+  `queries/agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING`,
+  and `store/agent_templates_builtins.go` states it in prose: an existing row, builtin or
+  admin-edited, is never overwritten. The only **mechanism** is the admin-only,
+  per-template, verbatim **Reset to default** — admin-only by
+  `authorizeTemplateWrite` (`handler/agent_templates.go:146-152`), which 403s a
+  `builtin`-scope write for a non-admin, so the operator note has to say who can do it.
+  Not "the only path": an admin hand-pasting the new body works too, and
+  `docs/agent-templates.md` already offers exactly that ("skip reset entirely and
+  hand-merge the new paragraphs"). A propagation mechanism for builtin updates (schema +
+  reconcile + UI, plus a policy question about overriding admin customizations) and the
+  missing `version:` field on `builtins/*.md` (0 of 11) are the real fix and are filed
+  separately — user decision 2026-08-02 was to ship #197 small.
+- **D12 — `architect` is deliberately NOT sequenced into the wave, which is half of what the
+  issue asked for.** The issue proposes dispatching "the allocated read-only validators
+  (**and `architect`, when allocated**)". Shipped `lead.md` says only "the allocated
+  read-only validators" and does not mention `architect` at all (measured: zero
+  occurrences). That is not an oversight and it follows from D5 rather than contradicting
+  it — `architect` declares `Edit, Write`, so it is not a read-only validator and the
+  wording excludes it. It joins the plan-turn wave when **#203** removes its write tools,
+  not before. Recorded because an unstated omission becomes a surprise; note it does not
+  weaken the relay requirement, since `tester` also declares `Edit, Write` and *is* named a
+  read-only validator by the product's own docs.
+- **The wave is bounded on REPETITION, not only on width.** A planning turn re-enters from
+  two loops: `QUESTION_MAX` (default 5, `config.go:664`) allows up to six planning turns per
+  gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —
+  a ceiling of 24 planning turns, each of which would otherwise carry a full wave, against a
+  **non-resetting** 2h `RUN_TIMEOUT`, since `started_at` is `COALESCE`d once and never
+  re-stamped (`queries/runtime.sql:647`). The bounding clause therefore has to name **any
+  re-planning turn**, not a revise turn: there are two distinct re-entry paths, and they
+  are the two factors above — `buildRevisePlanPrompt` (`sdk-executor.ts:804`) for a
+  rejected plan, and `buildPlanAfterAnswerPrompt` (`:1215`, inside `drivePlanningTurn`)
+  for an answered question. The **rejected** phrasing, naming only revisions, removes the ×4
+  and leaves the ×6: ceiling 24 → about 6, which is why "one clause bounds it" was an
+  over-claim on the first version of this sentence. **The shipped phrasing names any
+  re-planning turn, so it covers both paths and takes the ceiling to about 1 full wave** —
+  the re-entries after it re-cite only what changed.
+- **`docs/agent-templates.md` was the fifth file, and the run brief missed it.** Its
+  `:58-61` **as of `480c1b02`** (a reader at HEAD lands on the replacement, which says the
+  opposite) restated the post-implementation-only ordering, and its frontmatter is
+  `audience: user`, so it renders in-app at `/docs/agent-templates`: shipping without it
+  would have left uzi's own docs telling users the opposite of what its lead does. Found
+  independently by reviewer, architect and auditor. The gate widened accordingly to
+  `task gate:api` **and** `task gate:web` (the doc edit runs under `check-docs:web`), not
+  `task gate`.
+
 **Numbering note for the four M3 sections below.** They start at 468, not 467, because 467 was
 already held by the then-unmerged `fix/197-lead-design-critique-wave` branch — found by
 sweeping every sibling worktree of this bare clone at write time, which is the local form of
 the *"first free across all remotes"* rule stated in the numbering note above §455, and the
-same discipline §464 applied for the same reason one milestone earlier. The 467 gap is
-intended; closing it would recreate the collision.
+same discipline §464 applied for the same reason one milestone earlier. *(That branch has since
+merged, at `8dd67db0`, and §467 now sits directly above this note — so the gap the sweep left
+was filled by exactly the section it was left for. The note stays because it records the
+mechanism, and because a reader who finds these four starting at 468 with no gap in sight has
+no other way to learn that the number was reserved rather than picked. The same sweep is why
+§473-474 sit above main's §472 rather than colliding with it.)*
 
 ## 468. PRD #103 M3 — the Go ratchet lives in the CONFIG, which closes the ref question by construction, and the pre-flight guards `merge-base` rather than `rev-parse`
 
@@ -16516,6 +16742,149 @@ the same runner.
   keyed on something no caller can read. This is the price of the delivery choice in §468 and
   is worth paying; what it costs is that the *message text* is the only channel, for every
   golangci-lint failure mode, not just the one this list names.
+
+## 472. Issue #205 — the phrase pins are scoped to a REGION, which closes relocation by construction and retires §467's anchors
+
+§467 closed the *quality* half of the anchoring problem (the `anchor` field plus four
+asserted table properties) and recorded that it could not close the *expressiveness* half:
+a substring is position-independent by definition, so a phrase satisfies its pin from
+anywhere in the template. This closes that half by changing what the assertion reads, and
+**deletes the three hand-anchors §467 added** — they were expected throwaway and are.
+
+`splitLeadRegions` cuts the flattened template at
+`Dispatch independent subagents in parallel in a single turn:`; seven cases assert against
+the plan region and one against the bullet region. Relocation now fails **by construction**
+— a clause moved into the other wave's bullet is no longer inside the region its case
+asserts — whatever context the phrase does or does not carry.
+
+- **The phrases shrink because the region carries the position.** Measured on the shipped
+  template, **666 → 376 bytes** — independently re-derived from the shipped tables by both
+  the auditor and the tester. (Stated raw rather than as a percentage, **and in bytes rather
+  than "characters", for one reason**: this shrink is **−44% or −43% depending on whether it
+  is taken in bytes or runes** — `(666−376)/666 = 43.54%` against `(662−376)/662 = 43.20%`,
+  each unit's own division rounded once, since the anchored set carried two em dashes at
+  3 bytes each and so counts 666 bytes against **662 runes**. The ambiguous unit diverges on
+  exactly one of the two figures — this set carries no em dash and is 376 either way — and
+  two figures in two places read as a disagreement to anyone who meets them apart, which raw
+  figures cannot. The issue's own 717 → 375 is a third such pair, and benign: it is the
+  tester's prototype, whose phrase set predates #197's round-4 rewording, so both are right
+  for their own tree.) Everything §467 gave up to make anchoring work comes back: the spans are
+  pairwise disjoint again, each phrase occurs exactly once, the two deliberate overlaps are
+  gone with the documented consequence that one deletion reddened three cases, and
+  `D2 ⊂ P1` dissolves on its own. All of it stays machine-checked.
+- **The naive form is STRICTLY WORSE than the whole-body assertions it replaces, which is
+  why the split is guarded.** `strings.Cut` on a missing separator returns
+  `(whole, "", false)`: the plan region silently becomes the entire body, so seven
+  assertions revert to whole-body semantics — still passing, no longer scoped, nothing
+  saying so — while the bullet region goes empty and reds. One loud, correct-looking red
+  about the bullet case concealing seven quietly disarmed ones. That is the gate lying
+  rather than a claim lying, and it is worse than the blindness it replaces because the
+  blindness was at least written down. Three clauses, all `Fatalf`: exactly one boundary;
+  neither region degenerate; no cross-contamination.
+- **CORRECTION to the issue's own justification for clause 3, measured.** #205 states that
+  clause 3 is *"the only clause that catches a boundary that MOVED"* and that clauses 1 and
+  2 both miss it. **That is false, and it was the lead's sentence rather than the tester's
+  measurement.** Folded with clause 3 deleted: a boundary moved **up** still reds — seven
+  `PLAN region lost …` errors — because a shrinking plan region drops the phrases out.
+  What clause 3 uniquely buys is two narrower things, and the second is the one that
+  matters: **an honest message** (seven reds say the template lost seven behaviours, which
+  is false; one Fatal says the boundary moved, which is true), and the **down**-move, where
+  the plan region silently *widens*. That case is not hypothetical — folded end to end:
+  clause 3 deleted, boundary moved down past the first bullet, and the citation clause
+  relocated into that bullet, the citation case **does not red**, because it matches from
+  inside the bullet. The only red names the ordering case. So a relocation goes undetected
+  underneath a red pointing somewhere else, which is precisely the class this change
+  exists to close, reappearing through its own guard. **The weaker true claim ships; the
+  stronger readable one was wrong.**
+- **The guard's landmarks must come from the region EDGES, and must be asserted BOTH ways.**
+  The prototype took its bullet landmark from the *second* bullet and was measured blind to
+  the down-move above: the landmark never moves, so the guard passes. The shipped landmarks
+  are the plan region's last clause and a sentence inside the first bullet. Each is asserted
+  present in its own region **and** absent from the other — a negative-only form goes
+  vacuous the moment a landmark is reworded, which is this repo's documented
+  vacuous-negative trap wearing a guard's clothes. Neither landmark is a phrase any case
+  pins, so a guard failure and a behaviour failure are never the same message.
+- **This is a STRICTER definition of correct, not a refactor.** A relocated-but-present rule
+  is stated *somewhere* in the template and used to pass; wrong-section is now a failure.
+  Coherent for an issue about which turn the wave runs in, and declared in the test comment
+  so it is met as a decision rather than discovered from a red.
+- **INSERTION STAYS OPEN, and no scoping reaches it.** `strings.Contains` is monotone under
+  insertion: if a phrase is in a region it is in every superstring of that region. Measured
+  green under both instruments — a paragraph inserted above the plan paragraph calling the
+  whole thing "an optional pre-flight … skip it entirely and call `submit_plan` straight
+  away" neutralises every behaviour at `rc=0`. Not patched, because the obvious patch (a
+  negative assertion on the inserted wording) goes vacuous on the next copy change and then
+  guards nothing forever. Real coverage needs a semantic check on the rendered prompt and is
+  separate work. **"Regions closed relocation" must never be read as "regions closed the
+  problem."**
+- **Scoping cannot LOSE detection, and that bounds the question of what it costs.** Each
+  region is a substring of the body, so `Contains(region, p)` implies `Contains(body, p)`:
+  every fold the whole-body form reddened on this set reddens here too. A **proof**, not a
+  measurement, and worth stating because it turns *"does scoping open a new class?"* from
+  open-ended into answerable — the split is the entire new exposure. **And that exposure is
+  three prose dependencies no behaviour pin protects**: the boundary sentence and the two
+  landmarks are ordinary template prose, and a benign edit to any one fatals all eight
+  assertions at the guard. The sharpest is punctuation — the boundary's trailing colon
+  changed to a period gives `guard 1: occurs 0 times` while `TestLeadParallelDispatchPhrases`'
+  pin on that same sentence stays **green**, because it quotes the sentence without the
+  colon. One character, identical behaviour, whole instrument down. All three fail **closed
+  and self-locating**, which makes it a cost rather than a hazard, but the whole-body form
+  did not have it and it is invisible from reading the case table, since the three strings
+  sit in constants that read as configuration.
+- **Controlling clause 3 requires a DUPLICATION fold, and the obvious control cannot reach
+  it.** Each landmark is checked present-in-its-own-region first and leaked-into-the-other
+  second, both `Fatalf` — so a moved boundary always trips the presence branch and the leak
+  branch is unreachable that way. Measured: every boundary-move fold reports
+  `no longer contains its landmark`, never a leak. An auditor controlling the leak branch by
+  moving the boundary therefore concludes it is dead code and deletes a live check.
+  Duplicating a landmark into the other region reaches it, with the boundary count still 1.
+  Same family as this file's other instrument entries: the natural control answers a
+  different question, cleanly and repeatably.
+- **"Relocation fails by construction" reaches exactly as far as the BOUNDARY, and the
+  independent rounds bounded it in three directions.** (a) The plan region is everything
+  *before* the boundary — frontmatter plus both intro paragraphs — not the plan-critique
+  paragraph: **1655 bytes of region against 889 of paragraph** (889 takes the paragraph
+  through its trailing space, which the boundary `Cut` leaves behind; trimming it gives
+  888/767 — a one-byte delimitation choice, not a disagreement), so 766 bytes of room above
+  it. Measured, hoisting the relay clause into the intro reworded as *"as a general habit"*
+  gives **rc=0, no guard, no red**, with the clause out of the section that gives it
+  meaning. Relocation *across* the boundary fails by construction; relocation *within* the
+  plan region does not. Closing it needs a second cut, and the paragraph's opening sentence
+  is itself a pinned phrase, so a naive `strings.Cut` on it would remove that phrase from
+  the region and red its own case — not a one-liner, deliberately not attempted.
+  (b) A **third boundary position** exists that no guard clause covers: partway down, past
+  the ordering sentence but before the bullet landmark. Zero guards fire, and the run reds
+  with a **false message** — `BULLET region lost … missing phrase "fans out again after an
+  implementation unit lands"` while that phrase is still in the template one line above the
+  boundary. Detection holds either way, so it is a **message** gap rather than a detection
+  gap. (c) What closes that window is a **behaviour pin, not the guard**: the bullet region
+  carries exactly one case whose phrase is the first sentence after the boundary, so any
+  move past it reds. Retire or reword that pin and the window widens with nothing structural
+  behind it — a reader sees a behaviour assertion where something load-bearing for the split
+  also sits.
+- **The sibling 14-pin set is STILL whole-body, in the same file.** `TestLeadParallelDispatchPhrases`
+  asserts against the flattened body, so the class is closed for 8 pins and open for 14:
+  measured, moving a parallel-implementer constraint out of its bullet and up into the plan
+  paragraph — across the very boundary this change introduces — leaves **both sets green at
+  rc=0**. Its exposure is genuinely narrow (those phrases nearly all live in the bullets and
+  have nowhere misleading to go), so documenting rather than scoping was the call — but
+  `splitLeadRegions` sitting in that file makes it *look* scoped, and that inference is wrong
+  for 14 of its 22 pins. Scoping them is separate work.
+- **A fold harness produced six plausible, wrong results in this run, and the tell was a
+  count that could not happen.** The guard batch called its fold helper without the empty
+  insert-argument placeholder, so the `sed` expressions were *appended to the template as
+  text* instead of applied. All six folds reported `guard 1` firing — exactly what a
+  boundary fold should produce, which is why it nearly passed. The tell was
+  `occurs 2 times` / `occurs 3 times` from a fold that rewords one line. Re-run with correct
+  arity, and each fold now prints the mutated file's boundary count beside its verdict as a
+  positive control. Same family as this repo's other harness failures: the instrument, not
+  the hypothesis, is what a uniform or impossible result indicts.
+- **The author's round is not the independent one.** The guard was written and folded by the
+  same agent, which is the control-written-from-inside problem that produced #197's finding
+  in the first place — so #205 was split out of #197 precisely to get an auditor onto the
+  guard and a tester onto the instrument. Two of the divergences above (edge landmarks, and
+  the clause-3 correction) came out of the author folding its own work, which is evidence
+  that folding it is worth doing, not evidence that it is sufficient.
 
 ## 473. PRD #103 M4 — the dead-code gate ships EMPTY baselines gating at ZERO, the wrapper survives for the EXIT CODE, and `-test` hides the very class the `:all` companions exist to report
 

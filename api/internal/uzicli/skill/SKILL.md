@@ -151,13 +151,19 @@ uzi version
   (with the `=`, since a bare bool flag consumes no following word) to force it off
   for this run only. A parked run holds its issue and its worker's disk until it
   resumes, so it is opt-in rather than the default.
-- `uzi run approve <run-id>` — approve the plan gate. By default the run uses its
-  own default subagent roster. To choose the roster explicitly, pass
-  `--agent-source own|repo` (`own` = your template roster, `repo` = the agents
-  the worker detected in the clone's `.claude/agents/`); add
+- `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
+  sends no selection at all, and an absent selection resolves to **the agents the
+  worker detected in the clone's `.claude/agents/`**, falling back to your own
+  template roster only when the repo has none. So the repo roster is the default
+  wherever one exists. To choose explicitly, pass `--agent-source own|repo`
+  (`own` = your template roster, `repo` = the detected one); add
   `--exclude-agents <a,b>` to drop individual subagents from that source.
   `--exclude-agents` requires `--agent-source`. The server validates the
   selection against the run's live roster.
+
+  Do not read "the run's default" as the source named `own` — they are opposite
+  on every repo that ships agents, and this line said the former while reading as
+  the latter until 2026-08-03.
 - `uzi run reject <run-id> [--message <text>]` — reject the plan gate, optionally
   with a reason for the agent.
 - `uzi run cancel <run-id>` — cancel a run.

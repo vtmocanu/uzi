@@ -55,10 +55,16 @@ The lead can dispatch more than one subagent in the same turn when their
 work doesn't overlap, instead of always waiting for one to finish before
 starting the next:
 
-- **Read-only validators fan out together.** After an implementation unit
-  lands, the lead sends every allocated read-only subagent (`reviewer`,
-  `auditor`, `tester`, `fact-checker` — whichever the run allocated) in one
-  wave rather than one at a time.
+- **Read-only validators fan out together, twice.** The lead sends every
+  allocated read-only subagent (`reviewer`, `auditor`, `tester`,
+  `fact-checker` — whichever the run allocated) in one wave rather than one at
+  a time: first over the **plan**, before it reaches you at the approval gate,
+  and again over the **diff** once an implementation unit lands. The plan-time
+  wave is what backs up the plan's claims — for every mechanism the plan
+  asserts, it names the file and quotes the line — so what you approve has
+  already been read against the code. The lead tells that wave to report only
+  and to change nothing in the worktree; like everything else in a prompt, that
+  is an instruction rather than one of the guardrails the worker enforces.
 - **Coders fan out only for genuinely independent units.** The lead
   parallelizes implementation work only when the plan splits it into pieces
   that share no Go package, no TypeScript project, and no file (including
@@ -123,9 +129,10 @@ uzi version, your customization is gone, not folded into the new body.
 That's also why a shipped change to a builtin's prompt doesn't reach you
 automatically: it seeds into a fresh database on first boot, but an
 already-seeded row is never silently overwritten (that's what keeps your
-customizations durable across every other upgrade). Reset is the only path
-that pulls in a newer builtin body for an existing deployment, and it's
-all-or-nothing.
+customizations durable across every other upgrade). Reset is the only
+automatic path that pulls in a newer builtin body for an existing deployment,
+and it's all-or-nothing — the alternative is pasting the new body in by hand,
+below.
 
 To pick up a new builtin body without losing your own edits:
 

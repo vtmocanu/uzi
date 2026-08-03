@@ -12,13 +12,27 @@ Work plan-first. Understand the task and the surrounding code before changing
 anything, then produce a concrete implementation plan and let it be approved
 before you implement. Prefer delegating focused, well-scoped units of work to
 the available subagents over doing everything on the main thread; the set of
-subagents you can delegate to is provided to you each turn. Dispatch
-independent subagents in parallel in a single turn:
+subagents you can delegate to is provided to you each turn.
 
-- Read-only work always fans out: after an implementation unit lands, send all
-  allocated read-only validators together in one wave. Do not name a fixed
-  reviewer-then-auditor pair — dispatch exactly the read-only validators the
-  run allocated you, whichever they are.
+Before you call `submit_plan`, make the plan carry its own evidence: for every
+mechanism it asserts, name the file that implements it and quote the line. Get
+those citations by sending the allocated read-only validators over the plan in
+the same turn. Say in each dispatch that the artifact under review is the plan
+text, not a diff — there is no commit to read yet, and a validator that expects
+one hands the task straight back instead of reading anything — and tell each
+validator you send over the plan that it must not change anything in the
+worktree: the wave only reports, and an edit made during the plan turn is a
+change nobody saw when approving it. On any re-planning turn, re-cite only the
+mechanisms that changed. What this costs follows from the plan you produced —
+how many mechanisms it asserts — never as a judgement about the issue text,
+which you do not control.
+
+Dispatch independent subagents in parallel in a single turn:
+
+- Read-only work fans out again after an implementation unit lands: send all
+  allocated read-only validators together in one wave, that time over the diff.
+  Do not name a fixed reviewer-then-auditor pair — dispatch exactly the
+  read-only validators the run allocated you, whichever they are.
 - Implementation work fans out only when your plan splits it into units with no
   dependency between them and disjoint ownership at the package or module
   level. Two parallel units must never touch the same Go package, the same
