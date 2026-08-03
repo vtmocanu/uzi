@@ -67,12 +67,27 @@ function extractTargets(md) {
 
 const isExternal = (t) => /^[a-z][a-z0-9+.-]*:/i.test(t) || t.startsWith("//");
 
-// The web image build context is trimmed to web/ + docs/ (see the root
-// .dockerignore + Dockerfile), so repo-root link targets (../ARCHITECTURE.md,
-// ../plan.md) are absent there by design — the viewer rewrites them to GitLab
-// anyway. Links resolving INSIDE docs/ (doc->doc, doc->img) are always in
-// context and always checked; targets OUTSIDE docs/ are only checked in a full
-// checkout, so the containerized build stays green.
+// WHAT MAKES THE CONTAINERIZED BUILD SAFE IS `.git` BEING ABSENT, NOT A TRIMMED
+// CONTEXT. This comment said (here and again above extraLinkFiles below) that
+// "the web image build context is trimmed to web/ + docs/". Measured 2026-08-03
+// (PRD #103 M5) against the root .dockerignore, whose entire non-comment content
+// is `.git .gitignore .gitmodules .env .env.* **/.env **/.env.* inspiration/
+// api/ agent/ e2e/ web/node_modules web/dist`: the context is the repo root MINUS
+// that named list, so it still CONTAINS prds/, adr/, specs/, controller/,
+// deploy/, Formula/, fixtures/, .claude/, CLAUDE.md and ARCHITECTURE.md.
+//
+// The conclusion below is unchanged and the mechanism is not. `.git` is excluded,
+// so `fullCheckout` is false in the image build and the whole outside-docs block
+// is skipped there regardless of what else the context carries. A reader
+// reasoning from the trimmed-context version would conclude that the existsSync
+// guards are what keep the image build green and that adding a directory to
+// extraLinkFiles could break it. Neither is true: the guards only make each entry
+// optional, and nothing under `if (fullCheckout)` runs in the image at all.
+//
+// Links resolving INSIDE docs/ (doc->doc, doc->img) are always in context and
+// always checked; targets OUTSIDE docs/ are only checked in a full checkout.
+// Repo-root link targets (../ARCHITECTURE.md, ../plan.md) are absent from the
+// viewer's view by design either way — the viewer rewrites them to GitLab.
 const fullCheckout = existsSync(path.join(repoRoot, ".git"));
 
 const files = readdirSync(docsDir)
@@ -155,13 +170,30 @@ for (const file of files) {
 // ARCHITECTURE.md alone. These files carry no frontmatter and no `order`, so
 // only the link check applies to them.
 //
-// Gated on fullCheckout for the same reason as the doc->outside case above: the
-// web image build context is trimmed to web/ + docs/, so these files are absent
-// there by design and the containerized build must stay green.
+// Gated on fullCheckout for the same reason as the doc->outside case above —
+// read that comment for the mechanism, which is `.git` being absent from the
+// image build context rather than the context being trimmed to web/ + docs/.
+//
+// prds/ and adr/ joined specs/ here in PRD #103 M5. They are the two remaining
+// heavy PRD-linking populations, and adr/ is the worse of the two: an ADR's
+// number is its originating issue number, so every one of the five opens with a
+// `[prds/N-slug.md](../prds/N-slug.md)` line that goes stale the moment that PRD
+// is moved to prds/done/. Three such links were dead when this landed.
+//
+// 🔴 FLAT, NOT RECURSIVE, AND readdirSync IS WHAT MAKES IT SO. A non-recursive
+// read returns `done` and `mockups` as directory ENTRIES, and neither ends in
+// `.md`, so the filter drops them without a stat. That is a load-bearing property
+// of this loop rather than a happy accident: recursing would pull in
+// prds/done/*.md, which carries 16 further true positives (all the same move rot)
+// and would make this commit a 10-completed-PRD edit. Scoped flat by the user's
+// ruling of 2026-08-03; prds/done/ is a KNOWN, DELIBERATE residual. Widening it
+// is a decision, not a tidy-up.
 const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
-if (existsSync(path.join(repoRoot, "specs"))) {
-  for (const f of readdirSync(path.join(repoRoot, "specs")).sort()) {
-    if (f.endsWith(".md")) extraLinkFiles.push(path.join("specs", f));
+for (const dir of ["specs", "prds", "adr"]) {
+  const abs = path.join(repoRoot, dir);
+  if (!existsSync(abs)) continue; // optional directories
+  for (const f of readdirSync(abs).sort()) {
+    if (f.endsWith(".md")) extraLinkFiles.push(path.join(dir, f));
   }
 }
 
