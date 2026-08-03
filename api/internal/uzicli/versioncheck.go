@@ -67,10 +67,25 @@ func IsStampedVersion(v string) bool { return semver.IsValid(normSemver(v)) }
 // disposition.
 func SkewWarning(cliVersion, serverVersion string) (string, bool) {
 	cli, srv := normSemver(cliVersion), normSemver(serverVersion)
-	// Both guards are load-bearing and they guard different populations: the CLI
-	// side covers `dev` (every developer build and every test binary), the server
-	// side covers a compose server, a pre-PRD-#175 server that sends no version at
-	// all, and garbage from a hostile endpoint.
+	// The two guards cover different populations — the CLI side covers `dev` (every
+	// developer build and every test binary), the server side covers a compose
+	// server, a pre-PRD-#175 server that sends no version at all, and garbage from a
+	// hostile endpoint.
+	//
+	// 🔴 BUT ONLY THE CLI-SIDE GUARD CAN CHANGE AN ANSWER TODAY. This comment used to
+	// say "both are load-bearing", and that half is refuted: measured over a 39x39
+	// cross product of every shape either side ships plus 20 invalid ones, dropping
+	// the SERVER guard changes 0 of 1521 rows while dropping the CLI guard changes
+	// 378. The mechanism follows from x/mod's own rule that an invalid version sorts
+	// below a valid one: a valid CLI against an invalid server gives Compare == +1
+	// and is already silent via the `>= 0` test below, and both-invalid gives 0,
+	// also silent. The CLI guard is what stops a `dev` build being told to run brew.
+	//
+	// IT STAYS, AND NOT OUT OF CAUTION — it is inert only GIVEN the direction test
+	// immediately below. Drop this guard and flip that `>= 0` to `!= 0` and four
+	// fixture rows go red (dev_server, empty_server, four-part_server, cli_ahead).
+	// So it is the thing that stops a future change to the operator silently opening
+	// the invalid-server path, which is a different job from filtering inputs today.
 	if !semver.IsValid(cli) || !semver.IsValid(srv) {
 		return "", false
 	}

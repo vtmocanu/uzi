@@ -455,6 +455,50 @@ func TestVersionCacheRecordsCLIVersionButDoesNotKeyOnIt(t *testing.T) {
 	}
 }
 
+// 🔴 THE SYMLINK PIN. writeFileAtomic writes a temp file and RENAMES it over the
+// target; rename REPLACES a symlink rather than following it. os.WriteFile FOLLOWS
+// one, so the same code with that one substitution writes attacker-chosen content
+// through a planted link to any path the user can write — which the design calls a
+// real vulnerability, and which nothing in this suite could previously tell apart:
+// swapping writeFileAtomic for os.WriteFile went fully green.
+//
+// The assertion is on the LINK TARGET, not on the cache file, because the cache file
+// is written correctly either way. What differs is whether something ELSE was
+// clobbered on the way.
+func TestVersionCacheWriteDoesNotFollowASymlink(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "victim")
+	const sentinel = "DO NOT CLOBBER"
+	if err := os.WriteFile(outside, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Plant the link where the cache is about to be written.
+	if err := os.Symlink(outside, filepath.Join(dir, versionCheckFile)); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	s := NewStore(dir)
+	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("the write FOLLOWED the symlink and overwrote %s:\n%s", outside, got)
+	}
+	// Positive control: the cache itself must still have been written, otherwise this
+	// test would pass against a store that simply never writes anything.
+	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); !fresh || v != "0.14.0" {
+		t.Fatalf("got (%q, %v) — nothing was written, so the symlink assertion is vacuous", v, fresh)
+	}
+}
+
 func TestVersionCacheFileMode(t *testing.T) {
 	s := NewStore(t.TempDir())
 	if _, err := s.RecordServerVersion(testURL, "0.14.0", "v0.11.8", time.Now()); err != nil {

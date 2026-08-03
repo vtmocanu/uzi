@@ -483,7 +483,13 @@ func TestSkewWarningSanitizesTheServerString(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &uzicli.FakeClient{Build: apitypes.BuildInfoDTO{Version: tc.version, Founded: "2026-07-03"}}
 			_, errOut, _ := runCLI(t, skewEnv(t, fc), "run", "list", "--url", skewURL)
-			warned := strings.Contains(errOut, "is behind server 0.14.0")
+			// Matched on the PREFIX, not on "is behind server 0.14.0": the server
+			// string is interpolated VERBATIM, so a leading-control payload renders
+			// as "behind server \r0.14.0" and the fuller pattern misses a warning
+			// that was printed. The row still caught its mutation with the fuller
+			// pattern -- but it reported "no warning printed" when one had been,
+			// which sends the next reader after the wrong mechanism.
+			warned := strings.Contains(errOut, "is behind server")
 			if warned != tc.wantWarning {
 				t.Fatalf("warning printed = %v, want %v:\n%.200q", warned, tc.wantWarning, errOut)
 			}
@@ -496,9 +502,17 @@ func TestSkewWarningSanitizesTheServerString(t *testing.T) {
 			if got := len(nonEmptyLines(errOut)); got > 1 {
 				t.Errorf("stderr is %d lines, want at most 1:\n%q", got, errOut)
 			}
-			// The length bound is what discriminates the build-metadata row: it
-			// carries no control character and stays on one line, so the two
-			// assertions above cannot see it.
+			// 🔴 THIS IS NOT WHAT CATCHES THE BUILD-METADATA ROW, despite reading
+			// like it. That row aborts at the wantWarning t.Fatalf above when the
+			// cap is removed, so this line never executes for the one input that
+			// could exceed 4096 -- wantWarning is the real catcher. It is not dead
+			// either: lowering the threshold to > 0 reddens every row that warns --
+			// SIX of them here, at 96 bytes each, and not unbounded_build_metadata,
+			// whose stderr is empty. So it runs only for rows that can never trip
+			// it. (The tester measured FOUR for the same control at a4a18c0d; both
+			// are right for their tree -- the two Zl/Zs rows landed after it ran.)
+			// Kept as a cheap backstop for a future row that warns AND is long,
+			// which is a combination no current row has.
 			if len(errOut) > 4096 {
 				t.Errorf("stderr is %d bytes; the server string reached it unbounded", len(errOut))
 			}
