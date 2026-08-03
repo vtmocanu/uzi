@@ -43,6 +43,20 @@ linters:
     - ineffassign
     - unused
     - unparam
+    # nolintlint — ADDED 2026-08-03 (PRD #103 M4's validation wave, W5; approved
+    #   by the user as a deliberate change to M3's frozen enable set). It lints
+    #   the SUPPRESSIONS rather than the code, and without it a bare `//nolint`
+    #   silences all five linters above with NO warning and exit 0, unreported
+    #   forever. The residual paragraph in this file's header does NOT cover
+    #   that: it names CODEOWNERS as the structural fix for neutering the gate
+    #   FROM THIS FILE, and `//nolint` lives in the `.go` file instead.
+    #   Measured with a positive control first: a directive where nothing fires
+    #   and no directive at all are otherwise INDISTINGUISHABLE.
+    #   The decisive argument is symmetry inside one MR — the npm half already
+    #   ships the exact analogue,
+    #   `--report-unused-disable-directives-severity=error` (see `lint:web`'s
+    #   comment in Taskfile.yml for why). The Go half had no such guard.
+    - nolintlint
 
   # EVERY DISABLED LINTER OWES A ONE-LINE JUSTIFICATION (git-manager's convention,
   # adopted by PRD #103 M3). Two are disabled deliberately and both would otherwise
@@ -130,6 +144,33 @@ linters:
   #   unnoticed" — but the PRD itself quotes git-manager's CLAUDE.md saying that
   #   repo has no CI gate at all. The lesson there is "no gate ⇒ accumulation", not
   #   "goconst has signal".
+
+  settings:
+    # nolintlint's three knobs, all deliberate (PRD #103 M4 W5):
+    #   allow-unused: false      — a directive that suppresses nothing is
+    #     reported. THIS IS THE WHOLE POINT of enabling the linter; set it true
+    #     and the vacuous-directive hole reopens silently.
+    #   require-explanation: true — `//nolint:errcheck // <why>` rather than a
+    #     bare one. Same rule this file's own header applies to every disabled
+    #     linter, and the same rule web/knip.jsonc applies to every suppression.
+    #   require-specific: true    — `//nolint:errcheck`, never a bare `//nolint`.
+    #     A bare directive silences linters nobody considered, including ones
+    #     added later by a future milestone.
+    #
+    # ADOPTION COST, MEASURED not estimated (2026-08-03 at 1076b133): `task
+    # lint:api` stays at 0 issues on an untouched tree, because the ratchet is
+    # `new-from-merge-base` + `whole-files`. UNRATCHETED it adds 2 findings,
+    # both the bare `//nolint` in api/internal/store/revise_cap_integration_test.go
+    # and revise_cap_repro_test.go — they block only when someone next touches
+    # those files, which is the ratchet working rather than a debt to burn down
+    # now. The three already-vacuous directives elsewhere (`//nolint:gosec` x2 for
+    # a linter that is not enabled, `//nolint:govet` for one deliberately
+    # disabled) are deliberately NOT cleaned up in this MR — let the ratchet
+    # surface them.
+    nolintlint:
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
 
   exclusions:
     rules:

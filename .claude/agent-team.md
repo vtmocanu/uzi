@@ -1348,7 +1348,8 @@ lint           task lint           # composite, all four components (M5 will app
                task lint:agent     # COVERS THIS SLOT for that component -- same shape
                                    # as the format slot above. Go is golangci-lint
                                    # (errcheck, staticcheck, ineffassign, unused,
-                                   # unparam) via a pinned `go run ...@v2.12.2`; npm
+                                   # unparam, nolintlint) via a pinned
+                                   # `go run ...@v2.12.2`; npm
                                    # is oxlint 1.76.0 via each package's `npm run
                                    # lint`. Ordering differs by component ON PURPOSE:
                                    # lint runs AFTER build in the Go gates (it

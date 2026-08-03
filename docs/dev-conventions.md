@@ -134,10 +134,17 @@ a fixing variant. All three reasons are written beside the recipe.
 
 There **is** a linter, as of PRD #103 M3: `task lint` runs all four components,
 and each `task gate:<component>` runs its own. Go (`api`, `controller`) is
-golangci-lint with `errcheck`, `staticcheck`, `ineffassign`, `unused` and
-`unparam`; `web` and `agent` are oxlint, whose configuration promotes
-`react-hooks/rules-of-hooks` explicitly because it is a `pedantic` rule that the
-`correctness` tier cannot reach.
+golangci-lint with `errcheck`, `staticcheck`, `ineffassign`, `unused`,
+`unparam` and `nolintlint`; `web` and `agent` are oxlint, whose configuration
+promotes `react-hooks/rules-of-hooks` explicitly because it is a `pedantic` rule
+that the `correctness` tier cannot reach.
+
+`nolintlint` lints the **suppressions** rather than the code. Without it a bare
+`//nolint` silences every other linter on that line with no warning and exit 0,
+so write `//nolint:errcheck // <why>`: specific, and with a reason. It is the Go
+counterpart of the npm half's
+`--report-unused-disable-directives-severity=error`, which has been there since
+M3 — the two lint halves now guard their own escape hatches symmetrically.
 
 The Go half is **ratcheted** and the npm half is not, which is the one thing to
 know before your first red. `.golangci.yml` carries

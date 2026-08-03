@@ -34,7 +34,9 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 - **Contributor tooling: linting now runs in the gate and on every MR**, for the
   first time in this repo. `task lint` covers all four components and each
   `task gate:<component>` runs its own. Go gets golangci-lint (`errcheck`,
-  `staticcheck`, `ineffassign`, `unused`, `unparam`), ratcheted against
+  `staticcheck`, `ineffassign`, `unused`, `unparam`, and `nolintlint`, which
+  lints the suppressions themselves so a bare or vacuous `//nolint` is a finding
+  rather than a silent blanket exemption), ratcheted against
   `origin/main` so only findings a branch introduces block; `web` and `agent` get
   oxlint, configured so `react-hooks/rules-of-hooks` actually runs, which the
   default severity tier does not reach. The 16 pre-existing TypeScript findings
