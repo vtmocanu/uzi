@@ -86,23 +86,26 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 - **Contributor tooling: shell scripts, YAML and the Homebrew formula are now
   checked in the gate and on every MR.** `task gate:repo` runs first inside
   `task gate` and covers the checks that belong to no single component:
-  shellcheck over every tracked `*.sh` (scoped by `git ls-files`, so
-  `agent/templates/entrypoint.sh`, the worker container entrypoint, is finally in
-  scope), yamllint over every tracked YAML except the Helm templates (which are Go
+  shellcheck over every tracked shell script (the git index unioned with a
+  shebang scan, so `agent/templates/entrypoint.sh` and `agent/bin/agent-browser`
+  — the worker container entrypoint and the `agent-browser` shim inside every
+  worker pod, neither reachable by extension alone — are finally in scope),
+  yamllint over every tracked YAML except the Helm templates (which are Go
   templates, not YAML), and a syntax check of `Formula/uzi-cli.rb`, which release
   CI copies verbatim into the shared tap on every tag. All three gate at zero: the
   four shellcheck warnings and three yamllint findings that existed were fixed
   rather than suppressed. One new CI job, `lint:repo`. `web/scripts/check-docs.mjs`
   also now validates relative links in `prds/*.md` and `adr/*.md`, which nothing
   checked before, and the three that had rotted are repaired. Part of PRD #103.
-  Developer-facing only: no change to how uzi behaves. **Running `task gate`
-  locally now needs shellcheck on your `PATH`, exactly 0.11.0**: the version is
-  asserted, because 0.10.0 does not report one of the diagnostics this repo relies
-  on, and a mismatch exits 2 rather than quietly grading differently. The formula
-  check wants a Ruby 3.1 or newer, which macOS's own `/usr/bin/ruby` is not; it
-  falls back to the Ruby that Homebrew bundles for itself, and if neither is
-  present it prints a loud skip and passes rather than blocking you. CI always runs
-  it. See [docs/dev-conventions.md](docs/dev-conventions.md).
+  Developer-facing only: no change to how uzi behaves. **None of the three tools
+  is required locally** — a missing shellcheck, yamllint or Ruby ≥3.1 prints a
+  loud skip and passes rather than blocking you (the formula check falls back to
+  Homebrew's own bundled Ruby first, so it only skips outright without Homebrew
+  either). **A shellcheck that IS present must be exactly 0.11.0**: the version
+  is asserted and a mismatch exits 2 rather than quietly grading differently,
+  because 0.10.0 does not report one of the diagnostics this repo relies on. CI
+  always runs all three. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
 
 ### Fixed
 

@@ -34,19 +34,22 @@ equivalence check, not a matching hash. This is the same trust model the repo
 already uses for `sqlc@v1.30.0`.
 
 ```sh
-task gate              # everything, serially
+task gate              # everything, serially: gate:repo first, then all four components
+task gate:repo         # repo-wide checks with no component: shell, YAML, the brew formula
 task gate:api          # one component: fmt-check + vet + build + lint + deadcode + test
 task gate:controller   # same shape
 task gate:web          # lint + deadcode + check-docs + typecheck + test
 task gate:agent        # lint + deadcode + typecheck + test
 task fmt-check         # the format slot alone, both Go modules
-task lint              # the lint slot alone, all four components
+task lint              # the lint slot alone, all seven: four components plus shell/YAML/formula
 task deadcode          # the dead-code slot alone, all four components
 ```
 
 *(The three `gate:*` comments above were written before PRD #103 M3 and M4 and
 listed neither `lint` nor `deadcode`. Corrected 2026-08-02 with M4; the slots
-themselves are described further down this page.)*
+themselves are described further down this page. A further correction,
+2026-08-03 with M5: `task gate` gained a fifth step, `gate:repo`, run first —
+three repo-wide checks that belong to no component, described below.)*
 
 Individual slots exist too (`task test:api`, `task typecheck:web`,
 `task check-docs:web`, …), and `.gitlab-ci.yml` calls those fine-grained targets
@@ -203,6 +206,62 @@ its own, so read their output rather than their exit code.
 
 There is still no coverage signal. That is PRD #103's M6, and a target for it
 arrives with the check itself rather than as an empty stub.
+
+There are also three repo-wide checks with no component, as of PRD #103 M5:
+`task lint:shell` (shellcheck), `task lint:yaml` (yamllint `--strict`) and
+`task lint:formula` (`ruby -c` on `Formula/uzi-cli.rb`, which release CI copies
+verbatim into the shared Homebrew tap on every tag). `task gate:repo` composes
+the three and runs **first** inside `task gate`, cheap-first, ahead of any Go
+module's `-race` compile or npm step — none of the three needs a build or a
+warm toolchain. Like the other repo-wide slots, their scope comes from the git
+index rather than a hand-maintained list: shellcheck's is `git ls-files
+'*.sh'` **unioned with a shebang scan**, because the extension alone missed
+`agent/bin/agent-browser` — a `#!/bin/sh` shim with no `.sh` suffix, COPYd into
+every worker image — and yamllint's is every tracked `*.yml`/`*.yaml` except
+`deploy/chart/templates/` (Helm templates are Go templates, not YAML).
+
+**Tool absent is a loud skip at exit 0, locally; tool present at the wrong
+version is a hard `exit 2`, unconditionally.** `gate:repo` runs first inside
+`task gate`, so a hard failure on a tool you have not installed would block
+every other component gate from running at all — the same argument that
+already governs `lint:formula`'s ruby fallback above. So a missing shellcheck,
+yamllint or ruby prints a banner naming what to install and exits 0. CI must
+not be able to take that skip: it sets `UZI_LINT_SHELL_REQUIRED`,
+`UZI_LINT_YAML_REQUIRED` and `UZI_LINT_FORMULA_REQUIRED` on the `task
+gate:repo` script line itself (never in a job `variables:` block — GitLab
+ranks pipeline- and project-level variables above a job's own, so a
+same-named manual-pipeline variable would silently displace it), plus a `CI`
+fallback GitLab sets on its own, so the skip is unreachable there.
+
+**The version gradient this produces is perverse-looking and is the ruled
+behaviour anyway: a contributor who `brew upgrade`s shellcheck is worse off
+than one who never installed it.** `lint:shell` pins the version **exactly**
+(0.11.0 today) and exits 2 on any other one — present, older, or newer — with
+no fallback. That is deliberate: an *older* shellcheck is **blind** (0.10.0
+does not emit SC3067 at all, so this repo's three per-instance disables in
+`agent/templates/entrypoint.sh` would be suppressions for a diagnostic that
+never fires, and the gate would go green by the tool's blindness rather than
+by the code being right), where a *newer* one is merely **loud**. When brew
+moves past the pin, the remedy is one line: bump the version literal in both
+`Taskfile.yml`'s `lint:shell` target and `.gitlab-ci.yml`'s `lint:repo` job —
+the duplication is self-checking, so bumping only one makes the other's assert
+exit 2 naming both numbers — then re-derive the finding count under the new
+version and say so in the commit. yamllint and ruby carry no such pin in the
+wrapper scripts (their two candidate versions were measured to agree on this
+tree), though `lint:repo`'s CI job does assert its own apt-installed versions
+of both, symmetrically with shellcheck's, so a Debian point release that moves
+either is something the pipeline states rather than something a reader has to
+infer.
+
+**`--severity=warning` cannot see an unquoted expansion.** SC2086 is `info`
+severity, so the shipped threshold structurally excludes that whole class —
+including in `agent/templates/entrypoint.sh`, the worker container entrypoint
+that runs in every hosted worker pod. "shellcheck now gates the worker
+entrypoint" does not mean injection is covered. The tree has zero SC2086
+findings today; tightening the threshold is a deliberate follow-up rather than
+a flag flip, because the rest of that tier is 11 pre-existing findings
+(6× `SC2016`, 2× `SC2001`, 1× `SC2329`) that are benign or intentional, and
+tightening would surface all of them at once.
 
 ## Scripting the bot setup with `glab`
 
