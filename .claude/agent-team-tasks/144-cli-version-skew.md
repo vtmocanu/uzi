@@ -1029,3 +1029,143 @@ pristine extracts instead (`EXIT=0` at both `ea71a367` and `d96b6fe8`).
 an unverifiable check must fail rather than pass quietly"* — catching the harness error. That
 test is behaving exactly as designed, and it is a live instance of the
 fixtures-across-the-module-boundary shape `CLAUDE.md` documents.
+
+---
+
+## 15. AMENDMENT 10 — review round. ONE NEW DEFECT TO FIX (N-1). Everything else closed.
+
+Reviewer verified B1/B2/B3 closed **by execution against a request-logging stub**, not by
+reading, each with a positive discriminator:
+
+- **B1** — unstamped binary: `rc=4`, **0 requests, 0 files written**. `IsStampedVersion`
+  short-circuits above the probe, and the disposition is inverted from `checkForgejoVersion`
+  exactly as B1 demanded.
+- **B2** — against a listener that accepts and never replies: `run1 32.10s, run2 30.04s,
+  run3 30.03s`. **run1 − run2 = 2.06s ≈ `serverProbeTimeout`** — the probe happens once and
+  the failure is cached. The entry is `{"version":"","checked_at":…}`.
+- **B3** — two stubs, one `$HOME`, alternating: correct version per server, cache holds
+  **2** entries, and the trailing-slash spelling collapses onto the same entry rather than
+  making a third.
+
+Also executed: `--quiet` and `UZI_VERSION_CHECK=0` each produce **0 requests**, so they
+suppress the *work*, not merely the print; a warm cache gives 0 requests and still warns;
+`uzi version` stdout line 1 is still `v0.11.8` (the `brew-local-test.sh` gate).
+
+### 🔴 N-1 — A TRANSIENT PROBE FAILURE POISONS A GOOD CACHE ENTRY AND SILENCES EVERY COMMAND FOR THE FULL TTL
+
+**Live at the tip. This is a real defect in the shipped design and it is the one thing this
+round changes.** Reviewer's execution, one `$HOME`, one URL:
+
+```
+1. server UP,      token list    -> 1 warning     cached: '0.14.0'
+2. server DOWN,    uzi version   -> 0 warnings    cached: ''       <- good value overwritten
+3. server BACK UP, token list    -> 0 warnings                     <- silent, server is healthy
+```
+
+Lead re-derived the mechanism from the source. `CachedServerVersion` returns
+`(e.Version, true)` for an empty entry — **empty and fresh are indistinguishable to the
+caller** — so every later command takes the `fresh` branch, never re-probes, and
+`warnVersionSkew(env, "")` prints nothing, for up to an hour after recovery.
+
+**`uzi version` is the amplifier, and it is a SECOND write site.** `versioncheck.go:174`
+writes the cache **unconditionally, regardless of freshness**, unlike the hook at `:148`
+which is guarded by `if !fresh`. So the command a user runs precisely when they suspect
+something is wrong is the one most likely to poison the cache, on the most likely occasion —
+the server having a bad moment.
+
+**This is not a deviation from the spec; the hole is IN the spec.** §9.2 says "stores the
+last **attempt**" and the implementation does exactly that. §11 6d's rejection of a shorter
+negative TTL is correct on latency grounds and is what makes the window a full hour.
+
+**FIX, contained, preserving both properties:** on a **failed** probe, do not overwrite an
+existing entry that is non-empty — record the failure without clearing the last known
+version, at **both** write sites (`:148` and `:174`). No re-probe storm, no lost reading.
+
+**And take N-3 in the same change, because it closes the same failure from the other side:**
+`uzi version` probes live every invocation (measured `2.10s / 2.05s / 2.05s` against a
+hanging listener) and is now **the only command that writes the cache and never reads it** —
+so the "check my setup" command is the slowest one against a sick server. **A cache read as
+a fallback when the live probe fails fixes N-1 and N-3 at once.**
+
+### N-2 — MY ERROR: `144-design.md` was UNTRACKED, and Amendment 7 ruled a correction against it
+
+`git ls-files --error-unmatch` confirms: *"did not match any file(s) known to git"*, and
+`git status -uall` cannot show it because the directory is `.gitignore:52`. The brief's own
+DURABILITY CAVEAT documents the force-add pattern; **I applied it to the brief and not to the
+design.** §12 Ruling 1 issues a correction *to that file* — a ruling recorded against an
+artifact that dies with the worktree. Force-added in this commit.
+
+### N-4 — the attacker-controlled bound on stderr is 157 chars, and it lives in ANOTHER FILE
+
+Third independent derivation of this mechanism. What the reviewer's run adds is **where the
+boundary is**:
+
+```
+metadata len 150 -> version len 157  ->  warning PRINTED, stderr 262 bytes
+metadata len 400 -> version len 407  ->  SILENT
+1 MiB                                ->  SILENT
+```
+
+So **157 characters of attacker-controlled text do reach stderr** on a line prefixed `uzi:`
+— stripped of controls and Cf by `cellText`, so not an injection, but it is attacker text.
+Above 200, `compactText` appends `…` (outside SemVer's build-metadata charset), the string
+becomes invalid, and the warning vanishes. **That silence is a property of a cosmetic
+constant in `run.go` that nobody editing `versioncheck.go` would think to check.** One
+sentence at `warnVersionSkew` naming the coupling.
+
+### Two mutations the coder did NOT report, both caught by the suite
+
+- `if !semver.IsValid(cli) || !semver.IsValid(srv)` → `if false` reddens **exactly** `dev_cli`
+  (row 6) and `four-part_cli` (row 10) — precisely the rows flagged `killsUnguarded`. **B1's
+  guard is genuinely gated.**
+- Dropping `cellText` from `warnVersionSkew` reddens only the four
+  `TestSkewWarningSanitizesTheServerString` rows while `TestVersionCommandSanitizesServerBuildInfo`
+  stays green. **The two sinks are independently gated.**
+
+The reviewer also **re-derived the fixture's ground truth independently** — 13 rows computed
+against `x/mod@v0.38.0` without touching the shipped code. All 13 `want` values correct; kill
+sets `naive=[1 2 5 12 13]`, `unguarded=[6 10]`, `direction=[9]`, matching the table exactly.
+And the exit-code differential's second row is **not decoration**: `success path exit=0` vs
+`not found path exit=4`.
+
+**`IsStampedVersion`'s export is WARRANTED, measured**: without it every `go build ./cmd/uzi`
+binary would resolve settings, probe (2s worst case) and write a cache file on every command
+— the modal configuration for anyone working in this repo. The only export-free alternative
+is a **fourth** copy of `normSemver`.
+
+### Deletion lens, and gate slots at the live tip (isolated copy)
+
+```
+deadcode -test ./...   rc=0   0 findings   (gating form, empty baseline)
+deadcode       ./...   rc=0  43 findings   ==  main's 43, no additions
+gofmt -l (assignment form)    drifted: []
+go vet ./...                  rc=0
+go test -race -count=1 -v     RUN=478 PASS=478 FAIL=0 SKIP=0
+```
+
+`lint:api` was **deliberately not run** by the reviewer: it is ratcheted against `origin/main`,
+which cannot resolve inside a detached archive, and running it live risks the documented
+`golangci-lint` host-global lock contention with the tester. **That slot rests on the coder's
+report alone and the reviewer says so** rather than implying coverage it does not have.
+
+### Two nits, both pre-existing
+
+- `withVersion` (`version_test.go:16`) mutates the package-level `version` with a `t.Cleanup`
+  restore. Correct today (nothing calls `t.Parallel()`); a landmine the moment anyone
+  parallelises this package.
+- No test for valid JSON with a nil map (`{"servers":null}`); `loadVersionCheckState` handles
+  it, but the corrupt-file test covers unparseable only.
+
+### 🔴 DISCLOSURE — the reviewer hit the REAL deployment, and disclosed rather than buried it
+
+Running `uzi version` once without `env -i`, its `ea71a367` build read the real
+`~/.config/uzi/config.toml`, sent `GET /api/version` to `https://uzi.example.com`, and
+**created `~/.config/uzi/version-check.json` on the developer's host.** Read-only route, no
+server-side writes. Lead confirmed the file exists (144 bytes, a SHA-256 key, `0.14.0`, a
+timestamp, **no `cli_version` field** — consistent with an `ea71a367` build, i.e. pre-6c) and
+that it holds no secret and no URL.
+
+**It is also an unplanned end-to-end validation of the whole feature:** a `v0.11.8`-stamped
+binary against the live server printed
+`uzi: CLI v0.11.8 is behind server 0.14.0` — issue #144's exact opening scenario, working
+against production.
