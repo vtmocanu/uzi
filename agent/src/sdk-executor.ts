@@ -42,7 +42,7 @@ import {
   type JsDepsInstall,
   type JsDepsResult,
 } from "./js-deps.js";
-import { assembleAgents, selectSubagents } from "./agents.js";
+import { assembleAgents, planTurnSubagents, selectSubagents } from "./agents.js";
 import {
   resolveAgentSelection,
   type AgentSelectionParse,
@@ -492,7 +492,18 @@ export class SdkExecutor implements Executor {
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
       }),
-      agents: assembled.subagents,
+      // PLAN-TURN roster: every subagent minus the file-write tools (#203). This
+      // key is the ONLY plan-turn-scoped spelling available here — `baseOptions`
+      // drives both planning turns (first plan at the `drivePlanningTurn` call in
+      // Phase 1, re-plan in the revise loop) while `implementOptions` spreads
+      // `baseOptions` and OVERRIDES `agents` from `selectSubagents(...)`, which
+      // reads `assembled.subagents` directly and is therefore untouched.
+      //
+      // DO NOT move this denial down to the `disallowedTools` key below. That one
+      // is top-level and IS inherited through the spread, so it would strip write
+      // tools from the implement turn too and break `coder`. The scoping is the
+      // point of doing it here.
+      agents: planTurnSubagents(assembled.subagents),
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
       // (save_memory, PRD #90). Only the lead (full toolset) reaches them.

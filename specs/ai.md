@@ -16280,10 +16280,28 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   read-only validators" and does not mention `architect` at all (measured: zero
   occurrences). That is not an oversight and it follows from D5 rather than contradicting
   it — `architect` declares `Edit, Write`, so it is not a read-only validator and the
-  wording excludes it. It joins the plan-turn wave when **#203** removes its write tools,
-  not before. Recorded because an unstated omission becomes a surprise; note it does not
-  weaken the relay requirement, since `tester` also declares `Edit, Write` and *is* named a
-  read-only validator by the product's own docs.
+  wording excludes it. Recorded because an unstated omission becomes a surprise.
+
+  **Amended 2026-08-03 (#203 landed).** Two things this bullet asserted have changed, and
+  the conclusion survives both:
+
+  - It said architect "joins the plan-turn wave when #203 removes its write tools, not
+    before." #203 removed them **from the plan turn's assembled map**
+    (`agents.ts planTurnSubagents`, wired at `sdk-executor.ts`'s `baseOptions.agents`)
+    while `architect.md` still **declares** them, because they remain correct on the
+    implement turn. So the precondition is met, but not in the form this sentence
+    describes: there is no frontmatter edit to point at. **Whether architect actually
+    enters the plan-time wave is still open and deliberately deferred** — it widens the
+    wave against the re-entry ceiling the next bullet quantifies, which is a scope
+    decision, not an architecture one. `lead.md` is unchanged and still does not mention
+    `architect`.
+  - It closed by arguing the omission "does not weaken the relay requirement, since
+    `tester` also declares `Edit, Write` and *is* named a read-only validator by the
+    product's own docs." That last clause was true and is now **false by construction**:
+    #203's docs half removed the "read-only subagent (`reviewer`, `auditor`, `tester`,
+    `fact-checker`)" enumeration from `docs/agent-templates.md`, which was the naming it
+    cited. The relay requirement stands on its own terms; the supporting appeal to that
+    line does not, and is retracted rather than repointed at a replacement.
 - **The wave is bounded on REPETITION, not only on width.** A planning turn re-enters from
   two loops: `QUESTION_MAX` (default 5, `config.go:664`) allows up to six planning turns per
   gate entry, and `PLAN_MAX_REVISIONS` (default 3, `config.go:663`) up to four entries —

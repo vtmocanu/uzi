@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assembleAgents, LEAD_NAME_RE, selectSubagents, subagentsFromTemplates } from "../src/agents.js";
+import { assembleAgents, LEAD_NAME_RE, planTurnSubagents, selectSubagents, subagentsFromTemplates } from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -266,5 +266,102 @@ describe("shipped lead builtin", () => {
     const name = raw.match(/^name:\s*(.+)$/m)?.[1]?.trim();
     assert.ok(name, "lead.md must declare a name in its frontmatter");
     assert.ok(LEAD_NAME_RE.test(name), `shipped lead name ${name} must match LEAD_NAME_RE`);
+  });
+});
+
+describe("planTurnSubagents (#203)", () => {
+  const WRITE_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+  const architect: AgentTemplate = {
+    name: "architect",
+    description: "designs",
+    prompt_body: "You design.",
+    tools: ["Bash", "Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
+    model: null,
+  };
+  const inheritCoder: AgentTemplate = {
+    name: "coder",
+    description: "implements",
+    prompt_body: "You implement.",
+    tools: null,
+    model: null,
+  };
+
+  it("does BOTH operations unconditionally: filters `tools` where present AND unions into `disallowedTools`", () => {
+    // Doing only one would leave the run's safety resting on a `disallowedTools`-vs-
+    // `tools` precedence the SDK does not document and no test here can settle.
+    const { subagents } = assembleAgents([architect, reviewer]);
+    const planned = planTurnSubagents(subagents);
+
+    assert.deepStrictEqual(planned.architect?.tools, ["Bash", "Read", "WebFetch"]);
+    for (const t of WRITE_TOOLS) {
+      assert.ok(planned.architect?.disallowedTools?.includes(t), `${t} denied`);
+    }
+    // The structural denials are preserved and stay FIRST — appended-to, not replaced.
+    assert.deepStrictEqual(planned.architect?.disallowedTools, [
+      "Agent",
+      "mcp__uzi",
+      "mcp__memory",
+      ...WRITE_TOOLS,
+    ]);
+    // A role declaring no write tool keeps its allowlist verbatim and still gains the
+    // denials (unconditional means unconditional).
+    assert.deepStrictEqual(planned.reviewer?.tools, ["Read", "Grep", "Glob"]);
+    for (const t of WRITE_TOOLS) assert.ok(planned.reviewer?.disallowedTools?.includes(t));
+  });
+
+  it("leaves an absent `tools` absent — inherit-all survives the transform", () => {
+    const { subagents } = assembleAgents([inheritCoder]);
+    const planned = planTurnSubagents(subagents);
+    assert.strictEqual(planned.coder?.tools, undefined, "inherit-all must not be materialized into an allowlist");
+    for (const t of WRITE_TOOLS) assert.ok(planned.coder?.disallowedTools?.includes(t), `${t} denied`);
+  });
+
+  it("BUILDS NEW OBJECTS: the input map, its definitions and their arrays are untouched", () => {
+    // The trap this pins. `selectSubagents`'s own-source path copies REFERENCES
+    // (`out[name] = def`), so a transform that mutated `def.tools` in place would
+    // leak into the IMPLEMENT map and strip the write tools for the whole run —
+    // breaking `coder`, the one role whose entire job is writing. Nothing about the
+    // plan turn's own assertions would catch that; only this does.
+    const { subagents } = assembleAgents([architect, inheritCoder, reviewer]);
+    const before = structuredClone(subagents);
+    const beforeDefs = Object.fromEntries(Object.entries(subagents).map(([k, v]) => [k, v]));
+
+    const planned = planTurnSubagents(subagents);
+
+    assert.deepStrictEqual(subagents, before, "the input map is deep-equal to its pre-call snapshot");
+    for (const name of Object.keys(subagents)) {
+      assert.deepStrictEqual(subagents[name]?.tools, before[name]?.tools, `${name}.tools unchanged`);
+      assert.deepStrictEqual(
+        subagents[name]?.disallowedTools,
+        before[name]?.disallowedTools,
+        `${name}.disallowedTools unchanged`,
+      );
+      // Identity, not just value: a fresh object and fresh arrays, so a LATER mutation
+      // of the plan map cannot reach the implement map either.
+      assert.notStrictEqual(planned[name], beforeDefs[name], `${name} is a new object`);
+      assert.notStrictEqual(
+        planned[name]?.disallowedTools,
+        subagents[name]?.disallowedTools,
+        `${name}.disallowedTools is a new array`,
+      );
+      if (subagents[name]?.tools) {
+        assert.notStrictEqual(planned[name]?.tools, subagents[name]?.tools, `${name}.tools is a new array`);
+      }
+    }
+  });
+
+  it("carries every other AgentDefinition field through unchanged", () => {
+    const { subagents } = assembleAgents([architect, reviewer]);
+    const planned = planTurnSubagents(subagents);
+    for (const name of Object.keys(subagents)) {
+      assert.strictEqual(planned[name]?.prompt, subagents[name]?.prompt);
+      assert.strictEqual(planned[name]?.description, subagents[name]?.description);
+      assert.strictEqual(planned[name]?.model, subagents[name]?.model);
+      assert.deepStrictEqual(planned[name]?.skills, subagents[name]?.skills);
+    }
+  });
+
+  it("is a no-op on an empty roster", () => {
+    assert.deepStrictEqual(planTurnSubagents({}), {});
   });
 });

@@ -11,6 +11,16 @@ architectural judgment. Do NOT modify source code; your only write
 surface is design documents (docs/adr/, docs/design/, or the repo's
 spec/RFC directory - follow whichever convention already exists).
 
+WHEN you may write that surface: only AFTER the plan is approved. Before
+the approval gate, report through SendMessage to `main` and write no
+files at all - a document authored pre-approval is an uncommitted
+worktree change the approver never read, which the first implementation
+commit then sweeps in. The pre-approval artifact IS the plan; the ADR or
+design doc is the durable record of a decision that has been taken. If
+you find you have no file-writing tools, you are on the plan turn and
+this is why - report and continue, do not treat it as a broken
+environment or work around it with shell redirection.
+
 Two dispatch shapes:
 
 A. Design (pre-implementation). Workflow:
@@ -34,12 +44,15 @@ A. Design (pre-implementation). Workflow:
      criteria the coder and tester can verify mechanically.
    - Open questions: anything unclear or assumed - never silently
      guess.
-3. Right-size the artifact: a summary via SendMessage to `main` for
-   small changes; an ADR (matching the repo's existing numbering/format)
-   for decisions with long-term consequences; a design doc for large
-   features. Do not create a docs/adr/ tree in a repo that has no
-   design-doc convention without proposing it to the lead via
-   SendMessage to `main` first.
+3. Deliver the design pre-approval as the plan itself plus a summary via
+   SendMessage to `main`. Right-size the DURABLE artifact and write it
+   once the plan is approved: nothing beyond that summary for small
+   changes; an ADR (matching the repo's existing numbering/format) for
+   decisions with long-term consequences; a design doc for large
+   features. Name which one you intend in the pre-approval summary, so
+   the approver is gating that too. Do not create a docs/adr/ tree in a
+   repo that has no design-doc convention without proposing it to the
+   lead via SendMessage to `main` first.
 
 Halt and escalate to the lead via SendMessage to `main` instead of
 designing past any of these:

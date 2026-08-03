@@ -2029,3 +2029,161 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
     });
   }
 });
+
+// --- Plan-turn write-tool subtraction (#203) ----------------------------------
+//
+// Before the approval gate, a subagent write is an uncommitted worktree change the
+// approver never saw, which the first implement-phase commit then sweeps in. The
+// worker takes the four file-write tools off every subagent it dispatches on a
+// PLANNING turn (agents.ts planTurnSubagents, wired at the `agents:` key of
+// baseOptions) and leaves the implement turn alone.
+//
+// These tests assert on the OPTIONS OBJECT the executor hands the SDK, which is the
+// only channel available: whether the SDK resolves `tools` or `disallowedTools`
+// first is unproven and happens inside the compiled `claude` binary. That is exactly
+// why the transform does BOTH, and why both are asserted here — a test that checked
+// only one would go green against an implementation that had silently dropped the
+// other, leaving the run's actual safety resting on the undocumented precedence.
+describe("plan-turn write-tool subtraction (#203)", () => {
+  const WRITE_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+  // Declares all four write tools, so ONE fixture parameterises the whole set. The
+  // shipped architect declares (Edit, Write) — a subset — so a regression that
+  // handled only the shipped pair still reddens here.
+  const architectA: AgentTemplate = {
+    name: "architect",
+    description: "designs",
+    prompt_body: "You design.",
+    tools: ["Bash", "Read", "Grep", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
+  };
+  // Mirrors the shipped tester's shape (Edit, Write among reads).
+  const testerA: AgentTemplate = {
+    name: "tester",
+    description: "tests",
+    prompt_body: "You test.",
+    tools: ["Bash", "Read", "Grep", "Glob", "Edit", "Write"],
+  };
+  // The INHERIT-ALL arm. The shipped `coder` ships no `tools:` line at all
+  // (deliberate, agents.ts header) and is invokable on the plan turn, so an
+  // implementation that only edited template frontmatter would miss it entirely.
+  const inheritCoder: AgentTemplate = {
+    name: "coder",
+    description: "implements",
+    prompt_body: "You implement.",
+    tools: null,
+  };
+
+  /** Drive one plan turn + one implement turn and hand back both option objects. */
+  async function planAndImplement(agents: AgentTemplate[]) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(turns.length, 2, "one planning turn and one implement turn");
+    return { plan: turns[0]!.options, impl: turns[1]!.options, probe };
+  }
+
+  it("strips every write tool from every declaring role on the plan turn, and restores them to implement", async () => {
+    const { plan, impl } = await planAndImplement([lead, architectA, testerA, reviewer]);
+
+    for (const t of WRITE_TOOLS) {
+      for (const role of ["architect", "tester"]) {
+        assert.ok(
+          !(plan.agents![role]!.tools ?? []).includes(t),
+          `${role} must not be granted ${t} on the plan turn`,
+        );
+        assert.ok(
+          plan.agents![role]!.disallowedTools!.includes(t),
+          `${role} must additionally DENY ${t} on the plan turn (both operations, always)`,
+        );
+      }
+    }
+
+    // The implement turn is untouched: each role gets back EXACTLY what it declared,
+    // in declaration order. This is the half that proves the scoping — the same
+    // subtraction applied one key lower (baseOptions.disallowedTools) would be
+    // inherited through the implementOptions spread and redden here.
+    assert.deepStrictEqual(impl.agents!.architect!.tools, architectA.tools);
+    assert.deepStrictEqual(impl.agents!.tester!.tools, testerA.tools);
+    for (const role of ["architect", "tester"]) {
+      assert.deepStrictEqual(
+        impl.agents![role]!.disallowedTools,
+        ["Agent", "mcp__uzi", "mcp__memory"],
+        `${role} carries only the structural denials on the implement turn`,
+      );
+    }
+
+    // Non-write tools are NOT collateral: only the four come off.
+    assert.deepStrictEqual(
+      plan.agents!.architect!.tools,
+      ["Bash", "Read", "Grep", "WebFetch"],
+      "reads, Bash and WebFetch survive the plan turn untouched",
+    );
+    // A role that declared no write tool in the first place is unchanged.
+    assert.deepStrictEqual(plan.agents!.reviewer!.tools, reviewer.tools);
+  });
+
+  it("the inherit-all role (no `tools:` line) is covered by the denial arm, and only on the plan turn", async () => {
+    const { plan, impl } = await planAndImplement([lead, inheritCoder, reviewer]);
+
+    // `tools` STAYS UNSET. Materializing an allowlist here would silently narrow
+    // coder to whatever the transform imagined the full toolset to be — the
+    // inherit-all contract (PRD #3) is what the absent key means.
+    assert.strictEqual(plan.agents!.coder!.tools, undefined, "inherit-all is preserved as an absent key");
+    for (const t of WRITE_TOOLS) {
+      assert.ok(plan.agents!.coder!.disallowedTools!.includes(t), `coder must deny ${t} on the plan turn`);
+    }
+    // The structural denials are kept, not replaced.
+    for (const t of ["Agent", "mcp__uzi", "mcp__memory"]) {
+      assert.ok(plan.agents!.coder!.disallowedTools!.includes(t), `${t} still denied on the plan turn`);
+    }
+
+    // On the implement turn coder is back to inherit-all with no write denial —
+    // otherwise the role that exists to write code could not write code.
+    assert.strictEqual(impl.agents!.coder!.tools, undefined);
+    assert.deepStrictEqual(impl.agents!.coder!.disallowedTools, ["Agent", "mcp__uzi", "mcp__memory"]);
+  });
+
+  it("the TOP-LEVEL disallowedTools is untouched on both turns (the denial is per-agent, not global)", async () => {
+    const { plan, impl } = await planAndImplement([lead, architectA, inheritCoder]);
+    // Putting the subtraction on baseOptions.disallowedTools is the naive reading and
+    // is wrong: implementOptions spreads baseOptions, so it would deny the write tools
+    // for the whole run. Pinning BOTH turns is what makes that a red rather than a
+    // silently-passing alternative implementation.
+    assert.deepStrictEqual(plan.disallowedTools, ["ScheduleWakeup", "CronCreate"]);
+    assert.deepStrictEqual(impl.disallowedTools, ["ScheduleWakeup", "CronCreate"]);
+  });
+
+  it("a REVISE round is a planning turn too: the second plan turn carries the same subtraction", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // first planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // the revision turn
+      [signalDone(), resultSuccess()], // implement
+    ]);
+    const probe = makeCtx({ agents: [lead, architectA, inheritCoder] }, [
+      { kind: "revise", feedback: "narrow it" },
+      { kind: "approve", selection: { status: "absent" } },
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(turns.length, 3, "plan + revise + implement");
+
+    for (const turnIdx of [0, 1]) {
+      const opts = turns[turnIdx]!.options;
+      for (const t of WRITE_TOOLS) {
+        assert.ok(
+          !(opts.agents!.architect!.tools ?? []).includes(t),
+          `turn ${turnIdx}: architect must not be granted ${t}`,
+        );
+        assert.ok(
+          opts.agents!.architect!.disallowedTools!.includes(t),
+          `turn ${turnIdx}: architect must deny ${t}`,
+        );
+        assert.ok(opts.agents!.coder!.disallowedTools!.includes(t), `turn ${turnIdx}: coder must deny ${t}`);
+      }
+    }
+    // ...and the implement turn still restores them.
+    assert.deepStrictEqual(turns[2]!.options.agents!.architect!.tools, architectA.tools);
+  });
+});

@@ -13,11 +13,14 @@
 // prompt and it is NOT also registered as an invokable subagent. Every other
 // template becomes an invokable subagent.
 //
-// Read-only roles (reviewer/tester) are enforced via each AgentDefinition's
+// Read-only roles (reviewer/auditor) are enforced via each AgentDefinition's
 // `tools` allowlist — subagents inherit the parent's `bypassPermissions` mode
-// and cannot override it, so the allowlist (already excluding Edit/Write in the
-// PRD #3 templates) is what makes them read-only. Every subagent additionally
-// disallows the Agent tool, so no subagent can spawn further nested agents.
+// and cannot override it, so the allowlist (excluding Edit/Write in the PRD #3
+// templates for exactly those two roles) is what makes them read-only. Every
+// subagent additionally disallows the Agent tool, so no subagent can spawn
+// further nested agents. Roles that DO declare write tools (coder, architect,
+// tester, documenter, spec-keeper, plus anything inheriting all) keep them on the
+// implement turn and lose them on the PLAN turn — see planTurnSubagents (#203).
 //
 // null/absent/empty `tools` = INHERIT ALL (PRD #3 wire contract). We honor it by
 // leaving the allowlist UNSET, so the SDK grants the full toolset — the built-in
@@ -36,7 +39,7 @@
 
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSource, AgentTemplate } from "./protocol.js";
-import { NESTED_AGENT_TOOL } from "./guardrails.js";
+import { NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
@@ -61,6 +64,10 @@ const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 // writing cross-run memory. Defense-in-depth: the entry is still per-(user,repo)
 // scoped and server-capped, but provenance stays "the lead saved this".
 const MEMORY_SERVER_DENY = `mcp__${MEMORY_SERVER_NAME}`;
+
+/** Membership form of WRITE_PATH_TOOLS, for planTurnSubagents' filter. Derived,
+ *  never re-typed — guardrails.ts owns the list (#203). */
+const WRITE_TOOL_SET: ReadonlySet<string> = new Set<string>(WRITE_PATH_TOOLS);
 
 /**
  * A template is the lead orchestrator (routed to the main thread, not registered
@@ -102,11 +109,11 @@ function toDefinition(
     disallowedTools: [NESTED_AGENT_TOOL, SIGNAL_SERVER_DENY, MEMORY_SERVER_DENY],
   };
   // A non-empty template list is an explicit allowlist honored verbatim (and is
-  // what makes reviewer/tester read-only). null/absent/empty ⇒ leave `tools`
+  // what makes reviewer/auditor read-only). null/absent/empty ⇒ leave `tools`
   // unset so the SDK inherits all — the PRD #3 contract (see header). Repo skills
   // do NOT touch this allowlist: enabling a skill via `skills` is sufficient (per
   // sdk.d.ts:44 a tools-`Skill` grant is deprecated), so a read-only subagent
-  // (reviewer/tester) still expands a repo skill without any tools widening.
+  // (reviewer/auditor) still expands a repo skill without any tools widening.
   if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
@@ -238,6 +245,65 @@ export function subagentsFromTemplates(
  * but the worker owns what actually reaches the SDK. An exclusion naming an agent
  * not in the chosen source is a harmless no-op (nothing to remove).
  */
+/**
+ * The subagent roster to run a PLANNING turn with: the assembled map with every
+ * file-write tool (`WRITE_PATH_TOOLS`) taken off every subagent (#203).
+ *
+ * WHY. Before the human approval gate, a subagent write is an uncommitted
+ * worktree change the approver never saw, which the first implement-phase commit
+ * then sweeps in. Five roles can write on the plan turn today — architect,
+ * tester, documenter and spec-keeper declare write tools, and `coder` ships no
+ * `tools:` line at all (inherit-all, deliberate — see the header) while being
+ * invokable on that turn. So this operates on the ASSEMBLED MAP rather than on
+ * template frontmatter: editing four templates' `tools:` lines would miss coder
+ * and would also cost those roles their write tools on the implement turn, where
+ * writing is the job.
+ *
+ * WHAT THIS IS NOT. Not a structural guarantee, and it must not be described as
+ * one: every one of those roles also declares `Bash`, the turn runs under
+ * `bypassPermissions`, and guardrails.ts denies no filesystem write of any kind
+ * (`echo >`, `sed -i`, `tee`, `git apply` all pass). This removes the ergonomic
+ * path and the model's awareness of it — defence-in-depth one layer better than
+ * the prompt instruction that carried it before. The integrity property is #212.
+ *
+ * BOTH OPERATIONS, ALWAYS, and that is the whole design. `tools` is filtered
+ * where present AND the write tools are unioned into `disallowedTools`,
+ * unconditionally. Which of the two the SDK honours, and in what order, is
+ * UNPROVEN here: `sdk.d.ts:44-50` documents both fields on `AgentDefinition` with
+ * no ordering between them, the precedence sentence people quote
+ * (`sdk.d.ts:1391-1393`) is attached to the top-level `Options.disallowedTools`,
+ * and resolution happens inside the compiled `claude` binary. Doing both makes
+ * the question stop being a dependency instead of betting on an answer.
+ *
+ * NEW OBJECTS, NEVER MUTATION. `selectSubagents`'s own-source path copies
+ * REFERENCES (`out[name] = def`), so mutating a definition here would leak into
+ * the implement map and strip write tools for the whole run, breaking `coder`.
+ * Each entry gets a fresh object with fresh `tools`/`disallowedTools` arrays;
+ * remaining fields are shared by reference and are never mutated by anyone.
+ *
+ * The LEAD is deliberately out of scope: it is not in this map (it is the main
+ * thread), so it keeps its write tools on the plan turn. The harm argument
+ * applies to a lead write identically — the lead is the accountable party the
+ * human is gating, and only a `PreToolUse` deny (the recorded upgrade path)
+ * would reach it. Stated, not closed.
+ */
+export function planTurnSubagents(
+  subagents: Record<string, AgentDefinition>,
+): Record<string, AgentDefinition> {
+  const out: Record<string, AgentDefinition> = {};
+  for (const [name, def] of Object.entries(subagents)) {
+    const next: AgentDefinition = { ...def };
+    // Filter where present only: an ABSENT `tools` is the inherit-all contract
+    // (PRD #3), and materializing an allowlist here would silently narrow coder
+    // to whatever this function happened to think the full toolset was.
+    if (def.tools) next.tools = def.tools.filter((t) => !WRITE_TOOL_SET.has(t));
+    const denied = def.disallowedTools ?? [];
+    next.disallowedTools = [...denied, ...WRITE_PATH_TOOLS.filter((t) => !denied.includes(t))];
+    out[name] = next;
+  }
+  return out;
+}
+
 export function selectSubagents(
   source: AgentSource,
   ownSubagents: Record<string, AgentDefinition>,
