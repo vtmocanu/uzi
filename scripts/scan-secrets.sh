@@ -243,13 +243,43 @@ trap 'rm -f "$REPORT" "$TRACKED"' EXIT HUP INT TERM
 # stale build output -- none of which is in CI's checkout.  Same index-scoped rule
 # lint-shell.sh and lint-yaml.sh already take.
 #
-# UNTRACKED FINDINGS ARE REPORTED BUT DO NOT GATE. Dropping them silently would
-# throw away the most useful local signal there is (a secret in a file you just
-# created and have not added yet); gating on them would make a contributor's
-# verdict differ from CI's. So they are counted and named, at exit 0, under a
-# banner saying they are not gating. `git add` the file and the next run gates on
-# it.
-FILES="$(git ls-files)" || exit 2
+# UNTRACKED FINDINGS ARE REPORTED BUT DO NOT GATE, and the security argument is
+# stronger than the consistency one. A secret reaches the forge, other clones, CI
+# logs and images BY BEING TRACKED; an untracked file is by construction not in
+# the artifact anyone else receives, so gating on it adds no coverage of the
+# exposure path. What it would cost is the thing this design cannot defend: a gate
+# that reddens on files a contributor cannot fix by editing tracked code is a gate
+# people switch off, and the switch available here is `.gitleaks.toml` -- the
+# narrowing route the canaries can only partly see. Dropping them silently would
+# instead throw away the most useful local signal there is (a secret in a file you
+# just created), so they are counted and named at exit 0 under a NOT GATING
+# banner. `git add` the file and the next run gates on it.
+#
+# 🔴 THAT MAKES THE CLASSIFICATION THE SECURITY BOUNDARY. Anything that makes a
+# tracked file's REPORTED path differ from its INDEX spelling silently demotes a
+# gating finding to a note. Three routes exist and all three are answered here:
+#   * the report's spelling -- `dir -- .` from the repo root yields repo-relative
+#     paths, which is what `git ls-files` prints (fixed above, and the reason the
+#     working directory is fixed);
+#   * the index's spelling -- C-quoting, refused below;
+#   * SUBMODULES -- `git ls-files` lists the GITLINK and never the contents, so
+#     nothing inside a submodule can ever be in the tracked set. A secret
+#     committed in one is therefore printed and does NOT gate. That is defensible
+#     (it is not this repo's content, and `lint-shell.sh`/`lint-yaml.sh` skip
+#     submodule contents for the same reason) but it is not obvious, and it is not
+#     hypothetical here: `inspiration/` WAS three submodules until 2026-08-03. If
+#     they come back, this gate quietly changes what it gates on while still
+#     printing the findings.
+#
+# `core.quotePath=false` IS LOAD-BEARING, NOT COSMETIC. By default git C-quotes any
+# path with a byte above ASCII, so a single accented filename anywhere in the repo
+# would make the refusal below fire and brick this gate. gitleaks reports the RAW
+# path, and with this flag `git ls-files` prints the raw path too -- measured
+# byte-identical on `café.txt`, and measured to leave a newline-containing path
+# still C-quoted, which is the one case a line-based comparison genuinely cannot
+# handle. So the flag narrows the refusal from "any non-ASCII path" to "any path
+# holding a control character".
+FILES="$(git -c core.quotePath=false ls-files)" || exit 2
 
 if [ -z "$FILES" ]; then
   echo "scan-secrets: the git index lists no files under $ROOT." >&2
@@ -260,17 +290,24 @@ if [ -z "$FILES" ]; then
 fi
 printf '%s\n' "$FILES" > "$TRACKED"
 
-# git C-QUOTES a path containing a control character, so a tracked path with a
-# newline in its name would reach $TRACKED as a literal `"a\nb"` and never match
-# the raw path gitleaks reports -- that finding would silently fall into the
-# non-gating untracked bucket. There are none today (measured: zero lines begin
-# with a quote) and this refuses to run if that changes, rather than degrading
-# quietly.
+# Even with `core.quotePath=false` above, git C-QUOTES a path whose name holds a
+# CONTROL character, so a tracked path with a newline in it would reach $TRACKED
+# as the literal `"a\nb"` and never match the raw path gitleaks reports -- that
+# finding would silently fall into the non-gating untracked bucket, which is the
+# security boundary named above. This refuses to run instead of degrading quietly.
+#
+# The branch is not merely asserted-by-absence: it was exercised. Before the
+# `core.quotePath=false` flag, adding a `café.txt` fired it (rc=2) and removing it
+# restored rc=0; with the flag that same file passes and a newline-named one still
+# fires. So this now covers the case a line-based comparison genuinely cannot
+# handle, and nothing else.
 if grep -q '^"' "$TRACKED"; then
-  echo "scan-secrets: the index contains a C-quoted path (one whose name holds a" >&2
-  echo "  control character or a newline). The tracked-set comparison below is" >&2
-  echo "  line-based and cannot match it, so such a file would be treated as" >&2
-  echo "  untracked and would stop gating. Rename it." >&2
+  echo "scan-secrets: the index contains a C-quoted path -- one whose name holds a" >&2
+  echo "  CONTROL character (a newline, a tab). Note this is NOT about accents:" >&2
+  echo "  the list is read with core.quotePath=false, so non-ASCII names are fine." >&2
+  echo "  The tracked-set comparison is line-based and cannot match a quoted path," >&2
+  echo "  so such a file would be classed untracked and would stop gating. Rename" >&2
+  echo "  it." >&2
   exit 2
 fi
 
