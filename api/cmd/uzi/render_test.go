@@ -149,11 +149,11 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	// The class this belongs to is worth naming: the broken implementation and the
 	// correct one AGREE on the case that was picked, so the fixture passed against
 	// both and read as proof of something it never tested.
-	hostile := "safe‮dnetsop\x1b[31m\nnext-line"
+	hostile := "safe\u202ednetsop\x1b[31m\nnext-line"
 	out := render(&hostile)
 	// The first two pin the shared floor (either helper satisfies them); the third is
 	// the discriminating one.
-	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q, got:\n%q", bad, out)
 		}
@@ -261,11 +261,11 @@ func TestLimitWaitLine(t *testing.T) {
 func TestLimitWaitLineSanitizesTheRateLimitType(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	r := parkedRun(now)
-	hostile := "five‮ruoh_\x1b[31m\nnext-line"
+	hostile := "five\u202eruoh_\x1b[31m\nnext-line"
 	r.RateLimitType = &hostile
 
 	got := limitWaitLine(r, now)
-	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("a hostile rate_limit_type reached the terminal carrying %q, got:\n%q", bad, got)
 		}

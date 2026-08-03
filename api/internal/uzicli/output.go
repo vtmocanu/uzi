@@ -171,14 +171,14 @@ func (p *Printer) Table(headers []string, rows [][]string) error {
 				cols[i] = "\x1b[1m" + cols[i] + "\x1b[0m"
 			}
 		}
-		fmt.Fprintln(tw, strings.Join(cols, "\t"))
+		_, _ = fmt.Fprintln(tw, strings.Join(cols, "\t"))
 	}
 	for _, r := range rows {
 		cells := make([]string, len(r))
 		for i, c := range r {
 			cells[i] = CellText(c)
 		}
-		fmt.Fprintln(tw, strings.Join(cells, "\t"))
+		_, _ = fmt.Fprintln(tw, strings.Join(cells, "\t"))
 	}
 	return tw.Flush()
 }
@@ -212,7 +212,7 @@ func (p *Printer) Printf(format string, a ...any) {
 		format = SanitizeTTY(format)
 		a = sanitizeArgs(a)
 	}
-	fmt.Fprintf(p.out, format, a...)
+	_, _ = fmt.Fprintf(p.out, format, a...)
 }
 
 // Println writes its arguments followed by a newline to the output. Sanitized on the
@@ -221,7 +221,7 @@ func (p *Printer) Println(a ...any) {
 	if p.Format != FormatJSON {
 		a = sanitizeArgs(a)
 	}
-	fmt.Fprintln(p.out, a...)
+	_, _ = fmt.Fprintln(p.out, a...)
 }
 
 // sanitizeArgs returns a copy of a with every string operand sanitized, leaving the
