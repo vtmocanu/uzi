@@ -219,12 +219,39 @@ format         task fmt-check      # gofmt -l over both Go modules. CHECK, never
                                    # -- the standing rule it retired, plus that file's
                                    # copy of this slot. specs/ai.md section 466 carries
                                    # the gate's DESIGN properties, not this history.
-lint           task lint           # composite, all four components (M5 will append
-               task lint:api       # shell + YAML to it). Each gate:<c> already runs
+lint           task lint           # composite over SEVEN targets, not four: the four
+               task lint:api       # components plus lint:shell, lint:yaml and
                task lint:controller
-               task lint:web       # its own lint:<c>, so a COMPONENT GATE ALREADY
-               task lint:agent     # COVERS THIS SLOT for that component -- same shape
-                                   # as the format slot above. Go is golangci-lint
+               task lint:web       # lint:formula, which PRD #103 M5 appended. (This
+               task lint:agent     # line read "all four components (M5 will append
+               task lint:shell     # shell + YAML to it)" until M5 landed; M5 appended
+               task lint:yaml      # THREE, not two, and the future tense was wrong
+               task lint:formula   # the moment it did.) Each gate:<c> already runs
+               task gate:repo      # its own lint:<c>, so a COMPONENT GATE ALREADY
+                                   # COVERS THIS SLOT for that component -- same shape
+                                   # as the format slot above.
+                                   # 🔴 BUT THE THREE REPO-WIDE ONES ARE IN NO
+                                   # gate:<c> AT ALL. They are functions of the TREE
+                                   # and hang off `task gate:repo`, which `task gate`
+                                   # runs FIRST -- so running a component gate does
+                                   # NOT cover them.
+                                   # 🔴 AND A GREEN gate:repo CAN MEAN "CHECKED
+                                   # NOTHING". If shellcheck or yamllint is not on
+                                   # your PATH the script prints a boxed SKIP banner
+                                   # and exits 0, deliberately (gate:repo runs first,
+                                   # so a hard fail there would block every component
+                                   # gate). CI arms them, so they never skip on an MR.
+                                   # READ THE BANNER, NOT THE STATUS. A WRONG VERSION
+                                   # is different and still exit 2: shellcheck is
+                                   # pinned EXACTLY 0.11.0 because 0.10.0 does not
+                                   # emit SC3067 at all and is therefore a different
+                                   # gate, not the same one running late.
+                                   # lint:formula is `ruby -c` on the brew formula
+                                   # (syntax only); it wants ruby >= 3.1, falls back
+                                   # to Homebrew's vendored ruby, and skips loudly
+                                   # if neither exists -- macOS's own ruby is 2.6.10
+                                   # and reports a syntax error on a CORRECT file.
+                                   # Go is golangci-lint
                                    # (errcheck, staticcheck, ineffassign, unused,
                                    # unparam, nolintlint -- the last lints the
                                    # SUPPRESSIONS: a bare or vacuous `//nolint`
