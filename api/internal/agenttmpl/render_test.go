@@ -389,13 +389,14 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 // discipline, not of a defect. The region carries the position now, so the
 // phrase only has to carry the meaning: the phrases below total 376 BYTES
 // against the 666 of the anchored ones they replace, none contains another, and
-// each occurs exactly once. (Raw figures rather than a percentage, deliberately
-// — one shrink measured in two units gives −44% in bytes and −43% in runes,
-// each rounded once, and two figures in two files read as a discrepancy to
-// whoever meets them apart. Bytes rather than "characters"
-// for the same reason: the anchored set carried two em dashes, so its rune
-// count is 662 against 666 bytes. The ambiguous unit diverges on exactly one of
-// the two figures.)
+// each occurs exactly once. (Raw figures rather than a percentage, and bytes
+// rather than "characters", for one reason: this shrink is −44% or −43%
+// depending on whether it is taken in bytes or runes, because the anchored set
+// carried two em dashes and so counts 666 bytes against 662 runes. Each
+// percentage is that unit's own division rounded once — no single number rounds
+// to both. The ambiguous unit diverges on exactly one of the two figures, since
+// this set carries no em dash and is 376 either way, and two figures in two
+// files read as a disagreement to whoever meets them apart.)
 //
 // It cannot LOSE detection relative to the whole-body form it replaces, and
 // that is a proof rather than a measurement: each region is a substring of the
