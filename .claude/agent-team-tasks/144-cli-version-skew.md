@@ -1169,3 +1169,54 @@ that it holds no secret and no URL.
 binary against the live server printed
 `uzi: CLI v0.11.8 is behind server 0.14.0` — issue #144's exact opening scenario, working
 against production.
+
+---
+
+## 16. AMENDMENT 11 — reviewer's provenance audit of its own report. B1's EVIDENCE was contaminated; B1 STANDS.
+
+**One measurement in §15 was produced by a binary built from the shared worktree mid-edit:
+the B1 row "dev binary makes 0 probes".** Re-derived from pristine `git archive` extracts,
+now with a positive control so an all-zero result cannot pass as evidence:
+
+```
+ea71a367  dev binary, token list         reqs=0 warn=0 cachefile=no
+d96b6fe8  dev binary, token list         reqs=0 warn=0 cachefile=no
+d96b6fe8  stamped,    token list         reqs=1 warn=1 cachefile=yes   <- harness is LIVE
+```
+
+**The conclusion is unchanged; only its evidence is now sound.**
+
+**🔴 WHY THAT ONE ROW SURVIVED THE FIRST RE-DERIVATION IS THE LESSON.** The reviewer had
+already re-run everything else from the contaminated batch. It carried this row forward
+*"because 'dev short-circuits' felt independent of the exemption edits."* That is the
+generalisable trap: **contamination is a property of the BUILD, not of the topic**, so
+reasoning about whether a result *could* have been affected by the specific edits is the
+wrong filter — and it is the filter a careful person reaches for, because re-running
+everything feels wasteful. The right question is only *which binary produced this number*.
+
+Both the auditor and the reviewer hit this, independently, and **both were caught by the
+same shape**: a contradiction between static reading and observed behaviour, not by
+suspicion. The auditor's was `auth status` reading not-exempt while its binary behaved
+exempt; the reviewer's was a `cli_version` key on disk that the struct it had just read did
+not declare.
+
+**Restore verified against the VCS, not a grep count**: `diff -r` of the mutation working
+copy against a fresh `ea71a367` extract, **rc=0** — which is `CLAUDE.md`'s own prescription
+for exactly this check.
+
+### Exemption set re-verified at `d96b6fe8`, pristine extract, all eight correct
+
+`git diff --stat d96b6fe8 d26d77bb -- api/ e2e/ docs/` is **empty**, confirming the
+`CLAUDE.md` commit touched no code, so the earlier `d26d77bb` measurements transfer.
+
+```
+auth token 0/0   logout 0/0   skill status 0/0   auth status 0/0   <- exempt
+version 1/1 (relocated, warns inline)
+token list 1/1   repo list 1/1   whoami 1/1                        <- not exempt
+```
+
+### N-1 unchanged and still reproducing at `d96b6fe8`; N-4's boundary confirmed as an independent third derivation
+
+The reviewer states it read §13 before finishing and **did not use 6b as an instrument** —
+so its N-4 is a genuinely independent derivation of the `compactText`/`…` mechanism rather
+than an echo of the amendment. Three agents, three routes, same mechanism.
