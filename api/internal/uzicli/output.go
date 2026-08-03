@@ -131,6 +131,13 @@ func NewPrinter(out io.Writer, tty, jsonFlag, noColor, quiet bool) *Printer {
 }
 
 // JSON writes v as an indented JSON document.
+//
+// DELIBERATELY NOT SANITIZED, and that is not an oversight (#180). encoding/json
+// escapes every control byte on its own — ESC leaves here as the six characters
+// backslash-u-0-0-1-b — so the machine channel is already terminal-safe, and it is
+// terminal-safe LOSSLESSLY: a consumer decodes back to the server's exact bytes.
+// Running a stripper over it would destroy the one faithful record of what a hostile
+// server actually sent, which is the opposite of what an agent-facing format is for.
 func (p *Printer) JSON(v any) error {
 	enc := json.NewEncoder(p.out)
 	enc.SetIndent("", "  ")
@@ -138,20 +145,40 @@ func (p *Printer) JSON(v any) error {
 }
 
 // Table writes an aligned table. An empty headers slice omits the header row.
+//
+// Every header and every cell goes through CellText first: this is the shared
+// human-table boundary all seventeen table call sites reach, and it is where a
+// server-supplied string stops being able to drive the terminal (#180). Sanitizing
+// here rather than per-call-site means a new command cannot forget it, and it holds
+// even for cells whose value is "server-controlled today" — the assumption this repo
+// has watched rot before.
+//
+// Unconditional, NOT gated on Format: a table is a human artefact by definition, every
+// caller branches to JSON() before reaching here, and a dead `if` in a security
+// boundary is worse than none. Idempotent, so the call sites that already sanitize
+// (cellText on worker names, token labels, actor cells) are unaffected — stripping
+// twice strips nothing the second time.
+//
+// The bold header codes are added AFTER sanitizing, so the Printer's own escapes are
+// the only ones that survive this function.
 func (p *Printer) Table(headers []string, rows [][]string) error {
 	tw := tabwriter.NewWriter(p.out, 0, 2, 2, ' ', 0)
 	if len(headers) > 0 {
-		cols := headers
-		if p.Color {
-			cols = make([]string, len(headers))
-			for i, h := range headers {
-				cols[i] = "\x1b[1m" + h + "\x1b[0m"
+		cols := make([]string, len(headers))
+		for i, h := range headers {
+			cols[i] = CellText(h)
+			if p.Color {
+				cols[i] = "\x1b[1m" + cols[i] + "\x1b[0m"
 			}
 		}
 		fmt.Fprintln(tw, strings.Join(cols, "\t"))
 	}
 	for _, r := range rows {
-		fmt.Fprintln(tw, strings.Join(r, "\t"))
+		cells := make([]string, len(r))
+		for i, c := range r {
+			cells[i] = CellText(c)
+		}
+		fmt.Fprintln(tw, strings.Join(cells, "\t"))
 	}
 	return tw.Flush()
 }
@@ -160,13 +187,57 @@ func (p *Printer) Table(headers []string, rows [][]string) error {
 // commands whose human view is neither a flat table nor a JSON document (run
 // detail, run logs, the review verdict + recommendation blocks): routing all
 // output through the Printer keeps a single destination.
+//
+// The format string and every string operand go through SanitizeTTY — the flowing-text
+// half, which SPARES \t and \n. That is required, not a weaker choice: renderReview
+// prints multi-line judge markdown through here line by line, and folding newlines
+// would collapse it into one line. The cost is that a newline in a server string can
+// still inject a line onto stdout; the containment is that nothing sized or aligned is
+// printed through Printf, so an injected line is a spoofed sentence rather than a
+// forged table row.
+//
+// Non-string operands are ints, floats and bools whose fmt verbs cannot emit a control
+// character. A %v over a struct could, which is why no call site does one.
+//
+// SKIPPED IN --json MODE, and this is the load-bearing half of the JSON promise:
+// renderMessage streams NDJSON through Println (not JSON()) for `run logs --follow`,
+// and json.Marshal does NOT escape the Cf block — U+202E and U+200D come out raw, so a
+// sanitizer here would silently mutate an agent's parsed payload. Measured, not assumed.
+//
+// One consequence worth stating: a future caller wanting COLOUR through Printf will
+// find its escapes stripped. Nothing does today (the header above is the only ANSI this
+// package emits), and losing colour is the correct failure for this boundary.
 func (p *Printer) Printf(format string, a ...any) {
+	if p.Format != FormatJSON {
+		format = SanitizeTTY(format)
+		a = sanitizeArgs(a)
+	}
 	fmt.Fprintf(p.out, format, a...)
 }
 
-// Println writes its arguments followed by a newline to the output.
+// Println writes its arguments followed by a newline to the output. Sanitized on the
+// same terms as Printf, including the --json passthrough NDJSON depends on.
 func (p *Printer) Println(a ...any) {
+	if p.Format != FormatJSON {
+		a = sanitizeArgs(a)
+	}
 	fmt.Fprintln(p.out, a...)
+}
+
+// sanitizeArgs returns a copy of a with every string operand sanitized, leaving the
+// caller's slice untouched. Copying matters: `a ...any` aliases the caller's backing
+// array for a slice-spread call, and rewriting it in place would mutate a value the
+// caller may still use.
+func sanitizeArgs(a []any) []any {
+	out := make([]any, len(a))
+	for i, v := range a {
+		if s, ok := v.(string); ok {
+			out[i] = SanitizeTTY(s)
+			continue
+		}
+		out[i] = v
+	}
+	return out
 }
 
 // IsTerminal reports whether f is attached to a character device (a terminal).

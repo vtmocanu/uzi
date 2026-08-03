@@ -71,14 +71,18 @@ func TestRenderRunDetailForgeAwareMRColumn(t *testing.T) {
 // TestRenderRunDetailAnthropicToken pins `uzi run get`'s ANTHROPIC_TOKEN row
 // (PRD #111 M1) and, more importantly, the sanitization it goes through.
 //
-// The label is the first genuinely USER-AUTHORED string this block renders, and the
-// two facts that make it dangerous are both measured, not assumed:
-// validateSecretLabel (handler/secrets.go) rejects control characters and U+FFFD but
-// NOT unicode.Cf, so a bidi-override label is storable and passes the DB CHECK; and
-// uzicli.Printer.Table does not sanitize what it is handed — it joins the cells and
-// flushes. cellText is what closes that, and this asserts it rather than the row's
-// mere presence, because a row rendered through the wrong helper looks identical
-// until someone stores a hostile label.
+// The label is the first genuinely USER-AUTHORED string this block renders. This
+// comment used to name two supporting facts and BOTH have since gone false, which is
+// the more useful thing to record: "validateSecretLabel permits unicode.Cf" (PRD #111
+// M2 made the validator reject it) and "uzicli.Printer.Table does not sanitize what it
+// is handed" (#180 put CellText on every cell).
+//
+// The test is unchanged and is worth MORE, not less, for that. It drives the real
+// render path and asserts on the rendered bytes, so it never depended on which layer
+// did the stripping — it now pins two independent defences, and it would still redden
+// if a refactor moved this row off Printer.Table and dropped cellText in the same
+// stroke. A row rendered through the wrong helper looks identical until someone stores
+// a hostile label, which is why this asserts the CONTENT and not the row's presence.
 func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	render := func(label *string) string {
 		t.Helper()

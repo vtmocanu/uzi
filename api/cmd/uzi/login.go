@@ -66,7 +66,10 @@ func runLogin(cmd *cobra.Command, env Env, gf *globalFlags) error {
 	// Instructions go to stderr so stdout stays clean for --json; the user_code and
 	// URL are essential, so they print even with --quiet. The token is NEVER printed.
 	fmt.Fprintf(env.Stderr, "\nTo authorize this login, open:\n\n    %s\n\n", consentURL)
-	fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", start.UserCode)
+	// user_code is server-supplied and printed outside the Printer (#180). consentURL
+	// beside it needs nothing: its server-supplied half is url.QueryEscape'd, which
+	// percent-encodes every control byte.
+	fmt.Fprintf(env.Stderr, "and enter this one-time code when asked:\n\n    %s\n\n", uzicli.CellText(start.UserCode))
 	if err := openBrowser(consentURL); err != nil {
 		fmt.Fprintln(env.Stderr, "(could not open a browser automatically — open the URL above)")
 	}
@@ -168,7 +171,8 @@ func finishLogin(env Env, gf *globalFlags, resolvedURL string, res uzicli.CLIAut
 		return p.JSON(res.User)
 	}
 	if !gf.quiet {
-		fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context default.\n", res.User.Email)
+		// Server-supplied email, outside the Printer (#180).
+		fmt.Fprintf(env.Stdout, "Logged in as %s. Token stored for context default.\n", uzicli.CellText(res.User.Email))
 	}
 	return nil
 }

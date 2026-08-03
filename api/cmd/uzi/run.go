@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -665,9 +664,15 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	//
 	// Through cellText, NOT sanitizeTTY, and the difference is load-bearing here in a
 	// way it is not for the rows above. This is the first genuinely USER-AUTHORED
-	// string in this block, and uzicli.Printer.Table does not sanitize what it is
-	// handed. cellText is the table-cell wrapper: sanitizeTTY plus newline folding,
-	// tab folding and a length cap.
+	// string in this block. cellText is the table-cell wrapper: sanitizeTTY plus
+	// newline folding, tab folding and a length cap.
+	//
+	// This used to justify itself with "uzicli.Printer.Table does not sanitize what it
+	// is handed", which #180 made false: Table now runs CellText over every cell, so
+	// the newline fold happens with or without this call. What is left is a genuine
+	// reason rather than a residual one — the length cap is cellText's alone, and a
+	// call site that names its own untrusted input keeps stating that fact if the row
+	// is ever moved off Printer.Table.
 	//
 	// 🔴 THE PREMISE THIS USED TO GIVE IS NOW FALSE, AND THE CONCLUSION STILL HOLDS —
 	// which is exactly why the premise is being corrected rather than deleted. It read
@@ -841,17 +846,15 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 //     misaligning the rail. That is the same root cause as the tab bug whose comment
 //     notes the rune offset stayed pinned "which is why the existing alignment test
 //     could not see it". Stripping Cf fixes the spoof and that drift together.
-func sanitizeTTY(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\t' || r == '\n' {
-			return r
-		}
-		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
-			return -1
-		}
-		return r
-	}, s)
-}
+//
+// THE PREDICATE MOVED TO uzicli (#180) AND THIS IS NOW A DELEGATION, not a second
+// copy. uzicli.Printer.Table/Printf/Println sanitize at the shared render boundary, so
+// the binary would otherwise hold two implementations of the same security rule in two
+// packages — and the one that drifts is always the one nobody is looking at. The name
+// stays because it is what the D7 guard, the render tests and this file's ~30 call
+// sites are written against, and because the call sites below make a genuine
+// sanitizeTTY-versus-cellText choice that reads correctly under these names.
+func sanitizeTTY(s string) string { return uzicli.SanitizeTTY(s) }
 
 // renderMessage prints one run message. In --json mode it emits one compact JSON
 // object per line (NDJSON), so `--follow` streams cleanly and an agent parses it
