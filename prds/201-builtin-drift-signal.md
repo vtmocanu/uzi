@@ -261,7 +261,11 @@ writer.
 writer, because uncommitted work is invisible to the person reaching in. Do it after a commit,
 never on a dirty tree.
 
-Collision surface, measured with `git diff --stat 25ebcd39..origin/main` over M4a's files:
+Collision surface, measured with **`git diff --stat 25ebcd39..d367653b`** over M4a's files.
+*(The SHA is pinned deliberately. This originally read `25ebcd39..origin/main`, which
+reproduces only while `origin/main` sits where it did — a command embedding a moving ref
+silently changes what the sentence claims the next time main advances, without the text
+changing at all.)*
 
 - **`api/internal/handler/agent_templates.go` — UNTOUCHED.** M4a's primary surface is clean.
 - **`web/src/pages/{Agents,AgentDetail}.tsx`, `web/src/components/AgentTemplateEditor.tsx`,
