@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Security
+
+- **The `uzi` CLI no longer renders server-supplied text on your terminal
+  raw.** Every human-readable render path (tables, printed lines, the error
+  line, login and version output) passed the server's strings straight
+  through, so a hostile or compromised server the user had pointed `--url`
+  at could clear the screen, rewrite the window title, or use a bidi
+  override to make a name read as something other than what it says.
+  Terminal control characters and Unicode format characters (the bidi
+  overrides, zero-widths, the BOM) are now stripped at a shared render
+  boundary before anything reaches stdout; `--json` output is deliberately
+  untouched, since it already escapes those bytes and stays the lossless
+  forensic channel. **The accepted cost:** a zero-width joiner is itself one
+  of the stripped characters, so a multi-part emoji built from one (a family
+  emoji) now renders as its separate members instead of the joined glyph; a
+  single-codepoint emoji is unaffected (issue #180).
+
 ## [0.14.0] - 2026-08-03
 
 ### Added
