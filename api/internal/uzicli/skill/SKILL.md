@@ -89,7 +89,7 @@ uzi run list
 uzi run get <run-id>
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
@@ -157,6 +157,17 @@ uzi version
   (with the `=`, since a bare bool flag consumes no following word) to force it off
   for this run only. A parked run holds its issue and its worker's disk until it
   resumes, so it is opt-in rather than the default.
+
+  `--plan-file <path>` seeds the run with a plan you have already written: the worker
+  skips its own planning turn and the approval gate and implements the plan directly.
+  Pass `-` to read the plan from stdin. `--agent-source own|repo` picks the subagent
+  roster for that run (`own` = your template roster, `repo` = the agents the worker
+  detects in the clone's `.claude/agents/`), and `--exclude-agents <a,b>` drops
+  individual subagents from it. Both roster flags require `--plan-file`, and
+  `--exclude-agents` additionally requires `--agent-source` — either combination is a
+  usage error. With no roster flag a seeded run uses the repo's own agents (falling
+  back to your template roster when the clone has none). An empty plan, or one over the
+  size cap, is rejected at create time.
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own

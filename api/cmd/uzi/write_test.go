@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -48,6 +50,123 @@ func TestRunCreateWarnsLockedVault(t *testing.T) {
 	}
 	if !strings.Contains(errb, "warning") || !strings.Contains(errb, "vault is locked") {
 		t.Errorf("create did not warn about the locked vault (Risk 4):\n%s", errb)
+	}
+}
+
+// PRD #209 M3: `uzi run create --plan-file <path>` reads the plan from a file and
+// forwards it verbatim as the seed. With no roster flag the seed carries no selection,
+// so the worker runs the repo's own agents (Success Criterion 5).
+func TestRunCreateWithPlanFile(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	const plan = "# Plan\n\nDo the thing.\n"
+	if err := os.WriteFile(planPath, []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42", "--plan-file", planPath)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil {
+		t.Fatal("create with --plan-file sent no seed")
+	}
+	if fc.LastCreateSeed.PlanMD != plan {
+		t.Errorf("plan body = %q, want the file's contents verbatim (%q)", fc.LastCreateSeed.PlanMD, plan)
+	}
+	if fc.LastCreateSeed.Selection != nil {
+		t.Errorf("bare --plan-file must send no selection (repo's own agents), got %+v", fc.LastCreateSeed.Selection)
+	}
+}
+
+// --plan-file with --agent-source/--exclude-agents reuses approveSelection's wire
+// mapping: the seed carries {source, exclusions} verbatim (the server validates).
+func TestRunCreateWithPlanFileAndSelection(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--plan-file", planPath, "--agent-source", "own", "--exclude-agents", "tester,auditor")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil || fc.LastCreateSeed.Selection == nil {
+		t.Fatalf("seed/selection missing: %+v", fc.LastCreateSeed)
+	}
+	sel := fc.LastCreateSeed.Selection
+	if sel.Source != "own" {
+		t.Errorf("source = %q, want own", sel.Source)
+	}
+	if len(sel.Exclusions) != 2 || sel.Exclusions[0] != "tester" || sel.Exclusions[1] != "auditor" {
+		t.Errorf("exclusions = %v, want [tester auditor] (verbatim, server validates)", sel.Exclusions)
+	}
+}
+
+// --plan-file - reads the plan from stdin (mirroring `uzi auth token` / follow-up).
+func TestRunCreatePlanFromStdin(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	env := fakeEnv(fc)
+	env.Stdin = strings.NewReader("plan from a pipe")
+	env.StdinTTY = false
+	_, _, code := runCLI(t, env, "run", "create", "--repo", "p1", "--issue", "42", "--plan-file", "-")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil || fc.LastCreateSeed.PlanMD != "plan from a pipe" {
+		t.Fatalf("stdin plan = %+v, want 'plan from a pipe'", fc.LastCreateSeed)
+	}
+}
+
+// --exclude-agents without --agent-source is the SAME usage error on create as at the
+// plan gate (both reuse approveSelection), raised before any request is sent.
+func TestRunCreateExcludeWithoutSourceIsUsageError(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--plan-file", planPath, "--exclude-agents", "tester")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errb, "agent-source") {
+		t.Errorf("error should point at --agent-source:\n%s", errb)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error must not create a run")
+	}
+}
+
+// A roster flag with no --plan-file is a usage error client-side, mirroring the
+// server's 400 "agent_selection requires plan_md" — a clean message before any request.
+func TestRunCreateSelectionWithoutPlanFileIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--agent-source", "repo")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errb, "plan-file") {
+		t.Errorf("error should point at --plan-file:\n%s", errb)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error must not create a run")
+	}
+}
+
+// A nonexistent/unreadable --plan-file is a usage error, not a nil-plan run — the CLI
+// must refuse before calling the API.
+func TestRunCreatePlanFileUnreadable(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	missing := filepath.Join(t.TempDir(), "does-not-exist.md")
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42", "--plan-file", missing)
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("an unreadable plan file must not create a run")
 	}
 }
 

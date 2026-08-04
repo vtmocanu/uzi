@@ -72,11 +72,15 @@ type FakeClient struct {
 	// passed" into "passed false", which is the exact distinction the flag exists to
 	// carry, and no test could then catch its loss.
 	LastCreateWaitOnLimit *bool
-	InputResp             apitypes.RunInputResponse
-	LastInputRunID        string
-	LastInputKind         string
-	LastInputBody         string
-	LastInputSelection    *apitypes.AgentSelection
+	// LastCreateSeed captures PRD #209's optional seeded plan (nil when the run was
+	// created without --plan-file), so a test can assert the plan body and the roster
+	// the CLI forwarded — the assertion M3's flag parsing is proven against.
+	LastCreateSeed     *CreateRunSeed
+	InputResp          apitypes.RunInputResponse
+	LastInputRunID     string
+	LastInputKind      string
+	LastInputBody      string
+	LastInputSelection *apitypes.AgentSelection
 
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
@@ -426,10 +430,11 @@ func (f *FakeClient) PollCLIAuth(context.Context, string, string) (CLIAuthPollRe
 	return res, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
+	f.LastCreateSeed = seed
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
 	}

@@ -56,7 +56,7 @@ func TestStartCLIAuthWireShape(t *testing.T) {
 			t.Errorf("start body = %+v", body)
 		}
 		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"request_id":"req-1","user_code":"ABCD-1234","expires_in":300,"interval":5}`)
+		_, _ = io.WriteString(w, `{"request_id":"req-1","user_code":"ABCD-1234","expires_in":300,"interval":5}`)
 	}))
 	defer srv.Close()
 
@@ -83,12 +83,12 @@ func TestPollCLIAuthStatusMapping(t *testing.T) {
 				RequestID string `json:"request_id"`
 				Verifier  string `json:"verifier"`
 			}
-			json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body.RequestID != "req-1" || body.Verifier != "ver-1" {
 				t.Errorf("poll body = %+v", body)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"status":"pending"}`)
+			_, _ = io.WriteString(w, `{"status":"pending"}`)
 		}))
 		defer srv.Close()
 		res, err := (&HTTPClient{BaseURL: srv.URL, HTTP: srv.Client()}).PollCLIAuth(context.Background(), "req-1", "ver-1")
@@ -99,7 +99,7 @@ func TestPollCLIAuthStatusMapping(t *testing.T) {
 
 	t.Run("200 authorized", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			io.WriteString(w, `{"token":"uzc_minted","user":{"id":"u1","email":"a@b.c"}}`)
+			_, _ = io.WriteString(w, `{"token":"uzc_minted","user":{"id":"u1","email":"a@b.c"}}`)
 		}))
 		defer srv.Close()
 		res, err := (&HTTPClient{BaseURL: srv.URL, HTTP: srv.Client()}).PollCLIAuth(context.Background(), "r", "v")
@@ -114,7 +114,7 @@ func TestPollCLIAuthStatusMapping(t *testing.T) {
 	t.Run("410 terminal carries reason", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusGone)
-			io.WriteString(w, `{"status":"denied"}`)
+			_, _ = io.WriteString(w, `{"status":"denied"}`)
 		}))
 		defer srv.Close()
 		res, err := (&HTTPClient{BaseURL: srv.URL, HTTP: srv.Client()}).PollCLIAuth(context.Background(), "r", "v")
@@ -136,15 +136,15 @@ func TestCreateRunWireShape(t *testing.T) {
 		var body struct {
 			IssueIID int64 `json:"issue_iid"`
 		}
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.IssueIID != 42 {
 			t.Errorf("issue_iid = %d, want 42", body.IssueIID)
 		}
 		w.WriteHeader(http.StatusCreated)
-		io.WriteString(w, `{"run":{"id":"run-1","status":"queued","kind":"issue"}}`)
+		_, _ = io.WriteString(w, `{"run":{"id":"run-1","status":"queued","kind":"issue"}}`)
 	}))
 	defer srv.Close()
-	run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil)
+	run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 			}
 			raw, _ := io.ReadAll(r.Body)
 			var body map[string]json.RawMessage
-			json.Unmarshal(raw, &body)
+			_ = json.Unmarshal(raw, &body)
 			if string(body["kind"]) != `"cancel"` {
 				t.Errorf("kind = %s, want cancel", body["kind"])
 			}
@@ -172,7 +172,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 				t.Errorf("selection = %s, want null", body["selection"])
 			}
 			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"server_side":true}`)
+			_, _ = io.WriteString(w, `{"server_side":true}`)
 		}))
 		defer srv.Close()
 		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
@@ -184,7 +184,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 	t.Run("approve with selection", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var body apitypes.RunInputRequest
-			json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body.Kind != "approve_plan" || body.Selection == nil {
 				t.Fatalf("body = %+v", body)
 			}
@@ -192,7 +192,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 				t.Errorf("selection = %+v", body.Selection)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"server_side":false}`)
+			_, _ = io.WriteString(w, `{"server_side":false}`)
 		}))
 		defer srv.Close()
 		sel := &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}}
