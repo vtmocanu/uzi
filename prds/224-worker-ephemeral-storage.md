@@ -100,9 +100,8 @@ at all, so whatever is true of the docker tier is not automatically true there.
    (`values.yaml:546-553` → `UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}`), so a cluster can tune
    it without a controller release.
 
-**Open scope question, going to the user (§4 Q4):** the issue's `## Cleanup` section — three
-lingering `Failed`/`Evicted` pods in `uzi-workers-docker`, one over 7 days old, not GC'd
-automatically. Manual one-off cleanup, or a controller-side reaper?
+**Cleanup — settled, see Amendment A1.** Manual one-off deletion by exact name, plus a recorded
+note on why k8s does not reap them. No controller-side reaper in this task.
 
 **Out of scope:** the #218 fetch-back on the shutdown path (explicitly "filed as an amendment there
 rather than duplicated here" by the issue itself, and already recorded at `0111f01c`'s tip commit);
@@ -139,10 +138,12 @@ worker container's own ~100 MiB is not the number that matters and the sidecar's
 `emptyDir.sizeLimit` is a third instrument neither the issue nor this brief has considered — say
 whether it is the better tool for the daemon's data root.
 
-**Q5 — What is the steady-state number?** Nobody has measured it. Say what measurement would give
-it (a `kubectl exec du` sweep across live workers, `kubelet_volume_stats`, a Grafana query) and
-whether it can be taken before the fix lands. A guessed request that is too low re-creates the bug;
-too high strands node disk across the fleet.
+**Q5 — What is the steady-state number?** Nobody has measured it. **Settled in ORDER but not in
+VALUE — see Amendment A2:** ship a conservative, fully chart-tunable default now, measure after.
+So the question you still owe an answer to is not "what is the number" but **"what measurement
+would give it"** (a `kubectl exec du` sweep across live workers, `kubelet_volume_stats`, a Grafana
+query) and how conservative the interim default has to be to be safe without the measurement. A
+request guessed too low re-creates the bug; too high strands node disk across the fleet.
 
 **Q6 — Do the presets' `max` ceilings need to move?** The docker LimitRange's `max`
 (`values.yaml:534-536`) is cpu/memory only today. If a limit is declared per Q2, a `max` for it may
@@ -192,4 +193,26 @@ splitting them would put the seam between two coders instead of inside one commi
 
 ## Amendments
 
-_(none yet — findings from the design wave land here, dated, before the coder spawns)_
+### A1 — 2026-08-04, USER DECISION: evicted-pod cleanup is manual, not a reaper
+
+The issue's `## Cleanup` section is in scope as a **one-off manual deletion by exact name** plus a
+recorded explanation of why they linger (k8s reaps terminated pods only above the control plane's
+`--terminated-pod-gc-threshold`, which is not something this repo sets). **No controller-side
+reaper.** That would be a new reconcile responsibility, a new RBAC delete verb and its own tests,
+which is a different issue from the one-line-cause defect this is.
+
+Deletion obeys CLAUDE.md's namespace rule: **exact names, never a `uzi-` glob.** The three pods are
+in `uzi-workers-docker` on dev-cluster and two are named in issue #224's Evidence section.
+
+### A2 — 2026-08-04, USER DECISION: ship tunable now, measure after
+
+Sizing order is settled even though the value is not. **Land a deliberately conservative default
+that is fully overridable from chart values** — the precedent to copy exactly is `dindResources`
+(`values.yaml:546-553` → `UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}`, with the controller's
+built-in constants as the fallback for any field left empty). dev-cluster can then tune without a
+controller release. **Then open a follow-up issue** to replace the default with a measured one once
+the fleet has run on it.
+
+This constrains the design rather than merely scheduling it: any answer to Q3 that makes the value
+a compiled-in preset field with **no** chart override does not satisfy A2. A per-size field and a
+chart override are not mutually exclusive — say how they compose if you want both.
