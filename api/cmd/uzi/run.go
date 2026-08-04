@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -69,8 +71,9 @@ var terminalRunStatuses = map[string]bool{
 	"cancelled": true,
 }
 
-// newRunCmd — `uzi run` and its verbs. list/get/logs/review are wired to the
-// Client; create/approve/reject/cancel/follow-up are stubs (M8).
+// newRunCmd — `uzi run` and its verbs. Every verb is wired to the Client: the reads
+// (list/get/logs/review/inputs) and the writes (create/approve/reject/cancel/
+// follow-up/answer).
 func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -245,11 +248,15 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if issue <= 0 {
 				return uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
 			}
+			seed, err := seededPlanFlag(env, cmd)
+			if err != nil {
+				return err
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd))
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd), seed)
 			if err != nil {
 				return err
 			}
@@ -261,6 +268,25 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("wait-on-limit", false,
 		"park this run until the Anthropic usage window reopens instead of failing it; "+
 			"omit to inherit your Settings default, or pass --wait-on-limit=false to force off")
+	// PRD #209 seeded plan. --agent-source/--exclude-agents reuse the plan gate's flag
+	// names and validation (approveSelection); both are meaningful only alongside a plan.
+	create.Flags().String("plan-file", "",
+		"seed the run with a pre-written plan from this file (or '-' for stdin), skipping "+
+			"the planning turn and the approval gate (PRD #209)")
+	create.Flags().String("agent-source", "",
+		"which subagent roster the seeded run uses: own|repo (requires --plan-file)")
+	create.Flags().StringSlice("exclude-agents", nil,
+		"subagents to drop from the chosen source (requires --agent-source and --plan-file)")
+	// PRD #209 M4 staleness guard. --planned-commit records the commit the plan was
+	// written against; the worker warns (or, with --require-base, fails) if the clone's
+	// base has moved since. Both require --plan-file, and --require-base requires
+	// --planned-commit.
+	create.Flags().String("planned-commit", "",
+		"the commit the seeded plan was written against; the worker warns if the clone's "+
+			"base has moved since (requires --plan-file)")
+	create.Flags().Bool("require-base", false,
+		"fail the run instead of warning if the clone's base differs from --planned-commit "+
+			"(requires --planned-commit)")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
@@ -469,6 +495,103 @@ func approveSelection(source string, exclude []string) (*apitypes.AgentSelection
 		return nil, uzicli.Exitf(uzicli.ExitUsage, "--agent-source must be 'own' or 'repo'")
 	}
 	return &apitypes.AgentSelection{Source: source, Exclusions: exclude}, nil
+}
+
+// maxPlanReadBytes bounds a seeded plan read from STDIN (PRD #209 M3) so a hostile
+// pipe cannot make the CLI allocate without bound. It sits ABOVE the server's
+// create-time cap (workersvc.MaxSeededPlanBytes, 256 KiB) on purpose: an over-cap plan
+// is then read whole and rejected by the server's 422, never silently truncated here
+// into a shorter plan that would look valid.
+const maxPlanReadBytes = 1 << 20 // 1 MiB
+
+// plannedCommitRe mirrors the server's workersvc.plannedCommitRe (PRD #209 M4): hex, 7-64
+// chars. The server is authoritative; this is a pre-flight so a malformed --planned-commit
+// is a clean exit-2 usage error before any request rather than a round-trip 400.
+var plannedCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
+// seededPlanFlag assembles PRD #209's optional seeded plan from the `create` flags, and
+// returns nil when no --plan-file was given (an ordinary issue-planned run, unchanged).
+//
+// It reuses approveSelection — so `--exclude-agents` without `--agent-source` is the
+// SAME usage error the plan gate raises — and mirrors the server's coupling
+// client-side: a roster flag with no --plan-file is a usage error here (the server
+// would answer 400 "agent_selection requires plan_md"), so the user gets a clean
+// message before any request is sent. The plan's size cap and empty-plan rejection stay
+// the SERVER's (422): readPlanFile forwards the bytes.
+func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) {
+	source, _ := cmd.Flags().GetString("agent-source")
+	exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
+	sel, err := approveSelection(source, exclude)
+	if err != nil {
+		return nil, err
+	}
+	plannedCommit, _ := cmd.Flags().GetString("planned-commit")
+	plannedCommit = strings.TrimSpace(plannedCommit)
+	requireBase, _ := cmd.Flags().GetBool("require-base")
+	// M4: --require-base needs a --planned-commit to compare against; without one the
+	// flag can never fire (usage error before any request, mirroring the server's 400).
+	if requireBase && plannedCommit == "" {
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"--require-base requires --planned-commit (there is no commit to compare the clone's base against)")
+	}
+	// A pre-flight mirror of the server's ErrInvalidPlannedCommit (the server is the
+	// authority): reject a --planned-commit that is not a plausible git sha before any
+	// request, so the user gets exit 2 rather than a round-trip 400. A too-short value is
+	// the load-bearing case — it would silently disarm --require-base server-side.
+	if plannedCommit != "" && !plannedCommitRe.MatchString(plannedCommit) {
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"--planned-commit must be a hex commit sha of 7-64 characters")
+	}
+	planProvided := cmd.Flags().Changed("plan-file")
+	// A roster / a planned commit / a require-base is only meaningful for a seeded plan.
+	// Reject any of them without --plan-file up front, mirroring the server's
+	// "agent_selection requires plan_md" / "planned_commit and require_base require
+	// plan_md" 400s with a clean message before any request is sent.
+	if (sel != nil || plannedCommit != "" || requireBase) && !planProvided {
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"--agent-source/--exclude-agents/--planned-commit/--require-base require --plan-file "+
+				"(they are only meaningful for a seeded plan)")
+	}
+	if !planProvided {
+		return nil, nil
+	}
+	path, _ := cmd.Flags().GetString("plan-file")
+	plan, err := readPlanFile(env, path)
+	if err != nil {
+		return nil, err
+	}
+	return &uzicli.CreateRunSeed{
+		PlanMD:        plan,
+		Selection:     sel,
+		PlannedCommit: plannedCommit,
+		RequireBase:   requireBase,
+	}, nil
+}
+
+// readPlanFile reads a seeded plan (PRD #209 M3) from a file, or from STDIN when the
+// path is "-". The file is the user's own named local input, so it is read whole; stdin
+// is bounded (maxPlanReadBytes), like resolveMessage, because a pipe is the one source
+// whose size the caller does not control.
+func readPlanFile(env Env, path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "--plan-file needs a path (use '-' to read the plan from stdin)")
+	}
+	if path == "-" {
+		if env.Stdin == nil {
+			return "", uzicli.Exitf(uzicli.ExitUsage, "no stdin to read the plan from")
+		}
+		b, err := io.ReadAll(io.LimitReader(env.Stdin, maxPlanReadBytes))
+		if err != nil {
+			return "", uzicli.Exitf(uzicli.ExitGeneric, "reading plan from stdin: %v", err)
+		}
+		return string(b), nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read plan file: %v", err)
+	}
+	return string(b), nil
 }
 
 // submitInput sends one steering input and reports the outcome. server_side (a

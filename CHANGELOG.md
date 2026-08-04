@@ -6,6 +6,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Seed a plan onto a run: `uzi run create --plan-file <plan.md>`.** A run can now
+  be created with an externally-authored plan (written locally in Claude Code),
+  skipping uzi's Phase-1 planning turn and the approval gate: the worker implements
+  the supplied plan directly and opens an MR, so the human checkpoint moves from the
+  plan gate to MR review. Optional `--agent-source` / `--exclude-agents` pick the
+  subagent roster, and `--planned-commit` / `--require-base` guard against a stale
+  base commit. The seeded plan is size-capped and secret-scrubbed; a run created
+  with no `--plan-file` is unchanged. Web run pages render a seeded run's plan. See
+  `docs/seeded-plans.md`. PRD #209.
+
 ### Changed
 
 - **Contributor tooling: MR pipelines no longer wait for the full gate before

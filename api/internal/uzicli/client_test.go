@@ -138,7 +138,7 @@ func TestHTTPClientWhoami(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer uzc_test" {
 			t.Errorf("Authorization = %q", got)
 		}
-		w.Write([]byte(`{"user":{"id":"u1","email":"a@b.c","is_admin":true},"prd_label":"PRD"}`))
+		_, _ = w.Write([]byte(`{"user":{"id":"u1","email":"a@b.c","is_admin":true},"prd_label":"PRD"}`))
 	}))
 	defer srv.Close()
 	u, err := newTestClient(srv).Whoami(context.Background())
@@ -154,7 +154,7 @@ func TestHTTPClientWhoami(t *testing.T) {
 // must NOT be turned into a 404.
 func TestHTTPClientReviewNull(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"review":null}`))
+		_, _ = w.Write([]byte(`{"review":null}`))
 	}))
 	defer srv.Close()
 	rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
@@ -165,7 +165,7 @@ func TestHTTPClientReviewNull(t *testing.T) {
 
 func TestHTTPClientReviewPresent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"review":{"id":"rv1","verdict":"needs_work","status":"failed"}}`))
+		_, _ = w.Write([]byte(`{"review":{"id":"rv1","verdict":"needs_work","status":"failed"}}`))
 	}))
 	defer srv.Close()
 	rv, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
@@ -194,7 +194,7 @@ func TestHTTPClientReviewPendingJudge(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Write([]byte(tc.body))
+				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
 			rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
@@ -228,7 +228,7 @@ func TestHTTPClientReviewPendingJudge(t *testing.T) {
 func TestHTTPClientReview404(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"error":"run not found"}`))
+		_, _ = w.Write([]byte(`{"error":"run not found"}`))
 	}))
 	defer srv.Close()
 	_, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
@@ -241,7 +241,7 @@ func TestHTTPClientReview404(t *testing.T) {
 // consumed_at through as a pointer (null → nil = Queued, set → Delivered).
 func TestHTTPClientRunInputs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"inputs":[{"id":2,"body":"b2","created_at":"2026-07-20T10:00:00Z","consumed_at":"2026-07-20T10:01:00Z"},{"id":1,"body":"b1","created_at":"2026-07-20T09:00:00Z","consumed_at":null}]}`))
+		_, _ = w.Write([]byte(`{"inputs":[{"id":2,"body":"b2","created_at":"2026-07-20T10:00:00Z","consumed_at":"2026-07-20T10:01:00Z"},{"id":1,"body":"b1","created_at":"2026-07-20T09:00:00Z","consumed_at":null}]}`))
 	}))
 	defer srv.Close()
 	in, err := newTestClient(srv).RunInputs(context.Background(), "r1")
@@ -260,7 +260,7 @@ func TestHTTPClientRunInputs(t *testing.T) {
 // panic.
 func TestHTTPClientMalformedResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"user": not-json`))
+		_, _ = w.Write([]byte(`{"user": not-json`))
 	}))
 	defer srv.Close()
 	_, err := newTestClient(srv).Whoami(context.Background())
@@ -291,7 +291,7 @@ func TestHTTPClientStatusMapping(t *testing.T) {
 	for _, tc := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(tc.status)
-			w.Write([]byte(`{"error":"x"}`))
+			_, _ = w.Write([]byte(`{"error":"x"}`))
 		}))
 		got := ExitCodeFor(func() error { _, e := newTestClient(srv).Whoami(context.Background()); return e }())
 		srv.Close()
@@ -305,7 +305,7 @@ func TestHTTPClientStatusMapping(t *testing.T) {
 func TestHTTPClient403AdminHint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte(`{"error":"admin required"}`))
+		_, _ = w.Write([]byte(`{"error":"admin required"}`))
 	}))
 	defer srv.Close()
 	_, err := newTestClient(srv).AdminListUsers(context.Background())
@@ -344,7 +344,7 @@ func TestHTTPClientRefusesRedirect(t *testing.T) {
 		if r.Header.Get("Authorization") != "" {
 			httpSawAuth.Store(true)
 		}
-		w.Write([]byte(`{"user":{"id":"leaked"}}`))
+		_, _ = w.Write([]byte(`{"user":{"id":"leaked"}}`))
 	}))
 	defer plain.Close()
 
@@ -405,7 +405,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
-		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil); return e }},
+		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil, nil); return e }},
 		{"submit-run-input", func(c *HTTPClient) error {
 			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
 			return e
@@ -418,7 +418,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 	}))
 	defer fiveHundred.Close()
 	garbage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("this is not json at all <<<"))
+		_, _ = w.Write([]byte("this is not json at all <<<"))
 	}))
 	defer garbage.Close()
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
@@ -484,7 +484,7 @@ func TestBuildInfoIsGatedByCredentialSafeBase(t *testing.T) {
 
 	t.Run("loopback http is allowed", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
+			_, _ = w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
 		}))
 		defer srv.Close()
 
@@ -502,7 +502,7 @@ func TestBuildInfoIsGatedByCredentialSafeBase(t *testing.T) {
 		var gotAuth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
-			w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
+			_, _ = w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
 		}))
 		defer srv.Close()
 
@@ -556,7 +556,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -570,6 +570,89 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}
 			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
 				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestCreateRunWireBodySeededPlan pins PRD #209's seed → wire mapping at the RAW body,
+// which the command-level (fake-client) tests cannot see. The load-bearing case is the
+// first: a nil seed must send NEITHER plan_md nor agent_selection, so a run created
+// without --plan-file is byte-identical to a pre-#209 create (Success Criterion 2).
+// Asserted on the bytes, not a decoded struct, because omitempty is precisely what a
+// decode-into-pointer would erase.
+func TestCreateRunWireBodySeededPlan(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		seed         *CreateRunSeed
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:       "nil seed omits every seed key (byte-identical to a pre-#209 create)",
+			seed:       nil,
+			wantAbsent: []string{"plan_md", "agent_selection", "planned_commit", "require_base"},
+		},
+		{
+			name:         "plan, no roster/staleness: plan_md present, the rest omitted",
+			seed:         &CreateRunSeed{PlanMD: "do the thing"},
+			wantContains: []string{`"plan_md":"do the thing"`},
+			wantAbsent:   []string{"agent_selection", "planned_commit", "require_base"},
+		},
+		{
+			name: "plan + roster: both present, selection is {source, exclusions}",
+			seed: &CreateRunSeed{
+				PlanMD:    "do it",
+				Selection: &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}},
+			},
+			wantContains: []string{`"plan_md":"do it"`, `"agent_selection":{"source":"own","exclusions":["tester"]}`},
+			wantAbsent:   []string{"planned_commit", "require_base"},
+		},
+		{
+			// PRD #209 M4: planned_commit + require_base ride the wire when set.
+			name: "plan + staleness guard: planned_commit and require_base present",
+			seed: &CreateRunSeed{
+				PlanMD:        "do it",
+				PlannedCommit: "abc123def456",
+				RequireBase:   true,
+			},
+			wantContains: []string{`"planned_commit":"abc123def456"`, `"require_base":true`},
+		},
+		{
+			// planned_commit alone (warn-only): the commit rides, require_base is omitted
+			// (omitempty on a false bool), so a warn-default seed sends no require_base key.
+			name: "plan + planned_commit only: require_base omitted (warn default)",
+			seed: &CreateRunSeed{
+				PlanMD:        "do it",
+				PlannedCommit: "abc123def456",
+			},
+			wantContains: []string{`"planned_commit":"abc123def456"`},
+			wantAbsent:   []string{"require_base"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"}}`))
+			}))
+			defer srv.Close()
+
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.seed); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(body, want) {
+					t.Errorf("body = %s, want it to contain %s", body, want)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(body, absent) {
+					t.Errorf("body = %s, want it to OMIT %q (a nil/absent field must send no key)", body, absent)
+				}
 			}
 		})
 	}

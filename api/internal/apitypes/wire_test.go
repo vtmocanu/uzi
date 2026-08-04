@@ -71,6 +71,8 @@ var runDTOKeys = []string{
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
 	"auto_approve", "worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
+	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
+	"plan_source",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict", "claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",

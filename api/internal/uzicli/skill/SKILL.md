@@ -89,7 +89,7 @@ uzi run list
 uzi run get <run-id>
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
@@ -157,6 +157,25 @@ uzi version
   (with the `=`, since a bare bool flag consumes no following word) to force it off
   for this run only. A parked run holds its issue and its worker's disk until it
   resumes, so it is opt-in rather than the default.
+
+  `--plan-file <path>` seeds the run with a plan you have already written: the worker
+  skips its own planning turn and the approval gate and implements the plan directly.
+  Pass `-` to read the plan from stdin. `--agent-source own|repo` picks the subagent
+  roster for that run (`own` = your template roster, `repo` = the agents the worker
+  detects in the clone's `.claude/agents/`), and `--exclude-agents <a,b>` drops
+  individual subagents from it. Both roster flags require `--plan-file`, and
+  `--exclude-agents` additionally requires `--agent-source` — either combination is a
+  usage error. With no roster flag a seeded run uses the repo's own agents (falling
+  back to your template roster when the clone has none). An empty plan, or one over the
+  size cap, is rejected at create time.
+
+  `--planned-commit <sha>` records the commit you wrote the plan against. After the
+  worker clones and checks out, it compares that commit to the clone's own base; if they
+  differ (the default branch moved since you planned) it warns into the run feed, naming
+  both commits, and implements anyway. `--require-base` turns that divergence into a hard
+  failure instead, so the run stops rather than implement against a base that has moved.
+  Both require `--plan-file`, and `--require-base` requires `--planned-commit` — either
+  combination is a usage error.
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own
@@ -195,6 +214,65 @@ uzi version
   consumed_at}` list (derive the state yourself: `consumed_at` null = queued,
   set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
   chat turn as a follow-up, so its queue lists them all (issue runs start empty).
+
+### Authoring a seeded plan
+
+You can go from a written PRD to an implementing run in one pass, without
+waiting on the worker's own planning turn or a human approval: plan the work
+yourself, against your own clone, then hand the plan to `run create
+--plan-file` instead of letting the worker derive one from the issue. This
+is the mechanism, in order:
+
+1. **Clone the repo and read the PRD** the issue links (`prds/<n>-slug.md`).
+   Plan the change the same way you would for any local task: which files
+   change, and how.
+2. **Write the plan to stand alone.** This is the constraint the whole
+   feature rests on. A seeded run starts **cold** — no chat session, no
+   memory of the conversation that produced the plan. `plan_md` is the
+   worker's *only* instruction. "As we discussed" or "the file we looked at"
+   means nothing to a fresh agent reading just that text. Name the files to
+   touch, the change in each, and how to tell it's done, as if handing the
+   plan to someone who has read nothing else. Any plain text works — there
+   is no required schema.
+3. **Read the roster off the clone, not from memory, if you're naming one.**
+   `--agent-source repo` means the roster in the clone's `.claude/agents/`
+   (`ls .claude/agents/` there to see it — one role per file, named by its
+   filename); `--agent-source own` means the caller's own template roster.
+   Neither is checked against the clone's actual contents at create time —
+   unlike `run approve`'s gate, the clone doesn't exist yet when you create
+   the run, so there's nothing to validate against yet. Concretely:
+   `--agent-source repo` against a clone that turns out to have no
+   `.claude/agents/` runs with **zero subagents** rather than failing, and an
+   `--exclude-agents` name that doesn't match anything in the chosen source
+   is silently a no-op, not an error. Confirm the roster from the filesystem
+   before naming it. Omit both flags to get the same default every other run
+   gets: the repo's own agents when the clone has any, else the template
+   roster.
+4. **Note the commit you planned against** — the local clone's `HEAD` at the
+   moment you finished planning (`git rev-parse HEAD`) — and pass it as
+   `--planned-commit`. The worker compares it to the clone's own resolved
+   base once it checks out; a mismatch warns into the run feed by default,
+   or fails the run first if you also pass `--require-base`.
+5. **Create the run:**
+
+   ```
+   uzi run create --repo <repo-id> --issue <issue-iid> \
+     --plan-file plan.md --agent-source repo \
+     --planned-commit $(git rev-parse HEAD)
+   ```
+
+   `-` instead of a path reads the plan from stdin. An empty plan, or one
+   over the 256 KiB cap, is rejected at create time rather than stored.
+
+**No `prds/*.md` file for this issue yet?** It still works — the plan you
+supply is what the file would have provided. The issue needs **both** the
+`PRD` label and the `PRDLESS` label: PRDLESS is the escape hatch for a PRD
+issue with no file yet, not a way to skip the PRD label itself. And if you
+just added the `PRD` label yourself, `run create` may still answer "issue
+does not carry the PRD label" until the next poller sync — going through
+the forge's own **Promote** action instead writes the label and updates
+uzi's cache in the same request, so a freshly-promoted issue is runnable
+immediately, with no wait.
 
 ### Reading and triaging the judge's review
 

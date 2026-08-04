@@ -178,6 +178,71 @@ describe("buildImplementPrompt", () => {
     const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
     assert.match(p, /No subagents are available; do the work yourself\./);
   });
+
+  // PRD #209 (Decision A): a seeded plan was AUTHORED by the user, not approved through
+  // the gate, so "Your plan was approved" is a false claim for it.
+  it("PRD #209: a seeded first turn says the user supplied the plan, not that it was approved", () => {
+    const seeded = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1, seeded: true });
+    assert.match(seeded, /created with a plan you supplied/i);
+    assert.ok(!/plan was approved/i.test(seeded), "a seeded plan was authored, not gate-approved");
+    // The rest of the implement instructions are unchanged.
+    assert.match(seeded, /signal_done/);
+    assert.match(seeded, /never push/i);
+  });
+
+  // Anti-regression (Success Criterion 2): a NON-seeded run's implement prompt is
+  // byte-identical to before. `seeded:false` and the absent field must both give the
+  // exact "Your plan was approved" opening.
+  it("PRD #209 anti-regression: a non-seeded first turn is byte-identical (Decision A)", () => {
+    const absent = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1 });
+    const explicitFalse = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1, seeded: false });
+    assert.match(absent, /Your plan was approved\./);
+    assert.strictEqual(absent, explicitFalse, "seeded:false must change nothing");
+    assert.ok(!/created with a plan you supplied/i.test(absent));
+  });
+
+  // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters implement
+  // COLD, so the amnesiac prior-work note rides the implement prompt (an ordinary run got
+  // it on the plan prompt and resumes a session that saw it).
+  it("PRD #209 (D7): a seeded cold-start carries the prior-work note on the first implement turn", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, priorWork: { commits: 2 } });
+    assert.match(p, /already carries 2 commits/);
+    assert.match(p, /Do not redo what is already committed/);
+  });
+
+  it("PRD #209 (D7): the prior-work note is first-turn-only and absent by default", () => {
+    // A later turn resumes a session that already saw it, so it is not repeated.
+    const later = buildImplementPrompt({ branch: "b", subagentNames: [], first: false, iteration: 2, priorWork: { commits: 2 } });
+    assert.ok(!/already carries/.test(later));
+    // And an ordinary first turn with no priorWork never carries it (byte-identity).
+    const none = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
+    assert.ok(!/already carries/.test(none));
+  });
+
+  // PRD #209 (M2 validation): the seeded plan BODY must reach the implement turn — the
+  // assertion the original checklist missed. A session-less seeded run is prompt-only on
+  // its first turn, so the plan has to be embedded or the model never sees it.
+  it("PRD #209 M2: a seeded first turn embeds the supplied plan as authoritative <plan> instructions", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, seededPlan: "# My plan\n- step alpha-77" });
+    assert.match(p, /<plan>/);
+    assert.match(p, /<\/plan>/);
+    assert.match(p, /step alpha-77/, "the actual plan text is present");
+    // Authoritative instructions (D5), NOT untrusted-fenced like a follow_up. With no
+    // follow-up in this prompt, the untrusted framing must be entirely absent.
+    assert.ok(!/UNTRUSTED/i.test(p), "the seeded plan is instructions, not untrusted guidance");
+  });
+
+  it("PRD #209 M2: the plan body is first-turn-only and absent when no body is supplied", () => {
+    // A later turn resumes a session that already has the plan, so it is not re-embedded.
+    const later = buildImplementPrompt({ branch: "b", subagentNames: [], first: false, iteration: 2, seeded: true, seededPlan: "# My plan" });
+    assert.ok(!/<plan>/.test(later), "no plan block on a resumed later turn");
+    // First turn but no body supplied (a seeded resume, or any non-seeded run): no block.
+    const noBody = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true });
+    assert.ok(!/<plan>/.test(noBody), "no body ⇒ no plan block");
+    // And a whitespace-only body is treated as absent (nothing to implement).
+    const blank = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, seededPlan: "   " });
+    assert.ok(!/<plan>/.test(blank));
+  });
 });
 
 describe("buildRevisePlanPrompt (PRD #41)", () => {

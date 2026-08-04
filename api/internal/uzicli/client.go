@@ -127,7 +127,7 @@ type Client interface {
 	// terminal (Reason set). POST not GET so the verifier never lands in an access log.
 	PollCLIAuth(ctx context.Context, requestID, verifier string) (CLIAuthPollResult, error)
 	// CreateRun queues an agent run on a repo's PRD issue: POST /api/repos/{id}/runs
-	// {issue_iid, wait_on_limit?}. Returns the created run.
+	// {issue_iid, wait_on_limit?, plan_md?, agent_selection?}. Returns the created run.
 	//
 	// waitOnLimit is the PRD #35 usage-limit opt-in and is TRI-STATE, which is why it
 	// is a pointer rather than a bool: nil OMITS the key, and the server then stamps
@@ -136,7 +136,13 @@ type Client interface {
 	// Collapsing the two would make every CLI-created run silently opt OUT the moment
 	// this parameter shipped, which is the exact defect the server's own field comment
 	// cites for taking a *bool.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error)
+	//
+	// seed is PRD #209's optional seeded plan: nil OMITS both plan_md and
+	// agent_selection (an ordinary run planned from the issue, byte-identical to
+	// before), and a non-nil seed always carries a plan (the server rejects a
+	// selection with no plan). The plan's size cap and empty-plan rejection are the
+	// SERVER's (422) — the client forwards the bytes so those rules live in one place.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
 	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
 	// sel is legal only with approve_plan; the server validates it against the run's
@@ -364,7 +370,7 @@ func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBod
 		// timeout, context deadline): the server is effectively unreachable.
 		return nil, nil, Exitf(ExitUnreachable, "cannot reach uzi at %s: %v", c.BaseURL, transportMsg(err))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if err != nil {
 		return nil, nil, Exitf(ExitUnreachable, "reading response from uzi: %v", err)
@@ -897,7 +903,30 @@ func pollStatusField(body []byte) string {
 	return "expired"
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error) {
+// CreateRunSeed is PRD #209's optional seeded plan for CreateRun: an
+// externally-authored plan and the run's subagent roster. Nil ⇒ an ordinary run
+// planned from the issue. It mirrors the server's workersvc.SeededPlan and keeps the
+// coupling STRUCTURAL — a Selection cannot ride without a plan, which is the server's
+// own rule ("agent_selection requires plan_md"): a nil-vs-set seed carries the choice,
+// so no CreateRun caller can express the rejected combination in the first place.
+type CreateRunSeed struct {
+	// PlanMD is the plan text, forwarded verbatim. Empty is a valid value to SEND —
+	// the server returns 422 on an empty/whitespace plan, and letting it decide keeps
+	// the scrub-and-empty rule in one place rather than duplicated client-side.
+	PlanMD string
+	// Selection is the run's roster, or nil for "no selection" (the worker then applies
+	// its default: repo agents when the clone has a roster, else own — Success Criterion 5).
+	Selection *apitypes.AgentSelection
+	// PlannedCommit is the commit the plan was written against (PRD #209 M4), forwarded on
+	// `--planned-commit`. Empty ⇒ not sent, so the worker's staleness compare stays inert.
+	PlannedCommit string
+	// RequireBase makes a base-commit divergence FAIL the run rather than warn
+	// (`--require-base`). Only meaningful with a PlannedCommit; the CLI and the server both
+	// reject it otherwise.
+	RequireBase bool
+}
+
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -907,10 +936,32 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// omitted means "inherit my default", present-and-false means "explicitly not this
 	// run". A `map[string]any` with an `if != nil` guard would work too and is worse:
 	// it puts the rule in a conditional instead of in the type.
+	//
+	// plan_md/agent_selection stay `omitempty` so a nil seed sends NEITHER key and the
+	// body is byte-identical to a pre-#209 create (Success Criterion 2). A non-nil seed
+	// always sets plan_md (via &PlanMD, so even an empty plan is SENT and the server's
+	// 422 fires) and rides the selection only when one was chosen.
+	//
+	// planned_commit/require_base (M4) are `omitempty` for the same reason — a nil seed,
+	// AND a seed that set neither, sends neither key, so the byte-identical guarantee
+	// holds for a plain --plan-file create too. planned_commit rides only when non-empty
+	// (a *string so omitempty drops it); require_base only when true.
 	reqBody := struct {
-		IssueIID    int64 `json:"issue_iid"`
-		WaitOnLimit *bool `json:"wait_on_limit,omitempty"`
+		IssueIID      int64                    `json:"issue_iid"`
+		WaitOnLimit   *bool                    `json:"wait_on_limit,omitempty"`
+		PlanMD        *string                  `json:"plan_md,omitempty"`
+		Selection     *apitypes.AgentSelection `json:"agent_selection,omitempty"`
+		PlannedCommit *string                  `json:"planned_commit,omitempty"`
+		RequireBase   bool                     `json:"require_base,omitempty"`
 	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit}
+	if seed != nil {
+		reqBody.PlanMD = &seed.PlanMD
+		reqBody.Selection = seed.Selection
+		if seed.PlannedCommit != "" {
+			reqBody.PlannedCommit = &seed.PlannedCommit
+		}
+		reqBody.RequireBase = seed.RequireBase
+	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}

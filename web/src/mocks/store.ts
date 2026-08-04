@@ -22,6 +22,7 @@ import {
   mockLimitWaitMessages,
   mockProposals,
   mockRuns,
+  mockSeededMessages,
   mockUnreadableQuestionMessages,
 } from "./data";
 
@@ -63,6 +64,9 @@ function seed(): MockState {
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
   messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
+  // PRD #209 M5: the seeded-plan demo run. Its plan rides run.plan_md (SeededPlanPanel),
+  // NOT a feed message, so this log carries none — see mockSeededMessages.
+  messages.set("run-seeded", mockSeededMessages.map((m) => ({ ...m })));
   // PRD #88: the run parked on a question the UI cannot render. Seeded rather than
   // scripted, so the empty state is reachable by URL without walking the journey.
   messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);

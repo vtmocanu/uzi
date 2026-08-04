@@ -57,6 +57,19 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
 		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
 		PlanApproved:     true,
+		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
+		// here makes this a coherent seeded-run claim — approved, no session — and is a
+		// NON-DEFAULT value for the same "wired vs present-and-zero" reason the booleans
+		// above carry true. The default 'agent' would agree with a producer that dropped
+		// the field's write.
+		PlanSource: planSourceSeeded,
+		// PRD #209 M4: the staleness guard rides every seeded claim. A NON-NULL planned
+		// commit and require_base_match:true make this a coherent guarded seeded claim and,
+		// like the values above, are non-default so a producer that dropped either write is
+		// caught. planned_base_commit is omitempty (nil ⇒ absent); require_base_match is
+		// always present (NOT NULL, no omitempty).
+		PlannedBaseCommit: strptr("abc123def4567890abc123def4567890abc12345"),
+		RequireBaseMatch:  true,
 		// PRD #35: the persisted selection rides the claim so a resumed, already-approved
 		// run keeps the exclusions the same human verdict carried. NON-EMPTY on purpose —
 		// an empty exclusions list here would agree with a producer that dropped them.

@@ -14,6 +14,9 @@
   "auto_approve": true,
   "wait_on_limit": true,
   "plan_approved": true,
+  "plan_source": "seeded",
+  "planned_base_commit": "abc123def4567890abc123def4567890abc12345",
+  "require_base_match": true,
   "agent_selection": {
     "source": "repo",
     "exclusions": [

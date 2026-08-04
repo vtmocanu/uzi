@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -50,6 +51,30 @@ import (
 // single source of truth that replaced the two mirrored consts (PRD #19 M5).
 const MaxIssueDescriptionBytes = 256 * 1024
 
+// MaxSeededPlanBytes bounds a create-time seeded plan (PRD #209 D5), mirroring
+// MaxIssueDescriptionBytes: a seeded plan is untrusted external input on the same
+// footing as a snapshotted issue body, and the same 256 KiB bound is generous for a
+// plan document while staying a secondary guard under DecodeJSON's whole-body cap.
+// Checked on the RAW input before the secret scrub, so an oversize body is rejected
+// (422) rather than scrubbed-then-measured.
+const MaxSeededPlanBytes = 256 * 1024
+
+// planSourceAgent / planSourceSeeded are the two runs.plan_source values (00095).
+// A run planned inside the worker (or predating the column) is 'agent'; a run whose
+// plan was supplied at create time over the API is 'seeded'. Named constants so the
+// plan_approved third disjunct (assembleClaim) and the create path cannot drift on a
+// bare string literal.
+const (
+	planSourceAgent  = "agent"
+	planSourceSeeded = "seeded"
+)
+
+// plannedCommitRe validates a create-time --planned-commit (PRD #209 M4): hex, between
+// git's default abbreviation floor (7) and a full sha256 (64). See ErrInvalidPlannedCommit
+// for why the bound matters (a shorter value makes the worker's prefix-tolerant --require-base
+// compare inert). The CLI carries the same pattern as a pre-flight; this is the authority.
+var plannedCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
 // Terminal run statuses. A run in any of these is finished and immutable.
 var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
@@ -70,8 +95,29 @@ var (
 	// accident, from the board or unattended from autopilot.
 	ErrNotPRDIssue         = errors.New("issue does not carry the PRD label")
 	ErrDescriptionTooLarge = errors.New("issue description is too large to run")
-	ErrActiveRunExists     = errors.New("a non-terminal run already exists for this issue")
-	ErrRunTerminal         = errors.New("run has already finished")
+	// ErrPlanTooLarge rejects a create-time seeded plan over MaxSeededPlanBytes (PRD
+	// #209 D5) → 422. Mirrors ErrDescriptionTooLarge; checked on the raw input.
+	ErrPlanTooLarge = errors.New("seeded plan is too large to run")
+	// ErrPlanEmpty rejects a seeded plan that is empty or whitespace-only at create
+	// time (PRD #209 D8) → 422. (The check runs on the secret-scrubbed text, but the
+	// scrub only ADDS the "[redacted]" marker and never deletes, so it cannot itself
+	// make a non-empty plan empty — see createRun.) Storing a blank plan_md as 'seeded'
+	// is the entry half of the D8 armed-fall-through hole: the run would reach the
+	// worker plan_approved=true with nothing to implement, plan and gate, and come back
+	// armed. Rejecting at create time closes that entry path; the plan_source='agent'
+	// write in SetRunAwaitingApproval closes every other one.
+	ErrPlanEmpty = errors.New("seeded plan is empty")
+	// ErrInvalidPlannedCommit rejects a create-time --planned-commit that is not a
+	// plausible git commit sha (PRD #209 M4) → 400. The compare in the worker is
+	// prefix-tolerant with no floor, so a 1-2 char value would spuriously match almost
+	// any base and silently make --require-base inert (a user who asked to FAIL on
+	// divergence would get a silent proceed — the unsafe direction); and there is no
+	// other length/charset bound on the field, so garbage would persist and re-deliver on
+	// every claim. Requiring hex of git's abbrev floor (7) up to a full sha256 (64) closes
+	// both. This is the authoritative gate; the CLI mirrors it as a pre-flight usage error.
+	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
+	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
+	ErrRunTerminal          = errors.New("run has already finished")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -1434,7 +1480,28 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// re-plans, re-parks at awaiting_approval in front of a human who already
 		// approved, and can fail with REASON_NO_PLAN when the resumed session declines
 		// to re-emit its plan.
-		PlanApproved: run.AutoApprove || rc.HumanPlanApproved,
+		// PRD #209 D8 adds the THIRD disjunct: a seeded run has neither auto_approve
+		// (D3 forbids overloading it) nor a consumed approve_plan (M1 asserts none
+		// exists), so without this the claim would ship plan_approved:false and the
+		// seeded-implement path (D4 row 2) would be unreachable — the feature inert.
+		// The compare is a plain string because plan_source is NOT NULL DEFAULT 'agent'
+		// (00095), deliberately so this reads `== planSourceSeeded` rather than a
+		// pgtype.Text unwrap. Soundness note: this decouples plan_approved from plan_md's
+		// provenance, which SetRunAwaitingApproval's plan_source='agent' write re-couples
+		// (see GetRunClaimContext's invariant block and runtime.sql D8 comment).
+		PlanApproved: run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded,
+		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
+		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes
+		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker
+		// ignores the key.
+		PlanSource: run.PlanSource,
+		// PRD #209 M4 staleness guard: the commit the seeded plan was written against and
+		// whether a divergence should fail the run. Read from the runs row like PlanSource,
+		// so both re-deliver unchanged on every resume. PlannedBaseCommit is nil for a run
+		// that supplied no commit (the compare is then inert); RequireBaseMatch is a plain
+		// bool (NOT NULL DEFAULT false), false for every non-opted-in run.
+		PlannedBaseCommit: textPtr(run.PlannedBaseCommit),
+		RequireBaseMatch:  run.RequireBaseMatch,
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
@@ -2815,12 +2882,16 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // Decision 3): the handler sets it from the fresh forge snapshot's labels + the
 // prdless settings, and it exempts this run from the HasPrdLink gate. The
 // one-non-terminal-run-per-issue index rejects a duplicate active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
 	// override the user's own Settings choice with false.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, waitOnLimit)
+	//
+	// seed nil ⇒ an ordinary run planned from the issue (PRD #209): plan_source stays
+	// 'agent' and the run behaves byte-identically to a pre-#209 run (Success Criterion
+	// 2). Non-nil ⇒ a seeded-plan run that skips Phase 1 and the gate.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, waitOnLimit, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -2836,16 +2907,108 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // enforced structurally, not by two implementations that could drift.
 func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
 	// nil: an autopilot run has no human in the loop to express a per-run choice, so
-	// it takes the owner's default (PRD #35 Decision 7 / design brief 7.3).
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, nil)
+	// it takes the owner's default (PRD #35 Decision 7 / design brief 7.3). The final
+	// nil is the seeded plan: autopilot NEVER seeds — it derives its plan in Phase 1
+	// exactly as before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, nil, nil)
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+// SeededPlan carries a create-time externally-authored plan and its optional agent
+// selection (PRD #209). A run created with a SeededPlan skips the Phase-1 planning
+// turn and the approval gate: the worker implements PlanMD directly. Nil for an
+// ordinary run planned from the issue alone.
+type SeededPlan struct {
+	// PlanMD is the externally-authored plan. Untrusted input (D5): capped and
+	// secret-scrubbed before storage, and an empty/whitespace plan is rejected (D8).
+	PlanMD string
+	// Selection is the run's subagent roster, persisted through the SAME columns the
+	// human plan gate writes (agent_source / agent_exclusions). Nil ⇒ the run makes no
+	// selection, so the worker's resolveAgentSelection default applies: repo agents
+	// when the clone has a roster, else own (Success Criterion 5). Validated for SHAPE
+	// only at create time — the clone roster is unknown here (Open Question 1).
+	Selection *AgentSelection
+	// PlannedCommit is the commit the external planner planned against (PRD #209 M4),
+	// forwarded on `uzi run create --planned-commit`. Empty ⇒ no planned commit was
+	// supplied, so the worker's staleness compare is inert. Stored verbatim (full or
+	// abbreviated SHA); the worker compares it prefix-tolerantly to the clone's base.
+	PlannedCommit string
+	// RequireBase, when true, makes a base-commit divergence FAIL the run rather than
+	// warn into the feed (`uzi run create --require-base`, PRD #209 M4, Open Question 3).
+	// Only meaningful with a PlannedCommit to compare against — the handler rejects it
+	// otherwise.
+	RequireBase bool
+}
+
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
 	if len(description) > MaxIssueDescriptionBytes {
 		return store.Run{}, ErrDescriptionTooLarge
+	}
+	// Seeded-plan validation (PRD #209 D5/D8), also pure input validation, so checked
+	// alongside the description cap and BEFORE the repo/issue gates. The four run
+	// columns default to the not-seeded state — a NULL plan_md, plan_source 'agent', a
+	// NULL selection — which is exactly a pre-#209 run and satisfies Success Criterion
+	// 2 by construction.
+	planMD := pgtype.Text{}
+	planSource := planSourceAgent
+	agentSource := pgtype.Text{}
+	var agentExclusions []byte
+	// M4 staleness-guard columns default to the not-seeded state: no planned commit
+	// (NULL) and warn-only (false). Only a seeded run created with --planned-commit /
+	// --require-base overrides them below.
+	plannedBaseCommit := pgtype.Text{}
+	requireBaseMatch := false
+	if seed != nil {
+		// D5: cap the RAW input first (mirrors ErrDescriptionTooLarge — reject, do not
+		// truncate), THEN scrub secrets, THEN reject an empty/whitespace result. The cap
+		// is on the RAW input deliberately — capping after the scrub could let an oversize
+		// body through if the scrub happened to shrink it. The empty check, by contrast,
+		// is ORTHOGONAL to the scrub: secretscrub.Scrub replaces each matched secret with
+		// the non-empty marker "[redacted]" and deletes nothing, so it can never turn a
+		// non-empty plan into an empty one (a plan that is only a leaked secret is stored
+		// as "[redacted]", NOT blanked or rejected). So this rejects a genuinely empty or
+		// whitespace-only plan; running it on the scrubbed text is equivalent to running
+		// it on the raw and just stays correct if the scrub ever gains a deleting rule.
+		if len(seed.PlanMD) > MaxSeededPlanBytes {
+			return store.Run{}, ErrPlanTooLarge
+		}
+		scrubbed := secretscrub.Scrub(seed.PlanMD)
+		if strings.TrimSpace(scrubbed) == "" {
+			return store.Run{}, ErrPlanEmpty
+		}
+		planMD = pgText(scrubbed)
+		planSource = planSourceSeeded
+		if seed.Selection != nil {
+			sel := *seed.Selection
+			// Shape only — no roster exists at create time (Open Question 1). A source
+			// that is not 'repo'/'own' would otherwise hit the agent_source CHECK
+			// constraint as a 500; a malformed exclusion name would persist unchecked.
+			if err := validateSelectionShape(sel); err != nil {
+				return store.Run{}, err
+			}
+			agentSource = pgText(sel.Source)
+			enc, err := encodeJSONArray(sel.Exclusions)
+			if err != nil {
+				return store.Run{}, fmt.Errorf("encode seeded agent exclusions: %w", err)
+			}
+			agentExclusions = enc
+		}
+		// M4: the commit the plan was written against. Trimmed, then validated as a
+		// plausible git sha (hex, 7-64) and stored TRIMMED. Empty ⇒ NULL, and the worker's
+		// staleness compare is inert. The validation is load-bearing, not cosmetic: the
+		// worker compare is prefix-tolerant with no floor, so an unvalidated 1-2 char value
+		// would match almost any base and silently disarm --require-base (ErrInvalidPlannedCommit).
+		// require_base_match only ever fires alongside a planned commit; the handler rejects
+		// require_base without planned_commit.
+		if pc := strings.TrimSpace(seed.PlannedCommit); pc != "" {
+			if !plannedCommitRe.MatchString(pc) {
+				return store.Run{}, ErrInvalidPlannedCommit
+			}
+			plannedBaseCommit = pgText(pc)
+		}
+		requireBaseMatch = seed.RequireBase
 	}
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2912,6 +3075,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// keep the behaviour it was created with, so flipping the default later cannot
 		// retroactively change a run already in flight.
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
+		// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
+		// all zero-valued to the not-seeded state above unless seed != nil. The M4
+		// staleness-guard pair (planned_base_commit, require_base_match) is here for the
+		// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
+		// silently opt every seeded run out of the fail-on-divergence behaviour.
+		PlanMd:            planMD,
+		PlanSource:        planSource,
+		AgentSource:       agentSource,
+		AgentExclusions:   agentExclusions,
+		PlannedBaseCommit: plannedBaseCommit,
+		RequireBaseMatch:  requireBaseMatch,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

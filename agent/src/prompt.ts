@@ -580,6 +580,20 @@ export interface ImplementPromptInput {
   first: boolean;
   /** The current implement⇄review iteration (1-based). */
   iteration: number;
+  /** PRD #209 (Decision A): this run's plan was supplied by the user at create time,
+   *  so the FIRST implement turn opens by saying so rather than "Your plan was
+   *  approved" — nobody approved a seeded plan through the gate. FIRST TURN ONLY; an
+   *  approved (non-seeded) run's prompt is byte-identical to before. */
+  seeded?: boolean;
+  /** PRD #209 (M2 validation): the seeded plan BODY to carry out, embedded on the FIRST
+   *  implement turn. A session-LESS seeded run (row 2 cold start, and a requeued seeded
+   *  run whose transcript was dropped) has no plan turn and no resumed session holding the
+   *  plan, so without this the model never sees it and falls back to the issue. Set ONLY
+   *  on that session-less seeded path — a seeded RESUME already has the plan in its session
+   *  and every non-seeded path leaves this absent, so the resume/gated prompts are
+   *  unchanged. It is AUTHORITATIVE instructions (D5), rendered in a plain <plan> block —
+   *  NOT untrusted-fenced like a follow_up; the deny-hook is the backstop. */
+  seededPlan?: string;
   /** A queued user correction to fold into this turn, if any (untrusted). */
   followUp?: string;
   /** #157: the per-dir outcome of the worker's dependency install, known by the time
@@ -598,6 +612,14 @@ export interface ImplementPromptInput {
   baseCommit?: string;
   /** The default branch's tip. See baseCommitNote. */
   defaultBranchCommit?: string;
+  /** PRD #209 (D7): prior pushed work on this branch, for a SEEDED cold-start implement.
+   *  A requeued seeded run whose transcript was dropped never saw a plan turn, so the
+   *  amnesiac note an ordinary run got in its plan prompt must ride the implement prompt
+   *  instead. FIRST TURN ONLY, like deps/baseCommit; absent ⇒ no note. An ordinary run's
+   *  implement prompt never carried this (the sdk-executor threads it on the pre-approved
+   *  path only), so this is additive rather than a change to the approved-run prompt.
+   *  See priorWorkNote. */
+  priorWork?: PriorWork;
 }
 
 /**
@@ -608,14 +630,45 @@ export interface ImplementPromptInput {
 export function buildImplementPrompt(input: ImplementPromptInput): string {
   const lines: string[] = [];
   if (input.first) {
-    lines.push(
-      "Your plan was approved. Implement it now on the current branch, delegating to",
-      "your subagents and iterating until the review passes.",
-    );
+    if (input.seeded) {
+      // PRD #209 (Decision A): a seeded run's plan was AUTHORED by the user, not
+      // approved through the gate, so "Your plan was approved" would be a false claim.
+      lines.push(
+        "This run was created with a plan you supplied. Implement it now on the current",
+        "branch, delegating to your subagents and iterating until the review passes.",
+      );
+    } else {
+      lines.push(
+        "Your plan was approved. Implement it now on the current branch, delegating to",
+        "your subagents and iterating until the review passes.",
+      );
+    }
   } else {
     lines.push(
       "Continue the implementation. Address any remaining review findings, keep",
       "iterating between your subagents until the review passes.",
+    );
+  }
+  // PRD #209 (D7): the amnesiac cold-start note, first turn only. Ordinary runs carry
+  // this on the PLAN prompt and resume a session that saw it; a seeded run requeued
+  // after its transcript was dropped had no plan turn, so it rides here. Empty (nothing
+  // pushed) ⇒ nothing added, so a non-seeded run's prompt is unchanged.
+  const priorNote = input.first ? priorWorkNote(input.priorWork) : "";
+  if (priorNote) lines.push("", priorNote);
+  // PRD #209 (M2 validation): a session-less seeded run starts implement COLD, so the
+  // user's plan text must ride THIS prompt or the model never sees it. It is the plan to
+  // carry out — AUTHORITATIVE instructions (D5), a plain <plan> block, NOT untrusted-fenced
+  // like a follow_up; the deny-hook is the backstop. First turn only, and only when the
+  // caller supplied a body (the session-less seeded path); a resume/gated turn leaves it
+  // absent and this adds nothing.
+  if (input.first && input.seededPlan?.trim()) {
+    lines.push(
+      "",
+      "The plan to implement is below, between the <plan> and </plan> tags. It is the plan",
+      "you supplied for this run — carry it out:",
+      "<plan>",
+      input.seededPlan,
+      "</plan>",
     );
   }
   lines.push(delegatesLine(input.subagentNames));

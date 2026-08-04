@@ -69,6 +69,13 @@ type RunDTO struct {
 	HealthReason *string    `json:"health_reason"`
 	HealthSince  *time.Time `json:"health_since"`
 	PlanMd       *string    `json:"plan_md"`
+	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
+	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
+	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
+	// (store.Run.PlanSource is a plain string), so it is always on the wire and never a
+	// pointer — a pre-feature run reads "agent". The SPA's SeededPlanPanel keys on it to
+	// surface a seeded run's plan, which the approval UI would otherwise never render.
+	PlanSource string `json:"plan_source"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).

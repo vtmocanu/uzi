@@ -43,4 +43,10 @@ test("ci_fix claim wire contract: worker parses the server's ci_fix shape", () =
   assert.equal(job.name, "unit");
   assert.equal(job.stage, "test");
   assert.equal(typeof job.log_tail, "string");
+
+  // PRD #209: an ordinary (worker-planned) run carries plan_source "agent" — the
+  // DEFAULT and the value that leaves the session/approval discriminator unchanged.
+  // Pinned here as the non-seeded counterpart to the seeded golden in
+  // claim-skills-contract.test.ts.
+  assert.equal(claim.plan_source, "agent");
 });

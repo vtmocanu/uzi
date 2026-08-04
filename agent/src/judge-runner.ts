@@ -390,7 +390,10 @@ export function buildJudgePrompt(trace: JudgeTraceResponse, signal: JudgeSignal 
 }
 
 // sampleMessages renders the message list to a char-budgeted string, keeping the head
-// and tail (where the plan gate and the delivery live) when the middle overflows.
+// and tail when the middle overflows. The head holds the run's opening — the plan gate
+// for a normal run, but the implement opening with NO gate for a SEEDED run (PRD #209,
+// whose plan was authored at create time), and the tail holds the delivery; head+tail
+// captures the opening and the outcome either way.
 function sampleMessages(messages: WorkerRunMessage[]): string {
   const render = (m: WorkerRunMessage): string => {
     const who = m.agent ? `${m.kind}/${m.agent}` : m.kind;

@@ -601,24 +601,35 @@ export class SdkExecutor implements Executor {
     let resumeId = ctx.sessionId ?? undefined;
 
     try {
-      // --- PRD #35 Decision 6b: resume past an approval that already happened ---
+      // --- PRD #35 Decision 6b + PRD #209 D4: skip planning for an approved plan ---
       //
-      // Both conditions are required and the runner supplies both. `planApproved`
-      // alone is not enough: without a resumable session there is no conversation to
-      // continue, and without the plan text the implement loop would start with no
-      // instructions. Either missing ⇒ fall through and plan as today, which is also
-      // what a park BEFORE approval does.
+      // Fires when the plan is approved, there is plan text to implement, AND either a
+      // resumable session exists (PRD #35: resume past an approval that already happened)
+      // OR the run is SEEDED (PRD #209: the user authored the plan at create time).
+      // `planApproved` alone is not enough: without EITHER a session or a seeded plan
+      // there is no basis to skip, and without the plan text the implement loop would
+      // start with no instructions. All missing ⇒ fall through and plan as today, which
+      // is also what a park BEFORE approval does.
       //
-      // Skipping the gate here is NOT a weakening of the approval guardrail. The
-      // approval already happened, on this exact plan, and is recorded server-side as
-      // a consumed approve_plan input (or the run is autopilot). What is skipped is
-      // asking a human to approve the SAME plan a second time because the worker lost
-      // a token window — the alternative is not "more oversight", it is a run that
-      // parks at awaiting_approval unattended and can then die on REASON_NO_PLAN when
-      // the resumed session declines to re-emit signal_plan.
+      // The seeded relaxation does not weaken the session guard — it removes a guard that
+      // never applied. `!!ctx.sessionId` exists to stop a NON-seeded run whose transcript
+      // was dropped from skipping planning (it must re-plan — D4 row 3), but a seeded run
+      // never had a session, so "no session" is its normal state rather than a lost one.
+      // The runner already encodes this: it sets ctx.planApproved only when
+      // plan_approved && (sessionId || seeded), so a dropped-transcript non-seeded run
+      // arrives here with planApproved=false and this branch is not taken.
+      //
+      // Skipping the gate is NOT a weakening of the approval guardrail. For a PRD #35
+      // resume the approval already happened on this exact plan (a consumed approve_plan
+      // input, or autopilot). For a seeded run the plan is the USER'S OWN, supplied
+      // through an authenticated create call — there was never a gate to skip, because
+      // the human authored the plan instead of approving a worker's. Either way what is
+      // skipped is asking a human to approve a plan they already own; the alternative for
+      // a seeded run is not "more oversight" but a run that parks unattended and can die
+      // on REASON_NO_PLAN.
       const preApproved =
         ctx.planApproved === true &&
-        !!ctx.sessionId &&
+        (!!ctx.sessionId || ctx.seeded === true) &&
         !!ctx.approvedPlan?.trim();
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
@@ -700,11 +711,17 @@ export class SdkExecutor implements Executor {
       const budget = { asked: 0 };
 
       if (preApproved) {
+        // PRD #209: distinguish an externally-supplied (seeded) plan from a PRD #35
+        // resume so the transcript records the provenance rather than leaving it
+        // inferable. Both phrasings carry "skipping the planning turn and the approval
+        // gate" (the M6 e2e pins that substring); a non-seeded resume is unchanged.
         ctx.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: "resuming an already-approved plan — skipping the planning turn and the approval gate",
+            text: ctx.seeded
+              ? "implementing a user-supplied plan (seeded) — skipping the planning turn and the approval gate"
+              : "resuming an already-approved plan — skipping the planning turn and the approval gate",
           },
         });
         approvedPlan = ctx.approvedPlan!;
@@ -963,6 +980,22 @@ export class SdkExecutor implements Executor {
       });
 
       // --- Phase 2: implement ⇄ review loop --------------------------------
+      // PRD #209 (M2 validation): the seeded plan BODY must reach the first implement turn.
+      // A session-less seeded run (row 2 cold start, or a requeued seeded run whose
+      // transcript was dropped) has no plan turn AND no resumable session carrying the plan,
+      // so without this the model never sees the user's plan and falls back to the issue —
+      // defeating the feature. Gated on the ABSENCE of a session: a seeded RESUME already
+      // has the plan in its session (byte-identical), and every non-seeded path leaves this
+      // undefined. buildImplementPrompt embeds it first-turn-only, as authoritative
+      // instructions (D5), never untrusted-fenced. The gate is embedSeededPlan (extracted
+      // so its defense-in-depth `seeded` term is testable — see that function's doc).
+      const seededPlanBody = embedSeededPlan({
+        preApproved,
+        seeded: ctx.seeded === true,
+        hasSession: !!ctx.sessionId,
+      })
+        ? approvedPlan
+        : undefined;
       let iteration = 0;
       let followUp: string | undefined;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
@@ -985,6 +1018,14 @@ export class SdkExecutor implements Executor {
             subagentNames: selectedNames,
             first: iteration === 1,
             iteration,
+            // PRD #209 (Decision A): a seeded run's first-turn opening says the user
+            // supplied the plan, not that it was "approved". First turn only (gated
+            // inside buildImplementPrompt); false/absent for every non-seeded run.
+            seeded: ctx.seeded,
+            // PRD #209 (M2 validation): the seeded plan body, embedded first-turn-only.
+            // Undefined for every path except the session-less seeded cold start (see
+            // seededPlanBody above), so resume/gated implement prompts are unchanged.
+            seededPlan: seededPlanBody,
             followUp,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn
@@ -996,6 +1037,11 @@ export class SdkExecutor implements Executor {
             // lead hands a subagent a diff command, which is where the wrong one was seen.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
+            // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
+            // implement COLD — no plan turn carried the prior-work note. Threaded on the
+            // pre-approved path ONLY, so an ordinary gated run's implement prompt is
+            // byte-identical to before (it never carried this). First turn only.
+            priorWork: preApproved ? ctx.priorWork : undefined,
           }),
           state,
           idleMs,
@@ -1611,6 +1657,30 @@ export function resolveLeadModel(
   templateModel?: string,
 ): string | undefined {
   return configModel || templateModel || undefined;
+}
+
+/**
+ * PRD #209 (M2 validation): whether to embed the seeded plan BODY in the FIRST implement
+ * prompt. True only for a session-less seeded pre-approved run — the row-2 cold start, and
+ * a requeued seeded run whose transcript was dropped — which has no planning turn and no
+ * resumable session carrying the plan. A seeded RESUME already has the plan in its session,
+ * and a non-preApproved run never gets here.
+ *
+ * The `seeded` term is DEFENSE IN DEPTH and today REDUNDANT: `preApproved` already implies
+ * `(session || seeded)`, so `preApproved && !session` implies `seeded`. It is kept — and
+ * this predicate is EXTRACTED from run() — precisely so the currently-unreachable
+ * `{preApproved, !seeded, !session}` combination is testable independently of how
+ * `preApproved` is derived. No executor-driven test can observe the term's removal (that
+ * state cannot occur through the real `preApproved`); a direct unit test on this function
+ * can, so if a future change ever decoupled `preApproved` from `(session || seeded)` the
+ * guard that refuses to hand a NON-seeded run an authoritative <plan> block stays pinned.
+ */
+export function embedSeededPlan(args: {
+  preApproved: boolean;
+  seeded: boolean;
+  hasSession: boolean;
+}): boolean {
+  return args.preApproved && args.seeded && !args.hasSession;
 }
 
 /**

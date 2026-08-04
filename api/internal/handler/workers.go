@@ -321,6 +321,7 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		HealthReason:     textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
 		HealthSince:      timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
+		PlanSource:       r.PlanSource,
 		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ClaimedAt:        timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
@@ -696,6 +697,22 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// against a start-run modal on 2026-07-27); the per-run toggle is
 		// PUT /api/runs/{id}/wait-on-limit.
 		WaitOnLimit *bool `json:"wait_on_limit"`
+		// PRD #209 seeded plan: an externally-authored plan and its optional agent
+		// roster. A POINTER so absence (an ordinary run planned from the issue) stays
+		// distinct from an empty string (a blank plan, which createRun rejects 422). The
+		// web board start button omits both; the CLI `uzi run create --plan-file` sets
+		// them (M3).
+		PlanMd         *string                   `json:"plan_md"`
+		AgentSelection *workersvc.AgentSelection `json:"agent_selection"`
+		// PRD #209 M4 staleness guard: the commit the plan was written against, and
+		// whether a divergence should fail the run rather than warn. PlannedCommit is a
+		// POINTER so its absence is distinct from an empty string. Both are meaningful
+		// ONLY alongside a plan_md (they describe a seeded run), and RequireBase is
+		// meaningful only alongside a PlannedCommit — rejected below otherwise. The web
+		// board omits both; the CLI `uzi run create --planned-commit/--require-base` sets
+		// them.
+		PlannedCommit *string `json:"planned_commit"`
+		RequireBase   bool    `json:"require_base"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -731,9 +748,46 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
 	allowWithoutPRD := prdlessEnabled && slices.Contains(issue.Labels, prdlessLabel)
 
+	// PRD #209: assemble the optional seeded plan. agent_selection is only meaningful
+	// alongside a plan (it is the roster for the seeded implement run); a selection
+	// with no plan is a confused request — the run would plan and gate normally, where
+	// the selection is made anyway — so reject it here rather than persist a pointless
+	// pre-gate selection. The plan itself is capped/scrubbed/empty-checked in CreateRun.
+	var plannedCommit string
+	if req.PlannedCommit != nil {
+		plannedCommit = *req.PlannedCommit
+	}
+	var seed *workersvc.SeededPlan
+	if req.PlanMd != nil {
+		seed = &workersvc.SeededPlan{
+			PlanMD:    *req.PlanMd,
+			Selection: req.AgentSelection,
+			// PRD #209 M4: the planned-against commit and the fail-on-divergence toggle.
+			// Both ride only with a plan_md (rejected below otherwise).
+			PlannedCommit: plannedCommit,
+			RequireBase:   req.RequireBase,
+		}
+	} else if req.AgentSelection != nil {
+		httpx.Error(w, http.StatusBadRequest, "agent_selection requires plan_md")
+		return
+	} else if req.PlannedCommit != nil || req.RequireBase {
+		// PRD #209 M4: a planned_commit / require_base with no plan_md is a confused
+		// request — the staleness guard describes a seeded run, and there is none here.
+		// Rejected consistently with "agent_selection requires plan_md" above.
+		httpx.Error(w, http.StatusBadRequest, "planned_commit and require_base require plan_md")
+		return
+	}
+	// require_base is meaningful only with a planned_commit to compare against — without
+	// one the flag can never fire. Reject it rather than silently persist a guard that is
+	// inert by construction (the CLI raises the same usage error before it gets here).
+	if seed != nil && req.RequireBase && strings.TrimSpace(seed.PlannedCommit) == "" {
+		httpx.Error(w, http.StatusBadRequest, "require_base requires planned_commit")
+		return
+	}
+
 	// The description cap is enforced inside CreateRun (shared with the autopilot
 	// path), surfaced here as ErrDescriptionTooLarge → 422.
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit)
+	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit, seed)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -742,6 +796,22 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
 		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
+		case errors.Is(err, workersvc.ErrPlanTooLarge):
+			// PRD #209 D5: the seeded plan exceeds the create-time cap.
+			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is too large to run")
+		case errors.Is(err, workersvc.ErrPlanEmpty):
+			// PRD #209 D8: the seeded plan is empty, or the secret scrub reduced it to
+			// whitespace. Never stored as a blank 'seeded' plan.
+			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
+		case errors.Is(err, workersvc.ErrInvalidPlannedCommit):
+			// PRD #209 M4: --planned-commit is not a plausible commit sha (hex, 7-64).
+			// A 400 (malformed input), like ErrInvalidSelection below.
+			httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
+		case errors.Is(err, workersvc.ErrInvalidSelection):
+			// PRD #209: the agent_selection is malformed (bad source or exclusion name).
+			// Roster-existence is NOT checked here — the clone roster is unknown at
+			// create time (Open Question 1); the worker resolves that.
+			httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 		case errors.Is(err, workersvc.ErrNotPRDIssue):
 			// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it
 			// for the same reason the gate is ordered that way in createRun: telling

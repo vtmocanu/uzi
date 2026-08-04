@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
@@ -2031,6 +2031,114 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
       assert.strictEqual(probe.gated.length, 1, "the gate must still run");
     });
   }
+
+  // ── PRD #209 D4: the `seeded` axis ─────────────────────────────────────────
+  // The loop above is the two-way discriminator. Adding `seeded` makes "no session"
+  // stop being a single verdict: without it a dropped transcript re-plans (row 3),
+  // WITH it the user-authored plan is implemented directly (row 2).
+
+  // Row 2 (NEW): approved + NO session + SEEDED ⇒ skip and implement. This is the case
+  // the old `&& sessionId` guard wrongly blocked. A seeded plan is approved with no
+  // session by construction (the user authored it), so there is no session to lose.
+  it("skips the gate for a seeded run with no session (D4 row 2)", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ ...preApproved, sessionId: null, seeded: true });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, [], "a seeded run must not call gatePlan");
+    assert.strictEqual(turns.length, 1, "no planning turn should run for a seeded plan");
+    assert.ok(
+      probe.emits.some((m) => String((m.payload as { text?: unknown }).text ?? "").includes("seeded")),
+      "the feed records that the plan was supplied externally (seeded)",
+    );
+  });
+
+  // Row 3 (NAMED REGRESSION — Success Criterion 3): a dropped session that is NOT seeded
+  // must still re-plan. A transcript lost mid-flight is not a seeded plan and must never
+  // be treated as one, even though both arrive as "approved, no session".
+  it("still plans for a dropped session that is NOT seeded (D4 row 3, Success Criterion 3)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ ...preApproved, sessionId: null, seeded: false });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(
+      probe.gated.length,
+      1,
+      "row 3 must still gate — a dropped transcript is never a seeded plan",
+    );
+  });
+});
+
+// ── PRD #209 (M2 validation): the seeded plan BODY reaches the implement turn ──────
+// The gap the original checklist missed. `ctx.approvedPlan` was read only by the
+// skip-gate condition and the ci_fix check — never passed to buildImplementPrompt. A
+// session-less seeded run's first implement turn is fresh and prompt-only, so without the
+// body in that prompt the model never sees the user's plan and falls back to the issue.
+// These assert on the prompt TEXT the executor streamed to the SDK (turns[i].promptText),
+// which is the only channel that proves the wiring — the stub harness feeds no model.
+describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 M2)", () => {
+  const PLAN = "# Seeded plan\n- do the uniquely-worded thing zqx42";
+
+  it("embeds the plan text in the first implement prompt for a session-less seeded run", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, seeded: true, sessionId: null, approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(turns.length, 1, "only the implement turn runs (no planning turn)");
+    assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the user's plan");
+    assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
+  });
+
+  it("does NOT re-embed the plan for a seeded RESUME — the session already carries it", async () => {
+    // sessionId present ⇒ a resume; the plan lives in the resumed session, so re-injecting
+    // it would be redundant and the resume prompt must stay unchanged apart from the opening.
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, seeded: true, sessionId: "sess-parked", approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /<plan>/, "a resume must not re-embed the plan body");
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /zqx42/);
+  });
+
+  it("does NOT embed a plan for an ordinary gated (non-seeded) run", async () => {
+    // Not approved/seeded ⇒ it gates; the implement prompt (turns[1], after the planning
+    // turn) must be byte-unaffected — buildImplementPrompt never carried a plan before.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /<plan>/, "a gated run's implement prompt is unchanged");
+  });
+});
+
+// ── PRD #209 (M2 validation, auditor-m2 delta): pin the DEFENSE-IN-DEPTH `seeded` term ──
+// The seeded-plan-body gate is `preApproved && seeded && !session`. The `seeded` term is
+// today REDUNDANT — `preApproved` already implies `(session || seeded)`, so `preApproved &&
+// !session` implies `seeded`, and NO executor-driven test can observe the term's removal
+// (the {preApproved, !seeded, !session} state is unreachable through the real preApproved:
+// a non-seeded dropped-session run is row 3 ⇒ planApproved=false ⇒ never preApproved). The
+// gate was extracted into `embedSeededPlan` precisely so that combination is testable
+// directly. Removing `args.seeded` from embedSeededPlan reddens the last case here and
+// nothing else — which is exactly why the term needs its own test.
+describe("embedSeededPlan — the seeded-plan-body gate (PRD #209 M2)", () => {
+  it("embeds only for a session-less seeded pre-approved run", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: true, hasSession: false }), true);
+  });
+  it("does NOT embed for a seeded RESUME — the session already carries the plan", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: true, hasSession: true }), false);
+  });
+  it("does NOT embed when the run is not pre-approved", () => {
+    assert.equal(embedSeededPlan({ preApproved: false, seeded: true, hasSession: false }), false);
+  });
+  // The load-bearing one: a NON-seeded, session-less, pre-approved run. Unreachable through
+  // today's `preApproved`, but if a future change decoupled it from `(session || seeded)`,
+  // this is the state the `seeded` term alone must refuse — so a non-seeded run can never be
+  // handed an authoritative <plan> block. Removing `args.seeded` from embedSeededPlan makes
+  // THIS assertion fail (verified by mutation) while every integration test stays green.
+  it("refuses a NON-seeded session-less pre-approved run (pins the defense-in-depth term)", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: false, hasSession: false }), false);
+  });
 });
 
 // --- Plan-turn write-tool subtraction (#203) ----------------------------------

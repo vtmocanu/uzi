@@ -53,6 +53,67 @@ import { installJsDeps } from "./js-deps.js";
 const MAX_FAILURE_REASON_LEN = 512;
 
 /**
+ * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
+ * user planned against AND the run was created with --require-base (PRD #209 M4, Open
+ * Question 3). The runner catches it on the generic failure path and reports `failed`
+ * with this message, which names both commits. Without --require-base a divergence only
+ * warns into the feed and the run implements anyway. The message carries commit SHAs
+ * only, never a secret.
+ */
+export class BaseCommitDivergedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseCommitDivergedError";
+  }
+}
+
+/**
+ * Whether a planned-against commit and the clone's resolved base name the SAME commit,
+ * tolerant of git's abbreviated SHAs (PRD #209 M4): a match when either is a prefix of
+ * the other, compared case-insensitively. Both sides must be non-empty — an empty side is
+ * never a match, so a missing base never reads as "matches everything". Equality is the
+ * degenerate prefix case, so it is covered without a special branch.
+ */
+export function baseCommitsMatch(planned: string, actual: string): boolean {
+  const a = planned.trim().toLowerCase();
+  const b = actual.trim().toLowerCase();
+  if (a === "" || b === "") return false;
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * Evaluate a seeded run's base-commit staleness (PRD #209 M4). It is the whole staleness
+ * decision, factored out of the runner so the fail path is directly testable by TYPE (the
+ * runner swallows the throw on its generic failure path, so a runner-level test can only
+ * see the resulting `failed` state, not the error class). Returns:
+ *   - `undefined` when there is no planned commit, or it matches the clone's base
+ *     (prefix-tolerant) — the caller proceeds silently;
+ *   - a warning STRING naming both commits when they diverge and `requireBase` is false —
+ *     the caller emits it to the feed and implements anyway;
+ * and THROWS BaseCommitDivergedError when they diverge and `requireBase` is true, so the
+ * caller lets it reach the run-failure path and never implements against a diverged base.
+ */
+export function evaluateBaseStaleness(
+  plannedBase: string | undefined,
+  actualBase: string,
+  requireBase: boolean,
+): string | undefined {
+  if (!plannedBase || baseCommitsMatch(plannedBase, actualBase)) return undefined;
+  const detail =
+    `the seeded plan was written against commit ${plannedBase}, but this clone's ` +
+    `base commit is ${actualBase}`;
+  if (requireBase) {
+    throw new BaseCommitDivergedError(
+      `${detail}; --require-base is set, so this run will not implement against a diverged base`,
+    );
+  }
+  return (
+    `${detail}; the plan may reference files that have moved since it was written — ` +
+    `implementing anyway (create the run with --require-base to stop instead)`
+  );
+}
+
+/**
  * What the per-run executor factory yields for one execution (PRD #42 Decisions
  * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
  *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
@@ -445,18 +506,53 @@ export class RunRunner {
           },
         });
       }
-      // Tell the lead whenever the branch it is standing on already carries commits it
-      // did not make this turn, so the honest degradation never becomes silently
-      // duplicated work. PRD #218 M3 widened this: it fired ONLY when the resume was
-      // dropped, which missed the case this PRD is about — the session survives but the
-      // TREE was recovered from the tracking ref (or was prior pushed work), where the
-      // lead equally needs to know its branch is not empty. `priorCommits > 0` alone is
-      // the condition now; a fresh run reading its own empty first-attempt branch counts
-      // 0 and gets nothing.
+      // Tell the lead whenever the branch it is standing on already carries commits it did
+      // not make this turn, so the honest degradation never becomes silently duplicated work.
+      // PRD #218 M3 widened the condition to `priorCommits > 0` alone: it previously fired
+      // ONLY when the resume was dropped, which missed the case where the session survives but
+      // the TREE was recovered from the tracking ref (or is prior pushed work), where the lead
+      // equally needs to know its branch is not empty. A fresh run reading its own empty
+      // first-attempt branch counts 0 and gets nothing.
+      //
+      // PRD #209 D7: this note normally reaches the lead in the PLANNING prompt, but a
+      // session-less SEEDED run has no planning turn, so it rides the IMPLEMENT prompt instead
+      // (threaded on the pre-approved path) — otherwise a requeued seeded run whose transcript
+      // was dropped would re-implement cold on a branch that already carries pushed commits,
+      // with no prior-work note.
       const priorWork =
         runnerClone.priorCommits > 0
           ? { commits: runnerClone.priorCommits }
           : undefined;
+
+      // PRD #209 (D4): a SEEDED run's plan was authored by the user at create time, so
+      // it is approved with NO server-side approve_plan input and — on a fresh seeded
+      // run — no SDK session. That is a legitimate "approved, no session" state, NOT the
+      // dropped-transcript one the `&& sessionId` guard below protects against: there
+      // was never a session to lose. The runner is the layer that can tell the two apart
+      // (it holds the preflight result), so it folds `seeded` into planApproved here
+      // rather than leaving the executor to read the claim.
+      const seeded = claim.plan_source === "seeded";
+
+      // PRD #209 M4 — staleness guard. A seeded run carries the commit the user planned
+      // against (claim.planned_base_commit). evaluateBaseStaleness compares it to the
+      // clone's resolved base (runnerClone.baseCommit, the same field forwarded into
+      // RunContext below): only a seeded run sets planned_base_commit, so an ordinary run
+      // yields undefined and proceeds silently. On a divergence it either returns a warning
+      // to emit (default) or, under --require-base (claim.require_base_match), THROWS
+      // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
+      // fails the run, so it never implements against a diverged base (Open Question 3).
+      const staleWarning = evaluateBaseStaleness(
+        claim.planned_base_commit ?? undefined,
+        runnerClone.baseCommit,
+        claim.require_base_match ?? false,
+      );
+      if (staleWarning) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: staleWarning },
+        });
+      }
 
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report
@@ -527,14 +623,19 @@ export class RunRunner {
         // on this worker (issue #105).
         sessionId,
         priorWork,
-        // PRD #35 Decision 6b. The RUNNER is the only layer that knows all three
-        // facts, which is why it resolves them here rather than the executor reading
-        // the claim: the server said the plan is approved, a session id arrived, and
-        // issue #105's transcript check did NOT drop it (`sessionId` is cleared above
-        // when it did). Passing plan_approved through unconditionally would make the
-        // executor skip planning for a run whose session is gone — the one case where
-        // it must plan.
-        planApproved: (claim.plan_approved ?? false) && !!sessionId,
+        // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
+        // all the facts, which is why it resolves them here rather than the executor
+        // reading the claim: the server said the plan is approved, and EITHER a session
+        // id arrived that issue #105's transcript check did NOT drop (`sessionId` is
+        // cleared above when it did) OR the run is SEEDED. Passing plan_approved through
+        // on a dropped-session NON-seeded run would make the executor skip planning for a
+        // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
+        // seeded run (D4 row 2) is approved with no session by construction, and that is
+        // fine because there was never a session to lose.
+        planApproved: (claim.plan_approved ?? false) && (!!sessionId || seeded),
+        // PRD #209: the executor relaxes its own session guard for a seeded run and
+        // emits the "plan supplied externally" feed line off this.
+        seeded,
         approvedPlan: claim.plan_md ?? undefined,
         // The persisted selection, replayed on the claim (PRD #35). Passed through
         // unconditionally rather than gated on planApproved: it is the run's

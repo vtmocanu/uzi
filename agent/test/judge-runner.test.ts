@@ -180,6 +180,105 @@ describe("JudgeRunner", () => {
   });
 });
 
+// ── PRD #209 M6: the judge handles a SEEDED (planless-gate) trace cleanly ─────
+//
+// A seeded run reuses kind='issue' (D2) but differs from a Phase-1 run in exactly
+// the two ways the judge scaffolding touches: (1) `plan_md` is the USER's plan, and
+// judge-runner.ts still delivers it into the header; (2) `inputs` is EMPTY — there is
+// no `approve_plan` steering entry — and the head of the message list holds the
+// implement opening, not an approval gate. The concern the PRD names is that the judge
+// must not PENALIZE the seeded run for having no gate. There is no LLM in a unit test,
+// so the deterministic, non-vacuous form of "no recommendation cites a missing plan"
+// is two facts the scaffolding must satisfy: the plan REACHES the judge (so "missing
+// plan" is factually false to it), and nothing in the pipeline SYNTHESIZES a plan
+// recommendation. Both are asserted below, plus the verdict-schema-parses end to end.
+const seededTrace: JudgeTraceResponse = {
+  target: {
+    id: "seeded-target-1",
+    kind: "issue", // D2: seeded reuses the issue kind
+    status: "completed",
+    issue_title: "Wire the seeded surface",
+    issue_description: "d",
+    branch: "agent/issue-90",
+    mr_iid: 42,
+    failure_reason: null,
+    fix_verdict: null,
+    // The USER's plan, authored at create time — the judge must see THIS.
+    plan_md: "# Seeded plan\n\n- write the marker file\n- open the MR against main",
+    iteration_count: 1,
+    repo_agents: null,
+  },
+  // The load-bearing seeded property: NO approve_plan input. The steering log is empty.
+  inputs: [],
+  // The head holds the implement opening (the seeded skip line), NOT an approval gate;
+  // the tail holds the delivery. This is the seeded message shape sampleMessages' head/
+  // tail comment now calls out explicitly — and the assertions prove buildJudgePrompt is
+  // well-formed regardless.
+  messages: [
+    {
+      seq: 1,
+      kind: "status",
+      agent: "worker",
+      payload: { text: "implementing a user-supplied plan (seeded) — skipping the planning turn and the approval gate" },
+      created_at: "2026-08-04T00:00:00Z",
+    },
+    {
+      seq: 2,
+      kind: "text",
+      agent: "coder",
+      payload: { text: "coder: implemented the change" },
+      created_at: "2026-08-04T00:00:01Z",
+    },
+    {
+      seq: 3,
+      kind: "text",
+      agent: "worker",
+      payload: { text: "stub work committed locally" },
+      created_at: "2026-08-04T00:00:02Z",
+    },
+  ],
+};
+
+describe("JudgeRunner — seeded (planless-gate) trace (PRD #209 M6)", () => {
+  it("delivers the seeded plan into the prompt and omits the empty steering log", () => {
+    const prompt = buildJudgePrompt(seededTrace, null);
+    // (1) The plan reaches the judge (judge-runner.ts's header still emits t.plan_md).
+    // Given the plan, the judge has no factual basis to recommend "a plan is missing".
+    assert.match(prompt, /Plan:/, "the seeded plan must be delivered under a Plan header");
+    assert.ok(
+      prompt.includes("write the marker file"),
+      "the seeded plan BODY must reach the judge, not just a header",
+    );
+    // (2) Empty inputs ⇒ the steering-log section is gracefully omitted, not rendered
+    // as an empty or misleading block that reads as "no plan was steered/approved".
+    assert.ok(
+      !prompt.includes("Steering log"),
+      "a seeded run's empty steering log must be omitted, never rendered as an absence to penalize",
+    );
+    // The prompt is still well-formed: the untrusted-trace fence carries its nonce.
+    assert.match(prompt, /<untrusted_trace_[0-9a-f]{16}>/, "the trace is still nonce-fenced");
+  });
+
+  it("parses the verdict end to end and synthesizes NO plan recommendation", async () => {
+    const { client, calls } = fakeClient(seededTrace);
+    // A clean model verdict for a well-run seeded run: ok, no recommendations. With NO
+    // judge_signal on the claim either, the ONLY sources of recommendations (the model
+    // and the command-not-found fallback) both contribute none — so a recommendation
+    // citing a missing plan cannot appear through any deterministic path.
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "clean seeded run", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ target_run_id: "seeded-target-1", judge_signal: null }));
+
+    // The verdict schema parses (Success-criterion half: "the verdict schema parses").
+    assert.equal(calls.review?.review.status, "complete", "a real model verdict parsed for a seeded trace");
+    assert.equal(calls.review?.review.verdict, "ok");
+    // No recommendation cites a missing plan — the pipeline injects none, and the model
+    // returned none. Empty is the strongest statement of "nothing penalized the gap".
+    assert.deepEqual(calls.review?.review.recommendations, [], "no recommendation is synthesized for a seeded (planless-gate) run");
+    assert.equal(calls.state?.body.status, "completed");
+  });
+});
+
 describe("parseReview", () => {
   it("parses a fenced JSON block", () => {
     const r = parseReview('```json\n{"verdict":"ok","summary":"s","recommendations":[]}\n```', "haiku");

@@ -70,7 +70,9 @@ headless path. **In GitLab CI, `UZI_TOKEN` must be a masked variable.**
 ```
 uzi login | logout | auth token [--with-token] | auth status | whoami
 uzi run list | get <id> | logs <id> [--follow] [--after <seq>]
-uzi run create --repo <id> --issue <iid>
+uzi run create --repo <id> --issue <iid> [--plan-file <path>]
+                [--agent-source own|repo] [--exclude-agents a,b]
+                [--planned-commit <sha>] [--require-base]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run cancel <id>
@@ -110,11 +112,23 @@ A few worth knowing:
 - **`token` is list-only, and `worker set-token` is the one write near it.**
   See [Anthropic tokens](#anthropic-tokens) below for why the split falls
   exactly there.
+- **`run create --plan-file <path>` seeds the run with a plan you already
+  wrote**, skipping the planning turn and the approval gate entirely — the
+  worker implements it directly. Pass `-` to read the plan from stdin. See
+  [Seeding a plan](./seeded-plans.md) for the full walkthrough, including the
+  constraint that matters most: the plan must stand on its own, since a
+  seeded run starts with no session and no memory of how it was written.
+  `--agent-source`/`--exclude-agents` (below) and `--planned-commit`/
+  `--require-base` (the base-commit staleness guard) are all optional and all
+  require `--plan-file`; an empty or oversized plan is rejected at create
+  time. A run created with no `--plan-file` is unchanged.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/`), and `--exclude-agents a,b` drops individual
   subagents from that source. `--exclude-agents` requires `--agent-source`.
+  `run create --plan-file` takes the same two flags, for the seeded run's
+  roster.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open

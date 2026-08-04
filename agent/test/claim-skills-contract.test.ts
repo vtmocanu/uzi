@@ -66,6 +66,18 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.equal(claim.wait_on_limit, true);
   assert.equal(claim.plan_approved, true);
   assert.equal(claim.plan_md, "# Plan\n");
+  // PRD #209: the plan_source discriminator rides the same claim, top-level alongside
+  // plan_approved. This golden models a SEEDED run — approved with no approve_plan input
+  // — so the pair the worker's D4 discriminator reads (plan_approved + plan_source) is
+  // pinned across the language boundary. Typing the parse as ClaimResponse also makes
+  // `npm run typecheck` fail if plan_source is dropped from protocol.ts.
+  assert.equal(claim.plan_source, "seeded");
+  // PRD #209 M4: the staleness-guard pair the runner reads after checkout rides the same
+  // seeded claim — the commit the plan was written against, and whether a divergence should
+  // fail the run. Pinned across the language boundary; typing the parse as ClaimResponse
+  // also makes `npm run typecheck` fail if either field is dropped from protocol.ts.
+  assert.equal(claim.planned_base_commit, "abc123def4567890abc123def4567890abc12345");
+  assert.equal(claim.require_base_match, true);
 
   // Config caps ride the claim (no worker-side hardcoded drift).
   assert.equal(claim.config?.skill_max_bytes, 65536);

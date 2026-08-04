@@ -305,6 +305,9 @@ type Run struct {
 	RateLimitType         pgtype.Text        `json:"rate_limit_type"`
 	OpenQuestionID        pgtype.Text        `json:"open_question_id"`
 	ReviseCount           int32              `json:"revise_count"`
+	PlanSource            string             `json:"plan_source"`
+	PlannedBaseCommit     pgtype.Text        `json:"planned_base_commit"`
+	RequireBaseMatch      bool               `json:"require_base_match"`
 }
 
 type RunMessage struct {
