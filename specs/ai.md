@@ -18247,3 +18247,150 @@ these unmet and has no other way to learn they were known:
   out, because a pod already `Failed`/`Succeeded` is deleted with period 0.
 - **The CLI needs no change**, checked rather than assumed: `api/cmd/uzi/` exposes no hosted-worker
   size or spec surface.
+
+## 482. PRD #103 M5 MR-C — dependency-vuln gating is DELIBERATELY NOT in `task gate`, folds into existing per-toolchain jobs, and inherits a release-block nobody's diff can escape
+
+MR-C closes the `security scan` slot's dependency half — `govulncheck` for both Go modules,
+`npm audit --audit-level=high` for both npm packages. **`human.md` untouched, no entry proposed**,
+same ground as §464-474: contributor tooling, no API/schema/worker/UI. The user set three
+constraints here (npm audit runs the FULL tree not `--omit=dev`; the release-blocking CVE property
+is accepted; Decision 9's single-source-of-recipes) — all **process/design** constraints, not
+product requirements, so none belongs in `human.md`. What a rebuild must reproduce:
+
+- **🔴 THE FOUR VULN CHECKS ARE THE ONE TOOLCHAIN CLASS EXCLUDED FROM `task gate`, ON A GROUND THE
+  EXISTING EXCLUSION LIST DOES NOT COVER (Success Criterion 1 amendment).** Every other exclusion
+  in that criterion is "cannot run meaningfully from a plain local checkout" (kaniko, helm,
+  store-it's Postgres, e2e). These four run fine locally — `task vulncheck` runs all four. They are
+  excluded because **their verdict is a function of a REMOTE MUTABLE advisory database, not of the
+  tree**: two runs of one commit with nobody's diff between them can disagree, and a contributor's
+  `task gate` must be deterministic against the tree. The tempting shorter reason ("gate is offline
+  anyway") is measurably FALSE — `lint:api`, `deadcode:api`, `scan:secrets` are all pinned `go run
+  pkg@version` and need the network on a cold cache (`GOPROXY=off` → rc 201). Do not write the false
+  version: it would invite "fixing" gitleaks out of `gate:repo` on the same reasoning. They live as
+  `vulncheck:{api,controller,web,agent}`, aggregated by `task vulncheck`.
+- **🔴 ZERO NEW CI JOBS — the four checks fold into EXISTING per-toolchain jobs as extra script
+  lines**, exactly the way `deadcode:api` already rides `lint:api` (§474). `vulncheck:api` /
+  `vulncheck:controller` append to `lint:api` / `lint:controller`; `vulncheck:web` /
+  `vulncheck:agent` append to `validate:web` / `validate:agent`. This corrects a Decision-3 error:
+  `govulncheck` had been listed among the repo-wide lint-stage jobs, but it is **per-Go-module**
+  (`govulncheck ./...` from a module root), not repo-wide. `.gate_needs` / `.publish_needs` are
+  byte-identical before and after (13 and 15 entries), verified by parsing not grepping (§470).
+- **🔴 THE THREE GATE SCRIPTS FAIL CLOSED — exit 2 = instrument failure, exit 1 = findings, 0 =
+  clean** (`scripts/{govulncheck,npm-audit,deps-check}-gate.sh`), the same 2/1/0 convention M2-M4
+  set, because this repo's silent-green history is the whole reason the milestone exists. Four
+  blocking defects were found by validators, each invisible in a green gate, each a fail-OPEN hole:
+  - **govulncheck failed open via a 3-line `GOPACKAGESDRIVER` stub** returning an empty package set
+    — "No vulnerabilities found" at rc=0 over a genuinely CALLED vuln. Same class as `GITLEAKS_CONFIG`
+    (`scan-secrets.sh` already refuses it). Both env vars now refused, exit 2; `GOFLAGS` refused
+    NARROWLY (`-tags` only) so the documented `-buildvcs=false` export survives.
+  - **A registry outage was classified as "there are advisories"** — `npm run --silent audit`
+    suppressed npm's own error line so the unreachable-registry branch fell through to findings. The
+    findings branch now requires a POSITIVE observation, not a fall-through.
+  - **A one-file `.npmrc` or an invisible `NPM_CONFIG_OMIT` disarmed the npm audit gate at exit 0.**
+    Closed by `--include=dev` on the command line IN THE VERSION-CONTROLLED TASKFILE TARGET (a CI job
+    script would be editable in the same invisible place as the attack). This is also why npm audit
+    runs the FULL tree, not `--omit=dev` (user ruling 1): the omit surface is an attack surface.
+  - The durable generalisation of these belongs in `docs/dev-conventions.md`: **a gate script names
+    the environment variables that can shrink its view, and refuses them** — three tools, three
+    variables (`GITLEAKS_CONFIG`, `NPM_CONFIG_OMIT`, `GOPACKAGESDRIVER`/`GOFLAGS`), one shape.
+- **🔴 `web` GATES AT `--audit-level=high`, LEAVING TWO react-router MODERATE ADVISORIES IN A RUNTIME
+  DEPENDENCY PERMANENTLY UNGATING — a deliberate, filed deferral (issue #226), not an oversight.**
+  No patched 6.x exists (`fixAvailable: true` is npm's flag for *a fixed version exists somewhere*,
+  not *`npm audit fix` will do it*), and the 6→7 major is out of MR-C's scope. The residual is
+  mitigated STRUCTURALLY, and the mitigation's invariant is what the follow-up must carry: the
+  constructor-injection advisory is structurally unreachable (no `createBrowserRouter` /
+  `createHashRouter` / `RouterProvider`, no SSR data-router), and both open-redirect advisories are
+  blocked at the only attacker-controlled sink by `safeNextPath` (rejects the backslash vector,
+  tested). **`safeNextPath` is a per-call-site guard**, so any future `navigate(<value from a URL or
+  the server>)` reopens the hole without touching react-router — that is the invariant, not a router
+  version.
+- **🔴 THE RELEASE-BLOCKING PROPERTY IS INHERITED, AND ACCEPTED (user ruling 4).** The four vuln
+  checks ride host jobs that are in `.publish_needs`, so a newly-published CVE can redden a `v*` tag
+  publish with **nobody's diff** — a green MR, then a red tag days later because an advisory landed.
+  This is the flip side of folding into existing jobs rather than adding advisory-only ones: the
+  release-block comes free with the membership. Accepted rather than worked around; the alternative
+  (a separate `allow_failure` advisory job) is the "warning nobody acts on" Decision 3 rejects.
+
+## 483. PRD #103 M5 MR-C — the `deps-check` staleness slot is TWO checks because each is blind exactly where the other sees, and vitest is EXACT-pinned 2→4
+
+The staleness slot that runs FIRST in `gate:web` / `gate:agent`, plus the pin that provoked it.
+Same `human.md` position as §482. This slot exists because a git pull can leave `node_modules`
+disagreeing with the lockfile, so a stale checkout runs **vitest 2 while the lockfile says 4**,
+green, and every downstream gate measures the wrong tree.
+
+- **🔴 IT IS TWO CHECKS, NOT ONE, BECAUSE NEITHER ALONE COVERS THE REAL STALE STATE — MEASURED, 1 OF
+  6 DEPENDENCY CHANGES CAUGHT BY THE FIRST CHECK ALONE.** The brief floated "`npm ls` OR a
+  lockfile-vs-`node_modules` join" as alternatives; they are complementary and the milestone ships
+  both:
+  - **`npm ls --depth=0`** detects a stale DIRECT dependency — `package.json` declares a range the
+    installed tree violates, rc=1 with `<pkg>@X invalid: "Y" from the root project` naming both
+    versions. **But it is INERT for a lockfile-only transitive bump** at any depth: measured against
+    this MR's own lockfile-only commit `1c751ae3`, all five vulnerable agent versions were installed,
+    `package.json` unchanged, and `npm ls --depth=0` returned rc=0 with none of the five appearing.
+    "`npm ls` is the staleness check" (the brief's phrase) is FALSE on its own.
+  - **A lockfile-vs-`node_modules` join on the INTERSECTION** of the two version maps
+    (`join -t$'\t' … | awk -F'\t' '$2!=$3'`) catches exactly that transitive case — including web's
+    high-severity postcss (installed 8.5.16 vs lockfile 8.5.25). The intersection is load-bearing: a
+    raw diff of the two files gives ~370 spurious rows because the committed lockfile enumerates the
+    full transitive closure while `node_modules/.package-lock.json` records only what is installed.
+  - **Keep both, do not swap** — `npm ls` names the declared-range violation the join cannot see (a
+    `package.json` edit with no reinstall leaves `node_modules` self-consistent), and the join names
+    the lockfile-only bump `npm ls` walks straight past. Offline, no registry.
+- **vitest is pinned EXACT `2.1.9`→`4.1.10`, not `^`.** The pin is what makes the staleness slot
+  necessary and what settled M6's open design question (§484): `environmentMatchGlobs` is **absent**
+  from 4.1.10 (2.1.9 has it untagged, 3.0.0 has it `@deprecated`+runtime-warn, 4.1.10 has zero
+  occurrences — settled against three package tarballs, not doc prose), and `test.workspace` was
+  removed in 4 and throws. So the environment split had to move to `test.projects`, which only exists
+  once vitest 4 is installed — which is why M5 and M6 ship together. Five vulnerable transitive npm
+  versions were cleared to `agent` `total=0` by explicit pins in the same lockfile-only work, never
+  by `npm audit fix --force`.
+
+## 484. PRD #103 M6 — coverage is MEASURED not thresholded, the jsdom/node split is keyed by EXCLUSION with the docblock pragma winning, and the coverage regex has two silent constraints
+
+M6 adds coverage reporting and the vitest environment split. `human.md` untouched, same ground as
+§482-483. Decision 6 is the spine: **measure before thresholding**. What a rebuild must reproduce:
+
+- **🔴 COVERAGE IS REPORTED, NEVER GATED — Decision 6 honoured STRUCTURALLY, not by a disabled
+  threshold.** `-coverprofile` for both Go modules, `vitest --coverage` (`@vitest/coverage-v8`
+  added) for web; cobertura artifacts on `test:api` / `test:controller` / `test:web`; percentages
+  visible on every MR via GitLab's `coverage:` regex. **No failing threshold anywhere** — a follow-up
+  picks per-package floors once real numbers are known, starting with security-critical packages
+  (`internal/store`, secretbox, PAT redactor), not a global floor. Nothing in those jobs can fail on
+  the number. **No new CI job**: coverage rides the three existing `test:*` jobs, already in both
+  needs lists (job count 27→27, established by parsing), so "is a coverage job a gate job" never
+  arises.
+- **🔴 THE MR WIDGET'S SINGLE PERCENTAGE IS AN UNWEIGHTED MEAN OVER JOBS, NOT REPO COVERAGE**
+  (`app/models/ci/pipeline.rb`: `coverage_array.sum / size`) — it weights a 437-block module equally
+  with an 11920-block one. Recorded in `.coverage_notes`, the CHANGELOG and `docs/dev-conventions.md`
+  so nobody quotes it as a repo figure.
+- **🔴 THE `coverage:` REGEX HAS TWO SILENT CONSTRAINTS, both measured in RE2 (GitLab's own engine):
+  NO `^` anchor and NO capturing group.** `output: prefixed` makes every line `[test:api] total: …`,
+  so both anchored variants match nothing; and GitLab requires all groups non-capturing while RE2
+  accepts a capturing group happily, so the wrong form passes when tested locally. The first draft had
+  both errors — this is not derivable from the config and must be re-derived by test, not by eye.
+- **🔴 THE jsdom/node SPLIT: `src/lib` + `src/mocks` → node, everything else under `src/` → jsdom,
+  EXPRESSED WITH `exclude` NOT AN ENUMERATED LIST.** Exclusion is load-bearing: a new top-level
+  directory defaults INTO jsdom rather than being collected by no project at all (silently untested).
+  `extends: true` carries `testTimeout: 20000` and `setupFiles` into both projects — without it both
+  silently vanish (not revert), verified by asserting the wrong value and reading the runner, not by a
+  passing suite.
+- **🔴 THE DOCBLOCK PRAGMA OUTRANKS `test.projects`, settled by MEASUREMENT on 4.1.10 after two
+  validators directly conflicted and neither could settle it until vitest 4 was installed.** A
+  `projects` entry with `environment: "node"` does NOT move a pragma-carrying file; one with
+  `"jsdom"` DOES move a pragma-less one. This is what makes the mixed `src/lib` (6/42) and `src/mocks`
+  (8/14) directories safe — the 14 pragma-carrying files there cannot be moved to node by a
+  directory-keyed split — and it is not readable from the config. Acceptance criterion: the per-file
+  environment census is byte-identical before and after (same sha256, 76 jsdom / 42 node), chosen
+  because it holds under EITHER answer to the precedence question, so a wrong partition is detectable.
+  New measured fact: `environmentMatchGlobs` on 4.1.10 is SILENTLY IGNORED (rc=0, no error), not
+  thrown.
+- **`testTimeout` stays 20000 suite-wide; two slow RunView tests carry a per-test 120000 cap.**
+  Tripling the hang-detection ceiling for 1658 tests to accommodate 2 is the wrong trade — the
+  per-test cap is the scoped fix (matches the `web/vite.config.ts` history already recorded in
+  CLAUDE.md).
+- **`-race` on `test:controller` was already landed (`f9b1f27f`, pulled forward into MR-C) and
+  VERIFIED not redone** — green on both runs, so Decision 3's `allow_failure` branch was not needed.
+  `test:api` already had `-race`; controller was the last Go module without it. The one honest gap,
+  `suspected` not measured: the cobertura DIFF ANNOTATIONS (percentages are measured; annotations need
+  the first pipeline, since they depend on the runner's `<CI_BUILDS_DIR>/<PROJECT_PATH>/…` source-path
+  shape).
