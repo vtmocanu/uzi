@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-04
+
 ### Added
 
 - **Seed a plan onto a run: `uzi run create --plan-file <plan.md>`.** A run can now
