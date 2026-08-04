@@ -188,3 +188,39 @@ true
 {{- $d.nonRootlessImage -}}
 {{- end -}}
 {{- end -}}
+
+{{- /*
+  uzi.quantityBytes: a Kubernetes resource quantity ("20Gi", "512Mi", "10G") as a
+  number of bytes, so two of them can be COMPARED. Helm has no quantity type and
+  sprig has no parser for one, and the strings cannot be compared directly: "20Gi" >
+  "800Gi" lexically, and "20Gi" vs "20000M" is a real inequality no string compare
+  finds. Callers wrap it in `float64` (it returns a rendered string) and use `gt`/`lt`.
+
+  🔴 IT FAILS CLOSED, AND THAT IS THE WHOLE REASON IT IS A HELPER RATHER THAN THREE
+  LINES AT THE CALL SITE. The obvious version of this — regex the digits, look the
+  suffix up in a table, multiply — returns 0 for anything it does not understand,
+  because a missing dict key multiplies to zero. Measured while writing it: "20GB"
+  (a plausible typo for 20G) rendered as 0, silently. A guard built on that would let
+  every malformed quantity through as "smaller than everything", i.e. it would pass
+  precisely the misconfigurations it exists to catch, and it would look like it was
+  working. Both the digits and the suffix are therefore checked explicitly and a
+  failure is a `fail`, not a fallback.
+
+  Binary suffixes are powers of 1024 and decimal ones powers of 1000, per the
+  Kubernetes quantity spec; `m` (milli) is included for completeness even though no
+  storage value uses it. Exponent notation ("2e3") is NOT supported — the API accepts
+  it, nothing in this chart writes it, and a silent misparse is worse than a refusal.
+*/ -}}
+{{- define "uzi.quantityBytes" -}}
+{{- $q := . | toString | trim -}}
+{{- $num := regexFind "^[0-9]+(\\.[0-9]+)?" $q -}}
+{{- if eq $num "" -}}
+{{- fail (printf "uzi.quantityBytes: %q is not a Kubernetes resource quantity (expected a number optionally followed by Ki/Mi/Gi/Ti/Pi or k/M/G/T/P, e.g. \"20Gi\")" $q) -}}
+{{- end -}}
+{{- $suffix := trimPrefix $num $q -}}
+{{- $factors := dict "" 1.0 "m" 0.001 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "P" 1e15 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 -}}
+{{- if not (hasKey $factors $suffix) -}}
+{{- fail (printf "uzi.quantityBytes: %q in %q is not a valid quantity suffix (expected one of Ki/Mi/Gi/Ti/Pi, k/M/G/T/P, or none — note the unit is case-sensitive, so \"Gi\" not \"gi\" and \"G\" not \"GB\")" $suffix $q) -}}
+{{- end -}}
+{{- mulf (float64 $num) (get $factors $suffix) -}}
+{{- end -}}

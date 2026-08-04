@@ -99,4 +99,48 @@
 {{- fail (printf "workers.docker.rootless=false but the selected DinD image %q is a rootless (-dind-rootless) image — a rootless image cannot run under the non-rootless posture (it crash-loops needing unprivileged userns, the exact node prerequisite rootless:false exists to avoid). Use a non-rootless -dind image (or unset workers.docker.image to take the pinned nonRootlessImage)." $img) }}
 {{- end }}
 {{- end }}
+{{- /*
+  PVC-SIZE vs LimitRange `max` FAIL-GUARD (issue #224, audit A12.1).
+
+  A per-worker PVC size larger than its tier's limitRange.maxPVCStorage is admissible
+  NOWHERE and detectable NOWHERE, and the failure is the exact shape #224 exists to fix.
+  Traced with workers.docker.dindDataSize: 40Gi against maxPVCStorage: 20Gi — `helm
+  template` renders clean, the controller boots clean (its own validation checks only
+  that the string PARSES, and it cannot know the chart's max), RenderPVCs emits the
+  claim, limitranger rejects it, the materializer returns before the Deployment is
+  created, and the reconcile loop logs into a void nothing reads. Nothing is reported to
+  the api. The worker never appears, forever, retrying every tick. That is
+  preset.go's worker-that-provisions-and-never-appears, and this converts it into a
+  `helm install` error naming both values.
+
+  IT IS WRITTEN AGAINST THE `max`, NOT AGAINST ONE CLAIMANT, so a future PVC gains
+  coverage by being added to the list rather than by someone remembering this file
+  exists. The default sits EXACTLY on the ceiling today (dindDataSize 20Gi ==
+  maxPVCStorage 20Gi), which is why `gt` and not `ge`: equal is the shipped, correct
+  configuration.
+
+  🔴 WHAT THIS CANNOT SEE, stated because a guard's blind spot is the thing that gets
+  assumed away: the OTHER two claimants are compiled into the controller, not supplied
+  by the chart. `nixSize` (20Gi, also exactly on the ceiling, on BOTH tiers) and each
+  preset's DataSize (`l` = 20Gi, likewise) are Go constants, and a chart cannot read
+  them. Duplicating them into values.yaml was rejected deliberately — it would make the
+  chart a fourth place preset quantities appear and the only one with no golden gating
+  it, which is the ungated-skew class preset.go's own header exists to prevent. They are
+  guarded on the Go side instead, by TestPresetPVCSizesFitTheChartsLimitRangeMax, which
+  carries maxPVCStorage as a documented constant and fails if a preset outgrows it. The
+  two halves together cover all three claimants; neither covers all three alone.
+*/ -}}
+{{- if and .Values.workers.docker.enabled .Values.workers.docker.limitRange.enabled }}
+{{- $max := .Values.workers.docker.limitRange.maxPVCStorage }}
+{{- $maxBytes := float64 (include "uzi.quantityBytes" $max) }}
+{{- /* name -> value, so the failure names the key an operator has to edit. */ -}}
+{{- $claimants := dict "workers.docker.dindDataSize" .Values.workers.docker.dindDataSize }}
+{{- range $key, $size := $claimants }}
+{{- if $size }}
+{{- if gt (float64 (include "uzi.quantityBytes" $size)) $maxBytes }}
+{{- fail (printf "%s=%s exceeds workers.docker.limitRange.maxPVCStorage=%s. The claim would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean, the controller boots clean, and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log. Raise workers.docker.limitRange.maxPVCStorage to at least %s (and raise workers.docker.quota.requestsStorage with it, or the tier runs out of storage budget instead), or lower %s." $key $size $max $size $key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

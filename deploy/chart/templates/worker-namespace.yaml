@@ -74,14 +74,16 @@ metadata:
   requests.* key is counted but never enforced: a pod declaring nothing for it is
   admitted and contributes zero.
 
-  Sized against the fleet: 20 x `m` = 10 CPU / 40Gi requested, and 20 x (10Gi data +
-  20Gi nix) = 600Gi of PVC. Storage is the binding constraint, not CPU or memory.
-  dev-cluster's real budget is M6's rollout conversation.
+  Sized against the fleet at its WORST CASE: 20 workers = 10 CPU / 40Gi requested, and
+  20 x (20Gi data + 20Gi nix) = 800Gi of PVC. Storage is the binding constraint, not
+  CPU or memory. dev-cluster's real budget is M6's rollout conversation.
 
-  The nix term is 20Gi, not the 4Gi this comment carried until issue #224: PRD #87
-  bumped nixSize and did not follow it here, leaving the tier able to hold 9 of the
-  20 workers it advertises. The arithmetic and values.yaml's copy of it move together
-  whenever nixSize or a preset's DataSize does.
+  The data term is `l`'s 20Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
+  this comment carried until issue #224. Nothing scopes a size to a tier, so any of
+  these 20 workers may be an `l`; sizing on `m` capped the tier at 15 of the 20 it
+  advertises, and PRD #87's nixSize bump was never followed here at all. The
+  arithmetic and values.yaml's copy of it move together whenever nixSize or a preset's
+  DataSize does.
 */}}
 ---
 apiVersion: v1

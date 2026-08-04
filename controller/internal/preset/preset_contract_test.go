@@ -198,6 +198,57 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 	}
 }
 
+// The Go half of the PVC-size-vs-LimitRange guard (issue #224, audit A12.1).
+//
+// A per-worker PVC larger than its namespace's limitRange.maxPVCStorage is rejected by
+// the limitranger admission plugin, and NOTHING surfaces that: the chart renders clean,
+// this controller boots clean, the materializer returns before the Deployment is
+// created, and the reconcile loop retries every tick with the reason only in its log.
+// The worker provisions and never appears — the failure this package's own header
+// describes, arriving through a size instead of through a name.
+//
+// WHY THE CHECK IS SPLIT ACROSS TWO REPOS' WORTH OF TOOLING, since that is the part
+// worth understanding before someone "unifies" it. Three things claim a PVC per worker:
+//
+//	dindDataSize  chart value      -> guarded in deploy/chart/templates/worker-invariants.yaml
+//	nixSize       Go constant      -> guarded HERE
+//	Size.DataSize Go constant      -> guarded HERE
+//
+// A Helm chart cannot read a Go constant, and putting these quantities into values.yaml
+// was rejected on purpose: it would make the chart a fourth place preset quantities
+// appear and the only one with no golden gating it, which is the ungated-skew class
+// this package's header exists to prevent. So the chart guards what the chart supplies
+// and this guards what the controller compiles in. Neither half covers all three.
+//
+// chartMaxPVCStorage IS A DUPLICATED CONSTANT AND THAT IS ACKNOWLEDGED, NOT OVERLOOKED.
+// It mirrors workers.limitRange.maxPVCStorage and workers.docker.limitRange.maxPVCStorage,
+// which are both 20Gi. Duplicating ONE ceiling is a far smaller exposure than duplicating
+// the preset table, and the failure is safe in the direction that matters: lowering the
+// chart's max without lowering this makes the test PASS while the cluster rejects claims
+// — so the chart-side comment on maxPVCStorage names this test, and this names those keys.
+// Both defaults currently sit EXACTLY on the ceiling, which is why the comparison is `>`
+// and not `>=`.
+func TestPresetPVCSizesFitTheChartsLimitRangeMax(t *testing.T) {
+	// deploy/chart/values.yaml: workers.limitRange.maxPVCStorage AND
+	// workers.docker.limitRange.maxPVCStorage. Raise there and here together.
+	chartMaxPVCStorage := resource.MustParse("20Gi")
+
+	if nixSize.Cmp(chartMaxPVCStorage) > 0 {
+		t.Errorf("nixSize = %s exceeds the chart's limitRange.maxPVCStorage = %s, so EVERY worker's /nix claim "+
+			"would be rejected at admission and every worker would provision and never appear. Raise "+
+			"maxPVCStorage on BOTH tiers in deploy/chart/values.yaml (and quota.requestsStorage with it).",
+			nixSize.String(), chartMaxPVCStorage.String())
+	}
+	for name, s := range sizes {
+		if s.DataSize.Cmp(chartMaxPVCStorage) > 0 {
+			t.Errorf("preset %q: DataSize = %s exceeds the chart's limitRange.maxPVCStorage = %s, so a worker of "+
+				"that size would provision and never appear. Raise maxPVCStorage on BOTH tiers in "+
+				"deploy/chart/values.yaml (and quota.requestsStorage with it).",
+				name, s.DataSize.String(), chartMaxPVCStorage.String())
+		}
+	}
+}
+
 // Burstable, not Guaranteed, and requests strictly below limits on every preset.
 // Guaranteed contradicts the PRD's own fleet arithmetic and would strand a full
 // memory limit per IDLE worker (measured idle: 148 MiB) on a shared cluster.

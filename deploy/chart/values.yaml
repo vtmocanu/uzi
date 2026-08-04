@@ -405,20 +405,27 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # Sized for a fleet of 20 x `m` — the number `deployments` below advertises:
-  # 10 CPU / 40Gi requested, and 20 x (10Gi data + 20Gi nix) = 600Gi of PVC. STORAGE
+  # Sized for the 20 workers `deployments` below advertises, at the WORST-CASE size:
+  # 10 CPU / 40Gi requested, and 20 x (20Gi data + 20Gi nix) = 800Gi of PVC. STORAGE
   # is the binding constraint, not CPU or memory. dev-cluster's real budget is M6's
   # rollout conversation.
+  #
+  # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
+  # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
+  # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
+  # 20Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 15 `l` workers against
+  # a tier advertising 20: the 16th is refused with a QUOTA error rather than a
+  # scheduling one, and no test in this repo can see it. If `l` should not be
+  # available here, the fix is to scope it off the tier, not to under-budget.
   #
   # THE NIX TERM IS 20Gi, NOT THE 4Gi THIS COMMENT CARRIED UNTIL ISSUE #224. PRD #87
   # bumped nixSize (controller/internal/preset/preset.go) for the prebaked Chromium
   # closure and did not follow the value into this arithmetic, so the quota was
-  # 2.14x too small for the fleet its own comment claimed to size — at 280Gi this
-  # tier held 9 workers, not 20, and the 11th would have been refused with a QUOTA
-  # error rather than a scheduling one, which no test in this repo can see. Raising a
-  # quota PROVISIONS NOTHING (it is a ceiling on claims, not a reservation), so the
-  # correction costs zero storage until the workers actually exist. If nixSize or a
-  # preset's DataSize moves again, this number moves with it.
+  # 2.86x too small for the fleet its own comment claimed to size — at 280Gi this
+  # tier held 7 `l` workers, not 20. Raising a quota PROVISIONS NOTHING (it is a
+  # ceiling on claims, not a reservation), so the correction costs zero storage until
+  # the workers actually exist. If nixSize or a preset's DataSize moves again, this
+  # number moves with it.
   #
   # SIDE EFFECT, and it is load-bearing: a quota on requests.CPU or requests.MEMORY
   # makes admission reject any pod with a container declaring no requests —
@@ -436,7 +443,7 @@ workers:
     enabled: true
     requestsCPU: "10"
     requestsMemory: 40Gi
-    requestsStorage: 600Gi
+    requestsStorage: 800Gi
     persistentVolumeClaims: "40"
     deployments: "20"
   # The backstop, never the source: every hosted worker pod arrives from the
@@ -445,6 +452,15 @@ workers:
   # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 8Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
   # appears. maxPVCStorage likewise >= l's /data (20Gi).
+  #
+  # maxPVCStorage IS AT ITS CEILING ON EVERY CLAIMANT TODAY: nixSize is 20Gi and `l`'s
+  # DataSize is 20Gi, so LOWERING this value makes every worker's claim inadmissible and
+  # nothing renders red — the rejection happens at admission, in the cluster, and the
+  # worker simply never appears. The two guards that catch it are
+  # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset, for the two
+  # sizes compiled into the controller, which carries this number as a constant and must
+  # be edited with it) and the chart's own worker-invariants.yaml (for chart-supplied
+  # PVC sizes). Raise quota.requestsStorage above whenever you raise this.
   limitRange:
     enabled: true
     default:
@@ -606,6 +622,14 @@ workers:
       max:
         cpu: "4"
         memory: 8Gi
+      # THREE claimants sit exactly on this ceiling: dindDataSize below, nixSize (20Gi)
+      # and `l`'s DataSize (20Gi). Raising any of them without raising this makes that
+      # claim inadmissible, and nothing renders red — the LimitRange rejects it at
+      # admission and the worker provisions and never appears. dindDataSize is guarded
+      # against this value in worker-invariants.yaml; the other two are Go constants a
+      # chart cannot read and are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
+      # (controller/internal/preset), which carries this number as a constant and must be
+      # edited alongside it. Raise quota.requestsStorage above whenever you raise this.
       maxPVCStorage: 20Gi
     # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
     # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
@@ -635,6 +659,14 @@ workers:
     # 20Gi is also the CEILING, not just the default: limitRange.maxPVCStorage above
     # is 20Gi and the limitranger validates PVC creates, so a larger value is rejected
     # at admission. Raise both together, and raise quota.requestsStorage with them.
+    # worker-invariants.yaml refuses to render the mismatched pair, so this is a
+    # `helm install` error rather than a worker that provisions and never appears.
+    #
+    # RAISING THIS ON A LIVE CLUSTER IS A NO-OP FOR EVERY EXISTING DOCKER WORKER, and
+    # that is by design rather than a bug to report. The pod's spec hash covers the
+    # claim's NAME and never its size, and PVCs here are never patched (a size change
+    # is delete + reprovision), so nothing rolls and nothing errors. New workers get
+    # the new size; existing ones keep theirs until they are reprovisioned.
     #
     # THE CACHE NOW PERSISTS ACROSS ROLLS AND NOTHING GC's IT — the same residual the
     # controller documents for /nix. The emptyDir at least died with the pod; this

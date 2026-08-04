@@ -648,10 +648,16 @@ func TestDinDDataSizeDefaultsOverridesAndDoesNotRollThePod(t *testing.T) {
 		t.Errorf("default dind-data size = %s, want 20Gi", got)
 	}
 
+	// 10Gi, and it is deliberately BELOW the chart's limitRange.maxPVCStorage (20Gi)
+	// rather than a round number picked for contrast. A fixture is read as an example:
+	// this used to be 40Gi, which is double the ceiling, so it demonstrated a value that
+	// renders clean, boots clean and then has its PVC rejected at admission — the worker
+	// provisions and never appears. worker-invariants.yaml now refuses to render that
+	// pair, so a 40Gi fixture would also contradict the chart's own guard.
 	over := dockerTestConfig()
-	over.DinDDataSize = "40Gi"
-	if got := dindPVC(over).Spec.Resources.Requests.Storage().String(); got != "40Gi" {
-		t.Errorf("overridden dind-data size = %s, want 40Gi", got)
+	over.DinDDataSize = "10Gi"
+	if got := dindPVC(over).Spec.Resources.Requests.Storage().String(); got != "10Gi" {
+		t.Errorf("overridden dind-data size = %s, want 10Gi", got)
 	}
 
 	// The override does not touch the pod template, in EITHER direction.

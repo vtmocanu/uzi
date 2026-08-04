@@ -619,13 +619,20 @@ func TestLoadDockerDinDDataSize(t *testing.T) {
 	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
 	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
 	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
-	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "40Gi")
+	// 10Gi, chosen to stay UNDER the chart's limitRange.maxPVCStorage (20Gi). This was
+	// 40Gi, which loads perfectly well and is then rejected at admission — and that is
+	// the point worth stating rather than silently fixing: this validation checks only
+	// that the string PARSES, and it structurally CANNOT check the size, because the
+	// controller does not know the LimitRange. The ceiling is enforced chart-side, in
+	// worker-invariants.yaml. A fixture demonstrating an inadmissible value invites
+	// someone to copy it.
+	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "10Gi")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.WorkerDinDDataSize != "40Gi" {
-		t.Fatalf("dind data size = %q, want 40Gi", cfg.WorkerDinDDataSize)
+	if cfg.WorkerDinDDataSize != "10Gi" {
+		t.Fatalf("dind data size = %q, want 10Gi", cfg.WorkerDinDDataSize)
 	}
 
 	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "20GB!") // not a k8s quantity
