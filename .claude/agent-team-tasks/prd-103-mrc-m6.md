@@ -422,12 +422,26 @@ findings at zero, vitest on 4.x.
   **govulncheck 1 → repo 2**. Getting it backwards reports a `vuln.go.dev` outage as
   *"there are findings"*, which is the loud-but-misleading shape carry-forward 3
   names.
-- **Two positives worth banking so nobody spends design time on them.**
-  `GOVULNDB=http://127.0.0.1:1` is **ignored** (rc=3, vuln still found) — only the
-  `-db` flag works, and a flag is visible in `Taskfile.yml`, so the environment-
-  variable hijack that forced `scan-secrets.sh` to *refuse* `GITLEAKS_CONFIG` has no
-  analogue here. And govulncheck caches nothing under the project dir, so it neither
-  enters gitleaks' walk nor forces a cache-key decision.
+- **One positive worth banking, not two — and the retired half was actively
+  harmful.** `GOVULNDB=http://127.0.0.1:1` is **ignored** (rc=3, vuln still found);
+  only the `-db` flag works. And govulncheck caches nothing under the project dir, so
+  it neither enters gitleaks' walk nor forces a cache-key decision. Both still true.
+
+  **🔴 AMENDMENT 6 RETRACTS THE REST OF THIS BULLET, WHICH READ: "so the
+  environment-variable hijack that forced `scan-secrets.sh` to *refuse*
+  `GITLEAKS_CONFIG` has no analogue here." THE ANALOGUE EXISTS. IT IS A DIFFERENT
+  VARIABLE, AND THERE ARE TWO OF THEM.** See `A2-7` below.
+
+  **The reason it survived is worth more than the correction.** The supporting
+  measurement (`probes/prd-103-mrc-m6-auditor/govulncheck-errormap.txt:19`) ran
+  `GOFLAGS=-tags=nonexistenttag` and got rc=3 — vuln still found. Correct arm, run by
+  a careful agent, and **a tag that excludes nothing cannot demonstrate exclusion**.
+  It is an instrument that could not produce the disconfirming answer, and it returned
+  the reassuring one. The discriminating input is a tag **the fixture actually guards
+  on**; that flips it to rc=0.
+
+  **And a banked positive is the worst place for this failure**, because its entire
+  purpose is to stop the next person looking. This one told them not to.
 - **govulncheck has NO suppression, baseline or allowlist mechanism** — `-h` at
   v1.1.4 offers only `-C -db -format -mode -scan -show -tags -test`. Every other
   gate here has an escape (golangci-lint ratchets, deadcode has a committed
@@ -641,6 +655,103 @@ Go file → binary rc=1, both flattened to 1 under `go run`. Reuse it. **Note fo
 calibration property 3**: the unparseable-file arm prints **absolute** paths, so the
 repo-root-relative check applies to *finding* lines, not to govulncheck's loader
 errors.
+
+### A2-7 — 🔴 THE GOVULNCHECK WRAPPER FAILS OPEN, AND THE FIX IS AN IDIOM THIS REPO ALREADY SHIPS
+
+**Measured 2026-08-04 against `scripts/govulncheck-gate.sh` at sha256
+`22cb878d…`, 145 lines** (uncommitted at measurement time; the finding is a **missing
+guard**, so an edit since is far more likely to have left it than removed it).
+
+Fixture: a module calling `golang.org/x/text@v0.3.5`'s `language.Parse` →
+**GO-2021-0113, genuinely called**.
+
+```
+no env                                      rc=1   correct, GO-2021-0113 named
++ GOPACKAGESDRIVER=<3-line stub>            rc=0   "No vulnerabilities found."
+                                                   "govulncheck-gate: <dir> clean
+                                                    (0 called vulnerabilities)"
+```
+
+The entire attack:
+
+```sh
+#!/bin/sh
+cat > /dev/null
+printf '{"Roots":[],"Packages":[]}\n'
+```
+
+govulncheck loads packages through `x/tools/go/packages`, which honours
+`GOPACKAGESDRIVER` — an env var naming an external program that supplies package
+metadata. Point it at a stub returning an empty package set and the call graph is
+empty, so nothing is reachable, so the gate is clean. **It needs nothing of the
+audited repo**: no build tags, no OS-suffixed files, no source change. And the gate
+does not merely miss the vulnerability — it **affirmatively reports clean**.
+
+**This is a class this repo has already decided is in scope and already mitigates.**
+`scripts/scan-secrets.sh:144-159` refuses `GITLEAKS_CONFIG` / `GITLEAKS_CONFIG_TOML`,
+and its stated reason transfers verbatim: *"a PROJECT-LEVEL or MANUAL-PIPELINE CI
+variable can replace this gate's entire ruleset with no file, no diff and nothing for
+a reviewer to see."* GitLab ranks project and pipeline variables above job variables,
+and these targets are reachable from `.publish_needs`.
+
+**REQUIRED — the same idiom, same shape, next to the existing arg checks:**
+
+```sh
+if [ -n "${GOPACKAGESDRIVER:-}" ]; then
+  echo "govulncheck-gate: GOPACKAGESDRIVER is set in the environment." >&2
+  echo "  It REPLACES go/packages' package loading, so this gate can be made to" >&2
+  echo "  report a clean tree with no file and no diff. Refused." >&2
+  exit 2
+fi
+```
+
+**`GOFLAGS` needs a NARROWER treatment — refuse only `-tags`, never wholesale.**
+Same disarm (`GOFLAGS=-tags=noVuln` on a tag-guarded fixture → rc=0), **latent here**:
+`//go:build` and `+build` appear in **0** files under `api/` and `controller/`
+(positive control: 546 files match `^package` on the same paths). It arms the day
+someone adds the first build tag. But **a blanket refusal would break a documented
+workflow** — `Taskfile.yml:141`, `.claude/agents/coder.md:198`,
+`.claude/agents/tester.md:485` and `specs/ai.md:15917` all tell contributors to
+*"export `GOFLAGS=-buildvcs=false` in your shell"*, so `GOFLAGS` is populated in
+precisely the shells that run `task gate`. Refuse only when it contains `-tags`.
+
+**`GOOS`/`GOARCH` fail closed by ACCIDENT, and that deserves a comment so nobody
+tidies it away**: `GOOS=linux` makes `go install` cross-compile, `$TMP/bin/govulncheck`
+is then not where the script looks, and the existing `[ ! -x … ]` check fires → exit 2.
+Right outcome, incidental cause.
+
+### 🔴 THE GENERAL RULE, WHICH IS THE DURABLE ARTIFACT AND BELONGS IN `docs/dev-conventions.md`
+
+**Every gate this MR installs shares one unexamined assumption: that the gate's
+ENVIRONMENT is trusted.** Three tools, three variables, one shape — found separately,
+by three different probes, at three different times, by two different agents:
+
+| tool | variable | status |
+|---|---|---|
+| gitleaks | `GITLEAKS_CONFIG` / `_TOML` | already refused (`scan-secrets.sh:144-159`) |
+| npm audit | `NPM_CONFIG_OMIT` | Amendment 5; remedy is `--include=dev` **in the Taskfile** |
+| govulncheck | `GOPACKAGESDRIVER`, `GOFLAGS=-tags` | this section, unlanded |
+
+**The rule to write down:** *a gate script names the environment variables that can
+shrink its view, and refuses them.* Three unrelated guards nobody connects is a worse
+artifact than one stated rule with three instances, and the next gate this repo adds
+will have a fourth variable that no one has met yet.
+
+*(One path neither refusal closes, noted and NOT this MR's to fix: `go install` inside
+the wrapper inherits `GOPROXY`/`GOSUMDB`, so a hostile proxy could serve a trojaned
+govulncheck that always exits 0. Identical trust model to every `go run pkg@version`
+already in this repo, so it is not a new weakness.)*
+
+**What the wrapper gets RIGHT, re-derived independently so nobody re-opens it**: it
+`go install`s a binary into a throwaway `GOBIN` (preserving exit **3**) and never
+passes `-format` (preserving text) — confirmed against the same fixture, where
+`-format json` and `-format sarif` both exit **0** with GO-2021-0113 present five
+times, and `go run` flattens to 1. Its 3→1 / everything-else→2 mapping is correct, and
+a module that does not parse returns **2**, which is exactly the `fmt-check:api` trap
+closed. Commit 4's `deps-check` is fail-closed too: with `node_modules` absent,
+`npm ls --depth=0` exits 1 with `ELSPROBLEMS` naming the missing packages, and there
+is no injection surface — two `package.json` script lines, two Taskfile targets, no
+variable spliced into any `cmds:`.
 
 ### `node_modules` in THIS worktree — the standing hazard does NOT apply, and check before you trust that
 
