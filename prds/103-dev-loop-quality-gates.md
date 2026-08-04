@@ -1987,7 +1987,93 @@ which previously prescribed only the fail-open form.
 
 **Phase 3 — measurement (after M1; independent of M2–M5)**
 
-- [ ] **M6 — Coverage measured, and `-race` for `controller`**: `-coverprofile`
+- [x] **M6 — Coverage measured, and `-race` for `controller`**:
+
+      > **CODE COMPLETE 2026-08-04 on branch `prd-103`, tip `8b8201ec`. NOT PUSHED,
+      > NO MR, AND NO PIPELINE HAS EVER RUN AGAINST ANY OF IT** — the same state M5's
+      > MR-C is in, and for the same reason: the two ship together.
+      >
+      > Gates at that tip: `gate:api` 0, `gate:controller` 0, `gate:web` 0,
+      > `cd web && npm run build` 0 (`probes/prd-103-mrc-m6-coder/b19-gates-at-tip.txt`).
+      >
+      > **The open design question was settled by measurement, not by argument.** Two
+      > validators had directly conflicted on whether the docblock pragma outranks
+      > `test.projects` in vitest 4, and nobody could settle it until MR-C installed
+      > vitest 4. Measured on 4.1.10, four cells with both controls behaving: **the
+      > pragma wins.** A `projects` entry with `environment: "node"` does not move a
+      > pragma-carrying file, and one with `"jsdom"` does move a pragma-less one. So
+      > the architect's 2.1.9 precedence result transfers, the fact-checker's R3
+      > assumption is refuted, and the 14 pragma-carrying files in the mixed
+      > `src/lib` / `src/mocks` directories **cannot** be moved to node by a
+      > directory-keyed split. That is what makes the mixed directories safe, and it
+      > is not readable from the config.
+      >
+      > **The acceptance criterion held**: the per-file environment census is
+      > byte-identical before and after the config change — same sha256, 118 lines,
+      > 76 jsdom / 42 node, collected pair 118 files / 1660 tests in both runs
+      > (`b4-census-{before,after}.txt`). That criterion was chosen because it is
+      > correct under *either* answer to the precedence question, so a wrong
+      > partition would have been detectable rather than merely unlikely.
+      >
+      > **The split ships as `src/lib` + `src/mocks` → node, everything else under
+      > `src/` → jsdom, expressed with `exclude` rather than an enumerated list**, so
+      > a new top-level directory defaults INTO jsdom instead of being collected by
+      > no project at all. `extends: true` carries `testTimeout: 20000` and
+      > `setupFiles` into both projects — verified by asserting the wrong value and
+      > reading what the runner printed, not by a passing suite. Removing `extends`
+      > makes both settings silently vanish rather than revert.
+      >
+      > **No new CI job.** Coverage rides `test:api`, `test:controller` and
+      > `test:web`, which are already in both `.gate_needs` and `.publish_needs`
+      > (established by parsing; job count 27 → 27), so Hard constraint 2 is
+      > satisfied with no list edit and the "is a coverage job a gate job" question
+      > never arises. Decision 6 is honoured structurally: nothing in those jobs can
+      > fail on the number.
+      >
+      > **Two silent constraints on the `coverage:` regex, both measured in RE2 —
+      > GitLab's own engine — across 9 arms including 6 negative controls.** No `^`
+      > anchor: `output: prefixed` makes every line `[test:api] total: …`, and both
+      > anchored variants match nothing. No capturing group: GitLab's docs require
+      > all groups to be non-capturing, and RE2 accepts a capturing group happily, so
+      > testing the wrong form locally passes. The first draft had both errors.
+      >
+      > **The MR widget's single percentage is an unweighted mean over jobs, not repo
+      > coverage** (`app/models/ci/pipeline.rb`: `coverage_array.sum / size`). Today
+      > api 55.4 / controller 90.0 / web 75.41 → ≈ **73.6%**, weighting a 437-block
+      > module equally with an 11920-block one. Recorded in `.coverage_notes`, the
+      > CHANGELOG and `docs/dev-conventions.md` so nobody quotes it as a repo figure.
+      >
+      > **Calibration (Success Criterion 8)**: the number moves and returns, read
+      > through the shipped pattern rather than by eye — controller 90.0 → **74.2** →
+      > 90.0, web 75.41 → **71.65** → 75.41, restore verified with `git status`. The
+      > first web attempt moved the number by **0.01** and was replaced: real,
+      > deterministic, and worthless as evidence.
+      >
+      > **A control found a real defect in the milestone's own script.**
+      > `scripts/coverage-total.sh`'s passing arm returned rc=2 (`go.mod file not
+      > found`) because `go tool cover -func` resolves package paths against the
+      > module in **cwd**, which the script inherited from its caller. It would have
+      > shipped working — the Taskfile calls it with `dir:` — with a hidden
+      > dependency and a guard whose calibration proved nothing, since all three arms
+      > returned 2.
+      >
+      > **`-race` on `test:controller` was already landed** in `f9b1f27f` (pulled
+      > forward into MR-C) and was verified rather than redone; green on both runs,
+      > so Decision 3's `allow_failure` branch was not needed.
+      >
+      > **The one honest gap, `suspected` rather than measured**: the Cobertura
+      > **diff annotations**. Both Go modules and vitest emit `filename=`
+      > module-relative with the module root in `<source>`, and GitLab's automatic
+      > class-path correction handles that only when the source path looks like
+      > `<CI_BUILDS_DIR>/<PROJECT_PATH>/…`, which holds under a normal runner. The
+      > **percentages** are measured; the annotations need the first pipeline.
+      >
+      > **New measured fact, sharper than this milestone's own spec:**
+      > `environmentMatchGlobs` on 4.1.10 is **silently ignored** — rc=0, no error,
+      > the glob simply does nothing — rather than throwing. The spec establishes it
+      > is absent from the package; this is what the runner does when handed one.
+
+      Original scope, kept for the record: `-coverprofile`
       for both Go modules and `vitest --coverage` for `web` (which needs
       `@vitest/coverage-v8` added to `web/package.json` — it is not currently
       a dependency), with the totals printed in CI job output and GitLab's

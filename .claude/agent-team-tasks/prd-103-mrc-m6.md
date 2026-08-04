@@ -2118,3 +2118,92 @@ mechanism instead of measuring it, in a file whose header documents the
 counter-example. Amendment 9's own closing note says not to trust a sentence in this
 brief that is not attached to a named measurement. That applies to the sentences I
 write here as much as to the ones I inherit.
+
+---
+
+# 🔴 END OF SESSION 2 — 2026-08-04. READ THIS FIRST, THEN THE ORDERED LIST.
+
+**Branch `prd-103`. NOTHING IS PUSHED. THERE IS NO MR. NO PIPELINE HAS EVER RUN
+AGAINST ANY OF THIS.** Same as session 1 ended, one milestone further on.
+
+**Do not quote a tip SHA out of this paragraph.** Session 1's handover was wrong
+about the tip in both directions inside one hour. Run `git log --oneline -3`.
+
+## Done this session
+
+1. **`origin/main` MERGED** — it had moved **55 commits** under this branch since
+   the branch point the brief records, including `a6d3aa3b`, which split
+   `CLAUDE.md` into a root router plus path-scoped `.claude/rules/*.md`. Only
+   `CLAUDE.md` conflicted and it was a MOVE rather than a disagreement; the five
+   branch edits were re-routed into the files that now hold that text.
+   **Re-fetch before doing anything: it will have moved again.**
+2. **M6 COMPLETE** and ticked in the PRD, with its full record there — the
+   precedence question settled by measurement, the byte-identical census, the two
+   silent `coverage:` regex constraints, and the unweighted-mean caveat.
+3. **The two 150-cap tests raised to a per-test `120000`.** Suite-wide
+   `testTimeout` stays **20000**.
+4. **The gate recipes reviewed for the first time at a pinned SHA** (task #3,
+   reopened) — 10 findings closed, then **audited**, which found 5 more. Both
+   rounds calibrated. See Amendments 10 and 11.
+5. **Docs**: CHANGELOG, `docs/dev-conventions.md` (including the durable rule this
+   milestone earned), and four PRD corrections.
+6. **Three issues filed**: **#226** react-router 6→7 (RUNTIME, shipped in the
+   bundle), **#227** the web flake as two problems under one cause, **#228** the
+   unpinned `GOOS`/`CGO_ENABLED` axes on the govulncheck gate.
+
+## NOT done — tomorrow's list, in order
+
+1. **Integrated pass.** More than one unit landed (the merge, Unit B, two rounds of
+   gate-script fixes, the docs), so **every validator so far was scoped to a diff
+   that is not the diff being shipped**. Cross-unit interaction is exactly what none
+   of them could see. Reviewer + auditor + fact-checker over `origin/main...HEAD`.
+   The fact-checker has not been dispatched at all this session and the MR
+   description is claim-dense.
+2. **Spec sync** (`spec-keeper`). `specs/ai.md`'s head is **481** on this branch, so
+   append from **482** — re-derive it, and note the `main` worktree reads 478 and is
+   stale, which is exactly the collision the append-only rule exists to prevent.
+3. **The MR.** Description drafted, and the five must-not-go-wrong items are in
+   `## Amendment 12` below.
+
+## 🔴 THREE THINGS AT PUSH TIME
+
+1. **Re-derive the CI-skip marker at the tip you are ACTUALLY pushing:**
+   `git log -1 --format=%B | grep -c -F '[skip ci]'`. Most commits on this branch
+   are docs-only and correctly carry it, so a clean tip is *incidental*. Fix by
+   landing a commit whose message omits it. **A check you performed earlier is a
+   fact about a commit, not about the branch.**
+2. **Push the SHA you gated, by refspec**: `git push origin <sha>:refs/heads/prd-103`.
+   A branch name resolves at push time; a gate result is bound to a SHA.
+3. **Expect the first pipeline to possibly be RED for FLAKE reasons.** `test:agent`
+   went green/red/red/green over four runs under this team's load; `test:web` red
+   once in three. **Read the named failing test. Never retry-until-green** — the
+   retry destroys the evidence. And note there is **no measured flake rate for CI**,
+   which is where it bites.
+
+## Gate state at this handover, measured
+
+`gate:repo` **rc=0** (`probes/prd-103-mrc-lead/gate-repo-final.txt`), with both
+canaries detected — so that green is a live scanner reporting nothing rather than a
+scanner that never looked. `gate:api` / `gate:controller` / `gate:web` and
+`npm run build` were **rc=0 at `8b8201ec`** (the coder's archive); the only changes
+since are `scripts/*.sh`, `Taskfile.yml` comments and docs, whose slots
+(`lint:shell`, `lint:yaml`, `scan:secrets`, `deps-check:*`, `vulncheck:*`) have all
+been re-run green individually. **A full `task gate` at the final tip has NOT been
+run and is the honest gap before the MR.**
+
+## The one process finding worth carrying, and it is about the lead
+
+**I broke a gate and reported a green over it.** `2841c7d7`'s message says
+*"task lint:shell clean, 26 tracked scripts"* and names no secret scan — while the
+commit added twelve `.txt` files under `probes/`, one of which tripped gitleaks and
+reddened `gate:repo`. `lint:shell` walks `git ls-files -- '*.sh'`; the added files
+are `.txt`. **The check I ran was structurally incapable of seeing the check I
+broke**, and the commit message's green reads as coverage it never had. Caught
+independently by the auditor and the coder, minutes apart, both with the same
+parent-commit control.
+
+The same session then produced a second instance one level up: I implemented a
+proposed remedy verbatim (`require 'found 0 vulnerabilities'`) and it was refuted
+by the shipped configuration inside a minute, because **no calibration arm covered
+the configuration this repo actually ships**. Both are recorded where they happened
+rather than summarised away.
