@@ -3486,9 +3486,14 @@ UPDATE runs SET
     plan_md    = $1,
     -- 🔴 PRD #209 D8 SAFETY FIX, carried in the SAME UPDATE that rewrites plan_md.
     -- plan_source describes the row's BIRTH; plan_md is MUTABLE, and this statement is
-    -- the mutation. A seeded run that falls through to the plan gate (a scrub-to-empty
-    -- plan, or any other path that reaches Phase 1) has this statement overwrite its
-    -- seeded plan_md with the worker's OWN Phase-1 plan. If plan_source stayed
+    -- the mutation. DEFENSE IN DEPTH: if a seeded run ever falls through to the plan
+    -- gate — the create-time empty/whitespace rejection plus the worker's own
+    -- non-empty-plan guard make it unreachable as this lands (the PRD's original
+    -- "scrub reduces the plan to whitespace" trigger cannot fire: secretscrub only
+    -- ADDS the "[redacted]" marker, it never empties a non-whitespace plan), but the
+    -- guard is one column and protects against any future worker path that does reach
+    -- Phase 1 — this statement overwrites its seeded plan_md with the worker's OWN
+    -- Phase-1 plan. If plan_source stayed
     -- 'seeded', the plan_approved third disjunct (service.go) would then ship
     -- plan_approved=true over that unreviewed plan_md on the next claim — and via
     -- RequeueRunsOfStaleWorkers (a direct UPDATE that never runs SetRunRunning's

@@ -91,13 +91,15 @@ var (
 	// ErrPlanTooLarge rejects a create-time seeded plan over MaxSeededPlanBytes (PRD
 	// #209 D5) → 422. Mirrors ErrDescriptionTooLarge; checked on the raw input.
 	ErrPlanTooLarge = errors.New("seeded plan is too large to run")
-	// ErrPlanEmpty rejects a seeded plan that is empty, or that the secret scrub
-	// (D5) reduces to whitespace, at create time (PRD #209 D8) → 422. Storing a blank
-	// plan_md as 'seeded' is the entry half of the D8 armed-fall-through hole: the run
-	// would reach the worker plan_approved=true with nothing to implement, plan and
-	// gate, and come back armed. Rejecting at create time closes that entry path; the
-	// plan_source='agent' write in SetRunAwaitingApproval closes every other one.
-	ErrPlanEmpty       = errors.New("seeded plan is empty after scrubbing")
+	// ErrPlanEmpty rejects a seeded plan that is empty or whitespace-only at create
+	// time (PRD #209 D8) → 422. (The check runs on the secret-scrubbed text, but the
+	// scrub only ADDS the "[redacted]" marker and never deletes, so it cannot itself
+	// make a non-empty plan empty — see createRun.) Storing a blank plan_md as 'seeded'
+	// is the entry half of the D8 armed-fall-through hole: the run would reach the
+	// worker plan_approved=true with nothing to implement, plan and gate, and come back
+	// armed. Rejecting at create time closes that entry path; the plan_source='agent'
+	// write in SetRunAwaitingApproval closes every other one.
+	ErrPlanEmpty       = errors.New("seeded plan is empty")
 	ErrActiveRunExists = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal     = errors.New("run has already finished")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
@@ -2894,7 +2896,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // ordinary run planned from the issue alone.
 type SeededPlan struct {
 	// PlanMD is the externally-authored plan. Untrusted input (D5): capped and
-	// secret-scrubbed before storage, and a scrub-to-empty plan is rejected (D8).
+	// secret-scrubbed before storage, and an empty/whitespace plan is rejected (D8).
 	PlanMD string
 	// Selection is the run's subagent roster, persisted through the SAME columns the
 	// human plan gate writes (agent_source / agent_exclusions). Nil ⇒ the run makes no
@@ -2922,10 +2924,15 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	var agentExclusions []byte
 	if seed != nil {
 		// D5: cap the RAW input first (mirrors ErrDescriptionTooLarge — reject, do not
-		// truncate), THEN scrub secrets, THEN reject an empty/whitespace result. The
-		// order matters: capping after the scrub would let an oversize body through if
-		// the scrub happened to shrink it, and the empty check must run on the scrubbed
-		// text so a plan that is nothing but a leaked secret cannot be stored blank.
+		// truncate), THEN scrub secrets, THEN reject an empty/whitespace result. The cap
+		// is on the RAW input deliberately — capping after the scrub could let an oversize
+		// body through if the scrub happened to shrink it. The empty check, by contrast,
+		// is ORTHOGONAL to the scrub: secretscrub.Scrub replaces each matched secret with
+		// the non-empty marker "[redacted]" and deletes nothing, so it can never turn a
+		// non-empty plan into an empty one (a plan that is only a leaked secret is stored
+		// as "[redacted]", NOT blanked or rejected). So this rejects a genuinely empty or
+		// whitespace-only plan; running it on the scrubbed text is equivalent to running
+		// it on the raw and just stays correct if the scrub ever gains a deleting rule.
 		if len(seed.PlanMD) > MaxSeededPlanBytes {
 			return store.Run{}, ErrPlanTooLarge
 		}
