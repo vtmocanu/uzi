@@ -1173,3 +1173,97 @@ silently, and neither is a code change:
 re-enumerate, exact names) and A9.1's reprovision of worker `8e1fef71`. Plus A9.4's four
 release-note lines, which are the documenter's. Tip carries no CI-skip marker, so a push produces a
 real pipeline.
+
+### A12 — 2026-08-04, AUDIT of M-a at `35ef2996`. Verdict sound; one Medium to fix before merge.
+
+Read from a detached worktree. **The cluster went unreachable partway through** (`dial tcp
+192.0.2.25:6443: i/o timeout`, 4 attempts over ~10 min), so the live quota `used` after the raise
+was **not** re-verified and the auditor says so rather than inferring it. See A12.6.
+
+**A12.1 — 🔴 MEDIUM: `dindDataSize` is DOCUMENTED IN THREE PLACES AND GUARDED IN NONE, and the
+failure is the exact shape this issue is about.** `dindDataDefaultSize = "20Gi"` (`render.go:257`),
+`workers.docker.dindDataSize: 20Gi`, and `workers.docker.limitRange.maxPVCStorage: 20Gi` — **equal**,
+so the default sits exactly on the ceiling and cannot be raised without raising the max too.
+`validateDockerTier` puts the new var in the same `quantities` loop as the DinD overrides, which
+checks only that the string **parses**; there is no comparison against `maxPVCStorage`, and the
+controller cannot know that value.
+
+Traced at this SHA, with `dindDataSize: 40Gi`: `helm template` renders **clean**; the controller
+boots **clean**; `RenderPVCs` emits the 40Gi claim; limitranger rejects it (*"maximum storage usage
+per PersistentVolumeClaim is 20Gi, but limit is 40Gi"*); `materializer.go:531-534` returns **before
+the Deployment is created**; `reconcile.go:221` logs *"reconcile cycle failed; retrying next tick"*.
+**The worker never appears, forever, retrying every tick, with the reason only in the controller's
+log** — nothing is reported back to the api (`:221`'s log line is the only consumer). That is
+`preset.go:14-17`'s worker-that-provisions-and-never-appears, arriving through the knob this change
+just added.
+
+**The fix is already an idiom here.** `deploy/chart/templates/worker-invariants.yaml` carries **six**
+`fail` guards including cross-value ones of exactly this shape, and its header says the guard *"stays
+the single definition of the rule."* A seventh converts an infinite silent retry into a `helm
+install` error naming both values. **`nixSize` (20Gi) sits on `maxPVCStorage` (20Gi) with no guard
+either, on BOTH tiers** — pre-existing, not M-a's, and a guard written against the *max* rather than
+against one claimant covers both pairs at once.
+
+**A12.2 — LOW: the worst-case principle was applied to one tier and not the other, in the commit
+that states that principle.** Docker is now self-consistent for the first time — at `l` (60Gi/worker)
+all three caps meet at exactly **10**, the advertised number, and the auditor's earlier finding is
+resolved. Restricted at `600Gi` caps at **15** `l` workers against `deployments: "20"`. The comment
+is **not false** — it says "20 x `m`" and delivers 20 `m` workers — but `l` is available on that tier
+(`preset.SizeNames()` is global, `render.go` takes `spec.Size.DataSize` for both tiers with no tier
+scoping). **20 x `l` needs 800Gi.** Same defect class M-a exists to fix, one tier over, one line.
+
+**A12.3 — RELEASE NOTE, second-order and easy to misread as a bug: raising `dindDataSize` on a live
+cluster is a SILENT NO-OP for every existing docker worker.** `specHash` hashes the pod template,
+which names `ClaimName` but never the claim's size, and `RenderPVCs` is *"never patched"*. So no
+roll, no error, no effect. The commit message states this and the reasoning is right; **A9.4's list
+does not**, and an operator who raises the value and sees nothing happen will file a bug.
+
+**A12.4 — Lens 3, Multi-Attach: NO FINDING.** `renderPVC` is unchanged in access mode (`RWO`, same
+function, one added call site), the strategy is still `Recreate`, and the dind claim mounts into the
+`dind` container in the same pod — same node, same attach lifecycle. The change is **+1 in the
+count and nothing in kind**. A8.7.1's planned release-note sentence is accurate as written.
+
+**A12.5 — Lens 4, fsGroup: CLEAN by inheritance, with one genuinely new combination.** Pod-level
+`FSGroup: 10001` with `FSGroupChangeOnRootMismatch` is unchanged, and fsGroup is a **supplementary
+group on every container**, so `dind` at uid 1000 carries gid 10001 regardless of its `RunAsUser`.
+`volume_linux.go` **ORs** the mask and never reduces, so the delta from the emptyDir is exactly one
+bit:
+
+| | base | after fsGroup | owner |
+|---|---|---|---|
+| emptyDir (before) | 0777 | **2777** | `root:10001` |
+| fresh ext4 PVC (after) | 0755 | **2775** | `root:10001` |
+
+**Only `o+w` is lost, and `o+w` was never the access path** — uid 1000 reaches it through
+supplementary group 10001. Positive control that fsGroup is live on this cluster at all: `data` and
+`nix` are the same class of object and are written by uid 10001, so if fsGroup were not applied they
+would already be broken.
+
+**The caveat: `dind-data` is the FIRST PVC in this pod mounted by a container whose uid is NOT the
+fsGroup.** New combination, not a new mechanism. **On dev-cluster it is moot** —
+`deploy/values/dev-cluster.yaml:175` sets `rootless: false`, so `dind` runs `RunAsUser: 0` and real
+root ignores DAC. **But the CHART DEFAULT is `rootless: true`**, so the uid-1000 combination is what
+every other cluster gets and no deployment exercises it today. Sharpening it: the volume mounts
+**directly at the data root** (`render.go:1032`), so the daemon's data root *is* the volume root,
+owned `root:10001`, and the daemon does not own it. Whether rootless dockerd tolerates that is not
+decidable read-only and the auditor declined to assert it. Check commands are in its report; the
+real signal is **`docker info` succeeding**, not the daemon merely answering, since dockerd creates
+subdirectories lazily.
+
+**A12.6 — OPERATIONAL, before anyone provisions a docker worker post-merge:**
+`kubectl get resourcequota -n uzi-workers-docker`. If ArgoCD has not synced `600Gi`/`30`, M-a's PVC
+creates are rejected on `requests.storage` at the old 140Gi — **the same infinite-retry path as
+A12.1, from a different cause.** The auditor could not check this; the apiserver was down.
+
+**A12.7 — security scan: CLEAN, with an armed instrument.** `gitleaks` scoped to the commit: `no
+leaks found`, rc=0. `task scan:secrets`: `EXIT=0`, `0 findings in tracked files (1495 in the index)`,
+and **`canaries DETECTED (gitlab-pat, gitleaks v8.30.1)`** naming both planted files. **The canary
+line is the positive observation** — a bare `no leaks found` is exactly what a disarmed scanner
+prints. Decision 3 intact: `dindContainer` still mounts only its own data root, the shared workdir
+and (rootless) the socket dir, never the token, `/data` or `/nix`.
+
+**A12.8 — noted, not graded: the observe/teardown asymmetry is defended only by prose plus one
+test.** `RenderPVCs` gates on `w.Docker`; `observeNamespace` and teardown deliberately do **not**,
+because teardown runs against a worker the api has already dropped and no `Docker` flag exists to
+branch on. Both comments say why. **That is exactly the kind of asymmetry a later refactor "tidies"
+into a bug**, and `TestTeardownRemovesTheDinDDataPVC` is the only mechanical defence.
