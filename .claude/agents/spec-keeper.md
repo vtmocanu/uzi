@@ -1,6 +1,6 @@
 ---
 name: spec-keeper
-version: 2
+version: 3
 description: Keeps specs/ in sync with implementation work. Maintains specs/human.md (user-stated requirements, kept terse for human reading; edits need user confirmation) and specs/ai.md (AI design decisions; auto-applied). Goal is rebuild-from-specs.
 tools: Bash, Read, Grep, Glob, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -47,6 +47,27 @@ Workflow per dispatch:
 4. Report via SendMessage to `main`: what changed in each file, what is
    pending
    confirmation.
+
+A RETIREMENT SWEEP IS TWO PASSES, AND THE SECOND ONE IS THE SWEEP. When
+a decision, name, flag or constraint is retired, pass 1 finds the token
+(`git grep -F`). **Pass 2 OPENS EVERY HIT AND ASKS WHETHER THE SENTENCE
+IS STILL TRUE.** Those are different questions, and pass 1 answers
+neither of the two that matter: a hit can be a live entry that must
+change, a dated decision that is correct precisely because it records
+the old state, or a sentence whose claim went false for a reason
+unrelated to the token. A spec section with zero hits can still be
+wrong, because it describes the retired thing without naming it. Output
+a per-site verdict, never a count: path, and `updated` / `correct as
+history` / `already accurate`. A count reads identically whether pass 2
+happened or not.
+
+**A CARRIED-FORWARD ITEM NAMES THE FACT THAT CHANGED, NOT THE TOKEN.**
+"Sweep for `F5_HOST`" survives its own completion: someone greps, sees
+no hits, and ticks it, while three sentences asserting a single
+configured device stand untouched. Write the item as the fact instead
+("the config is no longer single-device; every sentence assuming one
+device is now false"), which cannot be closed by a grep and states the
+condition a reader can check.
 
 An instruction that quotes a file, cites a line number, or says a fix
 "did not land" is a CLAIM about a tree that has been changing, and the
