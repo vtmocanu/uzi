@@ -1267,3 +1267,116 @@ test.** `RenderPVCs` gates on `w.Docker`; `observeNamespace` and teardown delibe
 because teardown runs against a worker the api has already dropped and no `Docker` flag exists to
 branch on. Both comments say why. **That is exactly the kind of asymmetry a later refactor "tidies"
 into a bug**, and `TestTeardownRemovesTheDinDDataPVC` is the only mechanical defence.
+
+### A13 — 2026-08-04, REVIEW of M-a at `35ef2996`. No Blocking. Two LEAD errors corrected.
+
+**A13.1 — the byte-identity property is CONFIRMED EMPIRICALLY, not read for.** A harness using only
+exported API (`RenderDeployment`/`RenderPVCs`/`RenderSecret`/`SpecHashOf`), compiled **unchanged at
+both SHAs**, dumping canonical JSON for a **plain** worker across all 6 `(template, size)` pairs with
+a maximally-populated `RenderConfig`:
+
+```
+19dab430 (parent)  47239 bytes
+35ef2996 (M-a)     47239 bytes      IDENTICAL — Deployment + PVCs + Secret + spec hash, all 6
+```
+
+**With a negative control, because an empty diff is also what a broken harness produces**: flipping
+one field to `Docker: true` and re-running the identical harness gives rc=1, **234 lines**, six
+changed spec hashes and the emptyDir→PVC swap. So the harness discriminates and the plain render
+genuinely did not move. **This is the check that matters most for A6.1's cost** — if it had moved,
+a docker-only change would roll every plain worker and add a fleet-wide loss event.
+
+Two tests pin what is pinnable *within one tree*; neither pins the plain hash to a **literal**, so a
+future change altering the plain render some other way is uncaught. **Not a gap the coder created**
+— no golden of the plain render exists in the module, and a cross-commit comparison is exactly what
+a single-tree test cannot do.
+
+**A13.2 — the create-gate, teardown and #114 BUG 3 are correct, including the part that is easy to
+get wrong.** The gate is on **observation**, matching `HasDataPVC`/`HasNixPVC`; the steady-state test
+asserts **zero** creates and reads create **names** rather than a count, so it can say *which* claim
+was skipped. And `observeNamespace` derives `id` from the **label** (`IsOurs(p.Labels)`), not by
+parsing the object name — checked specifically because `-dind-data` contains `-data`, so a
+name-parsing observer would read `uzi-hw-abc-dind-data` as id `abc-dind` and set the wrong flag.
+Teardown is unconditional and NotFound-tolerant; a docker-gated delete would have leaked a 20Gi claim
+per worker forever against a quota that counts PVCs.
+
+**A13.3 — the direction that would have been FATAL was checked: limitranger's `maxConstraint` is
+`>`, not `>=`.** A 20Gi request under `maxPVCStorage: 20Gi` is **admitted**. Had it been `>=`, every
+docker worker's dind PVC would have been refused and the whole tier would provision pods that never
+appear. Nobody else checked the inclusivity of that comparison.
+
+**A13.4 — 🔴 LEAD ERROR 1: the `render.go:690-692` citation does not resolve, and I PROPAGATED IT.**
+At `35ef2996` those lines are the `NODE_EXTRA_CA_CERTS` comment. The byte-identity comment is at
+**`750-753` at `35ef2996`** and at `689-692` at the parent — so the citation is off-by-one against
+the parent and points at unrelated code in the tree the commit creates. The commit message is
+immutable here (no force-push), so **the actionable part is that my dispatch to the reviewer
+repeated it verbatim**, and A8.12 carries it too. **Use `render.go:750-753 at 35ef2996`.** The
+comment the commit *adds* at `render.go:494` cites no line number and is the right pattern.
+
+**A13.5 — 🔴 LEAD ERROR 2: A10.3's `(bb187d97, not this branch's)` implies authorship and is not
+quite right.** `bb187d97` **relocated** the code — its diff removes the identical
+`caps == nil ||` / `range caps.Add` pair unindented and re-adds it inside a `t.Run`. The pattern
+**originates at `5c676f7c`** (`git log -S 'for _, c := range caps.Add'`). The commit message itself
+says only "pre-existing", which is correct; only my parenthetical implied more. This is the
+stale-identifier class the same commit swept seven sites of, committed inside the record of that
+sweep.
+
+**A13.6 — N2 and N3: two conditional Blockings, DISCHARGED BY M-b HAVING LANDED, and the condition
+is now load-bearing.** At `35ef2996` alone, `worker-docker-namespace.yaml` states **P and ¬P about
+the same mechanism 23 lines apart** (`:70-72` the old false `requests.*` sentence, `:93-95` the new
+refutation), with nothing marking one as superseding the other; and `values.yaml:551` describes M-b
+in the **present tense** while M-a alone renders no `requests.ephemeral-storage` at all. Both are
+true the moment M-b lands and false in any release carrying M-a alone. **M-b (`2a63ddb3`) has
+landed and A8.10/A9.3 already require both in ONE release** — so this is discharged. **But it
+converts "one release" from an efficiency argument into a correctness one**: splitting them ships a
+file that contradicts itself.
+
+**A13.7 — N4, for the follow-up commit: the suite's own fixture demonstrates an INADMISSIBLE
+value.** `TestDinDDataSizeDefaultsOverridesAndDoesNotRollThePod` uses `DinDDataSize = "40Gi"` and
+`TestLoadDockerDinDDataSize` asserts `UZI_WORKER_DIND_DATA_SIZE=40Gi` loads. Both pass, and 40Gi is
+**double** `maxPVCStorage` — it boots cleanly and then has its PVC rejected, which is A12.1's exact
+failure. The boot validation catches an unparseable string (the lesser problem) and **structurally
+cannot** catch an oversized one, because the controller does not know the LimitRange. Fix: use
+`10Gi` as the fixture, or one sentence saying 40Gi is deliberately above the ceiling and why the
+render-level assertion is still valid.
+
+**A13.8 — N5 agrees with A12.2 from the other direction.** The two tiers now use **different sizing
+conventions** and coincide at 600Gi — docker worst-case, restricted nominal — which invites reading
+them as one derivation. A12.2's raise to 800Gi resolves it; the restricted comment should also say
+it is `m`-sized on purpose and what an `l`-heavy fleet costs.
+
+**A13.9 — N6: the 4Gi→20Gi nix drift has TWO MORE LIVE SITES, in `specs/ai.md`.** `:6884` reads
+*"`/nix` is a flat 4Gi outside the table"*, sitting directly beneath a preset table whose other
+figures are all current — so it reads as present-tense and is false. `:8394` carries *"`preset.nixSize`
+(a flat 4 GiB)"*. The `prds/done/58` and `prds/done/87` occurrences are past-tense records and
+correctly stay. **→ spec-keeper (task #7).** This commit's doc sweep was specifically about this
+drift and stopped at the chart.
+
+**A13.10 — N7: `docs/worker-setup.md:122` now under-informs a k8s operator.** It calls the dind
+cache *"a compose `dinddata` volume, or its k8s equivalent"* and gives a compose-only reclaim recipe.
+After M-a the k8s equivalent is a persistent PVC with no GC. One sentence naming `docker system
+prune` and delete+reprovision. **→ documenter (task #6).**
+
+**A13.11 — N8, UNRESOLVED, cluster down: PV reclaim policy is now a 1.5x'd exposure.** Teardown
+deletes the PVC; whether the backing PV and datastore disk are freed depends on `storage-class`'s
+`reclaimPolicy`. **Under `Retain` the storage leaks per torn-down worker and the quota cannot see
+it**, because a quota counts PVCs, not orphaned PVs. Pre-existing for `/data` and `/nix`; three
+claims per docker worker now. One command answers it:
+`kubectl get sc storage-class -o jsonpath='{.reclaimPolicy}'`. **Reported unresolved rather than
+guessed** — the apiserver went unreachable for the reviewer too, independently of the auditor.
+
+**A13.12 — the fsGroup scoping nit AGREES WITH A12.5, reached independently.** Both flag that
+dev-cluster sets `rootless: false`, so `dind` runs as real root and ownership cannot block it, while
+the chart default `rootless: true` is the unexercised posture. **A8.8's "first thing to check"
+should be scoped to the rootless posture**, not stated flatly.
+
+**A13.13 — release-note addition: the daemon's BUILD CACHE now survives a pod roll.** A hosted worker
+is per-user so there is no new cross-user surface, but build-arg and layer residue from run A now
+outlives a restart into run B **for the same user**, where the emptyDir erased it. Beside A9.4's
+no-GC residual line.
+
+**A13.14 — what the reviewer did NOT run, recorded so the report is not read as broader than it
+is:** no `fmt-check`, no `lint` (it set no `GOLANGCI_LINT_CACHE` because it ran no lint at all, and
+did not `cache clean`); `go vet` on `./internal/kube/` only; `go build` covered implicitly by the
+test compile. Everything else it re-ran end to end, including `go test -count=1 -race ./...` at
+`RUN=182 PASS=182 FAIL=0 SKIP=0`.
