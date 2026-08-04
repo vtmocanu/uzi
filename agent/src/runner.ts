@@ -882,6 +882,18 @@ export class RunRunner {
       // holds the resumable SDK transcript. Preserving only some of them would
       // resume into a session missing its plugins or its worktree.
       //
+      // (Corrected 2026-08-04, PRD #218: the clone leg above no longer carries the
+      // resumed work. `runnerCloneForBranch` unconditionally deletes the clone on
+      // every claim and re-seeds it from a bare ref, so a parked run's own commits
+      // were never recovered from the preserved clone directory. PRD #218 fixed the
+      // real durability by fetching the agent's committed branch back into this
+      // worker's bare repo on both the park and shutdown paths, anchored to the
+      // writing run's id; an owned resume then reseeds off that tracking ref. The
+      // three-way preservation below still runs unchanged today, and the plugin-dir
+      // and HOME legs are still load-bearing exactly as the sentence above says; the
+      // clone leg is now redundant rather than wrong to skip, and its removal is a
+      // deferred follow-up, not done here.)
+      //
       // The other four statements in this block — the steering poller stop, the two
       // gate-map deletes, and the secret eviction above — MUST still run on a park.
       // Guarding the whole block (or returning early) would leave a poller running
