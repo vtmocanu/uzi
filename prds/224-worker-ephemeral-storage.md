@@ -1072,3 +1072,49 @@ the diff alone, and M-b first would ship 6Gi.
 run once** (A6.1); the third RWO PVC widens the Multi-Attach window on reschedule (A8.7.1); the image
 cache is now **persistent with no GC** (A8.7.2, `docker system prune` is the remedy); and #224
 **lowers the frequency** of a silent total work loss rather than fixing it (§1).
+
+### A10 — 2026-08-04, M-a LANDED at `35ef2996`, and a spec defect the LEAD introduced
+
+**A10.1 — 🔴 A9.2 AND A9.3 CONTRADICTED EACH OTHER AND THE CODER WAS RIGHT.** A9.2 said A8.5's two
+quota comments are rewritten *"in the same commit"* as the raise, which is **M-a**; A9.3 item 2
+listed the same correction under **M-b**'s doc sweep. Both were written by the lead, in one sitting.
+**Resolved in favour of A9.2 — the correction belongs in M-a**, because M-a is the commit that moves
+`280Gi → 600Gi`, and a comment still reading *"= 280Gi"* beside `requestsStorage: 600Gi` is a wrong
+doc **created by that commit**. A9.3 item 2 is amended accordingly; do not read it as still owing.
+
+**A10.2 — the A3.8 sweep is now SEVEN sites, not eight.** The coder also took
+`values.yaml`'s `ephemeralStorage` comment and its verbatim copy in `worker-docker-namespace.yaml`
+into M-a, and the reasoning is sound: **M-a falsifies that sentence a second time** — the data root
+is no longer on node ephemeral storage at all — and splitting one sentence's correction across two
+commits is worse than doing it once. Both clauses were corrected (the emptyDir claim and the
+"bounds a runaway pull" claim). **M-b's remaining sweep: the six `requests.*` enforcement sentences
+plus `render.go:289`'s `presetRequestsDominateTheSeed`.**
+
+**A10.3 — a pre-existing staticcheck nil-deref was pulled in by the ratchet, exactly as documented.**
+`render_test.go:815-824` (`bb187d97`, not this branch's) blocked the gate the moment the coder
+touched that file — `whole-files: true` behaving as CLAUDE.md says it does, **not a red gate to
+report**. Fixed in M-a: the nil-capabilities check is now `Fatal`, which is the correct semantics
+independently, since reading `caps.Add` past a non-fatal `Error` panics instead of reporting the
+security regression the test exists to catch. Lint was re-run with
+`--max-same-issues=0 --max-issues-per-linter=0` **before** counting, per CLAUDE.md's cap-reading
+trap: **0 issues**, so the printed list was not a cap reading.
+
+**A10.4 — lead's own verification of M-a, against the artifact rather than the report.** 12 files,
+matching the claim exactly. `render.go:859` renders `dind-data` as a `PersistentVolumeClaim`;
+`:864` and `:869` keep `run-workdir` and `dind-sock` as `EmptyDir` (correct — A4.5/A8.11:
+`run-workdir` must never be bounded). No `ResourceEphemeralStorage` anywhere in `render.go` yet,
+which is right, that is M-b. Quotas live at docker `600Gi`/`30` and restricted `600Gi`/`40` — the
+restricted PVC count correctly **unchanged**, since that tier gains no third volume. Tree clean.
+
+**A10.5 — mutation evidence, recorded because it is the part that makes the tests mean anything.**
+All four load-bearing sites were folded and each reddened a named test; restore was by **cp backup**
+(not `git checkout --`, which would revert to HEAD and is banned here while work is uncommitted),
+the pattern-present assert was checked, and the restore was verified by a green full suite rather
+than by a grep:
+
+| fold | reddened |
+|---|---|
+| `dind-data` volume back to `EmptyDir` | `TestDinDDataVolumeIsAPVCAndRunWorkdirIsStillAnEmptyDir` |
+| drop `if w.Docker` in `RenderPVCs` | 4 tests incl. `TestPVCsSizeFromThePresetAndNixIsFlat` |
+| drop the `HasDinDDataPVC` create-gate arm | `TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation` |
+| drop `dindDataPVCName` from teardown | `TestTeardownRemovesTheDinDDataPVC` |
