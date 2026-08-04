@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -68,6 +69,12 @@ const (
 	planSourceSeeded = "seeded"
 )
 
+// plannedCommitRe validates a create-time --planned-commit (PRD #209 M4): hex, between
+// git's default abbreviation floor (7) and a full sha256 (64). See ErrInvalidPlannedCommit
+// for why the bound matters (a shorter value makes the worker's prefix-tolerant --require-base
+// compare inert). The CLI carries the same pattern as a pre-flight; this is the authority.
+var plannedCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
 // Terminal run statuses. A run in any of these is finished and immutable.
 var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
@@ -99,9 +106,18 @@ var (
 	// worker plan_approved=true with nothing to implement, plan and gate, and come back
 	// armed. Rejecting at create time closes that entry path; the plan_source='agent'
 	// write in SetRunAwaitingApproval closes every other one.
-	ErrPlanEmpty       = errors.New("seeded plan is empty")
-	ErrActiveRunExists = errors.New("a non-terminal run already exists for this issue")
-	ErrRunTerminal     = errors.New("run has already finished")
+	ErrPlanEmpty = errors.New("seeded plan is empty")
+	// ErrInvalidPlannedCommit rejects a create-time --planned-commit that is not a
+	// plausible git commit sha (PRD #209 M4) → 400. The compare in the worker is
+	// prefix-tolerant with no floor, so a 1-2 char value would spuriously match almost
+	// any base and silently make --require-base inert (a user who asked to FAIL on
+	// divergence would get a silent proceed — the unsafe direction); and there is no
+	// other length/charset bound on the field, so garbage would persist and re-deliver on
+	// every claim. Requiring hex of git's abbrev floor (7) up to a full sha256 (64) closes
+	// both. This is the authoritative gate; the CLI mirrors it as a pre-flight usage error.
+	ErrInvalidPlannedCommit = errors.New("planned base commit is not a valid commit sha (hex, 7-64 chars)")
+	ErrActiveRunExists      = errors.New("a non-terminal run already exists for this issue")
+	ErrRunTerminal          = errors.New("run has already finished")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -2979,12 +2995,18 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 			agentExclusions = enc
 		}
-		// M4: the commit the plan was written against, stored verbatim (a full or
-		// abbreviated SHA). Empty ⇒ NULL, and the worker's staleness compare is inert.
-		// require_base_match only ever fires alongside a planned commit; the handler
-		// rejects require_base without planned_commit, so it is safe to persist as-is.
-		if strings.TrimSpace(seed.PlannedCommit) != "" {
-			plannedBaseCommit = pgText(seed.PlannedCommit)
+		// M4: the commit the plan was written against. Trimmed, then validated as a
+		// plausible git sha (hex, 7-64) and stored TRIMMED. Empty ⇒ NULL, and the worker's
+		// staleness compare is inert. The validation is load-bearing, not cosmetic: the
+		// worker compare is prefix-tolerant with no floor, so an unvalidated 1-2 char value
+		// would match almost any base and silently disarm --require-base (ErrInvalidPlannedCommit).
+		// require_base_match only ever fires alongside a planned commit; the handler rejects
+		// require_base without planned_commit.
+		if pc := strings.TrimSpace(seed.PlannedCommit); pc != "" {
+			if !plannedCommitRe.MatchString(pc) {
+				return store.Run{}, ErrInvalidPlannedCommit
+			}
+			plannedBaseCommit = pgText(pc)
 		}
 		requireBaseMatch = seed.RequireBase
 	}

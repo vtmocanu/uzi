@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -503,6 +504,11 @@ func approveSelection(source string, exclude []string) (*apitypes.AgentSelection
 // into a shorter plan that would look valid.
 const maxPlanReadBytes = 1 << 20 // 1 MiB
 
+// plannedCommitRe mirrors the server's workersvc.plannedCommitRe (PRD #209 M4): hex, 7-64
+// chars. The server is authoritative; this is a pre-flight so a malformed --planned-commit
+// is a clean exit-2 usage error before any request rather than a round-trip 400.
+var plannedCommitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
 // seededPlanFlag assembles PRD #209's optional seeded plan from the `create` flags, and
 // returns nil when no --plan-file was given (an ordinary issue-planned run, unchanged).
 //
@@ -527,6 +533,14 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	if requireBase && plannedCommit == "" {
 		return nil, uzicli.Exitf(uzicli.ExitUsage,
 			"--require-base requires --planned-commit (there is no commit to compare the clone's base against)")
+	}
+	// A pre-flight mirror of the server's ErrInvalidPlannedCommit (the server is the
+	// authority): reject a --planned-commit that is not a plausible git sha before any
+	// request, so the user gets exit 2 rather than a round-trip 400. A too-short value is
+	// the load-bearing case — it would silently disarm --require-base server-side.
+	if plannedCommit != "" && !plannedCommitRe.MatchString(plannedCommit) {
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"--planned-commit must be a hex commit sha of 7-64 characters")
 	}
 	planProvided := cmd.Flags().Changed("plan-file")
 	// A roster / a planned commit / a require-base is only meaningful for a seeded plan.

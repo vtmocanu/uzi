@@ -82,6 +82,38 @@ export function baseCommitsMatch(planned: string, actual: string): boolean {
 }
 
 /**
+ * Evaluate a seeded run's base-commit staleness (PRD #209 M4). It is the whole staleness
+ * decision, factored out of the runner so the fail path is directly testable by TYPE (the
+ * runner swallows the throw on its generic failure path, so a runner-level test can only
+ * see the resulting `failed` state, not the error class). Returns:
+ *   - `undefined` when there is no planned commit, or it matches the clone's base
+ *     (prefix-tolerant) — the caller proceeds silently;
+ *   - a warning STRING naming both commits when they diverge and `requireBase` is false —
+ *     the caller emits it to the feed and implements anyway;
+ * and THROWS BaseCommitDivergedError when they diverge and `requireBase` is true, so the
+ * caller lets it reach the run-failure path and never implements against a diverged base.
+ */
+export function evaluateBaseStaleness(
+  plannedBase: string | undefined,
+  actualBase: string,
+  requireBase: boolean,
+): string | undefined {
+  if (!plannedBase || baseCommitsMatch(plannedBase, actualBase)) return undefined;
+  const detail =
+    `the seeded plan was written against commit ${plannedBase}, but this clone's ` +
+    `base commit is ${actualBase}`;
+  if (requireBase) {
+    throw new BaseCommitDivergedError(
+      `${detail}; --require-base is set, so this run will not implement against a diverged base`,
+    );
+  }
+  return (
+    `${detail}; the plan may reference files that have moved since it was written — ` +
+    `implementing anyway (create the run with --require-base to stop instead)`
+  );
+}
+
+/**
  * What the per-run executor factory yields for one execution (PRD #42 Decisions
  * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
  *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
@@ -422,35 +454,23 @@ export class RunRunner {
       const seeded = claim.plan_source === "seeded";
 
       // PRD #209 M4 — staleness guard. A seeded run carries the commit the user planned
-      // against (claim.planned_base_commit). Compare it to the clone's resolved base
-      // (runnerClone.baseCommit, the same field forwarded into RunContext below): if they
-      // diverge, the plan may describe files that have since moved on the default branch.
-      // Only a seeded run sets planned_base_commit, so an ordinary run (undefined) skips
-      // this and proceeds silently. Prefix-tolerant compare (baseCommitsMatch): a git
-      // abbreviated SHA matches its full form. Default is to WARN into the feed and
-      // implement anyway; --require-base (claim.require_base_match) turns the divergence
-      // into a hard failure BEFORE any implement work — refusing to implement against a
-      // diverged base (Open Question 3, the lead's decision).
-      const plannedBase = claim.planned_base_commit ?? undefined;
-      if (plannedBase && !baseCommitsMatch(plannedBase, runnerClone.baseCommit)) {
-        const detail =
-          `the seeded plan was written against commit ${plannedBase}, but this clone's ` +
-          `base commit is ${runnerClone.baseCommit}`;
-        if (claim.require_base_match) {
-          // The catch-all reports `failed` with this reason and emits it on the feed, so
-          // the run never implements against the diverged base.
-          throw new BaseCommitDivergedError(
-            `${detail}; --require-base is set, so this run will not implement against a diverged base`,
-          );
-        }
+      // against (claim.planned_base_commit). evaluateBaseStaleness compares it to the
+      // clone's resolved base (runnerClone.baseCommit, the same field forwarded into
+      // RunContext below): only a seeded run sets planned_base_commit, so an ordinary run
+      // yields undefined and proceeds silently. On a divergence it either returns a warning
+      // to emit (default) or, under --require-base (claim.require_base_match), THROWS
+      // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
+      // fails the run, so it never implements against a diverged base (Open Question 3).
+      const staleWarning = evaluateBaseStaleness(
+        claim.planned_base_commit ?? undefined,
+        runnerClone.baseCommit,
+        claim.require_base_match ?? false,
+      );
+      if (staleWarning) {
         batcher.emit({
           kind: "status",
           agent: "worker",
-          payload: {
-            text:
-              `${detail}; the plan may reference files that have moved since it was written — ` +
-              `implementing anyway (create the run with --require-base to stop instead)`,
-          },
+          payload: { text: staleWarning },
         });
       }
 

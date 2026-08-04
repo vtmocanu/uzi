@@ -152,6 +152,67 @@ func TestCreateRunSeededPersistsPlanColumns(t *testing.T) {
 	}
 }
 
+// PRD #209 M4: --planned-commit is validated at create time (the authoritative gate).
+// A too-short, a non-hex, and an over-long value are each rejected with
+// ErrInvalidPlannedCommit and never reach the insert; a valid 7-char and a valid 40-char
+// are accepted and STORED TRIMMED. The too-short case is the load-bearing one — the
+// worker compare is prefix-tolerant, so a 1-2 char value would silently disarm --require-base.
+func TestCreateRunSeededPlannedCommitValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		planned string
+	}{
+		{"too short (1 char)", "a"},
+		{"too short (6 chars, one under the floor)", "abcdef"},
+		{"non-hex", "zzzzzzz"},
+		{"over-long (65 chars)", strings.Repeat("a", 65)},
+		{"hex-ish but with spaces inside", "abc 123"},
+	} {
+		t.Run("reject: "+tc.name, func(t *testing.T) {
+			fs := seededIssueStore()
+			svc := New(fs, newBox(t), testParams())
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil,
+				&SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned})
+			if err != ErrInvalidPlannedCommit {
+				t.Fatalf("err = %v, want ErrInvalidPlannedCommit", err)
+			}
+			if fs.createRunParams != nil {
+				t.Fatalf("a malformed planned commit must not reach CreateRun, got %+v", fs.createRunParams)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		planned string
+		want    string // the value that must be stored (trimmed)
+	}{
+		{"valid 7-char abbrev", "abc1234", "abc1234"},
+		{"valid 40-char sha1", strings.Repeat("a", 40), strings.Repeat("a", 40)},
+		{"valid 64-char sha256", strings.Repeat("f", 64), strings.Repeat("f", 64)},
+		{"trimmed before store", "  abc1234def  ", "abc1234def"},
+	} {
+		t.Run("accept: "+tc.name, func(t *testing.T) {
+			fs := seededIssueStore()
+			svc := New(fs, newBox(t), testParams())
+			if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil,
+				&SeededPlan{PlanMD: "# Plan\nDo it.", PlannedCommit: tc.planned, RequireBase: true}); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			p := fs.createRunParams
+			if p == nil {
+				t.Fatal("a valid seeded run must reach CreateRun")
+			}
+			if !p.PlannedBaseCommit.Valid || p.PlannedBaseCommit.String != tc.want {
+				t.Errorf("planned_base_commit = %+v, want %q (trimmed)", p.PlannedBaseCommit, tc.want)
+			}
+			if !p.RequireBaseMatch {
+				t.Error("require_base_match = false, want true")
+			}
+		})
+	}
+}
+
 func TestCreateRunSeededScrubsSecretsIntoPlanMd(t *testing.T) {
 	// D5: the plan is untrusted input and is secret-scrubbed BEFORE storage. A plan
 	// carrying a GitLab-PAT-shaped token is stored with the token replaced by the

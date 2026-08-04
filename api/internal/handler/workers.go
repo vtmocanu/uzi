@@ -803,6 +803,10 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			// PRD #209 D8: the seeded plan is empty, or the secret scrub reduced it to
 			// whitespace. Never stored as a blank 'seeded' plan.
 			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
+		case errors.Is(err, workersvc.ErrInvalidPlannedCommit):
+			// PRD #209 M4: --planned-commit is not a plausible commit sha (hex, 7-64).
+			// A 400 (malformed input), like ErrInvalidSelection below.
+			httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			// PRD #209: the agent_selection is malformed (bad source or exclusion name).
 			// Roster-existence is NOT checked here — the clone roster is unknown at

@@ -242,7 +242,7 @@ func TestRunCreateRequireBaseWithoutPlannedCommitIsUsageError(t *testing.T) {
 func TestRunCreatePlannedCommitWithoutPlanFileIsUsageError(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
-		"--planned-commit", "abc123")
+		"--planned-commit", "abc1234")
 	if code != uzicli.ExitUsage {
 		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
 	}
@@ -251,6 +251,35 @@ func TestRunCreatePlannedCommitWithoutPlanFileIsUsageError(t *testing.T) {
 	}
 	if fc.LastCreateRepoID != "" {
 		t.Error("a usage error must not create a run")
+	}
+}
+
+// A malformed --planned-commit (too short / non-hex) is a usage error before any request —
+// a pre-flight mirror of the server's ErrInvalidPlannedCommit. The too-short case is the
+// one that matters: it would otherwise silently disarm --require-base server-side.
+func TestRunCreateInvalidPlannedCommitIsUsageError(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, commit string }{
+		{"too short", "abc"},
+		{"non-hex", "zzzzzzz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{}
+			_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+				"--plan-file", planPath, "--planned-commit", tc.commit)
+			if code != uzicli.ExitUsage {
+				t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+			}
+			if !strings.Contains(errb, "planned-commit") {
+				t.Errorf("error should point at --planned-commit:\n%s", errb)
+			}
+			if fc.LastCreateRepoID != "" {
+				t.Error("a usage error must not create a run")
+			}
+		})
 	}
 }
 

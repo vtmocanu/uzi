@@ -2,7 +2,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
-import { baseCommitsMatch, type ExecutorFactory } from "../src/runner.js";
+import {
+  baseCommitsMatch,
+  BaseCommitDivergedError,
+  evaluateBaseStaleness,
+  type ExecutorFactory,
+} from "../src/runner.js";
 import {
   api,
   fakeGitlab,
@@ -44,6 +49,41 @@ describe("baseCommitsMatch (PRD #209 M4 prefix-tolerant compare)", () => {
     assert.equal(baseCommitsMatch("", full), false);
     assert.equal(baseCommitsMatch(full, ""), false);
     assert.equal(baseCommitsMatch("   ", full), false);
+  });
+});
+
+describe("evaluateBaseStaleness (PRD #209 M4 decision)", () => {
+  const base = "abc123def456abc123def456abc123def456abcd";
+  it("no planned commit ⇒ undefined (proceed silently)", () => {
+    assert.equal(evaluateBaseStaleness(undefined, base, false), undefined);
+    assert.equal(evaluateBaseStaleness(undefined, base, true), undefined);
+  });
+  it("a match ⇒ undefined even under --require-base", () => {
+    assert.equal(evaluateBaseStaleness(base.slice(0, 12), base, true), undefined);
+  });
+  it("mismatch without --require-base ⇒ a warning naming both commits", () => {
+    const warn = evaluateBaseStaleness("0000000abc", base, false);
+    assert.ok(warn && warn.includes("0000000abc"), "names the planned commit");
+    assert.ok(warn!.includes(base), "names the clone's base commit");
+  });
+  // The TYPE-pinning assertion (reviewer-m4 #2): the fail path must throw
+  // BaseCommitDivergedError specifically, not a bare Error with the same message. This is
+  // the M4 Case 4 contract at the unit level — the runner swallows the throw on its generic
+  // failure path, so only a direct call can observe the class — and it is what justifies
+  // exporting BaseCommitDivergedError.
+  it("mismatch with --require-base ⇒ throws BaseCommitDivergedError (not a bare Error)", () => {
+    assert.throws(
+      () => evaluateBaseStaleness("0000000abc", base, true),
+      (err: unknown) => {
+        assert.ok(
+          err instanceof BaseCommitDivergedError,
+          "the fail path must throw BaseCommitDivergedError, not a plain Error",
+        );
+        assert.ok((err as Error).message.includes("0000000abc"), "names the planned commit");
+        assert.ok((err as Error).message.includes(base), "names the clone's base commit");
+        return true;
+      },
+    );
   });
 });
 
