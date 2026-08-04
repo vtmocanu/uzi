@@ -30,6 +30,14 @@ remedy for the loss itself is #218's shutdown-path fetch-back, deliberately out 
 is stated at the top because a reader who takes §1 as the defect and §5 as the bar will conclude
 more than either supports.
 
+**🔴 AND THAT REMEDY SENTENCE IS ITSELF TOO STRONG — corrected by A5.1 and A7.4.** #218's
+fetch-back **cannot fire on a kubelet eviction on this cluster as configured**: every threshold here
+is hard (`evictionSoft: null`), so the eviction manager overrides the grace period to 0 and the
+clamp is 2 seconds. It **does** save every *voluntary* shutdown path — rollout, scale-down,
+spec-hash roll, node drain — all of which honour the full 30s, and that includes the fleet roll this
+very fix triggers. Making it fire on eviction would need `evictionSoft` +
+`evictionMaxPodGracePeriod` in the kubelet config: a cluster-config change, not a repo change.
+
 **Request is 0 because nothing declares one.** Verified on this tree at `0111f01c`:
 
 ```
@@ -713,3 +721,131 @@ resize path, conditional on A6.5). This is **not** three parallel units: M-a and
 worker container's resources and the volume list in `render.go`, and M-c edits `renderPVC` and
 `preset` alongside them. The file-disjointness test fails, so the parallel-worktree shape does not
 apply — one coder, sequential commits, per the validated single-writer-token pipeline.
+
+### A7 — 2026-08-04, architect (crossing A6): the eviction signal was misidentified from the start
+
+Written at `8778add2`, so it had read A1-A3 and **not** A4/A5/A6. It answers A2 and crossed the A6
+re-derivation dispatch. Everything here is independent of A6 and survives it.
+
+**A7.1 — 🔴 BOTH EVICTIONS WERE `imagefs.available`, NOT `nodefs.available`, AND THE NODE POOL IS
+HETEROGENEOUS. Nobody caught it because the tell is a number everyone read past.** The two evicted
+pods report *different* threshold quantities:
+
+```
+zzb7q  node 5shb4  "Threshold quantity: 3141254678, available: 2632184Ki"
+rmqvx  node 7fvcq  "Threshold quantity: 7878074885, available: 7691084Ki"
+```
+
+The kubelets carry exactly one 15% threshold (`imagefs.available`; `nodefs.available` is 10%), and
+`float32(0.15)` = 0.15000000596046448 reproduces **both** to the byte against their own node's
+imagefs capacity: `20941697024 × f32(0.15) = 3141254678.4`,
+`52520497152 × f32(0.15) = 7878074885.8`. **`nodefs.available` never fired.**
+
+```
+5shb4   nodefs 20941697024   imagefs 20941697024   MERGED   <- 2026-08-03 eviction
+7fvcq   nodefs 20941697024   imagefs 52520497152   split    <- 2026-07-27 eviction
+kxpgk   nodefs 20941697024   imagefs 52520497152   split
+m6chc   nodefs 20941697024   imagefs 52520497152   split
+```
+
+**A5.2 found the same heterogeneity independently; A7 adds that both evictions were the imagefs
+signal, and computes both thresholds exactly.** A3.5's "allocatable identical on all 4" stays true
+and does not extend to topology — allocatable derives from *nodefs* capacity, while topology selects
+the threshold **and the ranking formula**. The message cannot discriminate: `helpers.go:95` and
+`:99` map both signals to `v1.ResourceEphemeralStorage`, so the string is identical either way and
+the threshold quantity is the only tell.
+
+**A7.2 — what that changes, and the news is good.** On a split node an imagefs eviction ranks on
+`{fsStatsRoot, fsStatsImages}` (`helpers.go:1164`), and `containerUsage` has **no** `fsStatsImages`
+branch — so images contribute nothing per-pod and emptyDirs are not in the set at all:
+
+| | ranking input for our pod | what the request must beat |
+|---|---|---|
+| **split** (3 of 4), imagefs eviction | container writable layer only — **268 KiB** measured | anything over ~1 MiB wins outright |
+| **merged** (1 of 4) | images + rootfs + logs + emptyDirs (`helpers.go:1185`) | the emptyDir footprint; the value matters |
+
+On three nodes of four the **value barely matters** — a cheaper win than the sizing debate assumed,
+and another argument for erring low.
+
+**A7.3 — 🔴 ON SPLIT NODES THE REAL DRIVER IS IMAGE SIZE, WHICH NO EPHEMERAL REQUEST CAN TOUCH.**
+`7fvcq` had 7.33 GiB free on a 48.9 GiB imagefs against a **5.77 GB** agent image; one more tag
+fills it. `imageGCHighThresholdPercent: 85` reclaims only *unused* images. **A separate defect, not
+addressed by #224, and the architect's judgement is that it is the more likely repeat cause on 3 of
+4 nodes.** Strong follow-up candidate.
+
+**A7.4 — the architect WITHDRAWS its own `emptyDir.sizeLimit` deferral**, reaching A6.3's
+conclusion independently and by a different route: all three `localStorageEviction` arms evict at
+grace 0, and with `evictionSoft: null` every threshold here is hard, so node-pressure eviction is
+zero-grace too. That is the source of the §1 correction above.
+
+**A7.5 — Q3 FINAL, unchanged by A2, with A2's composition question answered.** Flat constants gated
+on `w.Docker`, chart-overridable — it *is* the `dindResources` precedent A2 names. Of three ways a
+per-size field could compose with an override: (a) flat-override-wins is rejected because the first
+tuning silently flattens the table; (b) per-size chart values is the only shape that genuinely
+delivers both, and is rejected because it makes the chart a **fourth** place preset names appear and
+**the only one with no golden gating it** — the ungated-skew class `preset.go:11-17` exists to
+prevent; (c) a multiplier, rejected on sight. **(d) is the real answer: they are SEQUENCEABLE.**
+Flat → per-size later is a pure controller-internal refactor with no api or wire change, so shipping
+flat **forecloses nothing** and is strictly dominant under A2's own ordering.
+
+**A7.6 — "CONSERVATIVE" HERE MEANS ERR *LOW*, and this is the sentence the shipped comment most
+needs.** The failure modes are asymmetric: too low = today's behaviour, probabilistic, recoverable,
+visible in a message we now know how to read. Too high = **unschedulable**, total, deterministic,
+**silent**, presenting as `preset.go:14-17`'s worker-that-never-appears — and A3.5 proves the docker
+quota cannot warn you, because it cannot bind. "When unsure, request more" is what everyone writes
+otherwise.
+
+**A7.7 — the PLACEMENT half of the issue's own claim is FALSE; only the RANKING half lands.**
+`kubectl describe node` reports **`ephemeral-storage 0 (0%)`** requested on nodes physically
+**51-52% full**. Nothing in this cluster declares the resource, so the scheduler's ephemeral view is
+empty on a half-full node and the ~10 GiB of undeclared usage stays invisible no matter what we
+declare. This is the mechanism behind A3.5's "ranking mitigation, not capacity guarantee" and
+belongs beside it in the shipped comment.
+
+**A7.8 — CORRECTION to §4 Q5's instrument list: `kubelet_volume_stats` CANNOT answer this.**
+`volume_stats.go:116-120` skips every volume whose `PVCRef == nil`, so there is **no**
+`kubelet_volume_stats_*` series for `dind-data` or `run-workdir`, ever. A Grafana panel built on it
+would show `/data` and `/nix` and silently omit the two volumes that matter. The summary API is the
+only confirmed instrument; the architect says "not found" rather than "does not exist", having not
+searched exhaustively.
+
+**A7.9 — pre-A6 values, kept for the audit trail and SUPERSEDED by the A6 re-derivation.** Under the
+emptyDir design the architect revised 6Gi down to **4Gi docker / 256Mi restricted**: the tiers are
+asymmetric, so A3.5's uniform ~2.3 GiB squeeze (98.3% of pool) becomes 64.1% with 25 GiB of margin.
+Under A6 the data root leaves ephemeral accounting entirely and the numbers are being re-derived.
+**The asymmetry argument survives; the numbers do not.**
+
+**A7.10 — the A2 follow-up needs a DISTRIBUTION, and the statistic is named.** Two spot reads 515x
+apart is exactly why a spot read cannot set this number. It needs per-pod
+`ephemeral-storage.usedBytes` **with the per-volume breakdown**, sampled on a schedule across all
+live workers, retaining the max per worker-lifetime, **tagged with the node's imagefs topology**
+(per A7.1, two runs otherwise disagree and nobody finds the reason). The docker value is set by the
+p95 of `dind-data` at end-of-run; the restricted value is set by container-log growth, bounded by
+rotation, and needs no measurement at all.
+
+**A7.11 — A5.1's follow-up: CONFIRMED by the fact-checker. Rollout = 30s, eviction = 2s.** Six cited
+links: the controller patches the Deployment and never deletes a pod; `rolloutRecreate` waits for
+old pods to be gone (so the worker's window is not raced by its successor — and this is also why
+`Recreate` dodges the Multi-Attach deadlock `render.go:592-593` cites); the ReplicaSet controller
+deletes with empty `DeleteOptions`; the apiserver fills `period` from
+`Spec.TerminationGracePeriodSeconds`; the kubelet treats that as "bedrock truth" and the 2s path
+arrives *only* through `PodTerminationGracePeriodSecondsOverride`, which a plain deletion leaves nil;
+and `setTerminationGracePeriod`'s first case returns the 30 unmodified (the `minimumGracePeriod`
+clamp is a **floor**). No preStop hooks exist, so nothing subtracts from it. **Three riders:**
+
+- **It is a derivation, not a measurement, and one field collapses links 3-6.** During the first
+  post-fix roll, while the old pod is `Terminating`:
+  `kubectl -n uzi-workers-docker get pod <old> -o jsonpath='{.metadata.deletionGracePeriodSeconds}'`.
+  **Add this to the verification bar** rather than trusting the derivation.
+- **🔴 A THIRD path exists and is worse than either: `shutdownGracePeriod: "0s"` — graceful node
+  shutdown is DISABLED on these kubelets.** On an ungraceful node power-off or machine replacement,
+  pods get **no SIGTERM window at all**. `kubectl drain` is unaffected (it goes through the same
+  `CheckGracefulDelete`, so 30s). **If the fleet is ever rolled by replacing NODES rather than by
+  patching Deployments, none of the 30s reasoning applies** — and this fleet sits on a platform node
+  pool, so that is not hypothetical.
+- **30s being AVAILABLE is not the fetch-back FITTING in it.** A `git fetch` against
+  `gitlab.example.com` from a worker holding an arbitrary repo is unmeasured. Note the asymmetry
+  that makes this worth saying: at 2s the answer is obviously no, which is what made A5.1 a clean
+  finding; at 30s it is a real, repo-size-dependent question. Relevant to #218, not to A6.1.
+- Minor, and it touches A1 rather than A5.1: `CheckGracefulDelete` sets `period = 0` for pods already
+  `Failed`/`Succeeded`, so **the lingering Evicted pods delete immediately** — no grace to wait out.
