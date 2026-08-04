@@ -1521,3 +1521,98 @@ between two values*, so it must be shown both to fire and **not** to fire.
 **Arm C is the one that proves the guard is a constraint rather than a hard-coded rejection of
 40Gi.** The auditor's own framing, which generalises past this guard: *"a guard nobody has seen fire
 is not a guard — and a guard nobody has seen NOT fire is not one either."*
+
+### A16 — 2026-08-04, REVIEW of M-b at `2a63ddb3` (delta pass). No Blocking. One record correction, one real finding.
+
+**A16.1 — the two load-bearing kubelet claims CONFIRMED against upstream, independently, for the
+third time.** The reviewer read `pkg/api/v1/resource/helpers.go` rather than trusting the comment:
+`GetResourceRequestQuantity` (which `exceedDiskRequests` calls) sums `.spec.containers` then
+max-folds each `.spec.initContainers` entry **with no `RestartPolicy` check anywhere**, while
+`PodRequests` **does** special-case `ContainerRestartPolicyAlways` and adds it cumulatively. So the
+shipped comment's worked example is arithmetically exact: worker 1Gi + dind 8Gi is **charged 9 and
+credited 8**. *"The single most falsifiable claim in the commit, and it holds."* All three
+never-a-limit sub-claims likewise confirmed, including that all three `localStorageEviction` arms
+pass `0` as `gracePeriodOverride` — **which is what structurally couples this to #218**: a limit
+would delete the pod with no grace, so any SIGTERM-time fetch-back #218 grows could never run.
+
+**A16.2 — 🔴 REAL FINDING (N2): the fleet-fit test COPIES two chart values into Go with nothing
+gating the copy, and the copy defeats the test's own purpose.**
+`TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes` hardcodes
+`const dockerWorkers, plainWorkers = 10, 20`, which are `values.yaml`'s `count/deployments.apps` for
+the two tiers. **Raise the docker tier to 20 there and the real fleet needs `20 x 4Gi + 20 x 512Mi =
+90 GiB` against a 70.2 GiB pool — precisely the condition this test exists to catch — and it stays
+green**, because its premise is a hardcoded 10.
+
+`nodeAllocatable = 17.55` is a *different* kind of constant and its comment justifies it honestly (a
+fact about one cluster; a smaller cluster lowers the values through the chart). **The two quota
+counts are not: they have a source in this repo and were copied instead of referenced.** Cheapest
+fix, and the one to take: a line on both `values.yaml` keys saying a controller test mirrors them.
+**→ the follow-up commit.**
+
+**A16.3 — 🔴 CORRECTION TO A11.3, AND IT IS THE UNCONTROLLED-COMPARISON SHAPE THIS TEAM FLAGS
+ELSEWHERE.** A11.3 recorded "38 / 24 documents" as a docker ON/OFF pair. **Those halves come from
+two different value sets:**
+
+```
+-f deploy/values/dev-cluster.yaml                                       38
+-f deploy/values/dev-cluster.yaml --set workers.docker.enabled=false    30
+-f deploy/values/dev-cluster.yaml --set workers.enabled=false           19
+chart DEFAULTS --set workers.enabled=true --set api.tls.enabled=true     24   <- what 24 actually is
+```
+
+So **38 is the dev-cluster render and 24 is the chart-defaults render**, reported as one
+before/after. The reviewer re-took it as a controlled pair — same file, one `--set` flipped — and
+**the conclusion is unaffected**: ON injects both vars, OFF injects the plain one alone. Only the
+numbers in the record were wrong. A11.3 is amended: the controlled pair is **38 / 30**.
+
+**A16.4 — AND THE TWO VALIDATORS' ABSOLUTE COUNTS DISAGREE, WHILE THEIR DELTA AGREES. Recorded, not
+adjudicated.** A14.1 (auditor) reports **34 ON / 26 OFF**; A16.3 (reviewer) reports **38 ON / 30
+OFF**. Both describe dev-cluster with one toggle flipped, both at `2a63ddb3`. **The delta is 8 in
+both**, so whatever differs is a constant 4 documents present in one invocation and not the other —
+plausibly a release-name, an extra `--set`, or empty-document handling, none of which either agent
+recorded. **Neither is being treated as the winner.** The claim both support is the one the design
+rests on and it is not a tally: *with the docker tier off, the plain env var is injected alone.*
+This is CLAUDE.md's own rule arriving on our own artifacts — **cite the shape, not the count** — and
+it is the second time in this PRD that two careful agents produced different numbers for what each
+described as the same measurement.
+
+**A16.5 — the invariant test survives both questions a test has to answer.** *What production edit
+fails it?* Adding the key to any container's `Limits` in `render.go` — a production edit, so it is
+not decoration. *Do the assertions execute in the failing case?* Yes: no `Fatalf` inside either
+loop, and the `seen < 2` guard is after them. **And it is the negative half of a PAIR** —
+`TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes` positively asserts the same typed
+key in `Requests`. That is CLAUDE.md's *deliberate* paired shape rather than the unpaired vacuous
+one, and the key is a typed constant, so no copy change can silently retire it.
+
+**A16.6 — mutations reproduced independently, and the discrimination is sharper than reported.** The
+sidecar-request fold reddens the budget test on **docker postures only** with `plain` correctly
+unaffected — **and leaves the limit test green**, because a request is not a limit and the two tests
+separate cleanly. The 20Gi fold reddens both arms of the fleet-fit test with self-explaining
+messages naming the node ceiling and the pool total.
+
+**A16.7 — N3, a conditionally-true clause in an otherwise exact paragraph.** `render.go`'s trap (2)
+says `containerEphemeralStorageLimitEviction` "measures rootfs+logs". Upstream measures `Logs`
+unconditionally and `Rootfs` **only when `!*m.dedicatedImageFs`** — so on a dedicated-imagefs node,
+which **A7.1 established 3 of 4 of this pool's nodes are**, container-level enforcement measures
+**logs alone**. The conclusion drawn ("emptyDirs are excluded from container-level enforcement
+entirely") is correct on **both** branches, so nothing downstream moves. Flagged because the
+split-imagefs fact is load-bearing elsewhere in this PRD and someone will try to reconcile the two.
+
+**A16.8 — N4, zero margin where it matters most.** The `seen < 2` guard passes at the boundary on a
+plain render, which has exactly two containers (`seed-nix` + `worker`); docker postures have 3 and 4.
+It achieves its stated purpose and should not change — **but it would not notice a plain render that
+lost its init container**, which is the neighbouring regression. One word in the message if anyone
+touches it.
+
+**A16.9 — `--dry-run=server` is worth MORE now than it was at M-a.** M-b is the commit that first
+moves the docker tier's `used.requests.ephemeral-storage` off `0` — to `10 x 4Gi = 40Gi` against the
+200Gi ceiling. Comfortable, but a **live** number rather than a dead one for the first time since
+that key was written. The restricted tier tracks no ephemeral key at all, so plain workers' 512Mi
+stays unbudgeted — **correct** (a quota only rejects on resources it tracks) and stated here so
+nobody "fixes" it.
+
+**A16.10 — `deadcode` without `-test` is byte-identical across M-a, M-b and the pre-#224 parent** (4
+findings, only `SpecHashOf`'s line number moving). **Neither commit orphaned anything.** Gates
+re-run: `go test -count=1 -race ./...` EXIT=0, `RUN=195 PASS=195 FAIL=0 SKIP=0`. Doc sweep re-done
+against **five alternative phrasings** with the hits read rather than post-filtered: zero survivors
+anywhere in `specs/`, `docs/`, `adr/`, `ARCHITECTURE.md`.
