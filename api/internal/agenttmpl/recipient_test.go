@@ -179,7 +179,7 @@ func collapseWS(s string) string {
 // point of this revision. The window was satisfiable three separate ways by
 // sentences anyone would write in this repo — most cheaply by `main` in its
 // GIT-BRANCH sense, which is the most repeated backticked token here
-// (`builtins/lead.md:61` already carries "never touch `main`"). Both of these
+// (`builtins/lead.md` already carries "never touch `main`"). Both of these
 // PASSED the window and RED the adjacency rule:
 //
 //	Report findings to the team lead via SendMessage; never touch `main`.

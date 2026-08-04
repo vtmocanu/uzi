@@ -198,6 +198,15 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 		{"declared scope map goes to the review wave", "include the declared scope map when you dispatch the review wave"},
 		{"when in doubt, run serially", "run them serially"},
 		{"sequential-by-nature work stays serial", "stays serial"},
+		// Pointer handover (2026-08-04). Same contract class as the bullets above:
+		// the fan-out depends on the lead handing over what it already found, so a
+		// reword that drops one of these silently restores the N-validators-re-grep
+		// cost the rule exists to remove.
+		{"lead hands over locations it already found", "Hand over the locations you have: name the files"},
+		{"citations quote the line, not just its number", "quote the line as well as giving its number"},
+		{"pointer set is labelled exhaustive or starting point", "Say whether that list is exhaustive or a starting point"},
+		{"the set of locations is itself a claim", "the set of locations is itself a claim"},
+		{"locations, never conclusions", "Give locations, not conclusions"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(body, c.phrase) {
