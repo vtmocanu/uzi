@@ -2272,3 +2272,79 @@ that an agent with no pending dispatch was safe to update. **It is not: any `Tas
 owner.** Three instances now — two chases plus this — and all three are the same root: **asserting
 something about a teammate's state without checking it.** The task list is a coordination
 convenience; **the brief's `## Roster` is the durable record and needs no write to a shared store.**
+
+### A24 — 2026-08-04, `13d02609`. **CODE SCOPE FOR #224 IS CLOSED.**
+
+Six code commits on `224`, all verified on the branch, tree clean:
+
+```
+35ef2996  M-a, dind data root off node ephemeral storage
+2a63ddb3  M-b, the worker container declares requests.ephemeral-storage
+6bf44a86  guard PVC sizes against the LimitRange max, restricted quota worst case
+936dec8e  read the fleet sizes out of values.yaml instead of copying them
+dae9b799  close the PVC-ceiling false negative and the unguarded default path
+13d02609  refuse to boot when a worker PVC exceeds its tier's LimitRange
+```
+
+Lead's verification of `13d02609`: 10 files (2 new — `pvcceiling.go`, `pvcceiling_test.go`);
+`UZI_WORKER_MAX_PVC_STORAGE` + `UZI_WORKER_DOCKER_MAX_PVC_STORAGE` injected at
+`controller-deployment.yaml:144` and `:215` and consumed at `pvcceiling.go:58-59`;
+`grep -c -i ephemeral worker-invariants.yaml` = **7** (was **0** at A22.3); the `"m"` suffix is
+**gone** from `_helpers.tpl`. Gates rc=0 both, canaries DETECTED, 38-document render.
+
+**A24.1 — two of A21.4's eight items were already in `dae9b799`, as A21.2 predicted.** The safety
+label was fixed by **deleting** the duplicated constant, so
+`TestPresetPVCSizesFitTheChartsLimitRangeMax` was already free of the stale-able constant before A21
+began. Six remaining items plus A22.3's LimitRange guard landed here. **Nothing in A21 contradicted
+anything — no round-trip needed.**
+
+**A24.2 — AN ABSENT CEILING SKIPS THAT TIER RATHER THAN DEFAULTING, and the reasoning belongs on the
+record.** Env injection across three postures:
+
+```
+docker ON        MAX_PVC_STORAGE 20Gi   DOCKER_MAX_PVC_STORAGE 20Gi
+docker OFF       MAX_PVC_STORAGE 20Gi   DOCKER_MAX_PVC_STORAGE absent
+limitRange off   both absent            -> check correctly SKIPPED
+```
+
+The coder's argument, and it is right: **a guessed ceiling that is too low refuses to boot a healthy
+fleet — a self-inflicted outage in a function whose whole purpose is preventing one.** Fail-closed is
+correct for a *malformed* value and wrong for an *absent* one, and the two are not the same case.
+
+**A24.3 — A20.1 was a SAFETY fix, not a tidy-up, and it deserves the line.** `20M` and `20m` both
+parsed and differ by **10⁹** — 2e+07 bytes against **0.02 bytes**. A single-keystroke slip produced a
+number so small that **no `gt` ceiling check could ever fire on it**. Nine of ten wrong-case suffixes
+already failed closed; this was the tenth. Now: `20m` rejected naming the suffix, `20M` still renders,
+bare integer prints as itself.
+
+**A24.4 — 🔴 THREE TIMES THIS SESSION A BROKEN INSTRUMENT IMITATED A REAL FINDING, ALL THREE IN THE
+CODER'S OWN HARNESSES, ALL THREE SELF-REPORTED.** This is the single most repeated failure of the
+run and it is worth stating as a class:
+
+1. **A18.2's probe** — an unquoted `--set` value that zsh split, helm rejecting an **unknown flag**,
+   and an `&&`/`||` test reading that non-zero exit as *"the guard fires"*. Three arms reported
+   guarded; none had run.
+2. **The first LimitRange mutation run** — a heredoc inside a loop clobbered `PATH`, so `python3`,
+   `head` and `gsed` all vanished and every arm printed *"NOT CAUGHT"*. **That was rc=127, not a
+   guard result.**
+3. **Its rerun's grep** — `workers[a-z.]* sets ephemeral-storage`, which cannot match `limitRange`'s
+   capital **R**, so all four arms printed empty. Also not a result.
+
+**All three looked exactly like "the guard does not fire."** Two of the three would have been
+reported as findings against working code; the third as a passing guard over an unrun test. **What
+settled all three was reading the RAW ERROR rather than the derived verdict** — and each was caught
+by the person who built the instrument, which is the only reason the corrected results are worth
+anything. The general form, which this repo already states in several places and which earned a third
+independent confirmation today: **an empty or non-zero result is a claim about your instrument until
+you have shown the instrument ran.**
+
+**A24.5 — one honest gap, stated in the commit as well as the report.** `main.go` has no test file,
+so the boot check's **three-line call site** is covered by the build and by review, **not by a test**.
+The function itself (`pvcceiling.go`) is table-driven and mutation-proven: `nixSize` 20Gi → 40Gi
+reddens the shipped-ceilings case, dropping the dind claimant reddens exactly the two dind cases, and
+`return nil` reddens five subtests.
+
+**A24.6 — what remains, none of it code.** A9.4's release note; the CHANGELOG; `specs/ai.md`'s two
+nix-drift sites (A13.9); `docs/worker-setup.md:122` (A13.10); A12.6's pre-provision quota check;
+A22.6/A12.5's `fsGroup` question on a real **rootless** provision; A1/A9.1's manual pod cleanup and
+worker reprovision.
