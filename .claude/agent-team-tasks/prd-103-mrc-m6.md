@@ -2233,7 +2233,7 @@ about the scripts, and those are the ones worth reading.**
 `2841c7d7`'s message says *"task lint:shell clean, 26 tracked scripts"* and names no
 secret scan. The commit added **twelve `.txt` files** under `probes/`, one of which
 tripped gitleaks `generic-api-key` on the literal `p5-verbose.log` — a scratchpad
-FILENAME inside `Logs: scratchpad/p5-vulncheck-api.log, p5-verbose.log`.
+FILENAME inside `Logs: scratchpad/p5-vulncheck-api.log, p5-verbose.log`. <!-- gitleaks:allow — this line is prose quoting the p5-verbose.log filename from the Amendment 11 incident record; it is not a credential. The directive must sit ON this line, per this same finding. -->
 `scan:secrets` → `gate:repo` → `task gate`, all red.
 
 **`lint:shell` walks `git ls-files -- '*.sh'`. The added files are `.txt`.** The
