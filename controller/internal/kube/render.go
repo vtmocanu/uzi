@@ -34,6 +34,9 @@ const (
 	tokenSuffix = "-token"
 	dataSuffix  = "-data"
 	nixSuffix   = "-nix"
+	// dindDataSuffix names the DinD daemon's data-root claim (issue #224 M-a).
+	// DOCKER workers only — a plain worker renders no such PVC.
+	dindDataSuffix = "-dind-data"
 )
 
 // Labels. The managed-by stamp is PROVENANCE, and provenance is what makes
@@ -156,8 +159,9 @@ const (
 )
 
 // The docker sidecar's wiring (PRD #83 M3). The socket dir is a shared emptyDir
-// carrying ONLY the daemon socket; the data dir is the rootless daemon's own root,
-// on a private emptyDir mounted into `dind` alone.
+// carrying ONLY the daemon socket; the data dir is the daemon's own root, on a
+// private PVC mounted into `dind` alone (issue #224 M-a — it was an emptyDir until
+// then; see dindDataDefaultSize).
 const (
 	dindSocketDir  = "/run/dind"
 	dindSocketPath = dindSocketDir + "/docker.sock"
@@ -213,9 +217,20 @@ const (
 )
 
 // dindResources / dindInitResources: like seedResources, REQUIRED not decoration —
-// a ResourceQuota on requests.* rejects any pod with a container declaring none, and
-// native sidecars count toward the pod's request (they run alongside the worker).
-// The sidecar budget follows arch §Q4 (~1-2 GiB / ~1 CPU on top of the agent).
+// a ResourceQuota on requests.CPU OR requests.MEMORY rejects any pod with a container
+// declaring none, and native sidecars count toward the pod's request (they run
+// alongside the worker). The sidecar budget follows arch §Q4 (~1-2 GiB / ~1 CPU on
+// top of the agent).
+//
+// "cpu or memory", NOT "requests.*", and the difference is not pedantry (issue #224).
+// The quota evaluator intersects a quota's tracked resources against a hardcoded
+// validationSet that holds cpu and memory ALONE — upstream calls that enforcement a
+// frozen mistake and says in so many words not to extend it. So the rule justifying
+// these constants holds EXACTLY, and it does not generalise: a quota on
+// requests.ephemeral-storage tracks the resource and can never force a pod to declare
+// it, which is why the docker tier's 200Gi key sat at used=0 while the nodes filled
+// and a worker was evicted. Do not read the corrected sentence as a reason to relax
+// anything here.
 //
 // The dind requests+limits are the DEFAULT; a cluster overrides them per-cluster (PRD #89
 // 0.8.1, RenderConfig.DinDRequest*/DinDLimit*) because in-daemon image builds OOM the 2Gi
@@ -229,6 +244,142 @@ const (
 	dindDefaultLimitCPU      = "2"
 	dindDefaultLimitMemory   = "2Gi"
 )
+
+// dindDataDefaultSize is the DinD daemon's data-root PVC — the images + build cache
+// (issue #224 M-a). It was an emptyDir until then, and moving it off node ephemeral
+// storage is the whole point: an emptyDir's bytes are charged to the POD's
+// ephemeral-storage usage, so a runaway image pull made the worker the pod kubelet
+// evicted under node disk pressure, which destroys the run's working tree. On a PVC
+// the daemon simply runs out of space: the docker step fails with ENOSPC, the pod
+// survives, and the tree survives with it. Backpressure instead of eviction.
+//
+// FLAT, and chart-overridable per cluster (UZI_WORKER_DIND_DATA_SIZE), for exactly
+// nixSize's reasons: the size tracks the user's repo images, not the worker's
+// CPU/RAM preset, so a per-size table here would be one repeated number.
+//
+// 20Gi is the top of the chart's own documented dind band, AND it is the ceiling:
+// the worker namespaces' LimitRange caps a PVC at maxPVCStorage (20Gi), and the
+// limitranger validates PVC creates, so a larger value is rejected at admission
+// rather than merely being expensive. Raising this means raising that too.
+//
+// THIS CONSTANT IS DUPLICATED IN deploy/chart/templates/worker-invariants.yaml, which
+// substitutes it when workers.docker.dindDataSize is unset — otherwise the guard there
+// would skip the default path entirely and a lowered maxPVCStorage would render clean
+// while every docker worker's third claim was rejected at admission (audit A18.2).
+// Helm cannot read a Go constant, so the two are tied by comment in both directions
+// plus TestDinDDataDefaultFitsTheChartsLimitRangeMax, which fails if this outgrows the
+// chart's ceiling. Move them together.
+//
+// RESIDUAL, documented rather than built, and it is the identical one nixSize
+// carries for /nix: the cache now PERSISTS across pod rolls and nothing garbage-
+// collects it, so a long-lived docker worker's image cache only grows into this
+// fixed volume. The emptyDir at least died with the pod. `docker system prune` is
+// the remedy and an agent can run it; v1's fallback is the same as everywhere else
+// here — delete + reprovision.
+const dindDataDefaultSize = "20Gi"
+
+// dindDataSize is the DinD data-root PVC size: the cluster's override when set,
+// dindDataDefaultSize otherwise. Config validated any override string as a k8s
+// quantity at boot, so MustParse here is safe — the same contract dindResources
+// relies on.
+func (cfg RenderConfig) dindDataSize() resource.Quantity {
+	if cfg.DinDDataSize != "" {
+		return resource.MustParse(cfg.DinDDataSize)
+	}
+	return resource.MustParse(dindDataDefaultSize)
+}
+
+// The worker's requests.ephemeral-storage (issue #224 M-b). Docker REPLACES plain;
+// they do not add.
+//
+// 🔴 THE WHOLE POD BUDGET GOES ON THE `worker` CONTAINER, AND NOT BECAUSE IT IS
+// TIDIER. Quota, the scheduler and kubelet's eviction ranker use three different
+// formulas over the same pod, and only one placement makes all three agree:
+//
+//   - PodRequests (quota + scheduler) sums .spec.containers PLUS restartable
+//     initContainers, so a budget on `dind` is charged in full;
+//   - GetResourceRequestQuantity, which the ranker's exceedDiskRequests uses, is
+//     max(sum(Containers), max(InitContainers)) with NO native-sidecar case, so the
+//     same budget on `dind` is only partially credited. Worker 1Gi + dind 8Gi is
+//     charged 9Gi and credited 8Gi.
+//
+// .spec.containers has exactly ONE entry, so putting the number there makes all
+// three views equal to it, with no double count. SPLITTING IT ACROSS CONTAINERS FOR
+// SYMMETRY SILENTLY HALVES THE RANKING THRESHOLD — that is the edit the next reader
+// makes, and this paragraph is here to stop it.
+//
+// 🔴 AND NEVER A `limits.ephemeral-storage`, ON ANY CONTAINER. A limit is strictly
+// worse than declaring nothing, three ways, any one of them sufficient:
+//
+//  1. podEphemeralStorageLimitEviction fires as soon as ANY container declares a
+//     limit, and compares the SUM of declared limits against pod usage that INCLUDES
+//     the emptyDirs. So one limit on `worker` creates a pod-level ceiling that
+//     run-workdir counts against: a new DETERMINISTIC eviction path that fires with
+//     no node pressure at all, which is this issue's failure arriving on schedule
+//     instead of by luck.
+//  2. A limit on `dind` is inert anyway: containerEphemeralStorageLimitEviction
+//     builds its map from pod.Spec.Containers only, and `dind` is a restartable
+//     initContainer. It also measures rootfs+logs, so emptyDirs are excluded from
+//     container-level enforcement entirely.
+//  3. A REQUEST adds no eviction path at all: every arm of localStorageEviction is
+//     limit- or sizeLimit-gated. It buys placement plus exceedDiskRequests ranking,
+//     over a podDiskUsage that DOES include emptyDirs.
+//
+// The LimitRange is the other half of the same rule: an ephemeral `max` would need a
+// `default` beside it, and that `default` would hand trap (1) to every pod in the
+// namespace. Neither tier declares one; do not add one.
+// TestNoContainerDeclaresAnEphemeralStorageLimit is what actually enforces this.
+//
+// preset.go:44-46 already makes this argument for memory ("kubelet evicts pods whose
+// usage exceeds their REQUESTS first"). This is the same argument for disk.
+//
+// WHAT THE NUMBERS BUY, stated honestly because the shipped values are small: this
+// is a RANKING mitigation, not a CAPACITY guarantee. Nothing else in this cluster
+// declares the resource — a node measured 51-52% full reports `ephemeral-storage
+// 0 (0%)` requested — so the scheduler's view of it is empty and the undeclared
+// usage stays invisible however much we declare. The capacity answer is bigger node
+// disks, and image accumulation is its own defect (issue #225).
+//
+// "CONSERVATIVE" HERE MEANS ERR *LOW*, which inverts the usual instinct and is the
+// sentence most worth keeping. Too low is today's behaviour: probabilistic,
+// recoverable, and visible in a message we now know how to read. Too high is
+// UNSCHEDULABLE: total, deterministic and SILENT, presenting as preset.go:14-17's
+// worker that provisions and never appears, and the docker tier's quota cannot warn
+// you because it cannot bind on this resource (see values.yaml's ephemeralStorage
+// comment).
+const (
+	// Plain worker: the working tree is NOT on ephemeral storage. render.go mounts
+	// run-workdir only when w.Docker, so /data/runner falls through to the `data`
+	// PVC and what is left on ephemeral is container logs plus the writable layer.
+	// Measured 45 KiB; kubelet's default log rotation ceiling is 10Mi x 5 per
+	// container. 512Mi is ~10x that ceiling.
+	workerDefaultEphemeralRequest = "512Mi"
+	// Docker worker: run-workdir IS an emptyDir, and it holds the run's entire
+	// working tree — one clone per run, multiplied by WORKER_MAX_CONCURRENT_RUNS,
+	// with $TMPDIR pointed at the same volume. This repo alone is a ~170 MiB runner
+	// clone before a single dependency install. 4Gi covers ~2 concurrent heavy runs.
+	//
+	// It is 4Gi and not the 6Gi an earlier draft carried BECAUSE of M-a: the daemon's
+	// image cache used to be an emptyDir on this same budget and is now a PVC. Do not
+	// raise this without re-deriving what is actually left on ephemeral storage.
+	workerDefaultDockerEphemeralRequest = "4Gi"
+)
+
+// ephemeralRequest is the worker container's requests.ephemeral-storage: the docker
+// value for a docker worker, the plain value otherwise, each overridable per cluster.
+// Config validated any override string as a quantity at boot, so MustParse is safe.
+func (cfg RenderConfig) ephemeralRequest(w protocol.DesiredWorker) resource.Quantity {
+	if w.Docker {
+		if cfg.DockerEphemeralRequest != "" {
+			return resource.MustParse(cfg.DockerEphemeralRequest)
+		}
+		return resource.MustParse(workerDefaultDockerEphemeralRequest)
+	}
+	if cfg.EphemeralRequest != "" {
+		return resource.MustParse(cfg.EphemeralRequest)
+	}
+	return resource.MustParse(workerDefaultEphemeralRequest)
+}
 
 // dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
 // dindDefault* constants for any field a cluster did not override (config validated every
@@ -280,14 +431,22 @@ func (cfg RenderConfig) namespaceFor(w protocol.DesiredWorker) string {
 
 // seedResources are the init container's requests/limits.
 //
-// They are REQUIRED, not decoration: a ResourceQuota on requests.* makes admission
-// reject any pod with a container that declares none — initContainers included. The
-// LimitRange is the backstop, not the source.
+// They are REQUIRED, not decoration: a ResourceQuota on requests.CPU or
+// requests.MEMORY makes admission reject any pod with a container that declares none
+// — initContainers included. The LimitRange is the backstop, not the source.
+//
+// "cpu or memory" rather than "requests.*", corrected in issue #224: the quota
+// evaluator's validationSet is those two and nothing else, permanently and by
+// upstream's explicit design. That makes the rule above EXACT here (cpu and memory
+// are what these constants declare) and makes it false as a generalisation — see the
+// longer note on dindResources.
 //
 // They cost nothing as long as they stay under the SMALLEST preset's requests: a
 // pod's effective request is max(initContainers), not sum, taken against
-// sum(containers). presetRequestsDominateTheSeed pins that property so shrinking a
-// preset cannot silently make the seed container the pod's effective request.
+// sum(containers). TestSeedContainerRequestsStayUnderEveryPreset (render_test.go)
+// pins that property so shrinking a preset cannot silently make the seed container
+// the pod's effective request. It named `presetRequestsDominateTheSeed` until issue
+// #224; no such symbol has ever existed in this tree.
 var seedResources = corev1.ResourceRequirements{
 	Requests: corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("100m"),
@@ -346,6 +505,32 @@ type RenderConfig struct {
 	DinDRequestMemory string
 	DinDLimitCPU      string
 	DinDLimitMemory   string
+	// EphemeralRequest / DockerEphemeralRequest override the WORKER container's
+	// requests.ephemeral-storage (issue #224 M-b). Docker REPLACES plain rather than
+	// adding to it. Empty ⇒ workerDefault{,Docker}EphemeralRequest ("512Mi" / "4Gi").
+	// Quantity strings, validated at the controller's boot so the render side can
+	// MustParse them. The right value is a property of the CLUSTER'S NODES rather than
+	// of the product, which is the same argument that made dindResources overridable.
+	// Read ephemeralRequest's header before touching either: the budget belongs on the
+	// worker container alone, and NEITHER may ever become a limit.
+	EphemeralRequest       string
+	DockerEphemeralRequest string
+	// MaxPVCStorage / DockerMaxPVCStorage are each tier's LimitRange maxPVCStorage
+	// (issue #224). They render NOTHING — they are the admission ceiling every PVC
+	// this controller creates must fit, checked once at boot by ValidatePVCCeilings so
+	// an oversized claim is a refusal to start rather than a fleet of workers that
+	// provision and never appear. Empty means that tier has no LimitRange, so there is
+	// no ceiling and its check is skipped. Per-tier because the two are separate
+	// namespaces with separate LimitRanges; see ValidatePVCCeilings for why the
+	// invariant is a per-tier minimum rather than an equality.
+	MaxPVCStorage       string
+	DockerMaxPVCStorage string
+	// DinDDataSize overrides the DinD daemon's data-root PVC size (issue #224 M-a).
+	// Empty ⇒ dindDataDefaultSize ("20Gi"). A quantity string, validated at the
+	// controller's boot so the render side can MustParse it. Docker-only, so it never
+	// touches a plain worker's spec/hash. See dindDataDefaultSize for the 20Gi
+	// admission ceiling and the no-GC residual.
+	DinDDataSize string
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -374,6 +559,10 @@ func deploymentName(id string) string { return NamePrefix + id }
 func secretName(id string) string     { return NamePrefix + id + tokenSuffix }
 func dataPVCName(id string) string    { return NamePrefix + id + dataSuffix }
 func nixPVCName(id string) string     { return NamePrefix + id + nixSuffix }
+
+// dindDataPVCName is the DinD daemon's data root (issue #224 M-a). Rendered for
+// docker workers only, so a plain worker never has an object by this name.
+func dindDataPVCName(id string) string { return NamePrefix + id + dindDataSuffix }
 
 // objectLabels is the stamp every created object carries.
 func objectLabels(id string) map[string]string {
@@ -428,23 +617,34 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 	}
 }
 
-// RenderPVCs builds the /data and /nix claims.
+// RenderPVCs builds the /data and /nix claims, plus — for a DOCKER worker only —
+// the DinD daemon's data root.
 //
-// Two volumes, pointing opposite ways for opposite reasons. /data is the clone
+// The first two point opposite ways for opposite reasons. /data is the clone
 // cache + per-run workspaces and varies by size. /nix is FLAT (20Gi, PRD #87 bump
 // for the prebaked Chromium closure) and persists because the store is an expensive
 // INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
 // and Decision 9 rolls every worker on every release —
 // so not persisting it would pay that cost per worker per release.
 //
+// The third is issue #224 M-a: the daemon's image + build cache, moved off the pod's
+// ephemeral storage so a runaway pull produces ENOSPC in the daemon instead of a
+// kubelet eviction that destroys the run's working tree. Flat, and rendered ONLY
+// when w.Docker — a plain worker's object set is unchanged, which is the same
+// property the docker branch of podTemplate preserves for its spec hash.
+//
 // Never patched. PVC specs are near-immutable and a size change is delete +
 // reprovision.
 func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []*corev1.PersistentVolumeClaim {
 	ns := cfg.namespaceFor(w)
-	return []*corev1.PersistentVolumeClaim{
+	pvcs := []*corev1.PersistentVolumeClaim{
 		renderPVC(cfg, ns, w.ID, dataPVCName(w.ID), spec.Size.DataSize),
 		renderPVC(cfg, ns, w.ID, nixPVCName(w.ID), spec.NixSize),
 	}
+	if w.Docker {
+		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize()))
+	}
+	return pvcs
 }
 
 func renderPVC(cfg RenderConfig, ns, id, name string, size resource.Quantity) *corev1.PersistentVolumeClaim {
@@ -787,10 +987,17 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindWorkdirVolume, MountPath: dindWorkdirDir})
 		volumes = append(volumes,
 			// The daemon's data root, mounted into `dind` ALONE (rootless HOME path or
-			// /var/lib/docker per posture). emptyDir in v1 (a PVC is the durable/size
-			// alternative, arch §Q4); this is the images + build cache the daemon writes,
-			// none of it worker state.
-			corev1.Volume{Name: dindDataVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			// /var/lib/docker per posture). Its OWN PVC since issue #224 M-a — it was the
+			// emptyDir arch §Q4 flagged, and an emptyDir's bytes count toward the pod's
+			// ephemeral-storage usage, which is what made a big image pull get the worker
+			// EVICTED and its in-flight run's tree destroyed. This is the images + build
+			// cache the daemon writes, none of it worker state, and Decision 3 is
+			// untouched: it stays mounted into `dind` alone.
+			corev1.Volume{Name: dindDataVolume, VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: dindDataPVCName(w.ID),
+				},
+			}},
 			// The shared run workdir (M-workdir). emptyDir, so it is torn down with the pod
 			// and is never a persistence surface; carries the run's checkout, NO secrets.
 			corev1.Volume{Name: dindWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
@@ -847,7 +1054,16 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    spec.Size.CPURequest,
 						corev1.ResourceMemory: spec.Size.MemoryRequest,
+						// The WHOLE pod's ephemeral-storage budget, on this one container, with
+						// NO matching limit. Both of those are load-bearing and neither is
+						// obvious — read ephemeralRequest's header before changing either.
+						// Adding a limit "for symmetry with cpu/memory" creates a deterministic
+						// eviction path that fires with no node pressure at all.
+						corev1.ResourceEphemeralStorage: cfg.ephemeralRequest(w),
 					},
+					// cpu and memory ONLY. See above: there is no ephemeral-storage limit here
+					// on purpose, and TestNoContainerDeclaresAnEphemeralStorageLimit enforces
+					// it across every container and initContainer in the pod.
 					Limits: corev1.ResourceList{
 						corev1.ResourceCPU:    spec.Size.CPULimit,
 						corev1.ResourceMemory: spec.Size.MemoryLimit,
@@ -859,8 +1075,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 				VolumeMounts: workerMounts,
 			}},
 			// Built above: [token, data, nix] plus, for a docker worker, the daemon's
-			// private data root + the shared run workdir emptyDirs (and, rootless only,
-			// the shared socket-dir emptyDir).
+			// private data-root PVC (issue #224 M-a) + the shared run workdir emptyDir
+			// (and, rootless only, the shared socket-dir emptyDir).
 			Volumes: volumes,
 		},
 	}

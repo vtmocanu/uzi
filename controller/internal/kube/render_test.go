@@ -4,11 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/yaml"
 
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
@@ -162,8 +164,11 @@ func TestRenderedPodPosture(t *testing.T) {
 		if len(c.SecurityContext.Capabilities.Drop) != 1 || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
 			t.Errorf("container %q: must drop ALL capabilities", c.Name)
 		}
-		// A ResourceQuota on requests.* rejects any pod with a container declaring none —
-		// initContainers included.
+		// A ResourceQuota on requests.CPU or requests.MEMORY rejects any pod with a
+		// container declaring none — initContainers included. Those two resources and no
+		// others: the quota evaluator's validationSet is hardcoded to them (issue #224
+		// corrected "requests.*" here), which is exactly why the ephemeral-storage
+		// request asserted further down needs its own test rather than this one.
 		if c.Resources.Requests.Cpu().IsZero() || c.Resources.Requests.Memory().IsZero() {
 			t.Errorf("container %q: requests are required or the ResourceQuota rejects the pod", c.Name)
 		}
@@ -312,6 +317,496 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 				t.Errorf("%s: storageClass not applied", p.Name)
 			}
 		}
+	}
+}
+
+// Issue #224 M-b: the worker container declares requests.ephemeral-storage, on the
+// WORKER container and nowhere else, at the per-tier value.
+//
+// Declaring nothing is what the issue is about: kubelet ranks a pod that requested 0
+// as exceeding its request by everything it uses, so a worker was the first thing
+// evicted under node disk pressure — and an evicted worker's in-flight run loses its
+// entire working tree, silently.
+//
+// The "worker container and nowhere else" half is the part that reads as an
+// oversight and is the actual design. Quota and the scheduler sum containers PLUS
+// restartable initContainers; the eviction ranker uses max(sum(Containers),
+// max(InitContainers)) with no sidecar case. .spec.containers holds exactly one
+// entry, so the whole budget on `worker` makes all three views agree on one number.
+// Splitting it across containers "for symmetry" is charged in full by quota and
+// credited only partially by the ranker, i.e. it silently halves the threshold this
+// exists to raise.
+func TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+		want string
+	}{
+		{"plain", testConfig(), desired("abc"), "512Mi"},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "4Gi"},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "4Gi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			worker := containerByName(t, pod.Containers, workerContainerName)
+			got, ok := worker.Resources.Requests[corev1.ResourceEphemeralStorage]
+			if !ok {
+				t.Fatalf("the worker container declares NO requests.ephemeral-storage. A pod that declares "+
+					"none is ranked as exceeding its request by its whole usage and is evicted FIRST under node "+
+					"disk pressure, which destroys the in-flight run's working tree (issue #224). requests = %v",
+					worker.Resources.Requests)
+			}
+			if want := resource.MustParse(tc.want); got.Cmp(want) != 0 {
+				t.Errorf("worker requests.ephemeral-storage = %s, want %s", got.String(), tc.want)
+			}
+
+			// EVERY other container: none of them declares one. This is the half a future
+			// "make the sidecar declare its share too" edit breaks.
+			for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+				if c.Name == workerContainerName {
+					continue
+				}
+				if q, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok {
+					t.Errorf("container %q also declares requests.ephemeral-storage (%s). The whole pod budget "+
+						"belongs on %q alone: quota and the scheduler sum containers plus restartable init "+
+						"containers, while the eviction ranker uses max(sum(Containers), max(InitContainers)) "+
+						"with no sidecar case, so a split is charged in full and credited only in part.",
+						c.Name, q.String(), workerContainerName)
+				}
+			}
+		})
+	}
+}
+
+// 🔴 THE INVARIANT TEST. No container in .spec.containers OR .spec.initContainers may
+// declare limits.ephemeral-storage, in either posture, docker or plain.
+//
+// This is not defensive tidiness — a limit is strictly WORSE than declaring nothing,
+// and it is what the next person adds "for symmetry with cpu and memory":
+//
+//  1. podEphemeralStorageLimitEviction fires as soon as ANY container declares a
+//     limit, and compares the SUM of declared limits against pod usage that INCLUDES
+//     the emptyDirs. One limit on `worker` therefore creates a pod-level ceiling that
+//     run-workdir — the run's own checkout — counts against. That is a DETERMINISTIC
+//     eviction with no node pressure at all: this issue's failure, on schedule.
+//  2. A limit on `dind` is inert anyway (containerEphemeralStorageLimitEviction reads
+//     pod.Spec.Containers only, and dind is a restartable initContainer), so it buys
+//     nothing while still arming (1).
+//  3. All three localStorageEviction arms evict at gracePeriodOverride 0, so a limit
+//     would also disarm any SIGTERM-time work-preservation the shutdown path grows.
+//
+// A REQUEST adds no eviction path at all — every arm is limit- or sizeLimit-gated —
+// which is why the request above is safe and this must stay empty.
+func TestNoContainerDeclaresAnEphemeralStorageLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			// Both lists, explicitly. Checking only .spec.containers would miss the whole
+			// docker tier, whose sidecars are initContainers — and trap (1) fires on a limit
+			// declared by ANY container, sidecar included.
+			seen := 0
+			for _, group := range []struct {
+				what string
+				cs   []corev1.Container
+			}{
+				{".spec.initContainers", pod.InitContainers},
+				{".spec.containers", pod.Containers},
+			} {
+				for _, c := range group.cs {
+					seen++
+					if q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+						t.Errorf("%s container %q declares limits.ephemeral-storage = %s. NEVER declare one: a limit "+
+							"on ANY container makes kubelet enforce the SUM of declared limits against pod usage that "+
+							"includes the emptyDirs, creating a deterministic eviction that fires with no node pressure "+
+							"— the exact failure issue #224 exists to reduce. Read ephemeralRequest's header in "+
+							"render.go before reverting this.", group.what, c.Name, q.String())
+					}
+				}
+			}
+			// The test iterated something. Without this it would pass vacuously if the
+			// render ever stopped producing containers at all.
+			if seen < 2 {
+				t.Fatalf("only %d containers in the rendered pod; the invariant was asserted over almost nothing", seen)
+			}
+		})
+	}
+}
+
+// The per-tier values are overridable per cluster (the right number is a property of
+// the CLUSTER'S NODES, not of the product — the same argument that made dindResources
+// overridable), docker REPLACES plain rather than adding to it, and either override
+// rolls its own tier and only its own.
+func TestEphemeralRequestOverridesArePerTierAndRollOnlyThatTier(t *testing.T) {
+	ephemeralOf := func(cfg RenderConfig, w protocol.DesiredWorker) string {
+		t.Helper()
+		pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+		q := containerByName(t, pod.Containers, workerContainerName).Resources.Requests[corev1.ResourceEphemeralStorage]
+		return q.String()
+	}
+
+	cfg := dockerTestConfig()
+	cfg.EphemeralRequest = "1Gi"
+	cfg.DockerEphemeralRequest = "8Gi"
+
+	if got := ephemeralOf(cfg, desired("abc")); got != "1Gi" {
+		t.Errorf("overridden plain request = %s, want 1Gi", got)
+	}
+	// REPLACES, not adds: 8Gi exactly, never 9Gi.
+	if got := ephemeralOf(cfg, desiredDocker("abc")); got != "8Gi" {
+		t.Errorf("overridden docker request = %s, want exactly 8Gi — the docker value REPLACES the plain one", got)
+	}
+
+	// A partial override leaves the other tier on its default, in both directions.
+	plainOnly := dockerTestConfig()
+	plainOnly.EphemeralRequest = "1Gi"
+	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "4Gi" {
+		t.Errorf("docker request with only the plain override set = %s, want the 4Gi default", got)
+	}
+	dockerOnly := dockerTestConfig()
+	dockerOnly.DockerEphemeralRequest = "8Gi"
+	if got := ephemeralOf(dockerOnly, desired("abc")); got != "512Mi" {
+		t.Errorf("plain request with only the docker override set = %s, want the 512Mi default", got)
+	}
+
+	// Each override rolls its own tier (it changes the rendered pod, so a bump must
+	// actually reach the fleet) and leaves the other tier's hash alone.
+	base := dockerTestConfig()
+	if SpecHashOf(base, desired("abc"), testSpec(t, "base", "m")) ==
+		SpecHashOf(plainOnly, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("raising the plain ephemeral request did not change a plain worker's spec hash, so the bump would never roll it")
+	}
+	if SpecHashOf(base, desiredDocker("abc"), testSpec(t, "base", "m")) !=
+		SpecHashOf(plainOnly, desiredDocker("abc"), testSpec(t, "base", "m")) {
+		t.Error("the PLAIN override changed a DOCKER worker's spec hash; the two tiers must roll independently")
+	}
+	if SpecHashOf(base, desired("abc"), testSpec(t, "base", "m")) !=
+		SpecHashOf(dockerOnly, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("the DOCKER override changed a PLAIN worker's spec hash; a docker-only knob must never roll the plain fleet")
+	}
+}
+
+// The shipped defaults must fit the fleet the chart's own quotas permit, or a worker
+// provisions and never appears — silently, because a quota on this resource cannot
+// bind (the evaluator enforces cpu and memory alone) and so cannot warn anybody.
+//
+// 🔴 THE FLEET SIZES ARE READ OUT OF values.yaml, NOT COPIED INTO THIS FILE, AND THAT
+// IS THE WHOLE POINT OF THE TEST. They were hardcoded (`10, 20`) until issue #224's
+// audit caught it: those are the two tiers' `count/deployments.apps` quotas, they have
+// a source in this repo, and copying them made the test assert against its own
+// premise rather than against the chart. Raise the docker tier to 20 in values.yaml
+// and the real fleet needs 20 x 4Gi + 20 x 512Mi = 90 GiB against a 70.2 GiB pool —
+// exactly the condition this test exists to catch — and a hardcoded copy stays GREEN.
+// A test whose premise is a stale copy of the thing it is checking is worse than no
+// test, because it reports safety it never verified.
+//
+// The read crosses the module boundary, which is an established idiom here — the
+// protocol and preset contract tests read api/ goldens the same way — and it is
+// precisely why `task test:controller` carries `-count=1`: Go's test cache hashes only
+// files inside the module root, so editing values.yaml changes nothing in this
+// module's cache key and a cached green would hide the regression.
+//
+// The NODE figure is different in kind and stays a constant: dev-cluster's measured
+// ephemeral-storage allocatable, identical on all four worker nodes. It is a fact
+// about one cluster with no source in this repo, and the assertion it supports is
+// "the SHIPPED DEFAULTS are sane for a real node", not "this controller knows your
+// nodes". A cluster with smaller nodes lowers the values through the chart.
+func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
+	// 17.55 GiB allocatable x 4 worker nodes.
+	const nodeAllocatable = 17.55
+	const workerNodes = 4
+	dockerWorkers, plainWorkers := chartDeploymentQuotas(t)
+
+	gib := func(s string) float64 {
+		t.Helper()
+		q := resource.MustParse(s)
+		return float64(q.Value()) / (1 << 30)
+	}
+	plain, docker := gib(workerDefaultEphemeralRequest), gib(workerDefaultDockerEphemeralRequest)
+
+	// A single worker must fit on ONE node with room for the node's own eviction
+	// threshold (15%) and for everything else already running there.
+	if docker > nodeAllocatable*0.85 {
+		t.Errorf("the docker default (%s = %.2f GiB) exceeds 85%% of a node's allocatable (%.2f GiB): "+
+			"the pod would be permanently unschedulable, which presents as a worker that provisions and never appears",
+			workerDefaultDockerEphemeralRequest, docker, nodeAllocatable)
+	}
+
+	// And the whole fleet the quotas permit must fit across the pool. This is the
+	// assertion that would have caught the 20Gi-per-worker figure an early draft
+	// considered: 1.14x a whole node, each.
+	fleet := float64(dockerWorkers)*docker + float64(plainWorkers)*plain
+	pool := nodeAllocatable * workerNodes
+	if fleet > pool {
+		t.Errorf("a full fleet (%d docker x %s + %d plain x %s = %.1f GiB) exceeds the worker pool's "+
+			"ephemeral-storage allocatable (%d x %.2f = %.1f GiB); workers would silently stop scheduling",
+			dockerWorkers, workerDefaultDockerEphemeralRequest, plainWorkers, workerDefaultEphemeralRequest,
+			fleet, workerNodes, nodeAllocatable, pool)
+	}
+}
+
+// The controller's OWN dind data-root default must fit the chart's docker-tier PVC
+// ceiling (audit A18.2). This is the UNSET path, and it was unguarded on both sides.
+//
+// An absent or empty workers.docker.dindDataSize does not mean "no claim": the
+// controller falls back to dindDataDefaultSize and creates that PVC anyway. The chart
+// guard originally skipped an empty value, so an empty string plus a lowered
+// maxPVCStorage rendered clean and every docker worker's third claim was rejected at
+// admission — the provisions-and-never-appears failure, through the default rather than
+// through an override.
+//
+// The chart now defaults the value before comparing, which fixes the render-time half.
+// This is the other half: it ties the CONTROLLER's constant to the chart's ceiling, so
+// raising dindDataDefaultSize past maxPVCStorage reddens here rather than in a cluster.
+// The two are a genuine cross-toolchain pair — Helm cannot read a Go constant — and this
+// is what keeps them honest.
+func TestDinDDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
+	max := chartDockerMaxPVCStorage(t)
+	def := resource.MustParse(dindDataDefaultSize)
+	if def.Cmp(max) > 0 {
+		t.Errorf("dindDataDefaultSize = %s exceeds workers.docker.limitRange.maxPVCStorage = %s. Every docker "+
+			"worker that does not override workers.docker.dindDataSize would have its dind data-root PVC "+
+			"rejected at admission and would provision and never appear. Raise maxPVCStorage in "+
+			"deploy/chart/values.yaml (and quota.requestsStorage with it), or lower the constant.",
+			def.String(), max.String())
+	}
+}
+
+// chartDockerMaxPVCStorage reads workers.docker.limitRange.maxPVCStorage out of
+// deploy/chart/values.yaml. Same contract as chartDeploymentQuotas below: parsed rather
+// than grepped (maxPVCStorage appears under two tiers), and FATAL on anything
+// unexpected, because a fallback would silently reinstate the hardcoded ceiling these
+// readers exist to remove.
+func chartDockerMaxPVCStorage(t *testing.T) resource.Quantity {
+	t.Helper()
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
+	}
+	var v struct {
+		Workers struct {
+			Docker struct {
+				LimitRange struct {
+					MaxPVCStorage string `json:"maxPVCStorage"`
+				} `json:"limitRange"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	if v.Workers.Docker.LimitRange.MaxPVCStorage == "" {
+		t.Fatalf("workers.docker.limitRange.maxPVCStorage is empty in %s; there is no ceiling to check against", path)
+	}
+	q, err := resource.ParseQuantity(v.Workers.Docker.LimitRange.MaxPVCStorage)
+	if err != nil {
+		t.Fatalf("workers.docker.limitRange.maxPVCStorage = %q in %s is not a resource quantity: %v",
+			v.Workers.Docker.LimitRange.MaxPVCStorage, path, err)
+	}
+	return q
+}
+
+// chartDeploymentQuotas reads the two tiers' `count/deployments.apps` quotas straight
+// out of deploy/chart/values.yaml, so the fleet-fit assertion above is made against
+// the chart the cluster actually installs rather than against a copy of it.
+//
+// PARSED, not grepped. A regex over YAML would find `deployments:` under whichever
+// block it met first and could not tell the two tiers apart, which is the failure
+// this repo has already paid for once with `kind:` in a rendered manifest: when a grep
+// and a parser disagree, the parser is right.
+//
+// A missing or unreadable file is a FATAL, never a skip or a default. The whole value
+// of reading the chart is lost the moment a failure quietly falls back to a number
+// baked in here, and a test that silently stops checking is the exact shape this
+// helper was written to remove.
+func chartDeploymentQuotas(t *testing.T) (docker, plain int) {
+	t.Helper()
+	// controller/internal/kube -> repo root.
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the fleet-fit assertion is made against the chart's own quotas; it must not fall back to a hardcoded fleet size)", path, err)
+	}
+	// Only the two fields we need. values.yaml quotes them (`deployments: "20"`),
+	// because a ResourceQuota's hard values are strings.
+	var v struct {
+		Workers struct {
+			Quota struct {
+				Deployments string `json:"deployments"`
+			} `json:"quota"`
+			Docker struct {
+				Quota struct {
+					Deployments string `json:"deployments"`
+				} `json:"quota"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	atoi := func(what, s string) int {
+		t.Helper()
+		if s == "" {
+			t.Fatalf("%s is empty in %s; the fleet-fit assertion has no fleet size to check against", what, path)
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			t.Fatalf("%s = %q in %s, which is not an integer: %v", what, s, path, err)
+		}
+		if n <= 0 {
+			t.Fatalf("%s = %d in %s; a non-positive fleet size would make the assertion vacuous", what, n, path)
+		}
+		return n
+	}
+	return atoi("workers.docker.quota.deployments", v.Workers.Docker.Quota.Deployments),
+		atoi("workers.quota.deployments", v.Workers.Quota.Deployments)
+}
+
+// Issue #224 M-a: the DinD daemon's data root is a THIRD PVC, and ONLY for a docker
+// worker. Both halves matter and they fail differently.
+//
+// The docker half is the fix: as an emptyDir, the daemon's image + build cache was
+// charged to the POD's ephemeral-storage usage, so a big pull made this pod the one
+// kubelet evicted under node disk pressure — and an evicted worker's in-flight run
+// loses its whole working tree, silently.
+//
+// The plain half is the blast radius. render.go builds the docker init containers,
+// mounts and volumes as slices precisely so a non-docker render stays byte-identical;
+// if the third PVC or its volume leaked into a plain worker's render, shipping a
+// DOCKER-only change would roll the ENTIRE plain fleet — every one of which is the
+// exact data-loss event this issue is about.
+func TestDinDDataPVCIsRenderedForDockerWorkersOnly(t *testing.T) {
+	for _, p := range dindPostures() {
+		// Docker: three claims, the third being the daemon's data root.
+		pvcs := RenderPVCs(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		if len(pvcs) != 3 {
+			t.Fatalf("[%s] docker worker rendered %d pvcs, want 3 (data, nix, dind-data)", p.name, len(pvcs))
+		}
+		dind := pvcs[2]
+		if dind.Name != "uzi-hw-abc-dind-data" {
+			t.Errorf("[%s] third pvc = %q, want uzi-hw-abc-dind-data", p.name, dind.Name)
+		}
+		if got := dind.Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+			t.Errorf("[%s] dind-data size = %s, want the flat 20Gi default", p.name, got)
+		}
+		if dind.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+			t.Errorf("[%s] dind-data must be RWO", p.name)
+		}
+		if dind.Spec.StorageClassName == nil || *dind.Spec.StorageClassName != "storage-class" {
+			t.Errorf("[%s] dind-data: storageClass not applied", p.name)
+		}
+		if dind.Namespace != "uzi-workers-docker" {
+			t.Errorf("[%s] dind-data namespace = %q, want the docker tier's", p.name, dind.Namespace)
+		}
+
+		// Plain: two claims, and NO object by the dind name anywhere in the set.
+		plain := RenderPVCs(p.cfg, desired("abc"), testSpec(t, "base", "m"))
+		if len(plain) != 2 {
+			t.Fatalf("[%s] plain worker rendered %d pvcs, want 2 — a docker-only volume must never reach the restricted tier", p.name, len(plain))
+		}
+		for _, q := range plain {
+			if q.Name == dindDataPVCName("abc") {
+				t.Errorf("[%s] a plain worker rendered %q", p.name, q.Name)
+			}
+		}
+
+		// ...and no such VOLUME in a plain worker's pod, which is the half that would
+		// roll the fleet rather than merely waste a claim.
+		for _, v := range RenderDeployment(p.cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Volumes {
+			if v.Name == dindDataVolume {
+				t.Errorf("[%s] a plain worker's pod carries the %q volume", p.name, dindDataVolume)
+			}
+		}
+	}
+}
+
+// The volume SOURCE, asserted positively against a control. "No EmptyDir" alone would
+// pass on a volume that is neither (an unset VolumeSource renders as an empty
+// {} and the apiserver rejects it), so assert the claim IS a PVC and names the right
+// claim — and keep run-workdir in the same test as the control that proves the
+// assertion discriminates: it is still an emptyDir and MUST stay one (it holds the
+// run's checkout, so bounding or persisting it is the opposite of this fix).
+func TestDinDDataVolumeIsAPVCAndRunWorkdirIsStillAnEmptyDir(t *testing.T) {
+	for _, p := range dindPostures() {
+		vols := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Volumes
+
+		data := volumeByName(t, vols, dindDataVolume)
+		if data.PersistentVolumeClaim == nil {
+			t.Fatalf("[%s] %s is not a PVC (source = %+v). As an emptyDir its bytes count toward the pod's "+
+				"ephemeral-storage usage, which is what got workers evicted (issue #224).", p.name, dindDataVolume, data.VolumeSource)
+		}
+		if got := data.PersistentVolumeClaim.ClaimName; got != "uzi-hw-abc-dind-data" {
+			t.Errorf("[%s] %s claimName = %q, want uzi-hw-abc-dind-data", p.name, dindDataVolume, got)
+		}
+		if data.EmptyDir != nil {
+			t.Errorf("[%s] %s carries BOTH a PVC and an emptyDir source", p.name, dindDataVolume)
+		}
+
+		// The control.
+		work := volumeByName(t, vols, dindWorkdirVolume)
+		if work.EmptyDir == nil {
+			t.Errorf("[%s] %s must stay an emptyDir: it holds the run's working tree, and this issue exists "+
+				"to stop that tree being destroyed, not to bound it", p.name, dindWorkdirVolume)
+		}
+	}
+}
+
+// The size is flat, chart-overridable, and — deliberately — NOT part of the pod's
+// spec hash.
+//
+// That last property is easy to read as a bug and is the correct behaviour: the pod
+// template only NAMES the claim, so raising the size cannot roll a worker, and it must
+// not pretend to. PVCs are never patched here (RenderPVCs' own header), so a size
+// change applies to newly-provisioned workers and existing ones need delete +
+// reprovision — exactly what /data and /nix already do. A roll would produce a pod
+// that restarts and then mounts the SAME old claim, i.e. a disruption that changes
+// nothing.
+func TestDinDDataSizeDefaultsOverridesAndDoesNotRollThePod(t *testing.T) {
+	dindPVC := func(cfg RenderConfig) *corev1.PersistentVolumeClaim {
+		t.Helper()
+		pvcs := RenderPVCs(cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		return pvcs[len(pvcs)-1]
+	}
+
+	if got := dindPVC(dockerTestConfig()).Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+		t.Errorf("default dind-data size = %s, want 20Gi", got)
+	}
+
+	// 10Gi, and it is deliberately BELOW the chart's limitRange.maxPVCStorage (20Gi)
+	// rather than a round number picked for contrast. A fixture is read as an example:
+	// this used to be 40Gi, which is double the ceiling, so it demonstrated a value that
+	// renders clean, boots clean and then has its PVC rejected at admission — the worker
+	// provisions and never appears. worker-invariants.yaml now refuses to render that
+	// pair, so a 40Gi fixture would also contradict the chart's own guard.
+	over := dockerTestConfig()
+	over.DinDDataSize = "10Gi"
+	if got := dindPVC(over).Spec.Resources.Requests.Storage().String(); got != "10Gi" {
+		t.Errorf("overridden dind-data size = %s, want 10Gi", got)
+	}
+
+	// The override does not touch the pod template, in EITHER direction.
+	if a, b := SpecHashOf(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(over, desiredDocker("abc"), testSpec(t, "base", "m")); a != b {
+		t.Error("changing the dind-data PVC size changed the docker worker's spec hash; it must not — " +
+			"the pod names the claim, never its size, and rolling the pod would remount the same old claim")
+	}
+	// And a plain worker's hash is untouched by the setting existing at all — the same
+	// guard TestDockerFlagRollsThePodButAbsentDockerIsInert applies to the docker tier
+	// config as a whole, restated for the one knob added here.
+	if a, b := SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(over, desired("abc"), testSpec(t, "base", "m")); a != b {
+		t.Error("a plain worker's spec hash depends on the dind-data size; a docker-only knob must never roll the plain fleet")
 	}
 }
 
@@ -682,14 +1177,21 @@ func TestDockerWorkerKeepsWorkerPostureAndPrivilegesOnlyTheSidecar(t *testing.T)
 				t.Fatal("dind-init must run as root (uid 0) to chown/chmod the socket dir")
 			}
 			caps := dindInit.SecurityContext.Capabilities
-			if caps == nil || len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
+			// FATAL, not Error: a nil capability set means every assertion below is
+			// vacuous, and reading caps.Add past a non-fatal Error is a real nil
+			// dereference — the test would PANIC rather than report the security
+			// regression it exists to catch.
+			if caps == nil {
+				t.Fatal("dind-init declares no capabilities at all; it must drop ALL and add back exactly CHOWN + FOWNER")
+			}
+			if len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
 				t.Error("dind-init must drop ALL capabilities")
 			}
 			gotAdd := map[corev1.Capability]bool{}
 			for _, c := range caps.Add {
 				gotAdd[c] = true
 			}
-			if caps == nil || len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
+			if len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
 				t.Errorf("dind-init must add exactly [CHOWN, FOWNER] and nothing else, got %v", caps.Add)
 			}
 		})

@@ -61,10 +61,16 @@ type ObservedWorker struct {
 	// from its own config, so the generation never moves for it). "" when
 	// HasDeployment is false.
 	SpecHash string
-	// HasDataPVC / HasNixPVC let a partially-created worker (a crashed reconcile
-	// between calls) converge without a read of anything sensitive.
-	HasDataPVC bool
-	HasNixPVC  bool
+	// HasDataPVC / HasNixPVC / HasDinDDataPVC let a partially-created worker (a
+	// crashed reconcile between calls) converge without a read of anything sensitive.
+	//
+	// HasDinDDataPVC is the DinD daemon's data root (issue #224 M-a), rendered for
+	// DOCKER workers only — so it stays false forever for a plain worker, which is
+	// correct rather than a gap: RenderPVCs emits no such claim for one, so there is
+	// nothing for the create-gate to skip and nothing for teardown to find.
+	HasDataPVC     bool
+	HasNixPVC      bool
+	HasDinDDataPVC bool
 	// Namespace is the namespace the object(s) for this worker were OBSERVED in
 	// (PRD #83 M3). With two worker namespaces — the restricted default and the
 	// privileged docker tier — teardown of a worker the api no longer wants must

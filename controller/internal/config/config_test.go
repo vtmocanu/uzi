@@ -603,4 +603,145 @@ func TestLoadDockerDinDResourceDefaultsEmpty(t *testing.T) {
 		t.Errorf("unset dind resources must stay empty, got req %q/%q lim %q/%q",
 			cfg.WorkerDinDRequestCPU, cfg.WorkerDinDRequestMemory, cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
 	}
+	// Issue #224 M-a: the data-root size is the same shape — unset means "let the
+	// render side pick", never a zero quantity.
+	if cfg.WorkerDinDDataSize != "" {
+		t.Errorf("unset UZI_WORKER_DIND_DATA_SIZE must stay empty, got %q", cfg.WorkerDinDDataSize)
+	}
+}
+
+// The DinD data-root PVC size (issue #224 M-a): read when set, and validated as a k8s
+// Quantity at BOOT. The far end is worse than usual for this one — an unparseable size
+// would surface as a PVC the apiserver rejects, i.e. a worker that provisions and never
+// appears, with nothing in the controller's own logs naming the cause.
+func TestLoadDockerDinDDataSize(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	// 10Gi, chosen to stay UNDER the chart's limitRange.maxPVCStorage (20Gi). This was
+	// 40Gi, which loads perfectly well and is then rejected at admission — and that is
+	// the point worth stating rather than silently fixing: this validation checks only
+	// that the string PARSES, and it structurally CANNOT check the size, because the
+	// controller does not know the LimitRange. The ceiling is enforced chart-side, in
+	// worker-invariants.yaml. A fixture demonstrating an inadmissible value invites
+	// someone to copy it.
+	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "10Gi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDDataSize != "10Gi" {
+		t.Fatalf("dind data size = %q, want 10Gi", cfg.WorkerDinDDataSize)
+	}
+
+	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "20GB!") // not a k8s quantity
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_DATA_SIZE") {
+		t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DIND_DATA_SIZE", err)
+	}
+}
+
+// The two tier PVC ceilings (issue #224). Same split and the same reason as the
+// ephemeral requests: the RESTRICTED one is read outside validateDockerTier because
+// every instance has that tier, and a var read only when docker is configured would be
+// silently ignored on most of them — here that would mean booting a controller whose
+// /nix claims are rejected at admission, which is the failure the check exists to stop.
+func TestLoadWorkerMaxPVCStoragePerTier(t *testing.T) {
+	t.Run("restricted tier is read with the docker tier OFF", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_WORKER_MAX_PVC_STORAGE", "20Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxPVCStorage != "20Gi" {
+			t.Fatalf("restricted ceiling = %q, want 20Gi (read even with no docker tier configured)", cfg.WorkerMaxPVCStorage)
+		}
+
+		t.Setenv("UZI_WORKER_MAX_PVC_STORAGE", "20GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_MAX_PVC_STORAGE") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_MAX_PVC_STORAGE", err)
+		}
+	})
+
+	t.Run("docker tier", func(t *testing.T) {
+		setDockerBaseEnv(t)
+		t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+		t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+		t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+		t.Setenv("UZI_WORKER_DOCKER_MAX_PVC_STORAGE", "20Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDockerMaxPVCStorage != "20Gi" {
+			t.Fatalf("docker ceiling = %q, want 20Gi", cfg.WorkerDockerMaxPVCStorage)
+		}
+		// Unset stays EMPTY rather than defaulting. A guessed ceiling that is too low
+		// refuses to boot a healthy fleet, which is worse than not checking that tier.
+		if cfg.WorkerMaxPVCStorage != "" {
+			t.Errorf("unset UZI_WORKER_MAX_PVC_STORAGE must stay empty, got %q", cfg.WorkerMaxPVCStorage)
+		}
+
+		t.Setenv("UZI_WORKER_DOCKER_MAX_PVC_STORAGE", "20GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_MAX_PVC_STORAGE") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DOCKER_MAX_PVC_STORAGE", err)
+		}
+	})
+}
+
+// The worker's requests.ephemeral-storage overrides (issue #224 M-b), per tier.
+//
+// The PLAIN one is read OUTSIDE validateDockerTier and this test's first half is what
+// pins that: every worker declares the resource, so a var validated only when the
+// docker tier is on would be silently ignored on the instances that do not run one —
+// which is most of them, and the failure would be a worker evicted exactly as before
+// with a values.yaml that says otherwise.
+func TestLoadWorkerEphemeralRequestsPerTier(t *testing.T) {
+	t.Run("plain tier is read with the docker tier OFF", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_WORKER_EPHEMERAL_REQUEST", "1Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerEphemeralRequest != "1Gi" {
+			t.Fatalf("plain ephemeral request = %q, want 1Gi (read even with no docker tier configured)", cfg.WorkerEphemeralRequest)
+		}
+
+		t.Setenv("UZI_WORKER_EPHEMERAL_REQUEST", "1GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_EPHEMERAL_REQUEST") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_EPHEMERAL_REQUEST", err)
+		}
+	})
+
+	t.Run("docker tier", func(t *testing.T) {
+		setDockerBaseEnv(t)
+		t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+		t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+		t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+		t.Setenv("UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", "8Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDockerEphemeralRequest != "8Gi" {
+			t.Fatalf("docker ephemeral request = %q, want 8Gi", cfg.WorkerDockerEphemeralRequest)
+		}
+		// Unset stays empty so the render side supplies its own default, never a zero
+		// quantity — which would re-create the very bug (a declared request of 0 ranks
+		// identically to declaring nothing).
+		if cfg.WorkerEphemeralRequest != "" {
+			t.Errorf("unset UZI_WORKER_EPHEMERAL_REQUEST must stay empty, got %q", cfg.WorkerEphemeralRequest)
+		}
+
+		t.Setenv("UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", "8GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_EPHEMERAL_REQUEST") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", err)
+		}
+	})
 }

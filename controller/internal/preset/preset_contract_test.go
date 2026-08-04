@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/yaml"
 )
 
 // The CONSUMER half of PRD #58's two cross-module goldens, and the thing that makes
@@ -196,6 +197,157 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The Go half of the PVC-size-vs-LimitRange guard (issue #224, audits A12.1 + A18).
+//
+// A per-worker PVC larger than its namespace's limitRange.maxPVCStorage is rejected by
+// the limitranger admission plugin, and NOTHING surfaces that: the chart renders clean,
+// this controller boots clean, the materializer returns before the Deployment is
+// created, and the reconcile loop retries every tick with the reason only in its log.
+// The worker provisions and never appears — the failure this package's own header
+// describes, arriving through a size instead of through a name.
+//
+// WHY THE CHECK IS SPLIT ACROSS TWO TOOLCHAINS, since that is the part worth
+// understanding before someone "unifies" it. Three things claim a PVC per worker:
+//
+//	dindDataSize  chart value      -> guarded in deploy/chart/templates/worker-invariants.yaml
+//	nixSize       Go constant      -> guarded HERE
+//	Size.DataSize Go constant      -> guarded HERE
+//
+// A Helm chart cannot read a Go constant, and putting these quantities into values.yaml
+// was rejected on purpose: it would make the chart a fourth place preset quantities
+// appear and the only one with no golden gating it, which is the ungated-skew class
+// this package's header exists to prevent. So the chart guards what the chart supplies
+// and this guards what the controller compiles in. Neither half covers all three.
+//
+// THE INVARIANT IS A PER-TIER MINIMUM, NOT AN EQUALITY. Each tier is its own namespace
+// with its own LimitRange, so every claimant is checked against THAT tier's ceiling.
+// The two carry the same 20Gi today and nothing requires that to continue; stating it
+// per tier is what makes a future divergence legible instead of silently checking one
+// number against the wrong namespace. Where a single value ever serves both, the
+// invariant collapses to `claimant <= min(restricted, docker)` — the min is the
+// fallback shape, the per-tier check is the general one.
+//
+// 🔴 THE CEILINGS ARE READ OUT OF values.yaml, ONE PER TIER, AND THE PREVIOUS VERSION
+// OF THIS TEST WAS WRONG IN A WAY WORTH RECORDING. It hardcoded a single
+// `chartMaxPVCStorage = 20Gi` standing in for BOTH tiers' keys, and its comment called
+// that "safe in the direction that matters: lowering the chart's max without lowering
+// this makes the test PASS while the cluster rejects claims". That is a FALSE NEGATIVE,
+// which is the UNSAFE direction — a check fails safe when it fails toward a false
+// POSITIVE. The reviewer executed it: max 10Gi against nixSize 20Gi rendered clean AND
+// passed this test, while every restricted worker would have been rejected at
+// admission. The label invited exactly the edit that breaks the fleet, so the constant
+// is gone rather than relabelled, and the two tiers are read separately because nothing
+// requires them to stay equal.
+//
+// WHAT THIS TEST COVERS, AND WHAT COVERS THE REST. Reading values.yaml catches an edit
+// to the SHIPPED DEFAULTS — a developer raising nixSize or a preset's DataSize — which
+// is the repo-level change a gate can see, and catching it at `go test` is the cheapest
+// feedback available. It cannot see a CLUSTER lowering maxPVCStorage through `--set` or
+// its own values file, because that value never reaches a test reading a file on disk.
+//
+// That second case is covered by kube.ValidatePVCCeilings, which the chart feeds the
+// real ceiling at runtime (UZI_WORKER_MAX_PVC_STORAGE) and which refuses to boot rather
+// than provisioning claims the LimitRange will reject. The two are layered on purpose:
+// this one is early and cheap and sees only the repo; that one is late and authoritative
+// and sees what the cluster actually configured.
+//
+// This test is HALF of its layer, not all of it: it covers nixSize and each preset's
+// DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax covers the third Go
+// constant, dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
+// same parse-and-Fatal contract, so neither carries a hardcoded ceiling.
+//
+// *** This paragraph replaced one that said an operator-lowered ceiling "remains ungated
+// on BOTH sides — a real residual, not a covered case". That was true when written and
+// was made FALSE by the very commit that added the boot check, which I wrote without
+// sweeping this comment. It is the same class of defect as the safety label above: a
+// stale claim about coverage, left behind by the change that altered the coverage. ***
+//
+// The residual that genuinely survives is narrower: a LimitRange edited DIRECTLY in the
+// cluster, out of band from the chart, is seen by neither — the chart never renders it
+// and the controller is never told. A `helm upgrade` cannot do this, since changing the
+// value rolls the controller with the new env.
+func TestPresetPVCSizesFitTheChartsLimitRangeMax(t *testing.T) {
+	ceilings := chartMaxPVCStorage(t)
+	// Vacuity guards, the idiom readGolden states 190 lines above in this same file: a
+	// check that iterates an empty collection passes while asserting nothing. Neither
+	// map can empty by accident, and that is precisely why the guard is one line rather
+	// than a judgement call each time.
+	if len(ceilings) == 0 {
+		t.Fatal("no tier ceilings were read from values.yaml; every assertion below would pass vacuously")
+	}
+	if len(sizes) == 0 {
+		t.Fatal("the preset size table is empty; the DataSize assertions below would pass vacuously")
+	}
+	for tier, max := range ceilings {
+		if nixSize.Cmp(max) > 0 {
+			t.Errorf("nixSize = %s exceeds %s = %s, so EVERY worker's /nix claim in that tier would be "+
+				"rejected at admission and every worker would provision and never appear. Raise it in "+
+				"deploy/chart/values.yaml (and quota.requestsStorage with it).",
+				nixSize.String(), tier, max.String())
+		}
+		for name, s := range sizes {
+			if s.DataSize.Cmp(max) > 0 {
+				t.Errorf("preset %q: DataSize = %s exceeds %s = %s, so a worker of that size would provision "+
+					"and never appear. Raise it in deploy/chart/values.yaml (and quota.requestsStorage with it).",
+					name, s.DataSize.String(), tier, max.String())
+			}
+		}
+	}
+}
+
+// chartMaxPVCStorage reads both tiers' limitRange.maxPVCStorage out of
+// deploy/chart/values.yaml, keyed by the values path so a failure names the key to edit.
+//
+// PARSED, not grepped: `maxPVCStorage` appears under two different blocks and a regex
+// cannot tell them apart. FATAL on anything unexpected — unreadable file, missing key,
+// unparseable quantity — because a skip or a default would silently restore the
+// hardcoded constant this function exists to remove.
+//
+// The read crosses the module boundary, an established idiom here (this file's own
+// goldenPath reaches into api/), and it is why `task test:controller` carries
+// `-count=1`: Go's test cache hashes only files inside the module root, so an edit to
+// values.yaml changes nothing in this module's cache key and a cached green would hide
+// the regression.
+func chartMaxPVCStorage(t *testing.T) map[string]resource.Quantity {
+	t.Helper()
+	// controller/internal/preset -> repo root.
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
+	}
+	var v struct {
+		Workers struct {
+			LimitRange struct {
+				MaxPVCStorage string `json:"maxPVCStorage"`
+			} `json:"limitRange"`
+			Docker struct {
+				LimitRange struct {
+					MaxPVCStorage string `json:"maxPVCStorage"`
+				} `json:"limitRange"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	out := map[string]resource.Quantity{}
+	for key, val := range map[string]string{
+		"workers.limitRange.maxPVCStorage":        v.Workers.LimitRange.MaxPVCStorage,
+		"workers.docker.limitRange.maxPVCStorage": v.Workers.Docker.LimitRange.MaxPVCStorage,
+	} {
+		if val == "" {
+			t.Fatalf("%s is empty in %s; there is no ceiling to check the preset sizes against", key, path)
+		}
+		q, err := resource.ParseQuantity(val)
+		if err != nil {
+			t.Fatalf("%s = %q in %s is not a resource quantity: %v", key, val, path, err)
+		}
+		out[key] = q
+	}
+	return out
 }
 
 // Burstable, not Guaranteed, and requests strictly below limits on every preset.

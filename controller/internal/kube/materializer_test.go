@@ -423,6 +423,147 @@ func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Cl
 	return m, client
 }
 
+// pvcCreateNames lists, in order, the PVC names a reconcile actually asked the
+// apiserver to create. Reading the NAMES rather than a count is what lets the tests
+// below say WHICH claim was wrong, and a count alone could not tell "the dind claim
+// was skipped" from "the data claim was skipped".
+func pvcCreateNames(t *testing.T, client *fake.Clientset) []string {
+	t.Helper()
+	var out []string
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "persistentvolumeclaims" || a.GetVerb() != "create" {
+			continue
+		}
+		c, ok := a.(k8stesting.CreateAction)
+		if !ok {
+			t.Fatalf("a create verb on persistentvolumeclaims was not a CreateAction: %T", a)
+		}
+		out = append(out, c.GetObject().(*corev1.PersistentVolumeClaim).Name)
+	}
+	return out
+}
+
+// Issue #224 M-a, the materializer half: a docker worker gets a THIRD claim created,
+// a plain one does not, and once observed neither is re-created.
+//
+// The create-gate is not tidiness. Issue #114 BUG 3: an unconditional create every
+// ~10s tick charges the ResourceQuota's used.requests.storage at admission, and k8s
+// does NOT decrement it when storage then rejects the create AlreadyExists (upstream
+// #119593) — the redundant charges pin the quota at its hard limit and genuinely-new
+// workers are refused their PVCs. A third claim is a third source of that charge.
+func TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation(t *testing.T) {
+	ctx := context.Background()
+	dockerNS := dockerTestConfig().DockerNamespace
+
+	// Fresh docker worker: all three claims created.
+	m, client := newDockerMat(t)
+	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{dock}, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got, want := pvcCreateNames(t, client), []string{"uzi-hw-d1-data", "uzi-hw-d1-nix", "uzi-hw-d1-dind-data"}; !equalStrings(got, want) {
+		t.Fatalf("docker worker pvc creates = %v, want %v", got, want)
+	}
+	if _, err := client.CoreV1().PersistentVolumeClaims(dockerNS).Get(ctx, "uzi-hw-d1-dind-data", metav1.GetOptions{}); err != nil {
+		t.Errorf("dind-data pvc not created in the docker namespace: %v", err)
+	}
+
+	// Fresh PLAIN worker on the same (docker-capable) controller: two claims, no third.
+	m, client = newDockerMat(t)
+	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain}, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got, want := pvcCreateNames(t, client), []string{"uzi-hw-p1-data", "uzi-hw-p1-nix"}; !equalStrings(got, want) {
+		t.Fatalf("plain worker pvc creates = %v, want %v — the dind claim is docker-only", got, want)
+	}
+
+	// Steady state: all three observed, so ZERO creates. Positive control: drop the
+	// obs.HasDinDDataPVC arm from reconcileWorker's switch and this goes RED with one
+	// create per tick, forever.
+	m, client = newDockerMat(t,
+		deployedWorkerNS("d1", dockerNS, 0, "h"),
+		pvcForNS("d1", "data", dockerNS), pvcForNS("d1", "nix", dockerNS), pvcForNS("d1", "dind-data", dockerNS),
+	)
+	steady := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true}
+	observed := []reconcile.ObservedWorker{{
+		ID: "d1", Namespace: dockerNS, HasDeployment: true, SpecHash: "h",
+		HasDataPVC: true, HasNixPVC: true, HasDinDDataPVC: true,
+	}}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{steady}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := pvcCreateNames(t, client); len(got) != 0 {
+		t.Fatalf("a docker worker whose three PVCs are already observed issued creates %v; want ZERO "+
+			"(issue #114 BUG 3: a redundant create is charged to used.requests.storage and never decremented)", got)
+	}
+	assertNoSecretReads(t, client)
+}
+
+// Observe must SET HasDinDDataPVC off the claim's name, or the gate above can never
+// engage: an unobserved claim looks missing forever and is re-created every tick.
+func TestObserveRecordsTheDinDDataPVC(t *testing.T) {
+	dockerNS := dockerTestConfig().DockerNamespace
+	m, _ := newDockerMat(t,
+		deployedWorkerNS("d1", dockerNS, 3, "hash-1"),
+		pvcForNS("d1", "data", dockerNS), pvcForNS("d1", "nix", dockerNS), pvcForNS("d1", "dind-data", dockerNS),
+	)
+	observed, err := m.Observe(context.Background())
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observed %d workers, want 1", len(observed))
+	}
+	o := observed[0]
+	if !o.HasDataPVC || !o.HasNixPVC || !o.HasDinDDataPVC {
+		t.Fatalf("observed pvc flags = data:%v nix:%v dind:%v, want all true", o.HasDataPVC, o.HasNixPVC, o.HasDinDDataPVC)
+	}
+}
+
+// Teardown removes the third claim too, and does so UNCONDITIONALLY — a dropped
+// worker's Docker flag is no longer in the desired set to branch on, so the delete
+// cannot be gated on it. For a plain worker the delete simply NotFounds, which this
+// path already tolerates; leaving the claim behind instead would strand storage that
+// nothing will ever reclaim, and it counts against the tier's requests.storage quota
+// for as long as it exists.
+func TestTeardownRemovesTheDinDDataPVC(t *testing.T) {
+	dockerNS := dockerTestConfig().DockerNamespace
+	m, client := newDockerMat(t,
+		deployedWorkerNS("gone", dockerNS, 0, "h"),
+		pvcForNS("gone", "data", dockerNS), pvcForNS("gone", "nix", dockerNS), pvcForNS("gone", "dind-data", dockerNS),
+	)
+	observed := []reconcile.ObservedWorker{{
+		ID: "gone", Namespace: dockerNS, HasDeployment: true, SpecHash: "h",
+		HasDataPVC: true, HasNixPVC: true, HasDinDDataPVC: true,
+	}}
+	if err := m.Reconcile(context.Background(), nil, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	deleted := map[string]bool{}
+	for _, a := range client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok {
+			deleted[a.GetResource().Resource+"/"+d.GetName()] = true
+		}
+	}
+	if !deleted["persistentvolumeclaims/uzi-hw-gone-dind-data"] {
+		t.Errorf("the dind-data pvc was not deleted; got %v", keysOf(deleted))
+	}
+	assertNoSecretReads(t, client)
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func deployedWorkerNS(id, ns string, generation int64, hash string) *appsv1.Deployment {
 	d := deployedWorker(id, generation, hash)
 	d.Namespace = ns
@@ -612,8 +753,11 @@ func deployedWorker(id string, generation int64, hash string) *appsv1.Deployment
 
 func pvcFor(id, kind string) *corev1.PersistentVolumeClaim {
 	name := dataPVCName(id)
-	if kind == "nix" {
+	switch kind {
+	case "nix":
 		name = nixPVCName(id)
+	case "dind-data":
+		name = dindDataPVCName(id)
 	}
 	return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name:      name,
