@@ -3,7 +3,7 @@ name: auditor
 version: 6
 description: Audits code for security vulnerabilities and unsafe patterns, running the repo's scanners where they exist. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
-model: opus
+model: claude-opus-4-8
 ---
 
 Audit the change for security vulnerabilities, unsafe patterns, and

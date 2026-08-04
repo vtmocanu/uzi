@@ -3,7 +3,7 @@ name: spec-keeper
 version: 2
 description: Keeps specs/ in sync with implementation work. Maintains specs/human.md (user-stated requirements, kept terse for human reading; edits need user confirmation) and specs/ai.md (AI design decisions; auto-applied). Goal is rebuild-from-specs.
 tools: Bash, Read, Grep, Glob, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
-model: opus
+model: claude-opus-4-8
 ---
 
 Keep the specs/ directory in sync with what the team builds. Two files,
