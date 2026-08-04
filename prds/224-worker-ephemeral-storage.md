@@ -2069,3 +2069,141 @@ optional:
 directions (developer raises a preset / operator lowers a ceiling) x two paths (knob set / knob
 unset) — **all guarded by one mechanism in the component that owns the construction**, with the
 chart guard kept as the earlier, cheaper net for the claimant it can see.
+
+### A22 — 2026-08-04, TESTER at `2a63ddb3`. **A11.5(1) is CLOSED.** No blocking. One should-fix.
+
+**A22.1 — ADMISSIBILITY PROVED. This was the only open question that could turn "renders fine" into
+"provisions and never appears."** Instrument: a throwaway **KinD v1.34.0** cluster named `tst224`
+(outside the `uzi-` namespace, deleted after; **nothing dry-run against dev-cluster**, which is
+unreachable from here). Three design choices make it evidence rather than theatre:
+
+- **Not a hand-written pod.** A throwaway `cmd/renderprobe` inside the controller module calls the
+  real `kube.RenderDeployment` / `kube.RenderPVCs`, so the object under test is what the controller
+  emits.
+- **A bare Pod, not just the Deployment.** A `Deployment` does **not** go through quota / LimitRange
+  / PodSecurity admission — the pod template had to be extracted to get the object that
+  discriminates.
+- **The real admission envelope.** The live per-cluster values file
+  (`apps/uzi/app.uzi.yaml` → `$values/deploy/values/dev-cluster.yaml`) **does not override**
+  `workers.quota`, `workers.limitRange`, `workers.docker.quota` or `workers.docker.limitRange`, so
+  A9.2's chart-default raise reaches the cluster unchanged. It *does* set `rootless: false`,
+  `dindResources: 500m/2Gi req, 4/6Gi lim`, `storageClass: storage-class`, `maxConcurrentRuns: 2` — all
+  fed in.
+
+Both tiers, every preset size: **rc=0**, all three PVCs plus Deployment plus bare Pod "created
+(server dry run)". Only stderr is the expected PodSecurity **warning** for `dind` (the docker
+namespace enforces `privileged` and keeps `warn/audit: restricted` deliberately).
+
+**Three positive controls proving admission was actually running** — without them, five "created"
+lines are indistinguishable from a dry-run that checks nothing:
+
+```
+PVC 21Gi       -> Forbidden: maximum storage usage per PersistentVolumeClaim is 20Gi, but request is 21Gi
+pod cpu 100    -> Forbidden: maximum cpu usage per Container is 4, but limit is 100
+privileged pod -> Forbidden: violates PodSecurity "restricted:latest": privileged   (into uzi-workers)
+```
+
+**A22.2 — fleet occupancy MEASURED, not computed.** Real objects created, quota watched:
+the docker tier's **10th worker's three claims admit at exactly 600Gi / 30 claims, and the 11th is
+rejected on both keys.** A9.2's storage triple is exactly honest at 10, end to end. And
+`requests.ephemeral-storage` climbs **4Gi per docker worker** (0 → 32Gi at 8) — the accounting side
+of A3.4 is live where it read `0` before, and nowhere near the 200Gi key.
+
+**A22.3 — 🔴 SHOULD-FIX, NEW: A3.2's "never in the LimitRange either" half is DOCUMENTED BUT NOT
+ENFORCED, and no test can reach it.** The invariant test asserts over the **rendered** object; a
+LimitRange `default` injects the limit at **admission**. Measured with a before/after/restore triple:
+
+```
+as shipped                      worker limits = {cpu 2, memory 4Gi}
++ ephemeral-storage: 2Gi under  worker limits = {cpu 2, ephemeral-storage 2Gi, memory 4Gi}
+  workers.limitRange.default                            ^ arms podEphemeralStorageLimitEviction
+```
+
+**Three values-file lines produce exactly the deterministic-eviction-with-no-node-pressure failure
+A3.2 forbids, and `task gate:controller` stays green.** `grep -c -i -F 'ephemeral'
+worker-invariants.yaml` = **0**, re-checked including the coder's uncommitted work. **This is the
+instrument's FLOOR, not a gap in the assertions** — the injection happens after rendering, so no
+bigger test reaches it. → dispatched into A21's commit.
+
+**A22.4 — the invariant test is mechanically live, and the discriminating fold is the second one.**
+Three folds, `cp` backup, pattern asserted present before each write, restore verified with
+`git status`/`git diff`:
+
+| fold | result |
+|---|---|
+| limit on the **worker** container | FAIL in all three postures, naming the container and the value |
+| limit on the **dind sidecar** only | **plain PASSES**, both docker postures FAIL naming `.spec.initContainers` — **fold 1 cannot exercise the initContainers half** |
+| render produces **no containers** | the `seen < 2` guard fires: *"only 0 containers … the invariant was asserted over almost nothing"* |
+
+**A22.5 — a DISCARDED fold, recorded because it is the failure the role brief warns about.** The
+first attempt at fold 3 returned early from `podTemplate` and **panicked** inside `RenderDeployment`
+(`assignment to entry in nil map`). That is a red from a **crash**, not from the assertion. It was
+thrown out and re-folded downstream. **A fold that reddens is not a fold that reddened for the right
+reason.**
+
+**A22.6 — 🔴 THE `fsGroup` QUESTION IS NARROWED, AND THE PROBE'S GREEN WAS CORRECTLY REFUSED.**
+dev-cluster runs **`rootless: false`** with `acknowledgeNonRootlessNodeRoot: true`, and the rendered
+pod for that posture has `dind` at **`runAsUser: 0 / runAsGroup: 0`**. A root process writes a
+root-owned volume whatever `fsGroup` says, so **A8.8's failure mode does not arise in the posture the
+target cluster runs.** It arises only in the chart-default rootless posture.
+
+**And the KinD probe could not settle that — with positive evidence that it could not.** The probe
+passed (`uid=1000 gid=1000 groups=1000,10001`, write OK) — **but the mount read `drwxrwxrwx 1 0 0`,
+group 0, not 10001, so the fsGroup chown never happened.** A control pod with **no `fsGroup` at all
+and an unrelated uid 4242** wrote just as happily. Both PVs are hostPath (`rancher.io/local-path`),
+which kubelet **excludes** from fsGroup ownership management and which hands out a world-writable
+root. ***"The green came from mode 0777, not from `fsGroup`. Reporting the green would have been a
+false all-clear."*** dev-cluster's `storage-class` has a `fsGroupPolicy` unreadable from here, and
+`fsGroupPolicy: None` is exactly the case where kubelet skips the chown. **Stays on the rollout, for
+the rootless posture only.**
+
+**A22.7 — OBSERVATION, pre-existing: a FOURTH axis binds before the three A8.4 made self-consistent.**
+With dev-cluster's real `dindResources` (500m/2Gi, not the chart's 250m/256Mi), the docker tier's
+cpu/memory quota caps the fleet well below the 10 its storage is now sized for — **measured on the
+cluster: the 9th `m` worker is rejected** with `exceeded quota: requests.cpu=8, requests.memory=32Gi`.
+
+```
+docker s   0.75 CPU / 3.0Gi  -> 10 workers
+docker m   1.00 CPU / 4.0Gi  ->  8 workers   (measured: 9th rejected)
+docker l   1.50 CPU / 6.0Gi  ->  5 workers
+```
+
+So `worker-docker-namespace.yaml`'s *"Sized for the 10 workers `count/deployments.apps` advertises"*
+is true **on the storage axis in isolation** and describes a fleet the cpu/memory axis forbids. Both
+predate #224 and raising a quota provisions nothing, so this costs nothing today — **but A8.4's whole
+argument was about the triple being self-consistent, and the fourth axis is the one that now binds
+first.**
+
+**A22.8 — citation drift, tracked across all three SHAs, and it explains A13.4.** The byte-identity
+comment moves: `19dab430 render.go:690` → `35ef2996 render.go:751` → `2a63ddb3 render.go:872`. **The
+number in M-a's commit message was minted against the PRE-M-a tree, and M-a's own diff moved it 61
+lines; M-b moved it another 121.** The property is real and was verified empirically (A22.9). **A
+line number without a SHA is not a citation** — this PRD now has the same lesson three times.
+
+**A22.9 — A8.12 confirmed at BYTE level.** Plain render across `19dab430` / `35ef2996` / `2a63ddb3`
+at all three sizes: **identical pre- and post-M-a** (8238 / 8239 / 8237 bytes), plain spec-hash
+unmoved by M-a and moved by M-b as designed. Docker spec-hash is **three distinct values** across the
+three SHAs — **direct evidence for A6.1/A8.10: shipping M-a and M-b in one release costs docker
+workers ONE roll, not two.**
+
+**A22.10 — gates, with the banners read rather than the exit codes trusted.** All in-scope slots
+green at `2a63ddb3`, including the repo-wide ones **armed, not skipped**: `shellcheck 0.11.0 (20
+tracked scripts)`, `yamllint --strict (11 files)`, `ruby 4.0.6 vendored → Syntax OK`, and
+`scan:secrets` **`canaries DETECTED`**. Private `GOLANGCI_LINT_CACHE`, **0 occurrences of `../`** in
+the lint output (no foreign-worktree replay), never `cache clean`. Positive execution evidence:
+`RUN=163 PASS=163 FAIL=0 SKIP=0` with all 20 #224 tests named. **`coverage` and `pre-commit` are
+`none (gap)` for `controller/`** — raised once, per the gate-slot convention.
+
+**A22.11 — `scripts/assert-chart-render.sh` prints `OK: 0 documents` on an empty file. SECOND
+INDEPENDENT HIT** (A18.6 was the reviewer's). It is a shape check, so the vacuous case is arguably
+outside its remit and nothing was mis-read here — **but `OK:` over a zero-byte render is the
+"a control that produces no output is not a control" shape sitting inside a validation script this
+repo runs in CI.** Two finders, independently. Worth fixing.
+
+**A22.12 — what this run did NOT reach**, stated so the green above is not read as broader: no
+node-level behaviour of any kind (no eviction observed, no ranking, no real disk consumption — A7.3
+and #225 remain untested); `TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes`'s node constants
+were **not re-derived** (dev-cluster unreachable; the arithmetic is internally correct, the node facts
+are inherited from A5.2/A7.1); and `api`/`web`/`agent` deliberately not run. **One tester figure is
+already superseded**: it measured the restricted tier exactly honest at 20 x `m`, which is true of
+`2a63ddb3` and not of HEAD, where `6bf44a86` raised `requestsStorage` to 800Gi for the worst case.
