@@ -1018,3 +1018,57 @@ produce a rejected update every tick.
 
 **A8.13 — issue #225 FILED** (`https://gitlab.example.com/vtmocanu/uzi/-/issues/225`) for A7.3's
 imagefs/image-accumulation defect, per the user's decision to file rather than fix.
+
+### A9 — 2026-08-04, USER DECISIONS. **THE DESIGN IS NOW FROZEN. The coder builds exactly this.**
+
+**A9.1 — M-c is DROPPED.** No PVC resize path. The auditor's premise-level evidence carried it: the
+77% reading is a **legacy 4Gi volume**, both live workers store an identical **2.77 GiB**, and the
+current 20Gi default sits at **14.2%** with 15.7 GiB free. **n=1 affected worker.** The remedy is the
+one `nixSize`'s own comment already prescribes — *"v1's remedy is delete + reprovision"* — and under
+A6.1 a disrupting roll is already accepted, so the marginal cost is zero.
+
+**What this avoids, which is the actual argument:** overturning `materializer.go:489-491`'s stated
+*"never patched"* decision, a new `patch` verb on PVCs in the controller Role, observed-**size**
+tracking in `observeNamespace` (it records booleans today), and re-arming issue #114 BUG 3 — where
+k8s does not decrement `used.requests.storage` on a redundant admission charge (upstream #119593) and
+pinned the quota at its hard limit. A patch charges the delta the same way.
+
+> **OPERATIONAL, NOT CODE — do not put this in a commit.** Worker `8e1fef71`'s legacy 4Gi `/nix` PVC
+> is fixed by deleting and reprovisioning **that worker**, which mints a new worker ID and therefore
+> new PVCs. A pod roll does **not** do this: a Deployment rollout replaces pods and leaves PVCs
+> alone. The disruption is already priced in under A6.1; the action is not automatic. Whoever runs
+> the rollout does this by hand, by exact name.
+
+**A9.2 — the quota triple is made HONEST at `deployments: 10`.** In `deploy/chart/values.yaml`:
+
+| key | from | to | tier |
+|---|---|---|---|
+| `workers.docker.quota.requestsStorage` | `140Gi` | **`600Gi`** | docker |
+| `workers.docker.quota.persistentVolumeClaims` | `20` | **`30`** | docker |
+| `workers.quota.requestsStorage` | `280Gi` | **`600Gi`** | restricted |
+
+**Raising a quota PROVISIONS NOTHING** — it is a ceiling on claims, not a reservation — so this costs
+zero storage until workers actually exist. The docker figure is `10 x (20 data + 20 nix + 20 dind)`;
+the restricted figure is `20 x (10 data + 20 nix)`, which is exactly the number A8.5 shows
+`values.yaml:380-382`'s own comment already asks for and has been getting wrong since PRD #87.
+**Both comments' arithmetic is rewritten with the current `nixSize`, in the same commit** (A8.5).
+
+**A9.3 — final scope, in build order. One release, or the "one roll instead of three" argument fails.**
+
+1. **M-a** — `dind-data` emptyDir → third per-docker-worker PVC. Flat **20Gi**,
+   `workers.docker.dindDataSize` → `UZI_WORKER_DIND_DATA_SIZE`, `pick`/`ParseQuantity` like every
+   other override. Rendered **only** when `w.Docker`. Plus the A9.2 quota raise, which M-a requires.
+2. **M-b** — `requests.ephemeral-storage` **512Mi** plain / **4Gi** docker, on the **`worker`
+   container only**, **no `limits.ephemeral-storage` anywhere in the pod spec**. Plus the doc sweep:
+   A3.8's eight sites and A8.5's two quota comments.
+3. **Not code:** A1's manual pod cleanup (**two** pods, not three — A5.6 — re-enumerate, exact names)
+   and A9.1's worker reprovision.
+
+**M-a must precede M-b in the history**, and not for file reasons: M-b's 4Gi is *derived from* M-a
+having moved `dind-data` off ephemeral accounting. One combined commit makes 4Gi unjustifiable from
+the diff alone, and M-b first would ship 6Gi.
+
+**A9.4 — what ships in the release note**, none of it optional: rolling this **kills every in-flight
+run once** (A6.1); the third RWO PVC widens the Multi-Attach window on reschedule (A8.7.1); the image
+cache is now **persistent with no GC** (A8.7.2, `docker system prune` is the remedy); and #224
+**lowers the frequency** of a silent total work loss rather than fixing it (§1).
