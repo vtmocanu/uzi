@@ -987,11 +987,15 @@ export class SdkExecutor implements Executor {
       // defeating the feature. Gated on the ABSENCE of a session: a seeded RESUME already
       // has the plan in its session (byte-identical), and every non-seeded path leaves this
       // undefined. buildImplementPrompt embeds it first-turn-only, as authoritative
-      // instructions (D5), never untrusted-fenced.
-      const seededPlanBody =
-        preApproved && ctx.seeded === true && !ctx.sessionId
-          ? approvedPlan
-          : undefined;
+      // instructions (D5), never untrusted-fenced. The gate is embedSeededPlan (extracted
+      // so its defense-in-depth `seeded` term is testable — see that function's doc).
+      const seededPlanBody = embedSeededPlan({
+        preApproved,
+        seeded: ctx.seeded === true,
+        hasSession: !!ctx.sessionId,
+      })
+        ? approvedPlan
+        : undefined;
       let iteration = 0;
       let followUp: string | undefined;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
@@ -1653,6 +1657,30 @@ export function resolveLeadModel(
   templateModel?: string,
 ): string | undefined {
   return configModel || templateModel || undefined;
+}
+
+/**
+ * PRD #209 (M2 validation): whether to embed the seeded plan BODY in the FIRST implement
+ * prompt. True only for a session-less seeded pre-approved run — the row-2 cold start, and
+ * a requeued seeded run whose transcript was dropped — which has no planning turn and no
+ * resumable session carrying the plan. A seeded RESUME already has the plan in its session,
+ * and a non-preApproved run never gets here.
+ *
+ * The `seeded` term is DEFENSE IN DEPTH and today REDUNDANT: `preApproved` already implies
+ * `(session || seeded)`, so `preApproved && !session` implies `seeded`. It is kept — and
+ * this predicate is EXTRACTED from run() — precisely so the currently-unreachable
+ * `{preApproved, !seeded, !session}` combination is testable independently of how
+ * `preApproved` is derived. No executor-driven test can observe the term's removal (that
+ * state cannot occur through the real `preApproved`); a direct unit test on this function
+ * can, so if a future change ever decoupled `preApproved` from `(session || seeded)` the
+ * guard that refuses to hand a NON-seeded run an authoritative <plan> block stays pinned.
+ */
+export function embedSeededPlan(args: {
+  preApproved: boolean;
+  seeded: boolean;
+  hasSession: boolean;
+}): boolean {
+  return args.preApproved && args.seeded && !args.hasSession;
 }
 
 /**

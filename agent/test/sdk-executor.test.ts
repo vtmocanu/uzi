@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
@@ -2109,6 +2109,35 @@ describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 
     const probe = makeCtx({ approvedPlan: PLAN });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.doesNotMatch(turns[1]!.promptText ?? "", /<plan>/, "a gated run's implement prompt is unchanged");
+  });
+});
+
+// ── PRD #209 (M2 validation, auditor-m2 delta): pin the DEFENSE-IN-DEPTH `seeded` term ──
+// The seeded-plan-body gate is `preApproved && seeded && !session`. The `seeded` term is
+// today REDUNDANT — `preApproved` already implies `(session || seeded)`, so `preApproved &&
+// !session` implies `seeded`, and NO executor-driven test can observe the term's removal
+// (the {preApproved, !seeded, !session} state is unreachable through the real preApproved:
+// a non-seeded dropped-session run is row 3 ⇒ planApproved=false ⇒ never preApproved). The
+// gate was extracted into `embedSeededPlan` precisely so that combination is testable
+// directly. Removing `args.seeded` from embedSeededPlan reddens the last case here and
+// nothing else — which is exactly why the term needs its own test.
+describe("embedSeededPlan — the seeded-plan-body gate (PRD #209 M2)", () => {
+  it("embeds only for a session-less seeded pre-approved run", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: true, hasSession: false }), true);
+  });
+  it("does NOT embed for a seeded RESUME — the session already carries the plan", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: true, hasSession: true }), false);
+  });
+  it("does NOT embed when the run is not pre-approved", () => {
+    assert.equal(embedSeededPlan({ preApproved: false, seeded: true, hasSession: false }), false);
+  });
+  // The load-bearing one: a NON-seeded, session-less, pre-approved run. Unreachable through
+  // today's `preApproved`, but if a future change decoupled it from `(session || seeded)`,
+  // this is the state the `seeded` term alone must refuse — so a non-seeded run can never be
+  // handed an authoritative <plan> block. Removing `args.seeded` from embedSeededPlan makes
+  // THIS assertion fail (verified by mutation) while every integration test stays green.
+  it("refuses a NON-seeded session-less pre-approved run (pins the defense-in-depth term)", () => {
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: false, hasSession: false }), false);
   });
 });
 
