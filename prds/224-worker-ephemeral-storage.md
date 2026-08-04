@@ -2445,3 +2445,107 @@ belong to spec-keeper and task #7, not to the documenter. A1/A9.1's manual pod c
 reprovision are **ops actions, not doc changes**. A12.6's pre-provision quota check and A22.6's
 `fsGroup` question both need a live cluster. None of the four is dischargeable from this worktree,
 and it said so rather than writing around them.
+
+### A27 — 2026-08-04, FINAL AUDIT of `dae9b799` + `13d02609`. A19.4 is CLOSED. One new cost to disclose.
+
+**A27.1 — the fail-open is closed, and the auditor drove the REAL BOOT PATH rather than a unit
+test.** It rendered the chart with A19.4's exact config, extracted the controller Deployment's env
+**verbatim from the rendered manifest** (22 vars, not hand-typed), and fed it through `config.Load()`
+and the same three field mappings `main.go:86/93/94` makes. *(`main.go`'s own call sits after
+`rest.InClusterConfig()`, which cannot succeed off-cluster, so the binary dies before reaching the
+check — hence reproducing the wiring. The one substituted var, `UZI_API_CA_FILE`, is declared.)*
+
+```
+A19.4's config: both tiers' maxPVCStorage=10Gi, dindDataSize=10Gi
+
+helm template            rc=0, 38 documents      <- chart guard still passes, correctly:
+                                                    it cannot see Go constants, never its job
+rendered env             MAX_PVC_STORAGE=10Gi  DOCKER_MAX_PVC_STORAGE=10Gi
+controller boot path     exit=1   REFUSED TO BOOT
+  restricted: /nix 20Gi and preset "l" /data 20Gi exceed 10Gi
+  docker:     /nix 20Gi and preset "l" /data 20Gi exceed 10Gi
+```
+
+At `6bf44a86` the identical config gave `helm rc=0`, the Go test **exit 0**, and every worker on both
+tiers silently unprovisionable. **All four claimants are now named, with both numbers and the
+remedy.** Control: shipped dev-cluster defaults → **exit=0, boot allowed** — it does not refuse a
+healthy fleet. Mutation on the checker itself (`if false && …`, vet-clean first so behavioural)
+reddens `TestValidatePVCCeilings` with **5 named subtests**. A19.5's Low is fixed too: the
+bare-integer case now prints `100000000000` rather than `%!s(int64=…)`.
+
+**A27.2 — per-tier independence verified in all FOUR combinations, and rows 3-4 are the ones that
+matter** — they would expose a `min()`-style shortcut, and neither leaks into the other tier:
+
+| restricted | docker | boot |
+|---|---|---|
+| on 20Gi | on 20Gi | exit 0 |
+| off | off | exit 0 — nothing to check |
+| on **10Gi** | off | **exit 1**, flags *restricted only* |
+| off | on **10Gi** | **exit 1**, flags *docker only* |
+
+**A27.3 — skipping an absent ceiling is right for a STRONGER reason than A24.2 gave.** The coder's
+argument (a guessed ceiling can refuse a healthy fleet) is correct but is about *harm*. The
+structural reason: **with no LimitRange rendered there is no ceiling in existence, so the check has
+no operand.** Skipping is not "declining to check", it is *"there is nothing to check against"* — and
+a default would be **inventing a constraint the cluster does not have**.
+
+**A27.4 — 🔴 DISABLING THE LIMITRANGE RELOCATES THE HAZARD RATHER THAN REMOVING IT.** The
+**ResourceQuota is a separate object with a separate `enabled` flag**, and a quota rejection on
+`requests.storage` has the **identical silent shape**: PVC create rejected → `reconcileWorker`
+returns before the Deployment → infinite retry → worker provisions and never appears. **The boot
+check does not cover that path.**
+
+Not filed as a finding, because the general case is **structurally unfixable at boot**: a quota is a
+**cumulative** ceiling whose headroom depends on how many workers already exist, which the controller
+cannot know before the reconcile loop starts. **But one slice IS boot-checkable and cheap:**
+`requestsStorage >= DataSize + nixSize + dindDataSize` — *"can even the FIRST worker be created"*. A
+per-claim floor, exactly the shape the new check already handles. **Candidate follow-up.**
+
+**A27.5 — 🔴 BLAST RADIUS: A NEW COST, STATED PLAINLY RATHER THAN WAVED THROUGH.** What an operator
+sees is `CrashLoopBackOff` on `uzi-controller` with every offending claimant named, both numbers, the
+env var to edit and the remedy — *"about as good as a boot refusal gets"*. Existing worker Deployments
+and pods are untouched and **runs in flight continue**, since the api's run lanes do not go through
+the controller.
+
+**What stops is provisioning, drift reconciliation AND TEARDOWN** — pass 3 of `Reconcile` is in the
+same loop. So a prolonged crash-loop **leaks PVCs and storage quota for workers the api has already
+dropped**. The auditor's framing, which I am keeping verbatim because it refuses the easy summary:
+
+> **Before this change, the same misconfiguration gave a silently stalled fleet with teardown still
+> working; now it gives a loud failure with teardown stopped.**
+
+**The trade is still clearly right** — a silent permanent stall is the worse failure and is the one
+#224 exists to eliminate — **but the teardown loss is a genuine new cost that did not exist before,
+and it belongs in the release note beside the guard.** → documenter, once spec-keeper releases the
+writer token.
+
+**A27.6 — recovery needs a chart change, effectively.** Both vars come from the chart, and ArgoCD's
+`syncPolicy.automated.selfHeal: true` **reverts a `kubectl set env`** on the Deployment. Recovery is
+a values change plus a sync. Acceptable — the tripping config is one no cluster has today — but an
+operator who does not know this **will try `kubectl set env` first and watch it revert**.
+
+**A27.7 — the invariant is "verified at boot", NOT "maintained".** A running controller does not
+re-check. In practice a values change that lowers a ceiling rolls the Deployment and therefore trips
+it, **but that coupling is incidental rather than enforced.**
+
+**A27.8 — scan clean, armed.** `gitleaks` over `dae9b799~1..13d02609`: exit 0, 4 commits, 51.72 KB,
+no leaks. `task scan:secrets`: EXIT=0, `0 findings (1497 in the index)`, **canaries DETECTED**.
+`pvcceiling.go` **holds no credential and cannot reach the apiserver** — it takes sizes and a
+resolver and returns an error. **The kube credential's blast radius is unchanged, if anything
+narrowed**, since the controller now declines to start rather than issuing claims it knows will be
+rejected.
+
+**A27.9 — three below the bar.** The failure message says to raise the value *"in
+`deploy/chart/values.yaml`"*, but a cluster overriding it per-cluster edits its own file —
+correct for the only live deployment today, **not durable for the first cluster that overrides**.
+`ValidatePVCCeilings` re-resolves every (template, size) pair inside the per-tier loop, so `/nix` is
+written once per pair and the map dedupes — correct output, but it **reads as if it accumulates**.
+And **two claimant sets now exist in two languages** (the chart's `$claimants` dict, the controller's
+`claims` map), deliberately different because the chart owns one and the controller three — the
+residual being that a **fourth** per-worker PVC later requires remembering both, and **nothing fails
+if you update only one**.
+
+**A27.10 — it declined to re-derive A24.4's corrected mutation results**, relying instead on its own
+independent mutation of `pvcceiling.go` for the piece that matters. That is the right instinct: a
+self-report of a corrected instrument is worth less than one independent measurement of the thing the
+instrument was measuring.
