@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import {
   PlanPanel,
+  SeededPlanPanel,
   AgentRosterSummary,
   JudgePanel,
   RunHeading,
@@ -230,6 +231,45 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
   });
 });
 
+// PRD #209 M5. A seeded run supplies its plan at create time and never enters
+// awaiting_approval, so PlanPanel (the approval UI) never renders for it and run.plan_md
+// would be unreachable on the run page. SeededPlanPanel is the read-only surface that
+// makes it reachable in any state. It must NOT carry the gate's actions — an Approve/Reject
+// on a run that has no approval gate would be a lie — which is what keeps the
+// awaiting_approval PlanPanel the ONLY approval surface (Success Criterion 2).
+describe("SeededPlanPanel (PRD #209 M5)", () => {
+  it("renders the seeded plan body in a read-only collapsible", () => {
+    const { container } = render(
+      <SeededPlanPanel run={run({ status: "running", plan_md: "# Plan\n- seeded step" })} />,
+    );
+    // The plan markdown reaches the page…
+    expect(screen.getByText("seeded step")).toBeTruthy();
+    // …inside a native <details> collapsible whose summary names it "Seeded plan".
+    expect(container.querySelector("details")).toBeTruthy();
+    expect(container.querySelector("summary")?.textContent).toContain("Seeded plan");
+  });
+
+  it("carries NONE of the gate's actions — it is not the approval UI", () => {
+    render(<SeededPlanPanel run={run({ status: "running", plan_md: "# Plan\n- seeded step" })} />);
+    // Positive anchor first, so the absence checks below are not vacuous: a component that
+    // rendered nothing would fail here.
+    expect(screen.getByText("seeded step")).toBeTruthy();
+    // No approve/reject/revise controls. These strings DO render on the awaiting_approval
+    // PlanPanel (asserted in the PlanPanel block above), so a regression that copied the
+    // gate's actions onto this surface would redden these lines — they are not vacuous.
+    expect(screen.queryByRole("button", { name: /Approve plan/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Reject$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Request changes/i })).toBeNull();
+  });
+
+  it("renders nothing when the run carries no plan body", () => {
+    const { container } = render(
+      <SeededPlanPanel run={run({ status: "running", plan_md: null })} />,
+    );
+    expect(container.textContent).toBe("");
+  });
+});
+
 describe("AgentRosterSummary (read-only, post-approval)", () => {
   it("a repo-source run states the internal review was repo-authored, inertly", () => {
     const { container } = render(
@@ -273,6 +313,37 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     expect(screen.getByText("coder")).toBeTruthy();
     expect(screen.getByText("tester")).toBeTruthy();
     expect(screen.getByText(/Excluded: reviewer/)).toBeTruthy();
+  });
+
+  // PRD #209 M5. A seeded run carries agent_source="repo" from creation but has no
+  // repo_agents until the worker's post-checkout report. The card used to render the
+  // definitive "internal review was performed by repo-authored agents" claim over an
+  // EMPTY chip list — asserting a roster it does not have. The pending state states the
+  // source without the roster claim.
+  it("a seeded repo-source run with no roster yet shows a pending state, not an asserted empty roster (PRD #209 M5)", () => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          plan_source: "seeded",
+          agent_source: "repo",
+          repo_agents: null,
+        })}
+      />,
+    );
+    // Positive: the pending copy names the source (repo agents) and explains the gap.
+    expect(screen.getByText(/roster appears here once the worker checks out/i)).toBeTruthy();
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    // Non-vacuous negative: the past-tense "internal review was performed by" claim —
+    // the misleading assertion this fix removes — must NOT render here. It CAN render
+    // (the adjacent "repo-source run" test above asserts it does for a populated roster),
+    // so reverting the fix reddens this line. Measured: with the fix reverted this run
+    // renders "its internal review was performed by repo-authored agents" and this fails.
+    expect(screen.queryByText(/internal review was performed by/i)).toBeNull();
+    // The past-tense "used the repository's own agents" wording is likewise gone.
+    expect(screen.queryByText(/used the repository's own agents/i)).toBeNull();
+    // And no chip is rendered claiming a specific agent.
+    expect(screen.queryByText(/^●?\s*coder/i)).toBeNull();
   });
 });
 

@@ -649,6 +649,16 @@ export function RunView() {
         />
       )}
 
+      {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
+          PlanPanel above never renders and run.plan_md has no home on the page. This is
+          the read-only surface for it, shown in every state (queued through terminal).
+          Gated on plan_source alone: it is "seeded" ONLY for a seeded run and never
+          overlaps the gate — M1 flips plan_source back to 'agent' in the same UPDATE that
+          rewrites plan_md if a seeded run ever fell through to awaiting_approval (the D8
+          safety fix), so the two panels are disjoint by construction, not by a status
+          guard bolted on here. */}
+      {run.plan_source === "seeded" && <SeededPlanPanel run={run} />}
+
       {/* PRD #88: the clarification park. Gated on BOTH the status and a derived open
           question: the status alone would render a composer with nothing to answer in
           the window before the `question` message replays (the worker flushes it first,
@@ -1061,10 +1071,55 @@ export function PlanPanel({
   );
 }
 
+// SeededPlanPanel (PRD #209 M5): a seeded run receives its plan from the user at
+// create time and never enters awaiting_approval, so PlanPanel — the approval UI —
+// never renders and run.plan_md would otherwise be UNREACHABLE on the run page. This
+// read-only collapsible surfaces the seeded plan in any state (queued through
+// terminal). It is deliberately NOT the gate: it carries no approve/reject/revise
+// actions and does not read the feed, so it cannot be confused with the approval UI
+// and does not touch the awaiting_approval path (Success Criterion 2 / anti-regression).
+//
+// The plan is UNTRUSTED input (user-authored, D5) but is size-capped and secret-scrubbed
+// server-side at create time; it renders through the same hardened <Markdown> the gate
+// uses for plan_md, never a raw HTML sink. Defaults OPEN: the whole point of the
+// milestone is that this content was unreachable, so hiding it behind a click would
+// re-hide it; the inner max-h scroll keeps a long plan from dominating the page.
+export function SeededPlanPanel({ run }: { run: Run }) {
+  // Belt-and-braces: a seeded run always carries a non-empty plan_md (M1 rejects an
+  // empty/whitespace plan with a 422 at create time), but render nothing rather than an
+  // empty box if a caller ever passes a run without one.
+  if (!run.plan_md) return null;
+  return (
+    <details open className="overflow-hidden rounded-xl border border-edge bg-raised/40">
+      <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-fg">
+        Seeded plan
+        <span className="ml-2 text-xs font-normal text-faint">
+          you supplied this plan when starting the run — it is implemented without an approval gate
+        </span>
+      </summary>
+      <div className="border-t border-edge p-4">
+        <div className="max-h-96 overflow-auto rounded-lg border border-edge bg-surface p-3">
+          <Markdown content={run.plan_md} />
+        </div>
+      </div>
+    </details>
+  );
+}
+
 // AgentRosterSummary: the read-only record of the locked-in selection, shown once
 // a run is past the gate (PRD #37 Decision 3b). For a repo-source run it says so
 // plainly, so a reader knows the internal review loop was repo-authored. Repo
 // names/descriptions render as plain JSX text, never <Markdown>.
+//
+// PRD #209 M5: a SEEDED run carries agent_source="repo" from creation, so this card
+// mounts immediately — but repo_agents stays null until the worker's post-checkout
+// report lands the clone's roster. Rendering the definitive "used the repository's
+// own agents" claim over an empty chip list would assert a roster the run does not
+// yet have. So a SEEDED repo-source run with an empty roster shows a "roster pending"
+// state instead. Keyed on plan_source==="seeded" (not on roster-emptiness alone): a
+// normal repo-source run reports repo_agents before agent_source is even set, so its
+// roster is never empty here — but keying on the seeded signal directly is more robust
+// than inferring it from an empty roster, which has edges (e.g. a repo that reports []).
 /**
  * The run header's title line. Extracted and exported for the same reason PlanPanel,
  * AgentRosterSummary and JudgePanel are: `RunView` itself needs routing, a live stream and
@@ -1140,10 +1195,24 @@ export function AgentRosterSummary({ run }: { run: Run }) {
   // own_agents now carries the own-source roster on the detail read, so this lists
   // the actual agent names for either source (M4-fix) instead of nothing for own.
   const included = roster.filter((a) => !excluded.has(a.name)).map((a) => a.name);
+  // PRD #209 M5: a seeded run whose repo roster has not been reported yet (before its
+  // post-checkout report). Keyed on the seeded signal directly. Only the repo branch can
+  // be pending — an own-source run with no templates is a legitimate lead-only run, not a
+  // missing roster, so it keeps its definitive copy.
+  const repoRosterPending =
+    run.plan_source === "seeded" && run.agent_source === "repo" && roster.length === 0;
   return (
     <Card className="space-y-2 p-4">
-      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Agents used</h2>
-      {run.agent_source === "repo" ? (
+      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
+        {repoRosterPending ? "Agents" : "Agents used"}
+      </h2>
+      {repoRosterPending ? (
+        <p className="text-sm text-muted">
+          This run uses the repository's own agents from{" "}
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code>. The
+          roster appears here once the worker checks out the repository.
+        </p>
+      ) : run.agent_source === "repo" ? (
         <p className="text-sm text-muted">
           This run used the repository's own agents from{" "}
           <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code> — its
