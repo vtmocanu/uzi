@@ -1698,12 +1698,30 @@ f47961e6  assert --include=dev rather than only delegating it
 
 ## 🔴 TWO THINGS THAT WILL BITE AT PUSH TIME
 
-1. **🔴 THE TIP CARRIES THE CI-SKIP MARKER RIGHT NOW. AS THIS BRIEF IS WRITTEN,
-   THE BRANCH IS NOT SAFE TO PUSH.** `f47961e6`, the last *code* commit, is clean —
-   but every docs commit on this branch correctly carries the marker, and the docs
-   commits are on top. **`git log -1 --format=%B | grep -c -F '[skip ci]'` returns
-   1 at the tip.** Fix by landing any non-docs commit last, or an empty one whose
-   message omits the marker.
+1. **🔴 THE MARKER IS SCATTERED THROUGH THIS BRANCH'S RECENT HISTORY. DERIVE THE
+   TIP'S STATE AT PUSH TIME; DO NOT CARRY A NUMBER FORWARD FROM THIS FILE.**
+
+   ```
+   git log -1 --format=%B | grep -c -F '[skip ci]'
+   ```
+
+   **Do not read a state out of this paragraph — it has now been wrong in BOTH
+   directions inside one hour.** It first said the tip was clean (true of
+   `f47961e6`, false of the branch once two docs commits landed on top). It was
+   then rewritten to say *"the tip carries the marker right now, the branch is NOT
+   safe to push"* — **also true when written and false minutes later**, once a
+   marker-free commit landed on top. Whichever number you find here is a fact about
+   a commit that is no longer the tip.
+
+   **The durable fact, which does not go stale:** a majority of this branch's
+   recent commits are docs-only and **correctly** carry the marker, so a clean tip
+   is *incidental* — it means a non-docs commit happened to land last, not that the
+   branch is safe by construction. Fix by landing any commit whose message omits
+   the marker.
+
+   *(Even the count is window-dependent: the coder reported "3 of the last 6" from
+   its tip and the same command from one commit later gives 2 of 6. Both correct,
+   different windows — which is the same reason the tip state cannot be quoted.)*
 
    GitLab reads the marker from the MR's HEAD commit however the pipeline is
    triggered; the result is `skipped`, not `failed`; the MR still reports
@@ -1722,6 +1740,89 @@ f47961e6  assert --include=dev rather than only delegating it
 2. **Push the SHA you gated, by refspec** — `git push origin <sha>:refs/heads/prd-103` —
    not the branch name. A branch name resolves at push time; a gate result is
    bound to a SHA.
+
+## 🔴 THE TESTER'S 73-RUN RESULT LANDED AFTER THE HANDOFF WAS WRITTEN AND CHANGES IT
+
+Matched-pair design, Clopper-Pearson intervals, ambient load recorded per run
+(it drifted 40 → 190 across the session, from the rest of this team). Raw data
+and `00-PREDICTIONS.md` — written before the first run, unedited — in
+`probes/prd-103-mrc-tester-tt/`. **Read this before touching the flake again.**
+
+**1. `testTimeout: 60000` DOES NOT REMOVE THE FLAKE. It makes it rarer.** The cap
+test was observed at **49869 ms inside a GREEN run at the shipped cap**, under two
+concurrent suites — **82% of the ceiling**. Real margin over the worst observed
+excursion is **1.20x**. **`web/vite.config.ts`'s "~15x steady state" is against the
+wrong denominator** — steady state is not the relevant scale for a starvation tail,
+and that claim is in shipped code. *(Answering my own dispatch question directly:
+"fixed" vs "merely rarer" → **rarer**, with a number rather than a bound.)*
+
+**2. THE 60000 RED IS A DIFFERENT TEST AND A DIFFERENT MECHANISM, AND NO
+`testTimeout` VALUE FIXES IT.** `IssueView.test.tsx:140` does a synchronous
+`getByText` after a `waitFor` anchored on a *different* element (the iid chip at
+:138). Under contention the chip renders and the title has not, so the sync query
+fails instantly — **zero `Test timed out` lines in that run**. A latent test bug
+exposed by contention, orthogonal to both `testTimeout` and `asyncUtilTimeout`.
+**The ruling treated this as one knob's problem; it is at least two independent
+tests under one shared cause.**
+
+**3. THE SPLIT IS DEFINITIVELY DEAD, AND THE `runner.test.ts` ANALOGY DOES NOT
+TRANSFER.** Five matched pairs started at the same instant, so ambient load is held
+constant *within* each pair: **wall clock identical within 3 s in all five**, and
+the starvation untouched (15065 → 15068 ms). The RunView file's own duration drops
+30.4 → 23.8 s, but the longest file in the run barely moves because another file
+immediately becomes the pole. The suite is **CPU-bound, not packing-bound** — 261 s
+of file-work over ~9 workers would ideally pack to ~29 s against a **94 s** actual.
+`runner.test.ts` was a **per-file** cap with 7 suites serialized inside one file;
+here the cap is **per-test** and the pressure is scheduler starvation across 118
+parallel files. **Splitting relieves a constraint that is not binding.**
+
+**4. THE RATE IS NOT STATIONARY, AND THE DISAGREEMENT WAS NEVER REAL.**
+
+```
+ambient, one suite,  tt=20000    0/19    [0.0%, 17.6%]
+ambient, one suite,  tt=60000    0/19    [0.0%, 17.6%]
+two concurrent,      tt=20000    1/8     [0.3%, 52.7%]
+two concurrent,      tt=60000    1/20    [0.1%, 24.9%]
+```
+
+**Amendment 7's "1-in-13, not 1-in-3" is itself an over-claim and is corrected
+here.** The coder's original n=3 carries a **0.8%–90.6%** interval — it was never a
+33% claim, it was "somewhere between rare and almost always". P(0 reds in 19 |
+p=1/3) = 4.5e-4 refutes 1/3 *at ambient load only*. Nothing was ever contradicted;
+the windows differed in load, and **I treated two point estimates from tiny samples
+as though they disagreed.**
+
+**5. `--maxWorkers` DOES NOT AMPLIFY THIS** — 24/48/96/118 at tt=60000 all stayed
+near steady state (5105 ms at w=118). In-suite parallelism is not the mechanism;
+*competing whole suites plus ambient load* is. Bank this so nobody tries to
+reproduce it cheaply that way.
+
+**WHAT IT DID NOT REACH, and this is the gap that matters: there is NO RATE FOR
+CI.** Every figure above is one laptop under an agent-team load. The GitLab runner
+is a different machine with different cores and different contention, and **CI is
+where this actually bites**. Nothing here transfers.
+
+**Consequences for tomorrow:**
+- **Task #16 is validated as the better-targeted lever** — and it does nothing for
+  finding 2.
+- **`web/vite.config.ts`'s "~15x" comment must be corrected** — refuted in shipped
+  code.
+- **File the issue as two problems under one cause**, not as "split the file".
+- The `IssueView` race is **n=1, found not characterised**.
+
+**Two instrument caveats worth more than the result**, and one is mine:
+- **The vitest JSON reporter does not put "timed out" in `failureMessages`.** The
+  cap test appears as `status: failed` with a missing-element message; only
+  `duration: 20049` and the terminal log identify it. **A JSON-only harness would
+  have mis-classified the RED.**
+- **A lognormal fit to 38 ambient durations predicts P(>20000) = 1 in 124,000** —
+  flatly contradicted by an observed red. The tail is heavier than any parametric
+  fit 38 points can justify. Do not quote an extrapolated rate.
+- **The shared scratchpad clobbered the tester's file, and the writer was me.** My
+  redaction-header `hdr.txt` overwrote its `hdr.txt` at 10:05; its split rebuild
+  inherited a 382 KB redaction note and esbuild failed loudly. **Caught only
+  because it was a parse error — a silent content collision would not have been.**
+  The team scratchpad is shared; use a private subdirectory.
 
 ## What this session actually bought, and it was not the code
 
