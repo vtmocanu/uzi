@@ -65,7 +65,7 @@ Exposure, narrowed rather than left as "the Go half":
 - **CI's `test:controller` was never at risk** -- it already passes `-count=1`, and
   `.gitlab-ci.yml` spells out this exact mechanism for the `api/` goldens *it* reads across
   the same module boundary. That comment predates this fixture and describes it precisely.
-- **The exposed gates were `cd api && go test ./...`** (the command `.claude/rules/go.md` prescribed
+- **The exposed gates were `cd api && go test ./...`** (the command `CLAUDE.md` prescribed
   at the time; since PRD #103 M1 it names `task gate:api`, which carries `-count=1`)
   **and CI's `test:api`**, which ran it bare while `.go_job` persists `.gocache/` across
   pipelines. `test:api` now passes `-count=1` for the reason its controller sibling already

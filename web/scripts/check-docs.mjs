@@ -215,12 +215,19 @@ for (const file of files) {
 // were written when that content sat at the repo root. PRD-less fix, 2026-08-04: the
 // CLAUDE.md split silently broke one such link and this checker could not see it.
 const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
-const rulesDir = path.join(repoRoot, ".claude", "rules");
-if (existsSync(rulesDir)) {
-  for (const f of readdirSync(rulesDir).sort()) {
-    if (f.endsWith(".md")) extraLinkFiles.push(path.join(".claude/rules", f));
+// RECURSIVE on purpose: Claude Code discovers rules recursively ("All .md files
+// are discovered recursively, so you can organize rules into subdirectories"), so a
+// flat read here would skip .claude/rules/frontend/x.md -- a file the loader DOES
+// load. That is the same shape as the bug this block exists to catch.
+const walkRules = (abs, rel) => {
+  if (!existsSync(abs)) return;
+  for (const e of readdirSync(abs, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const nextRel = path.join(rel, e.name);
+    if (e.isDirectory()) walkRules(path.join(abs, e.name), nextRel);
+    else if (e.name.endsWith(".md")) extraLinkFiles.push(nextRel);
   }
-}
+};
+walkRules(path.join(repoRoot, ".claude", "rules"), ".claude/rules");
 for (const dir of ["specs", "prds", "adr"]) {
   const abs = path.join(repoRoot, dir);
   if (!existsSync(abs)) continue; // optional directories
