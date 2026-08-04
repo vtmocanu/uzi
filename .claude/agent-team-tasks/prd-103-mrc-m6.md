@@ -31,15 +31,15 @@ lead-enforced writer token, exactly one writer unfrozen at a time.
 
 | role | disposition |
 |---|---|
-| architect | pending — design wave |
-| reviewer | pending — design wave, then per-unit |
-| auditor | pending — design wave, then per-unit |
-| fact-checker | pending — design wave (the brief's numbers are mine and were wrong twice before they were right) |
+| architect | **dispatched 2026-08-04 at `848cf53d`** — design wave |
+| reviewer | **dispatched 2026-08-04 at `848cf53d`** — design wave, then per-unit |
+| auditor | **dispatched 2026-08-04 at `848cf53d`** — design wave, then per-unit |
+| fact-checker | **REPORTED 2026-08-04 at `848cf53d`** — 1 refuted (R1), 1 ambiguous (A1), 6 notes, 7 targets confirmed, every `measured` figure re-derived independently. Folded in as **Amendment 1**. Evidence: `probes/fc-mrc-m6/INDEX.txt` + 12 raw files. |
 | coder | pending — Unit A, then Unit B |
 | tester | pending — after each unit's first commit, never at kickoff |
 | documenter | pending — CHANGELOG + `docs/dev-conventions.md` owe a line per carry-forward 12 |
 | spec-keeper | pending — `specs/` exists |
-| web-ux | **closed — no user-facing surface.** Both units touch CI config, task targets and test configuration only. No UI change, so there is nothing to drive in a browser. |
+| web-ux | **closed — no user-facing surface.** Neither unit changes rendered behaviour, so there is nothing to drive in a browser. *(Amendment 1: the original reason said the units "touch CI config, task targets and test configuration only", which understates Unit A — a vitest 2→4 major can require edits to the 118 test files themselves. The closure stands; its stated scope was wrong. The 118/1660 predicted-count control is what covers that risk.)* |
 | researcher | **closed — the research is already written.** M5's brief and the carry-forward doc are the corpus; a fresh investigation would re-derive 22 items somebody already measured. |
 | release | pending — user-gated, and `/prd-full` stops at MR creation, so this is MR-open only, never merge. |
 
@@ -141,12 +141,36 @@ web/src test files   118
 
 **This is the measurement that decides M6's approach and it cuts against the easy
 fix.** Flipping the global default to `jsdom` moves 42 files from node to jsdom —
-the same silent-wrong-environment bug the pragma-less files have today, in the
-opposite direction, which is precisely what the PRD warns about. `git grep -L` will
-tell you which 42; some are genuinely node-side (`lib/`, contract tests) and some
-are DOM tests missing their pragma. **Those two populations need separating before
-any config change is designed.** Nobody has done that yet; it is Unit B's first
-task and its result may change the design.
+the same silent-wrong-environment bug in the opposite direction, which is precisely
+what the PRD warns about. That warning stands unchanged.
+
+**🔴 ALL 42 ARE NODE-SIDE. THERE IS NO MISSING-PRAGMA POPULATION.** *(Amendment 1,
+2026-08-04. This paragraph originally read "some are genuinely node-side (`lib/`,
+contract tests) and some are DOM tests missing their pragma. Those two populations
+need separating before any config change is designed … its result may change the
+design." The second population does not exist.)*
+
+```
+36  web/src/lib      6  web/src/mocks      0 elsewhere
+42  .ts              0  .tsx
+```
+
+**The decisive instrument was the measurement two sections above it in this very
+file.** A DOM test running under node throws `ReferenceError: document is not
+defined`; the baseline is **118/118 files, 1660/1660 tests green** with those 42
+running under node. A green suite is therefore a proof that no DOM test is among
+them. The refutation was already in the brief, one section up, at the moment the
+wrong sentence was written.
+
+Three independent probes agree, each shaped to fail differently and each carrying a
+positive control over pragma-carrying `.tsx` files: DOM-global references → 1 hit,
+the word `localStorage` inside a test *description string*; react / testing-library
+imports → 1 hit, a file importing a bare constant with no render; a wider DOM-token
+set → 2 hits, the word "screen" in prose comments. Zero real DOM usage.
+
+**So Unit B's classification step is DISCHARGED, not deferred, and the `projects`
+split is mechanical**: `src/lib/**` and `src/mocks/**` node, everything else jsdom.
+Re-derive the partition at your own tip before relying on it — files get added.
 
 ### Two instrument failures I hit taking these numbers, recorded because they are the shape this milestone is about
 
@@ -160,6 +184,20 @@ task and its result may change the design.
    *no findings* from *wrong pattern*. The discriminating read was the prose
    summary, which reports 2 and 1 uncalled — i.e. the file was never empty.
 
+**Failure 1 reproduced independently THREE MORE TIMES within hours**, by the
+fact-checker verifying this brief: `git ls-files web`, a `git grep -- web` and a
+`git grep -- .gitlab-ci.yml`, each with cwd left inside `web/` by an earlier
+command, **each returning a clean empty result**. The Bash tool's cwd persists
+between calls and an empty result is indistinguishable from a true negative. Four
+instances in one day, by two careful parties, is a property of the tool rather than
+of anyone's attention: **pass absolute paths, or `cd` in the same command.**
+
+**And one more instrument note from the same pass, which cost a wrong empty
+answer**: `git grep -F -- '--audit-level' <paths>` finds NOTHING, because the
+leading `--` is parsed as end-of-options; `git grep -F -e '--audit-level' <paths>`
+finds six. **A pattern beginning with `-` needs `-e`.** It was caught only because
+a positive control was run on the same form.
+
 ---
 
 ## Unit A — MR-C
@@ -170,6 +208,19 @@ findings at zero, vitest on 4.x.
 ### Binding user rulings, carried verbatim from `.claude/agent-team-tasks/prd-103-m5.md`
 
 1. **`npm audit` gates the FULL tree, fixed first, at zero.** Not `--omit=dev`.
+
+   **🔴 THE GATING FLAG IS `--audit-level=high`, AND OMITTING IT MAKES THE GATE RED
+   ON DAY ONE AFTER EVERY PLANNED FIX LANDS.** *(Amendment 1, 2026-08-04: the flag
+   was in the PRD (`:1877`) and in M5's record (six sites) and **nowhere in this
+   brief**, which said only "at zero". That is under-specified in the direction that
+   costs a red pipeline.)* Measured: **bare `npm audit` exits 1 on both packages
+   today**, and it still will afterwards. `vitest@4.1.10` clears web's
+   `@vitest/mocker`, `esbuild` and `vite-node` moderates as a side effect, but
+   **five moderates survive every planned fix** — web's `react-router` and
+   `react-router-dom`, agent's `@hono/node-server`, `@modelcontextprotocol/sdk` and
+   `hono`. All five report `fixAvailable: true` (in-range, no major), so clearing
+   them is *possible*; it is not what the PRD specifies, and widening scope to do it
+   is a decision to surface, not to take. **"At zero" means high-and-above at zero.**
 2. **`govulncheck`'s called vulns are BUMPED here, not filed.** *(Vacuously satisfied
    today — there are none. Do not read that as licence to skip the gate.)*
 3. **The vitest 2.x → 4.x major is IN.** Raised as a concern and reaffirmed.
@@ -191,15 +242,22 @@ findings at zero, vitest on 4.x.
 
 ### Three findings that change the implementation, measured during M5 and not to be re-derived
 
-- **`go run` destroys govulncheck's exit-code discrimination.** The binary exits
-  **3** for findings and **1** for its own errors; under `go run` everything nonzero
-  flattens to **1**, this repo's "there are findings" code. Use
-  `go install …@vX` into a temp GOBIN — keeps the pin *and* the three-way
-  convention. *(Note my baseline above used `go run` deliberately: I wanted counts,
-  not an exit code, and rc=0 is unambiguous. The gate needs the discrimination.)*
-- **`govulncheck -format json` always exits 0**, even with called vulns present. A
-  wrapper reading a JSON run's status is permanently green — the fail-open shape,
-  and the natural thing to write if you reach for JSON in order to count.
+- **`go run` destroys govulncheck's exit-code discrimination, and the split is
+  FOUR-way, not three.** *(Amendment 1, 2026-08-04: this said "exits 3 for findings
+  and 1 for its own errors". There is a third nonzero code and a wrapper built on a
+  two-way split misreads it.)* Read out of `x/vuln@v1.1.4`: **0** clean, **3**
+  findings (`internal/scan/text.go:84`), **2** usage error (`errUsage`,
+  `internal/scan/errors.go:26`, e.g. a typo'd flag), **1** everything else via
+  `main.go`'s `default:`. Under `go run` every nonzero flattens to **1** — this
+  repo's "there are findings" code. Use `go install …@vX` into a temp GOBIN: keeps
+  the pin *and* the discrimination. *(My baseline above used `go run` deliberately —
+  I wanted counts, and rc=0 is unambiguous either way. The gate needs the codes.)*
+- **`govulncheck -format json` always exits 0**, even with called vulns present, and
+  the mechanism is stronger than "observed": `errVulnerabilitiesFound` has **exactly
+  one return site**, in the text formatter, so JSON *cannot* produce it. The source
+  comment says so outright: *"This returns exit status 3 when running without the
+  -json flag."* A wrapper reading a JSON run's status is permanently green — the
+  fail-open shape, and the natural thing to write if you reach for JSON to count.
 - **A version BUMP of a devDependency fails SILENTLY, unlike a new one.** Carry-forward
   12 is about a *new* dep: `npm run` puts `node_modules/.bin` on PATH and fails
   closed with `command not found`. A bump cannot fire that — the binary is already
@@ -246,11 +304,20 @@ postinstall runs anyway.**
   Per carry-forward 12 that owes a CHANGELOG line and a `docs/dev-conventions.md`
   line, and per carry-forward 6 the Task target **delegates to a `package.json`
   script** rather than reimplementing the command.
-- **jsdom: `environmentMatchGlobs` is dead here.** It works on vitest 2 and is
-  deprecated from vitest 3; after Unit A the tree is on 4.x, so the projects /
-  workspace config is the only route. M5's recommendation, adopted: **re-scope M6
-  onto the projects config; do not pull the jsdom migration into MR-C.**
-  Start from the 76/42 split above, not from a config edit.
+- **jsdom: `environmentMatchGlobs` is REMOVED in vitest 4, not merely deprecated.**
+  Settled against three package tarballs rather than doc prose: 2.1.9 has it
+  implemented with no `@deprecated` tag; 3.0.0 has it with a `@deprecated` JSDoc
+  *and* a runtime `logger.warn`; **4.1.10 has zero occurrences of it in the entire
+  package.** After Unit A the tree is on 4.x, so it is gone, not noisy.
+- **The route is `test.projects`, and `test.workspace` is NOT an alternative.**
+  *(Amendment 1, 2026-08-04. This line read "the projects / workspace config is the
+  only route", inherited verbatim from `prds/103-dev-loop-quality-gates.md:1947-1949`
+  where it was written against vitest ≤3.)* `test.workspace` was **removed in
+  Vitest 4** and throws: *"The `test.workspace` option was removed in Vitest 4.
+  Please, migrate to `test.projects` instead."* It fails loud rather than silent, so
+  this is a spec precision fix and not a live hazard — but the brief is the spec.
+  M5's recommendation, adopted: **re-scope M6 onto `test.projects`; do not pull the
+  jsdom migration into MR-C.** Start from the discharged 76/42 split above.
 - **If the first `-race` run on `controller` is RED, STOP.** File the races as their
   own issue and land `-race` behind `allow_failure: true` **with a dated expiry
   note** rather than leaving a permanent advisory job (Decision 3). Note this is the
@@ -273,9 +340,17 @@ These are not style preferences; each one is a measured failure somewhere in
    author picks the target branch). npm targets **delegate** to a `package.json`
    script — a target that reimplements the command drops that script's flags
    silently.
-2. **A new lint-stage CI job must be added to BOTH `.gate_needs` and
-   `.publish_needs`**, and gets **its own `cache:` prefix** if it builds something
-   the jobs sharing that key do not. Verify list membership by parsing.
+2. **ANY new CI job must be added to BOTH `.gate_needs` and `.publish_needs`**, and
+   gets **its own `cache:` prefix** if it builds something the jobs sharing that key
+   do not. Verify list membership by parsing, never by grepping.
+
+   *(Amendment 1, 2026-08-04: this read "a new **lint-stage** CI job", which
+   NARROWED both its sources — carry-forward 2 says "any new CI job",
+   `.gitlab-ci.yml:292` says "a new gate job". That is carry-forward 16(d)'s
+   widening trap running in the other direction, and it bites **Unit B
+   specifically**: M6 is the milestone most likely to want a coverage job, which is
+   not lint-stage. The precise version survives at both original sites; the narrow
+   one was at the top of this brief, where a reader hits it first.)*
 3. **Prefer a pinned `go run pkg@version` / `go install pkg@version` inside the
    already-pinned `golang:1.26`** over a new image family. Do not add dev tooling
    to root `devbox.json` — that file is tier-2 *worker* config.
@@ -337,3 +412,40 @@ For these two units:
 - **Label every claim `measured` or `suspected`.** M5's handover did this and it is
   the format worth copying — half of it was suspected, and shipping those as facts
   is the failure this PRD is about.
+
+---
+
+## Amendment 1 — 2026-08-04, from the fact-checker's design-wave pass
+
+**Landed while the architect, reviewer and auditor were still reading `848cf53d`.**
+Their reports are pinned to that SHA and are **EARLY, not stale**: correct at the
+state they read, and correct forever at that state. Reconcile them against this
+amendment; do not re-dispatch them for it. *(That distinction is the skill's own and
+the two have different fixes — stale means re-pin what you verify, early means
+re-read, not re-run.)*
+
+Every claim I labelled `measured` was **re-derived independently** and every one
+reproduced: govulncheck 0/0/2 and 0/0/1; web 8/1/2/5/0 and agent 5/0/2/3/0 (with a
+`cmp` distinctness control aimed squarely at my instrument-failure #1); all five
+high-and-above rows exact; 118 files / 1660 tests; 76/42 from two separate
+enumerations. The text-output-hides-the-critical claim reproduced exactly.
+
+What moved, in order of what a wrong answer would have cost:
+
+| | section | change |
+|---|---|---|
+| **R1** | jsdom coverage | **REFUTED.** All 42 pragma-less files are node-side; the missing-pragma population does not exist. Unit B's classification step is discharged, not deferred. |
+| **N1** | Unit A ruling 1 | `--audit-level=high` was in the PRD and M5 and **absent here**. Without it the gate is red on day one after every planned fix, because five moderates survive. |
+| **N2** | Hard constraint 2 | Widened back to **any** new CI job. The narrow "lint-stage" form would have missed M6's coverage job. |
+| **A1** | Unit B jsdom | `test.workspace` is **removed** in vitest 4 and throws; the route is `test.projects` alone. |
+| **N3** | Unit A findings | govulncheck's exit split is four-way (0/1/2/3), not three; and the `-format json` fail-open has a source-level proof rather than an observation. |
+| **N5** | Roster, web-ux | Closure reason understated Unit A's blast radius. Closure itself unchanged. |
+| **N6** | instrument failures | Failure 1 reproduced three more times, by a second party, within hours. Plus the `git grep -e` leading-dash trap. |
+
+**One transit change reviewed and KEPT**: Hard constraint 3 extended carry-forward 6's
+`go run pkg@version` to `go run … / go install …`. That is a deliberate widening,
+justified by N3 — `go run` cannot preserve the exit codes the gate needs — and the
+source's rationale (pin the version, leave `go.mod` untouched, stay inside the
+already-pinned image) carries over to `go install` unchanged.
+
+**Nothing in the brief was found unverifiable.**
