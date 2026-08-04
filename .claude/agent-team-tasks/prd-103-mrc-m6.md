@@ -31,9 +31,9 @@ lead-enforced writer token, exactly one writer unfrozen at a time.
 
 | role | disposition |
 |---|---|
-| architect | **dispatched 2026-08-04 at `848cf53d`** — design wave |
-| reviewer | **dispatched 2026-08-04 at `848cf53d`** — design wave, then per-unit |
-| auditor | **dispatched 2026-08-04 at `848cf53d`** — design wave, then per-unit |
+| architect | **dispatched 2026-08-04 at `848cf53d`** — design wave, not yet reported |
+| reviewer | **REPORTED 2026-08-04 at `848cf53d`** — 1 blocking (my react-router error), 10 non-blocking, 1 nit; all 7 citation targets resolved, all 4 day-one figures re-derived. Folded in as **Amendment 2**. Evidence: `probes/prd-103-mrc-m6-reviewer/README.md` + 43 files. |
+| auditor | **REPORTED 2026-08-04 at `848cf53d`** — 4 HIGH (incl. the Success Criterion 1 conflict and the `.npmrc` disarm), 4 MEDIUM, 6 below-bar; ran `task scan:secrets` (rc=0, both canaries detected). Folded in as **Amendment 2**. Evidence: `probes/prd-103-mrc-m6-auditor/` + 24 files. |
 | fact-checker | **REPORTED 2026-08-04 at `848cf53d`** — 1 refuted (R1), 1 ambiguous (A1), 6 notes, 7 targets confirmed, every `measured` figure re-derived independently. Folded in as **Amendment 1**. Evidence: `probes/fc-mrc-m6/INDEX.txt` + 12 raw files. |
 | coder | pending — Unit A, then Unit B |
 | tester | pending — after each unit's first commit, never at kickoff |
@@ -155,12 +155,27 @@ design." The second population does not exist.)*
 42  .ts              0  .tsx
 ```
 
-**The decisive instrument was the measurement two sections above it in this very
-file.** A DOM test running under node throws `ReferenceError: document is not
-defined`; the baseline is **118/118 files, 1660/1660 tests green** with those 42
-running under node. A green suite is therefore a proof that no DOM test is among
-them. The refutation was already in the brief, one section up, at the moment the
-wrong sentence was written.
+**The load-bearing argument is STRUCTURAL, and it does not depend on the suite being
+green:** of the 42, **zero** are `.tsx` and **zero** import `@testing-library/react`.
+There is nothing there that could render a component.
+
+**🔴 AMENDMENT 2: THE ARGUMENT THIS PARAGRAPH ORIGINALLY GAVE DOES NOT CARRY, THOUGH
+ITS CONCLUSION DOES.** Amendment 1 argued: *"A DOM test running under node throws
+`ReferenceError: document is not defined`; the baseline is 118/118 files green with
+those 42 under node. A green suite is therefore a proof that no DOM test is among
+them."* **The universal claim is false.** `web/src/lib/prefs.ts:13,23` guards every
+access with `if (typeof window === "undefined") return fallback;`, so a pragma-less
+test importing it passes **2/2 under node and 2/2 under jsdom** while never touching
+`localStorage` under node — built and run, both ways. What a green suite actually
+proves is the weaker *"nothing in the 42 THROWS on a missing DOM global"*, and a
+vacuously-passing DOM test is precisely the thing that does not throw.
+
+Keep the green-suite observation as corroboration; do not cite it as the proof.
+*(Two data points that follow from the same probe: `prefs.test.ts` **does** carry the
+pragma, so it is not among the 42 and there is no live instance of this; and **4 of
+the 76** carry the pragma while using no DOM at all — `rateLimits`,
+`engineQuestion`, `mockApi.limitWait`, `mockApi.notifications` — so a `projects`
+split keyed purely on directory makes those four pay jsdom cost for nothing.)*
 
 Three independent probes agree, each shaped to fail differently and each carrying a
 positive control over pragma-carrying `.tsx` files: DOM-global references → 1 hit,
@@ -218,9 +233,35 @@ findings at zero, vitest on 4.x.
    `@vitest/mocker`, `esbuild` and `vite-node` moderates as a side effect, but
    **five moderates survive every planned fix** — web's `react-router` and
    `react-router-dom`, agent's `@hono/node-server`, `@modelcontextprotocol/sdk` and
-   `hono`. All five report `fixAvailable: true` (in-range, no major), so clearing
-   them is *possible*; it is not what the PRD specifies, and widening scope to do it
-   is a decision to surface, not to take. **"At zero" means high-and-above at zero.**
+   `hono`. **"At zero" means high-and-above at zero.**
+
+   **🔴 AMENDMENT 2, 2026-08-04 — THE SENTENCE THAT USED TO END THIS NOTE WAS MINE
+   AND WAS WRONG.** It read: *"All five report `fixAvailable: true` (in-range, no
+   major), so clearing them is possible; it is not what the PRD specifies, and
+   widening scope to do it is a decision to surface, not to take."* For web's two
+   that is **false**, and it is exactly the half a reader prices the scope decision
+   from:
+
+   - both `react-router` advisories carry range **`6.0.0 - 7.17.0`**, and the latest
+     published 6.x is **`6.30.4`** — the whole 6.x line sits inside the range, so
+     **no patched 6.x exists**;
+   - `react-router-dom` is declared `^6.28.0` under **`dependencies`** — the SPA's
+     runtime router, not a dev tool;
+   - `npm audit fix --force --dry-run` proposes vitest and postcss and **contains no
+     react-router line at all**. It will not attempt it.
+
+   So clearing web's two is a **React Router 6 → 7.18+/8 major migration of shipped
+   runtime code**. `fixAvailable: true` is npm's flag meaning *a fixed version
+   exists somewhere*, **not** *`npm audit fix` will do it*. Agent's three do clear,
+   but via `@hono/node-server 1.19.14 → 2.1.0` — a transitive **major** landing in
+   the worker's MCP transport under the exact-pinned
+   `@anthropic-ai/claude-agent-sdk@0.3.219`. "No major" was wrong there too.
+
+   **Act on this instead:** web's two react-router moderates cannot be cleared
+   without a runtime router major and are **out of scope**. Agent's three clear with
+   `npm audit fix --package-lock-only` (measured: agent to **total=0**,
+   `package.json` unchanged, 5 lockfile bumps, **0 new package names**) but cross a
+   major under the pinned SDK and **owe test evidence**.
 2. **`govulncheck`'s called vulns are BUMPED here, not filed.** *(Vacuously satisfied
    today — there are none. Do not read that as licence to skip the gate.)*
 3. **The vitest 2.x → 4.x major is IN.** Raised as a concern and reaffirmed.
@@ -236,9 +277,52 @@ findings at zero, vitest on 4.x.
 - **Zero `.gate_needs` / `.publish_needs` edits** — and *verify that by parsing,
   not by grepping* (carry-forward 2 and 7: this repo lost a chart object for days
   to a grep that found `kind:` in a merged document).
-- **Neither may enter `task gate` or any `gate:*`.** They make network calls and a
+- **Neither may enter `task gate` or any `gate:*`** — but **BOTH GET THEIR OWN
+  `Taskfile.yml` TARGETS, AND CI CALLS THOSE TARGETS.**
+
+  *(Amendment 2, 2026-08-04. This bullet used to end "They make network calls and a
   contributor's gate stays offline — the same reason carry-forward 6 bans a bare
-  `npx`.
+  `npx`." **The stated reason is false and the omission was a real design gap.**)*
+
+  **The false half, measured on the pinned tree:** `task gate` is **not** offline
+  today. On a cold module cache it needs the network **three times over** —
+  golangci-lint, deadcode and gitleaks are all `go run pkg@version`. Control:
+  `task scan:secrets` with `GOPROXY=off` returns 201 with *"module lookup disabled
+  by GOPROXY=off"* and the script's own instrument-failure branch firing, while the
+  same target on the same tree with a warm cache returns 0 with both canaries
+  printed. **The true property is that the gate's VERDICT must not depend on a
+  network call** — a pinned `go run` fetches a checksum-verified artifact once and
+  then answers from the tree; these two query a mutable oracle on every run. State
+  the true property: the false one invites someone to "fix" gitleaks out of
+  `gate:repo`.
+
+  **The gap: as briefed, Unit A violates Success Criterion 1**, which reads *"CI runs
+  no toolchain check that `task gate` does not"* and carries an explicit exclusion
+  list (`prds/103-dev-loop-quality-gates.md:1999-2007`) that names four kaniko
+  builds, `helm_chart`, the sqlc-drift diff, `test:api-store-it` and
+  `e2e:kind-smoke` — and **not** these two. They are toolchain checks (go, npm) in
+  per-toolchain jobs. M5 avoided this by putting gitleaks *inside* `task gate`.
+
+  **RULING (lead, 2026-08-04), and it is the shape that satisfies both constraints:**
+
+  1. Define `audit:deps:api`, `audit:deps:controller`, `audit:deps:web`,
+     `audit:deps:agent` (name them as you see fit) in `Taskfile.yml`, plus an
+     `audit:deps` composite. **CI invokes those targets, never a hand-typed command
+     line.** That is what Success Criterion 1 exists to buy — local and CI cannot
+     drift apart — and Success Criterion 3 requires it outright: gate recipes are
+     defined once, in `Taskfile.yml`.
+  2. **Do NOT add them to `gate`/`gate:*`.** A contributor's gate must be
+     deterministic against the tree; a target whose verdict is a function of a
+     remote mutable database makes `task gate` answer differently on two runs of one
+     commit.
+  3. **Amend Success Criterion 1's exclusion list in the same MR**, adding these two
+     with the reason stated as *the verdict is a function of a remote mutable
+     database, not of the tree* — which is a different and more honest exclusion
+     ground than the existing list's "cannot run meaningfully from a plain local
+     checkout". Both tools run fine locally; that is not why they are excluded.
+
+  A criterion this PRD wrote and then quietly violates is worse than one it amends
+  on the record. Amend it.
 
 ### Three findings that change the implementation, measured during M5 and not to be re-derived
 
@@ -252,12 +336,45 @@ findings at zero, vitest on 4.x.
   repo's "there are findings" code. Use `go install …@vX` into a temp GOBIN: keeps
   the pin *and* the discrimination. *(My baseline above used `go run` deliberately —
   I wanted counts, and rc=0 is unambiguous either way. The gate needs the codes.)*
-- **`govulncheck -format json` always exits 0**, even with called vulns present, and
-  the mechanism is stronger than "observed": `errVulnerabilitiesFound` has **exactly
-  one return site**, in the text formatter, so JSON *cannot* produce it. The source
-  comment says so outright: *"This returns exit status 3 when running without the
-  -json flag."* A wrapper reading a JSON run's status is permanently green — the
-  fail-open shape, and the natural thing to write if you reach for JSON to count.
+- **EVERY NON-TEXT FORMAT FAILS OPEN, not just json.** *(Amendment 2: this said
+  "`-format json` always exits 0". True and too narrow.)* Measured against a fixture
+  with a genuinely CALLED vuln (`golang.org/x/text@v0.3.0` → `language.Parse`,
+  GO-2021-0113), installed binary v1.1.4: `text` → **rc=3**; `-format json`,
+  `-json`, **`-format sarif`** and **`-format openvex`** → **rc=0, all four**. So a
+  wrapper reaching for sarif to feed GitLab's security dashboard is permanently
+  green. The mechanism explains all of them: `errVulnerabilitiesFound` has exactly
+  one return site, in the **text** formatter, and its source comment says so —
+  *"This returns exit status 3 when running without the -json flag."*
+- **🔴 GOVULNCHECK'S EXIT CODES ARE INVERTED AGAINST THIS REPO'S CONVENTION. MAP
+  THEM, DO NOT PASS THEM THROUGH.** This repo uses **2 = instrument broken**,
+  **1 = there are findings** (`fmt-check:api`, `scripts/deadcode-gate.sh`, the
+  golangci-lint pre-flight). govulncheck uses **3 = findings**, **1 = its own
+  error**. And a DB outage lands in govulncheck's `1`: measured,
+  `-db http://127.0.0.1:1` → **rc=1**, the same code as "no packages matched" and
+  "outside a module". So the wrapper must map **govulncheck 3 → repo 1** and
+  **govulncheck 1 → repo 2**. Getting it backwards reports a `vuln.go.dev` outage as
+  *"there are findings"*, which is the loud-but-misleading shape carry-forward 3
+  names.
+- **Two positives worth banking so nobody spends design time on them.**
+  `GOVULNDB=http://127.0.0.1:1` is **ignored** (rc=3, vuln still found) — only the
+  `-db` flag works, and a flag is visible in `Taskfile.yml`, so the environment-
+  variable hijack that forced `scan-secrets.sh` to *refuse* `GITLEAKS_CONFIG` has no
+  analogue here. And govulncheck caches nothing under the project dir, so it neither
+  enters gitleaks' walk nor forces a cache-key decision.
+- **govulncheck has NO suppression, baseline or allowlist mechanism** — `-h` at
+  v1.1.4 offers only `-C -db -format -mode -scan -show -tags -test`. Every other
+  gate here has an escape (golangci-lint ratchets, deadcode has a committed
+  baseline, knip stages severity, gitleaks has allow markers). Under ruling 4 (no
+  `allow_failure`) that means a future called vuln with no fix is an unremediable
+  red: **api already carries `GO-2026-5932` (`golang.org/x/crypto@v0.53.0`) with
+  `Fixed in: N/A`**, uncalled today. Cheap derisk available now: `GO-2026-5942`
+  (`x/net@v0.55.0`, fixed in v0.56.0) is uncalled in both modules — bump it and
+  remove one future tripwire.
+- **`govulncheck -test` defaults to `false`, the opposite of this repo's deadcode
+  convention** (`scripts/deadcode-gate.sh` runs `deadcode -test`), so a reader will
+  assume symmetry. It excludes 293 api and 10 controller test files from the call
+  graph. Enabling it changes nothing today (still 0/0/2 and 0/0/1). **Say which you
+  chose and why** — this is a scope decision to write down, not a live gap.
 - **A version BUMP of a devDependency fails SILENTLY, unlike a new one.** Carry-forward
   12 is about a *new* dep: `npm run` puts `node_modules/.bin` on PATH and fails
   closed with `command not found`. A bump cannot fire that — the binary is already
@@ -267,6 +384,111 @@ findings at zero, vitest on 4.x.
   a lockfile-versus-`node_modules` staleness check, or a `vitest --version`
   assertion in the gate. **Design this deliberately; it is the one genuinely open
   design question in Unit A.**
+
+### Amendment 2 — five more things Unit A must handle, all measured in the design wave
+
+**A2-1. 🔴 A ONE-FILE `.npmrc` IN THE SAME MR DISARMS THE WHOLE WEB npm-audit GATE,
+AT EXIT 0.** This is the `.gitleaks.toml` shape M5 spent a milestone closing,
+reappearing in a tool that has no canary. All three of web's high-and-above are
+`dev=true` (`vitest`, `vite`, `postcss` — lockfile-verified), so:
+
+```
+no .npmrc                    rc=1   <- armed
+.npmrc:  omit=dev            rc=0   <- DISARMED, prints "found 0 vulnerabilities"
+.npmrc:  audit-level=none    rc=1   <- CLI --audit-level wins for THAT key
+```
+
+`--audit-level` on the command line does beat `.npmrc`, but **`omit` is a different
+key**, so nothing on the command line contradicts it. There is no `.npmrc` anywhere
+today (root, `web/`, `agent/`, `~`), so this is an *add*, not an edit, and it would
+appear in the diff — but nothing fails.
+
+**Remedy, measured to work: put `--include=dev` (or `--omit=`) on the gate command**;
+rc goes 0 → 1 again under both the `omit=dev` and `omit[]=dev` spellings. Keep the
+severity on the command line too, never in `.npmrc`. And **`web/.npmrc` and
+`agent/.npmrc` join the gate-config file list** that reviewers watch.
+
+**A non-remedy, checked and retracted inside the auditor's own probe**:
+`metadata.dependencies` is byte-identical (515/403) armed and disarmed, so it cannot
+serve as an in-band canary. **npm audit has no in-band positive observation that
+separates an armed run from an omit-disarmed one.** That is why A2-2 matters.
+
+**A2-2. `npm audit`'s rc=1 is AMBIGUOUS and one branch is a network failure.**
+Registry unreachable → **rc=1** with `npm error audit endpoint returned an error`;
+findings → **rc=1**. Same with `--json`. It fails closed, which is right, but it
+collapses the two states the Go half is being carefully engineered to separate. The
+wrapper must read the output (or `--json`'s `error` object) and **exit 2** on the
+network branch. A typo'd level fails closed loudly (`npm warn invalid config`), so
+`--audit-level=none` is the only silent hole and A2-1's remedy is what closes it.
+
+**A2-3. DO AGENT FIRST — the fix ordering is inverted relative to shipped exposure.**
+web's three high-and-above are **all dev-only**: build-time, not in the web image's
+runtime. agent's two are **production dependencies that ship in the worker image**,
+both reached via `@anthropic-ai/claude-agent-sdk` → `@modelcontextprotocol/sdk`, and
+both are trust-boundary code — `GHSA-mwp4-54f8-5fhr` is *"leading-zero octets
+decoded as decimal … allowing SSRF and trust-boundary bypass"*, `GHSA-v2hh-gcrm-f6hx`
+is *"host confusion via literal backslash authority delimiter"*. This repo runs an
+https-only SSRF allowlist as a named control, so that class is not theoretical here.
+**No reachable call path was traced, so this is not a claim of exploitability** — the
+argument is shipped-versus-not, which is measured. The agent fix is nearly free
+(total=0, no `package.json` change, 0 new package names) and **does not depend on the
+vitest major landing**, so it is a one-commit derisk that can go first.
+
+**A2-4. THE VITEST-4 SUPPLY DELTA, AND THE ONE ITEM A VERSION NUMBER DOES NOT TELL
+YOU.** Resolved with `npm install --package-lock-only --ignore-scripts` in scratch:
+**454 → 450** distinct packages, **4 new, 8 removed, 39 version-changed**. Three of
+the four new are unremarkable (`@types/chai`, `@types/deep-eql`,
+`@standard-schema/spec`). The fourth is not: **`obug@2.1.4`, npm-created 2025-11-11,
+single maintainer, pulled DIRECTLY by `vitest` at `^2.1.1`** — a roughly nine-month-old
+single-maintainer package becoming a direct dependency of the test runner, on a caret
+range, so future minors flow in on any lockfile refresh. The MR owes: its publish
+provenance; explicit acknowledgement that **five further majors ride along**
+(`chai 5→6`, `tinyrainbow 1→3`, `std-env 3→4`, `es-module-lexer 1→2`,
+`tinyexec 0.3→1`); whether any of the 39 changed packages gained an install script
+(the `agent-browser` class — the lockfile records `hasInstallScript`); and that the
+lockfile came from an **explicit pin**, never from `npm audit fix --force`.
+
+Two facts that remove worries rather than add them: **the vitest major does not force
+a vite major** (vitest@4.1.10 wants `vite ^6 || ^7 || ^8`, web declares `^6.0.5` and
+has 6.4.3 installed — the flagged `vite <=6.4.2` is the *nested* 5.4.21 under vitest
+2), and its engines are `^20 || ^22 || >=24`, so `node:22-alpine` is fine. But
+**vitest@4.1.10 alone leaves web at high=1 (`postcss`) plus moderates**, so the major
+does not satisfy ruling 1 on its own — postcss 8.5.23/24/25 are inside `^8.4.49` and
+land lockfile-only.
+
+**A2-5. THE OPEN DESIGN QUESTION IS ANSWERED: USE `npm ls`.** The brief floated a
+lockfile-versus-`node_modules` staleness check *or* a `vitest --version` assertion,
+and did not choose. Measured on the real git-pull shape (v1 installed;
+`package.json` + lockfile replaced from a separate resolve; hidden lockfile
+untouched):
+
+```
+npm ls <pkg>       rc=1   'ms@1.0.0 invalid: "2.1.3" from the root project'   <- THE DETECTOR
+npm ci --dry-run   rc=0   says "change ms 1.0.0 => 2.1.3" in its OUTPUT only
+npm audit          rc=0   structurally blind — it reads the lockfile
+npm outdated       rc=0
+```
+
+`npm ls` exits **1** with a **positive observation naming both versions**, needs no
+new dependency, is offline, and covers **every** dependency rather than the one bump
+you remembered — strictly better than the `vitest --version` assertion. **Where it
+lies:** in the *other* stale shape, `npm install --package-lock-only` run in place
+(which also rewrites `node_modules/.package-lock.json`), `npm ls` returns **rc=0 and
+prints `2.1.3` while `node_modules/ms/package.json` says `1.0.0`** — confidently
+wrong. A git pull cannot produce that state, but **someone testing this will**. Also
+measured: CI is not exposed (`npm ci` restores), and `npm ci` itself fails loudly
+(rc=1, `EUSAGE`) on a `package.json`/lockfile mismatch.
+
+**A2-6. THE CALIBRATION PROBE ALREADY EXISTS — DO NOT MUTATE `api/go.mod` TO BUILD
+ONE.** Both modules are at 0 called, so nothing in this repo can redden the
+govulncheck gate. The reviewer built a throwaway module on
+`golang.org/x/text@v0.3.5` calling `language.Parse` that settles all three exit-code
+claims at once: **binary rc=3, `go run` rc=1, `-format json` rc=0**. Two further arms
+confirm what the `go install` route buys: unreachable DB → binary rc=1, unparseable
+Go file → binary rc=1, both flattened to 1 under `go run`. Reuse it. **Note for
+calibration property 3**: the unparseable-file arm prints **absolute** paths, so the
+repo-root-relative check applies to *finding* lines, not to govulncheck's loader
+errors.
 
 ### `node_modules` in THIS worktree — the standing hazard does NOT apply, and check before you trust that
 
@@ -326,6 +548,48 @@ postinstall runs anyway.**
 - **Calibration**: confirm the coverage number MOVES when a test is deleted, and
   that the GitLab regex picks it up on the MR. A coverage job reporting nothing
   looks identical to one reporting a stable number.
+
+### Amendment 2 — four measured facts Unit B should start from
+
+**B2-1. 🔴 ADDING `@vitest/coverage-v8` REDDENS M4's `deadcode:web` GATE, AND THE FIX
+IS A CONFIG DECLARATION RATHER THAN AN IGNORE ENTRY.** `web/knip.jsonc` sets
+`"devDependencies": "error"`, which is a *gating* tier. Three-arm control, restored
+and `git status`-verified:
+
+```
+arm 0  baseline                                    rc=0   22 warn findings
+arm 1  dep added, no coverage config               rc=1   "Unused devDependencies (1)
+                                                           @vitest/coverage-v8  package.json:39:6"
+arm 2  arm 1 + coverage: { provider: "v8" } in
+       vite.config.ts's test: block                rc=0   zero mentions
+```
+
+All four calibration properties hold on arm 1 (nonzero exit, tool name in output,
+repo-root-relative path, green-on-restore by VCS). **Declare the provider in
+`vite.config.ts`; do not reach for `ignoreDependencies`** — the declaration is what
+makes knip's finding genuinely false, the ignore entry just silences a true one.
+
+**B2-2. `-race` ON `controller` IS GREEN — Decision 3's `allow_failure` escape hatch
+is not needed.** `go test -race -count=1 ./...` in `controller/` → rc=0, 6 packages
+ok, no `WARNING: DATA RACE`, no FAIL. **Caveat that keeps this honest**: one run, on
+darwin/arm64. CI is linux/amd64 under contention and race detection is probabilistic,
+so this **de-risks rather than settles**. The "if the first run is red, STOP" branch
+above stays live; it is now unlikely rather than expected.
+
+**B2-3. `.gitignore` carries `coverage.out` and nothing else coverage-shaped** — no
+`web/coverage/`, no lcov pattern. vitest's default reporters write to
+`web/coverage/`, so either pick text-only reporters or add the entry. Note
+`scan:secrets` is scoped to **tracked** files, so the gitleaks exposure M5's handover
+flagged for `web/dist` does **not** apply to a coverage directory.
+
+**B2-4. Parsed, not grepped: there is no `coverage:` key and no
+`artifacts:reports:coverage_report` anywhere in `.gitlab-ci.yml` today.** M6 adds the
+first of each.
+
+**And a counter-example to Hard constraint 2 that a reader will hit**: `e2e:kind-smoke`
+is in **neither** `.gate_needs` nor `.publish_needs`. Pre-existing and out of scope —
+recorded here so that the amended "ANY new CI job" reads as a rule with a known
+standing exception rather than as a rule already being broken.
 
 ---
 
@@ -415,6 +679,59 @@ For these two units:
 
 ---
 
+## Documentation this work must correct, in its own MR (fix-the-doc)
+
+**D1. 🔴 SUCCESS CRITERION 5 DOES NOT SAY WHAT FIVE DOCUMENTS CLAIM IT SAYS, AND ITS
+LITERAL PREDICATE IS ALREADY MET.** Verbatim at
+`prds/103-dev-loop-quality-gates.md:2059-2060`:
+
+> `.claude/agents/auditor.md` no longer documents the absence of a secret scanner,
+> because one runs.
+
+Whitespace-flattened, the entire 74-line Success Criteria section contains **zero**
+occurrences of `gitleaks`, `govulncheck` or `npm audit`; `secret scanner` appears
+**once**. Control on the same instrument, same section: `gofmt` 2, `shellcheck` 2,
+`knip` 2, `coverage` 2 — it is live, it simply has nothing to find. And the criterion's
+own predicate is satisfied: `.claude/agents/auditor.md:116` reads *"secrets are
+covered as of PRD #103 M5 MR-B"*.
+
+Yet *"Success Criterion 5 is atomic across gitleaks AND govulncheck AND npm audit"*
+appears in **five places** — `.claude/agents/auditor.md:124-126`,
+`.claude/agent-team-tasks/prd-103-m5.md:243` and `:1072`,
+`prds/103-dev-loop-quality-gates.md:4` and `:1804-1805` — **and in this brief**. It
+is the stated reason M5 has stayed unticked.
+
+**The decision it produced is right and its stated ground is not.** The real residual
+is visible one line further on in the same file: `auditor.md` now documents the
+absence of *dependency-vulnerability* scanning. That is a genuine gap and it is
+exactly what Unit A closes.
+
+**Ruling: amend Success Criterion 5's TEXT to name all three tools**, making the
+five restatements true, rather than amending five restatements to match a criterion
+that has already been satisfied. Cheapest honest fix, and it keeps the record
+consistent with what everyone has been reasoning from.
+
+*(Recorded with its own instrument failure, because the auditor caught and corrected
+it in place: a first pass reported `secret scanner: 0`, an artifact of the phrase
+being line-wrapped in the source. **A line-oriented grep cannot see a wrapped
+phrase** — hence the flatten above.)*
+
+**D2. Two PRD sentences Unit A falsifies.**
+- `prds/…:1877-1878` — *"`govulncheck` … and `npm audit --audit-level=high` …
+  initially **`allow_failure` only** until the current finding count is known."*
+  Overridden by user ruling 4; the finding counts are now known. Stale.
+- `prds/…:349-350` — *"Its checks (`shellcheck`, `yamllint`, `gitleaks`,
+  `govulncheck`) are **repo-wide**, so … they genuinely cannot fold into a
+  per-toolchain `validate:*` job."* **govulncheck is per-Go-module, not repo-wide.**
+  The brief's placement is right and this sentence is wrong; it is the one a future
+  reader would follow into opening two needless jobs.
+
+**D3. Success Criterion 1's exclusion list** gains govulncheck and npm audit, with
+the reason stated as *verdict is a function of a remote mutable database* — see the
+RULING in Unit A's Placement section.
+
+---
+
 ## Amendment 1 — 2026-08-04, from the fact-checker's design-wave pass
 
 **Landed while the architect, reviewer and auditor were still reading `848cf53d`.**
@@ -449,3 +766,55 @@ source's rationale (pin the version, leave `go.mod` untouched, stay inside the
 already-pinned image) carries over to `go install` unchanged.
 
 **Nothing in the brief was found unverifiable.**
+
+---
+
+## Amendment 2 — 2026-08-04, from the reviewer's and auditor's design-wave passes
+
+Both worked in **detached worktrees of `848cf53d`**, never in the shared tree. Both
+re-derived all four of my day-one figures independently; **all four reproduced
+exactly, for the third and fourth time**. Every mechanism the brief asserts resolved
+to a file, in two independent citation tables that agree.
+
+**TWO OF THE FOUR CORRECTIONS ARE TO AMENDMENT 1, AND BOTH ARE MINE.** Amendment 1
+was written to record a *widening* finding, and introduced two of its own in the act
+of restating someone else's measurement — which is carry-forward 16(d) exactly, at
+the site the rule warns about (the fast-read paraphrase at the top of a section)
+rather than at the original measurement:
+
+- **the react-router claim** — the fact-checker said the five moderates are ones "no
+  planned fix touches", which is true. **I added "in-range, no major, so clearing
+  them is possible."** That is false for web's two and it is the half a reader prices
+  the scope decision from.
+- **the jsdom proof** — the fact-checker gave a structural argument. **I promoted a
+  green suite to "a proof that no DOM test is among them."** The conclusion survives;
+  the argument does not, because a guarded helper passes vacuously under node.
+
+Recorded in full rather than quietly fixed: the failure was not in the measurement,
+it was in the step where one agent's careful result passes through a lead on the way
+to being read fast.
+
+| | where | change |
+|---|---|---|
+| **B1** | Unit A ruling 1 | react-router: no patched 6.x exists, `react-router-dom` is a runtime dependency, `--force` will not touch it. Out of scope, stated as such. |
+| **B2** | jsdom section | the green-suite proof does not carry; the structural argument (0 `.tsx`, 0 `@testing-library/react`) does. |
+| **F2** | Placement | **Unit A as briefed violates Success Criterion 1.** Ruled: own Taskfile targets that CI calls, kept out of `gate`/`gate:*`, and SC1's exclusion list amended in the same MR. |
+| **F1** | A2-1 | a one-file `.npmrc` with `omit=dev` disarms the web gate at exit 0. Remedy `--include=dev`, measured. npm audit has **no** in-band canary. |
+| **F3** | Unit A findings | fail-open is **every non-text format** (json, sarif, openvex), and govulncheck's exit codes are **inverted** against this repo's 2/1 convention. Map them. |
+| **F5** | Placement | *"a contributor's gate stays offline"* is **false** — `task gate` needs the network three times on a cold cache. The true property is about the **verdict**. |
+| **F6** | A2-3 | agent's two high are **production** deps shipping in the worker image; web's three are dev-only. Do agent first. |
+| **F7** | A2-4 | vitest 4 supply delta: 4 new / 8 removed / 39 changed, five further majors riding along, and `obug@2.1.4` as a new direct dep of vitest. |
+| **F8** | A2-5 | the open design question is answered: **`npm ls`**, offline, positive observation, covers every dep. |
+| **#2** | Unit B | `@vitest/coverage-v8` **reddens `deadcode:web`** unless the provider is declared in `vite.config.ts`. Three-arm control. |
+| **#9** | Unit B | `-race` on controller is **green** — one run, darwin/arm64, de-risks rather than settles. |
+| **B1(aud)** | D1 | Success Criterion 5 does not name the three tools and its literal predicate is already met. Amend the criterion, not the five restatements. |
+| **B6** | D2 | two PRD sentences Unit A falsifies. |
+
+**One claim of mine downgraded rather than refuted**: *"the text output hides the only
+critical"* overstates by a notch — the tally line does read `1 critical`. What it
+hides is **which package**. So `--json` is needed for the **fix list**, not for
+gating; the exit code alone gates.
+
+**Design wave verdict: the spec is now settled enough to freeze.** Three independent
+citation passes, no unresolved mechanism, and every open design question answered
+with a measurement rather than a preference.
