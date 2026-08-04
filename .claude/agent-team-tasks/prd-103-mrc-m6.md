@@ -2071,3 +2071,50 @@ B's file scope (`web/`, `Taskfile.yml`, `.gitlab-ci.yml`, `.gitignore`), and the
 coder is mid-census. One writer per file, two writers in the worktree, no overlap —
 the same shape as this session's doc commits. NB-2 and NB-3 are the two that fall
 inside the coder's scope and are the two deferred.
+
+## Amendment 10, addendum — the reviewer closed a gap in my calibration
+
+**Measured by the reviewer, `probes/prd-103-mrc-b-reviewer/p7-post-fix-verification.txt`.**
+
+`fix-calibration.txt` covers B-1, B-3, NB-1 and NB-4; `b2-verify.txt` covers B-2's
+**clean** arm on both modules. **Neither covered the FINDINGS arm under the newly
+added `-show verbose`**, and Amendment 10 justified that with *"a display flag
+cannot weaken the gate"* — a reasoned claim, not a measured one.
+
+**The prior there is not neutral, and that is the part worth keeping.**
+`scripts/govulncheck-gate.sh`'s own header, forty lines above the line I changed,
+records a near neighbour that does exactly what I said could not happen:
+`-format json`, `-json`, `-format sarif` and `-format openvex` **all take rc from 3
+to 0 with a called vulnerability present**, because `errVulnerabilitiesFound` has
+one return site and it is in the text formatter. A flag that changes output shape
+taking this gate green is the documented behaviour of this tool, one flag over — so
+"a display flag cannot weaken it" was an assertion made in the teeth of a
+counter-example the file itself carries.
+
+Measured on the fixture that header names (a module genuinely calling
+`golang.org/x/text@v0.3.5`'s `language.Parse`, GO-2021-0113):
+
+```
+-test=false ./...                      rc=3      (pre-fix form)
+-test=false -show verbose ./...        rc=3      (shipped form)
+the shipped script, end to end         rc=1      "CALLED vulnerabilities (exit 3 -> gate exit 1)"
+control, dependency-free module        rc=0
+```
+
+**The claim holds and is now measured.** The 1/0 pair is what discriminates; the
+rc=3 pair alone would not have shown the gate's own mapping still fires.
+
+**NB-5 was re-tested against the ORIGINAL vector rather than against my new
+mechanism**, which is the right instinct given the fix took a different shape than
+the report proposed: `GOENV=<file containing GOFLAGS=-tags=skipme>` with `GOFLAGS`
+unset → rc=2, *"the effective GOFLAGS contains -tags. Refused."*; control with
+`GOENV` pointing at an **empty** file → rc=0, clean. So the refusal keys on the
+file's CONTENT rather than on `GOENV` being set at all — which is the false positive
+a blanket `GOENV` refusal would have had, and is the argument for `go env GOFLAGS`
+over the refusal the report proposed.
+
+**The lead-side lesson, since this is the second time in one session:** I asserted a
+mechanism instead of measuring it, in a file whose header documents the
+counter-example. Amendment 9's own closing note says not to trust a sentence in this
+brief that is not attached to a named measurement. That applies to the sentences I
+write here as much as to the ones I inherit.
