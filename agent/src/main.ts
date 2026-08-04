@@ -202,6 +202,14 @@ async function main(): Promise<void> {
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       log.info("shutting down", { signal: sig });
+      // PRD #218 M1: trigger the run lane's graceful shutdown FIRST — it marks every
+      // in-flight run and aborts its controller so each fetches its committed work back
+      // into the worker bare as it unwinds (the sweeper then requeues a run whose tree
+      // is safe). shutdown() does no git and is synchronous; the fetch-backs run inside
+      // the unwinding execute()s, which the claim-loop drain — gated by `worker.run`
+      // below — waits for within the container's termination grace. controller.abort()
+      // then unblocks the loops as today.
+      runner.shutdown();
       controller.abort();
     });
   }

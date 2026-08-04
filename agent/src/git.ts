@@ -132,16 +132,22 @@ export interface RunnerClone {
   /** Branch the runner clone is on — `agent/issue-{iid}`, `ci-fix/…`, or `uzi/…`. */
   branch: string;
   /** How many commits the seeded branch already carries that the default branch does
-   *  not — i.e. work a PREVIOUS run (or a human) pushed to this branch, which the
-   *  clone was based off. 0 when seeded off the default branch, and 0 when the count
-   *  could not be taken (best-effort: this is prompt colour, never load-bearing).
+   *  not. 0 when seeded off the default branch, and 0 when the count could not be
+   *  taken (best-effort: this is prompt/feed colour, never load-bearing).
    *
-   *  NOT "the commits the interrupted attempt made": a run pushes exactly once, after
-   *  the executor returns (runner.ts), and this seed `fs.rm`s and re-clones — so an
-   *  attempt requeued mid-flight left NOTHING behind. What lands here is prior
-   *  PUSHED work: an earlier completed run on the same issue, the self_improve fixed
-   *  branch's previous cycles, or a human's commits. Issue #105 uses it to warn the
-   *  lead off redoing work it can no longer remember doing. */
+   *  WHAT IT COUNTS DEPENDS ON `seededFrom`, and PRD #218 made that split load-bearing:
+   *   - `"origin"`  — prior PUSHED work the clone was based off: an earlier completed
+   *     run on the same issue, the self_improve fixed branch's previous cycles, or a
+   *     human's commits. This is the original contract (issue #105): a run pushes
+   *     exactly once, after the executor returns, and a fresh seed `fs.rm`s and
+   *     re-clones, so a fresh claim never sees THIS attempt's commits here.
+   *   - `"tracking"` — the commits RECOVERED from the interrupted attempt's own work,
+   *     read back from `refs/uzi-runner/<branch>` (PRD #218 M2). This INVERTS the
+   *     original "NOT the commits the interrupted attempt made" wording on purpose:
+   *     on the tracking-ref leg the interrupted attempt's commits are exactly what the
+   *     fetch-back preserved and the reseed is recovering, and M3 turns this number
+   *     into a lead-facing "recovered N commit(s)" status.
+   *   - `"default"` — 0 (the seed IS the default tip). */
   priorCommits: number;
   /** The commit the branch was checked out AT, resolved off the fresh remote-tracking ref
    *  in the bare (`refs/remotes/origin/*`, which every fetch updates) WHERE ONE EXISTS: the
@@ -188,6 +194,13 @@ export interface RunnerClone {
    *  Best-effort, exactly like priorCommits: a repo with no resolvable default branch
    *  yields undefined and the prompt says less rather than saying something false. */
   defaultBranchCommit?: string;
+  /** Which leg of the reseed resolved the base (PRD #218 M2). `"origin"` when the
+   *  branch already existed at origin, `"tracking"` when the base came from the
+   *  worker-side tracking ref `refs/uzi-runner/<branch>` (the interrupted attempt's
+   *  recovered work), `"default"` when neither applied and the seed is the default
+   *  tip. Read by the runner to decide what M3's feed status says: `"tracking"` names
+   *  the recovered commit count, `"default"` on a RESUME admits the tree was lost. */
+  seededFrom: "origin" | "tracking" | "default";
 }
 
 /**
@@ -303,19 +316,38 @@ export class GitCache {
    * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
    * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachRunnerClone(barePath: string, issueIid: number): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`);
+  async createOrAttachRunnerClone(barePath: string, issueIid: number, resume = false): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, resume);
   }
 
   /**
    * Seed a RUNNER CLONE for an EXPLICIT branch — the PRD #6 ci_fix targets (a fresh
    * `ci-fix/pipeline-{id}` off the default branch, or an existing `agent/issue-{iid}`
-   * run branch, updating its MR) and the PRD #46 self_improve branch. Resume vs fresh
-   * is decided by whether the branch exists at origin (refs/remotes/origin/<branch>
-   * in the bare): existing ⇒ base off that fresh tip; absent ⇒ base off the default.
+   * run branch, updating its MR) and the PRD #46 self_improve branch.
    * `key` names the on-disk clone dir (branch names carry `/`, so callers pass a
    * filesystem-safe key). The cross-kind same-branch exclusion (server-side) plus the
    * per-run clone dir means a stale dir is simply removed and recloned.
+   *
+   * Base resolution (PRD #218 M2). Three candidates: `refs/remotes/origin/<branch>`
+   * (pushed work), the worker-side tracking ref `refs/uzi-runner/<branch>` (the
+   * interrupted attempt's fetched-back work), and the default branch.
+   *   - `resume` FALSE (a fresh claim): unchanged and the tracking ref is IGNORED
+   *     entirely — origin/<branch> if it exists, else the default. A fresh run must
+   *     never inherit a stale tracking ref a permanently-dead run left behind (that
+   *     would reintroduce issue #105's silent redo through this very fix), so the
+   *     WHOLE tracking-ref consideration is gated on the claim being a resume.
+   *   - `resume` TRUE, origin AND tracking both exist: the tracking ref ONLY when
+   *     `merge-base --is-ancestor origin <tracking>` holds (it strictly descends from
+   *     origin); on divergence, origin — another worker pushed and silently preferring
+   *     local work would drop a published commit.
+   *   - `resume` TRUE, tracking exists but no origin branch (the first-park case): the
+   *     tracking ref, with NO ancestry test — there is no competing published work to
+   *     protect and the current default tip is not a meaningful reference (it may have
+   *     moved far past the fork point, which is exactly the case a uniform ancestor
+   *     test discards the recovered work on).
+   *   - otherwise: origin/<branch> if it exists, else the default.
+   * The git layer is claim-agnostic: `resume` is a plain boolean the runner threads
+   * from `claim.session_id != null`; nothing here knows about sessions.
    *
    * The seed is a LOCAL `clone --shared` from the worker bare: fast (objects are
    * referenced read-only from the bare via the clone's objects/info/alternates — the
@@ -325,7 +357,7 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    */
-  async runnerCloneForBranch(barePath: string, branch: string, key: string): Promise<RunnerClone> {
+  async runnerCloneForBranch(barePath: string, branch: string, key: string, resume = false): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
@@ -337,22 +369,48 @@ export class GitCache {
       // member) can then create its clone here. Single-uid (#58): plain worker dir.
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
 
-      // Resolve the base commit in the BARE (authoritative). A branch already at
-      // origin (fetched into refs/remotes/origin/<branch>) => resume off its fresh
-      // tip; otherwise off the fresh default branch.
+      // Resolve the base commit in the BARE (authoritative), per the PRD #218 M2 table
+      // documented above. All three candidate refs live in the bare (the clone does not
+      // necessarily carry the default branch), so the resolution happens here.
       const originRef = `refs/remotes/origin/${branch}`;
-      const resume = await this.refExists(barePath, originRef);
-      const baseRef = resume ? originRef : await this.defaultBranchRef(barePath);
+      const trackingRef = runnerTrackingRef(branch);
+      const originExists = await this.refExists(barePath, originRef);
+      // The tracking ref is consulted ONLY on a resume (gating the whole consideration —
+      // see the doc comment for why a fresh claim must ignore it).
+      const trackingExists = resume && (await this.refExists(barePath, trackingRef));
+
+      let baseRef: string;
+      let seededFrom: RunnerClone["seededFrom"];
+      if (trackingExists && originExists) {
+        // Both present: prefer the recovered local work ONLY when it strictly descends
+        // from origin; on divergence origin wins so a published commit is never dropped.
+        const descends = await this.isAncestor(barePath, originRef, trackingRef);
+        baseRef = descends ? trackingRef : originRef;
+        seededFrom = descends ? "tracking" : "origin";
+      } else if (trackingExists) {
+        // First park: recovered work with no competing published branch — no ancestry
+        // test, because the current default tip is not a meaningful reference here.
+        baseRef = trackingRef;
+        seededFrom = "tracking";
+      } else if (originExists) {
+        baseRef = originRef;
+        seededFrom = "origin";
+      } else {
+        baseRef = await this.defaultBranchRef(barePath);
+        seededFrom = "default";
+      }
       const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
-      // How much prior pushed work the seed carries (issue #105). Counted in the BARE,
-      // which holds both refs; the clone does not necessarily have the default branch.
-      // Best-effort by construction — a repo with no resolvable default branch, or any
-      // rev-list failure, yields 0 rather than failing a run over prompt colour.
-      const priorCommits = resume ? await this.commitsAheadOfDefault(barePath, baseSha) : 0;
-      // On a FRESH branch the seed already IS the default tip, so no second lookup. On a
-      // resume they differ, and the difference is exactly what the lead cannot infer.
-      const defaultBranchCommit = resume ? await this.defaultBranchSha(barePath) : baseSha;
-      this.log.info("runner clone: seeding", { branch, base: baseRef, resume, prior_commits: priorCommits, path: clonePath });
+      // How many commits the seed carries ahead of the default branch. On the origin
+      // leg that is prior PUSHED work (issue #105); on the tracking leg it is the
+      // interrupted attempt's RECOVERED work (PRD #218 M3). Counted in the BARE, which
+      // holds every ref. Best-effort by construction — a repo with no resolvable default
+      // branch, or any rev-list failure, yields 0 rather than failing a run over colour.
+      const isResumeLeg = seededFrom !== "default";
+      const priorCommits = isResumeLeg ? await this.commitsAheadOfDefault(barePath, baseSha) : 0;
+      // On the default leg the seed already IS the default tip, so no second lookup. On a
+      // resume leg they differ, and the difference is exactly what the lead cannot infer.
+      const defaultBranchCommit = isResumeLeg ? await this.defaultBranchSha(barePath) : baseSha;
+      this.log.info("runner clone: seeding", { branch, base: baseRef, seeded_from: seededFrom, prior_commits: priorCommits, path: clonePath });
 
       // The seed clone + checkout run as the RUNNER uid (PRD #51 M4), so the clone +
       // working tree are runner-owned (the agent commits there; the worker never writes
@@ -375,7 +433,7 @@ export class GitCache {
       // likely SUCCEED QUIETLY rather than fail loudly.
       await this.disableAutoMaintenance(clonePath, /* asRunner */ true);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
-      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit };
+      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom };
     });
   }
 
@@ -573,6 +631,14 @@ export class GitCache {
 
   private async refExists(barePath: string, ref: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
+  }
+
+  /** True when `ancestorRef` is an ancestor of (or equal to) `descendantRef` — i.e.
+   *  `descendantRef` strictly descends from it (PRD #218 M2). Exit 0 = ancestor, 1 =
+   *  not; any other failure (a missing ref) answers false, so a broken candidate never
+   *  wins the "strictly descends" branch. */
+  private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
+    return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
   }
 
   // --- git subprocess plumbing -------------------------------------------------

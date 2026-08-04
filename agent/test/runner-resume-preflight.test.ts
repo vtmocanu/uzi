@@ -141,9 +141,12 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     );
   });
 
-  it("warns the amnesiac lead about prior commits on the branch — but ONLY when the resume was dropped", async () => {
+  it("warns the lead about prior commits on the branch whenever they exist (PRD #218 M3)", async () => {
     // The honest degradation must not become silently redone work: if the branch already
-    // carries pushed work and the lead can no longer remember it, say so in the prompt.
+    // carries commits this turn did not make, say so in the prompt. PRD #218 M3 widened
+    // this from "only when the resume was DROPPED" to "whenever prior commits exist",
+    // because the case this PRD is about — the session survives but the tree was lost and
+    // recovered — carries prior commits with a LIVE session, which the old guard missed.
     const { gitlab } = fakeGitlab();
     const env = {
       ...process.env,
@@ -180,18 +183,19 @@ describe("RunRunner — resume preflight (issue #105)", () => {
         "counted against the default branch",
       );
 
-      // Same branch, same prior commits — but a resolvable session, so the lead
-      // remembers its own work and needs no warning.
+      // Same branch, same prior commits, and a resolvable (live) session. Post-#218 the
+      // lead is STILL told: prior commits it did not make this turn are worth surfacing
+      // whether or not the session survived — the branch is not empty either way.
       const kept: RunContext[] = [];
       const keptClaim = gitlabClaim(73, { session_id: SID });
       plantTranscript(path.join(homeRoot, keptClaim.run_id), SID);
       await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(
         keptClaim,
       );
-      assert.strictEqual(
+      assert.deepStrictEqual(
         kept[0]?.priorWork,
-        undefined,
-        "a live resume needs no prior-work warning",
+        { commits: 2 },
+        "a live resume with prior commits is now told about them too (PRD #218 M3)",
       );
 
       // And a fresh run (no session at all) on a branch with no prior work gets none.

@@ -1,23 +1,119 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type ExecutorResult } from "../src/executor.js";
-import { type ExecutorFactory } from "../src/runner.js";
+import { type ExecutorResult, type RunContext } from "../src/executor.js";
+import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { GitCache } from "../src/git.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { LimitReachedError } from "../src/limit.js";
+import { nullLogger } from "./helpers.js";
 import {
   api,
+  barrier,
+  client,
+  deferred,
   fakeGitlab,
+  fx,
+  git,
   gitlabClaim,
   installHarness,
+  input,
   runnerWith,
   secretRecordingLogger,
   worktreeDirFor,
 } from "./runner-harness.js";
 
 installHarness();
+
+// ── PRD #218 shared helpers ───────────────────────────────────────────────────
+// Real git so the fetch-back and reseed are exercised end to end, not mocked.
+const GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+};
+const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+/** Commit a file in a git working tree (the runner clone, or the fixture origin) and
+ *  return the new HEAD sha. */
+function commitInTree(treePath: string, file: string, content: string): string {
+  fs.writeFileSync(path.join(treePath, file), content);
+  execFileSync("git", ["-C", treePath, "add", file], { env: GIT_ENV, stdio: "pipe" });
+  execFileSync("git", ["-C", treePath, ...IDENT, "commit", "-m", `add ${file}`], {
+    env: GIT_ENV,
+    stdio: "pipe",
+  });
+  return execFileSync("git", ["-C", treePath, "rev-parse", "HEAD"], {
+    env: GIT_ENV,
+    encoding: "utf8",
+  }).trim();
+}
+
+/** The sha a ref resolves to in the worker bare, or null when it does not exist. */
+function shaInBare(bare: string, ref: string): string | null {
+  try {
+    return execFileSync("git", ["-C", bare, "rev-parse", "--verify", ref], {
+      env: GIT_ENV,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function gitUpdateRef(bare: string, ref: string, sha: string): void {
+  execFileSync("git", ["-C", bare, "update-ref", ref, sha], { env: GIT_ENV, stdio: "pipe" });
+}
+
+function originHead(): string {
+  return execFileSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], {
+    env: GIT_ENV,
+    encoding: "utf8",
+  }).trim();
+}
+
+/** Resolves once `signal` aborts (or immediately if already aborted). */
+function waitAbort(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const trackingRef = (iid: number) => `refs/uzi-runner/agent/issue-${iid}`;
+
+/** A minimal real Worker over the harness client/api, with the chat lane disabled
+ *  (chatSessions: 0 makes chatClaimLoop never claim) and a passing toolchain
+ *  preflight (this is not an image host). Used only for the within-grace proof that
+ *  the fetch-back completes before `worker.run` resolves. */
+function buildWorker(runner: RunRunner): Worker {
+  const config = {
+    workerName: "w1",
+    workerTemplate: "base",
+    maxConcurrentRuns: 1,
+    pollIntervalMs: 1,
+    heartbeatIntervalMs: 10_000,
+    chatPollMs: 10_000,
+    chatSessions: 0,
+    dockerWiring: {},
+  } as unknown as Config;
+  const noChat = { execute: async () => {} } as unknown as ChatRunner;
+  const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
+  return new Worker(config, client, runner, noChat, noJudge, nullLogger(), () => ({
+    ok: true,
+    missing: [],
+  }));
+}
 
 // ── PRD #35: the usage-limit park and its cleanup carve-out ───────────────────
 //
@@ -258,6 +354,639 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
         api.messages(failed.runId).some((m) => m.kind === "limit_wait"),
         false,
       );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── PRD #218 M1/M2/M3 — the park is durable (fetch-back + tracking-ref reseed) ──
+//
+// Before this, a park preserved the runner clone but the very NEXT claim's reseed
+// `fs.rm`d it and re-seeded off origin/default, destroying every commit the parked
+// attempt made (it had pushed nothing). M1 fetches the committed work back into the
+// worker bare's tracking ref; M2 teaches the reseed to read it on a resume.
+describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
+  /** A factory whose executor commits `file` in the runner clone, then parks on a
+   *  usage limit — the shape the bug needs (work committed, nothing pushed). Captures
+   *  the committed sha. */
+  function commitThenParkFactory(homeRoot: string, file: string): {
+    factory: ExecutorFactory;
+    sha: () => string;
+  } {
+    let sha = "";
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          sha = commitInTree(ctx.worktreePath, file, "work before the park\n");
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          throw new LimitReachedError({
+            resetsAtMs: Date.now() + 5 * 3600_000,
+            rateLimitType: "five_hour",
+          });
+        },
+      },
+    });
+    return { factory, sha: () => sha };
+  }
+
+  it("M1: fetches the committed work back into the worker bare on park", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-park-"));
+    try {
+      const iid = 201;
+      const { factory, sha } = commitThenParkFactory(homeRoot, "WORK.txt");
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(iid, { wait_on_limit: true }),
+      );
+      const bare = git.barePathFor(fx.originPath);
+      assert.strictEqual(
+        shaInBare(bare, trackingRef(iid)),
+        sha(),
+        "the tracking ref must carry the committed work after a park",
+      );
+      // And the park itself still happened (the fetch-back must not have undone it).
+      assert.ok(
+        api.states.some((s) => s.body.status === "limit_wait"),
+        "the run still parks",
+      );
+      assert.strictEqual(
+        fs.existsSync(worktreeDirFor(iid)),
+        true,
+        "the clone is still preserved by the park carve-out",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("M1: a failed fetch-back still parks the run (best-effort, D4)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-park-boom-"));
+    try {
+      const iid = 205;
+      // A real GitCache whose ONLY broken method is the fetch-back — ensureClone and
+      // the reseed must still work so the run gets far enough to park.
+      const brokenGit = new GitCache(fx.dataDir, nullLogger());
+      brokenGit.fetchAgentBranch = async () => {
+        throw new Error("fetch-back boom");
+      };
+      const { factory } = commitThenParkFactory(homeRoot, "WORK.txt");
+      const runner = new RunRunner(
+        client,
+        brokenGit,
+        factory,
+        nullLogger(),
+        20,
+        undefined,
+        { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab },
+      );
+      await runner.execute(gitlabClaim(iid, { wait_on_limit: true }));
+      assert.ok(
+        api.states.some((s) => s.body.status === "limit_wait"),
+        "a park that could not fetch back must still park — a lost park is worse",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("M2/regression: a park with local commits RESUMES with those commits present", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-resume-"));
+    try {
+      const iid = 202;
+      // 1) First attempt: commit + park (writes the tracking ref).
+      const { factory: parkFactory, sha } = commitThenParkFactory(
+        homeRoot,
+        "WORK.txt",
+      );
+      await runnerWith(parkFactory, gitlab).execute(
+        gitlabClaim(iid, { wait_on_limit: true }),
+      );
+
+      // 2) Resume (a claim with a session id): the reseed must read the tracking ref
+      //    and hand the executor a tree that still carries WORK.txt.
+      let sawFile = false;
+      let priorWork: unknown;
+      let baseCommit: string | undefined;
+      const resumeFactory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            sawFile = fs.existsSync(path.join(ctx.worktreePath, "WORK.txt"));
+            priorWork = ctx.priorWork;
+            baseCommit = ctx.baseCommit;
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      const resumeClaim = gitlabClaim(iid, {
+        wait_on_limit: true,
+        session_id: SID,
+      });
+      await runnerWith(resumeFactory, gitlab).execute(resumeClaim);
+
+      // The control the bug failed: the file the agent created before the park is
+      // still there after it (Success Criterion 1).
+      assert.strictEqual(
+        sawFile,
+        true,
+        "the committed file must survive the resume — this is the exact bug",
+      );
+      assert.strictEqual(
+        baseCommit,
+        sha(),
+        "the resume seeds off the recovered tracking-ref tip",
+      );
+      // M3: the lead is told the work was recovered (a commit, not a lead noticing).
+      assert.deepStrictEqual(
+        priorWork,
+        { commits: 1 },
+        "the lead is told a recovered commit exists on the branch",
+      );
+      const recovered = api
+        .messages(resumeClaim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text))
+        .find((t) => /recovered 1 commit/.test(t));
+      assert.ok(
+        recovered,
+        "the feed states the recovered commit count (Success Criterion 3)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("M3: a resume that recovers nothing admits the loss in the feed", async () => {
+    // A resume (session id present) on a branch with neither an origin branch nor a
+    // tracking ref — the cross-worker case (R1). The reseed falls back to the default
+    // branch, and the feed must SAY the tree could not be recovered rather than let
+    // the lead discover it.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-loss-"));
+    try {
+      const iid = 203;
+      const seen: RunContext[] = [];
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      const claim = gitlabClaim(iid, { wait_on_limit: true, session_id: SID });
+      await runnerWith(factory, gitlab).execute(claim);
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      assert.ok(
+        texts.some((t) => /no earlier work could be recovered/.test(t)),
+        `expected an honest tree-loss notice, got ${JSON.stringify(texts)}`,
+      );
+      assert.strictEqual(
+        seen[0]?.priorWork,
+        undefined,
+        "nothing recovered ⇒ no prior-work note",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── PRD #218 M2 — the reseed's per-leg base resolution (git level) ────────────
+//
+// The two legs a UNIFORM ancestor test gets wrong are the point: a first park with a
+// MOVED default (tracking must win) and a pushed branch that DIVERGED (origin must
+// win). Driven at the git layer, where the resolution lives, with `resume` as the
+// plain boolean the runner threads from `claim.session_id != null`.
+describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", () => {
+  it("first park + MOVED default branch: the tracking ref wins, with no ancestry test", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Commit locally off the fork point and fetch it back (a first park — never pushed).
+    const rc = await git.createOrAttachRunnerClone(bare, 210);
+    const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-210");
+    await git.removeRunnerClone(rc.path);
+
+    // The default branch moves PAST the fork point, then the bare is refreshed.
+    const moved = commitInTree(fx.originPath, "MOVED.txt", "moved\n");
+    await git.ensureClone(fx.originPath);
+
+    const resumed = await git.runnerCloneForBranch(
+      bare,
+      "agent/issue-210",
+      "issue-210",
+      /* resume */ true,
+    );
+    assert.strictEqual(resumed.seededFrom, "tracking");
+    assert.strictEqual(
+      resumed.baseCommit,
+      local,
+      "the tracking ref wins even though the default moved past the fork",
+    );
+    assert.notStrictEqual(resumed.baseCommit, moved);
+    assert.strictEqual(
+      fs.existsSync(path.join(resumed.path, "LOCAL.txt")),
+      true,
+    );
+    // The control: a uniform `--is-ancestor moved local` would FAIL (moved is not an
+    // ancestor of local), so a single uniform ancestor test would have discarded the
+    // recovered work — exactly the case D2 excludes the first-park leg from.
+    assert.strictEqual(
+      shaInBare(bare, trackingRef(210)),
+      local,
+      "the tracking ref still points at the recovered work",
+    );
+  });
+
+  it("resume with a pushed branch that DIVERGED: origin wins (never drop a published commit)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Push O1 to origin's agent/issue-211.
+    const first = await git.createOrAttachRunnerClone(bare, 211);
+    const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-211");
+    await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
+    await git.removeRunnerClone(first.path);
+    await git.ensureClone(fx.originPath); // learn origin/agent/issue-211 = O1
+
+    // A DIVERGED tracking ref: a commit off main that is NOT a descendant of O1.
+    const tmp = await git.createOrAttachRunnerClone(bare, 2110);
+    const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
+    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110");
+    await git.removeRunnerClone(tmp.path);
+    gitUpdateRef(bare, trackingRef(211), l1);
+
+    const resumed = await git.runnerCloneForBranch(
+      bare,
+      "agent/issue-211",
+      "issue-211",
+      true,
+    );
+    assert.strictEqual(resumed.seededFrom, "origin");
+    assert.strictEqual(
+      resumed.baseCommit,
+      o1,
+      "on divergence origin wins — a published commit is never dropped",
+    );
+  });
+
+  it("resume where the tracking ref DESCENDS from origin: tracking wins and the base moves past origin (Success Criterion 4)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 212);
+    const o1 = commitInTree(rc.path, "O.txt", "o\n");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212");
+    await git.pushBranch(bare, "agent/issue-212", "", fx.originPath);
+    // Build ON TOP of the pushed tip (descends), fetch that back — do NOT push it.
+    const l1 = commitInTree(rc.path, "L.txt", "l\n");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212");
+    await git.removeRunnerClone(rc.path);
+    await git.ensureClone(fx.originPath); // origin/agent/issue-212 stays at O1
+
+    const resumed = await git.runnerCloneForBranch(
+      bare,
+      "agent/issue-212",
+      "issue-212",
+      true,
+    );
+    assert.strictEqual(resumed.seededFrom, "tracking");
+    assert.strictEqual(
+      resumed.baseCommit,
+      l1,
+      "the tracking ref wins when it strictly descends from origin",
+    );
+    assert.notStrictEqual(
+      resumed.baseCommit,
+      o1,
+      "the base legitimately MOVES past origin/<branch> — asserting base==origin here would pin the bug",
+    );
+    assert.strictEqual(fs.existsSync(path.join(resumed.path, "L.txt")), true);
+  });
+
+  it("a FRESH claim (resume=false) IGNORES a stale tracking ref (issue #105 reintroduction guard)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // A tracking ref a permanently-dead run left behind, no origin branch.
+    const tmp = await git.createOrAttachRunnerClone(bare, 213);
+    commitInTree(tmp.path, "STALE.txt", "stale\n");
+    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213");
+    await git.removeRunnerClone(tmp.path);
+    assert.ok(shaInBare(bare, trackingRef(213)), "precondition: the stale ref exists");
+
+    const fresh = await git.runnerCloneForBranch(
+      bare,
+      "agent/issue-213",
+      "issue-213",
+      /* resume */ false,
+    );
+    assert.strictEqual(
+      fresh.seededFrom,
+      "default",
+      "a fresh claim must never inherit a dead run's tracking ref",
+    );
+    assert.strictEqual(fresh.baseCommit, originHead());
+    assert.strictEqual(fs.existsSync(path.join(fresh.path, "STALE.txt")), false);
+  });
+});
+
+// ── PRD #218 M1 — the same fetch-back on the WORKER-SHUTDOWN path ──────────────
+//
+// The larger loss: a requeue re-claims and the reseed's unconditional `fs.rm`
+// destroys committed work with no usage limit involved. A graceful SIGTERM aborts each
+// run; its catch fetches the work back and leaves the run NON-terminal so the sweeper
+// requeues it onto the recovered tree. The discriminator is the shutdown FLAG, never
+// the error (a user cancel raises the same one).
+describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
+  /** An executor that commits `file` in the clone, signals it started, waits for its
+   *  signal to abort, then throws. `commitOnKill` defers the commit into killAgentTree
+   *  so a test can prove the reap ran before the fetch-back (R5). */
+  function shutdownExecutorFactory(
+    homeRoot: string,
+    file: string,
+    opts: { commitOnKill?: boolean } = {},
+  ): {
+    factory: ExecutorFactory;
+    started: Promise<void>;
+    sha: () => string;
+    killed: () => boolean;
+  } {
+    const start = deferred();
+    let sha = "";
+    let killed = false;
+    let clonePath = "";
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          clonePath = ctx.worktreePath;
+          if (!opts.commitOnKill) sha = commitInTree(ctx.worktreePath, file, "wip\n");
+          start.resolve();
+          await waitAbort(ctx.signal!);
+          throw new Error("aborted mid-run");
+        },
+        killAgentTree: () => {
+          killed = true;
+          if (opts.commitOnKill && !sha) sha = commitInTree(clonePath, file, "wip\n");
+        },
+      },
+    });
+    return { factory, started: start.promise, sha: () => sha, killed: () => killed };
+  }
+
+  it("(a)+(b): a SIGTERM run fetches its work back WITHIN the grace and is NOT failed", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-sig-"));
+    try {
+      const iid = 220;
+      const { factory, started, sha } = shutdownExecutorFactory(homeRoot, "SHUT.txt");
+      const runner = runnerWith(factory, gitlab);
+      const worker = buildWorker(runner);
+      const claim = gitlabClaim(iid, { wait_on_limit: true });
+      api.enqueueClaim(claim);
+      const controller = new AbortController();
+      const done = worker.run(controller.signal);
+      await started;
+      // The signal handler's order (main.ts): shutdown() first (no git), then abort.
+      runner.shutdown();
+      controller.abort();
+      await done; // process exit is gated on this; the drain awaits the fetch-back.
+      const bare = git.barePathFor(fx.originPath);
+      assert.strictEqual(
+        shaInBare(bare, trackingRef(iid)),
+        sha(),
+        "the committed work is in the tracking ref the MOMENT worker.run resolves",
+      );
+      assert.strictEqual(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "failed",
+        ),
+        false,
+        "a shutdown interruption must requeue, never fail",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(c): reaps the agent tree BEFORE fetching back (R5 ordering)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-r5-"));
+    try {
+      const iid = 221;
+      // The commit is made INSIDE killAgentTree, so it can only reach the tracking ref
+      // if the reap ran before the fetch-back.
+      const { factory, started, sha, killed } = shutdownExecutorFactory(
+        homeRoot,
+        "SHUT.txt",
+        { commitOnKill: true },
+      );
+      const runner = runnerWith(factory, gitlab);
+      const p = runner.execute(gitlabClaim(iid, { wait_on_limit: true }));
+      await started;
+      runner.shutdown();
+      await p;
+      assert.strictEqual(killed(), true, "killAgentTree must run on the shutdown path");
+      assert.strictEqual(
+        shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)),
+        sha(),
+        "the kill-time commit reached the tracking ref ⇒ reap ran before fetch",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(d): a throwing fetch-back still requeues (best-effort)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-d-"));
+    try {
+      const iid = 222;
+      const brokenGit = new GitCache(fx.dataDir, nullLogger());
+      brokenGit.fetchAgentBranch = async () => {
+        throw new Error("fetch-back boom");
+      };
+      const { factory, started } = shutdownExecutorFactory(homeRoot, "SHUT.txt");
+      const runner = new RunRunner(
+        client,
+        brokenGit,
+        factory,
+        nullLogger(),
+        20,
+        undefined,
+        { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab },
+      );
+      const claim = gitlabClaim(iid, { wait_on_limit: true });
+      const p = runner.execute(claim);
+      await started;
+      runner.shutdown();
+      await p; // resolves, does not throw
+      assert.strictEqual(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "failed",
+        ),
+        false,
+        "a failed fetch-back must not turn the requeue into a failure",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(e): a user steering-cancel is UNCHANGED — it fails, it does not requeue", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-e-"));
+    try {
+      const iid = 223;
+      // Same abort, same error, but shuttingDown is false — the flag is the whole
+      // discriminator, so this must land on today's generic failure path.
+      const { factory, started } = shutdownExecutorFactory(homeRoot, "SHUT.txt");
+      const runner = runnerWith(factory, gitlab);
+      const claim = gitlabClaim(iid, { wait_on_limit: true });
+      const p = runner.execute(claim);
+      await started;
+      api.setInputs(claim.run_id, [input("cancel")]);
+      await p;
+      assert.strictEqual(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "failed",
+        ),
+        true,
+        "a user cancel still fails the run (unchanged behaviour)",
+      );
+      assert.strictEqual(
+        shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)),
+        null,
+        "no fetch-back on a plain cancel — the tracking ref must not appear",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(f): a run that COMPLETES naturally during shutdown reports completed, not requeued", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-f-"));
+    try {
+      const iid = 224;
+      const started = deferred();
+      const proceed = deferred();
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            commitInTree(ctx.worktreePath, "DONE.txt", "done\n");
+            started.resolve();
+            await proceed.promise; // ignores the abort — finishes normally
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      const runner = runnerWith(factory, gitlab);
+      const claim = gitlabClaim(iid, { wait_on_limit: true });
+      const p = runner.execute(claim);
+      await started.promise;
+      runner.shutdown(); // marks + aborts, but the executor ignores it and returns
+      proceed.resolve();
+      await p;
+      assert.strictEqual(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "completed",
+        ),
+        true,
+        "a natural completion during shutdown still completes (flag+throw is the discriminator)",
+      );
+      assert.strictEqual(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "failed",
+        ),
+        false,
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(g): two in-flight runs each snapshot on ONE shutdown", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-g-"));
+    try {
+      const both = barrier(2);
+      const shas = new Map<string, string>();
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            shas.set(ctx.branch, commitInTree(ctx.worktreePath, "SHUT.txt", ctx.branch));
+            both.arrive();
+            await waitAbort(ctx.signal!);
+            throw new Error("aborted mid-run");
+          },
+        },
+      });
+      const runner = runnerWith(factory, gitlab);
+      const p1 = runner.execute(gitlabClaim(230, { wait_on_limit: true }));
+      const p2 = runner.execute(gitlabClaim(231, { wait_on_limit: true }));
+      await both.ready; // both committed and registered
+      runner.shutdown(); // one shutdown aborts both
+      await Promise.all([p1, p2]);
+      const bare = git.barePathFor(fx.originPath);
+      assert.strictEqual(
+        shaInBare(bare, trackingRef(230)),
+        shas.get("agent/issue-230"),
+        "run 230 fetched back",
+      );
+      assert.strictEqual(
+        shaInBare(bare, trackingRef(231)),
+        shas.get("agent/issue-231"),
+        "run 231 fetched back on the same shutdown",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(h): deregisters on terminal, and a run registering mid-shutdown aborts at once (late-register guard)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-h-"));
+    try {
+      // Part 1 — no registry leak after an ordinary completed run.
+      const doneFactory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => ({
+            branch: ctx.branch,
+          }),
+        },
+      });
+      const doneRunner = runnerWith(doneFactory, gitlab);
+      await doneRunner.execute(gitlabClaim(240, { wait_on_limit: true }));
+      const doneActive = (
+        doneRunner as unknown as { activeRuns: Map<string, unknown> }
+      ).activeRuns;
+      assert.strictEqual(doneActive.size, 0, "no registry entry leaks after a terminal run");
+
+      // Part 2 — a run that registers AFTER shutdown() has fired: the late-register
+      // guard must abort it at once so it snapshots its committed work rather than
+      // running to completion past the grace window.
+      const iid = 241;
+      const { factory, sha } = shutdownExecutorFactory(homeRoot, "LATE.txt");
+      const lateRunner = runnerWith(factory, gitlab);
+      lateRunner.shutdown(); // global flag set before any run registers
+      await lateRunner.execute(gitlabClaim(iid, { wait_on_limit: true }));
+      assert.strictEqual(
+        shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)),
+        sha(),
+        "a run that starts during shutdown still snapshots its work",
+      );
+      const lateActive = (
+        lateRunner as unknown as { activeRuns: Map<string, unknown> }
+      ).activeRuns;
+      assert.strictEqual(lateActive.size, 0, "and deregisters afterwards");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
