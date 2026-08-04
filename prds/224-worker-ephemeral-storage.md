@@ -1789,3 +1789,132 @@ auditor's had (A14). **Both times the worker spent a turn refuting me instead of
 I keep applying to teammates' claims and not to my own: **check whether the artifact exists before
 asserting it does not.** A chase is a claim about the world and deserves the same re-derivation as
 any other.
+
+### A19 — 2026-08-04, `936dec8e` (A16.2 fixed, better than asked) + the guard verified at `6bf44a86`
+
+**A19.1 — the coder REFUSED the cheapest fix and was right.** A16.2 asked for a line on both
+`values.yaml` keys saying a controller test mirrors them. It added those lines **and did not stop
+there**: `chartDeploymentQuotas` now **parses both values out of `deploy/chart/values.yaml`**, so the
+copy is gone. Its reasoning is the operative part: *"a cross-reference is true by bookkeeping, and it
+leaves the test passing on a fleet that no longer fits; it asks the next person to notice, which is
+the thing that already failed once here."*
+
+Mutated with A16.2's own predicted case — docker `deployments` 10 → 20 in `values.yaml`:
+
+```
+--- FAIL: TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
+    a full fleet (20 docker x 4Gi + 20 plain x 512Mi = 90.0 GiB) exceeds the worker
+    pool's ephemeral-storage allocatable (4 x 17.55 = 70.2 GiB)
+```
+
+**That is A16.2's arithmetic to the digit, and it is exactly what the hardcoded version stayed GREEN
+for.** Also controlled for fail-closed by hiding `values.yaml`: the test dies naming the path rather
+than falling back to a baked-in number. Three deliberate choices in the read: **parsed, not grepped**
+(a regex finds `deployments:` under whichever block it meets first and cannot tell the tiers apart —
+the `kind:` lesson); **fatal** on unreadable/empty/non-integer/non-positive, never a skip and never a
+fallback; and it crosses the module boundary, an established idiom here
+(`protocol_contract_test.go:18` builds its path with `filepath.Join`, which is why a literal grep
+misses these) and **exactly why `test:controller` carries `-count=1`**.
+
+`nodeAllocatable = 17.55` correctly **stays** a constant — a measured fact about one cluster with no
+source in this repo, and its comment says so.
+
+**A19.2 — go.mod: `sigs.k8s.io/yaml` indirect → direct. ACCEPTED, and verified rather than taken on
+report.** `git show --stat 936dec8e -- controller/go.sum` is **empty** — go.sum unchanged, nothing
+new downloaded, already in the graph via apimachinery. The `go.mod` delta is exactly one line moving
+off `// indirect`. The coder flagged it because `go.mod` is on the stop-and-report list and offered
+to revert to the comment-only form; **the comment-only form is the weaker fix it correctly rejected**,
+so the dependency edit stands.
+
+**A19.3 — the guard verified across six arms plus a 22-input parser boundary probe. Every arm flips
+the way it must.**
+
+| arm | PRE `2a63ddb3` | POST `6bf44a86` | proves |
+|---|---|---|---|
+| A shipped defaults | rc=0, 38 docs | **rc=0, 38 docs** | the guard does not break the default path |
+| B `dindDataSize=40Gi` | **rc=0, 0 bytes stderr** | **rc=1**, names both keys | the flip |
+| C both raised to 40Gi | rc=0 | **rc=0** | a constraint *between two values* |
+| E equal `20Gi == 20Gi` | rc=0 | **rc=0** | `gt` not `ge` |
+| F bad suffix `20GB` | **rc=0, accepted silently** | **rc=1**, names the suffix | the fail-open, closed |
+| D restricted `requestsStorage` | 600Gi → **15** `l` | 800Gi → **20** `l` | matches what `deployments` advertises |
+
+**Parser boundary, 22 inputs, no false accepts and no false rejects.** 9 valid quantities ≤ 20Gi all
+pass — including `10G` and `5000M`, which are **decimal SI**, a distinct family a binary-only helper
+would have falsely rejected. 5 valid > 20Gi all fail, `21Gi` included, so the guard is **exact at the
+boundary rather than coarse**. 8 malformed all fail naming the offender. The two that correctly pass
+are `20` (20 bytes, a genuinely valid quantity) and `""` (unset — which is A18.2's gap).
+
+*Clarification on arm F's pre-state:* at `2a63ddb3` a `20GB` would still have been caught, by the
+**controller** at boot (`resource.ParseQuantity` rejects that suffix). The fail-open is specific to
+the **new helper's own arithmetic**, and F confirms the shipped helper closes it.
+
+**A19.4 — 🔴 MEDIUM: the two-mechanism split has a REACHABLE fail-open, and every instrument reports
+success through it.** A18.1 established the safety label is backwards. The auditor adds the part that
+makes it urgent: **it is reachable by a coherent-looking operator action, not a contrived one.** An
+operator downsizing a small cluster lowers the ceiling *and* the one claimant the chart knows about,
+together:
+
+```
+--set workers.docker.limitRange.maxPVCStorage=10Gi
+--set workers.limitRange.maxPVCStorage=10Gi
+--set workers.docker.dindDataSize=10Gi
+```
+
+Measured at `6bf44a86`: `helm template` **rc=0** (the chart guard passes, 10Gi <= 10Gi), and
+`TestPresetPVCSizesFitTheChartsLimitRangeMax` **passes** (its ceiling is a hardcoded 20Gi). Meanwhile
+`nixSize` is 20Gi and `l`'s `DataSize` is 20Gi. **Result: every worker's `/nix` claim on BOTH tiers,
+plus every `l` worker's `/data`, is 20Gi against a 10Gi ceiling — rejected at admission, every worker
+provisions and never appears.** The chart guard covers 1 of 3 claimants; the Go test covers the other
+2 against a **copy** of the ceiling that cannot move with the values. **The only thing between an
+operator and a dead fleet is a pair of cross-referencing comments.**
+
+**Proposed fix (auditor's, and it is the right shape):** inject `UZI_WORKER_MAX_PVC_STORAGE` from
+`workers.docker.limitRange.maxPVCStorage` (and the restricted one) into the controller, and validate
+at boot against `nixSize` and every preset's `DataSize`. It **closes all three claimants with one
+mechanism**, in the component that already owns two of them; it **adds no duplication** (the chart
+injects a value it owns, the controller compares constants it owns) — which is precisely the
+objection that correctly killed putting preset quantities into `values.yaml`; and it **matches the
+pattern this commit already established**, since `parseQuantityEnv`'s own doc says a typo *"is a BOOT
+error rather than a silent skip … otherwise a worker that provisions and never appears."* **Boot is
+the only place that can see both**: the chart cannot read Go constants and the Go test cannot read
+values.
+
+**A19.5 — LOW: a valid config produces a garbled failure message.** The `fail` uses `%s` for both
+quantities, but **a bare integer is a valid k8s quantity** (bytes) and Helm types it `int64`:
+
+```
+--set workers.docker.dindDataSize=100000000000  ->  ...dindDataSize=%!s(int64=100000000000) exceeds...
+```
+
+The guard still **fires correctly**; only the value is mangled. Graded Low for that reason — but not
+cosmetic in intent, since the template's own comment says the point is that *"the failure names the
+key an operator has to edit"*, and here it fails to name the **value**. Fix: `%v` for both.
+
+**A19.6 — 🔴 THE 32 / 34 / 38 DISCREPANCY IS SETTLED, AND MY FRAMING IN A16.4 / A17.8 WAS WRONG.**
+The auditor's 34 was **a known property of its own harness**, not drift: to render without network it
+had deleted the `dependencies:` block from `Chart.yaml`, removing the CNPG `cluster` subchart, and
+dev-cluster sets `postgres.enabled: true` — so those 4 documents were simply absent. With the
+dependency built for real it lands on **38**, matching the coder and the reviewer.
+
+```
+dev-cluster values + subchart BUILT        38
+dev-cluster values, subchart STRIPPED      34   <- the earlier harness
+chart DEFAULTS (postgres off, no subchart) 31
+```
+
+**So the count IS stable for a fixed (chart, values, dependency state); three different invocations
+were being compared.** I wrote "a count is not a stable identity across invocations" and generalised
+it into cite-the-shape-not-the-tally. **That let a real, findable discrepancy be filed as noise.**
+The auditor's correction is the one to keep: *the reason to prefer the behavioural flip is that it
+tests the GUARD rather than the MANIFEST — not that counting is unreliable.* An under-declared
+invocation is a fixable reporting defect, not an inherent property of counting.
+
+**A19.7 — three below the bar, all about future readers.** `TestPresetPVCSizesFitTheChartsLimitRangeMax`
+uses `>` with both defaults exactly on the ceiling — the same `gt`-not-`ge` correctness as the chart
+guard, consistent on both sides. The chart guard **iterates a `dict` with one entry**, deliberate
+shape-for-growth so the failure names the key — and *"exactly what a later reader simplifies into a
+direct comparison, taking the key name out of the message with it"*; the comment explains the dict's
+purpose but does not say **don't collapse this**. And `worker-invariants.yaml` now ends a block
+comment with `*/ -}}` — **not** the CLAUDE.md hazard here (it is followed by `{{- if`, not a `---`,
+and arm A renders identically pre and post, which is the check), but that file is now the one place
+in the chart where the pattern sits next to templating, and the documented failure is silent.
