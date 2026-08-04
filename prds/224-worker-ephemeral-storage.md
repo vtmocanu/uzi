@@ -1616,3 +1616,90 @@ findings, only `SpecHashOf`'s line number moving). **Neither commit orphaned any
 re-run: `go test -count=1 -race ./...` EXIT=0, `RUN=195 PASS=195 FAIL=0 SKIP=0`. Doc sweep re-done
 against **five alternative phrasings** with the hits read rather than post-filtered: zero survivors
 anywhere in `specs/`, `docs/`, `adr/`, `ARCHITECTURE.md`.
+
+### A17 — 2026-08-04, FOLLOW-UP `6bf44a86` closes A12.1 / A12.2 / A13.7. **A15.3 was WRONG.**
+
+Verified on the branch: `git merge-base --is-ancestor 6bf44a86 HEAD` → yes, sitting between A14 and
+A15 (the lead's docs commits interleave with the code commits, which is expected). `gt` confirmed at
+`worker-invariants.yaml:140`, `uzi.quantityBytes` at `_helpers.tpl:214`, `requestsStorage: 800Gi` at
+`values.yaml:446`, `TestPresetPVCSizesFitTheChartsLimitRangeMax` at `preset_contract_test.go:231`.
+Gates: `task gate:controller` **rc=0**, `task gate:repo` **rc=0** with **both canaries DETECTED**.
+
+**A17.1 — 🔴 LEAD ERROR, THE THIRD THIS PRD: A15.3's "the broad form covers both pairs" IS FALSE,
+AND A HELM GUARD CANNOT BE MADE TO COVER THEM.** I told the coder to write the guard against
+`maxPVCStorage` as the ceiling "so it covers `nixSize` too". **Helm cannot read a Go constant.**
+Verified on this tree: `grep -rn 'nixSize' deploy/chart/` returns **comments only, never a value** —
+`nixSize` is `preset.go:146` and nothing else. So no form of a chart guard, broad or narrow, can see
+it. The broad form covers **one** pair and generalises cheaply to future *chart-supplied* claimants;
+that is its real value, and it is not what I claimed.
+
+**Three claimants sit exactly on the 20Gi ceiling** — `dindDataSize` (chart), `nixSize` (Go), `l`'s
+`DataSize` (Go) — **and they are guarded by TWO mechanisms, neither of which covers all three:**
+
+| claimant | guarded by |
+|---|---|
+| `dindDataSize` | the chart guard (`worker-invariants.yaml`), broad form over a claimant dict |
+| `nixSize`, `l.DataSize` | `TestPresetPVCSizesFitTheChartsLimitRangeMax`, mutated twice (`nixSize`→40Gi, `l.DataSize`→30Gi) |
+
+Putting the Go quantities into `values.yaml` so the chart guard could reach them **was considered and
+rejected**, correctly: it would make the chart a **fourth place preset quantities appear and the only
+one with no golden gating it** — A7.5's own rejected class, cited back at me. The commit message says
+all of this; it is repeated here because A15.3 implies the chart half is sufficient and **it is not**.
+
+**A17.2 — THE HELPER HAD MY OWN FAILURE SHAPE IN IT, AND A THIRD MODE I DID NOT NAME.** I warned
+about `ge`-vs-`gt` (A15.1) and string comparison (A15.2). The obvious implementation has a **third**
+defect that **fails OPEN**: regex the digits, look the suffix up in a dict, multiply — **a missing key
+multiplies to zero**, so `20GB` rendered as **`0`** and passed silently. *"A guard built on that
+passes precisely the misconfigurations it exists to catch, while looking like it works."* Found **by
+probing, not by reading**. `uzi.quantityBytes` now validates digits and suffix explicitly and `fail`s
+on either.
+
+**A17.3 — the guard was mutated SEVEN ways, each checked for the RIGHT failure rather than merely for
+failing.** Both directions of the string-compare trap are now covered — my A15.2 example
+(`4Gi` under max `20Gi`) **renders**, where a string compare would have rejected it; the converse
+(`20Gi` vs `20000M`) **fails**, which is the case a string compare gets backwards.
+
+| case | result |
+|---|---|
+| 20Gi vs 20Gi (shipped) | renders — `gt` not `ge`, equal is correct (A15.1's arm A) |
+| 40Gi vs 20Gi | fails, naming both keys and both values |
+| 40Gi vs 40Gi (raise the max too) | renders — so it is the **pair** that is guarded (A15.4's arm C) |
+| 20Gi vs 20000M | fails — the case a string compare gets backwards |
+| 20000M vs 20Gi | renders — correct direction |
+| `40GB` / `20gi` | fail **closed** on the suffix, not silently compared as 0 |
+| docker tier OFF | does not fire |
+
+**A17.4 — the Go-side guard duplicates `maxPVCStorage`, acknowledged rather than overlooked, and it
+fails safe in the direction that matters.** Lowering the chart's max without lowering the test's
+leaves the test green while the cluster rejects claims — the mild direction. **Both `maxPVCStorage`
+keys now name the test and the test names both keys**, which is the mitigation A16.2 asked for on the
+fleet-fit constants, applied here without being asked.
+
+**A17.5 — A12.2 landed and both tiers are now EXACTLY self-consistent at their advertised fleet**,
+verified from a yaml parse rather than mental arithmetic:
+
+```
+restricted  20 x (20Gi data + 20Gi nix)      = 800Gi   quota 800Gi   pvcs 40 vs 40
+docker      10 x (20 + 20 + 20)              = 600Gi   quota 600Gi   pvcs 30 vs 30
+```
+
+The coder applied the 800Gi decision as directed **and disagrees with the alternative on record**:
+scoping `l` off the restricted tier would be a real behaviour change with an api-visible surface,
+since nothing in `preset.SizeNames()` or `render.go` is tier-aware today — against a quota raise that
+provisions nothing. Recorded because it is the reasoning, not just the outcome.
+
+**A17.6 — A13.7 closed**: both 40Gi fixtures → 10Gi, and the config one keeps a sentence saying the
+boot validation **structurally cannot** catch an oversized value. A12.3 is documented at the
+`dindDataSize` values key, where an operator reads before raising it.
+
+**A17.7 — the coder corrected its own earlier slip, unprompted.** It reported `task lint:repo` as
+"does not exist"; that was its slip, **not a repo defect** — `lint:repo` is a CI *job* that invokes
+`task gate:repo`, the same name-collision shape CLAUDE.md documents for `build:web`. Nothing to fix.
+
+**A17.8 — the document-count instability now has a THIRD reading, and it settles A16.4's approach as
+the right one.** The coder measures **32** (shipped defaults + docker on) and **38** (dev-cluster);
+the auditor reported 34, the reviewer 38/30. **The coder declines to call the auditor wrong** and
+says only that *a count is not a stable identity across invocations* — which is exactly right, and is
+CLAUDE.md's cite-the-shape-not-the-tally rule reached independently by a third agent. **The control
+is invocation-independent and is the thing to re-run:** at `2a63ddb3` the 40Gi case renders clean; at
+`6bf44a86` it fails naming both keys and both values. **That flip is the evidence, not any count.**
