@@ -328,12 +328,13 @@ lint           task lint           # composite over SEVEN targets, not four: the
                                    # collision is normal rather than exceptional. It
                                    # fails SAFE (false red, never false green), but
                                    # 🔴 THE STATUS CANNOT DISTINGUISH IT FROM A REAL
-                                   # FINDING. golangci-lint exits 3; `go run` prints
-                                   # that as the TEXT `exit status 3` and then exits
-                                   # **1** itself (measured on a 3-exiting program),
-                                   # and 1 is the Taskfile's "there are findings"
-                                   # code. So the 3 never reaches the exit code at
-                                   # all, `task` reports its usual 201, and an
+                                   # FINDING. golangci-lint exits 3; since PRD #230
+                                   # M5 the scripts/golangci-lint.sh wrapper execs
+                                   # the binary, so that 3 now reaches the SCRIPT's
+                                   # exit (the old `go run` flattened it to 1). But
+                                   # `task` flattens every nonzero to its usual 201,
+                                   # so through `task` the 3 still never reaches an
+                                   # observable exit code, and an
                                    # automated reader testing `!= 0` -- or even
                                    # reading the status carefully -- records a red
                                    # gate over code that is fine. THE ONLY

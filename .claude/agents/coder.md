@@ -151,10 +151,12 @@ whose whole comment is about a tally that read 26, then 25, then 19, then 16. If
 run `git fetch origin main` — **do not read the backlog it would otherwise
 print as your branch's findings.** And if a Go lint target prints
 `Error: parallel golangci-lint is running`, a sibling worktree holds the
-host-global lock: **re-run, do not report a red gate.** That one is invisible to
-the exit code — golangci-lint exits 3, `go run` prints it as text and exits **1**
-itself, which is the "there are findings" status — so the message text is the
-only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
+host-global lock: **re-run, do not report a red gate.** That one is invisible
+through `task` — golangci-lint exits 3, and since PRD #230 M5 the
+`scripts/golangci-lint.sh` wrapper execs the binary so that 3 now reaches the
+SCRIPT's exit (the old `go run` flattened it to 1); but `task` flattens every
+nonzero to its usual 201, so `task lint:api` reports 201 for a lock exactly as for
+a finding — the message text is the only discriminator. *(PRD #103 M3, 2026-08-02: this paragraph
 said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go
 hunting for a lint command; there isn't one". M3 landed golangci-lint for both
 Go modules and oxlint for both npm packages.)* `fmt-check:api` /

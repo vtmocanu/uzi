@@ -6,6 +6,59 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Contributor tooling: MR pipelines no longer wait for the full gate before
+  they start building images.** Each `build:*` job now `needs:` only the
+  checks for its own component (`build:api` waits on `validate:api`,
+  `test:api` and `lint:api`, not the whole gate set) instead of every check
+  across all four components, so it starts as soon as its own component is
+  clean rather than after the slowest of all four. Publish jobs' `needs:`
+  are untouched. Part of PRD #230. Developer-facing only: no change to how
+  uzi behaves.
+
+- **Contributor tooling: `test:api-store-it` no longer sits on the image-build
+  critical path, and still gates every release exactly as before.** It's
+  dropped from the validation-gate `needs:` list build jobs used to depend
+  on, but stays in the publish-gate list, so it still runs on every ref and a
+  tag pipeline still can't publish without it passing. Part of PRD #230.
+  Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: `e2e:kind-smoke` no longer rebuilds the api and web
+  images from scratch on `main`.** `build:api`/`build:web` now emit a
+  `--tarPath` image archive as an artifact on protected non-tag refs, and the
+  e2e job loads that instead of running its own cold `docker build` inside
+  DinD; a tag pipeline still self-builds its images, unchanged. `scripts/smoke.sh`
+  is untouched. Part of PRD #230. Developer-facing only: no change to how uzi
+  behaves.
+
+- **Contributor tooling: an MR that doesn't touch a component now skips that
+  component's image build.** `build:api`, `build:web` and `build:controller`
+  gained a `changes:` filter scoped to each component's real Dockerfile
+  inputs (`build:web`'s includes `docs/**`, which its Dockerfile copies in).
+  `build:agent` is deliberately excluded and always builds, and no
+  protected-ref pipeline skips a build, so `main` and tag pipelines are
+  unaffected. Part of PRD #230. Developer-facing only: no change to how uzi
+  behaves.
+
+- **Contributor tooling: `golangci-lint` no longer compiles from source on a
+  cold lint cache.** `task lint:api`/`lint:controller` now fetch a pinned,
+  sha256-verified release binary (`scripts/golangci-lint.sh`) instead of
+  `go run`-ing the module from source, with the cached binary re-verified
+  against its own pin on every run rather than trusted on a cache hit alone.
+  The pin is checked against both Go modules' `go` directive at gate time and
+  fails loudly if a future linter release's minimum Go version outgrows them.
+  Findings are unchanged: verified identical to the previous `go run` build,
+  by diff, on both modules. Part of PRD #230. Developer-facing only: no
+  change to how uzi behaves.
+
+- **Contributor tooling: `test:api-store-it`'s throwaway Postgres now runs
+  with durability off.** `fsync`, `full_page_writes` and `synchronous_commit`
+  are disabled on the job's disposable `postgres:17` service, since its data
+  is destroyed with the job either way; a mid-job crash could corrupt it,
+  which is an accepted trade for data that was never going to outlive the
+  job. Part of PRD #230. Developer-facing only: no change to how uzi behaves.
+
 ## [0.16.0] - 2026-08-04
 
 ### Changed
