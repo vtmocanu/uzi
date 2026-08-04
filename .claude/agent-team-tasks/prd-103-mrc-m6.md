@@ -9,10 +9,18 @@ message.
 invisible to `grep -r` / `rg`. `--hidden` is the wrong axis and changes nothing.
 See carry-forward item 8.
 
-- **Branch**: `prd-103`, in worktree `/home/user/myorg/workspaces/uzi/prd-103`
+- **Branch**: `prd-103`, in worktree
+  `/home/user/repos/myorg/workspaces/uzi/prd-103`. *(Amendment 9: this
+  read `/home/user/myorg/workspaces/uzi/prd-103`, which does not exist — every
+  repo on this host lives under `~/repos/`. The session-opening dispatch
+  carried the same wrong path, so it is inherited rather than a typo here.)*
 - **Branch point**: `0111f01c` — verified `== origin/main` after `git fetch origin`
   (0 ahead, 0 behind, clean tree) at 2026-08-04. Not `git rev-parse main`; the
-  remote was fetched first.
+  remote was fetched first. **🔴 THAT EQUALITY EXPIRED THE SAME DAY AND IS NOW FALSE
+  BY 55 COMMITS — see Amendment 9.** It is left standing rather than rewritten
+  because it is a correctly-dated measurement, and because a branch point that was
+  right when taken and wrong hours later is the exact failure the skill's fetch-first
+  precheck exists to catch.
 - **Prior record**: `prds/103-dev-loop-quality-gates.md` (the PRD),
   `.claude/agent-team-tasks/prd-103-m5.md` (27 amendments; MR-C's design is its
   `# MR-C` section), `.claude/agent-team-tasks/prd-103-carry-forward.md`
@@ -1909,3 +1917,98 @@ predicted in advance. And the *"no analogue here"* positive survived because its
 supporting arm used a build tag that excluded nothing — an instrument that could
 not produce the disconfirming answer, returning the reassuring one, banked
 specifically so nobody would look again.
+
+---
+
+# Amendment 9 — 2026-08-04, session 2 kickoff. `origin/main` moved under this branch.
+
+**Every figure in this amendment is `measured` in this worktree at `0d566949`,
+after `git fetch origin`.**
+
+## The branch point above is 55 commits stale, and the drift is not cosmetic
+
+```
+git merge-base origin/main HEAD          0111f01c  (2026-08-03T22:16:50+03:00)
+git rev-parse origin/main                21c8eb21  (2026-08-04T08:56:31Z)
+git rev-list --left-right --count origin/main...HEAD
+                                         55   31
+git merge-base --is-ancestor origin/main HEAD    -> NO
+```
+
+Issue #224 landed in full (worker ephemeral storage), and with it
+**`a6d3aa3b docs: split CLAUDE.md into a root router plus path-scoped rules`** —
+`CLAUDE.md` went **125,230 -> 46,793 bytes** and about 400 lines moved into
+`.claude/rules/{agent,go,stack,web}.md`.
+
+## The conflict surface, measured by trial merge rather than predicted
+
+Run in a throwaway `git worktree add --detach` at `0d566949`, aborted and removed,
+so this tree was never touched:
+
+```
+merge rc=1
+conflicted files:  CLAUDE.md          (3 hunks)
+auto-merged:       .gitlab-ci.yml
+                   docs/dev-conventions.md
+                   .claude/agents/tester.md
+```
+
+**The conflict is a MOVE, not a disagreement.** This branch's whole `CLAUDE.md`
+delta since the merge base is **5 insertions / 5 deletions** across four docs
+commits (`154ad390`, `0b704010`, `45af5f4a`, `4f121d8c`); the hunks are large only
+because `main` emptied the surrounding 400 lines. The resolution is therefore
+mechanical and checkable: **take `main`'s post-split `CLAUDE.md`, then re-route each
+of the five edits into whichever post-split file now holds that text** —
+
+| the branch's edit | where it lived | where it goes |
+|---|---|---|
+| `testTimeout` raised **twice** (`a5b65617` 5000->20000, `121d7610` ->60000) | Commands, serial-gates bullet | resolve at merge |
+| `gate:web` recipe gains `deps-check` | web section | `.claude/rules/web.md` |
+| `gate:agent` recipe gains `deps-check` | agent section | `.claude/rules/agent.md` |
+| `test:controller` gains `-race` | controller section | `.claude/rules/go.md` |
+| `probes/` README first line retired | Conventions | resolve at merge |
+
+## Why this lands FIRST, before Unit B and before the doc work
+
+Worklist items 3 and 4 write into `docs/dev-conventions.md` and `CLAUDE.md`. Writing
+them pre-merge puts prose into a file `main` has already emptied, and the merge then
+either drops it or resurrects a section that no longer exists. **The cost of merging
+first is one gate re-run, which the MR needs anyway; the cost of merging last is
+doing the doc work twice.**
+
+Note also that `main`'s `.claude/rules/*.md` are **path-scoped** — they load when an
+agent reads a file matching their globs, not at session start. A rule whose failure
+is irreversible belongs in the root file. That is a property of where item 4's
+durable rule goes, and it did not exist as a question when the worklist was written.
+
+## Roster — session 2
+
+**units: 3, and the split is by FILE SCOPE, not by convenience.** Unit C (the merge)
+is a prerequisite of the doc work and touches `CLAUDE.md` + `.claude/rules/`; Unit B
+(M6) touches `.gitlab-ci.yml`, `Taskfile.yml`, `web/vite.config.ts`,
+`web/package.json`, `.gitignore`; the reopened gate-recipe review is read-only over
+`scripts/*.sh`. **One shared worktree, lead-enforced writer token, exactly one writer
+unfrozen at a time** — unchanged from session 1.
+
+| role | disposition |
+|---|---|
+| coder | pending — Unit B (M6); its first act is the environment census, not config |
+| reviewer | pending — task #2 (REOPENED gate recipes, correctness/deletion lens) at a pinned SHA, then the integrated pass |
+| auditor | pending — integrated pass only; the security lens on the wrappers is already covered (Amendment 6) |
+| fact-checker | pending — the MR description's claims and this brief's carried numbers |
+| tester | **closed for now — its question is answered.** 73 runs, matched pairs, Clopper-Pearson; the outstanding items from it are DECISIONS (task #5, the cap) and EDITS (task #4, the refuted comment), not measurements. Re-open if Unit B's coverage work needs a calibration run. |
+| documenter | pending — task #7, blocked on the merge |
+| spec-keeper | pending — task #10, after the integrated pass |
+| architect | **closed — the design is frozen and was frozen by three waves.** Amendments 1-3 carry its findings; Unit B's one open design question (pragma vs `test.projects` precedence) is settled by MEASUREMENT, not by design, and the acceptance criterion is already written. |
+| web-ux | **closed — unchanged from session 1.** No rendered behaviour changes. |
+| researcher | **closed — unchanged from session 1.** |
+| release | **closed for this session — `/prd-full` stops at MR creation.** No tag, no publish, no merge. |
+
+## Design critique for THIS session's new work: closed, with the reason
+
+The only genuinely new design decision is *merge `origin/main` now vs at MR time*,
+and it was settled by a measurement (the trial merge above) rather than by argument —
+which is the same discipline Unit B's census criterion applies. Everything else in
+the worklist is either an edit whose content is already written down, a decision the
+tester's data already frames, or a validation pass. **A design wave over a spec that
+already carries eight amendments from three waves would re-derive them.**
