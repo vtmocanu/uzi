@@ -17,8 +17,11 @@ imagePullSecret:
 
 api:
   image:
-    # Locally built + kind-loaded: `docker build -t uzi-api:kind ./api` then
-    # `kind load docker-image uzi-api:kind`.
+    # `uzi-api:kind` reaches the KinD node one of two ways (PRD #230 M3): on the
+    # protected default branch, build:api's `--tarPath uzi-api.tar --destination
+    # uzi-api:kind` artifact is `kind load image-archive`d; on tags/locally it is
+    # `docker build -t uzi-api:kind ./api` + `kind load docker-image`. Either lands
+    # RepoTag uzi-api:kind, which IfNotPresent then resolves without a registry.
     repository: uzi-api
     tag: kind
     pullPolicy: IfNotPresent
