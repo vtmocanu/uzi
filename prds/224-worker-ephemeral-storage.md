@@ -1118,3 +1118,58 @@ than by a grep:
 | drop `if w.Docker` in `RenderPVCs` | 4 tests incl. `TestPVCsSizeFromThePresetAndNixIsFlat` |
 | drop the `HasDinDDataPVC` create-gate arm | `TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation` |
 | drop `dindDataPVCName` from teardown | `TestTeardownRemovesTheDinDDataPVC` |
+
+### A11 — 2026-08-04, M-b LANDED at `2a63ddb3`. A9.3's CODE scope is complete.
+
+`512Mi` plain / `4Gi` docker on the `worker` container, chart-overridable per tier
+(`workers.ephemeralRequest`, `workers.docker.ephemeralRequest` → `UZI_WORKER_EPHEMERAL_REQUEST`,
+`UZI_WORKER_DOCKER_EPHEMERAL_REQUEST`, both `ParseQuantity`-validated at boot; docker **replaces**
+plain). `preset.Size` untouched. `task gate:controller` rc=0, lint "0 issues.", deadcode "clean".
+
+**A11.1 — lead's verification against the artifact.** `render.go:1044` sets
+`ResourceEphemeralStorage` in **Requests only**; the `Limits` list immediately below is cpu and
+memory, with a comment naming the enforcing test. `TestNoContainerDeclaresAnEphemeralStorageLimit`
+exists at `render_test.go:400` and covers `.spec.containers` **and** `.spec.initContainers`, with a
+`seen < 2` guard so it cannot pass vacuously if the render ever stops producing containers. **That
+guard is the part worth noticing** — it is the *a control that produces no output is not a control*
+rule applied to an invariant test, without being asked for.
+
+**A11.2 — the mutation that matters most passed.** Folding in `limits.ephemeral-storage` "for
+symmetry" reddened `TestNoContainerDeclaresAnEphemeralStorageLimit` in **all three postures**. That
+is the exact future edit A4.3 predicted and A3.2 forbids, and it is now mechanically blocked rather
+than only documented. The other three folds (remove the request = the pre-#224 state; put a budget
+on the `dind` sidecar; raise docker to 20Gi) each reddened their intended test.
+
+**A11.3 — the chart was parsed in BOTH postures, which caught a real ordering requirement.**
+docker ON → all three vars present; docker OFF → `EPHEMERAL_REQUEST` present and both docker vars
+**absent**. That is why `UZI_WORKER_EPHEMERAL_REQUEST` is validated **outside** `validateDockerTier`
+— a plain-tier var validated inside the docker gate would go unchecked on every non-docker
+deployment. `assert-chart-render.sh`: 38 / 24 documents, one kind each.
+
+**A11.4 — doc sweep complete, seven sites, and the corrections carry a guard against their own
+misreading.** Each corrected sentence now names cpu and memory *and* states that the rule holds
+**exactly** for the constants it justifies and does not generalise — so nobody reads A3.1 as licence
+to relax `seedResources`/`dindResources`/`dindInitResources`, which is the precise error the
+withdrawn §2 bullet would have caused. Seventh site: `presetRequestsDominateTheSeed` →
+`TestSeedContainerRequestsStayUnderEveryPreset`, with a line recording that no such symbol ever
+existed. `git grep -F` sweep clean; every surviving hit is correction text naming the retired
+wording or this PRD's past-tense record. Nothing in `specs/`, `docs/`, `adr/`, `ARCHITECTURE.md` or
+`.claude/` carried either claim.
+
+**A11.5 — TWO CHECKS THE CODER DECLINED, BOTH CORRECTLY, BOTH STILL OWED.** Neither was skipped
+silently, and neither is a code change:
+
+1. **A3.9(2)'s `kubectl apply --dry-run=server`** of a rendered worker Deployment into a namespace
+   carrying the real quota + LimitRange. It needs a live cluster. **It is the only check that
+   discriminates ADMISSIBILITY**, which is the failure that presents as a worker that provisions and
+   never appears. `e2e:kind-smoke` does **not** cover it (A4.7: `workers.enabled: false`, never
+   renders a worker pod). → tester, or the rollout.
+2. **A8.8's `fsGroup` check on a real provision.** Rootless daemon uid 1000 against pod `fsGroup`
+   10001, on a freshly-provisioned PVC. Invisible to `helm template` and to every unit test; A8.8
+   calls it the most likely thing to break M-a in practice. → **first thing to check on the
+   dev-cluster run.**
+
+**A11.6 — still outstanding, none of it code.** A9.3 item 3: A1's manual pod cleanup (**two** pods,
+re-enumerate, exact names) and A9.1's reprovision of worker `8e1fef71`. Plus A9.4's four
+release-note lines, which are the documenter's. Tip carries no CI-skip marker, so a push produces a
+real pipeline.
