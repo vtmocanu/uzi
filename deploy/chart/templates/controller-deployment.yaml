@@ -160,6 +160,14 @@ spec:
             - name: UZI_WORKER_DIND_LIMIT_MEMORY
               value: {{ . | quote }}
             {{- end }}
+            # The DinD daemon's data-root PVC size (issue #224 M-a). Optional, same shape
+            # as the four above: the controller validates it as a k8s quantity at boot and
+            # falls back to its built-in 20Gi when unset. It must stay <= the docker
+            # tier's limitRange.maxPVCStorage or the apiserver rejects the claim.
+            {{- with .Values.workers.docker.dindDataSize }}
+            - name: UZI_WORKER_DIND_DATA_SIZE
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}

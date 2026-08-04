@@ -315,6 +315,137 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 	}
 }
 
+// Issue #224 M-a: the DinD daemon's data root is a THIRD PVC, and ONLY for a docker
+// worker. Both halves matter and they fail differently.
+//
+// The docker half is the fix: as an emptyDir, the daemon's image + build cache was
+// charged to the POD's ephemeral-storage usage, so a big pull made this pod the one
+// kubelet evicted under node disk pressure — and an evicted worker's in-flight run
+// loses its whole working tree, silently.
+//
+// The plain half is the blast radius. render.go builds the docker init containers,
+// mounts and volumes as slices precisely so a non-docker render stays byte-identical;
+// if the third PVC or its volume leaked into a plain worker's render, shipping a
+// DOCKER-only change would roll the ENTIRE plain fleet — every one of which is the
+// exact data-loss event this issue is about.
+func TestDinDDataPVCIsRenderedForDockerWorkersOnly(t *testing.T) {
+	for _, p := range dindPostures() {
+		// Docker: three claims, the third being the daemon's data root.
+		pvcs := RenderPVCs(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		if len(pvcs) != 3 {
+			t.Fatalf("[%s] docker worker rendered %d pvcs, want 3 (data, nix, dind-data)", p.name, len(pvcs))
+		}
+		dind := pvcs[2]
+		if dind.Name != "uzi-hw-abc-dind-data" {
+			t.Errorf("[%s] third pvc = %q, want uzi-hw-abc-dind-data", p.name, dind.Name)
+		}
+		if got := dind.Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+			t.Errorf("[%s] dind-data size = %s, want the flat 20Gi default", p.name, got)
+		}
+		if dind.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+			t.Errorf("[%s] dind-data must be RWO", p.name)
+		}
+		if dind.Spec.StorageClassName == nil || *dind.Spec.StorageClassName != "storage-class" {
+			t.Errorf("[%s] dind-data: storageClass not applied", p.name)
+		}
+		if dind.Namespace != "uzi-workers-docker" {
+			t.Errorf("[%s] dind-data namespace = %q, want the docker tier's", p.name, dind.Namespace)
+		}
+
+		// Plain: two claims, and NO object by the dind name anywhere in the set.
+		plain := RenderPVCs(p.cfg, desired("abc"), testSpec(t, "base", "m"))
+		if len(plain) != 2 {
+			t.Fatalf("[%s] plain worker rendered %d pvcs, want 2 — a docker-only volume must never reach the restricted tier", p.name, len(plain))
+		}
+		for _, q := range plain {
+			if q.Name == dindDataPVCName("abc") {
+				t.Errorf("[%s] a plain worker rendered %q", p.name, q.Name)
+			}
+		}
+
+		// ...and no such VOLUME in a plain worker's pod, which is the half that would
+		// roll the fleet rather than merely waste a claim.
+		for _, v := range RenderDeployment(p.cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Volumes {
+			if v.Name == dindDataVolume {
+				t.Errorf("[%s] a plain worker's pod carries the %q volume", p.name, dindDataVolume)
+			}
+		}
+	}
+}
+
+// The volume SOURCE, asserted positively against a control. "No EmptyDir" alone would
+// pass on a volume that is neither (an unset VolumeSource renders as an empty
+// {} and the apiserver rejects it), so assert the claim IS a PVC and names the right
+// claim — and keep run-workdir in the same test as the control that proves the
+// assertion discriminates: it is still an emptyDir and MUST stay one (it holds the
+// run's checkout, so bounding or persisting it is the opposite of this fix).
+func TestDinDDataVolumeIsAPVCAndRunWorkdirIsStillAnEmptyDir(t *testing.T) {
+	for _, p := range dindPostures() {
+		vols := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Volumes
+
+		data := volumeByName(t, vols, dindDataVolume)
+		if data.PersistentVolumeClaim == nil {
+			t.Fatalf("[%s] %s is not a PVC (source = %+v). As an emptyDir its bytes count toward the pod's "+
+				"ephemeral-storage usage, which is what got workers evicted (issue #224).", p.name, dindDataVolume, data.VolumeSource)
+		}
+		if got := data.PersistentVolumeClaim.ClaimName; got != "uzi-hw-abc-dind-data" {
+			t.Errorf("[%s] %s claimName = %q, want uzi-hw-abc-dind-data", p.name, dindDataVolume, got)
+		}
+		if data.EmptyDir != nil {
+			t.Errorf("[%s] %s carries BOTH a PVC and an emptyDir source", p.name, dindDataVolume)
+		}
+
+		// The control.
+		work := volumeByName(t, vols, dindWorkdirVolume)
+		if work.EmptyDir == nil {
+			t.Errorf("[%s] %s must stay an emptyDir: it holds the run's working tree, and this issue exists "+
+				"to stop that tree being destroyed, not to bound it", p.name, dindWorkdirVolume)
+		}
+	}
+}
+
+// The size is flat, chart-overridable, and — deliberately — NOT part of the pod's
+// spec hash.
+//
+// That last property is easy to read as a bug and is the correct behaviour: the pod
+// template only NAMES the claim, so raising the size cannot roll a worker, and it must
+// not pretend to. PVCs are never patched here (RenderPVCs' own header), so a size
+// change applies to newly-provisioned workers and existing ones need delete +
+// reprovision — exactly what /data and /nix already do. A roll would produce a pod
+// that restarts and then mounts the SAME old claim, i.e. a disruption that changes
+// nothing.
+func TestDinDDataSizeDefaultsOverridesAndDoesNotRollThePod(t *testing.T) {
+	dindPVC := func(cfg RenderConfig) *corev1.PersistentVolumeClaim {
+		t.Helper()
+		pvcs := RenderPVCs(cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		return pvcs[len(pvcs)-1]
+	}
+
+	if got := dindPVC(dockerTestConfig()).Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+		t.Errorf("default dind-data size = %s, want 20Gi", got)
+	}
+
+	over := dockerTestConfig()
+	over.DinDDataSize = "40Gi"
+	if got := dindPVC(over).Spec.Resources.Requests.Storage().String(); got != "40Gi" {
+		t.Errorf("overridden dind-data size = %s, want 40Gi", got)
+	}
+
+	// The override does not touch the pod template, in EITHER direction.
+	if a, b := SpecHashOf(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(over, desiredDocker("abc"), testSpec(t, "base", "m")); a != b {
+		t.Error("changing the dind-data PVC size changed the docker worker's spec hash; it must not — " +
+			"the pod names the claim, never its size, and rolling the pod would remount the same old claim")
+	}
+	// And a plain worker's hash is untouched by the setting existing at all — the same
+	// guard TestDockerFlagRollsThePodButAbsentDockerIsInert applies to the docker tier
+	// config as a whole, restated for the one knob added here.
+	if a, b := SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(over, desired("abc"), testSpec(t, "base", "m")); a != b {
+		t.Error("a plain worker's spec hash depends on the dind-data size; a docker-only knob must never roll the plain fleet")
+	}
+}
+
 // The CA relay: hosted workers are in a different namespace and cannot mount the
 // api's TLS Secret, so the CA rides the per-worker Secret this controller already
 // creates. No new RBAC verb — Decision 1's Secrets line stays verbatim.
@@ -682,14 +813,21 @@ func TestDockerWorkerKeepsWorkerPostureAndPrivilegesOnlyTheSidecar(t *testing.T)
 				t.Fatal("dind-init must run as root (uid 0) to chown/chmod the socket dir")
 			}
 			caps := dindInit.SecurityContext.Capabilities
-			if caps == nil || len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
+			// FATAL, not Error: a nil capability set means every assertion below is
+			// vacuous, and reading caps.Add past a non-fatal Error is a real nil
+			// dereference — the test would PANIC rather than report the security
+			// regression it exists to catch.
+			if caps == nil {
+				t.Fatal("dind-init declares no capabilities at all; it must drop ALL and add back exactly CHOWN + FOWNER")
+			}
+			if len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
 				t.Error("dind-init must drop ALL capabilities")
 			}
 			gotAdd := map[corev1.Capability]bool{}
 			for _, c := range caps.Add {
 				gotAdd[c] = true
 			}
-			if caps == nil || len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
+			if len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
 				t.Errorf("dind-init must add exactly [CHOWN, FOWNER] and nothing else, got %v", caps.Add)
 			}
 		})

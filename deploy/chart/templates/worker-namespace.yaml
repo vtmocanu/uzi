@@ -70,8 +70,13 @@ metadata:
   reason; the LimitRange below is the backstop, not the source.
 
   Sized against the fleet: 20 x `m` = 10 CPU / 40Gi requested, and 20 x (10Gi data +
-  4Gi nix) = 280Gi of PVC. Storage is the binding constraint, not CPU or memory.
+  20Gi nix) = 600Gi of PVC. Storage is the binding constraint, not CPU or memory.
   dev-cluster's real budget is M6's rollout conversation.
+
+  The nix term is 20Gi, not the 4Gi this comment carried until issue #224: PRD #87
+  bumped nixSize and did not follow it here, leaving the tier able to hold 9 of the
+  20 workers it advertises. The arithmetic and values.yaml's copy of it move together
+  whenever nixSize or a preset's DataSize does.
 */}}
 ---
 apiVersion: v1

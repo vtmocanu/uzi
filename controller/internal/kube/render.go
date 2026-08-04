@@ -34,6 +34,9 @@ const (
 	tokenSuffix = "-token"
 	dataSuffix  = "-data"
 	nixSuffix   = "-nix"
+	// dindDataSuffix names the DinD daemon's data-root claim (issue #224 M-a).
+	// DOCKER workers only — a plain worker renders no such PVC.
+	dindDataSuffix = "-dind-data"
 )
 
 // Labels. The managed-by stamp is PROVENANCE, and provenance is what makes
@@ -156,8 +159,9 @@ const (
 )
 
 // The docker sidecar's wiring (PRD #83 M3). The socket dir is a shared emptyDir
-// carrying ONLY the daemon socket; the data dir is the rootless daemon's own root,
-// on a private emptyDir mounted into `dind` alone.
+// carrying ONLY the daemon socket; the data dir is the daemon's own root, on a
+// private PVC mounted into `dind` alone (issue #224 M-a — it was an emptyDir until
+// then; see dindDataDefaultSize).
 const (
 	dindSocketDir  = "/run/dind"
 	dindSocketPath = dindSocketDir + "/docker.sock"
@@ -229,6 +233,42 @@ const (
 	dindDefaultLimitCPU      = "2"
 	dindDefaultLimitMemory   = "2Gi"
 )
+
+// dindDataDefaultSize is the DinD daemon's data-root PVC — the images + build cache
+// (issue #224 M-a). It was an emptyDir until then, and moving it off node ephemeral
+// storage is the whole point: an emptyDir's bytes are charged to the POD's
+// ephemeral-storage usage, so a runaway image pull made the worker the pod kubelet
+// evicted under node disk pressure, which destroys the run's working tree. On a PVC
+// the daemon simply runs out of space: the docker step fails with ENOSPC, the pod
+// survives, and the tree survives with it. Backpressure instead of eviction.
+//
+// FLAT, and chart-overridable per cluster (UZI_WORKER_DIND_DATA_SIZE), for exactly
+// nixSize's reasons: the size tracks the user's repo images, not the worker's
+// CPU/RAM preset, so a per-size table here would be one repeated number.
+//
+// 20Gi is the top of the chart's own documented dind band, AND it is the ceiling:
+// the worker namespaces' LimitRange caps a PVC at maxPVCStorage (20Gi), and the
+// limitranger validates PVC creates, so a larger value is rejected at admission
+// rather than merely being expensive. Raising this means raising that too.
+//
+// RESIDUAL, documented rather than built, and it is the identical one nixSize
+// carries for /nix: the cache now PERSISTS across pod rolls and nothing garbage-
+// collects it, so a long-lived docker worker's image cache only grows into this
+// fixed volume. The emptyDir at least died with the pod. `docker system prune` is
+// the remedy and an agent can run it; v1's fallback is the same as everywhere else
+// here — delete + reprovision.
+const dindDataDefaultSize = "20Gi"
+
+// dindDataSize is the DinD data-root PVC size: the cluster's override when set,
+// dindDataDefaultSize otherwise. Config validated any override string as a k8s
+// quantity at boot, so MustParse here is safe — the same contract dindResources
+// relies on.
+func (cfg RenderConfig) dindDataSize() resource.Quantity {
+	if cfg.DinDDataSize != "" {
+		return resource.MustParse(cfg.DinDDataSize)
+	}
+	return resource.MustParse(dindDataDefaultSize)
+}
 
 // dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
 // dindDefault* constants for any field a cluster did not override (config validated every
@@ -346,6 +386,12 @@ type RenderConfig struct {
 	DinDRequestMemory string
 	DinDLimitCPU      string
 	DinDLimitMemory   string
+	// DinDDataSize overrides the DinD daemon's data-root PVC size (issue #224 M-a).
+	// Empty ⇒ dindDataDefaultSize ("20Gi"). A quantity string, validated at the
+	// controller's boot so the render side can MustParse it. Docker-only, so it never
+	// touches a plain worker's spec/hash. See dindDataDefaultSize for the 20Gi
+	// admission ceiling and the no-GC residual.
+	DinDDataSize string
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -374,6 +420,10 @@ func deploymentName(id string) string { return NamePrefix + id }
 func secretName(id string) string     { return NamePrefix + id + tokenSuffix }
 func dataPVCName(id string) string    { return NamePrefix + id + dataSuffix }
 func nixPVCName(id string) string     { return NamePrefix + id + nixSuffix }
+
+// dindDataPVCName is the DinD daemon's data root (issue #224 M-a). Rendered for
+// docker workers only, so a plain worker never has an object by this name.
+func dindDataPVCName(id string) string { return NamePrefix + id + dindDataSuffix }
 
 // objectLabels is the stamp every created object carries.
 func objectLabels(id string) map[string]string {
@@ -428,23 +478,34 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 	}
 }
 
-// RenderPVCs builds the /data and /nix claims.
+// RenderPVCs builds the /data and /nix claims, plus — for a DOCKER worker only —
+// the DinD daemon's data root.
 //
-// Two volumes, pointing opposite ways for opposite reasons. /data is the clone
+// The first two point opposite ways for opposite reasons. /data is the clone
 // cache + per-run workspaces and varies by size. /nix is FLAT (20Gi, PRD #87 bump
 // for the prebaked Chromium closure) and persists because the store is an expensive
 // INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
 // and Decision 9 rolls every worker on every release —
 // so not persisting it would pay that cost per worker per release.
 //
+// The third is issue #224 M-a: the daemon's image + build cache, moved off the pod's
+// ephemeral storage so a runaway pull produces ENOSPC in the daemon instead of a
+// kubelet eviction that destroys the run's working tree. Flat, and rendered ONLY
+// when w.Docker — a plain worker's object set is unchanged, which is the same
+// property the docker branch of podTemplate preserves for its spec hash.
+//
 // Never patched. PVC specs are near-immutable and a size change is delete +
 // reprovision.
 func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []*corev1.PersistentVolumeClaim {
 	ns := cfg.namespaceFor(w)
-	return []*corev1.PersistentVolumeClaim{
+	pvcs := []*corev1.PersistentVolumeClaim{
 		renderPVC(cfg, ns, w.ID, dataPVCName(w.ID), spec.Size.DataSize),
 		renderPVC(cfg, ns, w.ID, nixPVCName(w.ID), spec.NixSize),
 	}
+	if w.Docker {
+		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize()))
+	}
+	return pvcs
 }
 
 func renderPVC(cfg RenderConfig, ns, id, name string, size resource.Quantity) *corev1.PersistentVolumeClaim {
@@ -787,10 +848,17 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindWorkdirVolume, MountPath: dindWorkdirDir})
 		volumes = append(volumes,
 			// The daemon's data root, mounted into `dind` ALONE (rootless HOME path or
-			// /var/lib/docker per posture). emptyDir in v1 (a PVC is the durable/size
-			// alternative, arch §Q4); this is the images + build cache the daemon writes,
-			// none of it worker state.
-			corev1.Volume{Name: dindDataVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			// /var/lib/docker per posture). Its OWN PVC since issue #224 M-a — it was the
+			// emptyDir arch §Q4 flagged, and an emptyDir's bytes count toward the pod's
+			// ephemeral-storage usage, which is what made a big image pull get the worker
+			// EVICTED and its in-flight run's tree destroyed. This is the images + build
+			// cache the daemon writes, none of it worker state, and Decision 3 is
+			// untouched: it stays mounted into `dind` alone.
+			corev1.Volume{Name: dindDataVolume, VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: dindDataPVCName(w.ID),
+				},
+			}},
 			// The shared run workdir (M-workdir). emptyDir, so it is torn down with the pod
 			// and is never a persistence surface; carries the run's checkout, NO secrets.
 			corev1.Volume{Name: dindWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
@@ -859,8 +927,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 				VolumeMounts: workerMounts,
 			}},
 			// Built above: [token, data, nix] plus, for a docker worker, the daemon's
-			// private data root + the shared run workdir emptyDirs (and, rootless only,
-			// the shared socket-dir emptyDir).
+			// private data-root PVC (issue #224 M-a) + the shared run workdir emptyDir
+			// (and, rootless only, the shared socket-dir emptyDir).
 			Volumes: volumes,
 		},
 	}

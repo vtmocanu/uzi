@@ -77,10 +77,13 @@ func main() {
 		DinDNonRootless: !cfg.WorkerDinDRootless,
 		// DinD resource overrides (PRD #89 0.8.1), requests + limits; empty leaves the
 		// render default.
-		DinDRequestCPU:     cfg.WorkerDinDRequestCPU,
-		DinDRequestMemory:  cfg.WorkerDinDRequestMemory,
-		DinDLimitCPU:       cfg.WorkerDinDLimitCPU,
-		DinDLimitMemory:    cfg.WorkerDinDLimitMemory,
+		DinDRequestCPU:    cfg.WorkerDinDRequestCPU,
+		DinDRequestMemory: cfg.WorkerDinDRequestMemory,
+		DinDLimitCPU:      cfg.WorkerDinDLimitCPU,
+		DinDLimitMemory:   cfg.WorkerDinDLimitMemory,
+		// The DinD daemon's data-root PVC size (issue #224 M-a); empty leaves the render
+		// default.
+		DinDDataSize:       cfg.WorkerDinDDataSize,
 		ServiceAccountName: cfg.WorkerServiceAccount,
 		APIURL:             cfg.WorkerAPIURL,
 		StorageClass:       cfg.WorkerStorageClass,

@@ -150,6 +150,14 @@ type Config struct {
 	WorkerDinDRequestMemory string
 	WorkerDinDLimitCPU      string
 	WorkerDinDLimitMemory   string
+	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
+	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
+	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
+	// even when the docker tier is on, and validated as a k8s Quantity when set, so a
+	// typo fails at boot rather than at admission. Note the worker namespaces'
+	// LimitRange caps a PVC at maxPVCStorage (20Gi), so a larger value here is
+	// rejected by the apiserver unless that is raised too.
+	WorkerDinDDataSize string
 }
 
 // Load reads and validates the configuration.
@@ -311,9 +319,10 @@ func validateDockerTier(cfg *Config) error {
 	}
 	cfg.WorkerDinDRootless = rootless
 
-	// Optional DinD resource overrides (PRD #89 0.8.1), requests + limits both. Validated as
-	// k8s Quantity strings when set so a typo fails at boot, not at the far end when the
-	// apiserver rejects the rendered pod. Empty leaves the render side's built-in default.
+	// Optional DinD resource overrides (PRD #89 0.8.1), requests + limits both, plus the
+	// daemon's data-root PVC size (issue #224 M-a). Validated as k8s Quantity strings when
+	// set so a typo fails at boot, not at the far end when the apiserver rejects the
+	// rendered pod. Empty leaves the render side's built-in default.
 	quantities := []struct {
 		key string
 		dst *string
@@ -322,6 +331,7 @@ func validateDockerTier(cfg *Config) error {
 		{"UZI_WORKER_DIND_REQUEST_MEMORY", &cfg.WorkerDinDRequestMemory},
 		{"UZI_WORKER_DIND_LIMIT_CPU", &cfg.WorkerDinDLimitCPU},
 		{"UZI_WORKER_DIND_LIMIT_MEMORY", &cfg.WorkerDinDLimitMemory},
+		{"UZI_WORKER_DIND_DATA_SIZE", &cfg.WorkerDinDDataSize},
 	}
 	for _, q := range quantities {
 		v := strings.TrimSpace(os.Getenv(q.key))

@@ -62,8 +62,10 @@ metadata:
 {{- /*
   The docker tier's own ResourceQuota (Decision 8's k8s floor, per-tier). Docker
   workers cost more than a plain one — the worker preset PLUS the DinD sidecar PLUS the
-  daemon's emptyDir image/build cache — so this tier is budgeted separately from the
-  restricted default's.
+  daemon's image/build cache, which since issue #224 M-a is a THIRD PVC per worker
+  rather than an emptyDir — so this tier is budgeted separately from the restricted
+  default's. Sized for the 10 workers `count/deployments.apps` advertises:
+  10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi across 30 claims.
 
   Same load-bearing side effect: a quota on requests.* makes admission REJECT any pod
   with a container declaring no requests — initContainers and native sidecars
@@ -85,8 +87,12 @@ spec:
     requests.memory: {{ .Values.workers.docker.quota.requestsMemory | quote }}
     requests.storage: {{ .Values.workers.docker.quota.requestsStorage | quote }}
     {{- with .Values.workers.docker.quota.ephemeralStorage }}
-    # The DinD daemon's data root is an emptyDir on node ephemeral storage; bound it so
-    # a runaway image pull cannot fill a node.
+    # A ceiling on what workers DECLARE, and nothing more — see values.yaml for the
+    # two false claims this comment used to make. The daemon's data root is a PVC
+    # since issue #224 M-a (charged to requests.storage above, never node ephemeral
+    # storage), and this key can never force a container to declare the resource:
+    # the quota evaluator enforces cpu and memory only, so an undeclaring pod is
+    # admitted and counted as 0.
     requests.ephemeral-storage: {{ . | quote }}
     {{- end }}
     persistentvolumeclaims: {{ .Values.workers.docker.quota.persistentVolumeClaims | quote }}

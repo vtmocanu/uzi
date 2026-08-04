@@ -603,4 +603,33 @@ func TestLoadDockerDinDResourceDefaultsEmpty(t *testing.T) {
 		t.Errorf("unset dind resources must stay empty, got req %q/%q lim %q/%q",
 			cfg.WorkerDinDRequestCPU, cfg.WorkerDinDRequestMemory, cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
 	}
+	// Issue #224 M-a: the data-root size is the same shape — unset means "let the
+	// render side pick", never a zero quantity.
+	if cfg.WorkerDinDDataSize != "" {
+		t.Errorf("unset UZI_WORKER_DIND_DATA_SIZE must stay empty, got %q", cfg.WorkerDinDDataSize)
+	}
+}
+
+// The DinD data-root PVC size (issue #224 M-a): read when set, and validated as a k8s
+// Quantity at BOOT. The far end is worse than usual for this one — an unparseable size
+// would surface as a PVC the apiserver rejects, i.e. a worker that provisions and never
+// appears, with nothing in the controller's own logs naming the cause.
+func TestLoadDockerDinDDataSize(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "40Gi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDDataSize != "40Gi" {
+		t.Fatalf("dind data size = %q, want 40Gi", cfg.WorkerDinDDataSize)
+	}
+
+	t.Setenv("UZI_WORKER_DIND_DATA_SIZE", "20GB!") // not a k8s quantity
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_DATA_SIZE") {
+		t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DIND_DATA_SIZE", err)
+	}
 }

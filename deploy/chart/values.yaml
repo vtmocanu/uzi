@@ -377,9 +377,20 @@ workers:
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
-  # Sized for a fleet of 20 x `m`: 10 CPU / 40Gi requested, 20 x (10Gi data + 4Gi nix)
-  # = 280Gi of PVC. STORAGE is the binding constraint, not CPU or memory.
-  # dev-cluster's real budget is M6's rollout conversation.
+  # Sized for a fleet of 20 x `m` — the number `deployments` below advertises:
+  # 10 CPU / 40Gi requested, and 20 x (10Gi data + 20Gi nix) = 600Gi of PVC. STORAGE
+  # is the binding constraint, not CPU or memory. dev-cluster's real budget is M6's
+  # rollout conversation.
+  #
+  # THE NIX TERM IS 20Gi, NOT THE 4Gi THIS COMMENT CARRIED UNTIL ISSUE #224. PRD #87
+  # bumped nixSize (controller/internal/preset/preset.go) for the prebaked Chromium
+  # closure and did not follow the value into this arithmetic, so the quota was
+  # 2.14x too small for the fleet its own comment claimed to size — at 280Gi this
+  # tier held 9 workers, not 20, and the 11th would have been refused with a QUOTA
+  # error rather than a scheduling one, which no test in this repo can see. Raising a
+  # quota PROVISIONS NOTHING (it is a ceiling on claims, not a reservation), so the
+  # correction costs zero storage until the workers actually exist. If nixSize or a
+  # preset's DataSize moves again, this number moves with it.
   #
   # SIDE EFFECT, and it is load-bearing: a quota on requests.* makes admission reject
   # any pod with a container declaring no requests — initContainers included. The
@@ -388,7 +399,7 @@ workers:
     enabled: true
     requestsCPU: "10"
     requestsMemory: 40Gi
-    requestsStorage: 280Gi
+    requestsStorage: 600Gi
     persistentVolumeClaims: "40"
     deployments: "20"
   # The backstop, never the source: every hosted worker pod arrives from the
@@ -505,18 +516,43 @@ workers:
       extraExcept: []
     # Namespace ResourceQuota for the docker tier (Decision 8's floor, per-tier).
     # Docker workers cost MORE than a plain one: the worker preset PLUS the DinD
-    # sidecar (~1-2 GiB / ~1 CPU, arch §Q4) PLUS the daemon's emptyDir image/build
-    # cache (~5-20 GiB, arch §Q4). Sized smaller than the default tier because the
-    # docker tier is opt-in and expected to hold few workers; tune at rollout.
+    # sidecar (~1-2 GiB / ~1 CPU, arch §Q4) PLUS the daemon's image/build cache — which
+    # since issue #224 M-a is its OWN PVC (dindDataSize below), not an emptyDir on node
+    # ephemeral storage.
+    #
+    # Sized for the 10 workers `deployments` advertises, at THREE PVCs each:
+    # 10 x (20Gi data + 20Gi nix + 20Gi dind) = 600Gi, and 10 x 3 = 30 claims. The data
+    # term is `l`'s, the worst case. STORAGE is the binding constraint here too — and it
+    # already was before M-a: at 140Gi / 20 claims this tier held 3 `l` workers against
+    # the 10 it advertises, so the triple was never self-consistent. Raising a quota
+    # PROVISIONS NOTHING (a ceiling on claims, not a reservation), so this costs zero
+    # storage until the workers exist.
     quota:
       enabled: true
       requestsCPU: "8"
       requestsMemory: 32Gi
-      requestsStorage: 140Gi
-      # emptyDir dind data roots land on node ephemeral storage; bound it so a runaway
-      # image pull cannot fill a node.
+      requestsStorage: 600Gi
+      # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
+      # falsified the first of them a second time over. It read: "emptyDir dind data
+      # roots land on node ephemeral storage; bound it so a runaway image pull cannot
+      # fill a node."
+      #
+      #   - The dind data root is a PVC as of M-a, charged to requests.storage above.
+      #     It is not on node ephemeral storage at all. (And while it WAS an emptyDir,
+      #     a ResourceQuota never observed its usage either — quota accounts declared
+      #     requests, not consumption.)
+      #   - This key cannot bound a runaway image pull, and could not have. Unlike
+      #     requests.cpu / requests.memory it can never FORCE a container to declare
+      #     the resource: the quota evaluator's validation set is cpu and memory only,
+      #     which upstream calls a frozen mistake and explicitly says not to extend.
+      #     So `used` reads "0" for any pod that declares nothing — exactly the
+      #     situation that let a node fill up and get a worker EVICTED (issue #224).
+      #
+      # It is kept as an honest ceiling on what workers DECLARE, which is what the
+      # controller's per-worker requests.ephemeral-storage feeds. It is not a guard
+      # against consumption, and nothing should be sized on the belief that it is.
       ephemeralStorage: 200Gi
-      persistentVolumeClaims: "20"
+      persistentVolumeClaims: "30"
       deployments: "10"
     # The backstop, never the source (the controller renders explicit requests+limits
     # on every container, sidecars included). `max` must stay >= the largest worker
@@ -551,6 +587,24 @@ workers:
       limits:
         cpu: "2"
         memory: 2Gi
+    # The DinD daemon's data root — its image and build cache — as a PER-WORKER PVC
+    # (issue #224 M-a → UZI_WORKER_DIND_DATA_SIZE). It was an emptyDir, and an
+    # emptyDir's bytes are charged to the POD's ephemeral-storage usage, so a large
+    # image pull made the worker the pod kubelet EVICTED under node disk pressure —
+    # which destroys the in-flight run's working tree with no trace beyond a normal-
+    # looking re-claim. On a PVC the daemon just runs out of room: the docker step
+    # fails with ENOSPC, the pod lives, the tree lives.
+    #
+    # 20Gi is also the CEILING, not just the default: limitRange.maxPVCStorage above
+    # is 20Gi and the limitranger validates PVC creates, so a larger value is rejected
+    # at admission. Raise both together, and raise quota.requestsStorage with them.
+    #
+    # THE CACHE NOW PERSISTS ACROSS ROLLS AND NOTHING GC's IT — the same residual the
+    # controller documents for /nix. The emptyDir at least died with the pod; this
+    # only grows into a fixed volume. `docker system prune` is the remedy (an agent
+    # can run it); otherwise it is delete + reprovision, as everywhere else here.
+    # Empty falls back to the controller's built-in 20Gi.
+    dindDataSize: 20Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).
