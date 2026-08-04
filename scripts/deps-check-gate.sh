@@ -120,27 +120,71 @@ rc1=0
 (cd "$PKG_DIR" && npm run deps-check) >"$TMP/out" 2>&1 || rc1=$?
 cat "$TMP/out"
 if [ "$rc1" -ne 0 ]; then
-  echo "deps-check-gate: $PKG_DIR -- node_modules does not satisfy package.json." >&2
-  status=1
+  # 🔴 THE FINDINGS BRANCH NEEDS A POSITIVE OBSERVATION, NOT MERELY A NON-ZERO RC.
+  # `npm run` returns 1 for "npm ls found a dependency problem" AND for every way
+  # npm can fail to run at all -- a package.json with no `deps-check` script
+  # (`Missing script: "deps-check"`), npm absent from PATH, an npm crash. Mapping
+  # all of those to status=1 announces "node_modules does not satisfy
+  # package.json", which is a verdict about a tree this script never inspected.
+  # Same shape as scripts/npm-audit-gate.sh's network branch, and the same fix:
+  # require the output to carry npm ls's own finding vocabulary before calling it
+  # a finding, and exit 2 otherwise. It fails CLOSED either way -- what this
+  # protects is the 2/1/0 convention that makes a red READABLE, which
+  # scripts/govulncheck-gate.sh's header exists to preserve.
+  #
+  # The tokens are npm ls's, not ours: `npm ls` prints `invalid:`, `missing:`,
+  # `extraneous`, `UNMET DEPENDENCY` or an `ELSPROBLEMS` code on a real finding.
+  if grep -q -E 'invalid:|missing:|extraneous|UNMET DEPENDENCY|ELSPROBLEMS' "$TMP/out"; then
+    echo "deps-check-gate: $PKG_DIR -- node_modules does not satisfy package.json." >&2
+    status=1
+  else
+    echo "deps-check-gate: 'npm run deps-check' in $PKG_DIR exited $rc1 without" >&2
+    echo "  reporting any dependency problem. INSTRUMENT FAILURE, NOT A FINDING." >&2
+    echo "  Its output is above. The usual causes are a package.json with no" >&2
+    echo "  deps-check script, or npm missing from PATH." >&2
+    exit 2
+  fi
 fi
 
 # ---- line 2: installed vs the RESOLVED lockfile version -------------------------
 skew="$(node -e '
 const fs = require("fs");
 const dir = process.argv[1];
-const read = (p) => JSON.parse(fs.readFileSync(p, "utf8")).packages || {};
-const lock = read(dir + "/package-lock.json");
-const inst = read(dir + "/node_modules/.package-lock.json");
-const rows = [];
+// 🔴 NO `|| {}` FALLBACK ON `packages`. An installed lockfile without that key
+// (lockfileVersion 1) yielded ZERO ROWS and read as up-to-date -- the
+// empty-result-set-looks-clean shape this file already guards against forty
+// lines up, reintroduced by a defensive default. Latent under npm 11, which
+// writes v3, and that is exactly the kind of latency that outlives the npm
+// version somebody checked. Fail closed instead.
+const read = (p, what) => {
+  const j = JSON.parse(fs.readFileSync(p, "utf8"));
+  if (!j.packages || typeof j.packages !== "object") {
+    throw new Error(what + " has no `packages` map (lockfileVersion " + j.lockfileVersion + "?)");
+  }
+  return j.packages;
+};
+const lock = read(dir + "/package-lock.json", "package-lock.json");
+const inst = read(dir + "/node_modules/.package-lock.json", "node_modules/.package-lock.json");
+// A lockfile entry that is optional, or platform-gated by os/cpu/libc, is
+// legitimately absent from THIS machine s tree. Everything else is not.
+const platformGated = (v) => Boolean(v.optional || v.os || v.cpu || v.libc);
+const skewRows = [], missingRows = [];
 for (const [k, v] of Object.entries(lock)) {
   if (k === "" || !v.version) continue;
   const i = inst[k];
-  // INTERSECTION ONLY. A key absent from the installed tree is almost always
-  // another platform s optional binary, not a stale package.
-  if (!i || !i.version) continue;
-  if (i.version !== v.version) rows.push(k + "  lockfile=" + v.version + "  installed=" + i.version);
+  if (!i || !i.version) {
+    // ABSENCE, which the intersection-only join was blind to. This is the state a
+    // `git pull` adding a TRANSITIVE dependency produces: the branch lockfile
+    // declares it, node_modules has never seen it, `npm ls` has no declared range
+    // to check it against, and require() fails at runtime while the gate says
+    // up to date. Suppressed only for platform-gated entries, which is what the
+    // intersection was really for -- a raw diff gives ~370 spurious rows.
+    if (!platformGated(v)) missingRows.push(k + "  lockfile=" + v.version + "  installed=(absent)");
+    continue;
+  }
+  if (i.version !== v.version) skewRows.push(k + "  lockfile=" + v.version + "  installed=" + i.version);
 }
-process.stdout.write(rows.sort().join("\n"));
+process.stdout.write(skewRows.sort().concat(missingRows.sort()).join("\n"));
 ' "$PKG_DIR")" || {
   echo "deps-check-gate: could not read $PKG_DIR's lockfiles. INSTRUMENT FAILURE." >&2
   exit 2
@@ -151,6 +195,8 @@ if [ -n "$skew" ]; then
   echo "$skew" | sed -e 's/^/  /'
   echo "  These are RESOLVED versions, so transitive packages appear here and cannot"
   echo "  appear above: a transitive bump has no declared range for npm ls to check."
+  echo "  An '(absent)' row is a package the lockfile declares and the tree has never"
+  echo "  installed; platform-gated entries (optional/os/cpu/libc) are excluded."
   echo "  Run 'cd $PKG_DIR && npm ci --ignore-scripts'."
   status=1
 fi

@@ -50,12 +50,12 @@
 # -test`, so a reader arriving from that file assumes symmetry; writing the value
 # out makes the asymmetry visible instead of hidden in a default. The reason for
 # the value: this gate's predicate is "is a vulnerable function reachable from
-# SHIPPED code". `-test` would add 293 api and 10 controller test files to the
+# SHIPPED code". `-test` would add 293 api and 11 controller test files to the
 # call graph, none of which is in any image -- and because these targets are
 # reachable from jobs in `.publish_needs`, a test-only finding would block a
 # RELEASE for a path that does not ship. govulncheck has NO suppression,
 # baseline or allowlist mechanism of any kind (`-h` at v1.1.4 offers only
-# -C -db -format -mode -scan -show -tags -test), so every widening of scope is a
+# -C -db -format -json -mode -scan -show -tags -test), so every widening of scope is a
 # widening of the UNREMEDIABLE-red surface. Enabling it changes nothing today
 # (both modules read 0 called either way), which is exactly when the decision is
 # cheap to make deliberately.
@@ -122,9 +122,23 @@ fi
 # tell contributors to export it in a linked worktree -- so a blanket refusal would
 # make this gate unrunnable in exactly the shells that run `task gate`. Build tags
 # are what shrink the package set; `-buildvcs` cannot.
-case "${GOFLAGS:-}" in
+#
+# 🔴 READ `go env GOFLAGS`, NOT `$GOFLAGS`. The environment variable is only one of
+# three routes to the same file selection, and the other two leave it EMPTY, so a
+# `case "${GOFLAGS:-}"` guard passes while the tags are in force: `GOENV=<file>`
+# naming a file that sets GOFLAGS, and a persisted `go env -w GOFLAGS=-tags=...` in
+# the user's default env file. Measured by the Unit B reviewer via GOENV -- the
+# stubbed build produced `[main.go stub.go]` against the control's
+# `[main.go normal.go]` -- with an empty GOFLAGS throughout. `go env GOFLAGS`
+# resolves all three with one read, because it is the same resolution the build
+# itself performs. No GOENV file exists on this host today; the guard is for the
+# route, not the instance.
+effective_goflags="$(go env GOFLAGS 2>/dev/null || true)"
+case "$effective_goflags" in
   *-tags*)
-    echo "govulncheck-gate: GOFLAGS contains -tags. Refused." >&2
+    echo "govulncheck-gate: the effective GOFLAGS contains -tags. Refused." >&2
+    echo "  Read from \`go env GOFLAGS\`, which resolves the environment variable," >&2
+    echo "  a GOENV=<file> override and a persisted \`go env -w\` alike." >&2
     echo "  Build tags select which files compile, so a tag that excludes the file" >&2
     echo "  holding the vulnerable call makes this gate report clean. GOFLAGS itself" >&2
     echo "  is fine and is deliberately still honoured: -buildvcs=false is a" >&2
@@ -133,11 +147,22 @@ case "${GOFLAGS:-}" in
     ;;
 esac
 
-# GOOS/GOARCH are NOT refused and fail closed by ACCIDENT rather than by design --
-# recorded so nobody "tidies away" the check that catches them. A cross GOOS makes
-# `go install` write the binary to $GOBIN/<goos>_<goarch>/, so the `[ ! -x ... ]`
-# test below does not find it and this script exits 2. Right outcome, incidental
-# cause: if that install check is ever loosened, this hole opens.
+# GOOS/GOARCH are NOT refused and fail closed, and the MECHANISM is the install
+# refusing outright -- recorded so nobody "tidies away" the check that catches them.
+#
+# 🔴 CORRECTED 2026-08-04 (PRD #103 MR-C, Unit B review). This said the cross-built
+# binary lands in $GOBIN/<goos>_<goarch>/ so the `[ ! -x ... ]` test below misses it,
+# and warned that "if that install check is ever loosened, this hole opens." Both
+# halves are wrong. Measured twice independently on go1.26.5:
+#
+#   GOBIN=<tmp> GOOS=linux GOARCH=amd64 go install <pkg@version>
+#     -> rc=1, "go: cannot install cross-compiled binaries when GOBIN is set",
+#        $GOBIN never created
+#
+# So the exit 2 comes from the `irc -ne 0` arm and NEVER from the `-x` arm, and
+# loosening the `-x` test opens nothing. The <goos>_<goarch>/ subdirectory is what
+# `go install` does when GOBIN is UNSET; this script always sets it, three lines
+# down, which is precisely why the refusal fires.
 
 # No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
 TMP="$(mktemp -d)"
@@ -150,7 +175,19 @@ irc=0
 GOBIN="$TMP/bin" go install "$TOOL" >"$TMP/install.out" 2>&1 || irc=$?
 if [ "$irc" -ne 0 ] || [ ! -x "$TMP/bin/govulncheck" ]; then
   cat "$TMP/install.out" >&2
-  echo "govulncheck-gate: could not install $TOOL (exit $irc)." >&2
+  # Two arms, two messages. The `-x` arm is reachable at irc=0 -- a pkg@version
+  # whose binary is not named `govulncheck` installs fine and lands elsewhere in
+  # $GOBIN -- and reporting that as "could not install (exit 0)" is a
+  # self-contradiction that sends the reader after a build failure that did not
+  # happen. The usage text advertises a generic <pkg@version>, so this is a
+  # configuration mistake worth naming precisely rather than an unreachable arm.
+  if [ "$irc" -ne 0 ]; then
+    echo "govulncheck-gate: could not install $TOOL (exit $irc)." >&2
+  else
+    echo "govulncheck-gate: $TOOL installed (exit 0) but produced no" >&2
+    echo "  \$GOBIN/govulncheck. This gate runs that exact binary name; a package" >&2
+    echo "  whose main is named anything else cannot be used here." >&2
+  fi
   echo "  This is an INSTRUMENT failure, not a finding. On a cold module cache" >&2
   echo "  this step fetches and builds the tool and therefore needs the network." >&2
   exit 2
@@ -159,15 +196,27 @@ fi
 # 🔴 RC FIRST. Redirect to files and read `$?` on the very next line -- do not
 # pipe, do not `$( )` into a test. `|| rc=$?` puts the command in a condition
 # context so errexit does not pre-empt the capture.
+#
+# `-show verbose` IS LOAD-BEARING ON THE CLEAN ARM AND IS NOT DECORATION. Without
+# it the clean report prints a bare COUNT -- "2 vulnerabilities in modules you
+# require" plus the tool's own "Use '-show verbose' for more details." -- and names
+# nothing. Measured (Unit B review, `probes/prd-103-mrc-b-reviewer/p4-...`): same
+# binary, same module, same `-test=false`, differing in this one flag, 0 GO-IDs
+# named against 2 (GO-2026-5932, GO-2026-5942). The residual UNCALLED set is the
+# thing that becomes a red the day somebody writes a call to it, so a count is not
+# enough to act on. It is a DISPLAY flag: it cannot change the verdict, and the
+# rc 0/3/* mapping below is untouched by it.
 rc=0
-(cd "$MODULE_DIR" && "$TMP/bin/govulncheck" -test=false ./...) \
+(cd "$MODULE_DIR" && "$TMP/bin/govulncheck" -test=false -show verbose ./...) \
   >"$TMP/out" 2>"$TMP/err" || rc=$?
 
 case "$rc" in
   0)
-    # Print the report even when clean: it names the residual UNCALLED
-    # vulnerabilities, which are the ones that become a red the day somebody
-    # writes a call to them, and there is no other place they surface.
+    # Print the report even when clean: with `-show verbose` above it NAMES the
+    # residual UNCALLED vulnerabilities, and there is no other place they surface.
+    # (Before that flag was added this comment claimed the same thing and was
+    # false -- the report gave a count. Fixed on both sides rather than by
+    # softening the sentence, because the count alone is not actionable.)
     cat "$TMP/out"
     # Written as an `if` and not `[ -s ... ] && cat`, for the reason
     # scripts/deadcode-gate.sh records at the same spot: that idiom's status is

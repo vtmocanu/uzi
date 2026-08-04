@@ -87,17 +87,49 @@ if [ ! -f "$PKG_DIR/package.json" ]; then
   exit 2
 fi
 
+# 🔴 BOTH ASSERTIONS BELOW READ `scripts.audit` BY PARSING, NOT THE FILE BY GREP.
+# They were file-wide `grep -q -F` over package.json, which is a different claim
+# from the one their own comments make ("what package.json's `audit` script
+# actually encodes"). Measured (Unit B review,
+# `probes/prd-103-mrc-b-reviewer/p3-...`): a package.json whose `audit` script is
+# `echo DISARMED-SCRIPT-RAN; exit 0`, with both flag strings present in a second
+# `audit:local` script, PASSES both guards and the gate prints "clean at
+# --audit-level=high". The realistic single-edit case was still caught -- deleting
+# the flag with no decoy present exits 2 and names the file -- so the grep form was
+# not useless; it dies the moment the package gains a second audit-ish script and
+# someone trims the first, which is ordinary maintenance rather than an attack.
+#
+# `node` and not `jq`, matching this repo's existing choice in
+# scripts/deps-check-gate.sh: node is already required by every npm target here,
+# jq is not guaranteed on a contributor's machine.
+AUDIT_SCRIPT="$(node -e '
+const fs = require("fs");
+const pkg = JSON.parse(fs.readFileSync(process.argv[1] + "/package.json", "utf8"));
+const s = (pkg.scripts || {}).audit;
+if (typeof s !== "string") { process.stderr.write("no scripts.audit"); process.exit(3); }
+process.stdout.write(s);
+' "$PKG_DIR")" || {
+  echo "npm-audit-gate: $PKG_DIR/package.json has no \`audit\` script to delegate to." >&2
+  echo "  INSTRUMENT FAILURE. This gate asserts its flags against that script and" >&2
+  echo "  then runs it; with no script there is nothing to assert and nothing to run." >&2
+  exit 2
+}
+
 # The level is asserted against what package.json's `audit` script actually
 # encodes, rather than being passed to npm from here. Without this the argument
 # would be decorative: the script would keep using its own baked-in level while
 # `task`'s echo advertised whatever was typed on the Taskfile line. A mismatch is
 # an instrument failure, not a finding.
-if ! grep -q -F -- "--audit-level=$LEVEL" "$PKG_DIR/package.json"; then
-  echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --audit-level=$LEVEL." >&2
-  echo "  The Taskfile line and the script must agree, or this file's echo advertises" >&2
-  echo "  a threshold that is not the one being enforced." >&2
-  exit 2
-fi
+case "$AUDIT_SCRIPT" in
+  *"--audit-level=$LEVEL"*) ;;
+  *)
+    echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --audit-level=$LEVEL." >&2
+    echo "  Its audit script is: $AUDIT_SCRIPT" >&2
+    echo "  The Taskfile line and the script must agree, or this file's echo advertises" >&2
+    echo "  a threshold that is not the one being enforced." >&2
+    exit 2
+    ;;
+esac
 
 # 🔴 AND `--include=dev` IS ASSERTED, NOT MERELY DELEGATED. It is the single flag
 # that keeps this gate armed against BOTH omit vectors -- a `.npmrc` carrying
@@ -119,15 +151,19 @@ fi
 # `package.json` is tracked and every change to it lands in the MR diff. The vectors
 # that leave nothing in a diff are `.npmrc` (an untracked add) and `NPM_CONFIG_OMIT`
 # (a CI variable), and `--include=dev` outranks both -- measured, both ways.
-if ! grep -q -F -- "--include=dev" "$PKG_DIR/package.json"; then
-  echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --include=dev." >&2
-  echo "  REFUSED. That flag is what keeps this gate armed against a .npmrc holding" >&2
-  echo "  'omit=dev' and against an NPM_CONFIG_OMIT=dev environment variable. Without" >&2
-  echo "  it, either one takes this gate to exit 0 printing 'found 0 vulnerabilities'" >&2
-  echo "  over a tree whose only high-severity findings are dev-tree, and npm audit" >&2
-  echo "  has NO in-band canary that would distinguish that from a clean run." >&2
-  exit 2
-fi
+case "$AUDIT_SCRIPT" in
+  *"--include=dev"*) ;;
+  *)
+    echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --include=dev." >&2
+    echo "  Its audit script is: $AUDIT_SCRIPT" >&2
+    echo "  REFUSED. That flag is what keeps this gate armed against a .npmrc holding" >&2
+    echo "  'omit=dev' and against an NPM_CONFIG_OMIT=dev environment variable. Without" >&2
+    echo "  it, either one takes this gate to exit 0 printing 'found 0 vulnerabilities'" >&2
+    echo "  over a tree whose only high-severity findings are dev-tree, and npm audit" >&2
+    echo "  has NO in-band canary that would distinguish that from a clean run." >&2
+    exit 2
+    ;;
+esac
 
 # No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
 TMP="$(mktemp -d)"
