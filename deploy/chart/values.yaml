@@ -445,6 +445,12 @@ workers:
     requestsMemory: 40Gi
     requestsStorage: 800Gi
     persistentVolumeClaims: "40"
+    # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
+    # tier's fleet size, and TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
+    # (controller/internal/kube) parses it out of this file to check that a full fleet
+    # of workers' ephemeral-storage requests still fits the node pool. Changing it here
+    # changes what that test asserts, which is the point: it used to hold a hardcoded
+    # copy, so raising a fleet size left it green while the fleet no longer fit.
     deployments: "20"
   # The backstop, never the source: every hosted worker pod arrives from the
   # controller with explicit requests + limits from its size preset.
@@ -606,6 +612,12 @@ workers:
       # against consumption, and nothing should be sized on the belief that it is.
       ephemeralStorage: 200Gi
       persistentVolumeClaims: "30"
+      # READ BY A CONTROLLER TEST — see the restricted tier's `deployments` above.
+      # TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes parses this value to
+      # check a full fleet's ephemeral-storage requests against the node pool, and
+      # docker workers are the expensive half (4Gi each against the plain tier's
+      # 512Mi). Raising this to 20 makes a full fleet need 90 GiB against a 70.2 GiB
+      # pool, and that test is what says so.
       deployments: "10"
     # The backstop, never the source (the controller renders explicit requests+limits
     # on every container, sidecars included). `max` must stay >= the largest worker

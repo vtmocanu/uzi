@@ -4,11 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/yaml"
 
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
@@ -498,17 +500,32 @@ func TestEphemeralRequestOverridesArePerTierAndRollOnlyThatTier(t *testing.T) {
 // provisions and never appears — silently, because a quota on this resource cannot
 // bind (the evaluator enforces cpu and memory alone) and so cannot warn anybody.
 //
-// The node figure is dev-cluster's measured ephemeral-storage ALLOCATABLE, identical
-// on all four worker nodes. It is a constant in this test rather than config on
-// purpose: it is a fact about one cluster, and the assertion it supports is "the
-// SHIPPED DEFAULTS are sane for a real node", not "this controller knows your nodes".
-// A cluster with smaller nodes lowers the values through the chart.
+// 🔴 THE FLEET SIZES ARE READ OUT OF values.yaml, NOT COPIED INTO THIS FILE, AND THAT
+// IS THE WHOLE POINT OF THE TEST. They were hardcoded (`10, 20`) until issue #224's
+// audit caught it: those are the two tiers' `count/deployments.apps` quotas, they have
+// a source in this repo, and copying them made the test assert against its own
+// premise rather than against the chart. Raise the docker tier to 20 in values.yaml
+// and the real fleet needs 20 x 4Gi + 20 x 512Mi = 90 GiB against a 70.2 GiB pool —
+// exactly the condition this test exists to catch — and a hardcoded copy stays GREEN.
+// A test whose premise is a stale copy of the thing it is checking is worse than no
+// test, because it reports safety it never verified.
+//
+// The read crosses the module boundary, which is an established idiom here — the
+// protocol and preset contract tests read api/ goldens the same way — and it is
+// precisely why `task test:controller` carries `-count=1`: Go's test cache hashes only
+// files inside the module root, so editing values.yaml changes nothing in this
+// module's cache key and a cached green would hide the regression.
+//
+// The NODE figure is different in kind and stays a constant: dev-cluster's measured
+// ephemeral-storage allocatable, identical on all four worker nodes. It is a fact
+// about one cluster with no source in this repo, and the assertion it supports is
+// "the SHIPPED DEFAULTS are sane for a real node", not "this controller knows your
+// nodes". A cluster with smaller nodes lowers the values through the chart.
 func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
 	// 17.55 GiB allocatable x 4 worker nodes.
 	const nodeAllocatable = 17.55
 	const workerNodes = 4
-	// The tiers' own `count/deployments.apps` quotas: 10 docker + 20 restricted.
-	const dockerWorkers, plainWorkers = 10, 20
+	dockerWorkers, plainWorkers := chartDeploymentQuotas(t)
 
 	gib := func(s string) float64 {
 		t.Helper()
@@ -536,6 +553,62 @@ func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
 			dockerWorkers, workerDefaultDockerEphemeralRequest, plainWorkers, workerDefaultEphemeralRequest,
 			fleet, workerNodes, nodeAllocatable, pool)
 	}
+}
+
+// chartDeploymentQuotas reads the two tiers' `count/deployments.apps` quotas straight
+// out of deploy/chart/values.yaml, so the fleet-fit assertion above is made against
+// the chart the cluster actually installs rather than against a copy of it.
+//
+// PARSED, not grepped. A regex over YAML would find `deployments:` under whichever
+// block it met first and could not tell the two tiers apart, which is the failure
+// this repo has already paid for once with `kind:` in a rendered manifest: when a grep
+// and a parser disagree, the parser is right.
+//
+// A missing or unreadable file is a FATAL, never a skip or a default. The whole value
+// of reading the chart is lost the moment a failure quietly falls back to a number
+// baked in here, and a test that silently stops checking is the exact shape this
+// helper was written to remove.
+func chartDeploymentQuotas(t *testing.T) (docker, plain int) {
+	t.Helper()
+	// controller/internal/kube -> repo root.
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the fleet-fit assertion is made against the chart's own quotas; it must not fall back to a hardcoded fleet size)", path, err)
+	}
+	// Only the two fields we need. values.yaml quotes them (`deployments: "20"`),
+	// because a ResourceQuota's hard values are strings.
+	var v struct {
+		Workers struct {
+			Quota struct {
+				Deployments string `json:"deployments"`
+			} `json:"quota"`
+			Docker struct {
+				Quota struct {
+					Deployments string `json:"deployments"`
+				} `json:"quota"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	atoi := func(what, s string) int {
+		t.Helper()
+		if s == "" {
+			t.Fatalf("%s is empty in %s; the fleet-fit assertion has no fleet size to check against", what, path)
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			t.Fatalf("%s = %q in %s, which is not an integer: %v", what, s, path, err)
+		}
+		if n <= 0 {
+			t.Fatalf("%s = %d in %s; a non-positive fleet size would make the assertion vacuous", what, n, path)
+		}
+		return n
+	}
+	return atoi("workers.docker.quota.deployments", v.Workers.Docker.Quota.Deployments),
+		atoi("workers.quota.deployments", v.Workers.Quota.Deployments)
 }
 
 // Issue #224 M-a: the DinD daemon's data root is a THIRD PVC, and ONLY for a docker
