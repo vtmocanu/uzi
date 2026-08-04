@@ -27,6 +27,22 @@
 #     .npmrc: audit-level=none   rc=1   <- CLI --audit-level wins for THAT key
 #     .npmrc: omit=dev + --include=dev on the command line   rc=1   <- re-armed
 #
+# 🔴 AND THE SAME KEY HAS AN ENVIRONMENT FORM, `NPM_CONFIG_OMIT`, WHICH MATTERS
+# MORE THAN THE FILE FORM: a GitLab project-level or manual-pipeline variable needs
+# no file and leaves no diff, and these targets are reachable from `.publish_needs`.
+# THIS GATE IS ALREADY IMMUNE AND THE IMMUNITY IS MEASURED, not assumed -- npm ranks
+# a CLI flag above both env and `.npmrc`, so the same `--include=dev` covers both.
+# Measured 2026-08-04 on a lockfile carrying 1 critical and 2 high, all dev-tree:
+#
+#   no env, this gate                            rc=1   8 vulnerabilities
+#   NPM_CONFIG_OMIT=dev, this gate               rc=1   8 vulnerabilities  <- immune
+#   NPM_CONFIG_OMIT=dev, bare npm audit          rc=0   2 moderate         <- disarmed
+#
+# Note the remedy shape differs from the Go half's deliberately: govulncheck's
+# `GOPACKAGESDRIVER` has no flag that overrides it, so that gate must REFUSE the
+# variable, while this one is simply outranked. Both are instances of one rule --
+# a gate script names the environment variables that can shrink its view.
+#
 # So `--include=dev` is not belt-and-braces, it is the remedy. And unlike the
 # gitleaks scan this milestone shipped earlier, npm audit HAS NO IN-BAND CANARY:
 # `metadata.dependencies` is byte-identical armed and disarmed, so nothing in a

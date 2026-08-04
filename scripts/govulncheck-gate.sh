@@ -85,6 +85,60 @@ if [ ! -d "$MODULE_DIR" ]; then
   exit 2
 fi
 
+# 🔴 THIS GATE'S ENVIRONMENT IS NOT TRUSTED, AND TWO VARIABLES CAN MAKE IT REPORT
+# CLEAN OVER A GENUINELY CALLED VULNERABILITY. Not hypothetical and not a missed
+# finding: in both cases the gate AFFIRMATIVELY PRINTS "No vulnerabilities found."
+# and exits 0. These targets are reachable from `.publish_needs`, and GitLab ranks
+# project-level and manual-pipeline variables ABOVE job variables, so the disarm
+# needs no file, no diff and nothing a reviewer can see. Same class and same remedy
+# as `scripts/scan-secrets.sh`'s refusal of GITLEAKS_CONFIG; read its comment.
+#
+# Measured 2026-08-04 against this script, on a fixture calling
+# golang.org/x/text@v0.3.5's language.Parse (GO-2021-0113, genuinely called):
+#
+#   no env                                       rc=1   GO-2021-0113 named
+#   + GOPACKAGESDRIVER=<3-line stub>             rc=0   "No vulnerabilities found."
+#   + GOFLAGS=-tags=<a tag the fixture guards>   rc=0   same
+#   + GOFLAGS=-tags=<a tag guarding nothing>     rc=1   <- THE NON-CONTROL
+#
+# THAT LAST ROW IS WHY THIS GUARD ALMOST DID NOT EXIST. The first attempt to
+# demonstrate the -tags disarm used a tag that excluded no file, got rc=3, and was
+# banked as "no analogue here" -- an instrument that could not produce the
+# disconfirming answer returning the reassuring one, in a note whose whole purpose
+# was to stop the next person looking. The discriminating input is a tag the
+# fixture actually guards on.
+if [ -n "${GOPACKAGESDRIVER:-}" ]; then
+  echo "govulncheck-gate: GOPACKAGESDRIVER is set in the environment. Refused." >&2
+  echo "  It names an external program that REPLACES go/packages' package loading," >&2
+  echo "  which is how govulncheck builds its call graph. A three-line stub printing" >&2
+  echo "  an empty package set makes this gate report a clean tree, with no file and" >&2
+  echo "  no diff. Unset it, or use a job-level variable that does not." >&2
+  exit 2
+fi
+
+# GOFLAGS gets the NARROW treatment: refuse `-tags` only, never the variable
+# wholesale. `GOFLAGS=-buildvcs=false` is a DOCUMENTED workflow here -- Taskfile.yml's
+# header, `.claude/agents/coder.md`, `.claude/agents/tester.md` and `specs/ai.md` all
+# tell contributors to export it in a linked worktree -- so a blanket refusal would
+# make this gate unrunnable in exactly the shells that run `task gate`. Build tags
+# are what shrink the package set; `-buildvcs` cannot.
+case "${GOFLAGS:-}" in
+  *-tags*)
+    echo "govulncheck-gate: GOFLAGS contains -tags. Refused." >&2
+    echo "  Build tags select which files compile, so a tag that excludes the file" >&2
+    echo "  holding the vulnerable call makes this gate report clean. GOFLAGS itself" >&2
+    echo "  is fine and is deliberately still honoured: -buildvcs=false is a" >&2
+    echo "  documented workflow in a linked git worktree. Drop the -tags." >&2
+    exit 2
+    ;;
+esac
+
+# GOOS/GOARCH are NOT refused and fail closed by ACCIDENT rather than by design --
+# recorded so nobody "tidies away" the check that catches them. A cross GOOS makes
+# `go install` write the binary to $GOBIN/<goos>_<goarch>/, so the `[ ! -x ... ]`
+# test below does not find it and this script exits 2. Right outcome, incidental
+# cause: if that install check is ever loosened, this hole opens.
+
 # No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.

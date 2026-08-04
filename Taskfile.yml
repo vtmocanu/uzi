@@ -1322,8 +1322,12 @@ tasks:
       # client its tests mutate from the test goroutine.
       #
       # 🔴 GREEN WHEN IT LANDED, AND THAT IS ONE HOST, NOT A PROOF. Measured
-      # twice on 2026-08-04, darwin/arm64, go1.26.5: 7 packages, rc=0, no
-      # `WARNING: DATA RACE` (probes/prd-103-mrc-coder/race-controller.txt). CI is
+      # twice on 2026-08-04, darwin/arm64, go1.26.5: rc=0, no `WARNING: DATA RACE`
+      # (probes/prd-103-mrc-coder/race-controller.txt). "7 packages" means SEVEN
+      # LINES OF OUTPUT: six `ok` plus `cmd/controller [no test files]`. Two
+      # validators read that same output as 7 and as 6 and both were right about
+      # different populations, so the count is spelled out rather than left to be
+      # re-derived. Six packages actually ran tests under -race. CI is
       # linux/amd64 under contention and race detection is PROBABILISTIC - the
       # detector reports a race it happens to observe, so a green here bounds
       # nothing about a red there. If this reddens in CI, the finding is a real

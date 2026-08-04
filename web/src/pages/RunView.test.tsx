@@ -876,6 +876,25 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
   // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
   // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  //
+  // 🔴 BOTH TESTS BELOW CARRY A PER-TEST TIMEOUT (the third argument to `it`), and the
+  // other 1658 tests in this suite keep the 20000 default (PRD #103 M5 MR-C). They are
+  // the two slowest tests here by a wide margin, and the reason is structural rather
+  // than environmental: each awaits `advanceTimersByTimeAsync(149 * 4000)` inside ONE
+  // `it()`, which is 149 sequential real event-loop turns, every one of them flushing a
+  // mocked promise and a React `act`. Measured 2026-08-04 under vitest 4.1.10 with the
+  // JSON reporter: 4228 ms mean inside the full 118-file suite, and 5416 ms mean running
+  // this file SOLO. Solo is the limit of splitting — zero competing files — and it is
+  // SLOWER, so splitting this file cannot fix it and the chain moves intact into
+  // whatever file it lands in. Under CPU contention that chain has been observed to
+  // exceed 20000 (once in thirteen full-suite runs), and when it does, everything after
+  // it in this file fails as an empty-container cascade.
+  //
+  // A PER-TEST CAP RATHER THAN RAISING THE SUITE DEFAULT, deliberately: this MR first
+  // took `testTimeout` to 60000 in `vite.config.ts` and that was reverted, because it
+  // weakened the hang-detection ceiling for 1658 tests to accommodate two. Do not
+  // "simplify" these back to the default; do fix the 149-turn chain, after which they
+  // come off.
   it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
     vi.useFakeTimers();
     try {
@@ -912,7 +931,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 60000);
 
   // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
   // `!next` branch — and one that could not have existed before #119. The effect used to
@@ -956,7 +975,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 60000);
 
   // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
   // site is covered by "treats an absent pending_judge…" below; this covers the case where
