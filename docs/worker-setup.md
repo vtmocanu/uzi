@@ -119,7 +119,7 @@ resources:
     cpu: "2"
 ```
 
-**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. `dinddata` only grows; reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
+**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. `dinddata` only grows; reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC rather than an emptyDir, and it is just as unbounded: reclaim it with `docker system prune` inside the worker, or by deleting and reprovisioning the worker, which recreates the PVC empty. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
 What the gauges mean:
 

@@ -103,6 +103,34 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   server returning a megabyte-long version string still printed all of it. The
   version line is bounded now (issue #144).
 
+- **Hosted worker pods now declare an ephemeral-storage request (512Mi plain,
+  4Gi docker-tier) on the worker container, and the Docker sidecar's data root
+  moved off the pod's ephemeral storage onto its own PVC.** Every container in
+  a worker pod previously requested zero ephemeral storage, so the scheduler
+  placed pods with no account of their real disk footprint and kubelet ranked
+  them first for eviction the moment a node ran low; an evicted pod's runs
+  re-queue onto a stale local clone and lose every uncommitted local commit
+  (one measured loss ran to 82 minutes of work, issue #209). **This lowers how
+  often that happens; it does not close it.** A declared request changes
+  kubelet's eviction ranking, it does not make a pod eviction-proof, and the
+  fix for the underlying loss, fetching work back before an evicted worker's
+  tree is discarded, is issue #218's, not this change's. **Operators:**
+  rolling this out replaces every worker pod once, so every run in flight at
+  deploy time loses its tree, the same accepted cost as any other
+  worker-pod-spec change. It ships inside the chart, so merging to `main`
+  alone does not deploy it: delivery needs a `v*` release tag published to
+  Harbor plus a manual `targetRevision` bump in the `argo-apps`
+  repo's `apps/uzi/app.uzi.yaml`. The new per-docker-worker dind-data PVC
+  (20Gi, chart-overridable) is a third RWO volume per worker, widening the
+  existing Multi-Attach window on reschedule by one; it is never
+  garbage-collected, so `docker system prune` on the worker is the reclaim
+  path, and the daemon's build cache now survives a pod restart instead of
+  being wiped with the old emptyDir. Raising `workers.docker.dindDataSize` on
+  a live cluster is a silent no-op for workers that already exist: the size
+  isn't part of the pod spec hash and the PVC is never resized after
+  creation, so only a newly-provisioned worker picks up a raised default
+  (issue #224).
+
 ### Security
 
 - **The `uzi` CLI no longer renders server-supplied text on your terminal
