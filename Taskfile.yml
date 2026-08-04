@@ -261,9 +261,61 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - lint, deadcode, check-docs, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, typecheck, test
     cmds:
-      # lint FIRST here, which is the MIRROR IMAGE of the Go gates above and is
+      # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
+      # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
+      # is ~1-3s, so on cost alone lint would still lead. It goes first because a
+      # STALE node_modules does not make the later slots WRONG, it makes them
+      # ANSWERS ABOUT A DIFFERENT TREE - lint, knip, tsc and vitest would all run,
+      # all pass, and all report on the versions that happen to be on disk rather
+      # than the ones this branch declares. A verdict about the wrong tree is worse
+      # than a slow one, which is the same argument `gate` uses for putting
+      # `gate:repo` ahead of a 51.8s `gate:api`.
+      #
+      # WHY THIS EXISTS AT ALL: A VERSION BUMP OF A devDependency FAILS SILENTLY,
+      # WHERE A NEW ONE FAILS LOUDLY. Carry-forward 12 covers the new-dependency
+      # case: `npm run` puts node_modules/.bin on PATH, so a missing binary dies with
+      # `command not found`. A BUMP cannot fire that - the binary is already there -
+      # so a checkout that skipped `npm ci` runs vitest 2 while the lockfile says 4,
+      # green, with nothing naming the mismatch. MR-C ships exactly that bump, so
+      # this is its own exposure rather than a general precaution.
+      #
+      # `npm ls --depth=0` AND NOT A `vitest --version` ASSERTION, measured rather
+      # than preferred. It exits 1 with a POSITIVE OBSERVATION NAMING BOTH VERSIONS
+      # (`vitest@2.1.9 invalid: "4.1.10" from the root project`), needs no new
+      # dependency, and covers EVERY direct dependency rather than the one bump
+      # somebody remembered to assert. A `--version` assertion has to be written
+      # again for each future bump, and the one nobody writes is the one that bites.
+      #
+      # IT IS OFFLINE, MEASURED, NOT ASSUMED. With an unreachable registry
+      # (`npm_config_registry=http://127.0.0.1:1`) the output is BYTE-IDENTICAL to
+      # the clean run and rc stays 0, in both packages. That is what lets it sit in
+      # `gate` at all: this file's govulncheck/npm-audit note below excludes those
+      # two precisely because their verdict is a function of a remote database, and
+      # this one's is a function of the tree.
+      #
+      # 🔴 TWO LIMITS, BOTH REAL, WRITTEN DOWN SO NOBODY READS A GREEN AS MORE THAN
+      # IT IS. `--depth=0` sees DIRECT dependencies only - a transitive version skew
+      # is invisible to it. And it compares node_modules against `package.json`
+      # RANGES, not against the lockfile, so a caret range makes it loose: `^4.1.10`
+      # is satisfied by 4.9.0 and the check would say nothing. That is why MR-C pins
+      # `vitest` with `--save-exact`, matching the `oxlint`/`knip` precedent.
+      #
+      # AND ONE STATE WHERE IT LIES, which is the one a person TESTING this will
+      # create: `npm install --package-lock-only` run in place also rewrites
+      # `node_modules/.package-lock.json`, after which `npm ls` reports the NEW
+      # version while the package on disk is still the old one. A git pull cannot
+      # produce that state; a hand-built repro can. Build the stale state the way a
+      # pull does - replace package.json and the lockfile, leave node_modules alone.
+      #
+      # NOT A CI CHECK, AND THAT DOES NOT VIOLATE SUCCESS CRITERION 1. SC1 reads
+      # "CI runs no toolchain check that `task gate` does not" and is one-directional;
+      # this is the other direction. CI is structurally unexposed anyway - every npm
+      # job's `before_script` is `npm ci`, which reinstalls from the lockfile, so the
+      # check would be asserting something CI has just made true by construction.
+      - task: deps-check:web
+      # lint SECOND here, which is the MIRROR IMAGE of the Go gates above and is
       # deliberate rather than inconsistent (PRD #103 M3). oxlint is measured at
       # ~0.06s, two orders of magnitude cheaper than anything else in this gate,
       # and unlike golangci-lint it is NOT type-aware - so it has no ordering
@@ -280,9 +332,17 @@ tasks:
       - task: test:web
 
   gate:agent:
-    desc: agent - lint, deadcode, typecheck, test
+    desc: agent - deps-check, lint, deadcode, typecheck, test
     cmds:
-      # lint first, same reason as gate:web (~0.05s here).
+      # deps-check first, same placement and the same reasons as gate:web above -
+      # read that target's comment, including the two limits and the one state in
+      # which `npm ls` lies. This package is the one where the standing remedy for a
+      # missing dependency (symlink node_modules rather than install) is unavailable,
+      # because `npm ci`/`npm install` here rewrites /opt/homebrew/bin/agent-browser
+      # host-wide, so a contributor is MORE likely to be running a stale tree here
+      # than in web/ and this check is what names it.
+      - task: deps-check:agent
+      # lint second, same reason as gate:web (~0.05s here).
       - task: lint:agent
       # knip second, same reason as gate:web (~1-3s wall here too).
       - task: deadcode:agent
@@ -1192,6 +1252,27 @@ tasks:
       - go test -race -count=1 ./...
 
   # ------------------------------------------------------------- web (npm) ----
+  deps-check:web:
+    desc: web - is node_modules stale against package.json? (npm ls --depth=0, offline)
+    dir: web
+    cmds:
+      # DELEGATES TO package.json's `deps-check` SCRIPT, as this file's header
+      # requires of every npm target. The script is a bare `npm ls --depth=0`, so
+      # there is nothing here for a rewrite to drop silently - but delegating anyway
+      # keeps the rule uniform, and `--depth=0` is the whole check: without it `npm
+      # ls` walks the entire tree and reports transitive noise this gate has no
+      # opinion about.
+      #
+      # NEVER A BARE `npx`: npx fetches from the network when the dep is missing,
+      # which a gate may not do. There is no npx form of this anyway; the note is
+      # here so a future edit does not invent one.
+      #
+      # Why this target exists, why it runs FIRST, what it cannot see, and the one
+      # state in which it reports confidently wrong: see `gate:web`'s comment. It is
+      # written there rather than here because the ORDERING is the load-bearing
+      # decision and that is where a reader meets it.
+      - npm run deps-check
+
   lint:web:
     desc: oxlint over web/src (correctness + react-hooks/rules-of-hooks)
     dir: web
@@ -1298,6 +1379,14 @@ tasks:
       - npm test
 
   # ----------------------------------------------------------- agent (npm) ----
+  deps-check:agent:
+    desc: agent - is node_modules stale against package.json? (npm ls --depth=0, offline)
+    dir: agent
+    cmds:
+      # Same delegation, same flag, same reasons - read deps-check:web's comment and
+      # gate:web's ordering paragraph before editing either.
+      - npm run deps-check
+
   lint:agent:
     desc: oxlint over agent/src and agent/test (correctness tier)
     dir: agent

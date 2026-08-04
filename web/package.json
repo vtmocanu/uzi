@@ -11,7 +11,8 @@
     "build": "npm run check-docs && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deps-check": "npm ls --depth=0"
   },
   "dependencies": {
     "diff": "9.0.0",
