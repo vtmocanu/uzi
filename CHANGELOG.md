@@ -59,6 +59,78 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   the render-side fix instead (issue #180), which strips the same
   characters on the way out (issue #169).
 
+- **Contributor tooling: dependency vulnerabilities are now scanned on every
+  MR**, for the first time in this repo — `govulncheck` for both Go modules and
+  `npm audit --audit-level=high` for both npm packages. They hang off the
+  existing per-toolchain jobs (`lint:api`, `lint:controller`, `validate:web`,
+  `validate:agent`) rather than adding new ones. Locally they are
+  `task vulncheck` and are **deliberately not part of `task gate`**: their
+  verdict is a function of a remote mutable database, so they can answer
+  differently on two runs of one commit with nobody's diff in between, and a
+  contributor's gate must be deterministic against the tree. All four host jobs
+  are in `*publish_needs`, so this is release-blocking by inheritance — a CVE
+  published on a Tuesday can redden a `v*` tag publish that contains nobody's
+  diff. That is accepted, not overlooked. The npm half gates at `high` rather
+  than zero because two moderate `react-router` advisories have no patched 6.x
+  to move to; clearing them is a React Router 6 → 7 major through **runtime,
+  shipped SPA routing code**, filed as issue #226. Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: the gate now refuses environment variables that would
+  silently narrow what it looks at.** Three tools turned out to have one — a
+  substituted `GITLEAKS_CONFIG`, an `NPM_CONFIG_OMIT=dev` that drops the dev
+  tree and prints "found 0 vulnerabilities" at exit 0, and a `GOPACKAGESDRIVER`
+  stub or `GOFLAGS=-tags` that build-tags the vulnerable call out of the graph.
+  Each produces output shaped exactly like a clean run. The scripts now refuse
+  them, narrowly where a legitimate use exists (`GOFLAGS=-buildvcs=false` is a
+  documented workflow here, so only `-tags` is rejected). Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: `task gate:web` and `task gate:agent` now check that
+  your `node_modules` matches the branch before running anything else.** A stale
+  install does not make lint, knip, `tsc` and vitest *wrong* — it makes them
+  answers about a different tree, all green. The check is two parts because
+  `npm ls` compares against declared ranges only, so a transitive bump is
+  invisible to it; the second part joins against the lockfile. Measured:
+  `gate:agent` was green on a tree holding all five of the vulnerable versions
+  this release bumps. Part of PRD #103. Developer-facing only: no change to how
+  uzi behaves. See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: `web` moved to vitest 4.1.10, pinned exactly.** A major,
+  taken because the 2.x line is where the remaining high-severity `web`
+  advisories lived. The pin is exact rather than a range, and so is
+  `@vitest/coverage-v8`, which is an exact-version optional peer — the two move
+  together or the install breaks. `environmentMatchGlobs` and `test.workspace`
+  are both gone in 4.x. The upgrade's control was a count written down before the
+  run and reproduced after (118 files / 1660 tests), because a green with a lower
+  collected count is a silently narrowed suite that no exit code reveals. Part of
+  PRD #103. Developer-facing only: no change to how uzi behaves.
+  **Existing checkouts need `npm install --ignore-scripts` in `web/`.**
+
+- **Contributor tooling: test coverage is now measured for `api`, `controller`
+  and `web`, and shown on every MR.** `task test:api` and `task test:controller`
+  write a profile and print the statement total; `task test:web` runs vitest with
+  the v8 provider. GitLab reads the number off each job and the Cobertura reports
+  annotate the MR diff. **There is deliberately no failing threshold** — a number
+  picked before the current one was known is either vacuous or blocks unrelated
+  work, so this milestone measures and a later one chooses. Two things worth
+  knowing before reading the figures: the totals exclude packages with no tests of
+  their own, and the single percentage GitLab puts on an MR is an unweighted mean
+  across the three jobs rather than a repo-wide figure — read the per-job numbers.
+  Part of PRD #103. Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: `web` tests now get their environment from
+  `vite.config.ts` instead of relying on a per-file docblock.** A test under
+  `src/components` or `src/pages` that forgets `// @vitest-environment jsdom` used
+  to run under node, which is usually a loud error and is not reliably one. Those
+  directories now default to jsdom via `test.projects`, while `src/lib` and
+  `src/mocks` — where every node-side test in the suite lives — stay on node. The
+  docblock still wins over the config where a file carries one, measured on
+  vitest 4 rather than assumed, so no existing file changed environment: the
+  per-file census is identical before and after. Part of PRD #103.
+
 ### Fixed
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team

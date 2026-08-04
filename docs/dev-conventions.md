@@ -38,8 +38,8 @@ task gate              # everything, serially: gate:repo first, then all four co
 task gate:repo         # repo-wide checks with no component: shell, YAML, the brew formula
 task gate:api          # one component: fmt-check + vet + build + lint + deadcode + test
 task gate:controller   # same shape
-task gate:web          # lint + deadcode + check-docs + typecheck + test
-task gate:agent        # lint + deadcode + typecheck + test
+task gate:web          # deps-check + lint + deadcode + check-docs + typecheck + test
+task gate:agent        # deps-check + lint + deadcode + typecheck + test
 task fmt-check         # the format slot alone, both Go modules
 task lint              # the lint slot alone, all seven: four components plus shell/YAML/formula
 task deadcode          # the dead-code slot alone, all four components
@@ -59,7 +59,7 @@ jobs and a wrapper would run the tests twice.
 Four things about it that are decisions rather than accidents:
 
 - **The load-bearing flags live in the targets, with their reason beside them.**
-  `-race` and `-count=1` on `test:api`, `-count=1` on `test:controller`,
+  `-race` and `-count=1` on `test:api` and (since PRD #103 M6) on `test:controller`,
   `--test-timeout=120000` inside `agent/package.json`'s `test` script. None is
   optional and each one's absence is invisible in a passing run, which is why
   the Taskfile is not `silent:` — Task echoes every command, so you can read the
@@ -306,6 +306,181 @@ Existing secrets in test fixtures are suppressed per-instance with
 `//gitleaks:allow` and a written reason (13 today, all load-bearing) — never a
 `.gitleaks.toml [allowlist] paths` regex, which would silently exempt every
 file the pattern matches rather than the one line that needs it.
+
+### Dependency vulnerabilities: `task vulncheck`, and why it is NOT in `task gate`
+
+Added by PRD #103 M5 MR-C. `govulncheck` for the two Go modules, `npm audit` for
+the two npm packages:
+
+```sh
+task vulncheck             # all four
+task vulncheck:api         # govulncheck, api module
+task vulncheck:controller  # govulncheck, controller module
+task vulncheck:web         # npm audit --audit-level=high, FULL tree
+task vulncheck:agent       # npm audit --audit-level=high, FULL tree
+```
+
+**This is the one target family `task gate` deliberately does not reach**, and it
+must stay out of `gate` *and* out of every `gate:<component>`, including any sixth
+component a future milestone adds.
+
+**The reason is the VERDICT, not the network, and the network version of the
+argument is measurably false.** `task gate` is not offline: `lint:api`,
+`deadcode:api` and `scan:secrets` are all `go run pkg@version` and all three need
+the network on a cold module cache — control: `task scan:secrets` under
+`GOPROXY=off` returns 201 with *"module lookup disabled by GOPROXY=off"*. What
+separates those from these two is that a pinned `go run` fetches a
+checksum-verified artifact **once** and then answers **from the tree**, whereas
+these query a **remote mutable database on every run**. A contributor's gate must
+be deterministic against the tree, and these two can answer differently on two runs
+of one commit with nobody's diff in between. Writing the offline version of this
+reason down would invite someone to "fix" gitleaks out of `gate:repo` on the same
+logic.
+
+They do run on every MR, as extra script lines of the existing per-toolchain jobs
+(`lint:api`, `lint:controller`, `validate:web`, `validate:agent`) rather than as new
+jobs. All four of those jobs are in `*publish_needs`, so **the release-blocking
+property is inherited**: a CVE published on a Tuesday can redden a `v*` tag publish
+with nobody's diff in it. That is accepted rather than overlooked.
+
+**npm audit gates at `--audit-level=high`, not at zero**, because two moderate
+`react-router` advisories survive every available option — no patched 6.x exists,
+`--force` will not touch them, `overrides` has nothing to point at — so clearing
+them is a React Router 6 → 7 major through shipped SPA routing code. Filed as its
+own issue rather than left as an unexplained threshold.
+
+### 🔴 The rule this milestone earned: a gate script names the environment variables that can shrink its view, and refuses them
+
+Every gate in this repo shares one assumption that nobody had examined: **that the
+gate's environment is trusted.** Three tools turned out to have a variable that
+narrows what the tool looks at while leaving the output shaped exactly like a clean
+run. They were found separately, by three different probes, at three different
+times, by two different people — which is the argument for writing the rule down
+rather than the three guards:
+
+| tool | variable | what it does | where it is refused |
+|---|---|---|---|
+| gitleaks | `GITLEAKS_CONFIG`, `GITLEAKS_CONFIG_TOML` | substitutes a config that can allowlist anything | `scripts/scan-secrets.sh:153` |
+| npm audit | `NPM_CONFIG_OMIT=dev` | drops the dev tree — `rc=0`, *"found 0 vulnerabilities"* | `scripts/npm-audit-gate.sh`, via an asserted `--include=dev` |
+| govulncheck | `GOPACKAGESDRIVER` | a 3-line stub answers for the whole package graph | `scripts/govulncheck-gate.sh` (the `GOPACKAGESDRIVER` refusal) |
+| govulncheck | `GOFLAGS=-tags=…` | build-tags the vulnerable call out of the build | `scripts/govulncheck-gate.sh` (the `GOFLAGS`/`-tags` refusal, via `go env GOFLAGS`) |
+
+Two details in that table are the interesting part.
+
+**`GOFLAGS` gets the NARROW treatment — `-tags` only, never the variable
+wholesale** — because `GOFLAGS=-buildvcs=false` is a documented workflow here (a
+linked worktree's `.git` pointer file trips Go's VCS stamping). A blanket refusal
+would break a real workflow to close a narrow hole.
+
+**`--include=dev` is ASSERTED, not merely passed**, and that resolves a genuine
+conflict between two of this repo's own rules. The Taskfile header requires npm
+targets to *delegate* to a `package.json` script, because a target that reimplements
+the command drops that script's flags silently — but this particular flag must not
+be droppable. So the flag lives in `package.json` and
+`scripts/npm-audit-gate.sh:122` exits 2 if it is not there. Delegation plus an
+assertion is strictly stronger than putting the flag on the Taskfile line, where
+nothing would guard it.
+
+**npm audit has no in-band canary**, unlike gitleaks: a disarmed run and a clean run
+are indistinguishable from their own output. That is why the guard is a refusal
+rather than a detection.
+
+One path neither refusal closes, recorded because it is a known limit rather than an
+oversight: `go install` inside the wrapper inherits `GOPROXY`/`GOSUMDB`, so a hostile
+proxy could serve a trojaned `govulncheck` that always exits 0. That is the identical
+trust model to every `go run pkg@version` already in this repo, so it is not a new
+weakness — but it is not closed either.
+
+**The next gate this repo adds will have a fourth variable nobody has met yet.** The
+rule, not the table, is the durable artifact.
+
+### `task deps-check:web` / `deps-check:agent`: is `node_modules` stale?
+
+Runs **first** in `gate:web` and `gate:agent`, ahead of the cheaper lint step, and
+that ordering is deliberate. A stale `node_modules` does not make the later slots
+*wrong*, it makes them **answers about a different tree**: lint, knip, `tsc` and
+vitest would all run, all pass, and all report on the versions that happen to be on
+disk rather than the ones the branch declares.
+
+**It is two checks, because the first covers one of six dependency changes.**
+`npm ls --depth=0` compares against **declared ranges**, so a *transitive* bump —
+which has no declared range at all — is invisible to it. Measured on the stale state
+a real `git pull` produces: `gate:agent` was green on a tree holding every one of the
+five vulnerable versions MR-C bumps, because all five are transitive and
+`agent/package.json` never changed. The second line is a lockfile join, which catches
+that. So `npm ls` catches a stale **direct** dependency and is inert for a
+lockfile-only transitive bump — do not describe it as a lockfile-versus-`node_modules`
+check.
+
+It is offline by construction and never a bare `npx`, which would fetch from the
+network when the dep is missing.
+
+### `web` is pinned to vitest `4.1.10`, exactly
+
+MR-C took `web` across the vitest 2 → 4 major. The pin is **exact, not a range**, and
+so is `@vitest/coverage-v8` — it is an exact-version optional peer of vitest, so the
+two must move together or the install breaks.
+
+The control for the upgrade was a **predicted count written down before the run**:
+118 test files / 1660 tests, reproduced after. A green with a lower collected count is
+a silently narrowed suite and is invisible to the exit code. Re-derive that pair at
+your own tip before quoting it; the suite grows.
+
+### Coverage: measured, printed, and deliberately not a gate
+
+`task test:api` and `task test:controller` write `coverage.out` in their module and
+print the statement total; `task test:web` runs vitest with the v8 provider and prints
+its summary block. All three are gitignored artifacts — nothing is committed.
+
+**No threshold, on purpose.** Nothing in these targets can fail because of the number.
+A threshold picked before the current value was known is either below it (vacuous) or
+above it (blocks every MR on unrelated work); the follow-up chooses one, starting with
+the security-critical packages rather than a global floor.
+
+Four things to know before you quote a figure:
+
+- **The Go totals exclude packages with no test files of their own.** Without
+  `-coverpkg`, each package is measured only by its own tests and an untested package
+  is absent from the profile rather than counted as zero, so the total is an
+  over-estimate of module-wide coverage.
+- **The single percentage GitLab shows on an MR is an unweighted mean across the three
+  jobs**, not a repo-wide number — `coverage_array.sum / coverage_array.size` in
+  GitLab's own pipeline model. It weights a 437-block module the same as an
+  11920-block one. Read the per-job numbers.
+- **`scripts/coverage-total.sh` refuses to summarise a profile that measured nothing.**
+  A run in which no test executed leaves a one-line profile, and `go tool cover -func`
+  reports `total: (statements) 0.0%` for it with rc=0 — a number that reads like
+  terrible coverage and is an absence of data. That guard is an instrument check, not a
+  threshold: it never compares the percentage to anything.
+- **The `coverage:` regexes in `.gitlab-ci.yml` cannot be anchored with `^`.** Task runs
+  with `output: prefixed`, so the totals reach the log as `[test:api] total: …`. They
+  also cannot contain a capturing group — GitLab requires all groups to be
+  non-capturing and extracts the number from the matched text itself. Both constraints
+  are counter-intuitive, both fail silently, and both are recorded with their
+  measurements in that file's `.coverage_notes`.
+
+### `web` test environments: `test.projects`, not a docblock per file
+
+DOM tests in `web/` opted into jsdom one file at a time with
+`// @vitest-environment jsdom`. A file that forgot it ran under node — usually a loud
+`ReferenceError`, but not reliably: `src/lib/prefs.ts` guards every access with
+`typeof window === "undefined"`, so a pragma-less test of it passes while touching no
+DOM at all.
+
+`web/vite.config.ts` now splits the suite into two projects: **`src/lib` and
+`src/mocks` run under node**, and **everything else under `src` runs under jsdom**,
+including any directory added later. Two consequences:
+
+- a new test under `src/components` or `src/pages` gets jsdom with no docblock;
+- a DOM test under `src/lib` or `src/mocks` still needs its docblock, because those
+  two directories hold every node-side test in the suite.
+
+**The docblock still outranks the project's `environment`** — measured on vitest 4.1.10
+with both controls, not carried over from the vitest 2 result it happens to agree with.
+That is what makes the split safe despite both node directories containing
+pragma-carrying files: 14 of them run under jsdom today and still do. The check that
+proves it is a per-file census of what all 118 files actually run under, taken before
+and after and byte-identical, rather than a count or a classification.
 
 ## Scripting the bot setup with `glab`
 

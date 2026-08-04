@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning; **MR-C deferred** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4). **M5 stays unticked and Success Criterion 5 unmet until MR-C lands**, since that criterion is atomic across all three security tools. **M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning. **M5's MR-C built 2026-08-04 on branch `prd-103`, 7 commits, tip `3903e9d7`, `task gate` rc=0 end to end — NOT YET PUSHED, NOT YET IN AN MR, AND NO PIPELINE HAS RUN AGAINST ANY OF IT.** `govulncheck` + `npm audit` gating at zero, the agent lockfile's five advisories cleared, vitest 2.1.9→4.1.10 exact-pinned, a `deps-check` staleness slot, and `-race` on `test:controller` pulled forward from M6. **M5 is now ticked**; Success Criterion 5 was amended (see its entry — its text never named the three tools, and its literal predicate had been met since MR-B). **M6 open and untouched.** **Two deferrals, both filed rather than absorbed**: react-router 6→7 (no patched 6.x exists, so `web` keeps two ungating *moderate* advisories in a runtime dependency; reachability audited and small) and the `RunView.test.tsx` per-test cap. **Before the MR: the branch tip must be checked for the CI-skip marker**, since most commits here are docs-only and correctly carry it, while GitLab reads it from the MR's HEAD commit and a `skipped` pipeline still reports mergeable. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
 
 *(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
@@ -346,10 +346,21 @@ the omission**, so a milestone that appends its job and forgets the lists produc
 green MR pipeline and a silent tag-time hole.
 
 **M5 inherits this obligation in full, and it is part of its definition of done.**
-Its checks (`shellcheck`, `yamllint`, `gitleaks`, `govulncheck`) are repo-wide, so
+Its checks (`shellcheck`, `yamllint`, `gitleaks`) are repo-wide, so
 unlike the npm half they genuinely cannot fold into a per-toolchain `validate:*`
 job — M5 **will** open lint-stage jobs, and every one of them goes into **both**
 lists in the commit that creates it.
+
+> **`govulncheck` WAS IN THAT LIST AND IS NOT REPO-WIDE. Corrected by M5 MR-C,
+> 2026-08-04.** It is **per-Go-module** (`govulncheck ./...` from a module root),
+> so it folds into the existing `lint:api` and `lint:controller` jobs as an extra
+> script line exactly the way `deadcode:api` already does — and `npm audit` folds
+> into `validate:web` / `validate:agent` the same way. **MR-C opened no CI job at
+> all**, and the `.gate_needs` / `.publish_needs` parse is byte-identical before
+> and after (13 and 15 entries). This sentence is the one a future reader would
+> have followed into opening two needless jobs, each of which is two more list
+> entries to keep in step. The OBLIGATION above is unchanged and still binds
+> anything that does open a job.
 
 **AND M5 NOW INHERITS A COMPLETENESS PROPERTY, NOT MERELY A MEMBERSHIP RULE.** M3
 shipped the "both lists, always" rule while an existing job was violating it:
@@ -1771,7 +1782,73 @@ which previously prescribed only the fail-open form.
       > carrying its counts (web 22, agent 53, 2026-08-02) so Decision 3's "a
       > warning nobody must act on" does not become the end state by default.
 
-- [ ] **M5 — The long tail: shell, YAML, secrets, vulns**:
+- [x] **M5 — The long tail: shell, YAML, secrets, vulns**:
+
+      > **COMPLETE 2026-08-04 on branch `prd-103`, tip `3903e9d7`. MR-A + MR-B
+      > merged (!175); MR-C built but NOT PUSHED and NEVER RUN IN CI.**
+      >
+      > MR-C's 7 commits: `-race` on `test:controller` (pulled forward from M6, the
+      > only cross-unit move); the agent lockfile's five advisories cleared to
+      > `total=0`; vitest 2.1.9→4.1.10 exact-pinned plus postcss; a `deps-check`
+      > staleness slot first in `gate:web`/`gate:agent`; `govulncheck` +
+      > `npm audit` gating at zero via `scripts/{govulncheck,npm-audit}-gate.sh`
+      > called from `Taskfile.yml` targets that CI invokes as extra script lines;
+      > and two brief-amendment commits.
+      >
+      > **Four blocking defects were found by validators, none visible in a green
+      > gate**, and all four reproduced before being acted on:
+      >
+      > 1. **The govulncheck wrapper FAILED OPEN.** A three-line
+      >    `GOPACKAGESDRIVER` stub returning an empty package set made it print
+      >    *"No vulnerabilities found"* and *"clean (0 called vulnerabilities)"* at
+      >    rc=0 over a module with a genuinely CALLED vulnerability. Same class as
+      >    `GITLEAKS_CONFIG`, which `scan-secrets.sh` already refuses. Both guards
+      >    added, exiting **2**; `GOFLAGS` refused narrowly (`-tags` only) so the
+      >    documented `-buildvcs=false` export survives, asserted both ways.
+      > 2. **`deps-check` covered 1 of 6 dependency changes.** On the real
+      >    git-pull stale state, `npm ls --depth=0` gave rc=0 with zero findings
+      >    over an agent tree holding all five vulnerable versions, and missed
+      >    web's high-severity postcss fix too. Fixed with a lockfile join on the
+      >    **intersection** of the two lockfiles.
+      > 3. **A registry outage classified as "there are advisories."**
+      >    `npm run --silent audit` suppressed npm's own error line, so the
+      >    unreachable-registry branch fell through to the findings branch — the
+      >    exact failure the script exists to prevent, introduced by a flag added
+      >    for tidiness. The findings branch now requires a positive observation.
+      > 4. **A one-file `.npmrc`, or an invisible `NPM_CONFIG_OMIT` CI variable,
+      >    disarmed the npm audit gate at exit 0.** Closed by `--include=dev` on
+      >    the command line **in the version-controlled Taskfile target** — in a
+      >    CI job script it would be editable in the same invisible place as the
+      >    attack.
+      >
+      > **The durable artifact is the generalisation of 1 and 4**, which belongs
+      > in `docs/dev-conventions.md`: *a gate script names the environment
+      > variables that can shrink its view, and refuses them.* Three tools, three
+      > variables, one shape — `GITLEAKS_CONFIG` (already refused),
+      > `NPM_CONFIG_OMIT`, `GOPACKAGESDRIVER`/`GOFLAGS`.
+      >
+      > **Two calibration non-controls were produced and caught, both by a
+      > predicted count rather than by the four-property bar.** One arm replaced
+      > `web/package.json` wholesale with a pre-upgrade copy that predates the
+      > `deps-check` script, so npm died with *"Missing script"* — **rc=201, the
+      > tool name in the output, and a sane path: three of the four properties
+      > held on a completely dead arm.** What separated them was one invalid line
+      > predicted against zero measured.
+      >
+      > **Deferred, filed rather than absorbed:** react-router 6→7. No patched 6.x
+      > exists (`fixAvailable: true` is npm's flag for *a fixed version exists
+      > somewhere*, not *`npm audit fix` will do it*), so `--audit-level=high`
+      > leaves two **moderate** advisories in `web`'s runtime router permanently
+      > ungating. Reachability audited and small: the constructor-injection
+      > advisory is structurally unreachable (no `createBrowserRouter` /
+      > `createHashRouter` / `RouterProvider` anywhere, no SSR), and both
+      > open-redirect ones are blocked at the only attacker-controlled sink by
+      > `safeNextPath`, which rejects the backslash vector specifically and is
+      > tested. **The invariant the follow-up issue must carry:** `safeNextPath`
+      > is a per-call-site guard, so any future `navigate(<value from a URL or the
+      > server>)` reopens the hole without touching react-router at all.
+      >
+      > Full record: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, twelve amendments plus two end-of-session handovers. It is gitignored-but-tracked, so `git grep` or open it by path — `grep -r` cannot see it.
 
       > **STATUS 2026-08-03: MR-A AND MR-B MERGED, M5 NOT COMPLETE.** MR
       > [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175),
@@ -1877,6 +1954,16 @@ which previously prescribed only the fail-open form.
       `npm audit --audit-level=high` for both npm packages, initially
       `allow_failure` only until the current finding count is known.
 
+      > **STALE, corrected by M5 MR-C on 2026-08-04: the `allow_failure` half is
+      > overridden and the counts are known.** User ruling 4 for M5 is *no
+      > `allow_failure` anywhere*, and the pipeline still has none. The counts, as
+      > shipped: both Go modules at **0 called** vulnerabilities, `agent` at
+      > **total=0**, `web` at **0 high-and-above** with two react-router MODERATE
+      > advisories surviving under `--audit-level=high` and filed as their own
+      > issue. So these land GATING at zero on day one, not advisory. The
+      > `--audit-level=high` half of the sentence is correct and is the shipped
+      > threshold.
+
       **Markdown link checking: extend `web/scripts/check-docs.mjs`, do not add
       a second checker.** It already validates relative-link existence and
       link-text-path correctness for `docs/`, `ARCHITECTURE.md`, `README.md`,
@@ -1900,7 +1987,93 @@ which previously prescribed only the fail-open form.
 
 **Phase 3 — measurement (after M1; independent of M2–M5)**
 
-- [ ] **M6 — Coverage measured, and `-race` for `controller`**: `-coverprofile`
+- [x] **M6 — Coverage measured, and `-race` for `controller`**:
+
+      > **CODE COMPLETE 2026-08-04 on branch `prd-103`, tip `8b8201ec`. NOT PUSHED,
+      > NO MR, AND NO PIPELINE HAS EVER RUN AGAINST ANY OF IT** — the same state M5's
+      > MR-C is in, and for the same reason: the two ship together.
+      >
+      > Gates at that tip: `gate:api` 0, `gate:controller` 0, `gate:web` 0,
+      > `cd web && npm run build` 0 (`probes/prd-103-mrc-m6-coder/b19-gates-at-tip.txt`).
+      >
+      > **The open design question was settled by measurement, not by argument.** Two
+      > validators had directly conflicted on whether the docblock pragma outranks
+      > `test.projects` in vitest 4, and nobody could settle it until MR-C installed
+      > vitest 4. Measured on 4.1.10, four cells with both controls behaving: **the
+      > pragma wins.** A `projects` entry with `environment: "node"` does not move a
+      > pragma-carrying file, and one with `"jsdom"` does move a pragma-less one. So
+      > the architect's 2.1.9 precedence result transfers, the fact-checker's R3
+      > assumption is refuted, and the 14 pragma-carrying files in the mixed
+      > `src/lib` / `src/mocks` directories **cannot** be moved to node by a
+      > directory-keyed split. That is what makes the mixed directories safe, and it
+      > is not readable from the config.
+      >
+      > **The acceptance criterion held**: the per-file environment census is
+      > byte-identical before and after the config change — same sha256, 118 lines,
+      > 76 jsdom / 42 node, collected pair 118 files / 1660 tests in both runs
+      > (`b4-census-{before,after}.txt`). That criterion was chosen because it is
+      > correct under *either* answer to the precedence question, so a wrong
+      > partition would have been detectable rather than merely unlikely.
+      >
+      > **The split ships as `src/lib` + `src/mocks` → node, everything else under
+      > `src/` → jsdom, expressed with `exclude` rather than an enumerated list**, so
+      > a new top-level directory defaults INTO jsdom instead of being collected by
+      > no project at all. `extends: true` carries `testTimeout: 20000` and
+      > `setupFiles` into both projects — verified by asserting the wrong value and
+      > reading what the runner printed, not by a passing suite. Removing `extends`
+      > makes both settings silently vanish rather than revert.
+      >
+      > **No new CI job.** Coverage rides `test:api`, `test:controller` and
+      > `test:web`, which are already in both `.gate_needs` and `.publish_needs`
+      > (established by parsing; job count 27 → 27), so Hard constraint 2 is
+      > satisfied with no list edit and the "is a coverage job a gate job" question
+      > never arises. Decision 6 is honoured structurally: nothing in those jobs can
+      > fail on the number.
+      >
+      > **Two silent constraints on the `coverage:` regex, both measured in RE2 —
+      > GitLab's own engine — across 9 arms including 6 negative controls.** No `^`
+      > anchor: `output: prefixed` makes every line `[test:api] total: …`, and both
+      > anchored variants match nothing. No capturing group: GitLab's docs require
+      > all groups to be non-capturing, and RE2 accepts a capturing group happily, so
+      > testing the wrong form locally passes. The first draft had both errors.
+      >
+      > **The MR widget's single percentage is an unweighted mean over jobs, not repo
+      > coverage** (`app/models/ci/pipeline.rb`: `coverage_array.sum / size`). Today
+      > api 55.4 / controller 90.0 / web 75.41 → ≈ **73.6%**, weighting a 437-block
+      > module equally with an 11920-block one. Recorded in `.coverage_notes`, the
+      > CHANGELOG and `docs/dev-conventions.md` so nobody quotes it as a repo figure.
+      >
+      > **Calibration (Success Criterion 8)**: the number moves and returns, read
+      > through the shipped pattern rather than by eye — controller 90.0 → **74.2** →
+      > 90.0, web 75.41 → **71.65** → 75.41, restore verified with `git status`. The
+      > first web attempt moved the number by **0.01** and was replaced: real,
+      > deterministic, and worthless as evidence.
+      >
+      > **A control found a real defect in the milestone's own script.**
+      > `scripts/coverage-total.sh`'s passing arm returned rc=2 (`go.mod file not
+      > found`) because `go tool cover -func` resolves package paths against the
+      > module in **cwd**, which the script inherited from its caller. It would have
+      > shipped working — the Taskfile calls it with `dir:` — with a hidden
+      > dependency and a guard whose calibration proved nothing, since all three arms
+      > returned 2.
+      >
+      > **`-race` on `test:controller` was already landed** in `f9b1f27f` (pulled
+      > forward into MR-C) and was verified rather than redone; green on both runs,
+      > so Decision 3's `allow_failure` branch was not needed.
+      >
+      > **The one honest gap, `suspected` rather than measured**: the Cobertura
+      > **diff annotations**. Both Go modules and vitest emit `filename=`
+      > module-relative with the module root in `<source>`, and GitLab's automatic
+      > class-path correction handles that only when the source path looks like
+      > `<CI_BUILDS_DIR>/<PROJECT_PATH>/…`, which holds under a normal runner. The
+      > **percentages** are measured; the annotations need the first pipeline.
+      >
+      > **New measured fact, sharper than this milestone's own spec:**
+      > `environmentMatchGlobs` on 4.1.10 is **silently ignored** — rc=0, no error,
+      > the glob simply does nothing — rather than throwing. The spec establishes it
+      > is absent from the package; this is what the runner does when handed one.
+
+      Original scope, kept for the record: `-coverprofile`
       for both Go modules and `vitest --coverage` for `web` (which needs
       `@vitest/coverage-v8` added to `web/package.json` — it is not currently
       a dependency), with the totals printed in CI job output and GitLab's
@@ -1944,11 +2117,84 @@ which previously prescribed only the fail-open form.
       Prefer an explicit per-directory project config over flipping the
       global default — a blanket default flips the remaining non-pragma files
       from node to jsdom, which is the same class of silent-wrong-environment
-      bug in the opposite direction. (`environmentMatchGlobs` does the same job
-      and works on the pinned `vitest ^2.1.9`, but it is deprecated from
-      Vitest 3 in favour of the projects/workspace config, so it buys a
-      migration later.) Removes the
+      bug in the opposite direction. Removes the
       vestigial `coverage.out` line from `.gitignore` or makes it real.
+
+      > **🔴 CORRECTED 2026-08-04, and BOTH HALVES of what stood here were false
+      > by the time M6 started.** This paragraph ended with a parenthetical
+      > recommending `environmentMatchGlobs` because it *"does the same job and
+      > works on the pinned `vitest ^2.1.9`, but it is deprecated from Vitest 3
+      > … so it buys a migration later."* M5's MR-C took `web` to an **exact
+      > `4.1.10`** pin, so neither clause survives: the pin is not `^2.1.9`, and
+      > the option is not deprecated in 4.1.10 — it is **absent**. Settled
+      > against three package tarballs rather than doc prose: 2.1.9 implements it
+      > with no `@deprecated` tag; 3.0.0 has it with a `@deprecated` JSDoc *and* a
+      > runtime `logger.warn`; **4.1.10 has zero occurrences of it in the entire
+      > package.**
+      >
+      > **The route is `test.projects`, and `test.workspace` is not an
+      > alternative** — it was removed in Vitest 4 and throws *"The
+      > `test.workspace` option was removed in Vitest 4. Please, migrate to
+      > `test.projects` instead."* That one fails loud, so it is a spec-precision
+      > fix rather than a live hazard; `environmentMatchGlobs` is the dangerous
+      > half, because a config key vitest 4 does not know is simply ignored.
+      >
+      > Two further facts M6 must start from, both measured and neither derivable
+      > from the paragraph above. **`test.projects` inherits NOTHING from the root
+      > `test:` block without `extends`** — and that block holds the suite-wide
+      > `testTimeout` and `setupFiles`, so a projects config that does not
+      > re-assert them silently drops both. And **the per-directory split this
+      > paragraph recommends cannot be keyed on directory alone**: `web/src/lib`
+      > and `web/src/mocks` are MIXED (6 of 42 and 8 of 14 respectively carry the
+      > pragma today), so assigning those two directories to node would move 14
+      > files that run under jsdom now — the exact silent-wrong-environment bug
+      > this paragraph warns about, introduced by the fix.
+
+## 🔴 ALL SIX MILESTONES ARE TICKED AND THE WORK IS NOT SHIPPED. THREE STEPS REMAIN.
+
+**Read this before concluding from the checkboxes that the PRD is finished**, because
+6 of 6 ticked plus 0 unticked is exactly what a completed PRD looks like and this one
+is not. Nothing is pushed, there is no MR, and **no pipeline has ever run against any
+of M5's MR-C or M6** — `git rev-parse @{u}` reports no upstream on `prd-103`.
+
+The remaining work is not milestone work, which is why it has no checkbox above:
+
+1. **Integrated pass.** Several units landed on this branch — the `origin/main` merge,
+   M6, two rounds of gate-script fixes, and the docs — so **every validator so far was
+   scoped to a diff that is not the diff being shipped.** Cross-unit interaction is
+   precisely what none of them could see. Reviewer + auditor + fact-checker over
+   `origin/main...HEAD`. The fact-checker has not run on this branch at all since the
+   design wave, and the MR description is claim-dense.
+2. **Spec sync.** `specs/ai.md` is append-only and numbered; its head is **481** on
+   this branch, so append from **482** — and re-derive that, because the `main`
+   worktree reads 478 and is stale, which is the exact collision the rule exists to
+   prevent.
+3. **The MR.** Draft committed at `probes/prd-103-mrc-lead/mr-description-draft.md`;
+   the five items that must not go wrong in it are Amendment 12 of the brief.
+
+**Before pushing, three checks, all measured and all cheap to get wrong** — they are
+written out in the brief's `END OF SESSION 2` section and summarised here because a
+reader who arrives at this file may never open that one:
+
+- **Re-derive the CI-skip marker at the tip you are actually pushing**
+  (`git log -1 --format=%B | grep -c -F '[skip ci]'`). Most commits here are docs-only
+  and correctly carry it, so a clean tip is *incidental*, and the marker on an MR's
+  HEAD commit makes GitLab skip the pipeline entirely — `skipped`, not `failed`, with
+  the MR still reading mergeable because this project sets
+  `allow_merge_on_skipped_pipeline: true`. Fix by landing a marker-free commit; this
+  repo forbids the force-push an amend would need.
+- **Push the SHA you gated, by refspec** (`git push origin <sha>:refs/heads/prd-103`).
+  A branch name resolves at push time; a gate result is bound to a SHA.
+- **Expect the first pipeline to possibly be RED for FLAKE reasons.** `test:agent` went
+  green/red/red/green over four runs under an agent-team load and `test:web` red once
+  in three. Read the named failing test; never retry-until-green, because the retry
+  destroys the evidence. There is **no measured flake rate for CI**, which is where it
+  actually bites — that gap is issue #227.
+
+**Full working record**: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, twelve
+amendments plus two end-of-session handovers. **That file is gitignored-but-tracked,
+so `grep -r` and `rg` cannot see it and `--hidden` does not help — use `git grep`, or
+open it by path.**
 
 ## Parallelization
 
@@ -2005,6 +2251,29 @@ Three exceptions where "append at the end" is not enough:
    `helm_chart`, the sqlc-drift `git diff --exit-code` in `validate:api`,
    `test:api-store-it`'s Postgres service and its ran/skipped assertion, and
    `e2e:kind-smoke`.
+
+   **Also excluded, on a DIFFERENT ground, added by M5 MR-C: `govulncheck` (the
+   `vulncheck:api` / `vulncheck:controller` targets, run as extra script lines of
+   the `lint:api` and `lint:controller` jobs) and `npm audit` (`vulncheck:web` /
+   `vulncheck:agent`, inside `validate:web` and `validate:agent`).** Both are
+   toolchain checks in per-toolchain jobs, so without this entry MR-C would
+   quietly violate a criterion this PRD wrote. State the ground precisely, because
+   it is not the list above's: **their verdict is a function of a remote mutable
+   database, not of the tree.** Both run perfectly well from a plain local
+   checkout — `task vulncheck` runs all four — which is exactly why the existing
+   "cannot run meaningfully locally" wording does not cover them. What disqualifies
+   them from `task gate` is that a contributor's gate must be deterministic against
+   the tree, and these two can answer differently on two runs of one commit with
+   nobody's diff in between.
+
+   *(And note the tempting shorter reason is measurably FALSE: `task gate` is not
+   offline. `lint:api`, `deadcode:api` and `scan:secrets` are all `go run
+   pkg@version` and all three need the network on a cold module cache — control:
+   `task scan:secrets` under `GOPROXY=off` returns 201 with "module lookup disabled
+   by GOPROXY=off". The difference is that a pinned `go run` fetches a
+   checksum-verified artifact once and then answers from the tree. Writing the
+   false version here would invite someone to "fix" gitleaks out of `gate:repo` on
+   the same reasoning.)*
 2. A newly introduced `gofmt` violation, `staticcheck` finding, dead Go
    function, or `shellcheck` error fails an MR pipeline — **each demonstrated
    by the milestone's calibration step, not asserted.** The shellcheck half is
@@ -2057,7 +2326,25 @@ Three exceptions where "append at the end" is not enough:
    milestone told to remove the markers "in both" will find only one file has
    any, and should not read that as having edited the wrong file.
 5. `.claude/agents/auditor.md` no longer documents the absence of a secret
-   scanner, because one runs.
+   scanner **or of dependency-vulnerability scanning**, because `gitleaks`,
+   `govulncheck` and `npm audit` all run.
+
+   *(**Amended by M5 MR-C, 2026-08-04, and the amendment is a correction of THIS
+   TEXT rather than of the five documents that restate it.** The criterion used to
+   end at "because one runs", and its literal predicate was ALREADY MET before
+   MR-C: `.claude/agents/auditor.md:116` has read "secrets are covered as of PRD
+   #103 M5 MR-B" since MR-B landed. Yet "Success Criterion 5 is atomic across
+   gitleaks AND govulncheck AND npm audit" appears in five places — `auditor.md`,
+   this file twice, and M5's brief twice — and is the stated reason M5 stayed
+   unticked. Whitespace-flattened, the whole Success Criteria section contained
+   **zero** occurrences of `gitleaks`, `govulncheck` or `npm audit`, against a
+   control on the same instrument in the same section of `gofmt` 2, `shellcheck` 2,
+   `knip` 2, `coverage` 2 — so the instrument was live and simply had nothing to
+   find. The DECISION the five restatements produced is right, because the real
+   residual was the dependency half, which MR-C closes. Only its stated ground was
+   wrong. Amending the criterion makes the five restatements true; amending five
+   restatements to match a criterion that was already satisfied would have made the
+   record worse.)*
 6. Coverage percentages for `api`, `controller` and `web` are visible on
    every MR.
 7. `main` is `gofmt`-clean across both Go modules.

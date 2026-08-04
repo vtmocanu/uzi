@@ -1,0 +1,280 @@
+#!/bin/sh
+# Gate one npm package on `npm audit` (PRD #103 M5 MR-C).
+#
+# 🔴 THIS WRAPPER EXISTS BECAUSE npm audit's rc=1 IS AMBIGUOUS AND ONE BRANCH OF
+# IT IS A NETWORK FAILURE. Measured 2026-08-04, npm 11.17:
+#
+#     findings at or above the level     rc=1
+#     registry unreachable               rc=1   + "npm error audit endpoint returned an error"
+#
+# Same code, and `--json` does not separate them either. It fails CLOSED, which is
+# right, but it collapses exactly the two states the Go half of this milestone is
+# carefully engineered to keep apart. This repo's convention is
+#
+#     2 = the instrument is broken     1 = there are findings     0 = clean
+#
+# so the network branch is detected in the OUTPUT and reported as 2.
+#
+# 🔴 THE FLAGS ARE THE GATE, AND ONE OF THEM CLOSES A DISARM THAT EXITS 0.
+# A one-file `.npmrc` carrying `omit=dev` takes `npm audit` on `web` from rc=1 to
+# rc=0, printing "found 0 vulnerabilities" -- because all three of web's
+# high-and-above findings are dev-tree. `--audit-level` on the command line DOES
+# beat `.npmrc` for its own key, but `omit` is a DIFFERENT key, so nothing on the
+# command line contradicts it. Measured:
+#
+#     no .npmrc                  rc=1   <- armed
+#     .npmrc: omit=dev           rc=0   <- DISARMED, silently
+#     .npmrc: audit-level=none   rc=1   <- CLI --audit-level wins for THAT key
+#     .npmrc: omit=dev + --include=dev on the command line   rc=1   <- re-armed
+#
+# 🔴 AND THE SAME KEY HAS AN ENVIRONMENT FORM, `NPM_CONFIG_OMIT`, WHICH MATTERS
+# MORE THAN THE FILE FORM: a GitLab project-level or manual-pipeline variable needs
+# no file and leaves no diff, and these targets are reachable from `.publish_needs`.
+# THIS GATE IS ALREADY IMMUNE AND THE IMMUNITY IS MEASURED, not assumed -- npm ranks
+# a CLI flag above both env and `.npmrc`, so the same `--include=dev` covers both.
+# Measured 2026-08-04 on a lockfile carrying 1 critical and 2 high, all dev-tree:
+#
+#   no env, this gate                            rc=1   8 vulnerabilities
+#   NPM_CONFIG_OMIT=dev, this gate               rc=1   8 vulnerabilities  <- immune
+#   NPM_CONFIG_OMIT=dev, bare npm audit          rc=0   2 moderate         <- disarmed
+#
+# Note the remedy shape differs from the Go half's deliberately: govulncheck's
+# `GOPACKAGESDRIVER` has no flag that overrides it, so that gate must REFUSE the
+# variable, while this one is simply outranked. Both are instances of one rule --
+# a gate script names the environment variables that can shrink its view.
+#
+# So `--include=dev` is not belt-and-braces, it is the remedy. And unlike the
+# gitleaks scan this milestone shipped earlier, npm audit HAS NO IN-BAND CANARY:
+# `metadata.dependencies` is byte-identical armed and disarmed, so nothing in a
+# disarmed run's own output distinguishes it from a clean one. `web/.npmrc` and
+# `agent/.npmrc` therefore belong on the list of gate-config files reviewers
+# watch; there is none in this repo today, at any level.
+#
+# THE LEVEL IS AN ARGUMENT, not a default inside this file, so `task`'s echo shows
+# it -- the same reason `lint:shell` passes its severity and `scan:secrets` passes
+# its version. For this check the threshold IS the gate.
+#
+# WHY `high` AND NOT ZERO. User ruling 1 is "the full tree, fixed first, at zero",
+# and "at zero" means high-and-above at zero: two MODERATE advisories survive every
+# option on `web` (`react-router` and `react-router-dom`, GHSA-wrjc-x8rr-h8h6 and
+# GHSA-337j-9hxr-rhxg). Both are patched only at 7.18.0, the installed 6.30.4 is
+# the newest 6.x that exists, the whole 6.x line sits inside the advisory range,
+# `overrides` has nothing patched to point at, and `npm audit fix --force`
+# emits no react-router entry at all. Clearing them is a React Router 6 -> 7 major
+# through shipped SPA routing code, which is filed as its own issue rather than
+# pulled into a quality-gates milestone.
+#
+# NOT DELEGATED TO A `package.json` SCRIPT THE WAY EVERY OTHER npm TARGET IS, AND
+# THAT IS DELIBERATE: it IS delegated, but through this file rather than around it.
+# `package.json`'s `audit` script carries the flags (so the Taskfile header's rule
+# holds and a rewrite cannot drop them silently), and this script exists solely for
+# the exit-code mapping, which a package.json script cannot express. A committed
+# script also gets linted by `lint:shell`, where an inline `cmds:` string gets
+# nothing.
+set -eu
+
+PKG_DIR="${1:-}"
+LEVEL="${2:-}"
+
+if [ -z "$PKG_DIR" ] || [ -z "$LEVEL" ]; then
+  echo "usage: scripts/npm-audit-gate.sh <package-dir> <audit-level>" >&2
+  echo "  e.g. scripts/npm-audit-gate.sh web high" >&2
+  exit 2
+fi
+
+if [ ! -f "$PKG_DIR/package.json" ]; then
+  echo "npm-audit-gate: no package.json in: $PKG_DIR" >&2
+  exit 2
+fi
+
+# 🔴 BOTH ASSERTIONS BELOW READ `scripts.audit` BY PARSING, NOT THE FILE BY GREP.
+# They were file-wide `grep -q -F` over package.json, which is a different claim
+# from the one their own comments make ("what package.json's `audit` script
+# actually encodes"). Measured (Unit B review,
+# `probes/prd-103-mrc-b-reviewer/p3-...`): a package.json whose `audit` script is
+# `echo DISARMED-SCRIPT-RAN; exit 0`, with both flag strings present in a second
+# `audit:local` script, PASSES both guards and the gate prints "clean at
+# --audit-level=high". The realistic single-edit case was still caught -- deleting
+# the flag with no decoy present exits 2 and names the file -- so the grep form was
+# not useless; it dies the moment the package gains a second audit-ish script and
+# someone trims the first, which is ordinary maintenance rather than an attack.
+#
+# `node` and not `jq`, matching this repo's existing choice in
+# scripts/deps-check-gate.sh: node is already required by every npm target here,
+# jq is not guaranteed on a contributor's machine.
+AUDIT_SCRIPT="$(node -e '
+const fs = require("fs");
+const pkg = JSON.parse(fs.readFileSync(process.argv[1] + "/package.json", "utf8"));
+const s = (pkg.scripts || {}).audit;
+if (typeof s !== "string") { process.stderr.write("no scripts.audit"); process.exit(3); }
+process.stdout.write(s);
+' "$PKG_DIR")" || {
+  echo "npm-audit-gate: $PKG_DIR/package.json has no \`audit\` script to delegate to." >&2
+  echo "  INSTRUMENT FAILURE. This gate asserts its flags against that script and" >&2
+  echo "  then runs it; with no script there is nothing to assert and nothing to run." >&2
+  exit 2
+}
+
+# The level is asserted against what package.json's `audit` script actually
+# encodes, rather than being passed to npm from here. Without this the argument
+# would be decorative: the script would keep using its own baked-in level while
+# `task`'s echo advertised whatever was typed on the Taskfile line. A mismatch is
+# an instrument failure, not a finding.
+case "$AUDIT_SCRIPT" in
+  *"--audit-level=$LEVEL"*) ;;
+  *)
+    echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --audit-level=$LEVEL." >&2
+    echo "  Its audit script is: $AUDIT_SCRIPT" >&2
+    echo "  The Taskfile line and the script must agree, or this file's echo advertises" >&2
+    echo "  a threshold that is not the one being enforced." >&2
+    exit 2
+    ;;
+esac
+
+# 🔴 AND `--include=dev` IS ASSERTED, NOT MERELY DELEGATED. It is the single flag
+# that keeps this gate armed against BOTH omit vectors -- a `.npmrc` carrying
+# `omit=dev` and an `NPM_CONFIG_OMIT=dev` environment variable -- and without this
+# check, deleting seven characters from `package.json`'s audit script takes the gate
+# green with `found 0 vulnerabilities` and nothing anywhere naming the change.
+#
+# WHY THE FLAG LIVES IN `package.json` AND THIS ASSERTION LIVES HERE, rather than
+# putting the flag on the Taskfile line. The two constraints pull opposite ways:
+# Taskfile.yml's header requires every npm target to DELEGATE ("a target that
+# reimplements the command drops that script's flags SILENTLY"), while the flag must
+# not be droppable. Delegation plus this assertion satisfies both and is STRICTLY
+# STRONGER than the Taskfile-line form, which no assertion guards at all -- there,
+# a future "simplify the gate" edit removes the flag and nothing notices, which is
+# precisely the failure the delegation rule was written about. Here the removal
+# exits 2 and names the file.
+#
+# The invisible-edit hazard the ruling is really about does not reach this file:
+# `package.json` is tracked and every change to it lands in the MR diff. The vectors
+# that leave nothing in a diff are `.npmrc` (an untracked add) and `NPM_CONFIG_OMIT`
+# (a CI variable), and `--include=dev` outranks both -- measured, both ways.
+case "$AUDIT_SCRIPT" in
+  *"--include=dev"*) ;;
+  *)
+    echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --include=dev." >&2
+    echo "  Its audit script is: $AUDIT_SCRIPT" >&2
+    echo "  REFUSED. That flag is what keeps this gate armed against a .npmrc holding" >&2
+    echo "  'omit=dev' and against an NPM_CONFIG_OMIT=dev environment variable. Without" >&2
+    echo "  it, either one takes this gate to exit 0 printing 'found 0 vulnerabilities'" >&2
+    echo "  over a tree whose only high-severity findings are dev-tree, and npm audit" >&2
+    echo "  has NO in-band canary that would distinguish that from a clean run." >&2
+    exit 2
+    ;;
+esac
+
+# No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
+TMP="$(mktemp -d)"
+# shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
+trap "rm -rf '$TMP'" EXIT INT TERM
+
+# 🔴 RC FIRST, AND INTO A FILE. Redirect and read `$?` on the very next line -- do
+# not pipe into grep and read the pipeline's status, and do not feed a shell
+# builtin's multi-line output into an early-exiting reader: `printf '%s' "$BIG" |
+# grep -q` returns 141 on SIGPIPE while the pattern is present, which is measured
+# in this repo (scripts/assert-changelog-covers-release.sh) and blocked a release.
+# A file has no writer process, so it cannot SIGPIPE, in any shell.
+#
+# 🔴 NO `--silent`, AND THAT IS THE WHOLE DISCRIMINATOR. `npm run --silent audit`
+# is the tidier-looking form and it DESTROYS this script's only signal. Measured
+# 2026-08-04, npm 11.17, against an unreachable registry, all three forms rc=1:
+#
+#   npm audit ...                  npm warn audit request ... ECONNREFUSED
+#                                  undefined
+#                                  npm error audit endpoint returned an error
+#   npm run audit                  identical, plus the script banner
+#   npm run --silent audit         undefined            <- AND NOTHING ELSE
+#
+# `--silent` suppresses BOTH the warn and the error line, so a registry outage
+# arrives as a one-word output and rc=1 -- indistinguishable, from the output, from
+# a tree full of critical advisories. This script shipped with `--silent` for
+# exactly one calibration run, which reported a network failure as
+# "web has advisories at or above 'high'". Do not put it back.
+rc=0
+(cd "$PKG_DIR" && npm run audit) >"$TMP/out" 2>&1 || rc=$?
+
+cat "$TMP/out"
+
+if [ "$rc" -eq 0 ]; then
+  # 🔴 THE CLEAN BRANCH NEEDS A POSITIVE OBSERVATION TOO, AND IT WENT WITHOUT ONE
+  # UNTIL 2026-08-04. The findings branch below has required npm's own report
+  # header since it shipped; this one required nothing, so ANY rc=0 was reported as
+  # "clean". That asymmetry is the wrong way round: the findings branch fails
+  # CLOSED, and this is the branch that ships a green.
+  #
+  # Measured by the auditor (probes/prd-103-mrc-b-auditor/a3-npm-audit-clean-arm.txt),
+  # and note both fixtures pass the two flag assertions above -- moving the read
+  # from the file to `scripts.audit` did not close this, because the decoy simply
+  # moves INSIDE the audit script:
+  #
+  #   scripts.audit = 'echo skipping: npm audit --audit-level=high --include=dev; exit 0'
+  #       -> both assertions pass, gate exit 0 "clean". No audit ran.
+  #   scripts.audit = 'npm audit --audit-level=high --include=dev || echo see docs/...'
+  #       -> npm genuinely errors, `|| echo` swallows the rc, gate exit 0 "clean"
+  #          with npm's own error text printed directly above the word. This is the
+  #          ordinary-maintenance shape, not an attack.
+  #
+  # 🔴 THE TEST IS "npm PRODUCED A VERDICT", NOT "npm FOUND NOTHING", AND THE
+  # DIFFERENCE IS THE WHOLE GATE. The obvious one-line remedy -- require npm's own
+  # `found 0 vulnerabilities` -- is WRONG for a gate that thresholds above zero, and
+  # it was written here and refuted by `web` inside a minute: `npm audit
+  # --audit-level=high` exits 0 on a tree whose only findings are MODERATE, while
+  # printing the full moderate report. Its output therefore says "2 moderate
+  # severity vulnerabilities" and never "found 0 vulnerabilities", so the strict
+  # form took `vulncheck:web` -- the configuration this repo actually ships -- to
+  # exit 2 with "INSTRUMENT FAILURE" over a perfectly good run.
+  #
+  # So accept EITHER of npm's two verdict shapes at rc=0: `found 0 vulnerabilities`
+  # (nothing at any level) or a `# npm audit report` header (findings exist, all of
+  # them below the threshold). The findings branch below already requires the same
+  # header, which is what makes the pair symmetric.
+  #
+  # Both of the auditor's fixtures still fail closed under this weaker test, which
+  # is the check that matters: `echo skipping: npm audit …; exit 0` prints neither
+  # shape, and `npm audit … || echo …` on a genuinely erroring npm prints neither.
+  if ! grep -q -F -e 'found 0 vulnerabilities' -e 'npm audit report' "$TMP/out"; then
+    echo "npm-audit-gate: $PKG_DIR -- npm exited 0 without printing a clean audit result." >&2
+    echo "  INSTRUMENT FAILURE, NOT A CLEAN TREE. The output above is the whole of" >&2
+    echo "  what npm produced; nothing in it is a verdict about this tree. The usual" >&2
+    echo "  cause is an \`audit\` script that does not actually run npm audit, or one" >&2
+    echo "  that swallows npm's exit code with \`|| something\`." >&2
+    exit 2
+  fi
+  echo "npm-audit-gate: $PKG_DIR clean at --audit-level=$LEVEL"
+  exit 0
+fi
+
+# THE NETWORK BRANCH. npm's own wording for an unreachable registry is
+# "audit endpoint returned an error"; the ENOTFOUND/ECONNREFUSED/ETIMEDOUT codes
+# cover the DNS and connection cases that never reach the endpoint at all. Any of
+# them means the verdict is about the network, not about the tree.
+if grep -q -F -e 'audit endpoint returned an error' \
+             -e 'ENOTFOUND' -e 'ECONNREFUSED' -e 'ETIMEDOUT' -e 'ERR_SOCKET_TIMEOUT' \
+             "$TMP/out"; then
+  echo "npm-audit-gate: $PKG_DIR -- npm audit could not reach the registry." >&2
+  echo "  INSTRUMENT FAILURE, NOT FINDINGS. npm audit returns 1 for both, so this" >&2
+  echo "  distinction cannot live in its exit code and lives here instead." >&2
+  exit 2
+fi
+
+# 🔴 THE FINDINGS BRANCH NEEDS A POSITIVE OBSERVATION, NOT MERELY THE ABSENCE OF
+# THE NETWORK ONE. The grep above is a NEGATIVE test, and a negative test cannot
+# tell "no network error" from "npm failed in a way this script has never seen" --
+# which is precisely how the --silent bug above reported an outage as advisories.
+# So classifying as FINDINGS requires npm's own report header to be present. Any
+# other nonzero exit is an instrument failure by default, because a run that
+# produced no report has not measured the tree.
+if ! grep -q -F 'npm audit report' "$TMP/out"; then
+  echo "npm-audit-gate: $PKG_DIR -- npm exited $rc without printing an audit report." >&2
+  echo "  INSTRUMENT FAILURE, NOT FINDINGS. The output above is the whole of what" >&2
+  echo "  npm produced; nothing in it is a verdict about this tree." >&2
+  exit 2
+fi
+
+echo "npm-audit-gate: $PKG_DIR has advisories at or above '$LEVEL' (gate exit 1)." >&2
+echo "  Fix them in this MR. Run 'cd $PKG_DIR && npm audit --json' for the package" >&2
+echo "  names -- the human-readable output leaves transitive findings unlabelled," >&2
+echo "  so a fix list built by reading it omits them." >&2
+exit 1

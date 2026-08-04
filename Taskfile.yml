@@ -261,9 +261,83 @@ tasks:
       - task: test:controller
 
   gate:web:
-    desc: web - lint, deadcode, check-docs, typecheck, test
+    desc: web - deps-check, lint, deadcode, check-docs, typecheck, test
     cmds:
-      # lint FIRST here, which is the MIRROR IMAGE of the Go gates above and is
+      # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
+      # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
+      # is ~1-3s, so on cost alone lint would still lead. It goes first because a
+      # STALE node_modules does not make the later slots WRONG, it makes them
+      # ANSWERS ABOUT A DIFFERENT TREE - lint, knip, tsc and vitest would all run,
+      # all pass, and all report on the versions that happen to be on disk rather
+      # than the ones this branch declares. A verdict about the wrong tree is worse
+      # than a slow one, which is the same argument `gate` uses for putting
+      # `gate:repo` ahead of a 51.8s `gate:api`.
+      #
+      # WHY THIS EXISTS AT ALL: A VERSION BUMP OF A devDependency FAILS SILENTLY,
+      # WHERE A NEW ONE FAILS LOUDLY. Carry-forward 12 covers the new-dependency
+      # case: `npm run` puts node_modules/.bin on PATH, so a missing binary dies with
+      # `command not found`. A BUMP cannot fire that - the binary is already there -
+      # so a checkout that skipped `npm ci` runs vitest 2 while the lockfile says 4,
+      # green, with nothing naming the mismatch. MR-C ships exactly that bump, so
+      # this is its own exposure rather than a general precaution.
+      #
+      # `npm ls --depth=0` AND NOT A `vitest --version` ASSERTION, measured rather
+      # than preferred. It exits 1 with a POSITIVE OBSERVATION NAMING BOTH VERSIONS
+      # (`vitest@2.1.9 invalid: "4.1.10" from the root project`), needs no new
+      # dependency, and covers EVERY direct dependency rather than the one bump
+      # somebody remembered to assert. A `--version` assertion has to be written
+      # again for each future bump, and the one nobody writes is the one that bites.
+      #
+      # IT IS OFFLINE, MEASURED, NOT ASSUMED. With an unreachable registry
+      # (`npm_config_registry=http://127.0.0.1:1`) the output is BYTE-IDENTICAL to
+      # the clean run and rc stays 0, in both packages. That is what lets it sit in
+      # `gate` at all: this file's govulncheck/npm-audit note below excludes those
+      # two precisely because their verdict is a function of a remote database, and
+      # this one's is a function of the tree.
+      #
+      # 🔴 THIS CHECK IS TWO LINES, NOT ONE, AND THIS COMMENT DESCRIBED ONLY THE
+      # FIRST UNTIL 2026-08-04. `3903e9d7` added a lockfile join precisely to cover
+      # the two limits listed below, so a reader who stopped here came away with a
+      # narrower view of the gate than it has had since. Corrected rather than
+      # deleted, because the limits are still true OF LINE 1 and line 1 is still
+      # what runs first. `deps-check:web`'s own comment further down describes both
+      # lines; if the two ever disagree again, that one is the definition and this
+      # one is the summary.
+      #
+      # LINE 1, `npm ls --depth=0`, has TWO LIMITS, BOTH REAL. `--depth=0` sees
+      # DIRECT dependencies only - a transitive version skew is invisible to it. And
+      # it compares node_modules against `package.json` RANGES, not against the
+      # lockfile, so a caret range makes it loose: `^4.1.10` is satisfied by 4.9.0
+      # and the check would say nothing. That is why MR-C pins `vitest` with
+      # `--save-exact`, matching the `oxlint`/`knip` precedent.
+      #
+      # LINE 2 is a join against the lockfile's RESOLVED versions, which is what
+      # covers both of those, and since `4f48085d` it reports ABSENCE as well as
+      # skew - the state a `git pull` adding a transitive dependency produces, where
+      # line 1 has no declared range to check either.
+      #
+      # AND ONE STATE WHERE THE CHECK LIES, which is the one a person TESTING this
+      # will create: `npm install --package-lock-only` run in place also rewrites
+      # `node_modules/.package-lock.json`, after which `npm ls` reports the NEW
+      # version while the package on disk is still the old one.
+      #
+      # 🔴 THAT STATE DEFEATS BOTH LINES, NOT JUST `npm ls`, and this comment blamed
+      # line 1 alone. `node_modules/.package-lock.json` is line 2's installed-side
+      # oracle, so rewriting it moves what line 2 reads as "installed" too - measured
+      # by the Unit B reviewer: on-disk 2.0.2, both lockfiles 2.0.1, gate rc=0 "up to
+      # date" (`probes/prd-103-mrc-b-reviewer/p5-deps-check-shared-oracle.txt`).
+      # NEITHER line has an independent read of what is actually unpacked on disk.
+      # A git pull cannot produce that state; a hand-built repro can. Build the stale
+      # state the way a pull does - replace package.json and the lockfile, leave
+      # node_modules alone.
+      #
+      # NOT A CI CHECK, AND THAT DOES NOT VIOLATE SUCCESS CRITERION 1. SC1 reads
+      # "CI runs no toolchain check that `task gate` does not" and is one-directional;
+      # this is the other direction. CI is structurally unexposed anyway - every npm
+      # job's `before_script` is `npm ci`, which reinstalls from the lockfile, so the
+      # check would be asserting something CI has just made true by construction.
+      - task: deps-check:web
+      # lint SECOND here, which is the MIRROR IMAGE of the Go gates above and is
       # deliberate rather than inconsistent (PRD #103 M3). oxlint is measured at
       # ~0.06s, two orders of magnitude cheaper than anything else in this gate,
       # and unlike golangci-lint it is NOT type-aware - so it has no ordering
@@ -280,9 +354,17 @@ tasks:
       - task: test:web
 
   gate:agent:
-    desc: agent - lint, deadcode, typecheck, test
+    desc: agent - deps-check, lint, deadcode, typecheck, test
     cmds:
-      # lint first, same reason as gate:web (~0.05s here).
+      # deps-check first, same placement and the same reasons as gate:web above -
+      # read that target's comment, including the two limits and the one state in
+      # which `npm ls` lies. This package is the one where the standing remedy for a
+      # missing dependency (symlink node_modules rather than install) is unavailable,
+      # because `npm ci`/`npm install` here rewrites /opt/homebrew/bin/agent-browser
+      # host-wide, so a contributor is MORE likely to be running a stale tree here
+      # than in web/ and this check is what names it.
+      - task: deps-check:agent
+      # lint second, same reason as gate:web (~0.05s here).
       - task: lint:agent
       # knip second, same reason as gate:web (~1-3s wall here too).
       - task: deadcode:agent
@@ -344,6 +426,56 @@ tasks:
       - task: lint:shell
       - task: lint:yaml
       - task: lint:formula
+
+  vulncheck:
+    # 🔴 THIS SLOT IS THE ONE TARGET FAMILY IN THIS FILE THAT `task gate` MUST NOT
+    # REACH, AND THAT IS A RULING RATHER THAN AN OVERSIGHT (PRD #103 M5 MR-C).
+    # Every other composed target here (`lint`, `fmt-check`, `deadcode`) is an
+    # entry point that happens not to sit in `gate`'s closure because `gate` names
+    # slots individually inside each `gate:*`. This one is different in kind: it
+    # must be absent from `gate` AND from all five `gate:*` targets, and if a
+    # future milestone adds a sixth component gate it must be left out of that too.
+    #
+    # THE REASON IS THE VERDICT, NOT THE NETWORK, and the distinction matters
+    # because the network version of this argument is FALSE here. `task gate` is
+    # not offline: `lint:api`, `deadcode:api` and `scan:secrets` are all
+    # `go run pkg@version` and all three need the network on a cold module cache
+    # (measured: `task scan:secrets` under GOPROXY=off returns 201 with "module
+    # lookup disabled"). What separates those from these two is that a pinned
+    # `go run` fetches a checksum-verified artifact ONCE and then answers from the
+    # TREE, whereas govulncheck and npm audit query a REMOTE MUTABLE DATABASE on
+    # every run. So `task gate` would answer differently on two runs of one commit
+    # with nobody's diff in between, and a contributor's gate must be
+    # deterministic against the tree. State it this way: the false version invites
+    # somebody to "fix" gitleaks out of `gate:repo` on the same reasoning.
+    #
+    # CI RUNS THESE TARGETS, WHICH IS WHAT KEEPS SUCCESS CRITERION 3 TRUE (gate
+    # recipes are defined once, in this file). They are invoked as EXTRA SCRIPT
+    # LINES of the four existing per-toolchain jobs -- `lint:api`,
+    # `lint:controller`, `validate:web`, `validate:agent` -- exactly the way
+    # `deadcode:api` is already a second script line inside the `lint:api` job. No
+    # new CI job, so no `.gate_needs` / `.publish_needs` edit.
+    #
+    # 🔴 AND `lint:api` NAMES BOTH A CI JOB AND A TASKFILE TARGET. That ambiguity
+    # is the trap here: the Taskfile target `lint:api` IS reachable from `task
+    # gate` (gate -> gate:api -> lint:api), so "fold govulncheck into lint:api"
+    # read as the target would put a remote-database query inside every
+    # contributor's gate. It is the JOB. When you read a placement claim about
+    # this milestone, check which of the two it means.
+    #
+    # SUCCESS CRITERION 1 IS AMENDED IN THE SAME MR RATHER THAN QUIETLY VIOLATED.
+    # It reads "CI runs no toolchain check that `task gate` does not" and carries
+    # an explicit exclusion list; these two are toolchain checks in per-toolchain
+    # jobs, so they belong on that list. Their exclusion GROUND is different from
+    # every existing entry's: the others "cannot run meaningfully from a plain
+    # local checkout", while both of these run fine locally -- that is not why they
+    # are excluded. The ground is the one stated above.
+    desc: dependency-vulnerability scan, all four components. NOT in `gate` -- see comment
+    cmds:
+      - task: vulncheck:api
+      - task: vulncheck:controller
+      - task: vulncheck:web
+      - task: vulncheck:agent
 
   deadcode:
     # ONE SLOT, ONE PREFIX, FOUR COMPONENTS (PRD #103 M4). The npm half is knip
@@ -1013,6 +1145,29 @@ tasks:
       # both of these were. See PRD #103 Decision 10.
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
 
+  vulncheck:api:
+    desc: api - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
+    cmds:
+      # 🔴 DELIBERATELY NOT IN `gate:api`, and this line exists so its absence
+      # reads as a decision rather than an omission -- the same reason
+      # `scan:secrets` carries one about the composed `lint` target. Its verdict
+      # is a function of a REMOTE MUTABLE DATABASE rather than of the tree, so it
+      # would make `task gate` answer differently on two runs of one commit. The
+      # `vulncheck` composite above carries the full argument, including why the
+      # obvious "but the gate isn't offline anyway" objection is correct and
+      # beside the point. `.gitlab-ci.yml`'s `lint:api` JOB invokes this target as
+      # an extra script line.
+      #
+      # A SCRIPT, NOT AN INLINE RECIPE, for `deadcode:api`'s reason: a committed
+      # script gets LINTED by `lint:shell`, an inline `cmds:` string gets nothing.
+      # Read scripts/govulncheck-gate.sh's header before editing this line -- the
+      # exit-code inversion, the `go run` flattening and the every-non-text-format
+      # fail-open are all measured there, and none of them is visible from here.
+      #
+      # THE PIN IS AN ARGUMENT so this file's echo shows it, exactly as
+      # `deadcode:api` and `scan:secrets` pass theirs.
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
     dir: api
@@ -1071,7 +1226,51 @@ tasks:
       # UZI_TEST_DATABASE_URL, and go RED if you export it for this run (the
       # package binaries race one shared database). Run those via
       # `./e2e/run-store-it.sh`, which carries `-p 1` for the same reason.
-      - go test -race -count=1 ./...
+      #
+      # -coverprofile/-covermode ADDED BY PRD #103 M6, and they are the whole of the
+      # measurement: the total printed on the next line is what .gitlab-ci.yml's
+      # `coverage:` regex reads off this job. NO THRESHOLD (Decision 6) - nothing
+      # here can fail because of the number.
+      #
+      # -covermode=atomic is REDUNDANT WITH -race AND IS WRITTEN ANYWAY. `go test`
+      # forces atomic whenever -race is on, so the flag changes nothing today; it is
+      # here so that DELETING -race cannot silently downgrade the counters to `set`
+      # and move the number for a reason unrelated to the tests. Same argument as
+      # -count=1 above: a flag whose absence is invisible in the output.
+      #
+      # 🔴 WHAT THIS NUMBER EXCLUDES, because whoever sets a threshold later needs
+      # it: without -coverpkg, each package is measured only by its OWN tests, and a
+      # package with no test files at all is absent from the profile rather than
+      # counted as 0%. The total is therefore an over-estimate of module-wide
+      # coverage. -coverpkg=./... would fix that and re-instruments every package on
+      # every run; that trade is a threshold-time decision, not a measurement-time one.
+      - go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      # A script, not `go tool cover ... | tail -1`: the pipe would put the verdict on
+      # `tail`, and it guards against summarising a profile that measured nothing.
+      - sh ../scripts/coverage-total.sh coverage.out
+
+  coverage-xml:api:
+    desc: api - Cobertura XML from coverage.out (run test:api first; used by CI only)
+    dir: api
+    cmds:
+      # 🔴 NOT A GATE AND NOT IN `task gate`. It converts an artifact for GitLab's MR
+      # diff annotations; there is no MR diff locally, so nothing here can fail a
+      # local run and nothing depends on its output. It is a Taskfile target rather
+      # than a `script:` line in .gitlab-ci.yml only so the pinned tool version lives
+      # in one file instead of two.
+      #
+      # NO `deps: [test:api]`. CI runs test:api and then this, and a dependency would
+      # run the whole -race suite a second time. If coverage.out is absent the
+      # redirect fails and the target reddens, which is the wanted behaviour: an
+      # empty XML is worse than a missing one.
+      #
+      # -by-files makes each <class> a FILE, so the report carries `filename=` paths
+      # GitLab can match against the diff. Those paths are MODULE-relative
+      # (`internal/store/x.go`) with the module root in <source> -- GitLab's
+      # documented class-path correction is what turns that into `api/internal/...`.
+      # Verified locally only as far as the XML's own shape; the annotation itself
+      # needs a pipeline, and is called out as unverified in the MR.
+      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------ controller (Go) -----
   fmt-check:controller:
@@ -1161,8 +1360,15 @@ tasks:
       # `unused` considers it used. Nothing else in the gate sees them.
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
 
+  vulncheck:controller:
+    desc: controller - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
+    cmds:
+      # Same script, same pin, same reasons, and the same deliberate absence from
+      # `gate:controller` - read vulncheck:api's comment before editing either.
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
   test:controller:
-    desc: controller unit tests (-count=1)
+    desc: controller unit tests (-race -count=1)
     dir: controller
     cmds:
       # -count=1 is load-bearing BY CONSTRUCTION here, not by analogy with the
@@ -1172,9 +1378,72 @@ tasks:
       # internal/preset   -> ../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json
       # Those cross-reads ARE the gate on the wire format, so a `(cached)` run
       # silently retires the only check on it.
-      - go test -count=1 ./...
+      #
+      # -race ADDED BY PRD #103 M6, AND IT CLOSES AN ASYMMETRY RATHER THAN ADDING
+      # A PREFERENCE. `test:api` has carried it since 8f1b0c9b and
+      # `test:api-store-it` carries it in its `-run 'LiveDB$'` sweep; this module
+      # is the only Go test command in the repo that ran without it, and it is the
+      # one holding a kube-apiserver credential. Nothing about its concurrency is
+      # simpler than api's - `internal/reconcile` runs a poll loop against a
+      # client its tests mutate from the test goroutine.
+      #
+      # 🔴 GREEN WHEN IT LANDED, AND THAT IS ONE HOST, NOT A PROOF. Measured
+      # twice on 2026-08-04, darwin/arm64, go1.26.5: rc=0, no `WARNING: DATA RACE`
+      # (probes/prd-103-mrc-coder/race-controller.txt). "7 packages" means SEVEN
+      # LINES OF OUTPUT: six `ok` plus `cmd/controller [no test files]`. Two
+      # validators read that same output as 7 and as 6 and both were right about
+      # different populations, so the count is spelled out rather than left to be
+      # re-derived. Six packages actually ran tests under -race. CI is
+      # linux/amd64 under contention and race detection is PROBABILISTIC - the
+      # detector reports a race it happens to observe, so a green here bounds
+      # nothing about a red there. If this reddens in CI, the finding is a real
+      # race in the controller: file it as its own issue rather than deleting the
+      # flag, which is PRD #103 Decision 3's branch.
+      #
+      # -coverprofile/-covermode, PRD #103 M6: read test:api's comment for what the
+      # number excludes and why -covermode=atomic is written next to -race even
+      # though -race already forces it. Same recipe, same reasons, one module over.
+      - go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - sh ../scripts/coverage-total.sh coverage.out
+
+  coverage-xml:controller:
+    desc: controller - Cobertura XML from coverage.out (run test:controller first; CI only)
+    dir: controller
+    cmds:
+      # Same recipe, same reasons, one module over - read coverage-xml:api's comment.
+      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------------- web (npm) ----
+  deps-check:web:
+    desc: web - is node_modules stale? (declared ranges AND resolved lockfile, offline)
+    cmds:
+      # A SCRIPT, NOT AN INLINE RECIPE, for `deadcode:api`'s reason: a committed
+      # script gets LINTED by `lint:shell`, an inline `cmds:` string gets nothing.
+      # It still DELEGATES to package.json's `deps-check` script for its first line,
+      # as this file's header requires of every npm target.
+      #
+      # 🔴 TWO LINES, BECAUSE THE FIRST COVERS 1 OF MR-C's 6 DEPENDENCY CHANGES.
+      # `npm ls --depth=0` compares against DECLARED RANGES, so a TRANSITIVE bump --
+      # which has no declared range at all -- is invisible to it. Measured on the
+      # stale state a real `git pull` produces: `gate:agent` was GREEN on a tree
+      # holding every one of the five vulnerable versions this MR bumps, because all
+      # five are transitive and `agent/package.json` never changed. The same blind
+      # spot hits `web` on the security-relevant package: a stale `postcss` reads
+      # 8.5.16 against a declared `^8.4.49`, satisfied, while the lockfile says
+      # 8.5.25 -- and that is the high-severity advisory fix, masked only because
+      # vitest reddens in the same run. The second line is a lockfile join. Read
+      # scripts/deps-check-gate.sh's header for why it joins on the INTERSECTION
+      # (a raw diff gives ~370 spurious rows) and why it uses `node` and not `jq`.
+      #
+      # NEVER A BARE `npx`: npx fetches from the network when the dep is missing,
+      # which a gate may not do. There is no npx form of this anyway; the note is
+      # here so a future edit does not invent one.
+      #
+      # Why this target runs FIRST, and the one state in which it reports
+      # confidently wrong, are in `gate:web`'s comment -- written there because the
+      # ORDERING is the load-bearing decision and that is where a reader meets it.
+      - ./scripts/deps-check-gate.sh web
+
   lint:web:
     desc: oxlint over web/src (correctness + react-hooks/rules-of-hooks)
     dir: web
@@ -1271,6 +1540,42 @@ tasks:
     cmds:
       - npm run typecheck
 
+  vulncheck:web:
+    desc: web - npm audit at --audit-level=high over the FULL tree. NOT in `gate`
+    cmds:
+      # 🔴 DELIBERATELY NOT IN `gate:web` - see `vulncheck`'s comment above, and
+      # note this half has an extra hazard the Go half does not: a one-file
+      # `.npmrc` carrying `omit=dev` DISARMS this check AT EXIT 0, printing
+      # "found 0 vulnerabilities", because all three of web's high-and-above
+      # findings are dev-tree. `--audit-level` on the command line beats `.npmrc`
+      # for its own key but `omit` is a different key, so nothing on the command
+      # line contradicts it. `--include=dev` in package.json's `audit` script is
+      # the measured remedy. npm audit has NO in-band canary, so a disarmed run
+      # and a clean run are indistinguishable from their own output.
+      #
+      # THE LEVEL IS AN ARGUMENT so this file's echo shows it - for this check the
+      # threshold IS the gate - and the script ASSERTS it against what
+      # package.json's `audit` script actually carries, exiting 2 on a mismatch.
+      # Without that assertion the argument would be decorative: the echo would
+      # advertise a threshold nothing enforces.
+      #
+      # 🔴 AND THE SCRIPT ASSERTS `--include=dev` THE SAME WAY, which is why that
+      # flag is safe to keep in `package.json` rather than on this line. The two
+      # rules pull opposite ways: this file's header requires npm targets to
+      # DELEGATE (a target that reimplements the command drops the script's flags
+      # SILENTLY), while the flag must not be droppable. Delegation plus an
+      # assertion satisfies both and is STRICTLY STRONGER than putting the flag
+      # here, where nothing would guard it. Measured: deleting `--include=dev`
+      # from the audit script exits 2 naming the file, and the same mutated script
+      # under a `.npmrc` holding `omit=dev` exits 0 printing no findings.
+      #
+      # WHY `high` AND NOT ZERO: two moderate react-router advisories survive
+      # every available option (no patched 6.x exists, `--force` will not touch
+      # them, `overrides` has nothing to point at), so clearing them is a React
+      # Router 6 -> 7 major through shipped SPA routing code. Filed as its own
+      # issue. Read scripts/npm-audit-gate.sh's header for the rest.
+      - ./scripts/npm-audit-gate.sh web high
+
   test:web:
     desc: web unit tests (vitest)
     dir: web
@@ -1281,6 +1586,16 @@ tasks:
       - npm test
 
   # ----------------------------------------------------------- agent (npm) ----
+  deps-check:agent:
+    desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)
+    cmds:
+      # Same script, same two lines, same reasons - read deps-check:web's comment and
+      # gate:web's ordering paragraph before editing either. THIS is the package the
+      # second line was added for: all five of MR-C's agent bumps are transitive, so
+      # the first line alone reported this package clean while node_modules held
+      # every vulnerable version.
+      - ./scripts/deps-check-gate.sh agent
+
   lint:agent:
     desc: oxlint over agent/src and agent/test (correctness tier)
     dir: agent
@@ -1317,6 +1632,16 @@ tasks:
     dir: agent
     cmds:
       - npm run typecheck
+
+  vulncheck:agent:
+    desc: agent - npm audit at --audit-level=high over the FULL tree. NOT in `gate`
+    cmds:
+      # Same script, same level, same reasons, and the same deliberate absence
+      # from `gate:agent` - read vulncheck:web's comment before editing either.
+      # One asymmetry worth knowing: this package's findings are PRODUCTION
+      # dependencies that ship in the worker image, where web's are all dev-tree.
+      # That does not change the recipe; it changes how urgently a red here reads.
+      - ./scripts/npm-audit-gate.sh agent high
 
   test:agent:
     desc: agent unit tests (node --test via tsx)

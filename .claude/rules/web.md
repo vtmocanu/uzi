@@ -9,7 +9,7 @@ Loaded when you touch `web/`. The repo-wide map is the root `CLAUDE.md`.
 ### web (Vite + React + TS)
 
 ```sh
-task gate:web                              # lint + deadcode + check-docs + typecheck + test
+task gate:web                              # deps-check + lint + deadcode + check-docs + typecheck + test
 task lint:web                              # the lint slot alone (oxlint; NOT ratcheted)
 task deadcode:web                          # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:web                              # vitest run

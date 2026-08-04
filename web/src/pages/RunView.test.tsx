@@ -876,6 +876,49 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
   // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
   // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  //
+  // 🔴 BOTH TESTS BELOW CARRY A PER-TEST TIMEOUT (the third argument to `it`), and the
+  // other 1658 tests in this suite keep the 20000 default (PRD #103 M5 MR-C). They are
+  // the two slowest tests here by a wide margin, and the reason is structural rather
+  // than environmental: each awaits `advanceTimersByTimeAsync(149 * 4000)` inside ONE
+  // `it()`, which is 149 sequential real event-loop turns, every one of them flushing a
+  // mocked promise and a React `act`. Measured 2026-08-04 under vitest 4.1.10 with the
+  // JSON reporter: 4228 ms mean inside the full 118-file suite, and 5416 ms mean running
+  // this file SOLO. Solo is the limit of splitting — zero competing files — and it is
+  // SLOWER, so splitting this file cannot fix it and the chain moves intact into
+  // whatever file it lands in. Under CPU contention that chain has been observed to
+  // exceed 20000, and when it does, everything after it in this file fails too — 48
+  // further failures in the archived run, which are missing-element and empty-string
+  // assertions rather than the single "empty-container cascade" signature this comment
+  // used to name (`probes/prd-103-mrc-lead/cascade-characterisation.txt`).
+  //
+  // A PER-TEST CAP RATHER THAN RAISING THE SUITE DEFAULT, deliberately: this MR first
+  // took `testTimeout` to 60000 in `vite.config.ts` and that was reverted, because it
+  // weakened the hang-detection ceiling for 1658 tests to accommodate two. Do not
+  // "simplify" these back to the default; do fix the 149-turn chain, after which they
+  // come off.
+  //
+  // 🔴 THE CAP IS 120000 AND IT WAS 60000 FOR ABOUT A DAY. 60000 was set against a rate
+  // that a 73-run study then refuted, and the same study measured what the cap actually
+  // has to clear: **49869 ms**, this test's sibling below, passing at **83.1% of a 60000
+  // ceiling** — and **49065 ms** inside a fully green run. A 1.20x margin over the worst
+  // thing you have ever seen is not margin on a starvation tail. Raw data and the
+  // pre-registered predictions in `probes/prd-103-mrc-tester-tt/`.
+  //
+  // WHY THAT IS NOT JUST "THE NUMBER THAT MAKES IT PASS", which is the objection this
+  // change has to answer: 60000 sat at the same position relative to the worst excursion
+  // of its day that the old suite-wide 20000 sat at relative to the excursion which
+  // failed it. Setting a ceiling just above the largest observation is the move that had
+  // already failed once here. What bounds this one instead is what the cap is FOR: these
+  // two tests do a fixed, deterministic 149 turns of work, so the cap is a hang detector,
+  // not a performance budget, and its cost is bounded to the two tests that carry it —
+  // the other 1658 keep 20000, and no assertion anywhere is loosened. Doubling the wait
+  // before a genuinely hung one of these two reports is the whole price.
+  //
+  // AND THE HONEST LIMIT: every figure above is one laptop under an agent-team load.
+  // **There is no measured rate for CI**, which is a different machine under different
+  // contention and is where this bites. 120000 is chosen to survive a tail nobody has
+  // characterised there, not to clear a number somebody measured here.
   it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
     vi.useFakeTimers();
     try {
@@ -912,7 +955,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 120000);
 
   // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
   // `!next` branch — and one that could not have existed before #119. The effect used to
@@ -956,7 +999,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 120000);
 
   // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
   // site is covered by "treats an absent pending_judge…" below; this covers the case where

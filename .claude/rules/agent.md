@@ -9,7 +9,7 @@ Loaded when you touch `agent/`. The repo-wide map is the root `CLAUDE.md`.
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-task gate:agent                            # lint + deadcode + typecheck + test
+task gate:agent                            # deps-check + lint + deadcode + typecheck + test
 task lint:agent                            # the lint slot alone (oxlint; NOT ratcheted)
 task deadcode:agent                        # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:agent                            # node --test via tsx
