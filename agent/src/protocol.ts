@@ -472,6 +472,16 @@ export interface ClaimResponse {
    *  seeded run through its third disjunct (D8), which is the mechanism that makes row 2
    *  reachable at all. */
   plan_source?: PlanSource;
+  /** The commit a SEEDED plan was written against (PRD #209 M4), forwarded so the worker
+   *  can compare it to the clone's resolved base after checkout. Present only for a seeded
+   *  run created with --planned-commit; absent (or null) ⇒ no planned commit, so the
+   *  staleness compare is inert and the run proceeds silently. Read from the runs row, so
+   *  it re-delivers unchanged on every resume. */
+  planned_base_commit?: string | null;
+  /** Whether a base-commit divergence should FAIL the run rather than warn into the feed
+   *  (PRD #209 M4 Open Question 3, `--require-base`). Meaningful only alongside
+   *  planned_base_commit. Absent on an older server ⇒ false, i.e. warn-and-implement. */
+  require_base_match?: boolean;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *

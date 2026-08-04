@@ -276,6 +276,16 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		"which subagent roster the seeded run uses: own|repo (requires --plan-file)")
 	create.Flags().StringSlice("exclude-agents", nil,
 		"subagents to drop from the chosen source (requires --agent-source and --plan-file)")
+	// PRD #209 M4 staleness guard. --planned-commit records the commit the plan was
+	// written against; the worker warns (or, with --require-base, fails) if the clone's
+	// base has moved since. Both require --plan-file, and --require-base requires
+	// --planned-commit.
+	create.Flags().String("planned-commit", "",
+		"the commit the seeded plan was written against; the worker warns if the clone's "+
+			"base has moved since (requires --plan-file)")
+	create.Flags().Bool("require-base", false,
+		"fail the run instead of warning if the clone's base differs from --planned-commit "+
+			"(requires --planned-commit)")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
@@ -509,10 +519,24 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	if err != nil {
 		return nil, err
 	}
-	planProvided := cmd.Flags().Changed("plan-file")
-	if sel != nil && !planProvided {
+	plannedCommit, _ := cmd.Flags().GetString("planned-commit")
+	plannedCommit = strings.TrimSpace(plannedCommit)
+	requireBase, _ := cmd.Flags().GetBool("require-base")
+	// M4: --require-base needs a --planned-commit to compare against; without one the
+	// flag can never fire (usage error before any request, mirroring the server's 400).
+	if requireBase && plannedCommit == "" {
 		return nil, uzicli.Exitf(uzicli.ExitUsage,
-			"--agent-source/--exclude-agents require --plan-file (a roster is only meaningful for a seeded plan)")
+			"--require-base requires --planned-commit (there is no commit to compare the clone's base against)")
+	}
+	planProvided := cmd.Flags().Changed("plan-file")
+	// A roster / a planned commit / a require-base is only meaningful for a seeded plan.
+	// Reject any of them without --plan-file up front, mirroring the server's
+	// "agent_selection requires plan_md" / "planned_commit and require_base require
+	// plan_md" 400s with a clean message before any request is sent.
+	if (sel != nil || plannedCommit != "" || requireBase) && !planProvided {
+		return nil, uzicli.Exitf(uzicli.ExitUsage,
+			"--agent-source/--exclude-agents/--planned-commit/--require-base require --plan-file "+
+				"(they are only meaningful for a seeded plan)")
 	}
 	if !planProvided {
 		return nil, nil
@@ -522,7 +546,12 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &uzicli.CreateRunSeed{PlanMD: plan, Selection: sel}, nil
+	return &uzicli.CreateRunSeed{
+		PlanMD:        plan,
+		Selection:     sel,
+		PlannedCommit: plannedCommit,
+		RequireBase:   requireBase,
+	}, nil
 }
 
 // readPlanFile reads a seeded plan (PRD #209 M3) from a file, or from STDIN when the

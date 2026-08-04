@@ -704,6 +704,15 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// them (M3).
 		PlanMd         *string                   `json:"plan_md"`
 		AgentSelection *workersvc.AgentSelection `json:"agent_selection"`
+		// PRD #209 M4 staleness guard: the commit the plan was written against, and
+		// whether a divergence should fail the run rather than warn. PlannedCommit is a
+		// POINTER so its absence is distinct from an empty string. Both are meaningful
+		// ONLY alongside a plan_md (they describe a seeded run), and RequireBase is
+		// meaningful only alongside a PlannedCommit — rejected below otherwise. The web
+		// board omits both; the CLI `uzi run create --planned-commit/--require-base` sets
+		// them.
+		PlannedCommit *string `json:"planned_commit"`
+		RequireBase   bool    `json:"require_base"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -744,11 +753,35 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// with no plan is a confused request — the run would plan and gate normally, where
 	// the selection is made anyway — so reject it here rather than persist a pointless
 	// pre-gate selection. The plan itself is capped/scrubbed/empty-checked in CreateRun.
+	var plannedCommit string
+	if req.PlannedCommit != nil {
+		plannedCommit = *req.PlannedCommit
+	}
 	var seed *workersvc.SeededPlan
 	if req.PlanMd != nil {
-		seed = &workersvc.SeededPlan{PlanMD: *req.PlanMd, Selection: req.AgentSelection}
+		seed = &workersvc.SeededPlan{
+			PlanMD:    *req.PlanMd,
+			Selection: req.AgentSelection,
+			// PRD #209 M4: the planned-against commit and the fail-on-divergence toggle.
+			// Both ride only with a plan_md (rejected below otherwise).
+			PlannedCommit: plannedCommit,
+			RequireBase:   req.RequireBase,
+		}
 	} else if req.AgentSelection != nil {
 		httpx.Error(w, http.StatusBadRequest, "agent_selection requires plan_md")
+		return
+	} else if req.PlannedCommit != nil || req.RequireBase {
+		// PRD #209 M4: a planned_commit / require_base with no plan_md is a confused
+		// request — the staleness guard describes a seeded run, and there is none here.
+		// Rejected consistently with "agent_selection requires plan_md" above.
+		httpx.Error(w, http.StatusBadRequest, "planned_commit and require_base require plan_md")
+		return
+	}
+	// require_base is meaningful only with a planned_commit to compare against — without
+	// one the flag can never fire. Reject it rather than silently persist a guard that is
+	// inert by construction (the CLI raises the same usage error before it gets here).
+	if seed != nil && req.RequireBase && strings.TrimSpace(seed.PlannedCommit) == "" {
+		httpx.Error(w, http.StatusBadRequest, "require_base requires planned_commit")
 		return
 	}
 

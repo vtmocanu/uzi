@@ -89,7 +89,7 @@ uzi run list
 uzi run get <run-id>
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
@@ -168,6 +168,14 @@ uzi version
   usage error. With no roster flag a seeded run uses the repo's own agents (falling
   back to your template roster when the clone has none). An empty plan, or one over the
   size cap, is rejected at create time.
+
+  `--planned-commit <sha>` records the commit you wrote the plan against. After the
+  worker clones and checks out, it compares that commit to the clone's own base; if they
+  differ (the default branch moved since you planned) it warns into the run feed, naming
+  both commits, and implements anyway. `--require-base` turns that divergence into a hard
+  failure instead, so the run stops rather than implement against a base that has moved.
+  Both require `--plan-file`, and `--require-base` requires `--planned-commit` — either
+  combination is a usage error.
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own

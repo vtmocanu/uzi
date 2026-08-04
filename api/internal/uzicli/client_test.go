@@ -589,15 +589,15 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 		wantAbsent   []string
 	}{
 		{
-			name:       "nil seed omits both keys (byte-identical to a pre-#209 create)",
+			name:       "nil seed omits every seed key (byte-identical to a pre-#209 create)",
 			seed:       nil,
-			wantAbsent: []string{"plan_md", "agent_selection"},
+			wantAbsent: []string{"plan_md", "agent_selection", "planned_commit", "require_base"},
 		},
 		{
-			name:         "plan, no roster: plan_md present, agent_selection omitted",
+			name:         "plan, no roster/staleness: plan_md present, the rest omitted",
 			seed:         &CreateRunSeed{PlanMD: "do the thing"},
 			wantContains: []string{`"plan_md":"do the thing"`},
-			wantAbsent:   []string{"agent_selection"},
+			wantAbsent:   []string{"agent_selection", "planned_commit", "require_base"},
 		},
 		{
 			name: "plan + roster: both present, selection is {source, exclusions}",
@@ -606,6 +606,28 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 				Selection: &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}},
 			},
 			wantContains: []string{`"plan_md":"do it"`, `"agent_selection":{"source":"own","exclusions":["tester"]}`},
+			wantAbsent:   []string{"planned_commit", "require_base"},
+		},
+		{
+			// PRD #209 M4: planned_commit + require_base ride the wire when set.
+			name: "plan + staleness guard: planned_commit and require_base present",
+			seed: &CreateRunSeed{
+				PlanMD:        "do it",
+				PlannedCommit: "abc123def456",
+				RequireBase:   true,
+			},
+			wantContains: []string{`"planned_commit":"abc123def456"`, `"require_base":true`},
+		},
+		{
+			// planned_commit alone (warn-only): the commit rides, require_base is omitted
+			// (omitempty on a false bool), so a warn-default seed sends no require_base key.
+			name: "plan + planned_commit only: require_base omitted (warn default)",
+			seed: &CreateRunSeed{
+				PlanMD:        "do it",
+				PlannedCommit: "abc123def456",
+			},
+			wantContains: []string{`"planned_commit":"abc123def456"`},
+			wantAbsent:   []string{"require_base"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -78,6 +78,17 @@ type ClaimPayload struct {
 	// exactly like AutoApprove and PlanApproved. Always present (the column is NOT
 	// NULL); an old worker ignores it and behaves as it does today.
 	PlanSource string `json:"plan_source"`
+	// PlannedBaseCommit is the commit a SEEDED plan was written against (runs.planned_base_commit,
+	// PRD #209 M4), forwarded so the worker can compare it to the clone's resolved base
+	// after checkout. Present only for a seeded run created with --planned-commit; omitted
+	// otherwise, in which case the worker's staleness compare is inert. Read from the runs
+	// row, so it re-delivers unchanged on every resume, like PlanSource above.
+	PlannedBaseCommit *string `json:"planned_base_commit,omitempty"`
+	// RequireBaseMatch makes a base-commit divergence FAIL the run rather than warn into
+	// the feed (runs.require_base_match, PRD #209 M4 Open Question 3). Always present (the
+	// column is NOT NULL); false for every run that did not opt in, so an old worker that
+	// ignores it, and every non-seeded run, keep today's behaviour.
+	RequireBaseMatch bool `json:"require_base_match"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//

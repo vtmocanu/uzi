@@ -53,6 +53,35 @@ import { installJsDeps } from "./js-deps.js";
 const MAX_FAILURE_REASON_LEN = 512;
 
 /**
+ * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
+ * user planned against AND the run was created with --require-base (PRD #209 M4, Open
+ * Question 3). The runner catches it on the generic failure path and reports `failed`
+ * with this message, which names both commits. Without --require-base a divergence only
+ * warns into the feed and the run implements anyway. The message carries commit SHAs
+ * only, never a secret.
+ */
+export class BaseCommitDivergedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseCommitDivergedError";
+  }
+}
+
+/**
+ * Whether a planned-against commit and the clone's resolved base name the SAME commit,
+ * tolerant of git's abbreviated SHAs (PRD #209 M4): a match when either is a prefix of
+ * the other, compared case-insensitively. Both sides must be non-empty — an empty side is
+ * never a match, so a missing base never reads as "matches everything". Equality is the
+ * degenerate prefix case, so it is covered without a special branch.
+ */
+export function baseCommitsMatch(planned: string, actual: string): boolean {
+  const a = planned.trim().toLowerCase();
+  const b = actual.trim().toLowerCase();
+  if (a === "" || b === "") return false;
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+/**
  * What the per-run executor factory yields for one execution (PRD #42 Decisions
  * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
  *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
@@ -391,6 +420,39 @@ export class RunRunner {
       // (it holds the preflight result), so it folds `seeded` into planApproved here
       // rather than leaving the executor to read the claim.
       const seeded = claim.plan_source === "seeded";
+
+      // PRD #209 M4 — staleness guard. A seeded run carries the commit the user planned
+      // against (claim.planned_base_commit). Compare it to the clone's resolved base
+      // (runnerClone.baseCommit, the same field forwarded into RunContext below): if they
+      // diverge, the plan may describe files that have since moved on the default branch.
+      // Only a seeded run sets planned_base_commit, so an ordinary run (undefined) skips
+      // this and proceeds silently. Prefix-tolerant compare (baseCommitsMatch): a git
+      // abbreviated SHA matches its full form. Default is to WARN into the feed and
+      // implement anyway; --require-base (claim.require_base_match) turns the divergence
+      // into a hard failure BEFORE any implement work — refusing to implement against a
+      // diverged base (Open Question 3, the lead's decision).
+      const plannedBase = claim.planned_base_commit ?? undefined;
+      if (plannedBase && !baseCommitsMatch(plannedBase, runnerClone.baseCommit)) {
+        const detail =
+          `the seeded plan was written against commit ${plannedBase}, but this clone's ` +
+          `base commit is ${runnerClone.baseCommit}`;
+        if (claim.require_base_match) {
+          // The catch-all reports `failed` with this reason and emits it on the feed, so
+          // the run never implements against the diverged base.
+          throw new BaseCommitDivergedError(
+            `${detail}; --require-base is set, so this run will not implement against a diverged base`,
+          );
+        }
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              `${detail}; the plan may reference files that have moved since it was written — ` +
+              `implementing anyway (create the run with --require-base to stop instead)`,
+          },
+        });
+      }
 
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report

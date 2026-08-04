@@ -170,6 +170,90 @@ func TestRunCreatePlanFileUnreadable(t *testing.T) {
 	}
 }
 
+// PRD #209 M4: --planned-commit / --require-base ride the seed. The commit is trimmed
+// and forwarded verbatim; --require-base sets the fail-on-divergence flag. The server (and
+// worker) do the actual compare — the CLI just carries the choice.
+func TestRunCreateWithPlannedCommitAndRequireBase(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--plan-file", planPath, "--planned-commit", "  abc123def456  ", "--require-base")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil {
+		t.Fatal("create with --planned-commit sent no seed")
+	}
+	if fc.LastCreateSeed.PlannedCommit != "abc123def456" {
+		t.Errorf("planned commit = %q, want the trimmed value abc123def456", fc.LastCreateSeed.PlannedCommit)
+	}
+	if !fc.LastCreateSeed.RequireBase {
+		t.Error("--require-base did not set RequireBase on the seed")
+	}
+}
+
+// A bare --plan-file carries no staleness fields (the warn-nothing default), so a
+// non-staleness create stays byte-identical (Success Criterion 2).
+func TestRunCreatePlanFileNoStalenessFields(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42", "--plan-file", planPath)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastCreateSeed == nil {
+		t.Fatal("create with --plan-file sent no seed")
+	}
+	if fc.LastCreateSeed.PlannedCommit != "" || fc.LastCreateSeed.RequireBase {
+		t.Errorf("bare --plan-file must carry no staleness fields, got commit=%q require=%v",
+			fc.LastCreateSeed.PlannedCommit, fc.LastCreateSeed.RequireBase)
+	}
+}
+
+// --require-base with no --planned-commit is a usage error (the flag can never fire),
+// raised before any request — mirroring the server's 400.
+func TestRunCreateRequireBaseWithoutPlannedCommitIsUsageError(t *testing.T) {
+	planPath := filepath.Join(t.TempDir(), "plan.md")
+	if err := os.WriteFile(planPath, []byte("do it"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc := &uzicli.FakeClient{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--plan-file", planPath, "--require-base")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errb, "planned-commit") {
+		t.Errorf("error should point at --planned-commit:\n%s", errb)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error must not create a run")
+	}
+}
+
+// --planned-commit with no --plan-file is a usage error (staleness is only meaningful for
+// a seeded run), raised before any request.
+func TestRunCreatePlannedCommitWithoutPlanFileIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "create", "--repo", "p1", "--issue", "42",
+		"--planned-commit", "abc123")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errb, "plan-file") {
+		t.Errorf("error should point at --plan-file:\n%s", errb)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error must not create a run")
+	}
+}
+
 func TestRunApprovePlain(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1")

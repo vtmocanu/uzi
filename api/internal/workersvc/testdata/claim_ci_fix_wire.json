@@ -15,6 +15,7 @@
   "wait_on_limit": false,
   "plan_approved": false,
   "plan_source": "agent",
+  "require_base_match": false,
   "pipeline": {
     "id": 4200,
     "ref": "main",

@@ -1479,6 +1479,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// it in M1; the worker consumes it in M2. Additive on the wire — an old worker
 		// ignores the key.
 		PlanSource: run.PlanSource,
+		// PRD #209 M4 staleness guard: the commit the seeded plan was written against and
+		// whether a divergence should fail the run. Read from the runs row like PlanSource,
+		// so both re-deliver unchanged on every resume. PlannedBaseCommit is nil for a run
+		// that supplied no commit (the compare is then inert); RequireBaseMatch is a plain
+		// bool (NOT NULL DEFAULT false), false for every non-opted-in run.
+		PlannedBaseCommit: textPtr(run.PlannedBaseCommit),
+		RequireBaseMatch:  run.RequireBaseMatch,
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
@@ -2904,6 +2911,16 @@ type SeededPlan struct {
 	// when the clone has a roster, else own (Success Criterion 5). Validated for SHAPE
 	// only at create time — the clone roster is unknown here (Open Question 1).
 	Selection *AgentSelection
+	// PlannedCommit is the commit the external planner planned against (PRD #209 M4),
+	// forwarded on `uzi run create --planned-commit`. Empty ⇒ no planned commit was
+	// supplied, so the worker's staleness compare is inert. Stored verbatim (full or
+	// abbreviated SHA); the worker compares it prefix-tolerantly to the clone's base.
+	PlannedCommit string
+	// RequireBase, when true, makes a base-commit divergence FAIL the run rather than
+	// warn into the feed (`uzi run create --require-base`, PRD #209 M4, Open Question 3).
+	// Only meaningful with a PlannedCommit to compare against — the handler rejects it
+	// otherwise.
+	RequireBase bool
 }
 
 func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
@@ -2922,6 +2939,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	planSource := planSourceAgent
 	agentSource := pgtype.Text{}
 	var agentExclusions []byte
+	// M4 staleness-guard columns default to the not-seeded state: no planned commit
+	// (NULL) and warn-only (false). Only a seeded run created with --planned-commit /
+	// --require-base overrides them below.
+	plannedBaseCommit := pgtype.Text{}
+	requireBaseMatch := false
 	if seed != nil {
 		// D5: cap the RAW input first (mirrors ErrDescriptionTooLarge — reject, do not
 		// truncate), THEN scrub secrets, THEN reject an empty/whitespace result. The cap
@@ -2957,6 +2979,14 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 			agentExclusions = enc
 		}
+		// M4: the commit the plan was written against, stored verbatim (a full or
+		// abbreviated SHA). Empty ⇒ NULL, and the worker's staleness compare is inert.
+		// require_base_match only ever fires alongside a planned commit; the handler
+		// rejects require_base without planned_commit, so it is safe to persist as-is.
+		if strings.TrimSpace(seed.PlannedCommit) != "" {
+			plannedBaseCommit = pgText(seed.PlannedCommit)
+		}
+		requireBaseMatch = seed.RequireBase
 	}
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -3024,11 +3054,16 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// retroactively change a run already in flight.
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
 		// PRD #209 seeded-plan columns, listed explicitly (runtime.sql's 🔴 warning):
-		// all four are zero-valued to the not-seeded state above unless seed != nil.
-		PlanMd:          planMD,
-		PlanSource:      planSource,
-		AgentSource:     agentSource,
-		AgentExclusions: agentExclusions,
+		// all zero-valued to the not-seeded state above unless seed != nil. The M4
+		// staleness-guard pair (planned_base_commit, require_base_match) is here for the
+		// same reason — require_base_match is NOT NULL DEFAULT false, so omitting it would
+		// silently opt every seeded run out of the fail-on-divergence behaviour.
+		PlanMd:            planMD,
+		PlanSource:        planSource,
+		AgentSource:       agentSource,
+		AgentExclusions:   agentExclusions,
+		PlannedBaseCommit: plannedBaseCommit,
+		RequireBaseMatch:  requireBaseMatch,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

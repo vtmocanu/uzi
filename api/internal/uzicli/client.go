@@ -917,6 +917,13 @@ type CreateRunSeed struct {
 	// Selection is the run's roster, or nil for "no selection" (the worker then applies
 	// its default: repo agents when the clone has a roster, else own — Success Criterion 5).
 	Selection *apitypes.AgentSelection
+	// PlannedCommit is the commit the plan was written against (PRD #209 M4), forwarded on
+	// `--planned-commit`. Empty ⇒ not sent, so the worker's staleness compare stays inert.
+	PlannedCommit string
+	// RequireBase makes a base-commit divergence FAIL the run rather than warn
+	// (`--require-base`). Only meaningful with a PlannedCommit; the CLI and the server both
+	// reject it otherwise.
+	RequireBase bool
 }
 
 func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, seed *CreateRunSeed) (apitypes.RunDTO, error) {
@@ -934,15 +941,26 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	// body is byte-identical to a pre-#209 create (Success Criterion 2). A non-nil seed
 	// always sets plan_md (via &PlanMD, so even an empty plan is SENT and the server's
 	// 422 fires) and rides the selection only when one was chosen.
+	//
+	// planned_commit/require_base (M4) are `omitempty` for the same reason — a nil seed,
+	// AND a seed that set neither, sends neither key, so the byte-identical guarantee
+	// holds for a plain --plan-file create too. planned_commit rides only when non-empty
+	// (a *string so omitempty drops it); require_base only when true.
 	reqBody := struct {
-		IssueIID    int64                    `json:"issue_iid"`
-		WaitOnLimit *bool                    `json:"wait_on_limit,omitempty"`
-		PlanMD      *string                  `json:"plan_md,omitempty"`
-		Selection   *apitypes.AgentSelection `json:"agent_selection,omitempty"`
+		IssueIID      int64                    `json:"issue_iid"`
+		WaitOnLimit   *bool                    `json:"wait_on_limit,omitempty"`
+		PlanMD        *string                  `json:"plan_md,omitempty"`
+		Selection     *apitypes.AgentSelection `json:"agent_selection,omitempty"`
+		PlannedCommit *string                  `json:"planned_commit,omitempty"`
+		RequireBase   bool                     `json:"require_base,omitempty"`
 	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection
+		if seed.PlannedCommit != "" {
+			reqBody.PlannedCommit = &seed.PlannedCommit
+		}
+		reqBody.RequireBase = seed.RequireBase
 	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err

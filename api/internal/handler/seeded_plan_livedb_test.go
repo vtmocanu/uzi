@@ -278,3 +278,101 @@ func TestSeededRunFallThroughToGateDisarmsLiveDB(t *testing.T) {
 		t.Errorf("re-claim plan_source = %q, want \"agent\"", second.PlanSource)
 	}
 }
+
+// PRD #209 M4 milestone gate, against a REAL Postgres: a seeded run created with
+// --planned-commit / --require-base persists both columns through CreateRun's INSERT and
+// the claim re-delivers them to the worker (the staleness guard's inputs). Mirrors the M1
+// claim test above; the assertion that would catch an omitted-column regression (the
+// runtime.sql 🔴 trap) is that a NON-set run comes back with a nil planned commit and
+// require_base_match:false — the warn-default state.
+func TestSeededRunClaimCarriesPlannedBaseCommitLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSeededPlanFixture(ctx, t)
+
+	const plannedCommit = "abc123def4567890abc123def4567890abc12345"
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
+		&workersvc.SeededPlan{
+			PlanMD:        "# Plan\nImplement the widget.",
+			PlannedCommit: plannedCommit,
+			RequireBase:   true,
+		})
+	if err != nil {
+		t.Fatalf("CreateRun (seeded, --planned-commit --require-base): %v", err)
+	}
+
+	// The row carries both columns (CreateRun listed them explicitly; an omission would
+	// silently persist NULL / false here).
+	var (
+		gotCommit pgtype.Text
+		gotReq    bool
+	)
+	if err := f.pool.QueryRow(ctx,
+		`SELECT planned_base_commit, require_base_match FROM runs WHERE id = $1`, run.ID).
+		Scan(&gotCommit, &gotReq); err != nil {
+		t.Fatalf("read staleness columns: %v", err)
+	}
+	if !gotCommit.Valid || gotCommit.String != plannedCommit {
+		t.Errorf("stored planned_base_commit = %+v, want %q", gotCommit, plannedCommit)
+	}
+	if !gotReq {
+		t.Error("stored require_base_match = false, want true")
+	}
+
+	// The claim re-delivers both to the worker.
+	payload, err := f.svc.Claim(ctx, f.wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a claim payload for the queued seeded run, got idle")
+	}
+	if payload.PlannedBaseCommit == nil || *payload.PlannedBaseCommit != plannedCommit {
+		t.Errorf("claim planned_base_commit = %v, want %q", payload.PlannedBaseCommit, plannedCommit)
+	}
+	if !payload.RequireBaseMatch {
+		t.Error("claim require_base_match = false, want true — the guard must reach the worker")
+	}
+}
+
+// A seeded run created with NO planned commit (and an ordinary run generally) comes back
+// with a nil planned commit and require_base_match:false — the warn-nothing default, and
+// the Success-Criterion-2 anti-regression case for M4's columns.
+func TestSeededRunNoPlannedCommitClaimIsInertLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newSeededPlanFixture(ctx, t)
+
+	run, err := f.svc.CreateRun(ctx, f.owner, f.repoID, f.iid, "issue body", false, nil,
+		&workersvc.SeededPlan{PlanMD: "# Plan\nImplement it."})
+	if err != nil {
+		t.Fatalf("CreateRun (seeded, no planned commit): %v", err)
+	}
+	var (
+		gotCommit pgtype.Text
+		gotReq    bool
+	)
+	if err := f.pool.QueryRow(ctx,
+		`SELECT planned_base_commit, require_base_match FROM runs WHERE id = $1`, run.ID).
+		Scan(&gotCommit, &gotReq); err != nil {
+		t.Fatalf("read staleness columns: %v", err)
+	}
+	if gotCommit.Valid {
+		t.Errorf("planned_base_commit = %q, want NULL for a run with no --planned-commit", gotCommit.String)
+	}
+	if gotReq {
+		t.Error("require_base_match = true, want false by default")
+	}
+
+	payload, err := f.svc.Claim(ctx, f.wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a claim payload, got idle")
+	}
+	if payload.PlannedBaseCommit != nil {
+		t.Errorf("claim planned_base_commit = %v, want nil (staleness compare inert)", *payload.PlannedBaseCommit)
+	}
+	if payload.RequireBaseMatch {
+		t.Error("claim require_base_match = true, want false")
+	}
+}
