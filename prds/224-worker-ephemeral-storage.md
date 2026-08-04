@@ -2627,3 +2627,84 @@ still renders). A22.3's guard fires on **all four** LimitRange keys, each naming
 `%v` confirmed against a YAML-numeric `maxPVCStorage: 10`. Vacuity guards landed on **both** maps
 plus `TestPresetTablesAreNotEmpty`. `go test -count=1 -race ./...`: **EXIT=0, RUN=212 PASS=212 FAIL=0
 SKIP=0**; `deadcode-gate` 0 findings; `assert-chart-render.sh` 38 documents.
+
+### A29 — 2026-08-04, AUDIT of `efd60dcc`. Comments TRUE. **One new Medium, one file over.**
+
+**A29.1 — 🔴 `strategy: Recreate` IS NOW LOAD-BEARING FOR CORRECTNESS, AND ITS OWN COMMENT SAYS IT IS
+NOT.** `controller-deployment.yaml:24-30` reads: *"Recreate, never RollingUpdate … Each pass is
+idempotent, so **this buys quiet rather than correctness** — but there is nothing to gain from the
+overlap either."* **True when written. `13d02609` made it false.** Re-derived:
+
+`replicaCount: 1`, and the controller has **no readiness probe** (deliberately). Under k8s defaults a
+`RollingUpdate` on 1 replica is `maxUnavailable = 0`, `maxSurge = 1`. So the new pod is created
+**while the old keeps running**; the old is terminated only once the new is **Available**; a lowered
+ceiling makes the new pod fail `ValidatePVCCeilings` and `os.Exit(1)` → `CrashLoopBackOff` → **never
+Available**; therefore **the old controller runs indefinitely, holding the OLD higher ceiling env,
+against the NEW lower LimitRange helm already applied.**
+
+**That is the exact mismatch the sweep calls the surviving residual — reached by a plain `helm
+upgrade`, with net 3 firing and being DEFEATED.** It detects the condition and the process it was
+meant to stop keeps reconciling, creating PVCs the limitranger rejects: the silent stall #224 exists
+to eliminate, **now with a crash-looping pod beside it that a reader would take as "the guard
+worked."** Under `Recreate` the old pod is deleted **first**, so no controller runs at all — loud and
+total. **`Recreate` is what converts net 3 from a DETECTOR into a STOP.**
+
+Two consequences, and the second is the dangerous one:
+
+1. **"A `helm upgrade` cannot reach this state" is TRUE only because of `Recreate`, and does not say
+   so.** It attributes its truth to *"changing the value rolls the controller with the new env"* —
+   but **a roll that never completes is exactly the failure case.**
+2. **The `Recreate` comment INVITES the change that would break it.** By saying the choice *"buys
+   quiet rather than correctness"* and that *"there is nothing to gain from the overlap either"*, it
+   presents itself as **discretionary**. A future reader wanting zero-downtime controller upgrades
+   has that comment's blessing to switch to `RollingUpdate`, **and nothing anywhere would fail.**
+
+**The auditor's own framing, which is the general rule:** *state an invariant where it is enforced,
+never derive it from a decision made elsewhere.* Net 3's guarantee currently rests on a predicate in
+a **different file explicitly labelled non-load-bearing.**
+
+**LEAD DECISION: take the TEST as well as the comments.** The auditor judged the two comment edits
+sufficient given blast radius and noted the test is cheap. **This session has watched a comment go
+stale three times** (A17.4, A23.4's two, and this one) — so a rendered-Deployment assertion that
+`strategy.type == "Recreate"` is the right call: it *"turns the dependency into something that fails
+rather than something that is written down."*
+
+**And the irony is the argument for fixing it now:** `efd60dcc` exists **because** a stale coverage
+claim was left behind by the change that altered the coverage. **This is a second instance of exactly
+that, from the same commit, one file over — missed by the sweep written to catch it.**
+
+**A29.2 — the new comments are TRUE, checked as assertions rather than read.** All five verified,
+including the load-bearing one: net 3 covers `--set` and per-cluster values files (reproduced
+independently from the render, not from the coder's chain); `chartMaxPVCStorage` reads **both** tiers
+and `t.Fatalf`s on a read failure so it **cannot silently fall back to a constant**; net 1 covers the
+chart's one claimant, overrides included; and neither net reads a live object. **The auditor went
+looking specifically to FALSIFY the fifth** — *"because it is the load-bearing sentence"* — and the
+mechanism that would falsify it is exactly A29.1.
+
+**A29.3 — it re-ran the whole arm set on a COMMENT-ONLY commit rather than assuming**, and verdicts
+were byte-identical to `13d02609`.
+
+**A29.4 — 🔴 AND IT CAUGHT A STALE READ IN ITS OWN HARNESS, THE FOURTH INSTRUMENT FAILURE OF THIS
+SESSION.** Its first pass printed `boot=0` for the chart-guard row. **That was the PREVIOUS row's
+answer**: when helm fails there is no manifest, so no env file is written, and the probe re-ran
+against the stale env. Caught because the `ceilings: "" / ""` line disagreed with the row above;
+re-run with the env file deleted first confirmed **no env is produced and the `boot` column does not
+apply to that row at all.** Its own note: *"exactly the shape I have twice warned others about — an
+instrument reporting the previous cell's answer with full confidence."* Fourth this session
+(A24.4's three were the coder's), and **fourth self-reported.**
+
+**A29.5 — the out-of-band residual is confirmed out of scope, with STRUCTURAL reasons rather than
+effort ones.** A chart is a **rendering** artifact with no read path against the live cluster and no
+reconcile loop, so there is no point at which it could observe drift. The controller *could* read the
+live LimitRange — **but that means a new `get limitranges` verb on the only kube-credentialed
+component in the system, plus a watch**, since a boot-time read closes only the window a boot-time
+env read already closes. **The auditor would object to that widening on this repo's own
+"four independent guardrail layers, don't weaken one" grounds, and I agree.** On this cluster it is
+additionally self-correcting: ArgoCD's `selfHeal: true` reverts a hand-edited LimitRange. **Release-
+note framing: an operator-discipline residual, not a defect** — the same category as "do not
+`kubectl edit` a GitOps-managed object", a property of the deployment model rather than of #224.
+
+**A29.6 — scan scope stated rather than implied.** `gitleaks` over `dae9b799~1..efd60dcc`: exit 0, 6
+commits, no leaks. The canary-armed wrapper was **not** re-run at `efd60dcc` — the delta is two
+comment blocks in two already-scanned files and the range scan covers all six commits. **Said out
+loud rather than letting a green imply a fresh run.**
