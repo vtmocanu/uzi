@@ -1162,7 +1162,7 @@ tasks:
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
 
   test:controller:
-    desc: controller unit tests (-count=1)
+    desc: controller unit tests (-race -count=1)
     dir: controller
     cmds:
       # -count=1 is load-bearing BY CONSTRUCTION here, not by analogy with the
@@ -1172,7 +1172,24 @@ tasks:
       # internal/preset   -> ../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json
       # Those cross-reads ARE the gate on the wire format, so a `(cached)` run
       # silently retires the only check on it.
-      - go test -count=1 ./...
+      #
+      # -race ADDED BY PRD #103 M6, AND IT CLOSES AN ASYMMETRY RATHER THAN ADDING
+      # A PREFERENCE. `test:api` has carried it since 8f1b0c9b and
+      # `test:api-store-it` carries it in its `-run 'LiveDB$'` sweep; this module
+      # is the only Go test command in the repo that ran without it, and it is the
+      # one holding a kube-apiserver credential. Nothing about its concurrency is
+      # simpler than api's - `internal/reconcile` runs a poll loop against a
+      # client its tests mutate from the test goroutine.
+      #
+      # 🔴 GREEN WHEN IT LANDED, AND THAT IS ONE HOST, NOT A PROOF. Measured
+      # twice on 2026-08-04, darwin/arm64, go1.26.5: 7 packages, rc=0, no
+      # `WARNING: DATA RACE` (probes/prd-103-mrc-coder/race-controller.txt). CI is
+      # linux/amd64 under contention and race detection is PROBABILISTIC - the
+      # detector reports a race it happens to observe, so a green here bounds
+      # nothing about a red there. If this reddens in CI, the finding is a real
+      # race in the controller: file it as its own issue rather than deleting the
+      # flag, which is PRD #103 Decision 3's branch.
+      - go test -race -count=1 ./...
 
   # ------------------------------------------------------------- web (npm) ----
   lint:web:
