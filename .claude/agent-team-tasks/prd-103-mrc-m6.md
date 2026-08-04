@@ -538,7 +538,36 @@ npm outdated       rc=0
 
 `npm ls` exits **1** with a **positive observation naming both versions**, needs no
 new dependency, is offline, and covers **every** dependency rather than the one bump
-you remembered — strictly better than the `vitest --version` assertion. **Where it
+you remembered — strictly better than the `vitest --version` assertion.
+
+**🔴 AMENDMENT 4: DO NOT DESCRIBE IT AS A "LOCKFILE-VERSUS-`node_modules` STALENESS
+CHECK". THAT PHRASE IS THIS BRIEF'S AND IT IS FALSE.** `npm ls` reports `invalid`
+only when an installed version violates a **declared range in `package.json`** — so
+it is **inert for a lockfile-only transitive bump**, at any `--depth`, not just 0.
+Measured against `1c751ae3`, a lockfile-only commit **in this very MR**: all five
+bumped packages are transitive and each parent's declared range admits *both* the
+pre-fix and post-fix version —
+
+```
+express-rate-limit -> ip-address         ^10.2.0             10.2.0  and 10.4.0  both OK
+ajv                -> fast-uri           ^3.0.1              3.1.3   and 3.1.5   both OK
+mcp-sdk            -> hono               ^4.11.4             4.12.27 and 4.13.0  both OK
+mcp-sdk            -> @hono/node-server  ^1.19.9 || ^2.0.5   1.19.14 and 2.1.0   both OK
+```
+
+— and `npm ls --depth=0` in `agent/` returns rc=0 with **none of the five appearing**.
+
+**The detector is not broken and the choice stands**: controlled both ways on a
+handmade package, a stale *direct* dep gives rc=1 naming `foo@1.0.0 invalid:
+"2.0.0" from the root project`, and matching the version gives rc=0. It genuinely
+covers the `web`/`vitest` case, which is the hazard it was chosen for, and it is why
+`121d7610`'s exact pin matters — `^4.1.10` would have made it loose.
+
+**ACCURATE WORDING, required in the Taskfile comment, the CHANGELOG and the MR
+description:** *catches a stale DIRECT dependency; a lockfile-only transitive bump is
+invisible to it, and `npm ci` is the only guarantee there.* A shipped comment
+claiming the lockfile framing is a **blocking** defect, not a nit — it would tell
+every future reader the gate covers a case it cannot see. **Where it
 lies:** in the *other* stale shape, `npm install --package-lock-only` run in place
 (which also rewrites `node_modules/.package-lock.json`), `npm ls` returns **rc=0 and
 prints `2.1.3` while `node_modules/ms/package.json` says `1.0.0`** — confidently
@@ -1093,6 +1122,49 @@ timeout buys margin and leaves the knife-edge in place.**)*
   `lint:controller` printed a `generated_file_filter` warning naming an absolute path
   into the **sibling** `uzi/103` worktree, then `0 issues.` — carry-forward 4's
   host-global cache replaying foreign paths, in the quiet direction.
+
+### Amendment 4 — 2026-08-04, from the Unit A review round at `154ad390`
+
+**Zero blocking findings on the landed code.** The design wave's one Blocking item
+(react-router) is resolved as ruled: filed separately, and `121d7610`'s message says
+so explicitly.
+
+- **The `npm ls` wording correction** is Amendment 4's headline and lives in the
+  `A2-5` section above, not here. It is the one item that would become blocking if
+  shipped, and it was sent to the coder mid-flight because it is writing that comment
+  now.
+- **`f9b1f27f` is labelled PRD #103 M6 and landed inside Unit A's window.** Correct
+  and deliberate — it is the one cross-unit move the plan makes, for the reason given
+  in Amendment 3's adopted-from-the-architect list. Recorded because the history is
+  no longer cleanly Unit-A-then-Unit-B and the Roster's sequential-units line implies
+  it is.
+- **The CHANGELOG still owes a line** (carry-forward 12: any milestone adding or
+  moving a devDependency owes one, plus a `docs/dev-conventions.md` line). Confirmed:
+  `origin/main..HEAD` touches `docs/dev-conventions.md` and **not** `CHANGELOG.md`,
+  and that edit covers `-race` only, not the vitest pin or the new `deps-check`
+  scripts. This is task #11 and is sequenced after the integrated pass — deliberate,
+  not lost.
+- **Nit, and it is a two-validator disagreement on a trivial count, which is the
+  interesting part.** `Taskfile.yml:1245`'s new `-race` comment says "**7 packages**";
+  the reviewer reads the same output as 6 `ok` lines plus one `[no test files]`, while
+  the architect independently reported "7 packages, all ok". Both are reading one
+  output. "7 packages" is right about packages and "all ok" is loose. Say which the
+  comment means.
+
+**Verification worth banking, so nobody re-runs it:** knip on `web` at vitest 4 is
+rc=0 with findings **byte-identical** to the pre-upgrade baseline (9 unused exports +
+13 unused types, empty `diff`) — the major orphaned no dependency and revealed none.
+**No vitest-2-only API or config key survives anywhere in `web/`**: `environmentMatchGlobs`,
+`test.workspace`, `deps.inline`, `testTransformMode`, `poolMatchGlobs` and
+`vitest/globals` are 0 files each (`vi.mocked` at 39 files is still current in v4, not
+a leftover). `.gate_needs`/`.publish_needs` parse to **13 and 15** with the job set
+**identical** to `848cf53d`, so no list edit was owed and none is missing. And the
+agent lockfile holds **225 package names before and after**, 0 added, 0 removed.
+
+**Scope note for the next round.** That review covered the three landed commits and
+**not** Unit A's actual gate recipes — `Taskfile.yml` carried ~97 uncommitted lines
+with the `govulncheck` and `npm audit` targets at the time. Those need their own
+review dispatch, pinned to a SHA, once commits 4-6 land. Expected, not a miss.
 
 ### Two instrument failures from the architect, both worth keeping
 
