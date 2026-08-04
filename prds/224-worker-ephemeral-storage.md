@@ -2858,3 +2858,64 @@ folded into 2a.
 `[Unreleased]` does not carry A27.5's finding that a crash-looping controller stops **teardown** as
 well as provisioning, leaking PVCs and quota for workers the api already dropped. → documenter, after
 the coder's commit. It is in `specs/ai.md` §481 regardless.
+
+### A33 — 2026-08-04, `da027fb0` + `7bdf448c`. Code and specs complete. One method, and its cost.
+
+**A33.1 — final code commit `da027fb0`, verified: CI-skip marker count 0**, `RenderPVCs` called at
+`pvcceiling.go:130`, tree clean, 7 files including a new `scripts/assert-controller-strategy.sh` and
+its `.gitlab-ci.yml` wiring. A28.2's calibration: a fourth 999Gi PVC reddens three cases **and names
+it**. A31's assertion **argues rather than forbids** — the failure text carries the chain and names
+what *would* justify revisiting the strategy (leader election first).
+
+**A33.2 — 🔴 PROPAGATE TO `CLAUDE.md`: the `helm_chart` job's pinned `alpine/helm` image has NO
+`python3`, and its busybox awk does NOT support interval expressions.** Established **by running the
+pinned digest**, not inferred. The coder's first draft used a YAML parse — the right instrument,
+absent from that image — and an early `/^[ ]{0,3}[^ ]/` was **silently inert, never matching**. Both
+invisible on this host. Every arm was then re-run **inside the image**, including the anti-vacuity
+one: a deleted strategy block **fails as vacuous rather than passing**. **This is a property of the
+job, so anything added to `helm_chart` inherits it** — and a silently-inert regex in a CI gate is the
+worst shape this repo collects.
+
+**A33.3 — 🔴 PROPAGATE: `lint:shell` sees only TRACKED files.** 20 scripts before staging the new
+one, 21 after. **A new script is invisible to shellcheck until `git add`**, so the first green covered
+20 files and said nothing about the file just written. A control that cannot produce the
+disconfirming answer.
+
+**A33.4 — the word-splitting trap hit for the FIFTH time**, in the same commit
+(`V="-f values.yaml"` then `helm … $V`, stderr to `/dev/null`, three arms reading as failing). The
+coder's tally across the session: `--set`, a heredoc that clobbered `PATH`, a grep that could not
+match a capital letter, and twice here. **Every instance produced output that looked exactly like a
+negative result** — which is what makes it survive: the wrong answer is the plausible one. All five
+self-caught by reading the raw error.
+
+**A33.5 — spec sync complete: `7bdf448c`**, +30/−0, Feature #224 at `specs/human.md:617`, the `/nix`
+20Gi sub-bullet ratified with `NEEDS RATIFICATION` dropped, the original 2026-07-17 line preserved as
+#58's record. **The ship-and-accept bullet carries its scope limit INSIDE the requirement** —
+*"lowers how often the loss happens; it does not close it"* — so a reader taking that section as
+"eviction is fixed" has read it wrong, and the contract is where that is prevented.
+
+**A33.6 — WRITING A SPEC AS BINDING RULES, AND ITS COST. The qualification is the valuable half, and
+it came from the same agent unprompted.** `da027fb0` owed no spec edit because §479-§481 were phrased
+as **binding rules rather than tense claims about the tree**, written while the code was in flight:
+*"derived from the renderer, not maintained beside it"* was true as a requirement before the code
+satisfied it, so there is no window in which the spec was false. Counterfactual, its own: *"had I
+written 'the check iterates `RenderPVCs`' before it did, the spec would have been false for two hours
+and true afterwards, with nothing marking the window."* **That is this session's dominant failure —
+A17.4, the two at `efd60dcc`, the `Recreate` comment — solved at the source rather than swept
+afterwards.**
+
+**🔴 And then it named the cost rather than letting the technique be adopted whole:**
+
+> *"a spec written entirely that way **cannot tell you the code is wrong**. It trades a false sentence
+> for a silent gap — the better trade, but still a trade."*
+
+**The failure mode of the rule form alone is a spec full of true, UNFALSIFIABLE sentences, and that is
+QUIETER than a stale one** — which is this whole session's category. What closes it is the step
+after: **re-deriving each rule against the tree and saying which ones the code now satisfies**, done
+and reported as a **separate act** rather than folded into the writing. **The rule form is what makes
+the spec safe to write early; the re-derivation is what makes it evidence. Neither half works alone.**
+
+**Where it does not apply at all: a MEASUREMENT cannot be written as a rule.** §479's 512Mi/4Gi, the
+70.21 GiB pool, the 2.77 GiB both workers store — **dated facts about one cluster at one moment, and
+they will go stale exactly the way the comments did.** They carry their basis so the next reader can
+tell what would invalidate them, **which is the most that shape of claim allows.**
