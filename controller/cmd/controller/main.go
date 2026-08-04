@@ -67,7 +67,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	materializer := kube.New(kubeClient, kube.RenderConfig{
+	materializerCfg := kube.RenderConfig{
 		Namespace:       cfg.WorkerNamespace,
 		DockerNamespace: cfg.WorkerDockerNamespace,
 		DinDImage:       cfg.WorkerDinDImage,
@@ -77,16 +77,43 @@ func main() {
 		DinDNonRootless: !cfg.WorkerDinDRootless,
 		// DinD resource overrides (PRD #89 0.8.1), requests + limits; empty leaves the
 		// render default.
-		DinDRequestCPU:     cfg.WorkerDinDRequestCPU,
-		DinDRequestMemory:  cfg.WorkerDinDRequestMemory,
-		DinDLimitCPU:       cfg.WorkerDinDLimitCPU,
-		DinDLimitMemory:    cfg.WorkerDinDLimitMemory,
-		ServiceAccountName: cfg.WorkerServiceAccount,
-		APIURL:             cfg.WorkerAPIURL,
-		StorageClass:       cfg.WorkerStorageClass,
-		MaxConcurrentRuns:  cfg.WorkerMaxConcurrentRuns,
-		APICAPEM:           cfg.APICAPEM,
-	}, resolver, log)
+		DinDRequestCPU:    cfg.WorkerDinDRequestCPU,
+		DinDRequestMemory: cfg.WorkerDinDRequestMemory,
+		DinDLimitCPU:      cfg.WorkerDinDLimitCPU,
+		DinDLimitMemory:   cfg.WorkerDinDLimitMemory,
+		// The DinD daemon's data-root PVC size (issue #224 M-a); empty leaves the render
+		// default.
+		DinDDataSize: cfg.WorkerDinDDataSize,
+		// The worker container's requests.ephemeral-storage (issue #224 M-b), per tier;
+		// docker REPLACES plain. Empty leaves the render defaults (512Mi / 4Gi).
+		EphemeralRequest:       cfg.WorkerEphemeralRequest,
+		DockerEphemeralRequest: cfg.WorkerDockerEphemeralRequest,
+		// Each tier's PVC admission ceiling (issue #224). Renders nothing; checked once
+		// at boot, just below.
+		MaxPVCStorage:       cfg.WorkerMaxPVCStorage,
+		DockerMaxPVCStorage: cfg.WorkerDockerMaxPVCStorage,
+		ServiceAccountName:  cfg.WorkerServiceAccount,
+		APIURL:              cfg.WorkerAPIURL,
+		StorageClass:        cfg.WorkerStorageClass,
+		MaxConcurrentRuns:   cfg.WorkerMaxConcurrentRuns,
+		APICAPEM:            cfg.APICAPEM,
+	}
+	materializer := kube.New(kubeClient, materializerCfg, resolver, log)
+
+	// REFUSE TO BOOT on a PVC that its namespace's LimitRange will reject (issue #224).
+	//
+	// It runs HERE, after the RenderConfig is assembled and before the reconcile loop
+	// starts, because that config is what carries both the ceilings and the dind
+	// override — this is the first point where every claimant is known. Fatal rather
+	// than a warning, and that is the proportionate response: an oversized claim is
+	// rejected at admission, the Deployment is never created, and the loop retries every
+	// tick forever with the cause in one log line nobody reads. The worker provisions
+	// and never appears. A CrashLoopBackOff naming the two numbers is strictly louder
+	// than a fleet that silently never materialises.
+	if err := kube.ValidatePVCCeilings(materializerCfg, resolver); err != nil {
+		log.Error("hosted-worker PVC sizes do not fit their namespace's LimitRange; refusing to start", "error", err)
+		os.Exit(1)
+	}
 
 	loop := reconcile.New(client, materializer, client, cfg.PollInterval, cfg.WorkerImageTag, log)
 

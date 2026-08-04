@@ -22,11 +22,31 @@ metadata:
 spec:
   replicas: {{ .Values.workers.controller.replicaCount }}
   strategy:
-    # Recreate, never RollingUpdate: the surge would run two controllers polling and
-    # reconciling the same fleet against one namespace. Each pass is idempotent, so
-    # this buys quiet rather than correctness — but there is nothing to gain from the
-    # overlap either, since the controller serves no traffic and has no availability
-    # to protect.
+    # 🔴 Recreate, never RollingUpdate, AND THIS IS LOAD-BEARING FOR CORRECTNESS.
+    #
+    # It used to say "this buys quiet rather than correctness", which was true until the
+    # controller gained a boot-time check that refuses to start when a worker PVC exceeds
+    # its tier's LimitRange ceiling (issue #224, kube.ValidatePVCCeilings). Refusing to
+    # boot only helps if the refusing pod is the ONLY one.
+    #
+    # Under RollingUpdate a new pod that EXITS AT BOOT never becomes Available, so the
+    # old pod is never retired: it runs indefinitely, holding the OLD ceiling, against
+    # the NEW LimitRange this same upgrade already applied. The check fires and is
+    # DEFEATED, with a crash-looping pod beside it that reads like the guard working.
+    #
+    # This holds at ANY replicaCount, and with or WITHOUT probes — a crash-looping
+    # container is never Ready either way. Said that way on purpose: an earlier draft
+    # reasoned from "replicaCount is 1 and there are no probes, SO ...", which invites
+    # someone adding a readinessProbe to conclude the concern is handled. It is not.
+    #
+    # Recreate deletes the old pod FIRST: the failure is fail-STOPPED (no controller runs
+    # at all) rather than fail-STALE. The original reason still holds too — two
+    # controllers reconciling one fleet is pointless overlap for a pod that serves no
+    # traffic — it is simply no longer the only reason.
+    #
+    # scripts/assert-controller-strategy.sh fails the render if this changes. A comment
+    # alone did not hold this coupling: the previous one disclaimed its own importance,
+    # and anyone adding HA would have read it and switched.
     type: Recreate
   selector:
     matchLabels:
@@ -117,6 +137,34 @@ spec:
             # env being absent. The controller rejects a non-integer or a value < 1.
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
+            # The worker container's requests.ephemeral-storage (issue #224). Without
+            # it a worker pod declares nothing for the resource and is therefore the
+            # first thing kubelet evicts under node disk pressure, which destroys the
+            # in-flight run's working tree. The controller validates it as a k8s
+            # quantity at boot and falls back to its built-in 512Mi when unset. Docker
+            # workers use the docker tier's own value INSTEAD (below).
+            {{- with .Values.workers.ephemeralRequest }}
+            - name: UZI_WORKER_EPHEMERAL_REQUEST
+              value: {{ . | quote }}
+            {{- end }}
+            # The RESTRICTED tier's PVC admission ceiling (issue #224). The controller
+            # constructs every worker PVC and is the only place in the system where all
+            # the claimants exist at once — nixSize, each preset's DataSize and the dind
+            # data root — but it has no way to know the LimitRange that will reject them.
+            # Injecting the ceiling makes that a missing INPUT rather than a layering
+            # violation (it already takes workers.storageClass the same way), and the
+            # controller then REFUSES TO BOOT rather than provisioning workers whose
+            # claims are rejected at admission, which presents as a worker that never
+            # appears with the reason only in a controller log.
+            #
+            # Only rendered when the LimitRange is: with no LimitRange there is no
+            # ceiling, and the controller correctly skips the check for that tier.
+            {{- if .Values.workers.limitRange.enabled }}
+            {{- with .Values.workers.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —
@@ -159,6 +207,34 @@ spec:
             {{- with .Values.workers.docker.dindResources.limits.memory }}
             - name: UZI_WORKER_DIND_LIMIT_MEMORY
               value: {{ . | quote }}
+            {{- end }}
+            # The DinD daemon's data-root PVC size (issue #224 M-a). Optional, same shape
+            # as the four above: the controller validates it as a k8s quantity at boot and
+            # falls back to its built-in 20Gi when unset. It must stay <= the docker
+            # tier's limitRange.maxPVCStorage or the apiserver rejects the claim.
+            {{- with .Values.workers.docker.dindDataSize }}
+            - name: UZI_WORKER_DIND_DATA_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER worker container's requests.ephemeral-storage (issue #224). It
+            # REPLACES UZI_WORKER_EPHEMERAL_REQUEST for this tier, and is larger because
+            # a docker worker's run-workdir emptyDir carries the run's whole working
+            # tree while a plain worker's lives on the /data PVC. Same validation and
+            # the same never-a-limit rule.
+            {{- with .Values.workers.docker.ephemeralRequest }}
+            - name: UZI_WORKER_DOCKER_EPHEMERAL_REQUEST
+              value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER tier's PVC admission ceiling — see the restricted tier's key
+            # above. Injected separately because the two tiers are separate namespaces
+            # with separate LimitRanges, so the ceiling is a per-tier fact; the docker
+            # tier additionally carries the dind data-root claim, which the restricted
+            # tier does not have at all.
+            {{- if .Values.workers.docker.limitRange.enabled }}
+            {{- with .Values.workers.docker.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_DOCKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
           resources:

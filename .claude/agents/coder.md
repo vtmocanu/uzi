@@ -185,7 +185,7 @@ not a dotfile**: the developer's profile exports the real `UZI_SEED_*`, `JWT_SEC
 `--env-file`, so dummy secrets alone are NOT sufficient — use `env -i HOME=$HOME
 PATH=$PATH docker compose --env-file <dummy.env> -p <unique> …` and verify with
 `compose config`. (Corrected 2026-08-02: this line said a bare `up` "autoloads the
-real `./.env`", which root `CLAUDE.md` records as measured-false on this host — there
+real `./.env`", which `.claude/rules/stack.md` records as measured-false on this host — there
 is no `.env` in any worktree or at the bare-clone root. The precaution was right and
 its stated mechanism was wrong.)
 

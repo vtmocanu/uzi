@@ -33,7 +33,7 @@ suite stands alone and the failure names the side: Go red plus vitest green mean
 drifted, and vice versa. Both test files say so at the failure site.
 
 A missing or unreadable fixture is a **fatal**, never a skip, on both sides. A skip here is
-the same false-green shape `CLAUDE.md` records for the live-DB suites, where a suite that
+the same false-green shape `.claude/rules/go.md` records for the live-DB suites, where a suite that
 ran nothing prints `ok`.
 
 ### 🔴 The two halves are NOT symmetric, and the Go half needs `-count=1`

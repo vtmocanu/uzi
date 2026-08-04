@@ -99,4 +99,167 @@
 {{- fail (printf "workers.docker.rootless=false but the selected DinD image %q is a rootless (-dind-rootless) image — a rootless image cannot run under the non-rootless posture (it crash-loops needing unprivileged userns, the exact node prerequisite rootless:false exists to avoid). Use a non-rootless -dind image (or unset workers.docker.image to take the pinned nonRootlessImage)." $img) }}
 {{- end }}
 {{- end }}
+{{- /*
+  PVC-SIZE vs LimitRange `max` FAIL-GUARD (issue #224, audit A12.1).
+
+  A per-worker PVC size larger than its tier's limitRange.maxPVCStorage is admissible
+  NOWHERE and detectable NOWHERE, and the failure is the exact shape #224 exists to fix.
+  Traced with workers.docker.dindDataSize: 40Gi against maxPVCStorage: 20Gi — `helm
+  template` renders clean, the controller boots clean (its own validation checks only
+  that the string PARSES, and it cannot know the chart's max), RenderPVCs emits the
+  claim, limitranger rejects it, the materializer returns before the Deployment is
+  created, and the reconcile loop logs into a void nothing reads. Nothing is reported to
+  the api. The worker never appears, forever, retrying every tick. That is
+  preset.go's worker-that-provisions-and-never-appears, and this converts it into a
+  `helm install` error naming both values.
+
+  IT IS WRITTEN AGAINST THE `max`, NOT AGAINST ONE CLAIMANT, so a future PVC gains
+  coverage by being added to the list rather than by someone remembering this file
+  exists. The default sits EXACTLY on the ceiling today (dindDataSize 20Gi ==
+  maxPVCStorage 20Gi), which is why `gt` and not `ge`: equal is the shipped, correct
+  configuration.
+
+  🔴 THIS GUARD IS DOCKER-TIER ONLY, WHICH IS CORRECT AND READS BROADER THAN IT IS
+  (audit A18.4). The restricted tier has no chart-supplied PVC size — its two claims are
+  sized by Go constants — so there is nothing here for this loop to check and the
+  `workers.docker.enabled` condition is right. The consequence a reader of THIS FILE
+  ALONE would miss: `workers.limitRange.maxPVCStorage` is checked by nothing in the
+  chart at all.
+
+  🔴 WHAT THIS CANNOT SEE, stated because a guard's blind spot is the thing that gets
+  assumed away: the OTHER two claimants are compiled into the controller, not supplied
+  by the chart. `nixSize` (20Gi, also exactly on the ceiling, on BOTH tiers) and each
+  preset's DataSize (`l` = 20Gi, likewise) are Go constants, and a chart cannot read
+  them. Duplicating them into values.yaml was rejected deliberately — it would make the
+  chart a fourth place preset quantities appear and the only one with no golden gating
+  it, which is the ungated-skew class preset.go's own header exists to prevent. They are
+  guarded on the Go side instead, by TestPresetPVCSizesFitTheChartsLimitRangeMax, which
+  READS both tiers' maxPVCStorage out of values.yaml.
+
+  SO THERE ARE THREE NETS, AT THREE DIFFERENT TIMES, AND THIS IS THE FIRST OF THEM:
+
+    1. HERE, at `helm install`/`template` time — the earliest and cheapest, covering the
+       one claimant the chart supplies, overrides included.
+    2. `go test` — TWO tests, one per source of a Go constant, and the pair is what
+       makes this net exhaustive: TestPresetPVCSizesFitTheChartsLimitRangeMax covers
+       nixSize and each preset's DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
+       covers dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
+       same parse-and-Fatal contract, so neither carries a hardcoded ceiling. They catch
+       a DEVELOPER raising a size in the repo.
+    3. CONTROLLER BOOT — kube.ValidatePVCCeilings, fed the real ceilings at runtime
+       (UZI_WORKER_MAX_PVC_STORAGE / UZI_WORKER_DOCKER_MAX_PVC_STORAGE), refuses to start
+       rather than provisioning claims the LimitRange will reject. This is the only one
+       that sees what the CLUSTER configured rather than what the repo ships, so it is
+       what covers `--set` and per-cluster values files. It enumerates claimants by
+       calling RenderPVCs rather than re-listing them, so a fourth PVC is covered by
+       construction. Its value depends on the controller Deployment's `strategy:
+       Recreate` — under RollingUpdate the old controller outlives the new one's
+       CrashLoopBackOff and keeps provisioning against a ceiling it was never told
+       about, so the check fires and is defeated.
+
+  *** An earlier version of this comment ended "an operator-lowered RESTRICTED-tier
+  ceiling is ungated on both sides — a real residual, not a covered case". That was true
+  when written and net 3 made it false; the sweep was missed by the commit that added
+  net 3. Corrected here rather than left, because a comment that UNDERSTATES coverage
+  sends the next reader off to build a guard that already exists. ***
+
+  Two residuals, and they are in different classes:
+
+    * `limitRange.enabled: false` while a LimitRange from a previous install remains.
+      Reachable through a SUPPORTED chart value: net 1 renders nothing, net 3 is not told
+      a ceiling, and a live object still rejects the claims. uzi's own ArgoCD app sets
+      `prune: true`, which deletes it; an installation syncing manually should delete the
+      object alongside the flag.
+    * A LimitRange edited DIRECTLY in the cluster. Out of scope by DEFINITION rather than
+      by difficulty: the chart's contract is that the rendered manifest is the desired
+      state, so an out-of-band `kubectl edit limitrange` IS a desired-state violation, and
+      the remedy for that class is GitOps, not a chart guard. A template cannot defend
+      objects it has already handed over. Where ArgoCD selfHeal is configured it is
+      reverted automatically — worth knowing, but this comment cannot rely on it, since
+      another installation might sync manually.
+
+  A `helm upgrade` reaches neither, but by DIFFERENT mechanisms, and the distinction is
+  the point rather than pedantry: for a lowered ceiling the object is re-rendered and the
+  controller is rolled with the new env; for `limitRange.enabled: false` nothing is
+  re-rendered at all — what removes the stale object is helm deleting resources that
+  dropped out of the release's manifest. One sentence covering both would be true of
+  neither.
+*/ -}}
+{{- /*
+  NO `ephemeral-storage` IN ANY LimitRange `default` OR `defaultRequest`, EITHER TIER
+  (issue #224, A3.2's second half; found unenforced by the tester as A22.3).
+
+  render.go's ephemeralRequest header explains at length why no CONTAINER may declare
+  `limits.ephemeral-storage`: kubelet's podEphemeralStorageLimitEviction fires as soon
+  as ANY container has one, and compares the SUM of declared limits against pod usage
+  that INCLUDES the emptyDirs — so a single limit creates a deterministic eviction that
+  fires with no node pressure at all, which is the failure this whole issue exists to
+  reduce. A unit test pins that over the RENDERED pod.
+
+  🔴 A LimitRange DEFEATS THAT TEST WITHOUT CONTRADICTING IT, WHICH IS WHY IT NEEDS A
+  CHART GUARD RATHER THAN A BETTER ASSERTION. The injection happens at ADMISSION, after
+  the controller has rendered and after every test has run: the object we render carries
+  no limit, the object the cluster admits does. Measured with a before/after/restore on
+  an otherwise cleanly-admitting pod — three lines in a values file moved the worker
+  container from `{cpu, memory}` to `{cpu, ephemeral-storage, memory}` limits, and
+  `task gate:controller` stayed green throughout. No test above this layer can see it,
+  so this is the instrument's floor, not a gap in the assertions.
+
+  `defaultRequest` is guarded too, and not merely for symmetry: it would inject a
+  REQUEST into every container that declares none — the dind sidecar and both init
+  containers — which silently breaks the "whole pod budget on the `worker` container
+  alone" invariant that makes quota, the scheduler and the eviction ranker agree on one
+  number.
+
+  Same shape as A3.6's rule for `max`, and for the same reason: an ephemeral `max`
+  needs a `default` beside it, and that `default` hands the trap above to EVERY pod in
+  the namespace. Neither tier declares any of these four keys; this refuses to render
+  if one appears.
+*/ -}}
+{{- range $path, $block := dict
+  "workers.limitRange.default"               .Values.workers.limitRange.default
+  "workers.limitRange.defaultRequest"        .Values.workers.limitRange.defaultRequest
+  "workers.docker.limitRange.default"        .Values.workers.docker.limitRange.default
+  "workers.docker.limitRange.defaultRequest" .Values.workers.docker.limitRange.defaultRequest }}
+{{- if $block }}
+{{- if hasKey $block "ephemeral-storage" }}
+{{- fail (printf "%s sets ephemeral-storage, which must never be declared in a LimitRange. It is injected at ADMISSION, so the controller renders a pod with no ephemeral limit and the cluster admits one WITH it — invisible to every unit test. A `default` arms kubelet's pod-level ephemeral eviction, which compares the SUM of declared limits against pod usage INCLUDING the emptyDirs and therefore evicts with no node pressure at all (the exact failure issue #224 exists to reduce, made deterministic). A `defaultRequest` injects a request into the dind sidecar and the init containers, breaking the invariant that the whole pod budget sits on the `worker` container alone. Remove the key: the controller declares the worker's requests.ephemeral-storage itself, per tier, and deliberately declares no limit anywhere." $path) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.workers.docker.enabled .Values.workers.docker.limitRange.enabled }}
+{{- $max := .Values.workers.docker.limitRange.maxPVCStorage }}
+{{- $maxBytes := float64 (include "uzi.quantityBytes" $max) }}
+{{- /*
+  THE UNSET PATH IS CHECKED TOO, and skipping it was a real hole (audit A18.2).
+  An empty or absent dindDataSize does NOT mean "no claim" — it means the controller
+  falls back to its OWN compiled-in default and creates a 20Gi PVC anyway. Guarding
+  only the set value left that claim unchecked, so an empty string plus a lowered max
+  rendered perfectly clean and produced exactly the failure this guard exists to stop.
+  Measured: dindDataSize "" + maxPVCStorage 10Gi rendered with no env var at all.
+
+  The literal below MIRRORS dindDataDefaultSize in controller/internal/kube/render.go
+  and the two must move together. It is a genuine cross-toolchain duplicate — Helm
+  cannot read a Go constant — so it is tied the same way every other one here is: that
+  constant's own comment names this file, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
+  (controller/internal/kube) fails if the controller's default outgrows this max. That
+  test is the mechanical half; this literal is what makes the CHART side honest about
+  what will actually be claimed.
+*/ -}}
+{{- $dindSize := .Values.workers.docker.dindDataSize }}
+{{- $dindKey := "workers.docker.dindDataSize" }}
+{{- if not $dindSize }}
+{{- $dindSize = "20Gi" }}
+{{- $dindKey = "the controller's built-in dind data-root default (workers.docker.dindDataSize is unset, so the controller supplies 20Gi itself)" }}
+{{- end }}
+{{- /* name -> value, so the failure names the key an operator has to edit. */ -}}
+{{- $claimants := dict $dindKey $dindSize }}
+{{- range $key, $size := $claimants }}
+{{- if $size }}
+{{- if gt (float64 (include "uzi.quantityBytes" $size)) $maxBytes }}
+{{- fail (printf "%s=%v exceeds workers.docker.limitRange.maxPVCStorage=%v. The claim would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean, the controller boots clean, and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log. Raise workers.docker.limitRange.maxPVCStorage to at least %v (and raise workers.docker.quota.requestsStorage with it, or the tier runs out of storage budget instead), or lower %s." $key $size $max $size $key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

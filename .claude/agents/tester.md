@@ -525,7 +525,7 @@ same day — **prefer splitting a file over raising the cap**, since under a per
 cap a large test file is a serialization point no timeout value fixes.
 **A file killed by the cap reports `cancelled`, not `fail`** — the summary reads
 `fail 0` on a red job — so read the exit code and the TAP plan (it shrinks, with
-the file named in place of its suites), never the tally. See `CLAUDE.md`'s
+the file named in place of its suites), never the tally. See `.claude/rules/agent.md`'s
 `--test-timeout` block before touching the number.
 
 `-count=1` on the two Go test targets is part of the gate, not a habit: Go's test cache
@@ -540,7 +540,7 @@ nothing.
 **The control is a mutation, not an absence: gut the fixture and confirm the gate
 reddens.** Do not substitute "no `(cached)` lines appeared" — that is satisfied by
 passing the flag at all, and it was measured PASSING in the exact broken
-configuration it would be claimed to detect. See `CLAUDE.md`'s api section.
+configuration it would be claimed to detect. See `.claude/rules/go.md`.
 
 Real suites: `task test:api` (api), `task test:web` / `task test:agent` (web = vitest,
 agent = node --test via tsx). The end-to-end gate is `./e2e/run-e2e.sh` (isolated stack,
@@ -555,8 +555,8 @@ profile exports the real `UZI_SEED_*`, `JWT_SECRET`, `UZI_SECRET_KEY` and
 `POSTGRES_PASSWORD`, and Compose ranks shell environment ABOVE `--env-file`, so dummy
 secrets alone are not sufficient (`env -i HOME=$HOME PATH=$PATH docker compose
 --env-file <dummy.env> -p <unique> …`). (Corrected 2026-08-02: this said a bare `up`
-"autoloads the real `./.env`", which root `CLAUDE.md` records as measured-false on this
-host.) The primary runtime is now the
+"autoloads the real `./.env`", which `.claude/rules/stack.md` records as measured-false on
+this host.) The primary runtime is now the
 hosted k8s deploy (dev-cluster, ArgoCD) — validate worker/runtime features there, not
 only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates by invoking the
 same `task` targets you do, but NOT e2e (it needs docker compose on the runner), so
@@ -598,8 +598,8 @@ lead as you would for e2e.
 log: `grep -c -F 'FAIL'` returned **9**, `grep -c -- '--- FAIL'` returned **0** — all
 nine were *passing* tests whose names contain the substring (`✓ a FAILED /api/version
 reaches the fleet panel …`). Use `--- FAIL` for Go, vitest's summary line, and
-`ℹ fail` plus the exit code for `node --test`. Same family as two traps `CLAUDE.md`
-records in its api and agent sections: the `--- PASS` population mismatch, and
+`ℹ fail` plus the exit code for `node --test`. Same family as two traps recorded in
+`.claude/rules/go.md` and `.claude/rules/agent.md`: the `--- PASS` population mismatch, and
 `node --test` printing `ℹ fail 0` while tests are failing by timeout.
 
 **Long-gate exception to the generic `<5min` live-wait bound:** `./e2e/run-e2e.sh` runs

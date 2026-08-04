@@ -178,6 +178,13 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			o.HasDataPVC = true
 		case nixPVCName(id):
 			o.HasNixPVC = true
+		case dindDataPVCName(id):
+			// Docker workers only (issue #224 M-a). Matched unconditionally rather than
+			// behind a docker check because this loop sees only a NAME and a stamp: the
+			// worker's Docker flag lives in the desired set, which teardown is defined not
+			// to have. A plain worker never has an object by this name, so the arm is
+			// simply never taken for one.
+			o.HasDinDDataPVC = true
 		}
 	}
 
@@ -496,12 +503,16 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// decrement it when storage then rejects the create AlreadyExists (upstream #119593):
 	// the redundant charges out-raced the quota-controller resync and pinned the quota at
 	// its hard limit, so genuinely-new workers were then refused their PVCs. Observe
-	// populates HasDataPVC/HasNixPVC every tick by listing the namespace, so once a PVC is
-	// seen we skip re-issuing its create. The AlreadyExists tolerance is retained for the
-	// observe→create race (a PVC created since the last Observe, so its flag is still
-	// false) — the gate removes the steady-state churn, the tolerance covers the window.
-	// Teardown deletes the PVCs, so a reprovisioned worker observes the flag false again
-	// and recreates — the delete+reprovision semantics are preserved.
+	// populates HasDataPVC/HasNixPVC/HasDinDDataPVC every tick by listing the namespace, so
+	// once a PVC is seen we skip re-issuing its create. The AlreadyExists tolerance is
+	// retained for the observe→create race (a PVC created since the last Observe, so its
+	// flag is still false) — the gate removes the steady-state churn, the tolerance covers
+	// the window. Teardown deletes the PVCs, so a reprovisioned worker observes the flag
+	// false again and recreates — the delete+reprovision semantics are preserved.
+	//
+	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
+	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
+	// and its gate cannot mis-fire there.
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
 		switch pvc.Name {
 		case dataPVCName(w.ID):
@@ -510,6 +521,10 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 			}
 		case nixPVCName(w.ID):
 			if obs.HasNixPVC {
+				continue
+			}
+		case dindDataPVCName(w.ID):
+			if obs.HasDinDDataPVC {
 				continue
 			}
 		}
@@ -591,8 +606,15 @@ func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 // Safe by construction even though a hosted worker's volumes are destroyed here:
 // /nix is a cache (re-seedable from the image), /data is the clone cache plus
 // per-run workspaces (the forge holds the durable output — branch and MR — and runs
-// are tracked in the DB and requeued), and a worker whose row is gone has no
-// workers.token_hash, so its pod cannot authenticate and is already dead weight.
+// are tracked in the DB and requeued), the dind data root is the daemon's image and
+// build cache (re-pullable, and none of it worker state — issue #224 M-a), and a
+// worker whose row is gone has no workers.token_hash, so its pod cannot
+// authenticate and is already dead weight.
+//
+// The dind claim is deleted UNCONDITIONALLY, not behind a docker check, and that is
+// the only correct shape: teardown runs against a worker the api has DROPPED, so its
+// Docker flag is no longer in the desired set to branch on. A plain worker never had
+// one, and the delete NotFounds — which this loop already tolerates.
 func (m *Materializer) teardown(ctx context.Context, id, ns string) error {
 	m.log.Info("tearing down a hosted worker the api no longer wants", "worker_id", id, "namespace", ns)
 	var errs []error
@@ -603,7 +625,7 @@ func (m *Materializer) teardown(ctx context.Context, id, ns string) error {
 	if err := m.client.CoreV1().Secrets(ns).Delete(ctx, secretName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		errs = append(errs, fmt.Errorf("delete secret: %w", err))
 	}
-	for _, name := range []string{dataPVCName(id), nixPVCName(id)} {
+	for _, name := range []string{dataPVCName(id), nixPVCName(id), dindDataPVCName(id)} {
 		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete pvc %s: %w", name, err))
 		}

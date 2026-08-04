@@ -43,7 +43,7 @@
 # at ERROR. `key-duplicates` is the one that matters operationally here -- a
 # duplicated key in `deploy/chart/values.yaml` or `docker-compose.yml` is silently
 # last-wins in every YAML parser, which is precisely how this repo lost a
-# ServiceAccount from the chart for days (CLAUDE.md records it). `truthy` also
+# ServiceAccount from the chart for days (`.claude/rules/stack.md` records it). `truthy` also
 # stays on: it fires on nothing in this repo today, which is a property of the
 # DATA and not of the rule, and it is exactly the rule you want the first time
 # somebody writes an `on:` key.

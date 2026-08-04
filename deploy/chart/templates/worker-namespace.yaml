@@ -64,14 +64,26 @@ metadata:
   hosted workers noisy-neighbour a shared cluster. The per-user quota in the api is
   the product control; this is the floor under it.
 
-  NOTE THE SIDE EFFECT, it is load-bearing: a ResourceQuota on requests.* makes
-  admission REJECT any pod with a container that declares no requests —
-  initContainers included. The controller renders them explicitly for exactly this
-  reason; the LimitRange below is the backstop, not the source.
+  NOTE THE SIDE EFFECT, it is load-bearing: a ResourceQuota on requests.CPU or
+  requests.MEMORY makes admission REJECT any pod with a container that declares no
+  requests — initContainers included. The controller renders them explicitly for
+  exactly this reason; the LimitRange below is the backstop, not the source.
 
-  Sized against the fleet: 20 x `m` = 10 CPU / 40Gi requested, and 20 x (10Gi data +
-  4Gi nix) = 280Gi of PVC. Storage is the binding constraint, not CPU or memory.
-  dev-cluster's real budget is M6's rollout conversation.
+  Those two resources ONLY -- this said "requests.*" until issue #224. The quota
+  evaluator's validation set is hardcoded to cpu and memory, so every other
+  requests.* key is counted but never enforced: a pod declaring nothing for it is
+  admitted and contributes zero.
+
+  Sized against the fleet at its WORST CASE: 20 workers = 10 CPU / 40Gi requested, and
+  20 x (20Gi data + 20Gi nix) = 800Gi of PVC. Storage is the binding constraint, not
+  CPU or memory. dev-cluster's real budget is M6's rollout conversation.
+
+  The data term is `l`'s 20Gi, not `m`'s 10Gi, and the nix term is 20Gi, not the 4Gi
+  this comment carried until issue #224. Nothing scopes a size to a tier, so any of
+  these 20 workers may be an `l`; sizing on `m` capped the tier at 15 of the 20 it
+  advertises, and PRD #87's nixSize bump was never followed here at all. The
+  arithmetic and values.yaml's copy of it move together whenever nixSize or a preset's
+  DataSize does.
 */}}
 ---
 apiVersion: v1
