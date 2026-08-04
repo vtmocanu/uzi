@@ -2403,3 +2403,45 @@ and it is the second time this session that a coder's own discipline covered a l
 gap (the first being A3.12's moving tree, which the auditor had already defended against with a
 detached worktree). Coder is now explicitly frozen; if a validator finding needs it, I freeze the
 documenter first and say so to both.
+
+### A26 — 2026-08-04, `fc984693`: docs land, and the LEAD's dispatch framing was wrong
+
+**A26.1 — 🔴 LEAD ERROR: I asked for "a terse CHANGELOG line PLUS a separate release note." This
+repo has neither of those things.** Verified on the tree rather than taken on report: `CHANGELOG.md`
+entries here are **bold lead plus a full paragraph**, several with their own **Operators:** section —
+not one-liners. And `[Unreleased]` **is** the release notes: the release role's own doc confirms it
+is folded into the cut version at tag time, so there is **no separate release-notes file and no home
+to invent one in**. Deliverables 1 and 2 of my dispatch were **one artifact**.
+
+The instruction came from the generic documenter guidance ("keeps the CHANGELOG TERSE: one concise
+line per change"), which this repo's own precedent contradicts. **The documenter checked the repo and
+its own role tail instead of complying**, said so, and offered to split it if I actually wanted that.
+**That is the third time this session a teammate corrected me by checking rather than by following**
+— after the coder on the chart-guard's reach (A17.1) and on my A17.4 staleness (A23.4), and the
+auditor and reviewer on chased reports that had already arrived.
+
+**A26.2 — the entry carries all five required facts and, critically, does NOT overclaim.** It says
+the change *"lowers how often that happens; it does not close it"* and **names #218 as the actual
+fix**. Never *"fixes eviction"*. Then, under **Operators:** the fleet roll kills every in-flight run
+once; merging to `main` is not deploying (a `v*` tag plus a manual `targetRevision` bump in
+`argo-apps`); the third RWO PVC widens the Multi-Attach window; the image and build cache is
+now persistent with no GC and `docker system prune` is the remedy; and raising `dindDataSize` on a
+live cluster is a **silent no-op** for existing workers.
+
+**A26.3 — `docs/worker-setup.md`** gains one sentence: on a hosted k8s worker the dind-cache "k8s
+equivalent" is a persistent per-worker PVC, *"just as unbounded"*, reclaimed via `docker system
+prune` inside the worker or by delete-and-reprovision. The compose recipe stays — it is still
+correct.
+
+**A26.4 — verified BEFORE committing, which is the part worth naming.** `task check-docs:web` rc=0,
+37 docs validated, only **pre-existing** line-count warnings (`worker-setup.md` was already over
+budget before the one-sentence add, **not newly so** — the distinction a careless report would have
+collapsed). `git diff --stat` confirmed only the two intended files. A control-character grep over
+both found none. No em dashes, per the repo owner's standing preference for user-facing content.
+Committed **by explicit path**.
+
+**A26.5 — what it deliberately left alone, correctly.** `specs/ai.md`'s two nix-drift sites (A13.9)
+belong to spec-keeper and task #7, not to the documenter. A1/A9.1's manual pod cleanup and worker
+reprovision are **ops actions, not doc changes**. A12.6's pre-provision quota check and A22.6's
+`fsGroup` question both need a live cluster. None of the four is dischargeable from this worktree,
+and it said so rather than writing around them.
