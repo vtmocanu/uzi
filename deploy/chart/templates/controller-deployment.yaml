@@ -117,6 +117,16 @@ spec:
             # env being absent. The controller rejects a non-integer or a value < 1.
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
+            # The worker container's requests.ephemeral-storage (issue #224). Without
+            # it a worker pod declares nothing for the resource and is therefore the
+            # first thing kubelet evicts under node disk pressure, which destroys the
+            # in-flight run's working tree. The controller validates it as a k8s
+            # quantity at boot and falls back to its built-in 512Mi when unset. Docker
+            # workers use the docker tier's own value INSTEAD (below).
+            {{- with .Values.workers.ephemeralRequest }}
+            - name: UZI_WORKER_EPHEMERAL_REQUEST
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —
@@ -166,6 +176,15 @@ spec:
             # tier's limitRange.maxPVCStorage or the apiserver rejects the claim.
             {{- with .Values.workers.docker.dindDataSize }}
             - name: UZI_WORKER_DIND_DATA_SIZE
+              value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER worker container's requests.ephemeral-storage (issue #224). It
+            # REPLACES UZI_WORKER_EPHEMERAL_REQUEST for this tier, and is larger because
+            # a docker worker's run-workdir emptyDir carries the run's whole working
+            # tree while a plain worker's lives on the /data PVC. Same validation and
+            # the same never-a-limit rule.
+            {{- with .Values.workers.docker.ephemeralRequest }}
+            - name: UZI_WORKER_DOCKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}
             {{- end }}
             {{- end }}

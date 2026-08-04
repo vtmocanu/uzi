@@ -100,6 +100,14 @@ type Config struct {
 	WorkerAPIURL string
 	// WorkerStorageClass is optional; empty means the cluster default.
 	WorkerStorageClass string
+	// WorkerEphemeralRequest overrides the WORKER container's
+	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
+	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
+	//
+	// Validated here rather than in validateDockerTier because it applies to EVERY
+	// worker, so it must be read even on an instance with the docker tier off. Its
+	// docker counterpart lives with the other docker knobs below.
+	WorkerEphemeralRequest string
 	// WorkerMaxConcurrentRuns is the per-hosted-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS
 	// → the pod's WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe opt-in); raising it opts
 	// into the intra-user concurrency residuals documented in docs/worker-setup.md
@@ -150,6 +158,13 @@ type Config struct {
 	WorkerDinDRequestMemory string
 	WorkerDinDLimitCPU      string
 	WorkerDinDLimitMemory   string
+	// WorkerDockerEphemeralRequest overrides the WORKER container's
+	// requests.ephemeral-storage for a DOCKER worker (issue #224 M-b;
+	// UZI_WORKER_DOCKER_EPHEMERAL_REQUEST). It REPLACES the plain value rather than
+	// adding to it. Empty ⇒ the render side's built-in 4Gi, which is larger than the
+	// plain default because a docker worker's run-workdir emptyDir carries the run's
+	// entire working tree while a plain worker's lives on the /data PVC.
+	WorkerDockerEphemeralRequest string
 	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
 	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
 	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
@@ -265,6 +280,14 @@ func loadWorkerSettings(cfg *Config) error {
 		cfg.WorkerMaxConcurrentRuns = n
 	}
 
+	// The worker container's requests.ephemeral-storage (issue #224 M-b), plain tier.
+	// Optional; empty leaves the render side's built-in 512Mi. Read here, outside
+	// validateDockerTier, because every worker gets one — validating it there would
+	// silently skip it on an instance with the docker tier off, which is most of them.
+	if err := parseQuantityEnv("UZI_WORKER_EPHEMERAL_REQUEST", &cfg.WorkerEphemeralRequest); err != nil {
+		return err
+	}
+
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
 	// silent default for the namespace — guessing it means rendering privileged pods
 	// somewhere this controller may have no RBAC, or worse, into the restricted
@@ -320,9 +343,10 @@ func validateDockerTier(cfg *Config) error {
 	cfg.WorkerDinDRootless = rootless
 
 	// Optional DinD resource overrides (PRD #89 0.8.1), requests + limits both, plus the
-	// daemon's data-root PVC size (issue #224 M-a). Validated as k8s Quantity strings when
-	// set so a typo fails at boot, not at the far end when the apiserver rejects the
-	// rendered pod. Empty leaves the render side's built-in default.
+	// daemon's data-root PVC size and the docker tier's worker ephemeral-storage request
+	// (issue #224). All docker-only, so they live behind the tier's early return above.
+	// The PLAIN tier's ephemeral request is read in loadWorkerSettings instead, because
+	// it applies to every worker.
 	quantities := []struct {
 		key string
 		dst *string
@@ -332,17 +356,32 @@ func validateDockerTier(cfg *Config) error {
 		{"UZI_WORKER_DIND_LIMIT_CPU", &cfg.WorkerDinDLimitCPU},
 		{"UZI_WORKER_DIND_LIMIT_MEMORY", &cfg.WorkerDinDLimitMemory},
 		{"UZI_WORKER_DIND_DATA_SIZE", &cfg.WorkerDinDDataSize},
+		{"UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", &cfg.WorkerDockerEphemeralRequest},
 	}
 	for _, q := range quantities {
-		v := strings.TrimSpace(os.Getenv(q.key))
-		if v == "" {
-			continue
+		if err := parseQuantityEnv(q.key, q.dst); err != nil {
+			return err
 		}
-		if _, err := resource.ParseQuantity(v); err != nil {
-			return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", q.key, v, err)
-		}
-		*q.dst = v
 	}
+	return nil
+}
+
+// parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst
+// untouched when the var is unset or blank (so the render side supplies its default).
+//
+// A typo is a BOOT error rather than a silent skip, and this one earns the strictness:
+// an unparseable quantity would otherwise surface at the far end as a pod or PVC the
+// apiserver rejects, i.e. a worker that provisions and never appears, with nothing in
+// this controller's logs naming the cause.
+func parseQuantityEnv(key string, dst *string) error {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return nil
+	}
+	if _, err := resource.ParseQuantity(v); err != nil {
+		return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", key, v, err)
+	}
+	*dst = v
 	return nil
 }
 

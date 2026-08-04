@@ -83,12 +83,16 @@ func main() {
 		DinDLimitMemory:   cfg.WorkerDinDLimitMemory,
 		// The DinD daemon's data-root PVC size (issue #224 M-a); empty leaves the render
 		// default.
-		DinDDataSize:       cfg.WorkerDinDDataSize,
-		ServiceAccountName: cfg.WorkerServiceAccount,
-		APIURL:             cfg.WorkerAPIURL,
-		StorageClass:       cfg.WorkerStorageClass,
-		MaxConcurrentRuns:  cfg.WorkerMaxConcurrentRuns,
-		APICAPEM:           cfg.APICAPEM,
+		DinDDataSize: cfg.WorkerDinDDataSize,
+		// The worker container's requests.ephemeral-storage (issue #224 M-b), per tier;
+		// docker REPLACES plain. Empty leaves the render defaults (512Mi / 4Gi).
+		EphemeralRequest:       cfg.WorkerEphemeralRequest,
+		DockerEphemeralRequest: cfg.WorkerDockerEphemeralRequest,
+		ServiceAccountName:     cfg.WorkerServiceAccount,
+		APIURL:                 cfg.WorkerAPIURL,
+		StorageClass:           cfg.WorkerStorageClass,
+		MaxConcurrentRuns:      cfg.WorkerMaxConcurrentRuns,
+		APICAPEM:               cfg.APICAPEM,
 	}, resolver, log)
 
 	loop := reconcile.New(client, materializer, client, cfg.PollInterval, cfg.WorkerImageTag, log)

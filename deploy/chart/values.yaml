@@ -374,6 +374,34 @@ workers:
   # longer leaves a user's other runs queued behind it — so size the preset to fit that
   # many concurrent runs. The controller rejects a non-integer or a value < 1 at boot.
   maxConcurrentRuns: 1
+  # The WORKER container's requests.ephemeral-storage (issue #224 →
+  # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
+  # INSTEAD of this, not on top of it.
+  #
+  # Why it exists: a worker pod that declares nothing is ranked as using infinitely
+  # more than it requested, so it is the FIRST thing kubelet evicts under node disk
+  # pressure — and an evicted worker's in-flight run loses its entire working tree,
+  # silently. Declaring a request buys scheduler placement and eviction RANKING.
+  #
+  # Read this before tuning it, because the two directions fail very differently:
+  #   - TOO LOW is today's behaviour. Probabilistic, recoverable, and visible in a
+  #     kubelet message that names the cause.
+  #   - TOO HIGH is UNSCHEDULABLE: total, deterministic and SILENT, presenting as a
+  #     worker that provisions and never appears. The quota cannot warn you, because
+  #     a quota on this resource cannot bind (see the docker tier's ephemeralStorage
+  #     comment). So when unsure, err LOW.
+  #
+  # 512Mi is ~10x kubelet's default per-container log-rotation ceiling (10Mi x 5),
+  # which is essentially all a plain worker keeps on ephemeral storage: its working
+  # tree lives on the /data PVC, not on an emptyDir.
+  #
+  # NEVER add a matching LIMIT, here or in limitRange. A limit on ANY container makes
+  # kubelet enforce the SUM of declared limits against pod usage that includes the
+  # emptyDirs, which is a new deterministic eviction path that fires with no node
+  # pressure at all — the exact failure this value exists to reduce, arriving on
+  # schedule instead of by luck. The controller's render.go states the three
+  # mechanisms and a unit test enforces it.
+  ephemeralRequest: 512Mi
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #
@@ -392,9 +420,18 @@ workers:
   # correction costs zero storage until the workers actually exist. If nixSize or a
   # preset's DataSize moves again, this number moves with it.
   #
-  # SIDE EFFECT, and it is load-bearing: a quota on requests.* makes admission reject
-  # any pod with a container declaring no requests — initContainers included. The
-  # controller renders them explicitly for exactly this reason.
+  # SIDE EFFECT, and it is load-bearing: a quota on requests.CPU or requests.MEMORY
+  # makes admission reject any pod with a container declaring no requests —
+  # initContainers included. The controller renders them explicitly for exactly this
+  # reason.
+  #
+  # THOSE TWO RESOURCES ONLY. This comment said "requests.*" until issue #224, which
+  # is false: the quota evaluator intersects a quota's tracked resources against a
+  # hardcoded set of cpu and memory, and upstream calls that a frozen mistake it will
+  # not extend. Every other requests.* key here is a CEILING that is counted, never a
+  # rule that is enforced — a pod declaring nothing for it is admitted and counted as
+  # zero. The docker tier's ephemeralStorage key is the live example of what that
+  # costs.
   quota:
     enabled: true
     requestsCPU: "10"
@@ -605,6 +642,24 @@ workers:
     # can run it); otherwise it is delete + reprovision, as everywhere else here.
     # Empty falls back to the controller's built-in 20Gi.
     dindDataSize: 20Gi
+    # The DOCKER worker container's requests.ephemeral-storage (issue #224 →
+    # UZI_WORKER_DOCKER_EPHEMERAL_REQUEST). It REPLACES workers.ephemeralRequest for
+    # this tier rather than adding to it; read that key's comment first, all of which
+    # applies here, including the never-a-limit rule.
+    #
+    # Larger than the plain tier's 512Mi for one structural reason: the run-workdir
+    # emptyDir is mounted ONLY for a docker worker, and it holds the run's entire
+    # working tree — one clone per run, times maxConcurrentRuns, with $TMPDIR pointed
+    # at the same volume. A plain worker's working tree is on the /data PVC instead
+    # and never touches ephemeral storage at all. uzi's own repo is a ~170 MiB runner
+    # clone before a single dependency install; 4Gi covers roughly two concurrent
+    # heavy runs.
+    #
+    # It is 4Gi rather than the larger figure an emptyDir-based design needed because
+    # dindDataSize above moved the daemon's image cache to a PVC, which was ~99% of
+    # the measured footprint. Re-derive what is left on ephemeral storage before
+    # raising it.
+    ephemeralRequest: 4Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).

@@ -633,3 +633,57 @@ func TestLoadDockerDinDDataSize(t *testing.T) {
 		t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DIND_DATA_SIZE", err)
 	}
 }
+
+// The worker's requests.ephemeral-storage overrides (issue #224 M-b), per tier.
+//
+// The PLAIN one is read OUTSIDE validateDockerTier and this test's first half is what
+// pins that: every worker declares the resource, so a var validated only when the
+// docker tier is on would be silently ignored on the instances that do not run one —
+// which is most of them, and the failure would be a worker evicted exactly as before
+// with a values.yaml that says otherwise.
+func TestLoadWorkerEphemeralRequestsPerTier(t *testing.T) {
+	t.Run("plain tier is read with the docker tier OFF", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_WORKER_EPHEMERAL_REQUEST", "1Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerEphemeralRequest != "1Gi" {
+			t.Fatalf("plain ephemeral request = %q, want 1Gi (read even with no docker tier configured)", cfg.WorkerEphemeralRequest)
+		}
+
+		t.Setenv("UZI_WORKER_EPHEMERAL_REQUEST", "1GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_EPHEMERAL_REQUEST") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_EPHEMERAL_REQUEST", err)
+		}
+	})
+
+	t.Run("docker tier", func(t *testing.T) {
+		setDockerBaseEnv(t)
+		t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+		t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+		t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+		t.Setenv("UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", "8Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDockerEphemeralRequest != "8Gi" {
+			t.Fatalf("docker ephemeral request = %q, want 8Gi", cfg.WorkerDockerEphemeralRequest)
+		}
+		// Unset stays empty so the render side supplies its own default, never a zero
+		// quantity — which would re-create the very bug (a declared request of 0 ranks
+		// identically to declaring nothing).
+		if cfg.WorkerEphemeralRequest != "" {
+			t.Errorf("unset UZI_WORKER_EPHEMERAL_REQUEST must stay empty, got %q", cfg.WorkerEphemeralRequest)
+		}
+
+		t.Setenv("UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", "8GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_EPHEMERAL_REQUEST") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", err)
+		}
+	})
+}

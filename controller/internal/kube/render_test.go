@@ -162,8 +162,11 @@ func TestRenderedPodPosture(t *testing.T) {
 		if len(c.SecurityContext.Capabilities.Drop) != 1 || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
 			t.Errorf("container %q: must drop ALL capabilities", c.Name)
 		}
-		// A ResourceQuota on requests.* rejects any pod with a container declaring none —
-		// initContainers included.
+		// A ResourceQuota on requests.CPU or requests.MEMORY rejects any pod with a
+		// container declaring none — initContainers included. Those two resources and no
+		// others: the quota evaluator's validationSet is hardcoded to them (issue #224
+		// corrected "requests.*" here), which is exactly why the ephemeral-storage
+		// request asserted further down needs its own test rather than this one.
 		if c.Resources.Requests.Cpu().IsZero() || c.Resources.Requests.Memory().IsZero() {
 			t.Errorf("container %q: requests are required or the ResourceQuota rejects the pod", c.Name)
 		}
@@ -312,6 +315,226 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 				t.Errorf("%s: storageClass not applied", p.Name)
 			}
 		}
+	}
+}
+
+// Issue #224 M-b: the worker container declares requests.ephemeral-storage, on the
+// WORKER container and nowhere else, at the per-tier value.
+//
+// Declaring nothing is what the issue is about: kubelet ranks a pod that requested 0
+// as exceeding its request by everything it uses, so a worker was the first thing
+// evicted under node disk pressure — and an evicted worker's in-flight run loses its
+// entire working tree, silently.
+//
+// The "worker container and nowhere else" half is the part that reads as an
+// oversight and is the actual design. Quota and the scheduler sum containers PLUS
+// restartable initContainers; the eviction ranker uses max(sum(Containers),
+// max(InitContainers)) with no sidecar case. .spec.containers holds exactly one
+// entry, so the whole budget on `worker` makes all three views agree on one number.
+// Splitting it across containers "for symmetry" is charged in full by quota and
+// credited only partially by the ranker, i.e. it silently halves the threshold this
+// exists to raise.
+func TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+		want string
+	}{
+		{"plain", testConfig(), desired("abc"), "512Mi"},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc"), "4Gi"},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc"), "4Gi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			worker := containerByName(t, pod.Containers, workerContainerName)
+			got, ok := worker.Resources.Requests[corev1.ResourceEphemeralStorage]
+			if !ok {
+				t.Fatalf("the worker container declares NO requests.ephemeral-storage. A pod that declares "+
+					"none is ranked as exceeding its request by its whole usage and is evicted FIRST under node "+
+					"disk pressure, which destroys the in-flight run's working tree (issue #224). requests = %v",
+					worker.Resources.Requests)
+			}
+			if want := resource.MustParse(tc.want); got.Cmp(want) != 0 {
+				t.Errorf("worker requests.ephemeral-storage = %s, want %s", got.String(), tc.want)
+			}
+
+			// EVERY other container: none of them declares one. This is the half a future
+			// "make the sidecar declare its share too" edit breaks.
+			for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+				if c.Name == workerContainerName {
+					continue
+				}
+				if q, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok {
+					t.Errorf("container %q also declares requests.ephemeral-storage (%s). The whole pod budget "+
+						"belongs on %q alone: quota and the scheduler sum containers plus restartable init "+
+						"containers, while the eviction ranker uses max(sum(Containers), max(InitContainers)) "+
+						"with no sidecar case, so a split is charged in full and credited only in part.",
+						c.Name, q.String(), workerContainerName)
+				}
+			}
+		})
+	}
+}
+
+// 🔴 THE INVARIANT TEST. No container in .spec.containers OR .spec.initContainers may
+// declare limits.ephemeral-storage, in either posture, docker or plain.
+//
+// This is not defensive tidiness — a limit is strictly WORSE than declaring nothing,
+// and it is what the next person adds "for symmetry with cpu and memory":
+//
+//  1. podEphemeralStorageLimitEviction fires as soon as ANY container declares a
+//     limit, and compares the SUM of declared limits against pod usage that INCLUDES
+//     the emptyDirs. One limit on `worker` therefore creates a pod-level ceiling that
+//     run-workdir — the run's own checkout — counts against. That is a DETERMINISTIC
+//     eviction with no node pressure at all: this issue's failure, on schedule.
+//  2. A limit on `dind` is inert anyway (containerEphemeralStorageLimitEviction reads
+//     pod.Spec.Containers only, and dind is a restartable initContainer), so it buys
+//     nothing while still arming (1).
+//  3. All three localStorageEviction arms evict at gracePeriodOverride 0, so a limit
+//     would also disarm any SIGTERM-time work-preservation the shutdown path grows.
+//
+// A REQUEST adds no eviction path at all — every arm is limit- or sizeLimit-gated —
+// which is why the request above is safe and this must stay empty.
+func TestNoContainerDeclaresAnEphemeralStorageLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RenderConfig
+		w    protocol.DesiredWorker
+	}{
+		{"plain", testConfig(), desired("abc")},
+		{"docker rootless", dockerTestConfig(), desiredDocker("abc")},
+		{"docker non-rootless", dockerTestConfigNonRootless(), desiredDocker("abc")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := RenderDeployment(tc.cfg, tc.w, testSpec(t, "base", "m")).Spec.Template.Spec
+
+			// Both lists, explicitly. Checking only .spec.containers would miss the whole
+			// docker tier, whose sidecars are initContainers — and trap (1) fires on a limit
+			// declared by ANY container, sidecar included.
+			seen := 0
+			for _, group := range []struct {
+				what string
+				cs   []corev1.Container
+			}{
+				{".spec.initContainers", pod.InitContainers},
+				{".spec.containers", pod.Containers},
+			} {
+				for _, c := range group.cs {
+					seen++
+					if q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+						t.Errorf("%s container %q declares limits.ephemeral-storage = %s. NEVER declare one: a limit "+
+							"on ANY container makes kubelet enforce the SUM of declared limits against pod usage that "+
+							"includes the emptyDirs, creating a deterministic eviction that fires with no node pressure "+
+							"— the exact failure issue #224 exists to reduce. Read ephemeralRequest's header in "+
+							"render.go before reverting this.", group.what, c.Name, q.String())
+					}
+				}
+			}
+			// The test iterated something. Without this it would pass vacuously if the
+			// render ever stopped producing containers at all.
+			if seen < 2 {
+				t.Fatalf("only %d containers in the rendered pod; the invariant was asserted over almost nothing", seen)
+			}
+		})
+	}
+}
+
+// The per-tier values are overridable per cluster (the right number is a property of
+// the CLUSTER'S NODES, not of the product — the same argument that made dindResources
+// overridable), docker REPLACES plain rather than adding to it, and either override
+// rolls its own tier and only its own.
+func TestEphemeralRequestOverridesArePerTierAndRollOnlyThatTier(t *testing.T) {
+	ephemeralOf := func(cfg RenderConfig, w protocol.DesiredWorker) string {
+		t.Helper()
+		pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+		q := containerByName(t, pod.Containers, workerContainerName).Resources.Requests[corev1.ResourceEphemeralStorage]
+		return q.String()
+	}
+
+	cfg := dockerTestConfig()
+	cfg.EphemeralRequest = "1Gi"
+	cfg.DockerEphemeralRequest = "8Gi"
+
+	if got := ephemeralOf(cfg, desired("abc")); got != "1Gi" {
+		t.Errorf("overridden plain request = %s, want 1Gi", got)
+	}
+	// REPLACES, not adds: 8Gi exactly, never 9Gi.
+	if got := ephemeralOf(cfg, desiredDocker("abc")); got != "8Gi" {
+		t.Errorf("overridden docker request = %s, want exactly 8Gi — the docker value REPLACES the plain one", got)
+	}
+
+	// A partial override leaves the other tier on its default, in both directions.
+	plainOnly := dockerTestConfig()
+	plainOnly.EphemeralRequest = "1Gi"
+	if got := ephemeralOf(plainOnly, desiredDocker("abc")); got != "4Gi" {
+		t.Errorf("docker request with only the plain override set = %s, want the 4Gi default", got)
+	}
+	dockerOnly := dockerTestConfig()
+	dockerOnly.DockerEphemeralRequest = "8Gi"
+	if got := ephemeralOf(dockerOnly, desired("abc")); got != "512Mi" {
+		t.Errorf("plain request with only the docker override set = %s, want the 512Mi default", got)
+	}
+
+	// Each override rolls its own tier (it changes the rendered pod, so a bump must
+	// actually reach the fleet) and leaves the other tier's hash alone.
+	base := dockerTestConfig()
+	if SpecHashOf(base, desired("abc"), testSpec(t, "base", "m")) ==
+		SpecHashOf(plainOnly, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("raising the plain ephemeral request did not change a plain worker's spec hash, so the bump would never roll it")
+	}
+	if SpecHashOf(base, desiredDocker("abc"), testSpec(t, "base", "m")) !=
+		SpecHashOf(plainOnly, desiredDocker("abc"), testSpec(t, "base", "m")) {
+		t.Error("the PLAIN override changed a DOCKER worker's spec hash; the two tiers must roll independently")
+	}
+	if SpecHashOf(base, desired("abc"), testSpec(t, "base", "m")) !=
+		SpecHashOf(dockerOnly, desired("abc"), testSpec(t, "base", "m")) {
+		t.Error("the DOCKER override changed a PLAIN worker's spec hash; a docker-only knob must never roll the plain fleet")
+	}
+}
+
+// The shipped defaults must fit the fleet the chart's own quotas permit, or a worker
+// provisions and never appears — silently, because a quota on this resource cannot
+// bind (the evaluator enforces cpu and memory alone) and so cannot warn anybody.
+//
+// The node figure is dev-cluster's measured ephemeral-storage ALLOCATABLE, identical
+// on all four worker nodes. It is a constant in this test rather than config on
+// purpose: it is a fact about one cluster, and the assertion it supports is "the
+// SHIPPED DEFAULTS are sane for a real node", not "this controller knows your nodes".
+// A cluster with smaller nodes lowers the values through the chart.
+func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
+	// 17.55 GiB allocatable x 4 worker nodes.
+	const nodeAllocatable = 17.55
+	const workerNodes = 4
+	// The tiers' own `count/deployments.apps` quotas: 10 docker + 20 restricted.
+	const dockerWorkers, plainWorkers = 10, 20
+
+	gib := func(s string) float64 {
+		t.Helper()
+		q := resource.MustParse(s)
+		return float64(q.Value()) / (1 << 30)
+	}
+	plain, docker := gib(workerDefaultEphemeralRequest), gib(workerDefaultDockerEphemeralRequest)
+
+	// A single worker must fit on ONE node with room for the node's own eviction
+	// threshold (15%) and for everything else already running there.
+	if docker > nodeAllocatable*0.85 {
+		t.Errorf("the docker default (%s = %.2f GiB) exceeds 85%% of a node's allocatable (%.2f GiB): "+
+			"the pod would be permanently unschedulable, which presents as a worker that provisions and never appears",
+			workerDefaultDockerEphemeralRequest, docker, nodeAllocatable)
+	}
+
+	// And the whole fleet the quotas permit must fit across the pool. This is the
+	// assertion that would have caught the 20Gi-per-worker figure an early draft
+	// considered: 1.14x a whole node, each.
+	fleet := float64(dockerWorkers)*docker + float64(plainWorkers)*plain
+	pool := nodeAllocatable * workerNodes
+	if fleet > pool {
+		t.Errorf("a full fleet (%d docker x %s + %d plain x %s = %.1f GiB) exceeds the worker pool's "+
+			"ephemeral-storage allocatable (%d x %.2f = %.1f GiB); workers would silently stop scheduling",
+			dockerWorkers, workerDefaultDockerEphemeralRequest, plainWorkers, workerDefaultEphemeralRequest,
+			fleet, workerNodes, nodeAllocatable, pool)
 	}
 }
 

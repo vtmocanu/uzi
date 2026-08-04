@@ -64,10 +64,15 @@ metadata:
   hosted workers noisy-neighbour a shared cluster. The per-user quota in the api is
   the product control; this is the floor under it.
 
-  NOTE THE SIDE EFFECT, it is load-bearing: a ResourceQuota on requests.* makes
-  admission REJECT any pod with a container that declares no requests —
-  initContainers included. The controller renders them explicitly for exactly this
-  reason; the LimitRange below is the backstop, not the source.
+  NOTE THE SIDE EFFECT, it is load-bearing: a ResourceQuota on requests.CPU or
+  requests.MEMORY makes admission REJECT any pod with a container that declares no
+  requests — initContainers included. The controller renders them explicitly for
+  exactly this reason; the LimitRange below is the backstop, not the source.
+
+  Those two resources ONLY -- this said "requests.*" until issue #224. The quota
+  evaluator's validation set is hardcoded to cpu and memory, so every other
+  requests.* key is counted but never enforced: a pod declaring nothing for it is
+  admitted and contributes zero.
 
   Sized against the fleet: 20 x `m` = 10 CPU / 40Gi requested, and 20 x (10Gi data +
   20Gi nix) = 600Gi of PVC. Storage is the binding constraint, not CPU or memory.
