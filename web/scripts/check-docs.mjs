@@ -211,7 +211,16 @@ for (const file of files) {
 // and would make this commit a 10-completed-PRD edit. Scoped flat by the user's
 // ruling of 2026-08-03; prds/done/ is a KNOWN, DELIBERATE residual. Widening it
 // is a decision, not a tidy-up.
+// `.claude/rules/*.md` carry moved CLAUDE.md content, including relative links that
+// were written when that content sat at the repo root. PRD-less fix, 2026-08-04: the
+// CLAUDE.md split silently broke one such link and this checker could not see it.
 const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
+const rulesDir = path.join(repoRoot, ".claude", "rules");
+if (existsSync(rulesDir)) {
+  for (const f of readdirSync(rulesDir).sort()) {
+    if (f.endsWith(".md")) extraLinkFiles.push(path.join(".claude/rules", f));
+  }
+}
 for (const dir of ["specs", "prds", "adr"]) {
   const abs = path.join(repoRoot, dir);
   if (!existsSync(abs)) continue; // optional directories

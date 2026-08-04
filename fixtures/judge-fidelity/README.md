@@ -33,7 +33,7 @@ suite stands alone and the failure names the side: Go red plus vitest green mean
 drifted, and vice versa. Both test files say so at the failure site.
 
 A missing or unreadable fixture is a **fatal**, never a skip, on both sides. A skip here is
-the same false-green shape `CLAUDE.md` records for the live-DB suites, where a suite that
+the same false-green shape `.claude/rules/go.md` records for the live-DB suites, where a suite that
 ran nothing prints `ok`.
 
 ### 🔴 The two halves are NOT symmetric, and the Go half needs `-count=1`
@@ -65,7 +65,7 @@ Exposure, narrowed rather than left as "the Go half":
 - **CI's `test:controller` was never at risk** -- it already passes `-count=1`, and
   `.gitlab-ci.yml` spells out this exact mechanism for the `api/` goldens *it* reads across
   the same module boundary. That comment predates this fixture and describes it precisely.
-- **The exposed gates were `cd api && go test ./...`** (the command `CLAUDE.md` prescribed
+- **The exposed gates were `cd api && go test ./...`** (the command `.claude/rules/go.md` prescribed
   at the time; since PRD #103 M1 it names `task gate:api`, which carries `-count=1`)
   **and CI's `test:api`**, which ran it bare while `.go_job` persists `.gocache/` across
   pipelines. `test:api` now passes `-count=1` for the reason its controller sibling already

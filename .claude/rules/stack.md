@@ -29,36 +29,7 @@ and verify with `... compose config` that the dummy admin is what will seed. Eac
 
 > **This sentence used to open "It autoloads the real `./.env`", and that half is FALSE on this host** (measured 2026-07-28). There is no `.env` in `main/`, in any PRD worktree, or at the bare-clone root. The running stack's own labels say `project=uzi`, `working_dir=<bare-clone parent>`, `config_files=<parent>/docker-compose.yml`, and **that file does not exist**: the 2026-07-20 bare-clone conversion moved everything into `main/`, and the stack has been up longer than that. The precaution is right; only its stated mechanism was wrong, which is the failure mode this file spends most of its length warning about. The seed vars are spelled out above for the same reason: writing only the `UZI_SEED_*` glob is an under-specification that let a plausible-but-wrong guess (`UZI_SEED_ADMIN_*`) through.
 
-**🔴 THE COMMAND THAT DESTROYS REAL DATA IS `docker compose -p uzi down -v`, FROM ANY DIRECTORY HOLDING A COMPOSE FILE.** It removes `uzi_pgdata` and `uzi_agentdata`, which carry the real admin and forge data. The stack can be brought back with `cd main && docker compose -p uzi up`, but **the volumes do not come back**. Never pass `-p uzi` to a `down`, and never add `-v` to one.
-
-The standing "never `docker compose down` from a worktree" rule below is now belt-and-braces rather than load-bearing, and it is worth knowing which it is: because the recorded `config_files` path no longer exists, config-file discovery **cannot reach project `uzi` from anywhere**, so a bare `docker compose down` in a worktree resolves that worktree's own project and cannot touch the real one. It stays as a rule because the discovery path could be restored by anyone re-creating that file, and because the explicit-project form above is not hypothetical at all.
-
-**🔴 NEVER GLOB `uzi-` WHEN TEARING DOWN CONTAINERS.** The dev stack (`uzi-web-1`, `uzi-api-1`, `uzi-agent-1`, `uzi-db-1`) runs on the same Docker daemon that tests and agents start throwaway Postgres containers on, and `uzi-db-1` shares `postgres:17` with them. Observed 2026-07-21, live:
-
-```
-uzi-seam5b-pg    postgres:17   Up 52 seconds   <- throwaway
-uzi-final-95941  postgres:17   Up 5 minutes    <- throwaway
-uzi-db-1         postgres:17   Up 2 weeks      <- the REAL database
-```
-
-Same prefix **and** same image, so **neither `--filter name=uzi-` nor `--filter ancestor=postgres:17` can tell them apart**. Two disposables were sitting inside the one namespace that must never be globbed, next to weeks of real admin and forge data.
-
-1. **Name throwaways OUTSIDE the `uzi-` namespace** (`cdr-*`, `aud-*`, `vm-rev-*`). This is the load-bearing rule: it removes the failure mode instead of relying on discipline.
-2. **Tear down only your own container, by exact name.** Never a `uzi-*` glob, never `docker compose down` from a worktree. This is the weaker rule — "be careful with globs" fails the moment someone reaches for one under time pressure, which is why (1) exists.
-3. **If you see a container you did not create, leave it.** Also applies to processes: a stray `run-e2e.sh` or `run-store-it.sh` may belong to another session. Verify ownership before killing anything — a worker refusing to kill an unowned process is behaving correctly, not obstructing.
-
-   **🔴 BUT VERIFY IT WITH THE REDIRECTED LOG PATH ALONE. THIS RULE USED TO NAME THREE SIGNALS — "shell-snapshot path, redirected log path, cwd" — AND ON AN AGENT TEAM TWO OF THE THREE RETURN A CLEAN, CONFIDENT, WRONG ANSWER.** Measured 2026-08-02 during PRD #103 M3, while several agents were working in one worktree:
-
-   - **Shell-snapshot path: SHARED, and it is per-CLI-SESSION rather than per-agent** — which is the non-obvious half and the reason it looks like an identity. Every process in one capture, across three different agents, sourced the identical `snapshot-zsh-1785689779598-39rq5l.sh`; the coder confirmed first-hand that its own shell sourced that same file. **Had anyone trusted this signal, it would have attributed an unowned process to whichever agent they checked first.** It is not weak evidence, it is *anti*-evidence: it manufactures a match between any two agents in the session.
-   - **cwd: SHARED.** Agents routinely run in each other's worktrees — a reviewer, an auditor, a fact-checker and a tester all working in the coder's tree is the normal shape of a validation wave, not an anomaly — and the scratchpad is team-wide, not per-agent. In the measured case cwd pointed at the worktree's owner for a process that belonged to someone else.
-   - **Redirected log path: still carries information**, but only when the writer chose a distinctive name. A generic `out.log` tells you nothing.
-
-   **SO: IF YOU CANNOT ATTRIBUTE A PROCESS, LEAVE IT.** That is the whole fallback and it needs no signal at all. The cost of leaving a stray process is a little CPU; the cost of killing another agent's mid-flight measurement is its result, silently, with the owner told nothing.
-
-   *(The story below is a correct past-tense record of a case where this rule worked and is deliberately unchanged. What changed is that two of the three signals it named have since been measured on a running agent team and do not discriminate — the rule would not do that work today. Found by M3's own tester while trying to settle a process-attribution question, and corrected here rather than filed, because a wrong safety rule about killing other agents' work is not a thing to ship a quality-gates milestone alongside.)*
-
-Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — inside the namespace rule (1) says to avoid. It is PID-unique and tears itself down by exact name, so it is safe to run; but it means rule (2) is what holds the line there, for everyone.
-
+**The destructive-operation rules that used to sit here are in the root `CLAUDE.md`**, under *Destructive operations*. They were moved because a path-scoped rule fires on a file READ: an agent that runs `docker ps`, sees a stray `uzi-*` container and tears it down reads nothing under `e2e/`, `scripts/` or `docker-compose.yml`, so the trigger could never fire for the one actor who needed the warning. Everything else in this file stays trigger-loaded.
 **`./e2e/run-e2e.sh` re-execs itself under `env -i` with a short allowlist, so it is safe to run from any shell** (PRD #58, 2026-07-17). Nothing you export can reach the stack unless it is named in that allowlist — which deliberately excludes every var `docker-compose.yml` reads as `${VAR:-default}`, because the harness's assertions exist to exercise those SHIPPED defaults.
 
 > **This line used to say "`./e2e/run-e2e.sh` is immune (its overlay hardcodes seed vars)", and the parenthetical was true while "immune" was not.** The overlay pins the *seed* vars, so the 2026-07-05 incident above could not recur through e2e — but it pins nothing else, and **19 of the 62 vars `docker-compose.yml` reads were exported in an ordinary dev shell** (measured 2026-07-17), `TRUSTED_PROXIES` among them. A session trusted the word "immune" and got two invalid e2e runs: a security gate was developed against a shell exporting the very value the fix removed, so the pre-fix and post-fix runs tested the same vulnerable config and **both results were meaningless**. The hardening above is what makes the claim true; the wording is what made it dangerous. If you add a var to the allowlist, you are re-opening exactly this door — say why in the same commit.
