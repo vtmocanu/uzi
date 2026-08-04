@@ -84,12 +84,14 @@ The Taskfile installs no *project* dependencies — no `npm ci`, no
 does that in its `before_script`.
 
 **One exception since PRD #103 M3, and it is why that sentence is now qualified:**
-`task lint:api` and `task lint:controller` invoke
-`go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`, which on a
-cold cache fetches and builds that tool's dependency tree. Measured at **51.6s
-cold, then under 2s warm**. It is pinned and sumdb-verified and writes nothing to
-either `go.mod`, so it changes no dependency of yours — but the first run is slow
-and that is expected, not a hang.
+`task lint:api` and `task lint:controller` acquire golangci-lint through
+`scripts/golangci-lint.sh v2.12.2` (PRD #230 M5) — a curl + sha256-verified
+release binary, cached under `$HOME/.cache`. It replaced a
+`go run …golangci-lint@v2.12.2` that **compiled** the tool from source on a cold
+cache (**51.6s**, the pipeline's cold long pole); the release binary is a ~1-2s
+download instead. It is version-pinned and writes nothing to either `go.mod`, so
+it changes no dependency of yours — the first run fetches once, which is expected,
+not a hang.
 
 **🔴 BEFORE YOUR FIRST `task gate:web` OR `task gate:agent` AFTER PULLING M3 OR
 M4, YOU MUST INSTALL IN BOTH npm PACKAGES.** M3 added oxlint and M4 added knip,
