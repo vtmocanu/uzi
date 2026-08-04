@@ -2009,3 +2009,63 @@ test:** *"this test is load-bearing in a way its name does not advertise. It is 
 between two Go constants and a whole-fleet silent rejection, and it is gated on a constant that can
 go stale from the other side."* The boot-time check would let it **drop the duplicated constant
 entirely and become an ordinary test of a validation function.**
+
+### A21 — 2026-08-04, USER DECISION: **BUILD THE BOOT-TIME CEILING CHECK.** Final code scope.
+
+**A21.1 — approved: inject the tier PVC ceilings into the controller and validate at boot.** The user
+took the option both validators independently recommended (A19.4, A20.2). This is the last code
+decision on #224.
+
+**Shape**, per the two converging reports:
+
+- `controller-deployment.yaml` injects `UZI_WORKER_MAX_PVC_STORAGE` from
+  `workers.docker.limitRange.maxPVCStorage` **and** the restricted tier's key, alongside the seven
+  `UZI_WORKER_*` vars it already carries.
+- Config validation **refuses to boot** when `nixSize`, any preset's `DataSize`, or the **effective**
+  `dindDataSize` exceeds its tier's ceiling.
+- **The chart guard STAYS.** They are complementary, not alternatives: a `helm install` error is
+  earlier and cheaper than a CrashLoopBackOff, and it covers the one claimant the chart owns.
+
+**Why this shape and not a fourth guard**, restated because it is the whole argument: **the
+controller is the only place in the system where all four numbers exist at once.** It constructs the
+PVC, so its admission ceiling is a **missing input rather than a layering violation** — it already
+takes `StorageClass` from the chart, which is the same kind of fact. It **adds no duplication** (the
+chart injects a value it owns; the controller compares constants it owns), which is precisely the
+objection that correctly killed putting preset quantities into `values.yaml` (A7.5's ungated-skew
+class). It **matches the precedent this branch already set**: `parseQuantityEnv`'s own doc says a
+typo *"is a BOOT error rather than a silent skip … otherwise a worker that provisions and never
+appears."* And fail-closed matches `secretbox`'s refuse-to-boot-on-placeholder.
+
+**A21.2 — it SUBSUMES A18.2 and lets A20.3's test shed its stale-able constant.** The boot check sees
+the *effective* `dindDataSize`, so the `{{- if $size }}` unset-path hole is closed by construction
+rather than by remembering to `default "20Gi"` — **do both anyway**, since the chart guard is staying
+and its own default path should not be the weak one. And per A20.4,
+`TestPresetPVCSizesFitTheChartsLimitRangeMax` can then **drop `chartMaxPVCStorage` entirely and
+become an ordinary test of a validation function**, which is the outcome that removes the duplication
+rather than documenting it.
+
+**A21.3 — the invariant must be written as the MIN, not as an equality.** A20.2(3): the comment says
+the two chart keys "are both 20Gi"; the condition is
+`ceiling <= min(workers.limitRange.maxPVCStorage, workers.docker.limitRange.maxPVCStorage)` **per
+tier**. They coincide today. **Stating it as the min is what makes a future divergence legible** —
+and with per-tier injection the check is per-tier anyway, so the min is only the fallback shape if
+one var is used for both.
+
+**A21.4 — final code scope for the last commit.** Everything below lands together; nothing here is
+optional:
+
+| item | source |
+|---|---|
+| the boot-time ceiling check + per-tier env vars | A21.1 |
+| `default "20Gi"` on the chart guard's unset path | A18.2 |
+| the safety label corrected — it fails **unsafe** in that direction | A18.1 (**Blocking**) |
+| `%v` not `%s` in the guard's `fail` message | A19.5 |
+| delete the `"m"` suffix from `uzi.quantityBytes` | A20.1 |
+| vacuity guard (`len(sizes) == 0`) on the preset test | A20.3 |
+| the invariant restated as a per-tier min | A21.3 |
+| one clause: the guard is a **ceiling** and structurally cannot be a **floor** | A20.1 |
+
+**A21.5 — what this closes.** Three claimants (`dindDataSize`, `nixSize`, `l.DataSize`) x two edit
+directions (developer raises a preset / operator lowers a ceiling) x two paths (knob set / knob
+unset) — **all guarded by one mechanism in the component that owns the construction**, with the
+chart guard kept as the earlier, cheaper net for the claimant it can see.
