@@ -405,6 +405,56 @@ tasks:
       - task: lint:yaml
       - task: lint:formula
 
+  vulncheck:
+    # 🔴 THIS SLOT IS THE ONE TARGET FAMILY IN THIS FILE THAT `task gate` MUST NOT
+    # REACH, AND THAT IS A RULING RATHER THAN AN OVERSIGHT (PRD #103 M5 MR-C).
+    # Every other composed target here (`lint`, `fmt-check`, `deadcode`) is an
+    # entry point that happens not to sit in `gate`'s closure because `gate` names
+    # slots individually inside each `gate:*`. This one is different in kind: it
+    # must be absent from `gate` AND from all five `gate:*` targets, and if a
+    # future milestone adds a sixth component gate it must be left out of that too.
+    #
+    # THE REASON IS THE VERDICT, NOT THE NETWORK, and the distinction matters
+    # because the network version of this argument is FALSE here. `task gate` is
+    # not offline: `lint:api`, `deadcode:api` and `scan:secrets` are all
+    # `go run pkg@version` and all three need the network on a cold module cache
+    # (measured: `task scan:secrets` under GOPROXY=off returns 201 with "module
+    # lookup disabled"). What separates those from these two is that a pinned
+    # `go run` fetches a checksum-verified artifact ONCE and then answers from the
+    # TREE, whereas govulncheck and npm audit query a REMOTE MUTABLE DATABASE on
+    # every run. So `task gate` would answer differently on two runs of one commit
+    # with nobody's diff in between, and a contributor's gate must be
+    # deterministic against the tree. State it this way: the false version invites
+    # somebody to "fix" gitleaks out of `gate:repo` on the same reasoning.
+    #
+    # CI RUNS THESE TARGETS, WHICH IS WHAT KEEPS SUCCESS CRITERION 3 TRUE (gate
+    # recipes are defined once, in this file). They are invoked as EXTRA SCRIPT
+    # LINES of the four existing per-toolchain jobs -- `lint:api`,
+    # `lint:controller`, `validate:web`, `validate:agent` -- exactly the way
+    # `deadcode:api` is already a second script line inside the `lint:api` job. No
+    # new CI job, so no `.gate_needs` / `.publish_needs` edit.
+    #
+    # 🔴 AND `lint:api` NAMES BOTH A CI JOB AND A TASKFILE TARGET. That ambiguity
+    # is the trap here: the Taskfile target `lint:api` IS reachable from `task
+    # gate` (gate -> gate:api -> lint:api), so "fold govulncheck into lint:api"
+    # read as the target would put a remote-database query inside every
+    # contributor's gate. It is the JOB. When you read a placement claim about
+    # this milestone, check which of the two it means.
+    #
+    # SUCCESS CRITERION 1 IS AMENDED IN THE SAME MR RATHER THAN QUIETLY VIOLATED.
+    # It reads "CI runs no toolchain check that `task gate` does not" and carries
+    # an explicit exclusion list; these two are toolchain checks in per-toolchain
+    # jobs, so they belong on that list. Their exclusion GROUND is different from
+    # every existing entry's: the others "cannot run meaningfully from a plain
+    # local checkout", while both of these run fine locally -- that is not why they
+    # are excluded. The ground is the one stated above.
+    desc: dependency-vulnerability scan, all four components. NOT in `gate` -- see comment
+    cmds:
+      - task: vulncheck:api
+      - task: vulncheck:controller
+      - task: vulncheck:web
+      - task: vulncheck:agent
+
   deadcode:
     # ONE SLOT, ONE PREFIX, FOUR COMPONENTS (PRD #103 M4). The npm half is knip
     # rather than `deadcode`, and `deadcode:web` is therefore slightly imprecise -
@@ -1073,6 +1123,29 @@ tasks:
       # both of these were. See PRD #103 Decision 10.
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
 
+  vulncheck:api:
+    desc: api - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
+    cmds:
+      # 🔴 DELIBERATELY NOT IN `gate:api`, and this line exists so its absence
+      # reads as a decision rather than an omission -- the same reason
+      # `scan:secrets` carries one about the composed `lint` target. Its verdict
+      # is a function of a REMOTE MUTABLE DATABASE rather than of the tree, so it
+      # would make `task gate` answer differently on two runs of one commit. The
+      # `vulncheck` composite above carries the full argument, including why the
+      # obvious "but the gate isn't offline anyway" objection is correct and
+      # beside the point. `.gitlab-ci.yml`'s `lint:api` JOB invokes this target as
+      # an extra script line.
+      #
+      # A SCRIPT, NOT AN INLINE RECIPE, for `deadcode:api`'s reason: a committed
+      # script gets LINTED by `lint:shell`, an inline `cmds:` string gets nothing.
+      # Read scripts/govulncheck-gate.sh's header before editing this line -- the
+      # exit-code inversion, the `go run` flattening and the every-non-text-format
+      # fail-open are all measured there, and none of them is visible from here.
+      #
+      # THE PIN IS AN ARGUMENT so this file's echo shows it, exactly as
+      # `deadcode:api` and `scan:secrets` pass theirs.
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
     dir: api
@@ -1220,6 +1293,13 @@ tasks:
       # fourth is called by two of the other three within its own package, so
       # `unused` considers it used. Nothing else in the gate sees them.
       - go run golang.org/x/tools/cmd/deadcode@v0.48.0 ./...
+
+  vulncheck:controller:
+    desc: controller - govulncheck over CALLED vulnerabilities. NOT in `gate` -- see `vulncheck`
+    cmds:
+      # Same script, same pin, same reasons, and the same deliberate absence from
+      # `gate:controller` - read vulncheck:api's comment before editing either.
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
   test:controller:
     desc: controller unit tests (-race -count=1)
@@ -1369,6 +1449,32 @@ tasks:
     cmds:
       - npm run typecheck
 
+  vulncheck:web:
+    desc: web - npm audit at --audit-level=high over the FULL tree. NOT in `gate`
+    cmds:
+      # 🔴 DELIBERATELY NOT IN `gate:web` - see `vulncheck`'s comment above, and
+      # note this half has an extra hazard the Go half does not: a one-file
+      # `.npmrc` carrying `omit=dev` DISARMS this check AT EXIT 0, printing
+      # "found 0 vulnerabilities", because all three of web's high-and-above
+      # findings are dev-tree. `--audit-level` on the command line beats `.npmrc`
+      # for its own key but `omit` is a different key, so nothing on the command
+      # line contradicts it. `--include=dev` in package.json's `audit` script is
+      # the measured remedy. npm audit has NO in-band canary, so a disarmed run
+      # and a clean run are indistinguishable from their own output.
+      #
+      # THE LEVEL IS AN ARGUMENT so this file's echo shows it - for this check the
+      # threshold IS the gate - and the script ASSERTS it against what
+      # package.json's `audit` script actually carries, exiting 2 on a mismatch.
+      # Without that assertion the argument would be decorative: the echo would
+      # advertise a threshold nothing enforces.
+      #
+      # WHY `high` AND NOT ZERO: two moderate react-router advisories survive
+      # every available option (no patched 6.x exists, `--force` will not touch
+      # them, `overrides` has nothing to point at), so clearing them is a React
+      # Router 6 -> 7 major through shipped SPA routing code. Filed as its own
+      # issue. Read scripts/npm-audit-gate.sh's header for the rest.
+      - ./scripts/npm-audit-gate.sh web high
+
   test:web:
     desc: web unit tests (vitest)
     dir: web
@@ -1423,6 +1529,16 @@ tasks:
     dir: agent
     cmds:
       - npm run typecheck
+
+  vulncheck:agent:
+    desc: agent - npm audit at --audit-level=high over the FULL tree. NOT in `gate`
+    cmds:
+      # Same script, same level, same reasons, and the same deliberate absence
+      # from `gate:agent` - read vulncheck:web's comment before editing either.
+      # One asymmetry worth knowing: this package's findings are PRODUCTION
+      # dependencies that ship in the worker image, where web's are all dev-tree.
+      # That does not change the recipe; it changes how urgently a red here reads.
+      - ./scripts/npm-audit-gate.sh agent high
 
   test:agent:
     desc: agent unit tests (node --test via tsx)

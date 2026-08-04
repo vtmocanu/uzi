@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "preview": "vite preview",
-    "deps-check": "npm ls --depth=0"
+    "deps-check": "npm ls --depth=0",
+    "audit": "npm audit --audit-level=high --include=dev"
   },
   "dependencies": {
     "diff": "9.0.0",

@@ -11,7 +11,8 @@
     "knip": "knip",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test --test-timeout=120000 test/*.test.ts",
-    "deps-check": "npm ls --depth=0"
+    "deps-check": "npm ls --depth=0",
+    "audit": "npm audit --audit-level=high --include=dev"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.219",

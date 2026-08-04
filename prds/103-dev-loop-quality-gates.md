@@ -346,10 +346,21 @@ the omission**, so a milestone that appends its job and forgets the lists produc
 green MR pipeline and a silent tag-time hole.
 
 **M5 inherits this obligation in full, and it is part of its definition of done.**
-Its checks (`shellcheck`, `yamllint`, `gitleaks`, `govulncheck`) are repo-wide, so
+Its checks (`shellcheck`, `yamllint`, `gitleaks`) are repo-wide, so
 unlike the npm half they genuinely cannot fold into a per-toolchain `validate:*`
 job — M5 **will** open lint-stage jobs, and every one of them goes into **both**
 lists in the commit that creates it.
+
+> **`govulncheck` WAS IN THAT LIST AND IS NOT REPO-WIDE. Corrected by M5 MR-C,
+> 2026-08-04.** It is **per-Go-module** (`govulncheck ./...` from a module root),
+> so it folds into the existing `lint:api` and `lint:controller` jobs as an extra
+> script line exactly the way `deadcode:api` already does — and `npm audit` folds
+> into `validate:web` / `validate:agent` the same way. **MR-C opened no CI job at
+> all**, and the `.gate_needs` / `.publish_needs` parse is byte-identical before
+> and after (13 and 15 entries). This sentence is the one a future reader would
+> have followed into opening two needless jobs, each of which is two more list
+> entries to keep in step. The OBLIGATION above is unchanged and still binds
+> anything that does open a job.
 
 **AND M5 NOW INHERITS A COMPLETENESS PROPERTY, NOT MERELY A MEMBERSHIP RULE.** M3
 shipped the "both lists, always" rule while an existing job was violating it:
@@ -1877,6 +1888,16 @@ which previously prescribed only the fail-open form.
       `npm audit --audit-level=high` for both npm packages, initially
       `allow_failure` only until the current finding count is known.
 
+      > **STALE, corrected by M5 MR-C on 2026-08-04: the `allow_failure` half is
+      > overridden and the counts are known.** User ruling 4 for M5 is *no
+      > `allow_failure` anywhere*, and the pipeline still has none. The counts, as
+      > shipped: both Go modules at **0 called** vulnerabilities, `agent` at
+      > **total=0**, `web` at **0 high-and-above** with two react-router MODERATE
+      > advisories surviving under `--audit-level=high` and filed as their own
+      > issue. So these land GATING at zero on day one, not advisory. The
+      > `--audit-level=high` half of the sentence is correct and is the shipped
+      > threshold.
+
       **Markdown link checking: extend `web/scripts/check-docs.mjs`, do not add
       a second checker.** It already validates relative-link existence and
       link-text-path correctness for `docs/`, `ARCHITECTURE.md`, `README.md`,
@@ -2005,6 +2026,29 @@ Three exceptions where "append at the end" is not enough:
    `helm_chart`, the sqlc-drift `git diff --exit-code` in `validate:api`,
    `test:api-store-it`'s Postgres service and its ran/skipped assertion, and
    `e2e:kind-smoke`.
+
+   **Also excluded, on a DIFFERENT ground, added by M5 MR-C: `govulncheck` (the
+   `vulncheck:api` / `vulncheck:controller` targets, run as extra script lines of
+   the `lint:api` and `lint:controller` jobs) and `npm audit` (`vulncheck:web` /
+   `vulncheck:agent`, inside `validate:web` and `validate:agent`).** Both are
+   toolchain checks in per-toolchain jobs, so without this entry MR-C would
+   quietly violate a criterion this PRD wrote. State the ground precisely, because
+   it is not the list above's: **their verdict is a function of a remote mutable
+   database, not of the tree.** Both run perfectly well from a plain local
+   checkout — `task vulncheck` runs all four — which is exactly why the existing
+   "cannot run meaningfully locally" wording does not cover them. What disqualifies
+   them from `task gate` is that a contributor's gate must be deterministic against
+   the tree, and these two can answer differently on two runs of one commit with
+   nobody's diff in between.
+
+   *(And note the tempting shorter reason is measurably FALSE: `task gate` is not
+   offline. `lint:api`, `deadcode:api` and `scan:secrets` are all `go run
+   pkg@version` and all three need the network on a cold module cache — control:
+   `task scan:secrets` under `GOPROXY=off` returns 201 with "module lookup disabled
+   by GOPROXY=off". The difference is that a pinned `go run` fetches a
+   checksum-verified artifact once and then answers from the tree. Writing the
+   false version here would invite someone to "fix" gitleaks out of `gate:repo` on
+   the same reasoning.)*
 2. A newly introduced `gofmt` violation, `staticcheck` finding, dead Go
    function, or `shellcheck` error fails an MR pipeline — **each demonstrated
    by the milestone's calibration step, not asserted.** The shellcheck half is
@@ -2057,7 +2101,25 @@ Three exceptions where "append at the end" is not enough:
    milestone told to remove the markers "in both" will find only one file has
    any, and should not read that as having edited the wrong file.
 5. `.claude/agents/auditor.md` no longer documents the absence of a secret
-   scanner, because one runs.
+   scanner **or of dependency-vulnerability scanning**, because `gitleaks`,
+   `govulncheck` and `npm audit` all run.
+
+   *(**Amended by M5 MR-C, 2026-08-04, and the amendment is a correction of THIS
+   TEXT rather than of the five documents that restate it.** The criterion used to
+   end at "because one runs", and its literal predicate was ALREADY MET before
+   MR-C: `.claude/agents/auditor.md:116` has read "secrets are covered as of PRD
+   #103 M5 MR-B" since MR-B landed. Yet "Success Criterion 5 is atomic across
+   gitleaks AND govulncheck AND npm audit" appears in five places — `auditor.md`,
+   this file twice, and M5's brief twice — and is the stated reason M5 stayed
+   unticked. Whitespace-flattened, the whole Success Criteria section contained
+   **zero** occurrences of `gitleaks`, `govulncheck` or `npm audit`, against a
+   control on the same instrument in the same section of `gofmt` 2, `shellcheck` 2,
+   `knip` 2, `coverage` 2 — so the instrument was live and simply had nothing to
+   find. The DECISION the five restatements produced is right, because the real
+   residual was the dependency half, which MR-C closes. Only its stated ground was
+   wrong. Amending the criterion makes the five restatements true; amending five
+   restatements to match a criterion that was already satisfied would have made the
+   record worse.)*
 6. Coverage percentages for `api`, `controller` and `web` are visible on
    every MR.
 7. `main` is `gofmt`-clean across both Go modules.
