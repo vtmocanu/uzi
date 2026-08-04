@@ -31,7 +31,7 @@ lead-enforced writer token, exactly one writer unfrozen at a time.
 
 | role | disposition |
 |---|---|
-| architect | **dispatched 2026-08-04 at `848cf53d`** — design wave, not yet reported |
+| architect | **REPORTED 2026-08-04 at `848cf53d`, re-pinned to `507d1712`** — 8 ranked findings, 2 escalated to the user, full citation table clean. Found the vitest-4 `projects` inheritance hazard and the environment-precedence result. Folded in as **Amendment 3**. Evidence: `probes/prd-103-mrc-m6-architect/README.md`. |
 | reviewer | **REPORTED 2026-08-04 at `848cf53d`** — 1 blocking (my react-router error), 10 non-blocking, 1 nit; all 7 citation targets resolved, all 4 day-one figures re-derived. Folded in as **Amendment 2**. Evidence: `probes/prd-103-mrc-m6-reviewer/README.md` + 43 files. |
 | auditor | **REPORTED 2026-08-04 at `848cf53d`** — 4 HIGH (incl. the Success Criterion 1 conflict and the `.npmrc` disarm), 4 MEDIUM, 6 below-bar; ran `task scan:secrets` (rc=0, both canaries detected). Folded in as **Amendment 2**. Evidence: `probes/prd-103-mrc-m6-auditor/` + 24 files. |
 | fact-checker | **REPORTED 2026-08-04 at `848cf53d`** — 1 refuted (R1), 1 ambiguous (A1), 6 notes, 7 targets confirmed, every `measured` figure re-derived independently. Folded in as **Amendment 1**. Evidence: `probes/fc-mrc-m6/INDEX.txt` + 12 raw files. |
@@ -183,9 +183,61 @@ the word `localStorage` inside a test *description string*; react / testing-libr
 imports → 1 hit, a file importing a bare constant with no render; a wider DOM-token
 set → 2 hits, the word "screen" in prose comments. Zero real DOM usage.
 
-**So Unit B's classification step is DISCHARGED, not deferred, and the `projects`
-split is mechanical**: `src/lib/**` and `src/mocks/**` node, everything else jsdom.
-Re-derive the partition at your own tip before relying on it — files get added.
+**So Unit B's CLASSIFICATION step is discharged** — every one of the 42 is node-side.
+**The PARTITION is a separate question and is still open.**
+
+**🔴 AMENDMENT 3: "the `projects` split is mechanical — `src/lib/**` and
+`src/mocks/**` node, everything else jsdom" WAS MINE, IS NEW IN AMENDMENT 1, AND IS
+FALSE IN THE DANGEROUS DIRECTION.** The real partition:
+
+```
+                 test files   CARRY pragma   pragma-less
+web/src/lib          42            6             36
+web/src/mocks        14            8              6
+elsewhere            62           62              0
+                    ---          ---            ---
+                    118           76             42     ✓ reconciles
+```
+
+**Those directories are MIXED.** A directory-keyed split assigning `src/lib` and
+`src/mocks` to node targets **14 files that run under jsdom today** — six in `lib`
+(`prefs`, `rateLimits`, `theme`, `useFollowScroll`, `usePollWhileVisible`,
+`useRunStream`; three of them `.tsx` hook tests) and eight in `mocks`. That is the
+silent-wrong-environment bug the PRD warns about, introduced **by the fix**.
+
+**The inference gap is precise and worth carrying past this instance:** the
+established result is *every pragma-less file is node-side* — a property of **files**.
+I converted it into *every file in those directories is node-side* — a property of
+**directories**. Nothing licensed that step, and the directories are mixed. (Amendment
+2 caught a weaker shadow of this, saying four files would "pay jsdom cost for nothing";
+the real exposure is **fourteen losing it**.)
+
+### 🔴 AND TWO VALIDATORS DIRECTLY CONFLICT ON WHETHER THAT MATTERS. DO NOT PICK ONE.
+
+- The **architect measured environment precedence** on vitest 2.1.9, six
+  discriminating cells: **docblock pragma > `environmentMatchGlobs` >
+  `test.environment` > default(node)**. If that holds, **no config-level mechanism
+  can move a pragma-carrying file** — the 76 are frozen, only the 42 are movable, and
+  a directory-keyed split *cannot* break those 14.
+- The **fact-checker's R3** assumes a directory-keyed `projects` config *does* move
+  them, which is what makes the mixed directories dangerous.
+
+**Both are right about what they measured, and the disagreement is not resolvable
+today**: `environmentMatchGlobs` is gone in vitest 4 and `test.projects` is a
+different layer, so the 2.1.9 precedence result may simply not transfer. The
+architect flagged exactly this and said its own finding is void if the pragma stops
+winning. **Nobody can settle it until Unit A installs vitest 4.**
+
+**RULING: do not settle it by argument. Make it Unit B's first measurement, and adopt
+an acceptance criterion that is correct under BOTH answers:**
+
+> **The per-file environment census is IDENTICAL before and after.**
+
+Enumerate, for all 118 files, which environment each one actually runs under, on
+vitest 4, before the config change and after it. That is an assertion on **content**,
+not on a count or on a classification being right — so a wrong partition is
+*detectable* rather than merely *unlikely*, and being right about precedence is not
+required. Re-derive the partition at your own tip either way; files get added.
 
 ### Two instrument failures I hit taking these numbers, recorded because they are the shape this milestone is about
 
@@ -207,11 +259,26 @@ between calls and an empty result is indistinguishable from a true negative. Fou
 instances in one day, by two careful parties, is a property of the tool rather than
 of anyone's attention: **pass absolute paths, or `cd` in the same command.**
 
-**And one more instrument note from the same pass, which cost a wrong empty
-answer**: `git grep -F -- '--audit-level' <paths>` finds NOTHING, because the
-leading `--` is parsed as end-of-options; `git grep -F -e '--audit-level' <paths>`
-finds six. **A pattern beginning with `-` needs `-e`.** It was caught only because
-a positive control was run on the same form.
+**A sixth instance, this one mine, while verifying the partition above**: two
+`git ls-files 'src/lib/**/*.test.ts'` calls returned **0** — `**` does not match
+zero directory levels in that pathspec, so a real 42-file directory read as empty.
+Same signature as all the others: a clean, confident, wrong empty result.
+
+*(Amendment 3 DELETES a seventh "instance" that was recorded here and was not one.
+This paragraph claimed `git grep -F -- '--audit-level' <paths>` "finds NOTHING,
+because the leading `--` is parsed as end-of-options" and that "a pattern beginning
+with `-` needs `-e`". **Measured, all four forms: `-F -- '<pat>' -- <paths>` WORKS,
+`-F -e '<pat>' -- <paths>` WORKS, `-F -- '<pat>' <paths>` WORKS, and the bare
+`-F '<pat>'` form fails LOUDLY with `error: unknown option`.** The real cause of the
+empty result was **the persistent cwd — failure 1 again, a fifth instance** — the
+command was run with cwd left inside `probes/fc-mrc-m6/`, so the pathspecs resolved
+under that directory; identical command, 0 lines from there and 10 from the repo
+root. Two inversions in the retired rule: the form it blamed is the one that works,
+and the failure it described is silent where the real bare-dash failure is loud. It
+came to me from the fact-checker, which has since retracted it — **I transmitted it
+faithfully, and faithful transmission of a wrong mechanism still puts a wrong rule in
+the spec.** The one genuine lesson is that the cwd trap has now produced **six**
+independent clean-empty results in one day across three parties.)*
 
 ---
 
@@ -604,17 +671,26 @@ These are not style preferences; each one is a measured failure somewhere in
    author picks the target branch). npm targets **delegate** to a `package.json`
    script — a target that reimplements the command drops that script's flags
    silently.
-2. **ANY new CI job must be added to BOTH `.gate_needs` and `.publish_needs`**, and
-   gets **its own `cache:` prefix** if it builds something the jobs sharing that key
-   do not. Verify list membership by parsing, never by grepping.
+2. **A new GATE job — any blocking check, in any stage — must be added to BOTH
+   `.gate_needs` and `.publish_needs`**, and gets **its own `cache:` prefix** if it
+   builds something the jobs sharing that key do not. Verify list membership by
+   parsing, never by grepping.
 
-   *(Amendment 1, 2026-08-04: this read "a new **lint-stage** CI job", which
-   NARROWED both its sources — carry-forward 2 says "any new CI job",
-   `.gitlab-ci.yml:292` says "a new gate job". That is carry-forward 16(d)'s
-   widening trap running in the other direction, and it bites **Unit B
-   specifically**: M6 is the milestone most likely to want a coverage job, which is
-   not lint-stage. The precise version survives at both original sites; the narrow
-   one was at the top of this brief, where a reader hits it first.)*
+   *(Amendment 3, 2026-08-04, and this line has now been wrong in BOTH directions.
+   It first read "a new **lint-stage** CI job" — too narrow, and it would have missed
+   M6's coverage job. Amendment 1 corrected it to "**ANY** new CI job" — too wide,
+   and measurably so: **12 existing jobs are correctly in neither list**
+   (`build:{api,web,controller,agent}`, `publish:{api,web,controller,chart,agent}`,
+   `publish_brew`, `e2e:kind-smoke`, `demo-fail`), and adding a new publish job to
+   `.publish_needs` would be a self-dependency.*
+
+   *The middle term was already written in the repo and neither of my versions used
+   it: `.gitlab-ci.yml:292` says "A new **gate** job MUST be added to this list AND
+   to `*publish_needs`". Carry-forward 2's wording is **descriptive** — "any new CI
+   job that is not in both is invisible to them" is a statement about visibility, not
+   an imperative — which is how I misread it as licence to widen. **Two corrections
+   to one line, in opposite directions, both by paraphrasing a source that was
+   already precise.**)*
 3. **Prefer a pinned `go run pkg@version` / `go install pkg@version` inside the
    already-pinned `golang:1.26`** over a new image family. Do not add dev tooling
    to root `devbox.json` — that file is tier-2 *worker* config.
@@ -815,6 +891,128 @@ critical"* overstates by a notch — the tally line does read `1 critical`. What
 hides is **which package**. So `--json` is needed for the **fix list**, not for
 gating; the exit code alone gates.
 
-**Design wave verdict: the spec is now settled enough to freeze.** Three independent
-citation passes, no unresolved mechanism, and every open design question answered
-with a measurement rather than a preference.
+**Design wave verdict from Amendment 2 — superseded by Amendment 3.** It read: *"the
+spec is now settled enough to freeze. Three independent citation passes, no
+unresolved mechanism, and every open design question answered."* The architect had
+not yet reported and the fact-checker's second pass had not run; between them they
+found three more errors of mine and one live conflict. **Declaring a wave settled
+before its last validator reports is the same class of mistake as everything else in
+this file.**
+
+---
+
+## Amendment 3 — 2026-08-04, from the architect and the fact-checker's second pass
+
+**THE SCORE ON MY OWN RESTATEMENTS, STATED PLAINLY BECAUSE IT IS THE FINDING.** Across
+Amendments 1 and 2 I introduced **three** errors and faithfully transmitted **one**:
+the react-router scope claim (A2), the green-suite proof (A2), the directory split
+(A3, R3), and the retired `git grep` leading-dash rule (A3, R4 — the fact-checker's
+error, transmitted correctly by me, which does not make it less wrong in the spec).
+Hard constraint 2 has now been wrong **in both directions** across two amendments.
+Every one arose in the step where another agent's measurement passes through me on
+its way to being read fast, and every one was caught by a validator re-deriving rather
+than agreeing. **The lead is the highest-traffic single point of distortion on this
+team, and the brief-amendment protocol concentrates rather than reduces that.**
+
+### DECISION — react-router, and the shape of "at zero" on `web`
+
+Two-party measurement (architect + fact-checker, independently): `react-router` and
+`react-router-dom` are installed at **6.30.4, the newest 6.x that exists**; both
+advisories are patched only at **7.18.0**; the declared range is `^6.28.0`;
+`npm audit fix` changes postcss only, and **`--force` emits no react-router entry at
+all**. `overrides` is not an option — there is nothing patched to override to. So
+"full tree, at zero" is **unreachable on `web`** under any option, and the two are
+**live CVEs in shipped SPA routing code** (open redirect → XSS; arbitrary constructor
+injection via `deserializeErrors()`), not dev tooling.
+
+**Ruled (lead): take `--audit-level=high`, and file react-router 6 → 7 as its own
+issue in the same commit.** This is the move this repo already made for knip's
+unused-export tier (issue #206) rather than widening a tooling milestone, and pulling
+a runtime router major through every route in an MR about quality gates is exactly
+the scope creep M3's own ruling refused. **Recorded as a decision, not a discovery:
+it accepts two ungating moderate CVEs in shipped code until that issue lands, and it
+is reversible by the user.**
+
+### Corrections to Amendment 2's own numbers
+
+- **Only TWO moderates survive, not five, and they are both web's.** Measured with
+  `npm audit fix --dry-run` (non-force), tree confirmed unmodified: **agent goes to
+  `total=0`** in one command — `ip-address 10.2.0→10.4.0`, `fast-uri 3.1.3→3.1.5`
+  (the two highs) **plus** `hono 4.12.27→4.13.0`, `@modelcontextprotocol/sdk
+  1.29.0→1.30.0`, `@hono/node-server 1.19.14→2.1.0` (all three moderates). Amendment 2
+  said agent's three "clear but owe test evidence" — right about the evidence, wrong
+  that they were separate from the high fixes. Flag for the MR unchanged:
+  `@hono/node-server` crosses **1.x → 2.x**, permitted without `--force` only because
+  it is transitive.
+- **`--audit-level=high` is RED today and that is expected**, not the remedy failing:
+  it goes green only after the vitest major plus the in-range postcss / `fast-uri` /
+  `ip-address` fixes land. Say so in the MR so nobody reads a day-one rc=1 as a
+  broken gate.
+- **Count fix**: `--audit-level=high` appears at **six sites across the two documents**
+  (5 in M5's record + 1 in the PRD), not "six in M5".
+
+### 🔴 The finding that could have silently undone PRD #98's flake fix
+
+**vitest 4's `projects` INHERITS NOTHING from the root config unless `extends` is
+set** — upstream's own wording: *"None of the configuration options are inherited
+from the root-level config file."* A projects config that omits `extends` loses
+`setupFiles: ["./src/test-setup.ts"]` (so `configure({ asyncUtilTimeout: 5000 })`
+goes, back to Testing Library's 1s default) **and** `testTimeout: 20000` (back to 5s).
+Both reinstate the exact PRD #98 flake class those two lines were added to kill, and
+both fail intermittently under CPU contention.
+
+**The 118/1660 predicted-count control CANNOT see this** — a flaky pass still counts
+1660. It is the one hazard in Unit B that the brief's own headline control is blind
+to. Second `projects` hazard in the other direction: overlapping `include` globs run a
+file **twice**, surfacing as a count **above** 1660. **Reconcile the predicted pair in
+both directions, and assert on `setupFiles`/`testTimeout` directly rather than
+inferring them from a green run.**
+
+### Adopted from the architect, with its reasoning
+
+- **`npm ls --depth=0`, delegated through a `package.json` script** — confirms
+  Amendment 2's A2-5 with a 2×2 {clean,stale}×{default,`--offline`} matrix (0,0/1,1),
+  rc=0 in the real tree offline, ~3.2s, and a failure string that satisfies
+  calibration property 2 unwrapped: `vitest@2.1.9 invalid: "^4.1.10" from the root
+  project`. Two riders: **pin `vitest` with `--save-exact`** — `^4.1.10` is satisfied
+  by 4.9.0, so a caret makes the check loose, and repo precedent already exact-pins
+  gate-relevant devDeps (`oxlint: "1.76.0"`, `knip: "6.31.0"`) with `vitest: "^2.1.9"`
+  the outlier — and **place the check FIRST in `gate:web`/`gate:agent`** despite
+  breaking cheapest-first, because a stale tree makes every later slot's verdict a
+  verdict about the wrong tree. Limits to write down: `--depth=0` sees direct deps
+  only, and it compares against `package.json` ranges rather than the lockfile.
+- **Land `-race` on `test:controller` as Unit A's FIRST commit.** It is 100% disjoint
+  from everything MR-C touches and it is the only item in either unit carrying a
+  stop-and-file branch. Local green (7 packages, rc=0) makes it cheap insurance;
+  discovering a race on day 3 rather than day 1 is a schedule event. *(This moves one
+  line of M6 into Unit A. Deliberate, and the only cross-unit move in the plan.)*
+- **"Folds into `lint:api`" is ambiguous and the wrong reading is dangerous** —
+  `lint:api` names both a **CI job** and a **Taskfile target**, and the target is
+  reachable from `task gate` via `gate → gate:api → lint:api`. The precedent for the
+  right shape is inside that very job: `deadcode:api` is its own target invoked as a
+  **second script line**. So the new targets are invoked as extra *script lines* of
+  the four CI jobs and belong to **no composed target**, with an explicit
+  "deliberately NOT here" comment mirroring `scan:secrets`'s.
+- **Decomposition confirmed: 2 sequential units is right.** The Go half of M6 is
+  genuinely disjoint at the target/job level, but **parallelism buys nothing under
+  one shared worktree with one writer token** — the binding constraint is the token,
+  not the dependency graph. Splitting would need a second worktree and is not worth
+  paying for.
+- **The release-blocking property is inherited, not chosen.** All four host jobs are
+  in `.publish_needs`, so a CVE published on a Tuesday reddens a `v*` tag publish with
+  nobody's diff in it. Rulings 1 and 4 imply accepting it; it needs no list edit, and
+  it goes in the MR description in those words so the first Tuesday-red release is
+  diagnosed in a minute rather than an afternoon.
+
+### Two instrument failures from the architect, both worth keeping
+
+- **`npx vitest run --environment node <a component test>` → rc=0, 61 passing.** Reads
+  as "a DOM test is fine under node"; the pragma silently outranks the flag. **The arm
+  cannot produce the disconfirming answer** — it is the same shape as everything else
+  in this file, arriving through a CLI flag.
+- **A packaged precedence probe returned 5 of 6 cells at rc=1 with no output, and the
+  single survivor printed the OPPOSITE of the true answer.** Cause: macOS `$TMPDIR`
+  lives under `/var/folders/…`, `/var` symlinks to `/private/var`, and Vite's resolved
+  id then does not match `--root`; `pwd -P` fixes it. **A near-uniform failure with one
+  plausible survivor is worse than a uniform one**, which at least announces itself as
+  an instrument failure.
