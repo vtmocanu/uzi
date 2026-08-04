@@ -572,6 +572,19 @@ ADR at `adr/0035-run-limit-retry.md`.
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 
+## Feature #218 — A park or shutdown must not lose the agent's committed work
+
+Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/218-park-resume-work-loss.md`.
+
+- When a run parks on a usage limit, or its worker is shut down or evicted, the
+  work the agent has already committed must survive: a resume finds those commits,
+  not an empty tree. [user 2026-08-04 — PRD #218, the originating bug]
+- A resume must not silently rebase onto a default branch that moved while the run
+  was interrupted; the run's own recovered work is preferred when it is available.
+  [user 2026-08-04]
+- When prior work genuinely cannot be recovered, the run says so in the feed rather
+  than silently re-treading it. [user 2026-08-04]
+
 ## Feature #88 — Ask-user clarification: the agent can ask the human a question
 
 Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/88-ask-user-clarification.md`.

@@ -71,6 +71,22 @@ export interface RunExecution {
 /** Build a per-execution executor for a run id (called once per `execute`). */
 export type ExecutorFactory = (runId: string) => RunExecution;
 
+/**
+ * PRD #218 M1 — the worker-shutdown registry entry for one in-flight run. A graceful
+ * SIGTERM/SIGINT (`Runner.shutdown`) must fetch each running run's committed work back
+ * into the worker bare before the container is killed, so the sweeper requeues a run
+ * whose TREE is safe rather than one whose work was destroyed on the next re-claim.
+ *  - `cancel`: the run's own per-run AbortController (the executor watches its signal),
+ *    so shutdown aborts the SDK turn the same way a steering cancel does.
+ *  - `shuttingDown`: the DISCRIMINATOR. Only a shutdown sets it; a user steering-cancel
+ *    aborts the same controller with the same error, so the flag — never the error — is
+ *    what routes a run to the fetch-back-and-requeue branch instead of today's failure.
+ */
+interface ActiveRun {
+  cancel: AbortController;
+  shuttingDown: boolean;
+}
+
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
@@ -155,6 +171,15 @@ export class RunRunner {
    *  regardless of planApprovalTimeoutMs (unlike keying off gateDeadlines). Cleared on a
    *  terminal verdict and, defensively, when the run reaches a terminal state. */
   private readonly gatedRuns = new Set<string>();
+  /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
+   *  catch fetch the committed work back before the container dies. Registered once the
+   *  runner clone exists (there is nothing to fetch back before that) and deregistered
+   *  in the terminal finally. */
+  private readonly activeRuns = new Map<string, ActiveRun>();
+  /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
+   *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
+   *  to completion past the grace window. */
+  private shuttingDownGlobal = false;
 
   constructor(
     private readonly client: WorkerClient,
@@ -288,6 +313,14 @@ export class RunRunner {
 
     let barePath: string | undefined;
     let worktreePath: string | undefined;
+    // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
+    // catch can name it. `runnerClone` is declared inside the try and there is no
+    // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
+    // copied here the moment the clone exists.
+    let branch: string | undefined;
+    // PRD #218 M1: this run's shutdown-registry entry, hoisted so the catch can read
+    // `active.shuttingDown` to tell a graceful shutdown apart from every other failure.
+    let active: ActiveRun | undefined;
     // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
     // the three filesystem removals in the finally and nothing else. Declared here
     // rather than in the catch so the finally can see it; false is the safe default,
@@ -308,11 +341,53 @@ export class RunRunner {
       );
       const runnerClone = await this.runnerCloneForClaim(barePath, claim);
       worktreePath = runnerClone.path;
+      branch = runnerClone.branch;
+      // PRD #218 M1: register for the shutdown fetch-back now that a clone exists to
+      // fetch from. The late-register guard covers the race where shutdown() already
+      // fired before this run reached here — abort it at once so it does not run to
+      // completion past the grace window.
+      active = { cancel, shuttingDown: false };
+      this.activeRuns.set(runId, active);
+      if (this.shuttingDownGlobal) {
+        active.shuttingDown = true;
+        cancel.abort();
+      }
       batcher.emit({
         kind: "status",
         agent: "worker",
         payload: { text: `runner clone ready on ${runnerClone.branch}` },
       });
+
+      // PRD #218 M3: say what a resume recovered, in a WORKER status rather than by the
+      // lead noticing the tree changed under it. Two honest outcomes:
+      //   - the tracking-ref leg fired with commits ahead of default. That leg is reached
+      //     ONLY when the ref's owner stamp matches THIS run (M2), so the work provably
+      //     belongs to this run's own interrupted attempt — the message says so without
+      //     hedging about "an earlier run".
+      //   - a RESUME (session id present) fell all the way back to the default branch:
+      //     no origin branch and no tracking ref THIS run owns was here — a cross-worker
+      //     resume (R1) or a ref that belongs to a different run. The tree is lost for
+      //     this run; admit it (the session may still resume with full context, a
+      //     separate signal above — this keeps the TREE honest too).
+      if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
+          },
+        });
+      } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "no earlier work could be recovered for this run on this worker — " +
+              "starting from the default branch, so some work may be repeated",
+          },
+        });
+      }
 
       // Resume preflight (issue #105). The claim carries the session id the run last
       // reported, but the transcript it names lives under the per-run HOME on the
@@ -344,13 +419,11 @@ export class RunRunner {
         this.openQuestionIds.set(runId, claim.open_question_id);
 
       let sessionId = claim.session_id ?? undefined;
-      let resumeDropped = false;
       if (
         sessionId &&
         runHome &&
         !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
       ) {
-        resumeDropped = true;
         sessionId = undefined;
         runLog.warn(
           "resume session transcript is not resolvable here; starting a fresh SDK session",
@@ -372,13 +445,16 @@ export class RunRunner {
           },
         });
       }
-      // The lead is about to plan with no memory of the earlier turns. If the branch it
-      // is standing on already carries pushed work, tell it so in the planning prompt —
-      // otherwise the honest degradation just becomes silently duplicated work, which
-      // is the harder failure to notice. Both conditions required: a fresh run reading
-      // its own first-attempt branch needs no such warning.
+      // Tell the lead whenever the branch it is standing on already carries commits it
+      // did not make this turn, so the honest degradation never becomes silently
+      // duplicated work. PRD #218 M3 widened this: it fired ONLY when the resume was
+      // dropped, which missed the case this PRD is about — the session survives but the
+      // TREE was recovered from the tracking ref (or was prior pushed work), where the
+      // lead equally needs to know its branch is not empty. `priorCommits > 0` alone is
+      // the condition now; a fresh run reading its own empty first-attempt branch counts
+      // 0 and gets nothing.
       const priorWork =
-        resumeDropped && runnerClone.priorCommits > 0
+        runnerClone.priorCommits > 0
           ? { commits: runnerClone.priorCommits }
           : undefined;
 
@@ -557,6 +633,7 @@ export class RunRunner {
         barePath,
         runnerClone.path,
         result.branch,
+        runId,
       );
 
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
@@ -706,6 +783,37 @@ export class RunRunner {
         );
         // parked === true is the ONLY thing that preserves on-disk state; see the
         // carve-out in the finally.
+        //
+        // PRD #218 M1: fetch the agent's committed work back into the worker bare
+        // BEFORE the finally's carve-out — the tracking ref is where the next claim's
+        // reseed (M2) reads it from, and it survives the `fs.rm` that the clone does
+        // not. Only when the run actually parked (a resume is coming) and a clone
+        // existed to fetch from. Best-effort: a park that fails is worse than a park
+        // that loses work (D4), so a failed fetch-back must not undo the park.
+        if (parked && barePath && worktreePath && branch) {
+          // Belt-and-braces reap before we read the runner-owned clone, matching the
+          // done path and the shutdown branch — safe today (the executor's run() finally
+          // reaps first) but kept consistent across all three fetch-back sites.
+          executor.killAgentTree?.();
+          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+        }
+      } else if (active?.shuttingDown) {
+        // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
+        // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
+        // steering-cancel aborts the same controller with the same REASON_CANCELLED and
+        // must still fall through to the generic failure below. The run's tree is
+        // already reaped (sdk-executor's run() finally kills the agent tree before this
+        // catch is entered); killAgentTree here is the belt-and-braces reap at the
+        // security boundary before we read the runner-owned clone.
+        executor.killAgentTree?.();
+        if (barePath && worktreePath && branch) {
+          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+        }
+        runLog.info("run interrupted by worker shutdown; leaving it for requeue");
+        await batcher.close().catch(() => undefined);
+        // NO reportState: the run stays non-terminal so the server's sweeper requeues
+        // it. Reporting `failed` here would turn a recoverable interruption into a dead
+        // run — the exact outcome the fetch-back exists to prevent.
       } else {
         // failure_reason goes straight to reportState, bypassing the batcher's
         // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
@@ -733,6 +841,10 @@ export class RunRunner {
         );
       }
     } finally {
+      // PRD #218 M1: drop the shutdown-registry entry. A terminal run (or a parked one)
+      // must not stay abortable — shutdown() iterating a stale entry would abort a
+      // controller nobody is watching, and the map would leak an entry per run.
+      this.activeRuns.delete(runId);
       await steering.stop().catch(() => undefined);
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
@@ -769,6 +881,18 @@ export class RunRunner {
       // the runner clone, the sibling skills plugin dir, and the per-run HOME that
       // holds the resumable SDK transcript. Preserving only some of them would
       // resume into a session missing its plugins or its worktree.
+      //
+      // (Corrected 2026-08-04, PRD #218: the clone leg above no longer carries the
+      // resumed work. `runnerCloneForBranch` unconditionally deletes the clone on
+      // every claim and re-seeds it from a bare ref, so a parked run's own commits
+      // were never recovered from the preserved clone directory. PRD #218 fixed the
+      // real durability by fetching the agent's committed branch back into this
+      // worker's bare repo on both the park and shutdown paths, anchored to the
+      // writing run's id; an owned resume then reseeds off that tracking ref. The
+      // three-way preservation below still runs unchanged today, and the plugin-dir
+      // and HOME legs are still load-bearing exactly as the sentence above says; the
+      // clone leg is now redundant rather than wrong to skip, and its removal is a
+      // deferred follow-up, not done here.)
       //
       // The other four statements in this block — the steering poller stop, the two
       // gate-map deletes, and the secret eviction above — MUST still run on a park.
@@ -835,6 +959,49 @@ export class RunRunner {
         );
       }
     }
+  }
+
+  /**
+   * PRD #218 M1 — trigger the graceful worker shutdown. SYNCHRONOUS and does NO git:
+   * it only flips the global flag (so a run claimed during the drain aborts on
+   * registration) and aborts every in-flight run's controller, marking each so its
+   * catch takes the fetch-back-and-requeue branch. The fetch-backs themselves run
+   * inside each `execute()` as it unwinds — deliberately NOT here, because the caller
+   * is a signal handler and `controller.abort()` (main.ts) races the async reap chain;
+   * a git fetch started here could read a runner-owned clone the run() unwind is still
+   * tearing down (R5). The worker's claim-loop drain (`Promise.allSettled(active)`)
+   * then waits for those unwinding executes, and process exit is gated on it, so the
+   * fetch-backs complete inside the container's termination grace.
+   */
+  shutdown(): void {
+    this.shuttingDownGlobal = true;
+    for (const a of this.activeRuns.values()) {
+      a.shuttingDown = true;
+      a.cancel.abort();
+    }
+  }
+
+  /**
+   * PRD #218 M1 — fetch the agent branch back into the worker bare, best-effort. The
+   * park and shutdown paths share this: both need the interrupted attempt's committed
+   * work in `refs/uzi-runner/<branch>` (where M2's reseed reads it) before the clone is
+   * removed or the container dies. It is the SAME hardened primitive the done path
+   * runs, at a different time — no new trust-boundary crossing. A failure is swallowed
+   * with a warn (D4): a fetch-back that fails must not undo the park or block the
+   * requeue.
+   */
+  private async fetchBackBestEffort(
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+    runId: string,
+    runLog: Logger,
+  ): Promise<void> {
+    await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId).catch((e) =>
+      runLog.warn("fetch-back on interruption failed; work may not be recoverable", {
+        error: errMessage(e),
+      }),
+    );
   }
 
   /**
@@ -1028,6 +1195,12 @@ export class RunRunner {
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
   private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
+    // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
+    // stays claim-agnostic — it consults the tracking ref only when its stamp matches
+    // this run id, so neither a fresh run nor a different run on the same issue can
+    // inherit a dead run's orphan ref. A requeue/resume keeps the same run_id, so a run
+    // resuming its OWN parked work matches; every other run does not.
+    const runId = claim.run_id;
     if (claim.kind === "ci_fix" && claim.pipeline) {
       const defaultBranch = claim.repo.default_branch?.trim();
       const fixBranch =
@@ -1038,6 +1211,7 @@ export class RunRunner {
         barePath,
         fixBranch,
         fixBranch.replace(/\//g, "-"),
+        runId,
       );
     }
     if (claim.kind === "self_improve") {
@@ -1048,11 +1222,12 @@ export class RunRunner {
         barePath,
         SELF_IMPROVE_BRANCH,
         SELF_IMPROVE_BRANCH.replace(/\//g, "-"),
+        runId,
       );
     }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
