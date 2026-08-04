@@ -696,6 +696,13 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// against a start-run modal on 2026-07-27); the per-run toggle is
 		// PUT /api/runs/{id}/wait-on-limit.
 		WaitOnLimit *bool `json:"wait_on_limit"`
+		// PRD #209 seeded plan: an externally-authored plan and its optional agent
+		// roster. A POINTER so absence (an ordinary run planned from the issue) stays
+		// distinct from an empty string (a blank plan, which createRun rejects 422). The
+		// web board start button omits both; the CLI `uzi run create --plan-file` sets
+		// them (M3).
+		PlanMd         *string                   `json:"plan_md"`
+		AgentSelection *workersvc.AgentSelection `json:"agent_selection"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -731,9 +738,22 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
 	allowWithoutPRD := prdlessEnabled && slices.Contains(issue.Labels, prdlessLabel)
 
+	// PRD #209: assemble the optional seeded plan. agent_selection is only meaningful
+	// alongside a plan (it is the roster for the seeded implement run); a selection
+	// with no plan is a confused request — the run would plan and gate normally, where
+	// the selection is made anyway — so reject it here rather than persist a pointless
+	// pre-gate selection. The plan itself is capped/scrubbed/empty-checked in CreateRun.
+	var seed *workersvc.SeededPlan
+	if req.PlanMd != nil {
+		seed = &workersvc.SeededPlan{PlanMD: *req.PlanMd, Selection: req.AgentSelection}
+	} else if req.AgentSelection != nil {
+		httpx.Error(w, http.StatusBadRequest, "agent_selection requires plan_md")
+		return
+	}
+
 	// The description cap is enforced inside CreateRun (shared with the autopilot
 	// path), surfaced here as ErrDescriptionTooLarge → 422.
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit)
+	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit, seed)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -742,6 +762,18 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
 		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
+		case errors.Is(err, workersvc.ErrPlanTooLarge):
+			// PRD #209 D5: the seeded plan exceeds the create-time cap.
+			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is too large to run")
+		case errors.Is(err, workersvc.ErrPlanEmpty):
+			// PRD #209 D8: the seeded plan is empty, or the secret scrub reduced it to
+			// whitespace. Never stored as a blank 'seeded' plan.
+			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
+		case errors.Is(err, workersvc.ErrInvalidSelection):
+			// PRD #209: the agent_selection is malformed (bad source or exclusion name).
+			// Roster-existence is NOT checked here — the clone roster is unknown at
+			// create time (Open Question 1); the worker resolves that.
+			httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
 		case errors.Is(err, workersvc.ErrNotPRDIssue):
 			// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it
 			// for the same reason the gate is ordered that way in createRun: telling

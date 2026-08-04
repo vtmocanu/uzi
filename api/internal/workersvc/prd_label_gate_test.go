@@ -119,7 +119,7 @@ func TestCreateRunRequiresThePRDLabel(t *testing.T) {
 					if path == "manual" {
 						// nil waitOnLimit (PRD #35): inherit the owner's default, which is
 						// the pre-#35 behaviour this gate was written against.
-						_, err = svc.CreateRun(context.Background(), user, repo, 4, "desc", tc.allowWithoutPRD, nil)
+						_, err = svc.CreateRun(context.Background(), user, repo, 4, "desc", tc.allowWithoutPRD, nil, nil)
 					} else {
 						_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", tc.allowWithoutPRD)
 					}
@@ -153,7 +153,7 @@ func TestPRDLabelGatePrecedesTheLinkGate(t *testing.T) {
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: labelsJSON(t, "bug"), HasPrdLink: false}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil); err != ErrNotPRDIssue {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil, nil); err != ErrNotPRDIssue {
 		t.Fatalf("err = %v, want ErrNotPRDIssue (not ErrNoPRDLink)", err)
 	}
 }

@@ -148,6 +148,34 @@ func validateSelection(sel AgentSelection, roster []string) error {
 	return nil
 }
 
+// validateSelectionShape checks a create-time seeded selection (PRD #209) for
+// well-formedness WITHOUT a roster. It is deliberately weaker than validateSelection:
+// at create time runs.repo_agents is NULL (only the worker's post-checkout report
+// writes it), so the roster is unknowable and "does this name exist in the roster"
+// and "repo requires a non-empty roster" cannot be answered here (Open Question 1 —
+// validation against the clone's roster is deferred to the worker's
+// resolveAgentSelection, which falls back to `own` on an unsatisfiable selection).
+//
+// What it CAN and MUST check is shape, so a garbage source never reaches the
+// agent_source CHECK constraint as a 500 and a malformed exclusion never persists:
+// the source enum, the exclusion count, and that each exclusion is a valid kebab
+// name. The roster-dependent checks (existence, at-least-one-survivor, empty-repo)
+// are the worker's job.
+func validateSelectionShape(sel AgentSelection) error {
+	if sel.Source != AgentSourceRepo && sel.Source != AgentSourceOwn {
+		return fmt.Errorf("%w: source must be 'repo' or 'own'", ErrInvalidSelection)
+	}
+	if len(sel.Exclusions) > MaxAgentExclusions {
+		return fmt.Errorf("%w: at most %d exclusions", ErrInvalidSelection, MaxAgentExclusions)
+	}
+	for _, name := range sel.Exclusions {
+		if !agenttmpl.IsValidName(name) {
+			return fmt.Errorf("%w: exclusion must be kebab-case and at most %d characters", ErrInvalidSelection, agenttmpl.MaxNameLen)
+		}
+	}
+	return nil
+}
+
 // ownSubagentNames drops the lead from the run owner's delivered TEMPLATE names:
 // that lead is uzi's builtin orchestrator, which runs on the main thread and is
 // never an invokable subagent, so it can be neither excluded nor counted as a

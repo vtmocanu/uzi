@@ -865,7 +865,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, nil, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {
@@ -883,7 +883,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &no); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &no, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if fs.createRunParams.WaitOnLimit {
@@ -900,7 +900,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 			userByID:        store.User{ID: optedIn.ID}, // default false
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &yes); err != nil {
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &yes, nil); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {
@@ -932,7 +932,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 			userByIDErr:     errors.New("boom"),
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", false, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", false, nil, nil); err != nil {
 			t.Fatalf("a preference lookup failure must not fail the creation: %v", err)
 		}
 		if fs.createRunParams.WaitOnLimit {

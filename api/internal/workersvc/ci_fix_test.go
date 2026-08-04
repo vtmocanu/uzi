@@ -70,7 +70,7 @@ func TestCreateRunRefusesWhenCIFixActiveOnBranch(t *testing.T) {
 	// ci_fix run is already fixing agent/issue-9 (they would share one worktree).
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true}, activeCIFixRuns: 1}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 9, "d", false, nil); err != ErrBranchInUse {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 9, "d", false, nil, nil); err != ErrBranchInUse {
 		t.Fatalf("err = %v, want ErrBranchInUse", err)
 	}
 }

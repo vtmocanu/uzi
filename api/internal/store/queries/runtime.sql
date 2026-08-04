@@ -299,8 +299,17 @@ WHERE status = 'online'
 -- column and regenerating left `go build ./...` fully green with all three call
 -- sites unstamped. So the guard here is a TEST that creates a run for an opted-in
 -- owner and asserts the flag arrives, per creation path — not the type system.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit)
+--
+-- 🔴 THE SAME TRAP APPLIES TO PRD #209's SEEDED-PLAN FIELDS BELOW. plan_md,
+-- plan_source, agent_source and agent_exclusions are listed explicitly for exactly
+-- that reason: a seeded run supplies them at create time (the human gate is the only
+-- other writer), and an omitted field would silently ship a plan-less, source-'agent'
+-- run — the feature inert with `go build` green. plan_source is NOT NULL DEFAULT
+-- 'agent', so a caller that seeds nothing passes 'agent' and behaves byte-identically
+-- to a pre-#209 run; only a real --plan-file caller passes 'seeded'. Guarded by a
+-- per-creation-path test, never the compiler.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -528,6 +537,19 @@ RETURNING *;
 -- AFTER THE CONSUMED approve_plan THAT MADE human_plan_approved TRUE. A tighter
 -- derivation is not cheaply available — runs carries no plan_md_set_at to compare
 -- consumed_at against, and inventing one is out of this PRD's scope.
+--
+-- 🔴 PRD #209 adds a FOURTH source of plan_approved beyond the two named above
+-- (auto_approve, human_plan_approved): a run born plan_source='seeded' (service.go's
+-- third disjunct). The invariant just stated is VACUOUS for such a run — it has no
+-- consumed approve_plan, so "no report rewrites plan_md AFTER the approval" cannot be
+-- violated, which is exactly why it cannot hold. The seeded run's soundness comes
+-- from a different guard: the moment SetRunAwaitingApproval rewrites plan_md with a
+-- worker-authored plan it ALSO sets plan_source='agent', so the disjunct that made
+-- plan_approved true stops firing at the same instant plan_md stops being the seeded
+-- (or create-time-validated-empty-rejected) text. plan_source therefore tracks
+-- plan_md's provenance, and the seeded run's plan_approved is sound for the same
+-- structural reason the other two are: it is true only while plan_md is the reviewed
+-- (here: create-time-supplied) text.
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
@@ -707,6 +729,21 @@ WHERE runs.id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = @plan_md,
+    -- 🔴 PRD #209 D8 SAFETY FIX, carried in the SAME UPDATE that rewrites plan_md.
+    -- plan_source describes the row's BIRTH; plan_md is MUTABLE, and this statement is
+    -- the mutation. A seeded run that falls through to the plan gate (a scrub-to-empty
+    -- plan, or any other path that reaches Phase 1) has this statement overwrite its
+    -- seeded plan_md with the worker's OWN Phase-1 plan. If plan_source stayed
+    -- 'seeded', the plan_approved third disjunct (service.go) would then ship
+    -- plan_approved=true over that unreviewed plan_md on the next claim — and via
+    -- RequeueRunsOfStaleWorkers (a direct UPDATE that never runs SetRunRunning's
+    -- consumed-approve_plan guard) the run re-enters implement with a plan no human
+    -- saw and no gate. Setting plan_source = 'agent' here makes the disjunct track
+    -- plan_md's PROVENANCE rather than the row's birth: once this worker authored the
+    -- plan_md, the run is an ordinary agent-planned run and re-gates like one. This is
+    -- the fix the create-time 422-on-empty (service.go) is the OTHER half of — the 422
+    -- closes the blank-plan ENTRY path, this closes every other fall-through. Both.
+    plan_source = 'agent',
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in

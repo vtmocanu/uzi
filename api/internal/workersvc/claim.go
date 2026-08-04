@@ -69,6 +69,15 @@ type ClaimPayload struct {
 	// awaiting_approval in front of a human who already approved, and can fail with
 	// REASON_NO_PLAN when the resumed session declines to re-emit signal_plan.
 	PlanApproved bool `json:"plan_approved"`
+	// PlanSource is where PlanMd came from (runs.plan_source, PRD #209): 'agent' for a
+	// worker-authored plan (or a pre-#209 run), 'seeded' for a plan supplied at create
+	// time over the API. The worker needs it to disambiguate the two plan_approved
+	// runs that arrive WITHOUT a resumable session: a seeded run (implement the plan,
+	// no gate — D4 row 2) versus a run whose session was dropped mid-flight (re-plan —
+	// D4 row 3). Read from the runs row, so it re-delivers unchanged on every resume,
+	// exactly like AutoApprove and PlanApproved. Always present (the column is NOT
+	// NULL); an old worker ignores it and behaves as it does today.
+	PlanSource string `json:"plan_source"`
 	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
 	// agent_exclusions), replayed on every claim. Omitted when the run has none.
 	//

@@ -305,6 +305,7 @@ type Run struct {
 	RateLimitType         pgtype.Text        `json:"rate_limit_type"`
 	OpenQuestionID        pgtype.Text        `json:"open_question_id"`
 	ReviseCount           int32              `json:"revise_count"`
+	PlanSource            string             `json:"plan_source"`
 }
 
 type RunMessage struct {
