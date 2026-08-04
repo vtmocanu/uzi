@@ -1848,7 +1848,7 @@ which previously prescribed only the fail-open form.
       > is a per-call-site guard, so any future `navigate(<value from a URL or the
       > server>)` reopens the hole without touching react-router at all.
       >
-      > Full record: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, 8 amendments.
+      > Full record: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, twelve amendments plus two end-of-session handovers. It is gitignored-but-tracked, so `git grep` or open it by path — `grep -r` cannot see it.
 
       > **STATUS 2026-08-03: MR-A AND MR-B MERGED, M5 NOT COMPLETE.** MR
       > [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175),
@@ -2149,6 +2149,52 @@ which previously prescribed only the fail-open form.
       > pragma today), so assigning those two directories to node would move 14
       > files that run under jsdom now — the exact silent-wrong-environment bug
       > this paragraph warns about, introduced by the fix.
+
+## 🔴 ALL SIX MILESTONES ARE TICKED AND THE WORK IS NOT SHIPPED. THREE STEPS REMAIN.
+
+**Read this before concluding from the checkboxes that the PRD is finished**, because
+6 of 6 ticked plus 0 unticked is exactly what a completed PRD looks like and this one
+is not. Nothing is pushed, there is no MR, and **no pipeline has ever run against any
+of M5's MR-C or M6** — `git rev-parse @{u}` reports no upstream on `prd-103`.
+
+The remaining work is not milestone work, which is why it has no checkbox above:
+
+1. **Integrated pass.** Several units landed on this branch — the `origin/main` merge,
+   M6, two rounds of gate-script fixes, and the docs — so **every validator so far was
+   scoped to a diff that is not the diff being shipped.** Cross-unit interaction is
+   precisely what none of them could see. Reviewer + auditor + fact-checker over
+   `origin/main...HEAD`. The fact-checker has not run on this branch at all since the
+   design wave, and the MR description is claim-dense.
+2. **Spec sync.** `specs/ai.md` is append-only and numbered; its head is **481** on
+   this branch, so append from **482** — and re-derive that, because the `main`
+   worktree reads 478 and is stale, which is the exact collision the rule exists to
+   prevent.
+3. **The MR.** Draft committed at `probes/prd-103-mrc-lead/mr-description-draft.md`;
+   the five items that must not go wrong in it are Amendment 12 of the brief.
+
+**Before pushing, three checks, all measured and all cheap to get wrong** — they are
+written out in the brief's `END OF SESSION 2` section and summarised here because a
+reader who arrives at this file may never open that one:
+
+- **Re-derive the CI-skip marker at the tip you are actually pushing**
+  (`git log -1 --format=%B | grep -c -F '[skip ci]'`). Most commits here are docs-only
+  and correctly carry it, so a clean tip is *incidental*, and the marker on an MR's
+  HEAD commit makes GitLab skip the pipeline entirely — `skipped`, not `failed`, with
+  the MR still reading mergeable because this project sets
+  `allow_merge_on_skipped_pipeline: true`. Fix by landing a marker-free commit; this
+  repo forbids the force-push an amend would need.
+- **Push the SHA you gated, by refspec** (`git push origin <sha>:refs/heads/prd-103`).
+  A branch name resolves at push time; a gate result is bound to a SHA.
+- **Expect the first pipeline to possibly be RED for FLAKE reasons.** `test:agent` went
+  green/red/red/green over four runs under an agent-team load and `test:web` red once
+  in three. Read the named failing test; never retry-until-green, because the retry
+  destroys the evidence. There is **no measured flake rate for CI**, which is where it
+  actually bites — that gap is issue #227.
+
+**Full working record**: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, twelve
+amendments plus two end-of-session handovers. **That file is gitignored-but-tracked,
+so `grep -r` and `rg` cannot see it and `--hidden` does not help — use `git grep`, or
+open it by path.**
 
 ## Parallelization
 
