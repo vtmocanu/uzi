@@ -2919,3 +2919,74 @@ the spec safe to write early; the re-derivation is what makes it evidence. Neith
 70.21 GiB pool, the 2.77 GiB both workers store — **dated facts about one cluster at one moment, and
 they will go stale exactly the way the comments did.** They carry their basis so the next reader can
 tell what would invalidate them, **which is the most that shape of claim allows.**
+
+### A34 — 2026-08-04, 🔴 **A33.2 IS HALF FALSE. STRIKING IT BEFORE ANYONE PROPAGATES IT.**
+
+**A33.2 flagged two facts for `CLAUDE.md` and one of them is wrong. The awk half is STRUCK.**
+
+> ~~"its busybox awk does NOT support interval expressions … an early `/^[ ]{0,3}[^ ]/` was silently
+> inert, never matching"~~ — **FALSE.**
+
+Re-derived by the auditor **inside `alpine/helm:3.16.4@sha256:9b25e60a…`**, which ships **BusyBox
+v1.37.0**, with two probes that discriminate rather than one that confirms:
+
+```
+a{3} vs "aaa"                              MATCH      intervals ARE supported
+a{3} vs "a{3}"                             no match   and INTERPRETED, not literal
+/^[ ]{0,3}[^ ]/ vs "    type: Recreate"    no match   CORRECT — does not end the block early
+/^[ ]{0,3}[^ ]/ vs "selector:"             MATCH      CORRECT — ends the block
+```
+
+**The retired pattern behaved correctly on both discriminating inputs. It was never inert.**
+
+**The `python3` half STANDS and is verified** (`command -v python3` → ABSENT, `/usr/bin/awk` →
+`/bin/busybox`). **A33.3's `lint:shell`-sees-only-tracked-files finding also stands**, independently
+confirmed here (21 tracked scripts clean, the new one included). **Only the awk sentence is
+withdrawn.**
+
+**A34.1 — WHY THE ORIGINAL MEASUREMENT INVERTED, WHICH IS THE PART TO KEEP: THE NATURAL PROBE IS
+NON-DISCRIMINATING, AND IT IS THE CAREFUL ONE.** Test that pattern only against **indented** lines —
+exactly what you reach for when asking *"does this wrongly terminate my block?"* — and you get **no
+match under BOTH hypotheses.** Working intervals: four spaces, so ≤3-then-non-space fails. Literal
+`{0,3}`: the text is not there. **Same answer, different reasons, and "never matches" is the
+conclusion either way.**
+
+**You check the case you are worried about, not the case that separates the hypotheses.** That is
+this project's blind-instrument shape in its purest form, and it arrived through diligence rather
+than through haste — the probe was aimed at the right worry.
+
+**A34.2 — THE LEAD AMPLIFIED IT, WHICH IS THE FAILURE THAT MATTERS MORE THAN THE MEASUREMENT.** It
+reached two dispatches and the user **twice**, each time as *"a general property of that job"*, and
+A33.2 marked it **🔴 PROPAGATE TO `CLAUDE.md`**. **One agent's measurement, carrying the phrase
+"verified by running the exact pinned digest", was promoted to a durable repo-wide fact without
+anyone asking for the discriminating probe.** The provenance phrase is what did it: *"verified in
+that exact pinned image"* reads as settled, and the one thing it does not tell you is **whether the
+probe could have come out the other way.**
+
+**The rule this earns, and it is not "trust agents less":** a measurement offered as a general fact
+needs the input that would have **falsified** it, not the input that confirmed it. Ask for the
+negative case before propagating. The `python3` claim survives precisely because `command -v` has no
+second interpretation.
+
+**A34.3 — the auditor REVERSED ITS OWN POSITION on the assertion test, and its third reason is the
+session's sharpest sentence.** It had judged comments sufficient (A29.1) and I overrode it. Asked
+whether it still held that view after seeing the artifact: *"No. Take it."* Three reasons — the
+comment it replaces said `Recreate` "buys quiet rather than correctness" so anyone adding HA would
+have believed it; the failure is a **rollout topology** spanning a chart template and a Go function
+that no Go test can see; and:
+
+> ***"This report is the argument. My finding above is a false comment in the very script that gates
+> the coupling. Comments are not self-verifying; the assertion is. I argued for the weaker instrument
+> and then found a defect that only the stronger kind catches."***
+
+**A34.4 — its own instrument slip, self-reported: `task lint:repo` exits 200 and prints the task
+listing.** It nearly read that as a gate result. **"200 plus a listing" looks nothing like a failure
+and everything like output** — the same shape as the coder's A17.7 slip on the same non-existent
+target, hit independently by a second agent.
+
+**A34.5 — no Blocking from either validator on `da027fb0`.** The script is proven live inside the
+pinned image by **both**, including the arm that matters most — a `strategy:` block with **no
+`type:`** plus a decoy `type: Recreate` downstream **fails as vacuous rather than printing OK**. The
+auditor added two arms of its own: a decoy under another key (state machine not fooled) and the wrong
+file passed entirely (the `!seen` guard catches a mis-wired caller). `RenderPVCs` enumeration
+confirmed to still catch the A19.4 case on both tiers.
