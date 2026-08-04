@@ -2549,3 +2549,81 @@ if you update only one**.
 independent mutation of `pvcceiling.go` for the piece that matters. That is the right instinct: a
 self-report of a corrected instrument is worth less than one independent measurement of the thing the
 instrument was measuring.
+
+### A28 — 2026-08-04, FINAL REVIEW. Blocking already closed; ONE new mechanism finding, queued.
+
+**A28.1 — the reviewer's Blocking is `efd60dcc`, which it had not seen.** It read at `13d02609` and
+my tip-moved notice crossed it. **Independently derived, identical to A25.1** — both found that
+`13d02609` falsified the two "ungated on both sides" comments, and both executed the chain
+(`--set maxPVCStorage=10Gi` → injected env → `ValidatePVCCeilings` rejects) rather than reading it.
+Verified at HEAD: the sentence survives **only inside the paragraph that strikes it**. **Nothing
+owed.** The reviewer adds one point A25 did not: the chart line was wrong **twice over**, since it
+also claimed only the docker tier was covered when at HEAD both are, per-tier, overrides included.
+
+**A28.2 — 🔴 NEW, AND IT IS THIS WHOLE CHAIN'S FAILURE CLASS ARRIVING INSIDE THE CHECK BUILT TO CLOSE
+IT.** `ValidatePVCCeilings` **enumerates the claimants in parallel with `RenderPVCs`, and nothing
+gates the parallelism.** `RenderPVCs` emits data / nix / (when `w.Docker`) dind-data;
+`ValidatePVCCeilings` **re-derives the same three by hand** through a `claimants []string` plus an
+`if extra == "dind-data"`. Verified: it never calls `RenderPVCs`, and no test pins the
+correspondence.
+
+**The reviewer calibrated rather than assumed, and the result is asymmetric:**
+
+- **a typo IS caught** — mutating the slice entry to `"dind_data"` reddens two named test cases, so
+  the `[]string` + `if` shape *looks* fail-open and is not;
+- **an ADDITION is not.** **A fourth PVC added to `RenderPVCs` is silently unchecked, and no test
+  would notice.**
+
+That is exactly `dindDataDefaultSize` being unguarded because a list did not learn about it (A18.2),
+**one level up, in the check built to close it.** It is also the auditor's A27.9 residual (two
+claimant sets in two languages) reached from the other side — **both validators, independently.**
+
+**The fix deletes code rather than adding it**, and is structurally exhaustive: per tier, iterate
+`RenderPVCs(cfg, protocol.DesiredWorker{Docker: tier == "docker"}, spec)` and check each returned
+claim's `Spec.Resources.Requests.Storage()` against the ceiling. A fourth PVC is covered **the day it
+is added**, and the `claimants`/`if extra ==` switch goes away entirely. Same package, `protocol`
+already imported, `RenderPVCs` already exported. **QUEUED for the coder once spec-keeper releases the
+writer token.**
+
+**Subsumed by that fix, recorded so it is not lost if the fix is dropped:**
+`claims["/nix (nixSize, flat across every preset)"]` is a **constant** map key assigned inside the
+template x size loop, so **only the last iteration's value survives**. Correct today *only* because
+`TestNixSizeIsFlatAcrossEveryPresetAndTemplate` pins flatness **in another package**. `/data` has the
+same shape, keyed by size but not by template. Neither is a defect; **both are silent narrowings
+resting on a property enforced elsewhere.**
+
+**A28.3 — the absent-ceiling justification should be REPLACED, and both validators say so
+independently.** A27.3 (auditor) and this both reject the shipped comment's argument (*"a guessed
+value too low refuses to boot a healthy fleet"*) as **an argument against defaulting — a different
+and weaker claim than the one being made.** The reviewer verified the structural one at the chart:
+each env var renders under **exactly** the LimitRange's own condition, so **absent env ⟺ no
+LimitRange ⟺ nothing to violate.** Skipping is **correct semantics, not a pragmatic compromise** —
+and the current wording *"invites someone to improve it with a default, which the structural argument
+forecloses."* → same commit as A28.2.
+
+**One state where the equivalence is imperfect, measured:** `limitRange.enabled: true` with
+`maxPVCStorage: ""` renders the LimitRange as `PVC max={'storage': ''}` while **omitting** the env,
+so the check skips a tier whose LimitRange did render. Benign either way — an empty quantity is not a
+valid LimitRange, so the object should be rejected at apply *(un-verified: the cluster has been
+unreachable for the reviewer since the M-a wave)*, and if accepted there is no effective ceiling
+anyway. **Worth knowing, not worth guarding.**
+
+**A28.4 — the `main.go` call site: the review half of A24.5's gap, and it is right on the property
+that matters.** **`materializerCfg` is built ONCE and passed to BOTH `kube.New` and
+`ValidatePVCCeilings`** — so the check validates **exactly** the config the materializer will render
+from, and two separately-constructed configs cannot drift. Ordering verified: after config assembly,
+after `kube.New` (*a pure constructor, no side effects*), and **before** `reconcile.New` and the
+loop, so no reconcile can precede it. `os.Exit` skips the `defer stop()`, which is
+`signal.NotifyContext`'s cancel and irrelevant at process exit — **and all four pre-existing exits in
+that function have the same property, so it is the file's convention rather than something this
+change introduced.**
+
+**A28.5 — verified good, independently.** `dae9b799` closes the earlier Blocking *"properly and
+better than I proposed"*: `chartMaxPVCStorage(t)` **parses** `values.yaml` with `sigs.k8s.io/yaml`
+rather than grepping — **and the header says why: `maxPVCStorage` appears under two blocks a regex
+cannot separate** — reads both tiers separately, and `Fatal`s on unreadable/missing/empty/unparseable
+rather than falling back. The `"m"` deletion is complete (`20m` fails closed naming the suffix, `20M`
+still renders). A22.3's guard fires on **all four** LimitRange keys, each naming its own values path.
+`%v` confirmed against a YAML-numeric `maxPVCStorage: 10`. Vacuity guards landed on **both** maps
+plus `TestPresetTablesAreNotEmpty`. `go test -count=1 -race ./...`: **EXIT=0, RUN=212 PASS=212 FAIL=0
+SKIP=0**; `deadcode-gate` 0 findings; `assert-chart-render.sh` 38 documents.
