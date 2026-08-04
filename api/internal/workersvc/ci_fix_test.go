@@ -135,9 +135,13 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 			IssueTitle:       "Fix CI: main pipeline #4200",
 			IssueDescription: "Diagnose and fix the failed pipeline for `main`.",
 			Status:           "claimed",
-			PipelineRef:      pgText("main"),
-			PipelineID:       pgtype.Int8{Int64: 4200, Valid: true},
-			FailureSnapshot:  snapJSON,
+			// PRD #209: a ci_fix run is worker-planned, so its row carries plan_source
+			// 'agent' (the NOT NULL default). Set explicitly so the golden reflects the
+			// real column value rather than an empty string the DB can never hold.
+			PlanSource:      planSourceAgent,
+			PipelineRef:     pgText("main"),
+			PipelineID:      pgtype.Int8{Int64: 4200, Valid: true},
+			FailureSnapshot: snapJSON,
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",

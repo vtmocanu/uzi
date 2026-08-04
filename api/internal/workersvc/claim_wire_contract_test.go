@@ -57,6 +57,12 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
 		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
 		PlanApproved:     true,
+		// PRD #209: plan_source rides every claim (NOT NULL, no omitempty). "seeded"
+		// here makes this a coherent seeded-run claim — approved, no session — and is a
+		// NON-DEFAULT value for the same "wired vs present-and-zero" reason the booleans
+		// above carry true. The default 'agent' would agree with a producer that dropped
+		// the field's write.
+		PlanSource: planSourceSeeded,
 		// PRD #35: the persisted selection rides the claim so a resumed, already-approved
 		// run keeps the exclusions the same human verdict carried. NON-EMPTY on purpose —
 		// an empty exclusions list here would agree with a producer that dropped them.

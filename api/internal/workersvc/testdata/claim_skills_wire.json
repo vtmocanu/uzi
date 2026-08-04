@@ -14,6 +14,7 @@
   "auto_approve": true,
   "wait_on_limit": true,
   "plan_approved": true,
+  "plan_source": "seeded",
   "agent_selection": {
     "source": "repo",
     "exclusions": [

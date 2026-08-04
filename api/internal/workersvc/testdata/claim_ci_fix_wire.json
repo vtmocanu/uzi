@@ -14,6 +14,7 @@
   "auto_approve": false,
   "wait_on_limit": false,
   "plan_approved": false,
+  "plan_source": "agent",
   "pipeline": {
     "id": 4200,
     "ref": "main",
