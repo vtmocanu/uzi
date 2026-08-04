@@ -295,19 +295,41 @@ tasks:
       # two precisely because their verdict is a function of a remote database, and
       # this one's is a function of the tree.
       #
-      # 🔴 TWO LIMITS, BOTH REAL, WRITTEN DOWN SO NOBODY READS A GREEN AS MORE THAN
-      # IT IS. `--depth=0` sees DIRECT dependencies only - a transitive version skew
-      # is invisible to it. And it compares node_modules against `package.json`
-      # RANGES, not against the lockfile, so a caret range makes it loose: `^4.1.10`
-      # is satisfied by 4.9.0 and the check would say nothing. That is why MR-C pins
-      # `vitest` with `--save-exact`, matching the `oxlint`/`knip` precedent.
+      # 🔴 THIS CHECK IS TWO LINES, NOT ONE, AND THIS COMMENT DESCRIBED ONLY THE
+      # FIRST UNTIL 2026-08-04. `3903e9d7` added a lockfile join precisely to cover
+      # the two limits listed below, so a reader who stopped here came away with a
+      # narrower view of the gate than it has had since. Corrected rather than
+      # deleted, because the limits are still true OF LINE 1 and line 1 is still
+      # what runs first. `deps-check:web`'s own comment further down describes both
+      # lines; if the two ever disagree again, that one is the definition and this
+      # one is the summary.
       #
-      # AND ONE STATE WHERE IT LIES, which is the one a person TESTING this will
-      # create: `npm install --package-lock-only` run in place also rewrites
+      # LINE 1, `npm ls --depth=0`, has TWO LIMITS, BOTH REAL. `--depth=0` sees
+      # DIRECT dependencies only - a transitive version skew is invisible to it. And
+      # it compares node_modules against `package.json` RANGES, not against the
+      # lockfile, so a caret range makes it loose: `^4.1.10` is satisfied by 4.9.0
+      # and the check would say nothing. That is why MR-C pins `vitest` with
+      # `--save-exact`, matching the `oxlint`/`knip` precedent.
+      #
+      # LINE 2 is a join against the lockfile's RESOLVED versions, which is what
+      # covers both of those, and since `4f48085d` it reports ABSENCE as well as
+      # skew - the state a `git pull` adding a transitive dependency produces, where
+      # line 1 has no declared range to check either.
+      #
+      # AND ONE STATE WHERE THE CHECK LIES, which is the one a person TESTING this
+      # will create: `npm install --package-lock-only` run in place also rewrites
       # `node_modules/.package-lock.json`, after which `npm ls` reports the NEW
-      # version while the package on disk is still the old one. A git pull cannot
-      # produce that state; a hand-built repro can. Build the stale state the way a
-      # pull does - replace package.json and the lockfile, leave node_modules alone.
+      # version while the package on disk is still the old one.
+      #
+      # 🔴 THAT STATE DEFEATS BOTH LINES, NOT JUST `npm ls`, and this comment blamed
+      # line 1 alone. `node_modules/.package-lock.json` is line 2's installed-side
+      # oracle, so rewriting it moves what line 2 reads as "installed" too - measured
+      # by the Unit B reviewer: on-disk 2.0.2, both lockfiles 2.0.1, gate rc=0 "up to
+      # date" (`probes/prd-103-mrc-b-reviewer/p5-deps-check-shared-oracle.txt`).
+      # NEITHER line has an independent read of what is actually unpacked on disk.
+      # A git pull cannot produce that state; a hand-built repro can. Build the stale
+      # state the way a pull does - replace package.json and the lockfile, leave
+      # node_modules alone.
       #
       # NOT A CI CHECK, AND THAT DOES NOT VIOLATE SUCCESS CRITERION 1. SC1 reads
       # "CI runs no toolchain check that `task gate` does not" and is one-directional;
