@@ -1824,6 +1824,67 @@ where this actually bites**. Nothing here transfers.
   because it was a parse error — a silent content collision would not have been.**
   The team scratchpad is shared; use a private subdirectory.
 
+## Shutdown handovers — three findings, one reopened task, and a stale-flag pattern
+
+**🔴 THE GATE RECIPES HAVE NEVER BEEN REVIEWED AT A PINNED SHA, AND I CLOSED THAT
+TASK PREMATURELY.** Task #3 is **reopened**. Both review rounds covered Unit A's
+*dependency* half (commits 1-4); `scripts/govulncheck-gate.sh` and
+`scripts/npm-audit-gate.sh` — the milestone's actual deliverable — were uncommitted
+at both review times. The auditor *did* audit the wrapper (Amendment 6's
+`GOPACKAGESDRIVER` fail-open), so the **security** lens is covered and the
+**correctness/deletion** lens is not. Re-dispatch against `f47961e6` or later.
+
+**NEW, and it independently supports `557b733b` more strongly than the rate does.**
+Across **134,460 individual test executions in 81 runs**, the worst *non-cap* test in
+a run reached only **42% (ambient) / 58% (concurrent) of the 20000 cap**; the third
+slowest test in `RunView.test.tsx` is ~900 ms against the two cap tests' ~4-5 s. So
+exempting **exactly those two** and leaving 1658 at 20000 is well-targeted, with
+~1.7x headroom on the next-worst test. That is a better argument for the fix than the
+flake rate ever was.
+
+**But the new 60000 per-test cap is a knife-edge, and the tester recommends 120000.**
+Its most extreme observation anywhere is that cap test at **49869 ms in a PASSING
+run** — **83% of the new cap, 1.20x margin**. 60000 sits roughly where the old
+suite-wide 20000 sat relative to the worst excursion of its day, which is the
+position that just failed. **One-token change, and it is a real decision rather than
+a tidy-up** — take it or record why not.
+
+**Residual, not an action item:** at an artificial `--maxWorkers=118`, five
+`mockApi.*` files blew past 20000 (max 35479 ms = 177% of cap). **Zero such
+excursions in the 76 realistic runs.** That is where the next flake comes from if
+contention grows, not where it is today.
+
+**THE PATTERN IN THE HANDOVERS ITSELF IS WORTH MORE THAN ANY OF THEIR ITEMS.** Four
+agents each flagged something as untracked, unfixed or open at shutdown, and **all
+four were reading pre-fix state** — they had been idle while I committed. Verified:
+`probes/prd-103-mrc-m6-architect/` 14 of 14 tracked, `probes/prd-103-mrc-m6-reviewer/`
+51 of 51 tracked, `git status` completely empty, `auditor.md` fixed in `b3b927ed`.
+
+**And the `auditor.md` one is carry-forward 16(c) demonstrating itself.** The coder
+reported that the file "now states something false", and `grep -c -F 'still do not
+exist'` does return **1** — at **line 147, inside the correction block that quotes
+the retired string in order to retire it**. *The correction is always a hit.* The
+discriminator is whether the hit sits in a live claim or in a comment about one.
+
+**The honest read is that this is a cost of idling agents rather than a failure by
+any of them**: an agent's last observation is frozen at the moment it went idle, and
+a handover written from that snapshot is *early*, not wrong. The lead's job on
+receipt is to re-derive, not to act — which is the same early-versus-stale
+distinction that bit me twice today in the other direction.
+
+**Two instruments to carry, both measured:**
+- **`yaml.safe_load` THROWS on `.gitlab-ci.yml`** — it carries `!reference` tags. The
+  working loader is `probes/prd-103-mrc-m6-reviewer/parse_needs.py`. Without it, a
+  reader concludes the file is unparseable and falls back to grepping, **which is the
+  exact failure the parse-don't-grep rule exists to prevent.**
+- **`probes/prd-103-mrc-m6-architect/vitest-env-precedence.sh` carries two lines that
+  look like clutter and are load-bearing**, and Unit B re-runs it on vitest 4: the
+  symlinked `node_modules` (else `jsdom` does not resolve from the scratch root) and
+  `S="$(cd "$S" && pwd -P)"` (else macOS `/var` → `/private/var` makes Vite's resolved
+  id miss `--root`). Removing either gives **5 of 6 cells at rc=1 with one plausible
+  survivor printing the opposite of the truth** — not a uniform failure, so it does
+  not announce itself.
+
 ## What this session actually bought, and it was not the code
 
 Four blocking defects, **none of which a green gate would have shown**: the
