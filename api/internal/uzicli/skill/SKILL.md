@@ -215,6 +215,65 @@ uzi version
   set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
   chat turn as a follow-up, so its queue lists them all (issue runs start empty).
 
+### Authoring a seeded plan
+
+You can go from a written PRD to an implementing run in one pass, without
+waiting on the worker's own planning turn or a human approval: plan the work
+yourself, against your own clone, then hand the plan to `run create
+--plan-file` instead of letting the worker derive one from the issue. This
+is the mechanism, in order:
+
+1. **Clone the repo and read the PRD** the issue links (`prds/<n>-slug.md`).
+   Plan the change the same way you would for any local task: which files
+   change, and how.
+2. **Write the plan to stand alone.** This is the constraint the whole
+   feature rests on. A seeded run starts **cold** — no chat session, no
+   memory of the conversation that produced the plan. `plan_md` is the
+   worker's *only* instruction. "As we discussed" or "the file we looked at"
+   means nothing to a fresh agent reading just that text. Name the files to
+   touch, the change in each, and how to tell it's done, as if handing the
+   plan to someone who has read nothing else. Any plain text works — there
+   is no required schema.
+3. **Read the roster off the clone, not from memory, if you're naming one.**
+   `--agent-source repo` means the roster in the clone's `.claude/agents/`
+   (`ls .claude/agents/` there to see it — one role per file, named by its
+   filename); `--agent-source own` means the caller's own template roster.
+   Neither is checked against the clone's actual contents at create time —
+   unlike `run approve`'s gate, the clone doesn't exist yet when you create
+   the run, so there's nothing to validate against yet. Concretely:
+   `--agent-source repo` against a clone that turns out to have no
+   `.claude/agents/` runs with **zero subagents** rather than failing, and an
+   `--exclude-agents` name that doesn't match anything in the chosen source
+   is silently a no-op, not an error. Confirm the roster from the filesystem
+   before naming it. Omit both flags to get the same default every other run
+   gets: the repo's own agents when the clone has any, else the template
+   roster.
+4. **Note the commit you planned against** — the local clone's `HEAD` at the
+   moment you finished planning (`git rev-parse HEAD`) — and pass it as
+   `--planned-commit`. The worker compares it to the clone's own resolved
+   base once it checks out; a mismatch warns into the run feed by default,
+   or fails the run first if you also pass `--require-base`.
+5. **Create the run:**
+
+   ```
+   uzi run create --repo <repo-id> --issue <issue-iid> \
+     --plan-file plan.md --agent-source repo \
+     --planned-commit $(git rev-parse HEAD)
+   ```
+
+   `-` instead of a path reads the plan from stdin. An empty plan, or one
+   over the 256 KiB cap, is rejected at create time rather than stored.
+
+**No `prds/*.md` file for this issue yet?** It still works — the plan you
+supply is what the file would have provided. The issue needs **both** the
+`PRD` label and the `PRDLESS` label: PRDLESS is the escape hatch for a PRD
+issue with no file yet, not a way to skip the PRD label itself. And if you
+just added the `PRD` label yourself, `run create` may still answer "issue
+does not carry the PRD label" until the next poller sync — going through
+the forge's own **Promote** action instead writes the label and updates
+uzi's cache in the same request, so a freshly-promoted issue is runnable
+immediately, with no wait.
+
 ### Reading and triaging the judge's review
 
 `uzi review show <run-id>` prints the judge's verdict, summary, a **triage line**
