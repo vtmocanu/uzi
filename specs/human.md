@@ -430,6 +430,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - The worker→api hop is TLS in v1. [user 2026-07-16]
 - Trimmed v1 surface: sizes are built-in constants (no preset CRUD), no restart endpoint, heartbeat-only status. [user 2026-07-16]
 - Sizes are Burstable (requests < limits): `s` 250m–1 CPU / 1–2Gi RAM; `m` 500m–2 / 2–4Gi; `l` 1–4 / 4–8Gi; `/data` 5/10/20Gi; `/nix` a flat 4Gi. [user 2026-07-17]
+  - `/nix` is now a flat **20Gi** — raised for PRD #87's prebaked Chromium closure. [user, PRD #87]
 - Default size is `m`, not `s`. [user 2026-07-16]
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
@@ -612,6 +613,35 @@ for the whole of #201; this milestone (M4a) is the drift signal only.
 
 Every other decision on this feature is the team's and lives in `specs/ai.md`
 §476-§478.
+
+## Feature #224 — Worker pods declare no ephemeral-storage request
+
+Tracked as GitLab issue vtmocanu/uzi#224; PRD at `prds/224-worker-ephemeral-storage.md`.
+
+- Fix the defect: a worker pod evicted for node ephemeral-storage pressure
+  destroys every in-flight run's work, silently. [user, the originating ask]
+- Ship a conservative, chart-tunable default now; measure on the fleet after.
+  [user 2026-08-04]
+- Ship it and accept ONE loss event: rolling this kills every in-flight run once.
+  Not sequenced behind #218, not gated on a drained fleet. The change lowers how
+  often the loss happens; it does not close it. [user 2026-08-04, chosen from
+  four options with the loss stated plainly]
+- All four design follow-ups land in this session rather than being filed —
+  "cant we fix them all now, in this session?" [user 2026-08-04]
+- Evicted-pod cleanup is a manual one-off deletion by exact name. No
+  controller-side reaper: a new reconcile responsibility plus an RBAC delete verb
+  plus its own tests, for a cosmetic problem. [user 2026-08-04]
+- Quotas are raised to match the advertised fleet, rather than the advertised
+  fleet lowered to match the quotas. [user 2026-08-04]
+- Build the boot-time PVC-ceiling check now. [user 2026-08-04]
+- The PVC resize path is dropped; the one legacy worker gets
+  delete-and-reprovision. [user 2026-08-04]
+- The imagefs / image-accumulation defect is FILED, not fixed — issue #225.
+  [user 2026-08-04]
+
+Every other decision on this feature is the team's and lives in `specs/ai.md`
+§479-§481.
+
 ## Feature #144 (item 1) — Warn when the CLI is behind the server
 
 Tracked as GitLab issue vtmocanu/uzi#144 (item 1). Scoped MR, no PRD [user 2026-08-03].
