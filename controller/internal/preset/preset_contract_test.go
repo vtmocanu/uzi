@@ -221,6 +221,14 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // this package's header exists to prevent. So the chart guards what the chart supplies
 // and this guards what the controller compiles in. Neither half covers all three.
 //
+// THE INVARIANT IS A PER-TIER MINIMUM, NOT AN EQUALITY. Each tier is its own namespace
+// with its own LimitRange, so every claimant is checked against THAT tier's ceiling.
+// The two carry the same 20Gi today and nothing requires that to continue; stating it
+// per tier is what makes a future divergence legible instead of silently checking one
+// number against the wrong namespace. Where a single value ever serves both, the
+// invariant collapses to `claimant <= min(restricted, docker)` — the min is the
+// fallback shape, the per-tier check is the general one.
+//
 // 🔴 THE CEILINGS ARE READ OUT OF values.yaml, ONE PER TIER, AND THE PREVIOUS VERSION
 // OF THIS TEST WAS WRONG IN A WAY WORTH RECORDING. It hardcoded a single
 // `chartMaxPVCStorage = 20Gi` standing in for BOTH tiers' keys, and its comment called
@@ -241,7 +249,18 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // So an operator-lowered restricted-tier ceiling remains ungated on BOTH sides. That is
 // a real residual, not a covered case; the chart-side comments say so too.
 func TestPresetPVCSizesFitTheChartsLimitRangeMax(t *testing.T) {
-	for tier, max := range chartMaxPVCStorage(t) {
+	ceilings := chartMaxPVCStorage(t)
+	// Vacuity guards, the idiom readGolden states 190 lines above in this same file: a
+	// check that iterates an empty collection passes while asserting nothing. Neither
+	// map can empty by accident, and that is precisely why the guard is one line rather
+	// than a judgement call each time.
+	if len(ceilings) == 0 {
+		t.Fatal("no tier ceilings were read from values.yaml; every assertion below would pass vacuously")
+	}
+	if len(sizes) == 0 {
+		t.Fatal("the preset size table is empty; the DataSize assertions below would pass vacuously")
+	}
+	for tier, max := range ceilings {
 		if nixSize.Cmp(max) > 0 {
 			t.Errorf("nixSize = %s exceeds %s = %s, so EVERY worker's /nix claim in that tier would be "+
 				"rejected at admission and every worker would provision and never appear. Raise it in "+

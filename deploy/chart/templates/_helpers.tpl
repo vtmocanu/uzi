@@ -207,9 +207,27 @@ true
   failure is a `fail`, not a fallback.
 
   Binary suffixes are powers of 1024 and decimal ones powers of 1000, per the
-  Kubernetes quantity spec; `m` (milli) is included for completeness even though no
-  storage value uses it. Exponent notation ("2e3") is NOT supported — the API accepts
-  it, nothing in this chart writes it, and a silent misparse is worse than a refusal.
+  Kubernetes quantity spec. Exponent notation ("2e3") is NOT supported — the API
+  accepts it, nothing in this chart writes it, and a silent misparse is worse than a
+  refusal.
+
+  🔴 `m` (milli) IS DELIBERATELY ABSENT FROM THE TABLE, and it is the one omission that
+  is a safety fix rather than a simplification. It was here "for completeness". Every
+  other wrong-case suffix fails closed — `gi`, `ki`, `mi`, `ti`, `pi`, `K`, `g`, `t`,
+  `p` are all rejected naming the mistake — but `20M` and `20m` BOTH parsed, and they
+  differ by 10⁹: `20M` is 2e+07 bytes while `20m` is **0.02 bytes**. A single-keystroke
+  slip on a storage value therefore produced a number so small that no ceiling check
+  could ever fire on it, silently. Storage quantities are never expressed in milli-
+  units, so dropping `m` costs nothing real and converts the tenth typo into the same
+  loud failure as the other nine. If a caller ever genuinely needs milli-units, add it
+  back for THAT caller, not to this shared helper.
+
+  AND NOTE WHAT A CALLER CAN AND CANNOT BUILD ON THIS: it supports a CEILING check
+  ("is X larger than the max?") and structurally cannot support a FLOOR one. A value
+  that is absurdly small is, to every `gt` comparison here, simply "not too big" — so
+  a nonsense-but-tiny quantity passes every guard written on top of this helper. That
+  is the direction dropping `m` closes off at the parse step, because no guard above
+  could have closed it.
 */ -}}
 {{- define "uzi.quantityBytes" -}}
 {{- $q := . | toString | trim -}}
@@ -218,7 +236,7 @@ true
 {{- fail (printf "uzi.quantityBytes: %q is not a Kubernetes resource quantity (expected a number optionally followed by Ki/Mi/Gi/Ti/Pi or k/M/G/T/P, e.g. \"20Gi\")" $q) -}}
 {{- end -}}
 {{- $suffix := trimPrefix $num $q -}}
-{{- $factors := dict "" 1.0 "m" 0.001 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "P" 1e15 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 -}}
+{{- $factors := dict "" 1.0 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "P" 1e15 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 -}}
 {{- if not (hasKey $factors $suffix) -}}
 {{- fail (printf "uzi.quantityBytes: %q in %q is not a valid quantity suffix (expected one of Ki/Mi/Gi/Ti/Pi, k/M/G/T/P, or none — note the unit is case-sensitive, so \"Gi\" not \"gi\" and \"G\" not \"GB\")" $suffix $q) -}}
 {{- end -}}

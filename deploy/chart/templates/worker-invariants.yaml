@@ -144,6 +144,48 @@
   ceiling is ungated on both sides — a real residual, not a covered case. The docker
   tier's is covered here, at render time, overrides included.
 */ -}}
+{{- /*
+  NO `ephemeral-storage` IN ANY LimitRange `default` OR `defaultRequest`, EITHER TIER
+  (issue #224, A3.2's second half; found unenforced by the tester as A22.3).
+
+  render.go's ephemeralRequest header explains at length why no CONTAINER may declare
+  `limits.ephemeral-storage`: kubelet's podEphemeralStorageLimitEviction fires as soon
+  as ANY container has one, and compares the SUM of declared limits against pod usage
+  that INCLUDES the emptyDirs — so a single limit creates a deterministic eviction that
+  fires with no node pressure at all, which is the failure this whole issue exists to
+  reduce. A unit test pins that over the RENDERED pod.
+
+  🔴 A LimitRange DEFEATS THAT TEST WITHOUT CONTRADICTING IT, WHICH IS WHY IT NEEDS A
+  CHART GUARD RATHER THAN A BETTER ASSERTION. The injection happens at ADMISSION, after
+  the controller has rendered and after every test has run: the object we render carries
+  no limit, the object the cluster admits does. Measured with a before/after/restore on
+  an otherwise cleanly-admitting pod — three lines in a values file moved the worker
+  container from `{cpu, memory}` to `{cpu, ephemeral-storage, memory}` limits, and
+  `task gate:controller` stayed green throughout. No test above this layer can see it,
+  so this is the instrument's floor, not a gap in the assertions.
+
+  `defaultRequest` is guarded too, and not merely for symmetry: it would inject a
+  REQUEST into every container that declares none — the dind sidecar and both init
+  containers — which silently breaks the "whole pod budget on the `worker` container
+  alone" invariant that makes quota, the scheduler and the eviction ranker agree on one
+  number.
+
+  Same shape as A3.6's rule for `max`, and for the same reason: an ephemeral `max`
+  needs a `default` beside it, and that `default` hands the trap above to EVERY pod in
+  the namespace. Neither tier declares any of these four keys; this refuses to render
+  if one appears.
+*/ -}}
+{{- range $path, $block := dict
+  "workers.limitRange.default"               .Values.workers.limitRange.default
+  "workers.limitRange.defaultRequest"        .Values.workers.limitRange.defaultRequest
+  "workers.docker.limitRange.default"        .Values.workers.docker.limitRange.default
+  "workers.docker.limitRange.defaultRequest" .Values.workers.docker.limitRange.defaultRequest }}
+{{- if $block }}
+{{- if hasKey $block "ephemeral-storage" }}
+{{- fail (printf "%s sets ephemeral-storage, which must never be declared in a LimitRange. It is injected at ADMISSION, so the controller renders a pod with no ephemeral limit and the cluster admits one WITH it — invisible to every unit test. A `default` arms kubelet's pod-level ephemeral eviction, which compares the SUM of declared limits against pod usage INCLUDING the emptyDirs and therefore evicts with no node pressure at all (the exact failure issue #224 exists to reduce, made deterministic). A `defaultRequest` injects a request into the dind sidecar and the init containers, breaking the invariant that the whole pod budget sits on the `worker` container alone. Remove the key: the controller declares the worker's requests.ephemeral-storage itself, per tier, and deliberately declares no limit anywhere." $path) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if and .Values.workers.docker.enabled .Values.workers.docker.limitRange.enabled }}
 {{- $max := .Values.workers.docker.limitRange.maxPVCStorage }}
 {{- $maxBytes := float64 (include "uzi.quantityBytes" $max) }}
@@ -174,7 +216,7 @@
 {{- range $key, $size := $claimants }}
 {{- if $size }}
 {{- if gt (float64 (include "uzi.quantityBytes" $size)) $maxBytes }}
-{{- fail (printf "%s=%s exceeds workers.docker.limitRange.maxPVCStorage=%s. The claim would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean, the controller boots clean, and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log. Raise workers.docker.limitRange.maxPVCStorage to at least %s (and raise workers.docker.quota.requestsStorage with it, or the tier runs out of storage budget instead), or lower %s." $key $size $max $size $key) }}
+{{- fail (printf "%s=%v exceeds workers.docker.limitRange.maxPVCStorage=%v. The claim would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean, the controller boots clean, and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log. Raise workers.docker.limitRange.maxPVCStorage to at least %v (and raise workers.docker.quota.requestsStorage with it, or the tier runs out of storage budget instead), or lower %s." $key $size $max $size $key) }}
 {{- end }}
 {{- end }}
 {{- end }}

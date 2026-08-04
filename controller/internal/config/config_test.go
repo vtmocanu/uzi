@@ -641,6 +641,57 @@ func TestLoadDockerDinDDataSize(t *testing.T) {
 	}
 }
 
+// The two tier PVC ceilings (issue #224). Same split and the same reason as the
+// ephemeral requests: the RESTRICTED one is read outside validateDockerTier because
+// every instance has that tier, and a var read only when docker is configured would be
+// silently ignored on most of them — here that would mean booting a controller whose
+// /nix claims are rejected at admission, which is the failure the check exists to stop.
+func TestLoadWorkerMaxPVCStoragePerTier(t *testing.T) {
+	t.Run("restricted tier is read with the docker tier OFF", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_WORKER_MAX_PVC_STORAGE", "20Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxPVCStorage != "20Gi" {
+			t.Fatalf("restricted ceiling = %q, want 20Gi (read even with no docker tier configured)", cfg.WorkerMaxPVCStorage)
+		}
+
+		t.Setenv("UZI_WORKER_MAX_PVC_STORAGE", "20GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_MAX_PVC_STORAGE") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_MAX_PVC_STORAGE", err)
+		}
+	})
+
+	t.Run("docker tier", func(t *testing.T) {
+		setDockerBaseEnv(t)
+		t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+		t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+		t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+		t.Setenv("UZI_WORKER_DOCKER_MAX_PVC_STORAGE", "20Gi")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerDockerMaxPVCStorage != "20Gi" {
+			t.Fatalf("docker ceiling = %q, want 20Gi", cfg.WorkerDockerMaxPVCStorage)
+		}
+		// Unset stays EMPTY rather than defaulting. A guessed ceiling that is too low
+		// refuses to boot a healthy fleet, which is worse than not checking that tier.
+		if cfg.WorkerMaxPVCStorage != "" {
+			t.Errorf("unset UZI_WORKER_MAX_PVC_STORAGE must stay empty, got %q", cfg.WorkerMaxPVCStorage)
+		}
+
+		t.Setenv("UZI_WORKER_DOCKER_MAX_PVC_STORAGE", "20GB!")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_MAX_PVC_STORAGE") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DOCKER_MAX_PVC_STORAGE", err)
+		}
+	})
+}
+
 // The worker's requests.ephemeral-storage overrides (issue #224 M-b), per tier.
 //
 // The PLAIN one is read OUTSIDE validateDockerTier and this test's first half is what

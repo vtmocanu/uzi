@@ -108,6 +108,17 @@ type Config struct {
 	// worker, so it must be read even on an instance with the docker tier off. Its
 	// docker counterpart lives with the other docker knobs below.
 	WorkerEphemeralRequest string
+	// WorkerMaxPVCStorage is the RESTRICTED tier's LimitRange maxPVCStorage
+	// (UZI_WORKER_MAX_PVC_STORAGE, issue #224). It is not used to render anything: it
+	// is the admission ceiling every PVC this controller creates must fit, and it
+	// exists so the controller can REFUSE TO BOOT rather than provisioning claims the
+	// LimitRange will reject — a rejection that otherwise surfaces only as a worker
+	// that never appears, with the reason in this process's log and nowhere else.
+	//
+	// Empty means the chart rendered no LimitRange for that tier, so there is no
+	// ceiling and the check is skipped. It is NOT a default: guessing a ceiling would
+	// be worse than not checking, since a wrong guess refuses to boot a healthy fleet.
+	WorkerMaxPVCStorage string
 	// WorkerMaxConcurrentRuns is the per-hosted-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS
 	// → the pod's WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe opt-in); raising it opts
 	// into the intra-user concurrency residuals documented in docs/worker-setup.md
@@ -165,6 +176,12 @@ type Config struct {
 	// plain default because a docker worker's run-workdir emptyDir carries the run's
 	// entire working tree while a plain worker's lives on the /data PVC.
 	WorkerDockerEphemeralRequest string
+	// WorkerDockerMaxPVCStorage is the DOCKER tier's LimitRange maxPVCStorage
+	// (UZI_WORKER_DOCKER_MAX_PVC_STORAGE, issue #224). Separate from
+	// WorkerMaxPVCStorage because the two tiers are separate namespaces with separate
+	// LimitRanges, and the docker tier carries a third claim (the dind data root) the
+	// restricted tier does not have. Empty means no LimitRange on that tier.
+	WorkerDockerMaxPVCStorage string
 	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
 	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
 	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
@@ -288,6 +305,14 @@ func loadWorkerSettings(cfg *Config) error {
 		return err
 	}
 
+	// The restricted tier's PVC admission ceiling (issue #224). Read here, outside
+	// validateDockerTier, for the same reason as the ephemeral request above: every
+	// instance has a restricted tier, so a var read only when the docker tier is
+	// configured would be silently ignored on most of them.
+	if err := parseQuantityEnv("UZI_WORKER_MAX_PVC_STORAGE", &cfg.WorkerMaxPVCStorage); err != nil {
+		return err
+	}
+
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
 	// silent default for the namespace — guessing it means rendering privileged pods
 	// somewhere this controller may have no RBAC, or worse, into the restricted
@@ -357,6 +382,7 @@ func validateDockerTier(cfg *Config) error {
 		{"UZI_WORKER_DIND_LIMIT_MEMORY", &cfg.WorkerDinDLimitMemory},
 		{"UZI_WORKER_DIND_DATA_SIZE", &cfg.WorkerDinDDataSize},
 		{"UZI_WORKER_DOCKER_EPHEMERAL_REQUEST", &cfg.WorkerDockerEphemeralRequest},
+		{"UZI_WORKER_DOCKER_MAX_PVC_STORAGE", &cfg.WorkerDockerMaxPVCStorage},
 	}
 	for _, q := range quantities {
 		if err := parseQuantityEnv(q.key, q.dst); err != nil {

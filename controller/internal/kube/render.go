@@ -515,6 +515,16 @@ type RenderConfig struct {
 	// worker container alone, and NEITHER may ever become a limit.
 	EphemeralRequest       string
 	DockerEphemeralRequest string
+	// MaxPVCStorage / DockerMaxPVCStorage are each tier's LimitRange maxPVCStorage
+	// (issue #224). They render NOTHING — they are the admission ceiling every PVC
+	// this controller creates must fit, checked once at boot by ValidatePVCCeilings so
+	// an oversized claim is a refusal to start rather than a fleet of workers that
+	// provision and never appear. Empty means that tier has no LimitRange, so there is
+	// no ceiling and its check is skipped. Per-tier because the two are separate
+	// namespaces with separate LimitRanges; see ValidatePVCCeilings for why the
+	// invariant is a per-tier minimum rather than an equality.
+	MaxPVCStorage       string
+	DockerMaxPVCStorage string
 	// DinDDataSize overrides the DinD daemon's data-root PVC size (issue #224 M-a).
 	// Empty ⇒ dindDataDefaultSize ("20Gi"). A quantity string, validated at the
 	// controller's boot so the render side can MustParse it. Docker-only, so it never

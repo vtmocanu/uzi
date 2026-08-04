@@ -127,6 +127,24 @@ spec:
             - name: UZI_WORKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}
             {{- end }}
+            # The RESTRICTED tier's PVC admission ceiling (issue #224). The controller
+            # constructs every worker PVC and is the only place in the system where all
+            # the claimants exist at once — nixSize, each preset's DataSize and the dind
+            # data root — but it has no way to know the LimitRange that will reject them.
+            # Injecting the ceiling makes that a missing INPUT rather than a layering
+            # violation (it already takes workers.storageClass the same way), and the
+            # controller then REFUSES TO BOOT rather than provisioning workers whose
+            # claims are rejected at admission, which presents as a worker that never
+            # appears with the reason only in a controller log.
+            #
+            # Only rendered when the LimitRange is: with no LimitRange there is no
+            # ceiling, and the controller correctly skips the check for that tier.
+            {{- if .Values.workers.limitRange.enabled }}
+            {{- with .Values.workers.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —
@@ -186,6 +204,17 @@ spec:
             {{- with .Values.workers.docker.ephemeralRequest }}
             - name: UZI_WORKER_DOCKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}
+            {{- end }}
+            # The DOCKER tier's PVC admission ceiling — see the restricted tier's key
+            # above. Injected separately because the two tiers are separate namespaces
+            # with separate LimitRanges, so the ceiling is a per-tier fact; the docker
+            # tier additionally carries the dind data-root claim, which the restricted
+            # tier does not have at all.
+            {{- if .Values.workers.docker.limitRange.enabled }}
+            {{- with .Values.workers.docker.limitRange.maxPVCStorage }}
+            - name: UZI_WORKER_DOCKER_MAX_PVC_STORAGE
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
           resources:
