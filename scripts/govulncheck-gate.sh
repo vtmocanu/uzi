@@ -55,7 +55,9 @@
 # reachable from jobs in `.publish_needs`, a test-only finding would block a
 # RELEASE for a path that does not ship. govulncheck has NO suppression,
 # baseline or allowlist mechanism of any kind (`-h` at v1.1.4 offers only
-# -C -db -format -json -mode -scan -show -tags -test), so every widening of scope is a
+# -C -db -format -json -mode -scan -show -tags -test -version -- enumerated from the
+# binary rather than from memory, twice, after the first two versions of this list
+# were each incomplete by one flag), so every widening of scope is a
 # widening of the UNREMEDIABLE-red surface. Enabling it changes nothing today
 # (both modules read 0 called either way), which is exactly when the decision is
 # cheap to make deliberately.
@@ -147,6 +149,39 @@ case "$effective_goflags" in
     ;;
 esac
 
+# 🔴 `CGO_ENABLED=0` MAKES THIS GATE REPORT CLEAN OVER A GENUINELY CALLED
+# VULNERABILITY, AND IT IS DELIBERATELY NOT REFUSED. Named here because the rule
+# this milestone earned is that a gate script NAMES the variables that can shrink
+# its view -- and this one is named without being refused, which needs its reason
+# written down or the next reader will "finish the job".
+#
+# MEASURED (auditor, probes/prd-103-mrc-b-auditor/a2-cgo-enabled-disarm.txt),
+# through this script unmodified, on a fixture whose call to a vulnerable symbol
+# sits behind `//go:build cgo`:
+#     default env      exit 1, GO-2021-0113 named
+#     CGO_ENABLED=0    exit 0, "No vulnerabilities found."
+# Mechanically this IS the -tags case: `cgo` is a build constraint, so CGO_ENABLED
+# selects which files compile, which is the refusal's own stated reason.
+#
+# WHY IT IS NOT REFUSED ANYWAY: this gate's predicate is "is a vulnerable function
+# reachable from SHIPPED code", and **the shipped binaries are built with
+# CGO_ENABLED=0** -- `api/Dockerfile:41` and `controller/Dockerfile:19` both read
+# `RUN CGO_ENABLED=0 GOOS=linux go build`. So a call reachable only under cgo is
+# not in any image, and refusing the setting would refuse the configuration that
+# matches what ships. The honest statement is that this gate already scans a
+# different file set than ships, on TWO axes -- GOOS and CGO_ENABLED -- because it
+# runs on a contributor's platform with that platform's defaults, and neither axis
+# is pinned. Pinning both to the image's values is the real fix and it is a
+# behaviour change needing its own calibration, so it is filed rather than
+# smuggled in here.
+#
+# Today it is latent, not live, and that too is measured rather than assumed: on
+# darwin/arm64 api's package graph is IDENTICAL under both settings (418 packages,
+# no file-count delta, 0 CgoFiles), and no file under `api/` or `controller/`
+# carries `import "C"` or a `//go:build cgo` constraint. On linux/amd64 the
+# stdlib file set does move (`net` 5 -> 0 CgoFiles, `os/user` 2 -> 0). It becomes
+# live the day a cgo-conditional path holds a called vulnerability.
+#
 # GOOS/GOARCH are NOT refused and fail closed, and the MECHANISM is the install
 # refusing outright -- recorded so nobody "tidies away" the check that catches them.
 #

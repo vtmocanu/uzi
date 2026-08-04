@@ -80,6 +80,39 @@ if [ ! -f "$PKG_DIR/package.json" ]; then
   exit 2
 fi
 
+# THE DELEGATED SCRIPT MUST BE AN `npm ls` INVOCATION, ASSERTED RATHER THAN
+# ASSUMED. Line 1 delegates to `scripts.deps-check` so that script's flags cannot
+# be dropped silently (Taskfile.yml's header), but the failure CLASSIFIER further
+# down reads `npm ls --depth=0 --json`'s structured `problems` array -- which is
+# only a valid discriminator if the thing that failed was npm ls. Asserting it here
+# makes the assumption checkable instead of implicit, and matches
+# scripts/npm-audit-gate.sh, which asserts its two flags against `scripts.audit`
+# for the same reason.
+DEPS_SCRIPT="$(node -e '
+const fs = require("fs");
+const pkg = JSON.parse(fs.readFileSync(process.argv[1] + "/package.json", "utf8"));
+const s = (pkg.scripts || {})["deps-check"];
+if (typeof s !== "string") { process.stderr.write("no scripts.deps-check"); process.exit(3); }
+process.stdout.write(s);
+' "$PKG_DIR")" || {
+  echo "deps-check-gate: $PKG_DIR/package.json has no \`deps-check\` script." >&2
+  echo "  INSTRUMENT FAILURE. This gate delegates to that script and classifies its" >&2
+  echo "  failures with npm ls's own structured output; with no script there is" >&2
+  echo "  nothing to delegate to." >&2
+  exit 2
+}
+case "$DEPS_SCRIPT" in
+  *"npm ls"*) ;;
+  *)
+    echo "deps-check-gate: $PKG_DIR/package.json's deps-check script does not run \`npm ls\`." >&2
+    echo "  Its deps-check script is: $DEPS_SCRIPT" >&2
+    echo "  REFUSED. This gate classifies a non-zero exit by reading" >&2
+    echo "  \`npm ls --depth=0 --json\`'s problems array, which is only a valid" >&2
+    echo "  discriminator for an npm ls failure." >&2
+    exit 2
+    ;;
+esac
+
 # A MISSING node_modules IS AN INSTRUMENT FAILURE, NOT A CLEAN TREE. Without this,
 # the join below reads no installed lockfile, produces zero rows, and reports clean
 # over a package with nothing installed at all -- the empty-result-set-looks-clean
@@ -132,16 +165,56 @@ if [ "$rc1" -ne 0 ]; then
   # protects is the 2/1/0 convention that makes a red READABLE, which
   # scripts/govulncheck-gate.sh's header exists to preserve.
   #
-  # The tokens are npm ls's, not ours: `npm ls` prints `invalid:`, `missing:`,
-  # `extraneous`, `UNMET DEPENDENCY` or an `ELSPROBLEMS` code on a real finding.
-  if grep -q -E 'invalid:|missing:|extraneous|UNMET DEPENDENCY|ELSPROBLEMS' "$TMP/out"; then
+  # 🔴 THE DISCRIMINATOR IS A STRUCTURED READ, NOT A SUBSTRING OF FREE TEXT, AND
+  # THE SUBSTRING VERSION OF THIS GUARD WAS WRONG IN BOTH DIRECTIONS.
+  #
+  # The first version of this branch grepped the delegated script's combined output
+  # for npm ls's finding vocabulary (`invalid:`, `missing:`, `extraneous`,
+  # `UNMET DEPENDENCY`, `ELSPROBLEMS`). Measured by the auditor: a deps-check script
+  # of `echo "cannot run: node_modules missing: reinstall" >&2; exit 127` was
+  # classified as a FINDING at exit 1 -- the exact inversion this branch exists to
+  # fix, reached through text instead of through an exit code.
+  #
+  # Stripping npm's `> ` script-echo lines was the obvious repair and it is NOT
+  # sufficient, which is worth recording because it looks sufficient: the token is
+  # in what the script PRINTS, not only in npm's echo of its body. Re-measured after
+  # that repair, the same fixture still returned 1. No refinement of a substring test
+  # reaches a difference the substring cannot see.
+  #
+  # So: ask npm directly, in a form that carries structure. `npm ls --depth=0 --json`
+  # emits a top-level `problems` array -- ABSENT on a clean tree, and holding the
+  # finding text when there is one (verified both ways against agent/ on npm 11.17).
+  # A script that merely prints the word "missing:" cannot populate it.
+  #
+  # THE ASSUMPTION IS ASSERTED RATHER THAN ASSUMED. This classifier only means
+  # anything if the delegated script is an `npm ls` invocation, so that is checked
+  # above; the delegation still owns WHAT RUNS (so the script's flags cannot be
+  # dropped silently, per Taskfile.yml's header), and this owns only HOW THE FAILURE
+  # IS CLASSIFIED.
+  problems=0
+  if (cd "$PKG_DIR" && npm ls --depth=0 --json) >"$TMP/ls.json" 2>/dev/null; then :; fi
+  problems="$(node -e '
+    const fs = require("fs");
+    try {
+      const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(String((j.problems || []).length));
+    } catch (_) { process.stdout.write("-1"); }
+  ' "$TMP/ls.json")"
+  if [ "$problems" = "-1" ]; then
+    echo "deps-check-gate: could not parse 'npm ls --depth=0 --json' in $PKG_DIR." >&2
+    echo "  INSTRUMENT FAILURE. Without it this script cannot tell a dependency" >&2
+    echo "  finding from npm failing to run at all." >&2
+    exit 2
+  fi
+  if [ "$problems" -gt 0 ]; then
     echo "deps-check-gate: $PKG_DIR -- node_modules does not satisfy package.json." >&2
     status=1
   else
-    echo "deps-check-gate: 'npm run deps-check' in $PKG_DIR exited $rc1 without" >&2
-    echo "  reporting any dependency problem. INSTRUMENT FAILURE, NOT A FINDING." >&2
-    echo "  Its output is above. The usual causes are a package.json with no" >&2
-    echo "  deps-check script, or npm missing from PATH." >&2
+    echo "deps-check-gate: 'npm run deps-check' in $PKG_DIR exited $rc1 while" >&2
+    echo "  'npm ls --depth=0 --json' reports ZERO problems. INSTRUMENT FAILURE," >&2
+    echo "  NOT A FINDING. Its output is above. The usual causes are a package.json" >&2
+    echo "  with no deps-check script, npm missing from PATH, or a deps-check script" >&2
+    echo "  that fails for a reason unrelated to the dependency tree." >&2
     exit 2
   fi
 fi

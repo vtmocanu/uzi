@@ -198,6 +198,50 @@ rc=0
 cat "$TMP/out"
 
 if [ "$rc" -eq 0 ]; then
+  # 🔴 THE CLEAN BRANCH NEEDS A POSITIVE OBSERVATION TOO, AND IT WENT WITHOUT ONE
+  # UNTIL 2026-08-04. The findings branch below has required npm's own report
+  # header since it shipped; this one required nothing, so ANY rc=0 was reported as
+  # "clean". That asymmetry is the wrong way round: the findings branch fails
+  # CLOSED, and this is the branch that ships a green.
+  #
+  # Measured by the auditor (probes/prd-103-mrc-b-auditor/a3-npm-audit-clean-arm.txt),
+  # and note both fixtures pass the two flag assertions above -- moving the read
+  # from the file to `scripts.audit` did not close this, because the decoy simply
+  # moves INSIDE the audit script:
+  #
+  #   scripts.audit = 'echo skipping: npm audit --audit-level=high --include=dev; exit 0'
+  #       -> both assertions pass, gate exit 0 "clean". No audit ran.
+  #   scripts.audit = 'npm audit --audit-level=high --include=dev || echo see docs/...'
+  #       -> npm genuinely errors, `|| echo` swallows the rc, gate exit 0 "clean"
+  #          with npm's own error text printed directly above the word. This is the
+  #          ordinary-maintenance shape, not an attack.
+  #
+  # 🔴 THE TEST IS "npm PRODUCED A VERDICT", NOT "npm FOUND NOTHING", AND THE
+  # DIFFERENCE IS THE WHOLE GATE. The obvious one-line remedy -- require npm's own
+  # `found 0 vulnerabilities` -- is WRONG for a gate that thresholds above zero, and
+  # it was written here and refuted by `web` inside a minute: `npm audit
+  # --audit-level=high` exits 0 on a tree whose only findings are MODERATE, while
+  # printing the full moderate report. Its output therefore says "2 moderate
+  # severity vulnerabilities" and never "found 0 vulnerabilities", so the strict
+  # form took `vulncheck:web` -- the configuration this repo actually ships -- to
+  # exit 2 with "INSTRUMENT FAILURE" over a perfectly good run.
+  #
+  # So accept EITHER of npm's two verdict shapes at rc=0: `found 0 vulnerabilities`
+  # (nothing at any level) or a `# npm audit report` header (findings exist, all of
+  # them below the threshold). The findings branch below already requires the same
+  # header, which is what makes the pair symmetric.
+  #
+  # Both of the auditor's fixtures still fail closed under this weaker test, which
+  # is the check that matters: `echo skipping: npm audit …; exit 0` prints neither
+  # shape, and `npm audit … || echo …` on a genuinely erroring npm prints neither.
+  if ! grep -q -F -e 'found 0 vulnerabilities' -e 'npm audit report' "$TMP/out"; then
+    echo "npm-audit-gate: $PKG_DIR -- npm exited 0 without printing a clean audit result." >&2
+    echo "  INSTRUMENT FAILURE, NOT A CLEAN TREE. The output above is the whole of" >&2
+    echo "  what npm produced; nothing in it is a verdict about this tree. The usual" >&2
+    echo "  cause is an \`audit\` script that does not actually run npm audit, or one" >&2
+    echo "  that swallows npm's exit code with \`|| something\`." >&2
+    exit 2
+  fi
   echo "npm-audit-gate: $PKG_DIR clean at --audit-level=$LEVEL"
   exit 0
 fi
