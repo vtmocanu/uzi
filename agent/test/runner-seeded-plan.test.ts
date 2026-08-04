@@ -235,3 +235,75 @@ describe("RunRunner — seeded plan discriminator (PRD #209 D4)", () => {
     );
   });
 });
+
+// ── PRD #209 M6: the seeded run's whole path, end to end through the stub ─────
+//
+// Success Criterion 1 ("a user with a written plan reaches 'worker is implementing'
+// in ONE command, with no approval gate and no planning turn") stated as a single
+// assertion over the REAL runner driving a StubExecutor (which already honours the
+// pre-approved path, executor.ts) against the fakeGitlab transport: create → claim →
+// implement → push → MR, and the run NEVER passes through awaiting_approval.
+//
+// The row-2 discriminator test above proves the runner RESOLVES the seed correctly
+// (what the executor receives); the D3 test proves no clobbering state report escapes.
+// This is the missing headline: the full lifecycle, asserting the gate-skip and the MR
+// delivery TOGETHER on one run, so a regression that reintroduced the gate — or one
+// that skipped the gate but then failed to reach the MR — is caught here specifically.
+describe("RunRunner — seeded run full path (PRD #209 M6, Success Criterion 1)", () => {
+  it("goes create → claim → implement → MR, never parking at awaiting_approval", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(90, {
+      plan_approved: true,
+      plan_source: "seeded",
+      plan_md: "# Seeded plan\n\n- write the marker\n- open the MR",
+      session_id: null,
+    });
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    const statuses = states.map((s) => s.status);
+    // The run walks claim→running (twice: the claim transition + the post-checkout
+    // roster report) then a `running` implement heartbeat, and ends `completed`. The
+    // load-bearing invariant of Success Criterion 1 is what is ABSENT: the run reaches
+    // implement and completes touching ONLY running + completed — never awaiting_approval.
+    // (The pre-approved path adds a third `running` via reportIteration; that count is
+    // incidental, so this asserts the state ALPHABET, not the exact sequence.)
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "a seeded run must never post an awaiting_approval state (Success Criterion 1)",
+    );
+    assert.strictEqual(statuses.at(-1), "completed", "the seeded run completes");
+    assert.deepStrictEqual(
+      [...new Set(statuses)].sort(),
+      ["completed", "running"],
+      "only running + completed states appear — no gate, no failure",
+    );
+
+    // → MR: the branch was pushed and exactly one merge request opened, carrying the
+    // Closes trailer and the run's branch. This is the "reaches delivery" half.
+    assert.strictEqual(calls.length, 1, "exactly one MR opened");
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "POST");
+    assert.match(call.url, /\/merge_requests$/);
+    const body = JSON.parse(call.body ?? "{}");
+    assert.strictEqual(body.source_branch, "agent/issue-90");
+    assert.strictEqual(body.target_branch, "main");
+    assert.match(body.description, /Closes #90/);
+    const completed = states.find((s) => s.status === "completed")!;
+    assert.strictEqual(completed.branch, "agent/issue-90");
+    assert.strictEqual(completed.mr_iid, 42);
+
+    // No planning turn: none of the plan-gate feed kinds a Phase-1 turn or a revision
+    // loop would emit ever appear. The seeded skip is announced exactly once, and its
+    // wording names the external provenance rather than mislabelling it a resume.
+    const msgs = api.messages(claim.run_id);
+    assert.deepStrictEqual(
+      msgs.filter((m) => m.kind === "plan" || m.kind === "plan_feedback" || m.kind === "plan_revising"),
+      [],
+      "a seeded run emits no plan / plan_feedback / plan_revising message (no planning turn, no gate)",
+    );
+    const skips = msgs.filter((m) => String(m.payload?.text ?? "").includes("skipping the planning turn"));
+    assert.strictEqual(skips.length, 1, "the gate-skip is reported exactly once on the feed");
+    assert.match(String(skips[0]!.payload.text), /seeded/, "the feed names the seeded provenance");
+  });
+});
