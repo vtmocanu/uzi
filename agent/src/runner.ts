@@ -322,7 +322,7 @@ export class RunRunner {
     // `active.shuttingDown` to tell a graceful shutdown apart from every other failure.
     let active: ActiveRun | undefined;
     // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
-    // the three filesystem removals in the finally and nothing else. Declared here
+    // the two filesystem removals in the finally and nothing else. Declared here
     // rather than in the catch so the finally can see it; false is the safe default,
     // so every path that never reaches the park logic cleans up exactly as before.
     let parked = false;
