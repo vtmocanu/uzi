@@ -189,7 +189,7 @@ if [ -f go.mod ]; then
         echo "  golangci-lint would emit typecheck errors instead of findings" >&2
         echo "  (golangci-lint #5641/#6272), diverging local/CI from this pin." >&2
         echo "  Bump the pin to a release built with go>=${m_maj}.${m_min}: update the" >&2
-        echo "  version and BOTH per-arch sha256 literals in this script (PRD #230 D6)." >&2
+        echo "  version and both per-arch tar+bin sha256 pairs in this script (PRD #230 D6)." >&2
         exit 2
       fi
       ;;
