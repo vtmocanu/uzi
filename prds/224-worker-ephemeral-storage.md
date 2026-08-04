@@ -642,3 +642,74 @@ source citation is upstream `release-1.29` while this is a vendor/platform FIPS 
 (`v1.29.4+vendor.3-fips.1`) whose patch set it did not diff** — a vendor deviation in the eviction
 manager would have been invisible to it. The live message rendering byte-matches the upstream format
 string, which is a positive control on that one path and not on the others.
+
+### A6 — 2026-08-04, USER DECISIONS: ship-and-accept, and all four follow-ups land HERE
+
+**A6.1 — sequencing: SHIP IT AND ACCEPT ONE LOSS EVENT.** A4.1's fleet roll is accepted rather than
+mitigated. #218 M1 is **not** a precondition, and the rollout is **not** gated on a drained fleet.
+The user was shown all four options with the loss stated plainly and chose this one.
+
+Two obligations follow, and they are not optional:
+
+1. **The release note and the CHANGELOG must say that rolling this kills every in-flight run once.**
+   Silence here converts an accepted, understood cost into an incident.
+2. **A5.1's open question is now MOOT for the sequencing decision.** Whether the rollout path keeps
+   its 30s grace only mattered for choosing between options; nothing now depends on it. The
+   fact-checker's answer is still worth having as a durable fact about this cluster — it corrects
+   issue #224's `## Related` and #218 M1 either way — but it no longer blocks anything.
+
+**A6.2 — all four follow-ups are IN SCOPE for this session, not filed.** The user's words: *"cant we
+fix them all now, in this session?"* This makes #224 substantially larger than its `effort::small`
+label, deliberately and with the cost stated. **One argument actively favours it: every item here is
+a pod-spec change, so doing them together costs ONE fleet roll instead of three** — which under A6.1
+is exactly the cost being accepted.
+
+**A6.3 — 🔴 (a) AND (c) WERE CONTRADICTORY AND THE LEAD RESOLVED IT IN FAVOUR OF (a).** They are
+alternatives, not complements. Moving the daemon data root to a PVC removes it from ephemeral
+accounting **entirely**, so there is no `emptyDir` left for an `emptyDir.sizeLimit` to bound.
+Selecting both is not buildable.
+
+- **(a) SHIPS.** It was the architect's own preference (A4.6), it is the only instrument in play that
+  produces **backpressure** rather than an eviction, and it changes the failure mode from *pod
+  eviction destroys the tree* to *ENOSPC in the daemon, the docker step fails, the tree survives*.
+- **(c) is MOOT BY CONSTRUCTION, not done.** Recorded as such so nobody later reads it as delivered.
+  `run-workdir` becomes the only remaining emptyDir and **must never** get a `sizeLimit` — it holds
+  the checkout this whole issue exists to protect (A4.5).
+
+**A6.4 — (a) RE-OPENS THE SIZING THE WAVE JUST CLOSED, in the easy direction.** A4.4's 6Gi and its
+~2.3 GiB fleet ceiling were both derived from a footprint that is **99.3% `dind-data`**. Move that
+to a PVC and the residual ephemeral footprint is the measured **~4 MiB** (run-workdir 3.2 MiB +
+both containers' rootfs+logs ~0.3 MiB). So:
+
+- the docker/plain split in A4.2 may collapse — if the residual is a few MiB either way, one flat
+  constant may serve both tiers;
+- **A3.5's fleet-unschedulability ceiling dissolves**, because a sub-GiB request cannot approach
+  17.55 GiB even at 30 workers;
+- **the 200Gi quota stops being decorative for a different reason than A3.5 gave** — the bytes move
+  to `requests.storage`, which that quota already tracks at 140Gi with 64Gi used. **The PVC quota
+  and `persistentvolumeclaims: "20"` count are now the binding constraints and must be re-derived**:
+  a third PVC per docker worker changes both.
+
+**The architect must re-answer A4.3's numbers under this design before the coder starts.** Do not
+carry 6Gi forward by inertia; it was correct for a design that is no longer the one being built.
+
+**A6.5 — (b) is genuinely independent and is the one item with no interaction.** The `/nix` PVC at
+2.97 GiB of 3.86 GiB (A4.10) is a different volume, a different failure and a different fix.
+**Feasibility is unestablished and must be checked before it is committed to**: PVC expansion needs
+`allowVolumeExpansion: true` on the StorageClass, and the controller would have to reconcile
+`spec.resources.requests.storage` on an existing PVC. If the StorageClass does not allow expansion
+there is no in-place path at all and the honest answer is delete-and-reprovision, which is what
+`nixSize`'s own comment already says. **Check the StorageClass before designing the fix.**
+
+**A6.6 — (d) is bounded by what a session can measure, and the honest answer is partial.** A p95 over
+a fleet-week is not obtainable today. What is obtainable now, read-only: a broader sweep across every
+live worker and both node classes, at more than the two time points the wave took. Under A6.4 the
+number matters far less anyway. **The follow-up to replace a default with a fleet-measured one
+survives this session** and should be filed rather than claimed as done.
+
+**A6.7 — decomposition. `units: 1`, three sequential milestones, ONE writer.** M-a (dind data root →
+PVC), M-b (ephemeral requests + the eight doc corrections, numbers re-derived per A6.4), M-c (nix
+resize path, conditional on A6.5). This is **not** three parallel units: M-a and M-b both edit the
+worker container's resources and the volume list in `render.go`, and M-c edits `renderPVC` and
+`preset` alongside them. The file-disjointness test fails, so the parallel-worktree shape does not
+apply — one coder, sequential commits, per the validated single-writer-token pipeline.
