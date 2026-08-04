@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type RunContext, type ExecutorResult } from "../src/executor.js";
+import { StubExecutor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
+import { nullLogger } from "./helpers.js";
 import {
+  api,
   fakeGitlab,
   gitlabClaim,
   installHarness,
+  runner,
   runnerWith,
 } from "./runner-harness.js";
 
@@ -162,5 +165,73 @@ describe("RunRunner — seeded plan discriminator (PRD #209 D4)", () => {
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
+  });
+
+  // Fail-safe (auditor-m2's surviving mutation): an OLDER server omits plan_source. The
+  // discriminator MUST compare the literal "seeded", never `!== "agent"` — the latter
+  // treats a missing field as seeded, reopening the D8 hole (skip the gate and implement an
+  // unreviewed plan). With no plan_source and no session, planApproved must follow the
+  // SESSION (false), not the source. This test fails under the `!== "agent"` refactor,
+  // which the whole D4 row suite above does NOT catch.
+  it("fail-safe: an absent plan_source is NOT seeded (planApproved follows the session)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-seeded-"));
+    const seen: RunContext[] = [];
+    // plan_source deliberately omitted (older server), approved, no session.
+    const claim = gitlabClaim(84, {
+      plan_approved: true,
+      plan_md: "# a plan",
+      session_id: null,
+    });
+    try {
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.strictEqual(
+        seen[0]?.seeded,
+        false,
+        "an absent plan_source must not be treated as seeded",
+      );
+      assert.strictEqual(
+        seen[0]?.planApproved,
+        false,
+        "no session + not seeded ⇒ must re-plan, never skip (D8 fail-safe)",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // D3 ⟨R⟩ invariant (PRD asked M2 to "assert, not assume"): a seeded run has a create-time
+  // agent_selection persisted server-side, and SetRunRunning COALESCEs agent_source against
+  // any non-null report — so if the worker echoed a selection on a state report it would
+  // CLOBBER the create-time one. A seeded run takes the pre-approved path and NEVER enters
+  // the autopilot gate branch (runner.ts's only site that reports agent_selection), so it
+  // must send no such report. Driven through the REAL runner + stub so every /state body is
+  // the one the server would receive.
+  it("D3: a seeded run reports NO agent_selection (cannot clobber its create-time selection)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(85, {
+      plan_approved: true,
+      plan_source: "seeded",
+      plan_md: "# Seeded plan\n- do it",
+      session_id: null,
+      // The create-time selection the server persisted and replays on the claim.
+      agent_selection: { source: "own", exclusions: ["reviewer"] },
+    });
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    const states = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
+    assert.ok(
+      states.every((s) => s.agent_selection === undefined),
+      "a seeded run must never echo an agent_selection on a state report (D3 clobber guard)",
+    );
+    assert.ok(
+      !states.some((s) => s.status === "awaiting_approval"),
+      "a seeded run skips the gate entirely (pre-approved path taken)",
+    );
+    assert.ok(
+      states.some((s) => s.status === "completed"),
+      "the seeded run completed — the state stream is the full run, not a truncated one",
+    );
   });
 });

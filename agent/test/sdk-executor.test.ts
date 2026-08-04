@@ -2070,6 +2070,48 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
   });
 });
 
+// ── PRD #209 (M2 validation): the seeded plan BODY reaches the implement turn ──────
+// The gap the original checklist missed. `ctx.approvedPlan` was read only by the
+// skip-gate condition and the ci_fix check — never passed to buildImplementPrompt. A
+// session-less seeded run's first implement turn is fresh and prompt-only, so without the
+// body in that prompt the model never sees the user's plan and falls back to the issue.
+// These assert on the prompt TEXT the executor streamed to the SDK (turns[i].promptText),
+// which is the only channel that proves the wiring — the stub harness feeds no model.
+describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 M2)", () => {
+  const PLAN = "# Seeded plan\n- do the uniquely-worded thing zqx42";
+
+  it("embeds the plan text in the first implement prompt for a session-less seeded run", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, seeded: true, sessionId: null, approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(turns.length, 1, "only the implement turn runs (no planning turn)");
+    assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the user's plan");
+    assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
+  });
+
+  it("does NOT re-embed the plan for a seeded RESUME — the session already carries it", async () => {
+    // sessionId present ⇒ a resume; the plan lives in the resumed session, so re-injecting
+    // it would be redundant and the resume prompt must stay unchanged apart from the opening.
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, seeded: true, sessionId: "sess-parked", approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /<plan>/, "a resume must not re-embed the plan body");
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /zqx42/);
+  });
+
+  it("does NOT embed a plan for an ordinary gated (non-seeded) run", async () => {
+    // Not approved/seeded ⇒ it gates; the implement prompt (turns[1], after the planning
+    // turn) must be byte-unaffected — buildImplementPrompt never carried a plan before.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ approvedPlan: PLAN });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /<plan>/, "a gated run's implement prompt is unchanged");
+  });
+});
+
 // --- Plan-turn write-tool subtraction (#203) ----------------------------------
 //
 // Before the approval gate, a subagent write is an uncommitted worktree change the

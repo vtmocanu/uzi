@@ -980,6 +980,18 @@ export class SdkExecutor implements Executor {
       });
 
       // --- Phase 2: implement ⇄ review loop --------------------------------
+      // PRD #209 (M2 validation): the seeded plan BODY must reach the first implement turn.
+      // A session-less seeded run (row 2 cold start, or a requeued seeded run whose
+      // transcript was dropped) has no plan turn AND no resumable session carrying the plan,
+      // so without this the model never sees the user's plan and falls back to the issue —
+      // defeating the feature. Gated on the ABSENCE of a session: a seeded RESUME already
+      // has the plan in its session (byte-identical), and every non-seeded path leaves this
+      // undefined. buildImplementPrompt embeds it first-turn-only, as authoritative
+      // instructions (D5), never untrusted-fenced.
+      const seededPlanBody =
+        preApproved && ctx.seeded === true && !ctx.sessionId
+          ? approvedPlan
+          : undefined;
       let iteration = 0;
       let followUp: string | undefined;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
@@ -1006,6 +1018,10 @@ export class SdkExecutor implements Executor {
             // supplied the plan, not that it was "approved". First turn only (gated
             // inside buildImplementPrompt); false/absent for every non-seeded run.
             seeded: ctx.seeded,
+            // PRD #209 (M2 validation): the seeded plan body, embedded first-turn-only.
+            // Undefined for every path except the session-less seeded cold start (see
+            // seededPlanBody above), so resume/gated implement prompts are unchanged.
+            seededPlan: seededPlanBody,
             followUp,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn

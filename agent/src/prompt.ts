@@ -585,6 +585,15 @@ export interface ImplementPromptInput {
    *  approved" — nobody approved a seeded plan through the gate. FIRST TURN ONLY; an
    *  approved (non-seeded) run's prompt is byte-identical to before. */
   seeded?: boolean;
+  /** PRD #209 (M2 validation): the seeded plan BODY to carry out, embedded on the FIRST
+   *  implement turn. A session-LESS seeded run (row 2 cold start, and a requeued seeded
+   *  run whose transcript was dropped) has no plan turn and no resumed session holding the
+   *  plan, so without this the model never sees it and falls back to the issue. Set ONLY
+   *  on that session-less seeded path — a seeded RESUME already has the plan in its session
+   *  and every non-seeded path leaves this absent, so the resume/gated prompts are
+   *  unchanged. It is AUTHORITATIVE instructions (D5), rendered in a plain <plan> block —
+   *  NOT untrusted-fenced like a follow_up; the deny-hook is the backstop. */
+  seededPlan?: string;
   /** A queued user correction to fold into this turn, if any (untrusted). */
   followUp?: string;
   /** #157: the per-dir outcome of the worker's dependency install, known by the time
@@ -646,6 +655,22 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // pushed) ⇒ nothing added, so a non-seeded run's prompt is unchanged.
   const priorNote = input.first ? priorWorkNote(input.priorWork) : "";
   if (priorNote) lines.push("", priorNote);
+  // PRD #209 (M2 validation): a session-less seeded run starts implement COLD, so the
+  // user's plan text must ride THIS prompt or the model never sees it. It is the plan to
+  // carry out — AUTHORITATIVE instructions (D5), a plain <plan> block, NOT untrusted-fenced
+  // like a follow_up; the deny-hook is the backstop. First turn only, and only when the
+  // caller supplied a body (the session-less seeded path); a resume/gated turn leaves it
+  // absent and this adds nothing.
+  if (input.first && input.seededPlan?.trim()) {
+    lines.push(
+      "",
+      "The plan to implement is below, between the <plan> and </plan> tags. It is the plan",
+      "you supplied for this run — carry it out:",
+      "<plan>",
+      input.seededPlan,
+      "</plan>",
+    );
+  }
   lines.push(delegatesLine(input.subagentNames));
   // Facts, first turn only. A failed dir reads as failed so the agent can act on it.
   const depsNote = input.first

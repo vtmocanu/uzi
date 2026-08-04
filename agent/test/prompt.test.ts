@@ -218,6 +218,31 @@ describe("buildImplementPrompt", () => {
     const none = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
     assert.ok(!/already carries/.test(none));
   });
+
+  // PRD #209 (M2 validation): the seeded plan BODY must reach the implement turn — the
+  // assertion the original checklist missed. A session-less seeded run is prompt-only on
+  // its first turn, so the plan has to be embedded or the model never sees it.
+  it("PRD #209 M2: a seeded first turn embeds the supplied plan as authoritative <plan> instructions", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, seededPlan: "# My plan\n- step alpha-77" });
+    assert.match(p, /<plan>/);
+    assert.match(p, /<\/plan>/);
+    assert.match(p, /step alpha-77/, "the actual plan text is present");
+    // Authoritative instructions (D5), NOT untrusted-fenced like a follow_up. With no
+    // follow-up in this prompt, the untrusted framing must be entirely absent.
+    assert.ok(!/UNTRUSTED/i.test(p), "the seeded plan is instructions, not untrusted guidance");
+  });
+
+  it("PRD #209 M2: the plan body is first-turn-only and absent when no body is supplied", () => {
+    // A later turn resumes a session that already has the plan, so it is not re-embedded.
+    const later = buildImplementPrompt({ branch: "b", subagentNames: [], first: false, iteration: 2, seeded: true, seededPlan: "# My plan" });
+    assert.ok(!/<plan>/.test(later), "no plan block on a resumed later turn");
+    // First turn but no body supplied (a seeded resume, or any non-seeded run): no block.
+    const noBody = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true });
+    assert.ok(!/<plan>/.test(noBody), "no body ⇒ no plan block");
+    // And a whitespace-only body is treated as absent (nothing to implement).
+    const blank = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, seededPlan: "   " });
+    assert.ok(!/<plan>/.test(blank));
+  });
 });
 
 describe("buildRevisePlanPrompt (PRD #41)", () => {

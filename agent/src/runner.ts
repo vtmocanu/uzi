@@ -373,10 +373,11 @@ export class RunRunner {
         });
       }
       // The lead is about to plan with no memory of the earlier turns. If the branch it
-      // is standing on already carries pushed work, tell it so in the planning prompt —
-      // otherwise the honest degradation just becomes silently duplicated work, which
-      // is the harder failure to notice. Both conditions required: a fresh run reading
-      // its own first-attempt branch needs no such warning.
+      // is standing on already carries pushed work, tell it so — in the planning prompt,
+      // or, for a session-less seeded run that has NO planning turn, the implement prompt
+      // (PRD #209 D7) — otherwise the honest degradation just becomes silently duplicated
+      // work, which is the harder failure to notice. Both conditions required: a fresh run
+      // reading its own first-attempt branch needs no such warning.
       const priorWork =
         resumeDropped && runnerClone.priorCommits > 0
           ? { commits: runnerClone.priorCommits }

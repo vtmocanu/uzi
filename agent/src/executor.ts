@@ -108,23 +108,27 @@ export interface RunContext {
    *  first turn instead of resuming anything. */
   sessionId?: string | null;
   /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
-   *  already carries pushed work. The executor forwards it to the planning prompt so
-   *  an amnesiac lead is told to read the existing commits rather than redo them —
-   *  the honest degradation must not become silently duplicated work. */
+   *  already carries pushed work. Forwarded to the planning prompt so an amnesiac lead is
+   *  told to read the existing commits rather than redo them — the honest degradation must
+   *  not become silently duplicated work. PRD #209 (D7) adds a SECOND consumer: on the
+   *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
+   *  the IMPLEMENT prompt instead (first turn only). */
   priorWork?: PriorWork;
-  /** PRD #35 Decision 6b: this run's plan is ALREADY APPROVED and its SDK session is
-   *  resumable here, so the executor skips the Phase-1 planning turn and the gate and
-   *  goes straight to implement⇄review with `approvedPlan` below.
+  /** PRD #35 Decision 6b + PRD #209 D4: this run's plan is ALREADY APPROVED, so the
+   *  executor skips the Phase-1 planning turn and the gate and goes straight to
+   *  implement⇄review with `approvedPlan` below.
    *
-   *  Set by the RUNNER, which is the only layer that knows all three facts: the
-   *  server said plan_approved, a session id survived, and issue #105's transcript
-   *  check did not drop it. Without this a park-and-resume re-plans, re-parks the run
-   *  at awaiting_approval in front of a human who already approved, and can fail
-   *  outright with REASON_NO_PLAN when the resumed session declines to re-emit
-   *  signal_plan — the run's own approval turned into a dead end.
+   *  Set by the RUNNER, which is the only layer that can tell the eligible cases apart:
+   *  the server said plan_approved, AND EITHER a session id survived issue #105's
+   *  transcript check (PRD #35 resume — the plan lives in that session) OR the run is
+   *  `seeded` (PRD #209 row 2 — the user authored the plan at create time and there is no
+   *  session, by construction). Without this a park-and-resume re-plans, re-parks the run
+   *  at awaiting_approval in front of a human who already approved, and can fail outright
+   *  with REASON_NO_PLAN when the resumed session declines to re-emit signal_plan.
    *
-   *  A park BEFORE approval (only reachable if the planning turn itself died on a
-   *  limit) leaves this false and resumes into planning exactly as today. */
+   *  A NON-seeded run whose transcript was dropped is set false here and re-plans (D4 row
+   *  3); a park BEFORE approval (only reachable if the planning turn itself died on a
+   *  limit) likewise leaves this false and resumes into planning exactly as today. */
   planApproved?: boolean;
   /** PRD #209 (D4 row 2): this run's plan was supplied EXTERNALLY by the user at create
    *  time (claim plan_source='seeded'), not produced by a Phase-1 planning turn. Set by
