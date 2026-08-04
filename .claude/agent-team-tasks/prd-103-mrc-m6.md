@@ -637,7 +637,56 @@ covers the `web`/`vitest` case, which is the hazard it was chosen for, and it is
 description:** *catches a stale DIRECT dependency; a lockfile-only transitive bump is
 invisible to it, and `npm ci` is the only guarantee there.* A shipped comment
 claiming the lockfile framing is a **blocking** defect, not a nit — it would tell
-every future reader the gate covers a case it cannot see. **Where it
+every future reader the gate covers a case it cannot see.
+
+**🔴 AMENDMENT 8: MEASURED ON THE REAL STALE STATE, `deps-check` COVERS 1 OF MR-C'S 6
+DEPENDENCY CHANGES, AND `gate:agent` IS GREEN ON A TREE HOLDING EVERY VULNERABLE
+VERSION.** The state was produced the way a git pull produces it — `npm ci` from the
+pre-bump `package.json`+lockfile, then `git checkout --` both files back to HEAD,
+`node_modules` untouched — not hand-built.
+
+```
+web    declared vitest 4.1.10, installed 2.1.9
+       npm run deps-check  rc=1   "vitest@2.1.9 invalid: \"4.1.10\" from the root project"
+       task gate:web       rc=201 after running exactly ONE target, deps-check:web   <- fails closed, first
+
+agent  lockfile 1.30.0 / 2.1.0 / 3.1.5 / 4.13.0 / 10.4.0
+       node_modules  1.29.0 / 1.19.14 / 3.1.3 / 4.12.27 / 10.2.0
+       npm run deps-check  rc=0, ZERO invalid lines                                  <- walks straight past
+```
+
+**And the same blind spot hits `web` on the security-relevant package.** On that stale
+web tree `postcss` reads **8.5.16 installed against declared `^8.4.49`** — satisfied,
+no finding — while the lockfile says **8.5.25**. postcss is the *high-severity
+advisory fix* in `121d7610`. It is masked only because vitest reddens in the same run;
+remove the vitest bump and the security fix is silently uncovered.
+
+**REQUIRED: add a second line to the same script — a lockfile join, measured, offline,
+no new dependency.**
+
+```sh
+jq -r '.packages|to_entries[]|select(.key!="")|"\(.key)\t\(.value.version)"' package-lock.json             | sort > lk.tsv
+jq -r '.packages|to_entries[]|select(.key!="")|"\(.key)\t\(.value.version)"' node_modules/.package-lock.json | sort > nm.tsv
+join -t$'\t' lk.tsv nm.tsv | awk -F'\t' '$2!=$3'
+```
+
+agent → **5 rows, exactly the five bumps, zero false positives**. web → **15 rows,
+including postcss 8.5.25 vs 8.5.16**. **The join on the INTERSECTION is load-bearing**:
+a raw diff of the two files gives ~370 spurious rows, because the committed lockfile
+lists every platform's optional binaries while the installed tree holds only this
+platform's.
+
+**Keep `npm ls --depth=0` and ADD this — do not swap.** `npm ls` names the declared
+*range*, which is the more legible message when it fires. Offline property
+re-derived and holding for both: with `npm_config_registry=http://127.0.0.1:1`, output
+is byte-identical to the clean run, rc=0.
+
+**Also: the calibration tested the MIRROR of the hazard.** The web arm mutated the
+declared range against a current install; the real hazard is a current declaration
+against a stale install. Both produce a finding, and the second is now measured — but
+the commit message presents the first as the calibration for the second, and the
+Taskfile comment quotes an output string the calibration never produced. That string
+*is* the true one on the real stale state. **Cite the measured direction.** **Where it
 lies:** in the *other* stale shape, `npm install --package-lock-only` run in place
 (which also rewrites `node_modules/.package-lock.json`), `npm ls` returns **rc=0 and
 prints `2.1.3` while `node_modules/ms/package.json` says `1.0.0`** — confidently
