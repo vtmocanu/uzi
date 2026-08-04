@@ -41,6 +41,11 @@ out and warns in the run feed on a mismatch. Add `--require-base` to make a
 mismatch fail the run instead of warning — useful when the plan describes
 exact line ranges that a moved base would invalidate.
 
+`--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
+non-hex value is a usage error (exit 2). The safe answer is always the full
+SHA of the commit you planned against: `--planned-commit $(git rev-parse
+HEAD)` in your own clone.
+
 ## 3. Pick the roster (optional)
 
 By default a seeded run uses the same roster any other run would: the
@@ -63,13 +68,14 @@ chosen source is silently a no-op rather than an error.
 
 ```sh
 uzi run create --repo <repo-id> --issue <issue-iid> \
-  --plan-file plan.md --agent-source repo
+  --plan-file plan.md --agent-source repo \
+  --planned-commit $(git rev-parse HEAD)
 ```
 
 Pass `-` instead of a file path to read the plan from stdin. An empty plan,
 or one over the 256 KiB cap, is rejected at create time (exit 1) rather than
 stored. A roster or base-commit flag without `--plan-file` is a usage error
-(exit 2) — see [Agents: `--json` and exit codes](./cli.md#agents-json-and-exit-codes).
+(exit 2) — see [Agents: `--json` and exit codes](./cli.md).
 
 The worker then clones, checks out, and implements the plan directly. Watch
 it the same way as any other run — `uzi run logs --follow` or `uzi tui
