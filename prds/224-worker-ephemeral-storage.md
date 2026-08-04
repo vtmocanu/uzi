@@ -2795,3 +2795,66 @@ different hat. **A guard has to survive the person with a reason to remove it**,
 that reaches that person is the text they see at the moment they are blocked.
 
 Queued with the rest; it modifies A30.6's fourth row rather than adding an item.
+
+### A32 — 2026-08-04, SPEC SYNC at `652fffd7`, and a 🔴 MERGE HAZARD on this branch
+
+**A32.1 — `specs/ai.md` §479-§481 applied.** Live head was **478 everywhere** — `origin/main` plus
+all six sibling worktrees, **swept rather than assumed**, per the append-only numbering rule — so no
+renumbering was needed. §479 is the ephemeral request design, §480 is M-a and the quota work, §481 is
+the three nets plus a standing **"what #224 does NOT deliver"** list. **The contract line is the first
+thing in §479, in a box:** #224 lowers the **frequency** of a silent total work loss, does not fix
+it, and #218's fetch-back cannot fire on a kubelet eviction here anyway.
+
+**A32.2 — it read A28-A31 mid-write and folded all four in.** The tip moved `e0fca371` → `9a161859`
+underneath it; it noticed, read them, and §481 already carries net-2-is-two-tests, the structural
+absent-ceiling reason, the `Recreate` coupling with A31's why-in-the-failure-message, and the
+derive-the-claimant-list-from-the-renderer rule **phrased as the binding rule so it stays true whether
+or not the coder's commit has landed.** It also split §480's `Recreate` discussion in two, since **the
+worker Deployment's `Recreate` (Multi-Attach) and the controller's (fail-stopped) are different
+objects with different reasons** — a conflation nobody else had spotted.
+
+**A32.3 — A13.9's drift was FIVE present-tense sites, not two.** The two the reviewer named, plus
+three more found **by sweeping around them**:
+
+| site | was | now |
+|---|---|---|
+| §268 | "`/nix` is a flat **4Gi**" | flat 20Gi, with #58→#87 history |
+| §268 | fleet arithmetic "20 x `m` = **280Gi**" | **the same 4Gi-era drift the chart's own quota comment carried** (A8.5) — corrected to 800Gi |
+| §305 | "`preset.nixSize` (a flat **4 GiB**) … may need a bump" | closed; #87 measured ~2.6 GiB |
+| §305 | k8s `dinddata` GC guidance | it is a PVC since M-a |
+| §302 | the render's `dinddata` volume | ditto |
+
+**The §268 arithmetic is the interesting one: the identical stale number appeared independently in
+`values.yaml` and in `specs/ai.md`**, and each was found by a different agent in a different round.
+`prds/done/58` and `prds/done/87` correctly untouched — past-tense records.
+
+**A32.4 — 🔴 MERGE HAZARD, VERIFIED BY THE LEAD: THE BRANCH TIP CARRIES THE CI-SKIP MARKER, AND
+30 OF 38 COMMITS DO.** Measured, not relayed: `git log -1 --format=%B | grep -c -F` on the tip
+returns **1**. This is exactly CLAUDE.md's documented trap. **GitLab reads the marker from the MR's
+HEAD commit however the pipeline is triggered** — an explicit API-triggered pipeline is not an escape
+hatch — and this project sets `allow_merge_on_skipped_pipeline: true`, so the MR would report
+`mergeable` with a `skipped` pipeline and **seven code commits could merge on a pipeline that ran
+nothing.**
+
+**The marker is CORRECT on every docs-only commit and dangerous only at the tip.** Requirement: **the
+final commit before the MR is cut must not carry it.** The coder's queued commit is code and is
+instructed not to mark it — but **any further amendment to this brief re-marks the tip**, so the last
+write before the MR must be the code commit, or a deliberate unmarked one on top. Check with
+`git log -1 --format=%B | grep -c -F '[skip ci]'` immediately before opening the MR.
+
+**A32.5 — `specs/human.md` NOT touched; two edits proposed for the owner** (the contract requires
+approval). **2a** is a new Feature #224 section recording the nine user-stated decisions with dates
+and verbatim quotes. **2b** amends a stale present-tense line under Feature #58 that still says `/nix`
+is a flat 4Gi.
+
+**And the spec-keeper flagged its own uncertainty on 2b rather than smoothing it:** it took the 20Gi
+provenance from `preset.go`'s comment (*"Bumped to 20Gi (owner-directed, PRD #87) … the owner accepted
+the cost"*), **not from anything in its dispatch.** If the owner did not state it, it is an AI decision
+and belongs only in `ai.md` — **in which case the `human.md` line still needs something, because as
+written it is a wrong contract item either way.** Relayed to the user as its own question rather than
+folded into 2a.
+
+**A32.6 — the teardown cost is still owed in the CHANGELOG.** `fc984693` predates A27, so
+`[Unreleased]` does not carry A27.5's finding that a crash-looping controller stops **teardown** as
+well as provisioning, leaking PVCs and quota for workers the api already dropped. → documenter, after
+the coder's commit. It is in `specs/ai.md` §481 regardless.
