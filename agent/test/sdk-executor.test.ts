@@ -2031,6 +2031,43 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
       assert.strictEqual(probe.gated.length, 1, "the gate must still run");
     });
   }
+
+  // ── PRD #209 D4: the `seeded` axis ─────────────────────────────────────────
+  // The loop above is the two-way discriminator. Adding `seeded` makes "no session"
+  // stop being a single verdict: without it a dropped transcript re-plans (row 3),
+  // WITH it the user-authored plan is implemented directly (row 2).
+
+  // Row 2 (NEW): approved + NO session + SEEDED ⇒ skip and implement. This is the case
+  // the old `&& sessionId` guard wrongly blocked. A seeded plan is approved with no
+  // session by construction (the user authored it), so there is no session to lose.
+  it("skips the gate for a seeded run with no session (D4 row 2)", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ ...preApproved, sessionId: null, seeded: true });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, [], "a seeded run must not call gatePlan");
+    assert.strictEqual(turns.length, 1, "no planning turn should run for a seeded plan");
+    assert.ok(
+      probe.emits.some((m) => String((m.payload as { text?: unknown }).text ?? "").includes("seeded")),
+      "the feed records that the plan was supplied externally (seeded)",
+    );
+  });
+
+  // Row 3 (NAMED REGRESSION — Success Criterion 3): a dropped session that is NOT seeded
+  // must still re-plan. A transcript lost mid-flight is not a seeded plan and must never
+  // be treated as one, even though both arrive as "approved, no session".
+  it("still plans for a dropped session that is NOT seeded (D4 row 3, Success Criterion 3)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ ...preApproved, sessionId: null, seeded: false });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(
+      probe.gated.length,
+      1,
+      "row 3 must still gate — a dropped transcript is never a seeded plan",
+    );
+  });
 });
 
 // --- Plan-turn write-tool subtraction (#203) ----------------------------------

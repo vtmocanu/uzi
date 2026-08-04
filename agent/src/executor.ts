@@ -126,6 +126,14 @@ export interface RunContext {
    *  A park BEFORE approval (only reachable if the planning turn itself died on a
    *  limit) leaves this false and resumes into planning exactly as today. */
   planApproved?: boolean;
+  /** PRD #209 (D4 row 2): this run's plan was supplied EXTERNALLY by the user at create
+   *  time (claim plan_source='seeded'), not produced by a Phase-1 planning turn. Set by
+   *  the runner. Two effects: it relaxes the pre-approved skip so it fires with NO SDK
+   *  session (a fresh seeded run never had one to lose — unlike the dropped-transcript
+   *  case, which must re-plan), and it drives the "plan supplied externally" feed line
+   *  and the seeded implement-prompt opening (Decision A). Absent/false ⇒ today's
+   *  behaviour, byte-for-byte. */
+  seeded?: boolean;
   /** The already-approved plan text to seed the implement loop with (PRD #35). Only
    *  meaningful with `planApproved`; the executor refuses to skip the gate without
    *  it, because an empty plan would enter implement with no instructions. */
@@ -590,10 +598,13 @@ export class StubExecutor implements Executor {
     // no instructions to implement, and `planApproved` alone does not imply one.
     //
     // `ctx.sessionId` is deliberately NOT re-checked here, though SdkExecutor does
-    // check it. The runner already ANDs the claim's plan_approved with a surviving
-    // session id before setting ctx.planApproved (runner.ts), so a run whose
-    // transcript was dropped never reaches this branch; and the stub has no SDK
-    // conversation to resume, so a session id would be a proxy for nothing it uses.
+    // check it (relaxed for seeded, PRD #209). The runner sets ctx.planApproved only
+    // when the claim's plan_approved holds AND (a surviving session id OR the run is
+    // SEEDED), so the only "approved but no session" run that reaches this branch is a
+    // seeded one (PRD #209 D4 row 2) — which never had a session to lose. A NON-seeded
+    // run whose transcript was dropped is set planApproved=false by the runner and
+    // re-plans (D4 row 3), so it still never reaches this branch. Either way the stub has
+    // no SDK conversation to resume, so a session id would be a proxy for nothing it uses.
     //
     // Without this the stub re-enters ctx.gatePlan on the resumed run and parks it at
     // awaiting_approval a SECOND time, waiting on a human verdict that the unattended
@@ -606,11 +617,18 @@ export class StubExecutor implements Executor {
 
     if (this.opts.planGate && ctx.gatePlan) {
       if (preApproved) {
+        // PRD #209: a seeded run's plan was AUTHORED by the user, not resumed from a
+        // prior approval — say that plainly so the transcript records the provenance
+        // rather than leaving it inferable, and do not mislabel a fresh seeded run as a
+        // "resume". A non-seeded pre-approved resume keeps its exact wording (the M6 e2e
+        // pins the "skipping the planning turn" substring, which both phrasings carry).
         ctx.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: "resuming an already-approved plan — skipping the planning turn and the approval gate",
+            text: ctx.seeded
+              ? "implementing a user-supplied plan (seeded) — skipping the planning turn and the approval gate"
+              : "resuming an already-approved plan — skipping the planning turn and the approval gate",
           },
         });
       } else {

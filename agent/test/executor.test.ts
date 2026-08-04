@@ -359,4 +359,35 @@ describe("StubExecutor — PRD #35 Decision 6b pre-approved resume", () => {
     assert.equal(gate.calls.length, 1, "approvedPlan alone must not skip the gate");
     assert.equal(emitted.filter((m) => String(m.payload.text ?? "").includes(skipText)).length, 0);
   });
+
+  // PRD #209 (D4 row 2 + item 5): a SEEDED run (no session — the stub never checks one)
+  // skips the gate AND records on the feed that the plan was supplied externally, so a
+  // reader can tell a user-authored plan from a resumed approval. The stub's discriminator
+  // ignores sessionId already, so this exercises the seeded feed line specifically.
+  it("a seeded run skips the gate and records that the plan was supplied externally", async () => {
+    const wt = makeWorktree();
+    const gate = countingGate();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      gatePlan: gate.gatePlan,
+      planApproved: true,
+      seeded: true,
+      approvedPlan: "## A plan the user supplied at create time",
+    });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.equal(gate.calls.length, 0, "a seeded plan must never call gatePlan");
+    // The skip is reported exactly once, and its wording names the seeded provenance
+    // rather than mislabelling a fresh seeded run as a "resume".
+    const skips = emitted.filter((m) => String(m.payload.text ?? "").includes(skipText));
+    assert.equal(skips.length, 1, "the skip is reported exactly once");
+    assert.match(String(skips[0]!.payload.text), /seeded/, "the feed names the external provenance");
+    assert.ok(
+      emitted.some((m) => m.kind === "text" && String(m.payload.text).includes("committed locally")),
+      "the run still implements after skipping the gate",
+    );
+  });
 });

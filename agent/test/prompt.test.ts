@@ -178,6 +178,46 @@ describe("buildImplementPrompt", () => {
     const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
     assert.match(p, /No subagents are available; do the work yourself\./);
   });
+
+  // PRD #209 (Decision A): a seeded plan was AUTHORED by the user, not approved through
+  // the gate, so "Your plan was approved" is a false claim for it.
+  it("PRD #209: a seeded first turn says the user supplied the plan, not that it was approved", () => {
+    const seeded = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1, seeded: true });
+    assert.match(seeded, /created with a plan you supplied/i);
+    assert.ok(!/plan was approved/i.test(seeded), "a seeded plan was authored, not gate-approved");
+    // The rest of the implement instructions are unchanged.
+    assert.match(seeded, /signal_done/);
+    assert.match(seeded, /never push/i);
+  });
+
+  // Anti-regression (Success Criterion 2): a NON-seeded run's implement prompt is
+  // byte-identical to before. `seeded:false` and the absent field must both give the
+  // exact "Your plan was approved" opening.
+  it("PRD #209 anti-regression: a non-seeded first turn is byte-identical (Decision A)", () => {
+    const absent = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1 });
+    const explicitFalse = buildImplementPrompt({ branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1, seeded: false });
+    assert.match(absent, /Your plan was approved\./);
+    assert.strictEqual(absent, explicitFalse, "seeded:false must change nothing");
+    assert.ok(!/created with a plan you supplied/i.test(absent));
+  });
+
+  // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters implement
+  // COLD, so the amnesiac prior-work note rides the implement prompt (an ordinary run got
+  // it on the plan prompt and resumes a session that saw it).
+  it("PRD #209 (D7): a seeded cold-start carries the prior-work note on the first implement turn", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, seeded: true, priorWork: { commits: 2 } });
+    assert.match(p, /already carries 2 commits/);
+    assert.match(p, /Do not redo what is already committed/);
+  });
+
+  it("PRD #209 (D7): the prior-work note is first-turn-only and absent by default", () => {
+    // A later turn resumes a session that already saw it, so it is not repeated.
+    const later = buildImplementPrompt({ branch: "b", subagentNames: [], first: false, iteration: 2, priorWork: { commits: 2 } });
+    assert.ok(!/already carries/.test(later));
+    // And an ordinary first turn with no priorWork never carries it (byte-identity).
+    const none = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
+    assert.ok(!/already carries/.test(none));
+  });
 });
 
 describe("buildRevisePlanPrompt (PRD #41)", () => {

@@ -169,6 +169,14 @@ export interface AnswerBody {
  *  its own MR evidence (Decision 10). */
 export type RunKind = "issue" | "ci_fix" | "judge" | "self_improve";
 
+/** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
+ *  planning turn — today's only case and the DEFAULT. "seeded": the user supplied the
+ *  plan at create time, so it was AUTHORED rather than gate-approved; the worker
+ *  implements it with no planning turn and no approval gate. Absent on an older server
+ *  ⇒ treat as "agent". Not exported: only ClaimResponse below reads it, and the runner's
+ *  discriminator compares the literal `"seeded"` rather than the type. */
+type PlanSource = "agent" | "seeded";
+
 /** A ci_fix run's outbound verdict (PRD #6). Only "not_code" travels the wire;
  *  verified/fix_failed are stamped server-side from the post-fix pipeline. */
 export type FixVerdict = "not_code";
@@ -454,6 +462,16 @@ export interface ClaimResponse {
    *  session declines to re-emit signal_plan.
    *  Absent on an older server ⇒ treat as false, i.e. plan as today. */
   plan_approved?: boolean;
+  /** How this run's plan_md was produced (PRD #209 D4). "seeded" means the user
+   *  supplied the plan at create time, so the run is approved with NO server-side
+   *  approve_plan input and (on a fresh run) NO SDK session — the worker implements it
+   *  directly, skipping the planning turn and the gate (D4 row 2). "agent" (the
+   *  DEFAULT, and how an older server that omits the field is treated) means the plan
+   *  came from the worker's own Phase-1 turn, leaving the session/approval discriminator
+   *  unchanged. Read alongside plan_approved: the server sets plan_approved true for a
+   *  seeded run through its third disjunct (D8), which is the mechanism that makes row 2
+   *  reachable at all. */
+  plan_source?: PlanSource;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *

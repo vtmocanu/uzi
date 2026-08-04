@@ -382,6 +382,15 @@ export class RunRunner {
           ? { commits: runnerClone.priorCommits }
           : undefined;
 
+      // PRD #209 (D4): a SEEDED run's plan was authored by the user at create time, so
+      // it is approved with NO server-side approve_plan input and — on a fresh seeded
+      // run — no SDK session. That is a legitimate "approved, no session" state, NOT the
+      // dropped-transcript one the `&& sessionId` guard below protects against: there
+      // was never a session to lose. The runner is the layer that can tell the two apart
+      // (it holds the preflight result), so it folds `seeded` into planApproved here
+      // rather than leaving the executor to read the claim.
+      const seeded = claim.plan_source === "seeded";
+
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report
       // rather than the gate so that an autopilot run — which never parks at
@@ -451,14 +460,19 @@ export class RunRunner {
         // on this worker (issue #105).
         sessionId,
         priorWork,
-        // PRD #35 Decision 6b. The RUNNER is the only layer that knows all three
-        // facts, which is why it resolves them here rather than the executor reading
-        // the claim: the server said the plan is approved, a session id arrived, and
-        // issue #105's transcript check did NOT drop it (`sessionId` is cleared above
-        // when it did). Passing plan_approved through unconditionally would make the
-        // executor skip planning for a run whose session is gone — the one case where
-        // it must plan.
-        planApproved: (claim.plan_approved ?? false) && !!sessionId,
+        // PRD #35 Decision 6b + PRD #209 D4. The RUNNER is the only layer that knows
+        // all the facts, which is why it resolves them here rather than the executor
+        // reading the claim: the server said the plan is approved, and EITHER a session
+        // id arrived that issue #105's transcript check did NOT drop (`sessionId` is
+        // cleared above when it did) OR the run is SEEDED. Passing plan_approved through
+        // on a dropped-session NON-seeded run would make the executor skip planning for a
+        // run whose session is gone — the one case (D4 row 3) where it must re-plan. A
+        // seeded run (D4 row 2) is approved with no session by construction, and that is
+        // fine because there was never a session to lose.
+        planApproved: (claim.plan_approved ?? false) && (!!sessionId || seeded),
+        // PRD #209: the executor relaxes its own session guard for a seeded run and
+        // emits the "plan supplied externally" feed line off this.
+        seeded,
         approvedPlan: claim.plan_md ?? undefined,
         // The persisted selection, replayed on the claim (PRD #35). Passed through
         // unconditionally rather than gated on planApproved: it is the run's

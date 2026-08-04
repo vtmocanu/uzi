@@ -66,6 +66,12 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.equal(claim.wait_on_limit, true);
   assert.equal(claim.plan_approved, true);
   assert.equal(claim.plan_md, "# Plan\n");
+  // PRD #209: the plan_source discriminator rides the same claim, top-level alongside
+  // plan_approved. This golden models a SEEDED run — approved with no approve_plan input
+  // — so the pair the worker's D4 discriminator reads (plan_approved + plan_source) is
+  // pinned across the language boundary. Typing the parse as ClaimResponse also makes
+  // `npm run typecheck` fail if plan_source is dropped from protocol.ts.
+  assert.equal(claim.plan_source, "seeded");
 
   // Config caps ride the claim (no worker-side hardcoded drift).
   assert.equal(claim.config?.skill_max_bytes, 65536);
