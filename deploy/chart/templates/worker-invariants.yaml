@@ -140,14 +140,22 @@
 
     1. HERE, at `helm install`/`template` time — the earliest and cheapest, covering the
        one claimant the chart supplies, overrides included.
-    2. `go test` — TestPresetPVCSizesFitTheChartsLimitRangeMax reads both tiers'
-       maxPVCStorage out of values.yaml and checks the Go constants against it, catching
-       a developer who raises nixSize or a preset's DataSize.
+    2. `go test` — TWO tests, one per source of a Go constant, and the pair is what
+       makes this net exhaustive: TestPresetPVCSizesFitTheChartsLimitRangeMax covers
+       nixSize and each preset's DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
+       covers dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
+       same parse-and-Fatal contract, so neither carries a hardcoded ceiling. They catch
+       a DEVELOPER raising a size in the repo.
     3. CONTROLLER BOOT — kube.ValidatePVCCeilings, fed the real ceilings at runtime
        (UZI_WORKER_MAX_PVC_STORAGE / UZI_WORKER_DOCKER_MAX_PVC_STORAGE), refuses to start
        rather than provisioning claims the LimitRange will reject. This is the only one
        that sees what the CLUSTER configured rather than what the repo ships, so it is
-       what covers `--set` and per-cluster values files.
+       what covers `--set` and per-cluster values files. It enumerates claimants by
+       calling RenderPVCs rather than re-listing them, so a fourth PVC is covered by
+       construction. Its value depends on the controller Deployment's `strategy:
+       Recreate` — under RollingUpdate the old controller outlives the new one's
+       CrashLoopBackOff and keeps provisioning against a ceiling it was never told
+       about, so the check fires and is defeated.
 
   *** An earlier version of this comment ended "an operator-lowered RESTRICTED-tier
   ceiling is ungated on both sides — a real residual, not a covered case". That was true
@@ -155,9 +163,23 @@
   net 3. Corrected here rather than left, because a comment that UNDERSTATES coverage
   sends the next reader off to build a guard that already exists. ***
 
-  What genuinely survives all three: a LimitRange edited DIRECTLY in the cluster, out of
-  band from the chart. Neither the chart nor the controller is told. A `helm upgrade`
-  cannot reach this state, since changing the value rolls the controller with the new env.
+  Two residuals, and they are in different classes:
+
+    * `limitRange.enabled: false` while a LimitRange from a previous install remains.
+      Reachable through a SUPPORTED chart value: net 1 renders nothing, net 3 is not told
+      a ceiling, and a live object still rejects the claims. uzi's own ArgoCD app sets
+      `prune: true`, which deletes it; an installation syncing manually should delete the
+      object alongside the flag.
+    * A LimitRange edited DIRECTLY in the cluster. Out of scope by DEFINITION rather than
+      by difficulty: the chart's contract is that the rendered manifest is the desired
+      state, so an out-of-band `kubectl edit limitrange` IS a desired-state violation, and
+      the remedy for that class is GitOps, not a chart guard. A template cannot defend
+      objects it has already handed over. Where ArgoCD selfHeal is configured it is
+      reverted automatically — worth knowing, but this comment cannot rely on it, since
+      another installation might sync manually.
+
+  A `helm upgrade` reaches neither: changing the value re-renders the object AND rolls the
+  controller with the new env.
 */ -}}
 {{- /*
   NO `ephemeral-storage` IN ANY LimitRange `default` OR `defaultRequest`, EITHER TIER

@@ -32,12 +32,12 @@ func TestValidatePVCCeilings(t *testing.T) {
 		{
 			name:    "restricted ceiling below nixSize",
 			cfg:     RenderConfig{MaxPVCStorage: "10Gi"},
-			wantErr: []string{"restricted tier", "nixSize", "20Gi", "UZI_WORKER_MAX_PVC_STORAGE", "10Gi"},
+			wantErr: []string{"restricted tier", "-nix", "20Gi", "UZI_WORKER_MAX_PVC_STORAGE", "10Gi"},
 		},
 		{
 			name:    "restricted ceiling below the largest preset's DataSize",
 			cfg:     RenderConfig{MaxPVCStorage: "15Gi"},
-			wantErr: []string{"restricted tier", "DataSize", `"l"`},
+			wantErr: []string{"restricted tier", "-data", `"l"`},
 		},
 		{
 			name: "docker ceiling below the dind data root's EFFECTIVE default",
@@ -45,12 +45,12 @@ func TestValidatePVCCeilings(t *testing.T) {
 			// an explicit override would leave exactly this path unguarded, which is the
 			// hole the chart guard originally had.
 			cfg:     RenderConfig{DockerMaxPVCStorage: "10Gi"},
-			wantErr: []string{"docker tier", "dind data root", "UZI_WORKER_DOCKER_MAX_PVC_STORAGE"},
+			wantErr: []string{"docker tier", "-dind-data", "UZI_WORKER_DOCKER_MAX_PVC_STORAGE"},
 		},
 		{
 			name:    "docker ceiling below an explicit dind override",
 			cfg:     RenderConfig{DockerMaxPVCStorage: "30Gi", DinDDataSize: "40Gi"},
-			wantErr: []string{"docker tier", "dind data root", "40Gi", "30Gi"},
+			wantErr: []string{"docker tier", "-dind-data", "40Gi", "30Gi"},
 		},
 		{
 			name: "an override that FITS a raised ceiling is accepted",

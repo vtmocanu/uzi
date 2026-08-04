@@ -253,6 +253,11 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // this one is early and cheap and sees only the repo; that one is late and authoritative
 // and sees what the cluster actually configured.
 //
+// This test is HALF of its layer, not all of it: it covers nixSize and each preset's
+// DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax covers the third Go
+// constant, dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
+// same parse-and-Fatal contract, so neither carries a hardcoded ceiling.
+//
 // *** This paragraph replaced one that said an operator-lowered ceiling "remains ungated
 // on BOTH sides — a real residual, not a covered case". That was true when written and
 // was made FALSE by the very commit that added the boot check, which I wrote without
