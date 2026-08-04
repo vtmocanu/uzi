@@ -18491,3 +18491,59 @@ byte-identical), proving the fetch-back is what carries committed work and remov
 that would have deleted the clone the fetch-back reads. So on a park only the plugin dir and the
 per-run HOME are preserved now; the clone is removed like on any terminal path (see the correction in
 §435). See PRD #218's Decision Log for full rationale (D1-D6) and the measured runs.
+
+## 486. PRD #230 — CI pipeline speedup: build DAG decoupled per-component, e2e loads prebuilt image tars, golangci-lint is a pinned release binary — all orchestration-only except the linter
+
+Serves human.md: reduce CI wall-clock **without weakening any gate/test/coverage** (SC-0), keeping
+local==CI byte-identical recipes (§464, PRD #103 SC-1), release atomicity — a red gate blocks every
+publish (SC-5) — and the MR trust boundary (§245). Pure dev-CI infrastructure: **no product-behavior
+or user-contract change**, which is why `human.md` is untouched. Full rationale, review findings and
+measured deltas live in `prds/230-ci-pipeline-speedup.md` (Decision log D0-D7); this is the terse
+contract, not a duplicate of it. All six landed milestones are CI-orchestration-only **except M5**,
+which is the sole `Taskfile.yml` change (SC-1's one exception).
+
+- **D1 — `build:*` decoupled from the whole gate set to component-scoped `needs:`, superseding
+  §244's "`needs: []` DAG" for the build jobs.** Each build needs only its own component's gates
+  (build:api→[validate:api, test:api, lint:api]; build:web→[validate:web, test:web];
+  build:controller→the three; build:agent→[validate:agent, test:agent] — there is no
+  lint:web/lint:agent job). NOT `needs: []` (that would build before the component's own tests, for
+  no extra critical-path win). Publish jobs keep `*publish_needs` untouched (atomicity). The
+  `&gate_needs` anchor is now orphaned but deliberately kept.
+- **D3 — `test:api-store-it` dropped from `.gate_needs`, kept in `.publish_needs`.** It still runs on
+  every ref and still gates **every** publish (SC-5 intact — a tag pipeline still `needs:` it); only
+  its place on the build/e2e critical path is removed. After D1 the sole `.gate_needs` consumer is
+  `e2e:kind-smoke`.
+- **D4/D4a — `e2e:kind-smoke` loads prebuilt api/web images instead of rebuilding them in its own
+  DinD.** `build:api`/`build:web` emit a kaniko `--tarPath` docker-archive artifact on **protected
+  non-tag refs only** (gated `KANIKO_AUTH==true` + empty `$CI_COMMIT_TAG`, so MR builds upload
+  nothing and the artifact path is credential-less). e2e gains `optional: true` artifact `needs:` on
+  those two plus an explicit gate list (the post-D3 `.gate_needs` set, minus store-it, pinned not
+  splatted); its script `kind load image-archive` when the tar is present, else self-builds.
+  **`optional: true` is load-bearing (blocker B1):** builds are skipped on tags, and a non-optional
+  need on a skipped job fails pipeline creation — so tag pipelines fall back to today's self-build,
+  smoke coverage unchanged. `scripts/smoke.sh` is byte-identical (SC-0).
+- **D5 — `changes:` path-gates `build:api`/`build:web`/`build:controller` on MR refs only; NEVER
+  `build:agent`, NEVER on a protected ref.** build:agent bakes uzi's whole source
+  (`UZI_SRC_SHA=$CI_COMMIT_SHA`) so almost any change is a real input; a `changes:` gate would
+  wrongly skip it. Protected builds stay unconditional so e2e always has its D4 tars — a
+  `changes:`-skipped main build would make D4's `optional:` fallback silently self-build on main,
+  quietly losing the win. Each gated build carries its own full `rules:` block (a job override
+  replaces, not merges, the shared `.kaniko_build` rules); build:agent keeps the shared rules.
+- **M5/D6 — golangci-lint is a pinned, sha256-verified release binary (`scripts/golangci-lint.sh`),
+  replacing `go run …golangci-lint@v2.12.2` compile-from-source** (killed the cold `lint-`-cache long
+  pole). It lands in `Taskfile.yml` so local and CI acquire the identical binary — SC-1 proven by a
+  byte-diff of the unfiltered backlog, not asserted. Spike gate (D6): the release binary's build-Go
+  **language** version (1.26) must be ≥ both modules' `go` directive language; the script's build-Go
+  guard exits 2 if a module's directive later rises above it (a downloaded binary carries a frozen
+  build-Go and can only lint code whose language ≤ it). Binary cached under `$HOME/.cache`,
+  deliberately **outside `$CI_PROJECT_DIR`** so it never crosses GitLab's MR/protected `cache:`
+  boundary (the issue #211 poisoning vector), and re-verified against a pinned binary sha256 on every
+  run. This is the change that **inverts §471's exit-code claim**: the wrapper `exec`s the binary so
+  the tool's real status now reaches the script, but `task` still flattens every nonzero to 201, so
+  the message text remains the only discriminator.
+- **M6a — `test:api-store-it`'s throwaway `postgres:17` runs with `fsync`/`full_page_writes`/
+  `synchronous_commit` off** via the service `command:`. Same engine at the same digest; only
+  crash-recovery is disabled on a DB the job destroys, so query semantics (SC-1) are unchanged.
+  **M6b (caching the `task`/shellcheck tarballs) was DROPPED** — a version-only cache key shared
+  across the MR/protected boundary reintroduces the #211 vector (a cache hit serves the binary
+  without re-verifying, and that binary then runs the whole gate).
