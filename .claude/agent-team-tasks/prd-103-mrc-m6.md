@@ -2312,3 +2312,34 @@ so pinning `GOOS` requires separating the install from the run.
   B-4. NB-5 carries the largest security surface in that commit and shipped on the
   reviewer's single measurement plus reasoning. All three routes have since been
   measured by the auditor and pass.
+
+---
+
+# Amendment 12 — the MR description, drafted and NOT yet posted
+
+The full draft is at `probes/prd-103-mrc-lead/mr-description-draft.md`, committed
+so it survives this worktree. Unit B's section is the one part still to write, and
+the coder's own report names what belongs in it: the calibration table (its items
+8 + 9 + 4) and the two silent `coverage:` regex constraints (item 6), which are
+the part a reviewer cannot re-derive by reading.
+
+**Five things in it that must not go wrong.** Each is either measured in this
+brief or re-derived for the draft; none may be softened:
+
+1. **Success Criterion 8** — the mutation record for every check the PRD adds,
+   against the FOUR-property bar, not just a non-zero exit.
+2. **react-router is RUNTIME, SHIPPED IN THE BUNDLE.** `1c751ae3`'s message says
+   web's findings are "all dev-only"; that is FALSE for two of eight, the message
+   is immutable, and the error must not propagate. Include the reachability read —
+   the residual is much smaller than the raw advisory list implies.
+3. **`npm ls` catches a stale DIRECT dependency and is inert for a lockfile-only
+   transitive bump.** Do not call it a lockfile-versus-node_modules check.
+4. **41 packages changed, not 39** — re-derived independently for the draft, and
+   the split matters: 16 real version changes, 25 DEDUPES. `vite 5.4.21,6.4.3 →
+   6.4.3` and `esbuild 0.21.5,0.25.12 → 0.25.12` are nested duplicates collapsing,
+   not bumps; a name→version table renders the first as a vite major that did not
+   happen.
+5. **The release-blocking property is INHERITED.** All four host jobs are in
+   `*publish_needs` — established by PARSING, since `yaml.safe_load` throws on
+   `.gitlab-ci.yml` — so a CVE published on a Tuesday reddens a `v*` tag publish
+   with nobody's diff in it. **Ruling 4 accepts this; say so in those words.**
