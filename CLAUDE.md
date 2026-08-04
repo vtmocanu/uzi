@@ -331,7 +331,7 @@ task lint:controller                       # the lint slot alone — RATCHETED, 
 task lint:controller:all                   # the UNFILTERED backlog; `task lint` does all seven (four components plus shell/YAML/formula)
 task deadcode:controller                   # the dead-code slot alone; `task deadcode` does all four components
 task deadcode:controller:all               # WITHOUT -test — 4 findings the gate cannot see; ALWAYS EXITS 0
-task test:controller                       # -count=1, see below
+task test:controller                       # -race -count=1, see below
 task vet:controller                        # or build:controller, individually
 ```
 

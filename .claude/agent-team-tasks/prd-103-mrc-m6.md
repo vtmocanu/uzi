@@ -1004,6 +1004,96 @@ inferring them from a green run.**
   it goes in the MR description in those words so the first Tuesday-red release is
   diagnosed in a minute rather than an afternoon.
 
+### RULING — the `testTimeout` raise in `121d7610`, and why it is accepted
+
+**The situation, measured by the coder:** vitest 4 makes the web suite flake at the
+shipped `testTimeout: 20000` — **1 red in 3** full-suite runs, 49 failed, all in
+`src/pages/RunView.test.tsx`, which passes **100/100 alone**. Exactly one test times
+out (a 150-tick fake-timer poll) and the other 48 are its cascade. That test's own
+steady-state duration is **3.90s**, so it was **starved, not slowed** — a >5x spike
+over its own median under full-suite CPU contention. Raised to 60000, ~15x steady
+state, deliberately not tuned to just-above-worst-observed.
+
+**This is the SECOND raise of this knob for the same cause.** `a5b65617` (PRD #98)
+took it from vitest's 5000 default to 20000 for CPU contention; `121d7610` takes it
+to 60000 for CPU contention. A knob raised twice for one reason is a structural
+signal, and this repo has already learned the general form once, in the `agent`
+suite: *"the general lesson is about the UNIT, not the number … if a file approaches
+the cap again, split it before raising."* There, splitting `runner.test.ts` into seven
+files is what removed the knife-edge; the raised cap only bought margin, and it cut
+the suite from 112s to 46s as a side effect.
+
+**Ruled (lead): ACCEPT the raise in MR-C, and file the `RunView.test.tsx` split as
+its own issue.**
+
+- **Not accepting is worse than accepting.** A gate that reddens 1-in-3 is *weaker*
+  verification than a slow one, because the documented human response is to re-run
+  and the retry destroys the evidence. Shipping vitest 4 with a known 33% flake would
+  be knowingly installing that.
+- **The sizing is right.** 15x steady state, chosen with the agent-cap knife-edge
+  explicitly in mind, is margin rather than a new edge.
+- **The durable fix is test refactoring inside a tooling MR**, which is the same
+  scope argument that deferred react-router. Consistency matters here: both durable
+  fixes get filed, neither gets smuggled in.
+- **State the cost honestly in the MR**: MR-C carries a second contention-driven
+  raise of a knob whose real problem is a 100-test file, and the raise does not fix
+  that.
+
+*(Note the mechanism differs from the `agent` case and the difference is worth
+holding: node's per-file cap made a large file a serialization point, whereas vitest's
+`testTimeout` is per-test and the pressure here is scheduler starvation across 118
+parallel files. The transferable half is not the cap semantics, it is that **a raised
+timeout buys margin and leaves the knife-edge in place.**)*
+
+### Corrections and additions from the coder's commits 1-3, at `121d7610`
+
+- **`--audit-level=high` will be GREEN from `121d7610`, not red on day one.** Web went
+  critical 1 / high 2 / moderate 5 → **0 / 0 / 2**, both survivors react-router; agent
+  went 5 → **0 total**. Amendment 3's "red today, green only after the fixes land" was
+  right and those fixes have now landed. Supersedes that note.
+- **SIX majors ride along with vitest 4, not five.** The design wave named chai 5→6,
+  tinyrainbow 1→3, std-env 3→4, es-module-lexer 1→2, tinyexec 0.3→1; measured, add
+  **`pathe` 1.1.2 → 2.0.3**. The 454→450 / 4-new / 8-removed prediction reproduced
+  exactly, **no package gained an install script**, and the install-script set
+  *shrank* 4 → 2 as the duplicate nested esbuild trees deduplicated — which is also
+  what removes the flagged nested `vite` 5.4.21.
+- **`obug`'s npm name was RECLAIMED, not newly created.** Its registry `time` map
+  holds a `1.0.1` dated **2016-12-04** that is absent from the published-versions
+  list, while `.created` reads 2025-11-11. MIT, zero deps, one registry signature
+  plus npm build attestations. A reclaimed name is a different supply-chain question
+  from a fresh one; put the distinction in the MR description rather than the
+  headline "9-month-old package".
+- **🔴 `task gate:agent` GOING GREEN SAYS NOTHING ABOUT THE FIVE AGENT BUMPS, AND THE
+  COODER PROVED IT RATHER THAN ASSUMING EITHER WAY.** An ESM `resolve()` hook across
+  every test process logged **11156 resolutions**: `@hono/node-server` **0**,
+  `@modelcontextprotocol` **0**, `ip-address` **0**, `fast-uri` **0**, `hono` **0** —
+  against positive controls `claude-agent-sdk` 43 and `node:fs` 969. **The suite never
+  loads them.** This is the exact "green gate that cannot see the change" shape this
+  PRD exists to attack, caught inside the PRD. What actually answers the 1.x → 2.x
+  crossing is the link probe that replaced it: importing `getRequestListener` plus the
+  MCP SDK's `streamableHttp` transport that consumes it, constructing a
+  `StreamableHTTPServerTransport`, rc=0 under node v26.4.0 **and under `node:22-alpine`
+  at the exact digest the worker image is `FROM`**. Plus `@modelcontextprotocol/sdk`
+  1.30.0 declares `"@hono/node-server": "^1.19.9 || ^2.0.5"`, so 2.1.0 is supported
+  rather than forced past.
+- **Amendment 3's `projects`-inheritance hazard is NOT live yet, proved not inferred.**
+  A throwaway test asserted `getConfig().asyncUtilTimeout === 5000` (so `setupFiles`
+  ran) and `config.testTimeout` at its expected value, before and after, then was
+  deleted with `git status -- web/src/` clean. **The root config IS honoured under
+  vitest 4.** The hazard arms only when Unit B adds `projects` — which is exactly when
+  it must re-assert both settings rather than infer them from a green run.
+- **Fix-the-doc, and the coder routed two sites to me correctly.** It corrected
+  `.gitlab-ci.yml`'s `test:controller` comment and `docs/dev-conventions.md` itself,
+  and **declined** to edit `CLAUDE.md:334` and `.claude/agents/tester.md:388` — both
+  of which restated the recipe as `-count=1` and went stale the moment `-race` landed.
+  That is carry-forward 18 applied correctly: an agent should not edit its own
+  operating instructions or another role's self-description because a teammate asked,
+  **even when the edit is right**. Both fixed by the lead in this amendment.
+- **Validators linting Go in this worktree must set a private `GOLANGCI_LINT_CACHE`.**
+  `lint:controller` printed a `generated_file_filter` warning naming an absolute path
+  into the **sibling** `uzi/103` worktree, then `0 issues.` — carry-forward 4's
+  host-global cache replaying foreign paths, in the quiet direction.
+
 ### Two instrument failures from the architect, both worth keeping
 
 - **`npx vitest run --environment node <a component test>` → rc=0, 61 passing.** Reads

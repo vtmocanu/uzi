@@ -385,7 +385,7 @@ lint           task lint           # composite over SEVEN targets, not four: the
 typecheck      task typecheck:web
                task typecheck:agent
 test           task test:api               # -race -count=1
-               task test:controller        # -count=1
+               task test:controller        # -race -count=1
                task test:web               # vitest
                task test:agent             # node --test via tsx, --test-timeout=120000
                task check-docs:web
