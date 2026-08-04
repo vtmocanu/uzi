@@ -3,7 +3,20 @@
 **Issue**: [#218](https://gitlab.example.com/vtmocanu/uzi/-/issues/218) · **Label**: PRD · **Priority**: High
 **Area**: `agent/src/runner.ts` (the park path and the cleanup carve-out) · `agent/src/git.ts` (`runnerCloneForBranch`, `fetchAgentBranch`) · `specs/ai.md` + `prds/done/35-run-limit-retry.md` (M5) · `adr/0035-run-limit-retry.md` (**M6 only** — see M5 for why it is not an M5 site).
 **Line references** are against `136d976a`.
-**Status**: not started.
+**Status**: COMPLETE. M1-M5 shipped in 0.15.0 (MR1, branch `218`: commits
+`47351bc9` + `e60012fb` + `ca9df2ca`, on `d240fe02` after merging origin/main).
+**M7 validated live on dev-cluster (2026-08-04): a real worker eviction recovered
+committed work via the tracking ref (seeded_from=tracking, prior_commits=1, marker
+byte-identical).** That satisfied D5's gate, so **M6 (drop the now-proven-redundant
+clone leg) landed** on branch `218-m6`. Two frozen design changes vs the draft
+below: M2's row-3 open question was resolved by a **run-identity anchor** (a
+per-branch `uzi-trackowner.<branch>` worker-bare config stamp; the reseed consults
+the tracking ref only when the stamp == `claim.run_id`) that REPLACES the
+session_id gate a design-wave counterexample showed was incomplete (a resume could
+inherit a different dead run's orphan ref = false provenance); and M1's shutdown
+half is implemented in-scope via **shape B** (`Runner.shutdown()` + a per-run
+registry; a `shuttingDown` flag makes the reap-induced abort skip the failed report
+so the sweeper requeues; blanket-abort, timed-drain deferred).
 **Evidence**: measured 2026-08-03 against the live stack, run `a146df98` on example-app issue #78, from the run feed and the code.
 
 ## Problem
@@ -192,7 +205,8 @@ clone was destroyed, recreated at the same path, and the session still resolved
 
 ## Milestones
 
-- [ ] **M1 — fetch the agent branch back on the park path.** Between the limit
+- [x] **M1 — fetch the agent branch back on the park path.** (Done: park + shutdown
+      shape-B, `fetchBackBestEffort` factored, belt-and-braces reap on all 3 sites.) Between the limit
       being caught (`runner.ts:700`) and the cleanup finally, run the same
       fetch-back the done path runs at `runner.ts:556`. Best-effort: a failed
       fetch-back must park the run anyway, since a park that fails is worse than a
@@ -246,7 +260,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       batcher at `runner.ts:942` (`:927` on the opt-out leg) **before** `parked` is
       known, so the fetch may live there but nothing M3 wants to *say* about it can
       be emitted after `runner.ts:700`.
-- [ ] **M2 — the reseed considers the tracking ref**, per the table above, and
+- [x] **M2 — the reseed considers the tracking ref**, per the table above, and
       **decides and states how a stale tracking ref from a permanently-dead run is
       excluded** (resume-gated vs run-id-scoped — the red-flagged paragraph above
       is the argument, and leaving it implied reintroduces issue #105's failure
@@ -276,12 +290,13 @@ clone was destroyed, recreated at the same path, and the session still resolved
       an `--agent-source repo` run; `parseRepoAgents` runs unconditionally either
       way, so the detection status at `runner.ts:1011` still tracks the base even
       on an `own`-source run.
-- [ ] **M3 — the feed states what the resume recovered.** A worker status naming
+- [x] **M3 — the feed states what the resume recovered.** A worker status naming
       the recovered commit count when M2's tracking-ref leg fires, and one
       admitting the loss when a resume finds neither an origin branch nor a
       tracking ref. Widen `priorWork` (`runner.ts:380-383`) so the lead is told
       about prior commits whenever they exist, not only when `resumeDropped`.
-- [ ] **M4 — tests.** Unit: the park path fetches back and the done path is
+- [x] **M4 — tests.** (Done: 20+ tests incl. the auditor's run-identity counterexample;
+      all load-bearing mutations caught in independent validation.) Unit: the park path fetches back and the done path is
       unchanged; **both** legs of M2's rule, including the two that a uniform
       ancestor test gets wrong — first park with a MOVED default branch (tracking
       ref must win) and a pushed branch that diverged (origin must win); a failed
@@ -296,7 +311,9 @@ clone was destroyed, recreated at the same path, and the session still resolved
       all of it is `agent/test/runner-usage-limit-park.test.ts`, which already
       holds the carve-out tests. Mind `agent/`'s per-FILE `--test-timeout`
       behaviour recorded in CLAUDE.md.
-- [ ] **M5 — docs.** `specs/ai.md:13840-13844` states Decision 6a's three-way
+- [x] **M5 — docs.** (Done: runner.ts carve-out comment + specs/ai.md §435/§485.
+      `prds/done/35` deliberately left as a past-tense record, still accurate. The
+      `specs/ai.md` ref had drifted to `:13874`, not `:13840`.) `specs/ai.md:13840-13844` states Decision 6a's three-way
       preservation as though it works (*"THREE removals, not two, and preserving
       only some of them resumes into a session missing its worktree or its
       plugins"*); correct it with the evidence and the date. So does the carve-out
@@ -310,7 +327,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       `:284-287` about the *acknowledgement condition*, which is true today and
       stays true after this PRD — but its word "three" becomes "two" at M6, so the
       edit belongs there.
-- [ ] **M6 — drop the clone leg of the carve-out.** Only after M1/M2 are validated
+- [x] **M6 — drop the clone leg of the carve-out.** Only after M1/M2 are validated
       on a real park. Removes **`&& !parked`** from the `removeRunnerClone` guard
       at `runner.ts:791-797` — not the whole condition, since `worktreePath` is the
       undefined guard and dropping it calls `removeRunnerClone(undefined)` —
@@ -319,7 +336,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       HOME"* log line at `:831`; and updates `adr/0035:284-287`'s "three
       filesystem cleanups" to two. Frees a full working tree per parked run, for
       up to the 8-day `RUN_LIMIT_MAX_PARK` (`api/internal/config/config.go:677`).
-- [ ] **M7 — validate on dev-cluster.** Per the k8s-first convention, and this one
+- [x] **M7 — validate on dev-cluster.** Per the k8s-first convention, and this one
       genuinely needs it: the worker bare lives on `/data`, a per-worker PVC in
       k8s (`git.ts:252`), and R1 below is about exactly that boundary. Run 78 is a
       better subject than its evidence table suggests — it parked **twice**

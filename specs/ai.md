@@ -13871,11 +13871,30 @@ predicate looks safer and is not: 0 rows ⇒ 409 ⇒ the worker treats it as "th
 exits, the report **vanishes**, and the run rots at `running` until `RUN_TIMEOUT` fails it with
 something misleading. Same branch point as the budget cap.
 
-**The on-disk carve-out is THREE removals, not two**, and preserving only some of them resumes into
-a session missing its worktree or its plugins: the runner clone, the **sibling** skills plugin dir
-(outside the clone, so removing the clone does not reach it), and the per-run HOME holding the
-resumable transcript. Exactly those three are skipped for a parked run and **nothing else in the
-teardown is**.
+**The on-disk teardown has THREE filesystem removals** — the runner clone, the **sibling** skills
+plugin dir (outside the clone, so removing the clone does not reach it), and the per-run HOME
+holding the resumable transcript. **As of PRD #218 M6 (2026-08-04) the park carve-out skips TWO of
+them**: the plugin dir and the per-run HOME. The clone leg now runs on a park too (see the corrected
+note below), and **nothing else in the teardown is** skipped for a parked run.
+
+**🔴 CORRECTED 2026-08-04 (PRD #218): the runner-clone leg does NOT preserve the agent's committed
+work, and the resume never read it for that.** This paragraph read *"preserving only some of them
+resumes into a session missing its worktree"*, treating the preserved clone as the store the
+committed work resumes from. It is not. A resume re-clones **unconditionally** (`git.ts` `fs.rm` at
+the top of `runnerCloneForBranch`) and reseeds the branch from `origin/<branch>` or the default
+branch, so a parked run's own commits, which are pushed nowhere, were destroyed on every resume
+regardless of the carve-out. PRD #218 makes committed work durable a different way: a park (and a
+worker SIGTERM) now fetches the agent's branch back into the worker's own bare as
+`refs/uzi-runner/<branch>` (`git.ts` `fetchAgentBranch`), and the reseed reseeds off that tracking
+ref (see §485). Recovery is via the tracking ref in the bare, NOT via the preserved clone dir.
+- The plugin-dir and HOME legs remain load-bearing for **session** resumability (the SDK transcript
+  keyed by HOME and cwd); only the clone leg was found redundant.
+- **M6 has LANDED (PRD #218, 2026-08-04): the redundant clone leg was removed, so the clone is now
+  cleaned up on a park like on any other terminal path.** Only TWO removals — the plugin dir and the
+  per-run HOME — are skipped for a parked run. M6 was gated on M7 recovering real work on
+  dev-cluster: a live worker eviction reseeded off the tracking ref (seeded_from=tracking,
+  prior_commits=1, marker byte-identical), proving the fetch-back, not the preserved clone, is what
+  carries the committed work.
 
 **🔴 THE OTHER TEARDOWN STEPS MUST STILL RUN ON A PARK, AND THEY DO NOT FAIL ALIKE.** Guarding the
 whole block, or returning early, leaves a steering poller running and a gate deadline registered for
@@ -18394,3 +18413,76 @@ M6 adds coverage reporting and the vitest environment split. `human.md` untouche
   `suspected` not measured: the cobertura DIFF ANNOTATIONS (percentages are measured; annotations need
   the first pipeline, since they depend on the runner's `<CI_BUILDS_DIR>/<PROJECT_PATH>/…` source-path
   shape).
+
+## 485. PRD #218: a park/shutdown fetches committed work back into the worker bare, and the reseed prefers that tracking ref over a moved default branch
+
+Serves human.md: a usage-limit park (and a worker shutdown) must not lose the agent's committed
+work; a resume must not silently rebase onto a default branch that moved; and a resume that cannot
+recover work must say so. Measured cause (2026-08-03, run `a146df98` example-app #78, and run `edbc3884`
+uzi #209): a parked or requeued run's own commits live only in the runner clone, and
+`runnerCloneForBranch` opens with an **unconditional** `fs.rm` of that clone (`agent/src/git.ts`),
+then reseeds off `origin/<branch>` or the default branch. So a run that pushed nothing lost
+everything on resume, and the loss also fires on an ordinary requeue with no usage limit involved.
+
+**Decision 1: the durable store is the worker's own bare, not the forge.** On park and on
+shutdown the worker calls `git.fetchAgentBranch(barePath, clonePath, branch)`, the same hardened
+file/pack primitive the done path already uses (`agent/src/git.ts` `fetchAgentBranch`, refspec
+`+refs/heads/<branch>:refs/uzi-runner/<branch>`), moving the agent's commits into the per-worker
+bare (a persistent `/data` PVC) before the next claim's `fs.rm` can reach them. Chosen over pushing
+to origin: cheapest store that survives the re-clone, adds no new trust-boundary crossing, and
+publishes nothing. Accepts the cross-worker limitation (a resume on a different worker finds neither
+the tracking ref nor the SDK transcript) deliberately; pushing on park stays out of scope (PRD #110
+is the closed decision record).
+
+**Decision 2: the reseed prefers the tracking ref, per leg, in `runnerCloneForBranch`
+(`agent/src/git.ts`).** The base is resolved:
+- **owned tracking ref + `origin/<branch>` exists**: the tracking ref only when it **strictly
+  descends** from `origin/<branch>` (`git merge-base --is-ancestor origin/<branch> <trackingRef>`);
+  on divergence, origin wins. Another worker may have pushed, and silently preferring local work
+  would drop a published commit. The ancestor test is on the origin leg ONLY.
+- **owned tracking ref + no `origin/<branch>`** (first park): the tracking ref, with **no** ancestry
+  test, because there is no competing published work and the freshly-fetched default tip is not a
+  meaningful reference. A uniform ancestor test against origin-or-default is WRONG here and was
+  refuted on run 78's own DAG: `ensureClone` re-fetches on every claim and runs
+  `remote set-head origin --auto`, so the default candidate at resume is a tip the parked work never
+  saw, and `--is-ancestor` would discard the very work the fetch-back saved.
+- **no owned tracking ref**: unchanged, `origin/<branch>` if it exists, else the default branch.
+
+**Decision 3: the tracking ref is OWNED by the writing run, gated by a per-branch config stamp.**
+The bare is persistent and nothing in `agent/src/` ever deletes `refs/uzi-runner/<branch>`, so a
+run that parks then dies permanently (retry budget exhausted, cancelled, failed push) leaves the ref
+behind. A later **fresh** run on the same issue/worker must not seed off a dead run's orphan
+commits (that is issue #105's failure arriving through the fix). Ownership is stamped in a
+per-branch worker-bare config key `uzi-trackowner.<branch>` set to the writing run's id; the reseed
+consults the tracking ref only when the stamp equals `claim.run_id`. **This REPLACED an earlier
+session_id gate**: a design-wave counterexample showed a session-keyed gate let a resume inherit a
+*different* dead run's orphan ref (same session lineage, different run), i.e. false provenance.
+Anchoring to the run id closes that.
+
+**Decision 4: shutdown durability (shape B), abort in-flight runs on SIGTERM, then fetch back.**
+`Runner.shutdown()` plus a per-run registry aborts each in-flight run's controller on SIGTERM
+(`agent/src/runner.ts`; the worker's existing SIGTERM/SIGINT handler in `agent/src/main.ts` drives
+it). A `shuttingDown` flag makes the reap-induced abort **skip the failed report** so the run is
+left for the sweeper to requeue rather than being marked `failed`. The fetch-back runs in the
+runner's `catch`, which is R5-safe because the agent tree is already reaped
+(`sdk-executor.ts` `finally` calls `killAgentTree`) before the catch is entered, so the worker never
+reads a store an untrusted uid is still mutating. Blanket-abort of in-flight runs is deliberate;
+a timed graceful drain is deferred.
+
+**Decision 5: best-effort, no auto-commit.** The fetch-back is best-effort: a failed fetch still
+parks or requeues the run, because a park/shutdown that fails is worse than one that loses work
+(the park path is a `catch`; a new throw there is a new way to lose the park). Uncommitted work is
+still lost by design, since `fetchAgentBranch` fetches `refs/heads/<branch>`, and auto-committing a
+half-applied edit that later gets built on is a worse failure than a clean loss.
+
+**Decision 6: the clone leg of PRD #35 Decision 6a was REDUNDANT, and M6 REMOVED it (PRD #218,
+2026-08-04).** Once the commits live in the bare, preserving the clone dir buys nothing for committed
+work: the reseed recreates the clone at the same path, so the HOME+cwd-keyed SDK session still
+resolves and the sibling skills-plugin dir is untouched regardless. M6 (dropping `&& !parked` from
+the `removeRunnerClone` guard, leaving the `worktreePath` guard so `removeRunnerClone(undefined)`
+never fires) has now LANDED. It was gated on M7 validating a real recovery first — a live worker
+eviction on dev-cluster reseeded off the tracking ref (seeded_from=tracking, prior_commits=1, marker
+byte-identical), proving the fetch-back is what carries committed work and removing the clone before
+that would have deleted the clone the fetch-back reads. So on a park only the plugin dir and the
+per-run HOME are preserved now; the clone is removed like on any terminal path (see the correction in
+§435). See PRD #218's Decision Log for full rationale (D1-D6) and the measured runs.

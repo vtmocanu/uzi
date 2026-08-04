@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-04
+
+### Changed
+
+- **A worker no longer keeps a parked run's on-disk clone around.** When a run
+  parks on a usage limit (or the worker shuts down), the worker used to preserve
+  the run's clone directory on the theory a resume needed it. It never did: a
+  resume re-clones unconditionally and the committed work is now fetched back into
+  the worker's own repo (a tracking ref) and recovered from there instead,
+  validated live on dev-cluster by a real worker eviction that recovered the
+  committed work byte for byte. So the clone is now cleaned up on a park like on
+  any other terminal path, freeing a full working tree per parked run for up to
+  the 8-day park window; the plugin dir and the per-run session HOME are still
+  preserved so the session resumes cleanly (issue #218).
+
+## [0.15.0] - 2026-08-04
+
 ### Added
 
 - **Agent templates now flag when a builtin has drifted from what this uzi
@@ -131,7 +148,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   vitest 4 rather than assumed, so no existing file changed environment: the
   per-file census is identical before and after. Part of PRD #103.
 
+- **Also in this release, smaller changes that merged alongside the above.** The
+  builtin agent templates gained additional role guidance for several roles
+  (auditor, coder, fact-checker, reviewer, tester, web-ux) (`e963f672`); on an
+  already-seeded install these badge as "differs from shipped" until reset, like
+  the #201 note above. The root `CLAUDE.md` was reorganised into path-scoped
+  contributor rule files (`8fd735ba`, NEW-6). And a rejection-message wording in
+  the secrets API handler was aligned with the project's lint rule (`10f7b6a5`).
+
 ### Fixed
+
+- **A run that parks on an Anthropic usage limit, or whose worker is shut down
+  or evicted, no longer loses the work the agent already committed.** Previously
+  the committed branch lived only in the per-run clone; the next claim deleted
+  that clone and re-seeded from the default branch, so a resume came back to an
+  empty working tree while every other signal said it had resumed cleanly. The
+  worker now fetches the agent's committed branch back into its own repository
+  before cleanup, on both the park and the shutdown or eviction paths, and a
+  resume rebuilds from that recovered work instead of silently rebasing onto a
+  default branch that moved in the meantime. When work genuinely cannot be
+  recovered, the run says so in its activity feed rather than re-treading it
+  silently. The runner clone, plugin dir and per-run HOME are still preserved on
+  a park exactly as before; removing the now-redundant clone-preservation step is
+  a deferred follow-up (issues #218, #224).
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team
   lead when they report back.** Each template's "report via SendMessage"

@@ -99,7 +99,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     const agentSha = gitIn(rc.path, ["rev-parse", "HEAD"]);
 
     // The worker fetches the agent branch BACK into a worker-side tracking ref.
-    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-7");
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
     assert.strictEqual(ref, "refs/uzi-runner/agent/issue-7");
     assert.strictEqual(gitIn(bare, ["rev-parse", ref]), agentSha, "fetch-back landed the agent commit in the worker bare");
     // The fetched objects are now in the worker bare (push does not depend on the clone).
@@ -121,7 +121,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     gitIn(first.path, ["add", "A.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "a"]);
     const sha1 = gitIn(first.path, ["rev-parse", "HEAD"]);
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-9");
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-9", "run-fixture");
     await git.pushBranch(bare, "agent/issue-9", "", fx.originPath);
     await git.removeRunnerClone(first.path);
 

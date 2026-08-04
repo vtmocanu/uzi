@@ -100,7 +100,7 @@ describe("pushBranch secret flow", () => {
     // that fetchAgentBranch writes, so the fetch-back must run first.
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 7);
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
 
     const oldPath = process.env.PATH ?? "";
     process.env.PATH = shimDir + path.delimiter + oldPath;
