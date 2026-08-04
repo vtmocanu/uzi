@@ -136,13 +136,28 @@
   guarded on the Go side instead, by TestPresetPVCSizesFitTheChartsLimitRangeMax, which
   READS both tiers' maxPVCStorage out of values.yaml.
 
-  AND THE RESIDUAL THAT NEITHER HALF CLOSES, since an earlier version of this comment
-  claimed a safety property it did not have: the Go test reads values.yaml FROM DISK, so
-  it gates an edit to the shipped defaults and CANNOT see a cluster lowering
-  maxPVCStorage through `--set` or its own values file. The chart cannot check that
-  either, because nixSize never reaches it. So an operator-lowered RESTRICTED-tier
-  ceiling is ungated on both sides — a real residual, not a covered case. The docker
-  tier's is covered here, at render time, overrides included.
+  SO THERE ARE THREE NETS, AT THREE DIFFERENT TIMES, AND THIS IS THE FIRST OF THEM:
+
+    1. HERE, at `helm install`/`template` time — the earliest and cheapest, covering the
+       one claimant the chart supplies, overrides included.
+    2. `go test` — TestPresetPVCSizesFitTheChartsLimitRangeMax reads both tiers'
+       maxPVCStorage out of values.yaml and checks the Go constants against it, catching
+       a developer who raises nixSize or a preset's DataSize.
+    3. CONTROLLER BOOT — kube.ValidatePVCCeilings, fed the real ceilings at runtime
+       (UZI_WORKER_MAX_PVC_STORAGE / UZI_WORKER_DOCKER_MAX_PVC_STORAGE), refuses to start
+       rather than provisioning claims the LimitRange will reject. This is the only one
+       that sees what the CLUSTER configured rather than what the repo ships, so it is
+       what covers `--set` and per-cluster values files.
+
+  *** An earlier version of this comment ended "an operator-lowered RESTRICTED-tier
+  ceiling is ungated on both sides — a real residual, not a covered case". That was true
+  when written and net 3 made it false; the sweep was missed by the commit that added
+  net 3. Corrected here rather than left, because a comment that UNDERSTATES coverage
+  sends the next reader off to build a guard that already exists. ***
+
+  What genuinely survives all three: a LimitRange edited DIRECTLY in the cluster, out of
+  band from the chart. Neither the chart nor the controller is told. A `helm upgrade`
+  cannot reach this state, since changing the value rolls the controller with the new env.
 */ -}}
 {{- /*
   NO `ephemeral-storage` IN ANY LimitRange `default` OR `defaultRequest`, EITHER TIER

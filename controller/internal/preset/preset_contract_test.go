@@ -241,13 +241,28 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // is gone rather than relabelled, and the two tiers are read separately because nothing
 // requires them to stay equal.
 //
-// 🔴 WHAT THIS STILL CANNOT SEE, stated plainly because the sentence it replaces got
-// this wrong: reading values.yaml catches an edit to the SHIPPED DEFAULTS, which is the
-// repo-level change a test can gate. It does NOT catch a cluster lowering maxPVCStorage
-// through `--set` or its own values file — that value never reaches this process, and
-// the chart cannot check it against nixSize either, because nixSize is a Go constant.
-// So an operator-lowered restricted-tier ceiling remains ungated on BOTH sides. That is
-// a real residual, not a covered case; the chart-side comments say so too.
+// WHAT THIS TEST COVERS, AND WHAT COVERS THE REST. Reading values.yaml catches an edit
+// to the SHIPPED DEFAULTS — a developer raising nixSize or a preset's DataSize — which
+// is the repo-level change a gate can see, and catching it at `go test` is the cheapest
+// feedback available. It cannot see a CLUSTER lowering maxPVCStorage through `--set` or
+// its own values file, because that value never reaches a test reading a file on disk.
+//
+// That second case is covered by kube.ValidatePVCCeilings, which the chart feeds the
+// real ceiling at runtime (UZI_WORKER_MAX_PVC_STORAGE) and which refuses to boot rather
+// than provisioning claims the LimitRange will reject. The two are layered on purpose:
+// this one is early and cheap and sees only the repo; that one is late and authoritative
+// and sees what the cluster actually configured.
+//
+// *** This paragraph replaced one that said an operator-lowered ceiling "remains ungated
+// on BOTH sides — a real residual, not a covered case". That was true when written and
+// was made FALSE by the very commit that added the boot check, which I wrote without
+// sweeping this comment. It is the same class of defect as the safety label above: a
+// stale claim about coverage, left behind by the change that altered the coverage. ***
+//
+// The residual that genuinely survives is narrower: a LimitRange edited DIRECTLY in the
+// cluster, out of band from the chart, is seen by neither — the chart never renders it
+// and the controller is never told. A `helm upgrade` cannot do this, since changing the
+// value rolls the controller with the new env.
 func TestPresetPVCSizesFitTheChartsLimitRangeMax(t *testing.T) {
 	ceilings := chartMaxPVCStorage(t)
 	// Vacuity guards, the idiom readGolden states 190 lines above in this same file: a
