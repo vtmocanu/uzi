@@ -322,7 +322,7 @@ export class RunRunner {
     // `active.shuttingDown` to tell a graceful shutdown apart from every other failure.
     let active: ActiveRun | undefined;
     // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
-    // the three filesystem removals in the finally and nothing else. Declared here
+    // the two filesystem removals in the finally and nothing else. Declared here
     // rather than in the catch so the finally can see it; false is the safe default,
     // so every path that never reaches the park logic cleans up exactly as before.
     let parked = false;
@@ -876,23 +876,27 @@ export class RunRunner {
       // resume, so both sentences are corrected above rather than left to mislead.)
       for (const s of runScopedSecrets) this.log.removeSecret(s);
       // ── The park carve-out (PRD #35 Decision 6a) ──────────────────────────────
-      // EXACTLY the three filesystem removals below are skipped for a parked run,
-      // and nothing else in this finally is. The three are what a resume needs:
-      // the runner clone, the sibling skills plugin dir, and the per-run HOME that
-      // holds the resumable SDK transcript. Preserving only some of them would
-      // resume into a session missing its plugins or its worktree.
+      // EXACTLY two filesystem removals below are skipped for a parked run, and
+      // nothing else in this finally is. The two are what a resume needs: the
+      // sibling skills plugin dir, and the per-run HOME that holds the resumable
+      // SDK transcript. Preserving only one of them would resume into a session
+      // missing its plugins or its transcript.
       //
-      // (Corrected 2026-08-04, PRD #218: the clone leg above no longer carries the
-      // resumed work. `runnerCloneForBranch` unconditionally deletes the clone on
-      // every claim and re-seeds it from a bare ref, so a parked run's own commits
-      // were never recovered from the preserved clone directory. PRD #218 fixed the
-      // real durability by fetching the agent's committed branch back into this
-      // worker's bare repo on both the park and shutdown paths, anchored to the
-      // writing run's id; an owned resume then reseeds off that tracking ref. The
-      // three-way preservation below still runs unchanged today, and the plugin-dir
-      // and HOME legs are still load-bearing exactly as the sentence above says; the
-      // clone leg is now redundant rather than wrong to skip, and its removal is a
-      // deferred follow-up, not done here.)
+      // (PRD #218 M6, 2026-08-04: the runner clone is no longer preserved on a
+      // park — the clone leg below runs unconditionally now. `runnerCloneForBranch`
+      // unconditionally deletes the clone on every claim and re-seeds it from a
+      // bare ref, so a parked run's own commits were never recovered from the
+      // preserved clone directory in the first place. PRD #218 M1/M2 moved the real
+      // durability off the clone: the agent's committed branch is fetched back into
+      // this worker's bare repo on both the park and shutdown paths, anchored to
+      // the writing run's id, and an owned resume reseeds off that tracking ref.
+      // That made preserving the clone redundant, and M7 proved it live on
+      // dev-cluster (2026-08-04): a real worker eviction recovered committed work
+      // from the tracking ref, seeded_from=tracking, marker byte-identical. So the
+      // clone leg is removed here — dropping the whole guard is wrong (`worktreePath`
+      // is the undefined guard and `removeRunnerClone(undefined)` would fire), only
+      // the `&& !parked` is gone. The plugin-dir and HOME legs are UNCHANGED and
+      // still load-bearing exactly as the sentence above says.)
       //
       // The other four statements in this block — the steering poller stop, the two
       // gate-map deletes, and the secret eviction above — MUST still run on a park.
@@ -912,7 +916,7 @@ export class RunRunner {
       //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
       //     for a timeout, so the tally will say everything passed while the exit
       //     code says otherwise. A hang here is this bug until proven otherwise.
-      if (worktreePath && !parked) {
+      if (worktreePath) {
         await this.git.removeRunnerClone(worktreePath).catch((e) =>
           runLog.warn("runner clone cleanup failed", {
             error: errMessage(e),
@@ -952,7 +956,7 @@ export class RunRunner {
         // what is being held and why — an operator reading disk pressure needs to
         // connect it to a parked run rather than to a leak.
         runLog.info(
-          "run parked on a usage limit; preserving its clone, plugin dir and HOME for resume",
+          "run parked on a usage limit; preserving its plugin dir and HOME for resume",
           {
             run_home: runHome,
           },

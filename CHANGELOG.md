@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **A worker no longer keeps a parked run's on-disk clone around.** When a run
+  parks on a usage limit (or the worker shuts down), the worker used to preserve
+  the run's clone directory on the theory a resume needed it. It never did: a
+  resume re-clones unconditionally and the committed work is now fetched back into
+  the worker's own repo (a tracking ref) and recovered from there instead,
+  validated live on dev-cluster by a real worker eviction that recovered the
+  committed work byte for byte. So the clone is now cleaned up on a park like on
+  any other terminal path, freeing a full working tree per parked run for up to
+  the 8-day park window; the plugin dir and the per-run session HOME are still
+  preserved so the session resumes cleanly (issue #218).
+
 ## [0.15.0] - 2026-08-04
 
 ### Added

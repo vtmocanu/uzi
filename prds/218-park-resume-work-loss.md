@@ -3,10 +3,12 @@
 **Issue**: [#218](https://gitlab.example.com/vtmocanu/uzi/-/issues/218) · **Label**: PRD · **Priority**: High
 **Area**: `agent/src/runner.ts` (the park path and the cleanup carve-out) · `agent/src/git.ts` (`runnerCloneForBranch`, `fetchAgentBranch`) · `specs/ai.md` + `prds/done/35-run-limit-retry.md` (M5) · `adr/0035-run-limit-retry.md` (**M6 only** — see M5 for why it is not an M5 site).
 **Line references** are against `136d976a`.
-**Status**: M1-M5 implemented and validated (MR1, branch `218`: commits
+**Status**: COMPLETE. M1-M5 shipped in 0.15.0 (MR1, branch `218`: commits
 `47351bc9` + `e60012fb` + `ca9df2ca`, on `d240fe02` after merging origin/main).
-M6 (drop the clone leg) is deliberately a SEPARATE later MR, gated on M7 (a real
-park recovering work on dev-cluster). Two frozen design changes vs the draft
+**M7 validated live on dev-cluster (2026-08-04): a real worker eviction recovered
+committed work via the tracking ref (seeded_from=tracking, prior_commits=1, marker
+byte-identical).** That satisfied D5's gate, so **M6 (drop the now-proven-redundant
+clone leg) landed** on branch `218-m6`. Two frozen design changes vs the draft
 below: M2's row-3 open question was resolved by a **run-identity anchor** (a
 per-branch `uzi-trackowner.<branch>` worker-bare config stamp; the reseed consults
 the tracking ref only when the stamp == `claim.run_id`) that REPLACES the
@@ -325,7 +327,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       `:284-287` about the *acknowledgement condition*, which is true today and
       stays true after this PRD — but its word "three" becomes "two" at M6, so the
       edit belongs there.
-- [ ] **M6 — drop the clone leg of the carve-out.** Only after M1/M2 are validated
+- [x] **M6 — drop the clone leg of the carve-out.** Only after M1/M2 are validated
       on a real park. Removes **`&& !parked`** from the `removeRunnerClone` guard
       at `runner.ts:791-797` — not the whole condition, since `worktreePath` is the
       undefined guard and dropping it calls `removeRunnerClone(undefined)` —
@@ -334,7 +336,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
       HOME"* log line at `:831`; and updates `adr/0035:284-287`'s "three
       filesystem cleanups" to two. Frees a full working tree per parked run, for
       up to the 8-day `RUN_LIMIT_MAX_PARK` (`api/internal/config/config.go:677`).
-- [ ] **M7 — validate on dev-cluster.** Per the k8s-first convention, and this one
+- [x] **M7 — validate on dev-cluster.** Per the k8s-first convention, and this one
       genuinely needs it: the worker bare lives on `/data`, a per-worker PVC in
       k8s (`git.ts:252`), and R1 below is about exactly that boundary. Run 78 is a
       better subject than its evidence table suggests — it parked **twice**
