@@ -362,8 +362,8 @@ rather than the three guards:
 |---|---|---|---|
 | gitleaks | `GITLEAKS_CONFIG`, `GITLEAKS_CONFIG_TOML` | substitutes a config that can allowlist anything | `scripts/scan-secrets.sh:153` |
 | npm audit | `NPM_CONFIG_OMIT=dev` | drops the dev tree — `rc=0`, *"found 0 vulnerabilities"* | `scripts/npm-audit-gate.sh`, via an asserted `--include=dev` |
-| govulncheck | `GOPACKAGESDRIVER` | a 3-line stub answers for the whole package graph | `scripts/govulncheck-gate.sh:110` |
-| govulncheck | `GOFLAGS=-tags=…` | build-tags the vulnerable call out of the build | `scripts/govulncheck-gate.sh:125` |
+| govulncheck | `GOPACKAGESDRIVER` | a 3-line stub answers for the whole package graph | `scripts/govulncheck-gate.sh` (the `GOPACKAGESDRIVER` refusal) |
+| govulncheck | `GOFLAGS=-tags=…` | build-tags the vulnerable call out of the build | `scripts/govulncheck-gate.sh` (the `GOFLAGS`/`-tags` refusal, via `go env GOFLAGS`) |
 
 Two details in that table are the interesting part.
 
