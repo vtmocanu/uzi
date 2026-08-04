@@ -892,11 +892,25 @@ These are not style preferences; each one is a measured failure somewhere in
    to root `devbox.json` — that file is tier-2 *worker* config.
 4. **Never a bare `npx <tool>`** — it fetches from the network when the dep is
    missing, which a gate may not do.
-5. **The CI-skip marker in a commit message skips the pipeline**, quoted or not,
-   including in a merge tip. Check with
-   `git log -1 --format=%B | grep -c -F '[skip ci]'` before pushing a tip you need
-   a pipeline for. A `skipped` pipeline is not `failed` — the MR still reads
-   mergeable, because `allow_merge_on_skipped_pipeline: true` is set here.
+5. **🔴 THE CI-SKIP MARKER IS SET ON THIS BRANCH'S TIP RIGHT NOW, AND IT IS THE MOST
+   LIKELY WAY THIS MR SHIPS UNVERIFIED.** The marker skips the pipeline, quoted or
+   not, including in a merge tip. Check with
+   `git log -1 --format=%B | grep -c -F '[skip ci]'` before pushing a tip you need a
+   pipeline for. A `skipped` pipeline is not `failed` — the MR still reads
+   **mergeable**, because `allow_merge_on_skipped_pipeline: true` is set here.
+
+   **Measured twice, minutes apart: it returns 1 at every docs tip on this branch.**
+   That is *correct per commit* — each is docs-only — and **fatal at the branch tip**,
+   since GitLab reads the marker from the MR's HEAD commit however the pipeline is
+   triggered. Nothing is pushed yet (`git rev-parse @{u}` → no upstream,
+   `git branch -r --contains 121d7610` empty), so it is still preventable, and
+   amending would need a force-push this repo forbids — the only way out is another
+   commit.
+
+   **It bites hardest here because Unit A's one CI-dependent claim is about a job
+   that has never run**: `f9b1f27f`'s *"if it reddens HERE first that is a real
+   finding"* concerns `-race` on `test:controller` in CI. **Re-check at PUSH TIME
+   against whatever the tip then is**, never against a commit you already checked.
 6. **Commit with a pathspec** — `git commit -- <paths>`. Staging by path is
    necessary and not sufficient: `git commit` takes the whole index, and in a
    shared worktree another agent's staged work is in it (carry-forward 20, where
@@ -1219,8 +1233,48 @@ the cap again, split it before raising."* There, splitting `runner.test.ts` into
 files is what removed the knife-edge; the raised cap only bought margin, and it cut
 the suite from 112s to 46s as a side effect.
 
-**Ruled (lead): ACCEPT the raise in MR-C, and file the `RunView.test.tsx` split as
-its own issue.**
+**🔴 AMENDMENT 7 REVISES THIS RULING. THE RATE IT WAS BUILT ON DOES NOT REPRODUCE,
+AND THE REMEDY IT FILED CANNOT WORK.** Read this box before the bullets below it,
+which are preserved as the original reasoning.
+
+- **The flake rate is 1-in-13, not 1-in-3.** Ten consecutive full-suite runs at
+  `testTimeout: 20000` under vitest 4.1.10, config mutated and the value echoed into
+  the log header, detached worktree: **0 reds**, all `118 passed / 1660 passed`.
+  Pooled with the coder's 3 runs that is **1 red in 13**. And **four of the ten were
+  SLOWER than the coder's 157s red run**, so this was not a quieter machine — the
+  obvious dismissal is closed. The coder's red was real, with a real timeout and a
+  named test; it is the *rate* that is refuted, and the rate is what my first bullet
+  argued from. **Quote 1-in-13 in the MR, or quote no rate at all.**
+- **Splitting `RunView.test.tsx` CANNOT fix the test that failed, and measured,
+  isolating it made it SLOWER.** Per-test durations via `--reporter=json`: in-suite
+  (118 files) n=6, mean **4228 ms**; solo (RunView alone) n=8, mean **5416 ms**. Solo
+  is the *limit* of splitting — zero competing files — and it is not faster. The
+  cause is structural and readable in the source: `RunView.test.tsx:879` and `:924`
+  each `await vi.advanceTimersByTimeAsync(149 * 4000)` inside **one** `it()`, which
+  is 149 sequential real event-loop turns, each with a mocked promise and a React
+  `act` flush. **That chain moves intact into whatever file it is split into.**
+- **"~3x the spike that actually failed" is not derivable and is in `vite.config.ts:44`
+  and the commit message.** The test was *cancelled* at 20000 ms, so its true duration
+  on that run is unknown and bounded only from below. 60000 is 3x **the cap that
+  fired**; the margin over the actual spike is unmeasured. The `~15x steady state`
+  half is sound.
+
+**REVISED RULING: the targeted fix is a PER-TEST timeout on the two cap tests, not a
+suite-wide 3x.** vitest 4 supports `it(name, fn, 60000)` (`@vitest/runner`'s
+`TestCollectorCallable`, `options?: number`). Applying it to those two leaves the
+other **1658 tests at 20000**, which is strictly less gate-weakening than tripling the
+ceiling for everything, and it needs no follow-up issue at all.
+
+**Land it as a follow-up commit after commits 5-6** — `121d7610` is already dispatched
+for review, so this does not amend it. **And the follow-up issue changes shape**: file
+it as *"the two 150-tick cap tests are a 149-turn awaited chain"*, **not** as *"split
+the 100-test file"*. The second sends someone to do work the measurement says will not
+move this number.
+
+*(Superseded reasoning, kept because the revision is only legible against it:)*
+
+**Ruled (lead), NOW REVISED: ACCEPT the raise in MR-C, and file the
+`RunView.test.tsx` split as its own issue.**
 
 - **Not accepting is worse than accepting.** A gate that reddens 1-in-3 is *weaker*
   verification than a slow one, because the documented human response is to re-run
@@ -1435,6 +1489,103 @@ is far smaller than the raw advisory list implies, and the next person to run
 **One invariant the filed 6→7 issue must carry**: `safeNextPath` is a *per-call-site*
 guard, so any future `navigate(<value derived from a URL or the server>)` reopens the
 hole without touching react-router at all.
+
+### Amendment 7 — 2026-08-04, from the Unit A review at `121d7610`
+
+**The two decision-changing findings are in the RULING box and in Hard constraint 5**
+(the revised per-test-timeout ruling, and the CI-skip marker on the branch tip). The
+rest:
+
+**🔴 `1c751ae3`'s MESSAGE SAYS WEB'S FINDINGS ARE "ALL DEV-ONLY". TWO OF THE EIGHT ARE
+RUNTIME, IN THE SHIPPED SPA.** `web/package.json` lists `react-router-dom` under
+**`dependencies`** at `^6.28.0`, not `devDependencies`; in the lockfile both
+`react-router@6.30.4` and `react-router-dom@6.30.4` carry no `dev` flag and are 2 of
+the 111 non-dev names. The clause is refuted by the clause *after* it in the same
+message, and by Amendment 3's own ruling, which calls them *"live CVEs in shipped SPA
+routing code"*.
+
+**The commit message is immutable; the blocking part is that it MUST NOT PROPAGATE.**
+The MR description, the CHANGELOG line and the react-router follow-up issue have to
+say **runtime, shipped in the bundle** — not dev-tooling debt. Amendment 3 already has
+the right words; the commit is where they went wrong.
+
+**Doc corrections owed, all falsified by THIS branch:**
+
+- **`CLAUDE.md:40`** said `web/vite.config.ts` "raised `testTimeout` to 20000". It is
+  60000 as of `121d7610`. **Fixed in this amendment's commit** — and rewritten to
+  record the *trajectory* (5000 → 20000 → 60000, twice for the same cause) with an
+  explicit "read the file, not this number", since a bare figure here has now gone
+  stale twice. Note it is a *third* stale site, falsified by the third commit rather
+  than the first, after `154ad390` fixed the two `-count=1` ones — the sweep found
+  what it was looking for and not what it wasn't.
+- **`prds/103-dev-loop-quality-gates.md:1947-1949`** prescribes `environmentMatchGlobs`
+  because it *"works on the pinned `vitest ^2.1.9`"*. **Both halves are now false**:
+  the pin is exact `4.1.10` and the option has zero occurrences in it. The brief
+  re-scopes M6 onto `test.projects`; the PRD is the durable record and still says the
+  other thing. Goes in the doc commit.
+- **`web/src/components/OccurrenceFileIssue.test.tsx:149`** is the one comment in the
+  suite naming a vitest version, and the major **inverted** it. It warns that
+  `getMockImplementation()` being `undefined` is *not* the check because "vitest
+  2.1.9's `mockReset()` installs `() => void 0`" — in 4.1.10, `mockReset` sets
+  `mockImplementation = resetToMockImplementation ? mockImplementation : undefined`,
+  which for a bare `vi.fn()` **is** `undefined`. **No behaviour break** (the mock is
+  declared with no implementation, so the teardown's leak-prevention still works) —
+  stale guidance in a live file, and the single site a runner major most obviously
+  owed a re-read.
+
+**What a count cannot see here — three checked directly, all clean.** The 118/1660
+pair is blinder than "it cannot see a flake": it is also compatible with a
+**passed→skipped shift** (both sides report `1660 passed`, `numPendingTests=0`); with
+an **environment shift** (the node `ExperimentalWarning: localStorage is not
+available` fires on exactly **64** lines under vitest 2.1.9 and **64** under every
+4.1.10 run — same files, same assignment, across the major); and with an **orphaned
+config key** (vitest 4 removes `poolMatchGlobs`, `environmentMatchGlobs`,
+`deps.external`, `browser.testerScripts`, `minWorkers`, `maxThreads`/`maxForks`,
+`singleThread`/`singleFork`, `transformMode`, `coverage.all`/`coverage.extensions`,
+`test.workspace` — **zero live hits**, the `minWorkers` matches being `AdminWorkers`
+substrings). The vitest 3/4 silent-semantics changes the suite *could* meet are
+`vi.restoreAllMocks` no longer touching automocks (7 uses), automocked getters no
+longer calling through, and `mock.invocationCallOrder` now 1-based (0 uses); none
+produced a red across 13 full-suite runs.
+
+**The deletion lens, settled**: the non-dev side of `web/package-lock.json` is **111
+names before and 111 after, name@version set byte-identical** — nothing the app needs
+at runtime left with those 1239 lines. All 58 removed entries are `dev: true`. The
+install-script set shrank 4 → 2 and **the two that left are nested duplicates of a
+survivor**, same package name, so no script was hidden and no name left the set.
+
+**`agent`'s five bumps are installed into the worker image and never loaded**, traced
+from the published tarball rather than an installed tree: their sole parent is
+`@modelcontextprotocol/sdk`, which is a **peer** of `@anthropic-ai/claude-agent-sdk@0.3.219`
+whose runtime entry (`sdk.mjs`, 1246466 bytes) contains **zero** occurrences of
+`@modelcontextprotocol` and zero bare non-builtin import specifiers — the only
+references are `import type` lines, erased at runtime. That makes the coder's
+shipped-versus-not framing exactly right and correctly hedged, and makes the
+0-of-11156 resolve-hook result unsurprising rather than alarming. **What a stronger
+probe would be is not a bigger probe but a GATE**: the link probe is a text file under
+`probes/` that nothing re-runs, so the next lockfile refresh reopens the blindness
+with no signal. Not asked for in this MR; say so in the MR description rather than let
+the probe carry weight it cannot hold.
+
+**Two count nits, both the unit rather than the claim.** `1c751ae3` says the agent
+lockfile is "byte-identical at **225 names**" — 225 counts `.packages` entries
+*including* the root `""`; distinct package names is **222**. The substantive claim
+(identical, 0 added, 0 removed) holds under every denominator. Same shape as the
+files-versus-lines correction `CLAUDE.md` already records. And `f9b1f27f`'s "the last
+Go test command in the repo running without `-race`" is true *for gate recipes*;
+`agent/src/self-improve.ts:105` runs a bare `go test ./...`, but that is a check uzi
+runs on a **user's** repo, not a gate on this one.
+
+**Housekeeping**: `probes/prd-103-mrc-coder/` is 30 files with no `README.md`, and
+`probes/README.md` lists 2 numbered sections for 7 directories. The architect's and
+both reviewers' dirs each carry their own README; the largest contributor does not.
+
+### Forward, and it changes Unit B's first line
+
+**`vitest@4.1.10` declares `@vitest/coverage-v8` as an EXACT-version optional peer** —
+`"@vitest/coverage-v8": "4.1.10"`, not a range. M6 must pin it at exactly `4.1.10`
+with `--save-exact`, matching the exact `vitest` pin. A caret gets a peer warning now
+and, on the next refresh, a coverage provider one minor off its runner.
 
 ### Two instrument failures from the architect, both worth keeping
 
