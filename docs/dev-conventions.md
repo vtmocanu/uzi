@@ -77,7 +77,7 @@ Four things about it that are decisions rather than accidents:
 
 Not everything is a target. A single-test run, `sqlc generate`, the compose
 stack, `./e2e/run-e2e.sh` and `./scripts/smoke.sh` are not gate recipes and stay
-written out as commands in `CLAUDE.md`.
+written out as commands in `CLAUDE.md` and the `.claude/rules/` files it indexes.
 
 The Taskfile installs no *project* dependencies — no `npm ci`, no
 `go mod download`. Your `node_modules` and module cache are expected to exist; CI
@@ -105,7 +105,7 @@ npm install --ignore-scripts
 **`--ignore-scripts` is not optional in `agent/`.** That package depends on
 `agent-browser`, whose `postinstall` rewrites `/opt/homebrew/bin/agent-browser` to
 point inside whatever `node_modules` just installed it, breaking the CLI host-wide
-for every other session and every other worktree — `CLAUDE.md` documents the
+for every other session and every other worktree — `.claude/rules/agent.md` documents the
 breakage and the `brew unlink` / `brew link --overwrite` repair. The flag is
 already settled for this repo with its own measurements (`agent/src/js-deps.ts`,
 PRD #121), including that **a repo `.npmrc` setting `ignore-scripts=false` does not

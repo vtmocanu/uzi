@@ -184,7 +184,7 @@ the tree or a commit message had that exact shape:
   Both readings of "when it was recorded" are needed, because a sentence about
   counts going stale before commit must not itself be ambiguous about which side
   of the commit it means. A count of a population that includes the document
-  counting it is stale before it is committed; `CLAUDE.md` has the same trap on
+  counting it is stale before it is committed; `.claude/rules/go.md` has the same trap on
   its `grep -c '^--- PASS'` tally.)*
 - *"Three non-whitespace changes."* The conclusion — commit 1 is semantically
   inert — is true and independently confirmed by a token-stream pass. The
@@ -342,7 +342,7 @@ decides where the next person spends their time. Re-derive those too.
   failed silently while the thing it was verifying looked fine.* In all three, the output of a
   broken check is indistinguishable from the output of a passing one.
 - **THE zsh WORD-SPLITTING TRAP HAS A VERIFICATION-LOOP FORM, AND IT IS WORSE THAN THE
-  COMMAND FORM `CLAUDE.md` ALREADY DOCUMENTS.** Measured on PRD #72: an auditor building a
+  COMMAND FORM `.claude/rules/stack.md` ALREADY DOCUMENTS.** Measured on PRD #72: an auditor building a
   mutation table ran `for g in $combo` over a space-joined string. zsh does **not** word-split
   unquoted variables, so the loop iterated **once, on the whole string**, and every pair- and
   triple-mutant silently never applied — while those rows still printed a confident
@@ -419,7 +419,7 @@ decides where the next person spends their time. Re-derive those too.
   Exit code and "no failures printed" are *both* satisfiable by a run in which
   not one assertion executed. Require a **positive control** — the named test
   appears as `--- PASS`/`--- FAIL`, zero `--- SKIP`, `RUN > 0` — and treat any
-  run failing that as INVALID rather than green. See `CLAUDE.md`'s api section
+  run failing that as INVALID rather than green. See `.claude/rules/go.md`
   for the operational form.
   **The positive control catches TWO of the three false-green mechanisms, not
   three, and the distinction is load-bearing.** It catches the skipped suite and
@@ -893,7 +893,7 @@ uncompilable mutation **twice — the second time inside the correction of the
 first**, by which point the failure mode was known. The point is not that the
 lead should have been more careful: it is that `sqlc generate` + `go vet` settles
 it in under a minute with no container and no database, so the check costs less
-than the correction. See `CLAUDE.md` for the mechanism (sqlc types by
+than the correction. See `.claude/rules/go.md` for the mechanism (sqlc types by
 expression).
 
 ## Inspiration-first rule
@@ -985,7 +985,7 @@ going red FOR THE REASON THE MUTATION NAMES.** Read the failure text, never the 
 agents on this branch shipped mutations that reddened for unrelated reasons and read the red as
 confirmation.
 
-CLAUDE.md's **"compile the mutation before you believe it"** is necessary and **not
+`.claude/rules/go.md`'s **"compile the mutation before you believe it"** is necessary and **not
 sufficient** — it eliminates only row 6. Rows 7 and 8 compile perfectly and still say nothing,
 and row 9 is not about mutation at all: **the test aborted before reaching the assertions that
 would have discriminated**, so the guard has to be ordering, not compilation. Put the checks
@@ -1659,7 +1659,7 @@ on the whole gate is exactly the kind of bare-tally trust this repo's own rules
 warn against. **The composite verdict is the exit code** (`task` exits 201 on any
 failure, per Decision 2 of PRD #103); use the per-component forms only to find
 *which* component failed and *which* test, never to decide pass/fail on their own.
-This is the same lesson as the `--- PASS` population trap in `CLAUDE.md`, arriving
+This is the same lesson as the `--- PASS` population trap in `.claude/rules/go.md`, arriving
 through test NAMES and cross-component blindness instead of through subtest
 indentation.
 
@@ -1705,7 +1705,7 @@ the output of any run you make:
   cap; in CI it landed ~25-30s and flaked. It was **split into seven
   `runner-*.test.ts` files the same day** (sharing `test/runner-harness.ts`), which
   is what actually removed the knife-edge and cut the agent suite 112s -> 46s wall.
-  Read `CLAUDE.md`'s `--test-timeout` block before touching the number, and prefer
+  Read `.claude/rules/agent.md`'s `--test-timeout` block before touching the number, and prefer
   splitting a file over raising the cap. The cap is live and worth
   carrying as insurance against a future slow test, not as a fix for a current
   hang.
@@ -1721,7 +1721,7 @@ the same tree naming the broken fixture. Two aggravations, same day — the buil
 is content-addressed and **shared across worktrees**, so even a fresh throwaway
 worktree can serve `(cached)`; and CI's `test:api` was armed the same way by
 `.go_job`'s persisted `.gocache/`. It costs the test-result cache only; compilation is
-still reused. See `CLAUDE.md`'s api section for the full measurement.
+still reused. See `.claude/rules/go.md` for the full measurement.
 
 ## Project signals
 
@@ -1877,7 +1877,7 @@ for the instruction nobody has written yet.
 *Measured on PRD #111 (2026-07-27), all four on one branch, by three different agents including
 the ones whose job is to catch this.*
 
-`CLAUDE.md` already says to assert a mutation actually applied. That rule covers one of four
+`.claude/rules/go.md` already says to assert a mutation actually applied. That rule covers one of four
 failure modes, and the other three are invisible to it:
 
 1. **The edit did not apply.** A replacement string that does not match the file is a no-op. Hit
@@ -1891,7 +1891,7 @@ failure modes, and the other three are invisible to it:
    live".
 3. **The suite did not run.** The same harness never exported `UZI_TEST_DATABASE_URL`, so every
    `*LiveDB` test skipped, `go test` exited 0, and that scored as survival — the positive-control
-   failure `CLAUDE.md` documents, occurring **inside the tool built to run the controls**. It
+   failure `.claude/rules/go.md` documents, occurring **inside the tool built to run the controls**. It
    produced two false survivors, one of which was a perfectly good assertion nearly "fixed".
 4. **The build failed.** After (3) was fixed, mutations that change sqlc's inferred nullability
    were found to have scored **RED** purely because a build failure also exits non-zero — a build
@@ -1936,7 +1936,7 @@ someone to "fix" the one that was already correct.
 
 *Also migrated from the PRD #98 checkpoint. Each keeps its incident: a rule without its
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
-compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
+compile-the-mutation) live in `.claude/rules/go.md`; these are the general ones.*
 
 - **PREFIX YOUR LONG-RUNNING PROBE COMMANDS WITH YOUR OWN ROLE NAME, in the echo:
   `echo "=== [reviewer] go.mod hashes BEFORE ==="`, never `echo "=== BEFORE ==="`.**
@@ -1956,7 +1956,7 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   attribution nearly landed on two different agents in turn, because the shared
   signals do not merely fail — they **manufacture a confident match** with whoever you
   check first. This rule turns the lucky match into a designed one. Read it as a pair
-  with the `CLAUDE.md` rule: **make your own processes attributable, and leave alone
+  with the root `CLAUDE.md` rule: **make your own processes attributable, and leave alone
   the ones that are not.**
 
 - **A DELIVERED TASK DESCRIPTION CARRIES NEITHER ITS CURRENCY NOR ITS COMPLETION — check the
@@ -2276,7 +2276,7 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
 
   **And record why the safe case was safe, because it is the load-bearing half.** The agent that
   avoided this got the good outcome by **verifying its index immediately before committing** —
-  which is *noticing*, and `CLAUDE.md` is explicit that a rule relying on noticing loses to one
+  which is *noticing*, and root `CLAUDE.md` is explicit that a rule relying on noticing loses to one
   that removes the failure mode (its own example: naming throwaway containers outside the `uzi-`
   namespace is the strong rule, "be careful with globs" the weak one). `git commit -- <path>` is
   the strong form here. Treat "I checked first" as a report of good luck, not of process.
