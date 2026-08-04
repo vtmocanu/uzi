@@ -222,7 +222,7 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 ### web (Vite + React + TS)
 
 ```sh
-task gate:web                              # lint + deadcode + check-docs + typecheck + test
+task gate:web                              # deps-check + lint + deadcode + check-docs + typecheck + test
 task lint:web                              # the lint slot alone (oxlint; NOT ratcheted)
 task deadcode:web                          # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:web                              # vitest run
@@ -281,7 +281,7 @@ Two refinements measured here, because both forms of that slip are easy to mis-s
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-task gate:agent                            # lint + deadcode + typecheck + test
+task gate:agent                            # deps-check + lint + deadcode + typecheck + test
 task lint:agent                            # the lint slot alone (oxlint; NOT ratcheted)
 task deadcode:agent                        # the dead-code slot alone (knip) — exports tier is `warn`, see below
 task test:agent                            # node --test via tsx
