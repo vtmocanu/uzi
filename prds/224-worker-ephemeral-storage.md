@@ -2708,3 +2708,73 @@ note framing: an operator-discipline residual, not a defect** — the same categ
 commits, no leaks. The canary-armed wrapper was **not** re-run at `efd60dcc` — the delta is two
 comment blocks in two already-scanned files and the range scan covers all six commits. **Said out
 loud rather than letting a green imply a fresh run.**
+
+### A30 — 2026-08-04, REVIEW of `efd60dcc`. No Blocking. The `Recreate` finding, CONVERGED.
+
+**A30.1 — the reviewer reached A29.1 INDEPENDENTLY, and neither had seen the other's report.** Same
+mechanism, same five-step chain, same conclusion: *"the conclusion is true, the stated reason does not
+establish it."* **Third convergence of this run** (after the boot check and the two-writer/PVC-count
+items), and the strongest signal available that a finding is real. It adds the detail that decides
+step 4: the rendered Deployment has **no readinessProbe, no livenessProbe and no startupProbe at
+all** — verified from the manifest, not inferred — so a crash-looping new pod is never Ready and k8s
+keeps the old one indefinitely.
+
+Its framing of the resulting state is the one to put in the comment: **`Recreate` makes the failure
+*fail-STOPPED* (no controller runs at all) rather than *fail-STALE* (an old controller keeps
+reconciling with a stale ceiling).** And its statement of the hazard: *"someone adding HA would read
+the strategy comment, take 'quiet rather than correctness' at face value, switch to RollingUpdate,
+and silently falsify a claim living 200 lines away in two other files — with **no test able to
+notice, because the failure is a rollout topology, not a rendered value**."*
+
+That last clause is why A29.1's lead decision to take the assertion test stands: a test on
+`strategy.type` is the only thing that converts an invisible cross-file coupling into one that fails.
+
+**A30.2 — 🔴 NEW: the "three nets" map names ONE Go test where there are TWO, and it undersells net 2
+by exactly the claimant that started this thread.** Net 2 is described as
+`TestPresetPVCSizesFitTheChartsLimitRangeMax` (covering `nixSize` and each preset's `DataSize`). The
+**third** Go constant, `dindDataDefaultSize`, is covered by
+**`TestDinDDataDefaultFitsTheChartsLimitRangeMax`** (`render_test.go:573`) — read and confirmed to use
+`chartDockerMaxPVCStorage(t)`, **the same parse-values.yaml-and-Fatal contract as its sibling**, so it
+carries no hardcoded ceiling and none of the defect that was fixed in the other one. **The map is
+presented as exhaustive and its reader's question is "is every claimant covered?"** One clause.
+
+**A30.3 — a residual sub-case reachable through a SUPPORTED CHART VALUE, which neither the auditor
+nor the lead had.** Setting **`workers.limitRange.enabled: false` while a LimitRange from a previous
+install remains**: the env is then not injected, so **net 3 skips a tier that still has a live
+ceiling.** Under uzi's own ArgoCD app `prune: true` removes the object, so it is fine *here* — **but
+it is reachable through a chart value rather than through a `kubectl` edit**, which places it in a
+different class from A29.5's out-of-band residual. Half a line in the comment.
+
+**A30.4 — the reviewer's articulation of WHY the out-of-band case is out of scope is better than
+"a chart cannot see the cluster", and worth adopting:** *"the chart's contract is that the rendered
+manifest is the desired state, so an out-of-band `kubectl edit limitrange` is **by definition** a
+desired-state violation, and the remedy for that class is GitOps, not a chart guard. A template
+cannot defend against edits to objects it has already handed over."* It also bounds the residual
+rather than leaving it open: **"reverted by ArgoCD selfHeal where that is configured"** is a
+materially more useful sentence than "survives all three" — while noting the comment cannot *rely*
+on it, since another installation might sync manually.
+
+**A30.5 — comment-only confirmed by FILTERING THE DIFF, not by trusting the stat.** Every changed Go
+line is a comment (`git show -- controller/` with comment lines filtered is empty). The retired claim
+survives at exactly two sites, **both inside the replacement paragraphs quoting it to record the
+correction** — the same pattern `render.go:440` used for `presetRequestsDominateTheSeed`. No live copy
+anywhere in `controller/`, `deploy/`, `specs/`, `docs/`, `adr/` or `ARCHITECTURE.md`.
+
+**A30.6 — SEVERITY BAR, armed for the next round.** `efd60dcc` was comment-only, and this round's
+findings are about prose. Per the workflow's own trigger, **the next findings round on this branch
+requires a DEMONSTRATION to block** — an execution that fails, or a re-derivation showing a sentence
+is FALSE. "Could be sharper" and "imprecise" become Non-blocking, reported in a separate list that
+the lead reads. **Exception declared now rather than later:** A29.1/A30.1 and A28.2 both cleared that
+bar already — each names a mechanism and carries a chain — so the bar applies to what comes *after*
+the coder's next commit, not retroactively to these.
+
+**FINAL QUEUE for the coder, one commit, once spec-keeper releases the writer token:**
+
+| item | source |
+|---|---|
+| iterate `RenderPVCs` instead of the hand-maintained claimant list | A28.2 |
+| replace the absent-ceiling comment's reason with the structural one | A28.3 / A27.3 |
+| `Recreate` is load-bearing: both coverage paragraphs **and** the strategy comment | A29.1 / A30.1 |
+| a rendered-Deployment assertion that `strategy.type == "Recreate"` | A29.1 (lead decision) |
+| net 2 names **both** Go tests | A30.2 |
+| the `limitRange.enabled: false` sub-case, and the GitOps framing for the out-of-band one | A30.3 / A30.4 |
