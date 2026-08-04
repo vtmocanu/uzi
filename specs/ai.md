@@ -16873,24 +16873,29 @@ the same runner.
   above happened.
 - **🔴 The same directory holds a host-global LOCK whose failure is INDISTINGUISHABLE from a
   finding by status alone.** Concurrent runs give `Error: parallel golangci-lint is running`
-  and golangci-lint exits **3** — but the pinned `go run` prints that as the *text*
-  `exit status 3` and then exits **1** itself, which is this repo's "there are findings" code,
-  and `task` reports its usual 201 regardless. So the 3 never reaches the exit code, and an
+  and golangci-lint exits **3**. Since PRD #230 M5 the `scripts/golangci-lint.sh` wrapper
+  `exec`s the binary, so that 3 now reaches the SCRIPT's exit (the retired `go run` flattened
+  it to 1); but `task` reports its usual **201** regardless, so through `task` — this repo's
+  shipped gate invocation — the 3 still never reaches an observable exit code, and an
   automated reader testing `!= 0` — or even reading the status carefully — records a red gate
   over code that is fine. **The only discriminator is the message text.** It fails safe (false
   red, never false green), and the correct response is to re-run rather than to report a red
   gate; on a bare clone with many sibling worktrees and agents running concurrently by design,
   the collision is normal rather than exceptional.
-- **That flattening is GENERAL, not a property of the lock, which is the durable half.** The
-  pinned `go run` collapses **every** distinct golangci-lint status onto its own exit 1,
-  printing the real one only as text. Re-derived on a second, unrelated status: invoked from
-  the repo root, golangci-lint exits **7** (`directory prefix . does not contain main module`)
-  and the observed exit is **1**, with `exit status 7` as output. So the tool's status codes —
-  3 for a lock collision, 7 for a wrong working directory, 1 for findings — are **not
-  observable through this repo's shipped invocation at all**, and any rule keyed on them is
-  keyed on something no caller can read. This is the price of the delivery choice in §468 and
-  is worth paying; what it costs is that the *message text* is the only channel, for every
-  golangci-lint failure mode, not just the one this list names.
+- **That flattening is GENERAL, not a property of the lock, which is the durable half — but
+  the LAYER that flattens changed with PRD #230 M5.** Until M5 the pinned `go run` collapsed
+  **every** distinct golangci-lint status onto its own exit 1, printing the real one only as
+  text. M5 replaced it with `scripts/golangci-lint.sh`, which `exec`s the binary, so the
+  binary's real status now reaches the SCRIPT. Re-measured post-M5 on the second, unrelated
+  status: invoked from the repo root, golangci-lint exits **7** (`directory prefix . does not
+  contain main module`) and the SCRIPT now exits **7** too, where the old `go run` observed
+  **1** (`exit status 7` as text). But `task` still flattens every nonzero to its usual
+  **201**, so the tool's status codes — 3 for a lock collision, 7 for a wrong working
+  directory, 1 for findings — remain **not observable through `task`, this repo's shipped gate
+  invocation**, and any rule keyed on them is keyed on something a `task`-level caller cannot
+  read. This is the price of the delivery choice in §468 and is worth paying; what it costs is
+  that the *message text* is the only channel, for every golangci-lint failure mode, not just
+  the one this list names.
 
 ## 472. Issue #205 — the phrase pins are scoped to a REGION, which closes relocation by construction and retires §467's anchors
 

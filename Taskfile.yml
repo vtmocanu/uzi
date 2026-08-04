@@ -104,13 +104,15 @@
 #
 # NO DEPENDENCY INSTALL STEP, DELIBERATELY - WITH ONE EXCEPTION SINCE PRD #103 M3,
 # NAMED HERE BECAUSE AN UNQUALIFIED CLAIM IS WORSE THAN A QUALIFIED ONE.
-# `lint:api` / `lint:controller` invoke `go run …golangci-lint@v2.12.2`, which on a
-# cold cache FETCHES AND BUILDS that tool's whole dependency tree - 51.6s measured,
-# recorded beside the target. It is a pinned, sumdb-verified, module-scoped fetch
-# that writes nothing to either go.mod (the same shape as validate:api's
-# `sqlc@v1.30.0`), so it does not install a PROJECT dependency and nothing below
-# changes. But "installs nothing" is now false as stated, and a reader trusting it
-# will be surprised by a 51.6s first run. Everything else still holds:
+# `lint:api` / `lint:controller` acquire golangci-lint through
+# `scripts/golangci-lint.sh v2.12.2` (PRD #230 M5): a curl + sha256-verified
+# RELEASE BINARY, cached under $HOME/.cache and exec'd. It replaced
+# `go run …golangci-lint@v2.12.2`, which COMPILED that tool from source on a cold
+# cache - 51.6s, the pipeline's cold long pole. So there is still a FETCH but no
+# compile (~1-2s to download+verify, not 51.6s), and it still writes nothing to
+# either go.mod - the pin-and-no-go.mod-write property validate:api's
+# `sqlc@v1.30.0` also has (sqlc is STILL a `go run`). "Installs nothing" remains
+# false as stated: it fetches a binary. Everything else still holds:
 # no `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
@@ -896,33 +898,34 @@ tasks:
       # bogus sibling key gives rc=3 and `additional properties 'no-such-key' not
       # allowed`, so the green means something rather than merely meaning the
       # parser did not crash. Cheap: ~0.9s warm.
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
-      # PINNED `go run`, NOT A PREINSTALLED BINARY AND NOT THE OFFICIAL IMAGE.
-      # Written out in full rather than through a Taskfile var, deliberately: the
-      # header's echo property is what makes a version pin going missing VISIBLE,
-      # and it is the only such property this target still has (see the ratchet
-      # note at the top of this comment).
-      #   - Same shape as the `sqlc@v1.30.0` precedent already in validate:api.
-      #   - It pins the version IDENTICALLY local and in CI, which is what kills
-      #     the unpinned-local-binary divergence: a contributor's brew
-      #     golangci-lint drifts on its own schedule and would disagree with CI
-      #     about what a finding is.
-      #   - It does NOT touch api/go.mod. `go run pkg@version` resolves in its own
-      #     module context; verified, `git status -- api/go.mod api/go.sum` is
-      #     clean after a run. `go get -tool` would instead write golangci-lint's
-      #     whole dependency tree into api/go.mod, and this repo keeps that file
-      #     deliberately clean - the separate controller module exists precisely so
-      #     k8s.io/client-go stays out of it.
-      #   - NOT the official golangci/golangci-lint image: it ships Go 1.26.2 with
-      #     GOTOOLCHAIN=auto against both modules' `go 1.26.4`, so it would make
-      #     lint the first job in this pipeline whose effective toolchain is
-      #     FETCHED rather than pinned. The golang:1.26 image CI already pins is
-      #     1.26.4 with GOTOOLCHAIN=local.
-      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64 with isolated
-      # GOMODCACHE+GOCACHE: 51.6s COLD (first build of the dependency tree), then
-      # 1.77s and 0.89s WARM. CI persists both caches via .go_job's `cache:` keyed
-      # on api/go.sum, so the cold cost is per-cache-key, not per-pipeline.
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+      - ../scripts/golangci-lint.sh v2.12.2 config verify
+      # PINNED RELEASE BINARY via scripts/golangci-lint.sh, NOT `go run` (PRD #230
+      # M5). `go run …golangci-lint@v2.12.2` COMPILED the linter from source on a
+      # cold GOCACHE — 51.6s measured (go1.26.5 darwin/arm64), the pipeline's cold
+      # long pole. The wrapper downloads the sha256-verified 2.12.2 release binary
+      # and skips the compile; warm runs were ~1s either way, so this is a
+      # cold-start win. Read scripts/golangci-lint.sh before editing this line.
+      #   - The version is still an ARGUMENT (`v2.12.2`), so the header's echo
+      #     property is preserved — a pin going missing is still VISIBLE here. Same
+      #     shape as the sqlc@v1.30.0 pin in validate:api and deadcode-gate.sh's.
+      #   - IDENTICAL findings local and in CI (PRD #103 SC-1): both acquire the
+      #     SAME pinned artifact. PROVEN BY DIFF, not asserted — the unfiltered
+      #     backlog of the release binary matched `go run`'s byte-for-byte on BOTH
+      #     modules (2026-08-04). The linter VERSION decides which rules fire; its
+      #     build-Go does not.
+      #   - Touches NOTHING in api/go.mod (a downloaded binary is not a module
+      #     dependency), so the controller module's k8s.io/client-go isolation is
+      #     unaffected — the property `go run pkg@version` had, for a different
+      #     reason (it resolved in its own module context).
+      #   - BUILD-GO IS THE ONE THING THE BINARY'S PROVENANCE DECIDES, and D6 guards
+      #     it. 2.12.2 ships built with go1.26.2 (language 1.26); golangci-lint can
+      #     only lint code whose LANGUAGE version <= its build-Go, and 1.26 >= both
+      #     modules' `go 1.26.4` language (1.26; the patch is ignored). The wrapper
+      #     fails LOUDLY if a module's directive language ever rises above the pinned
+      #     binary's build-Go — the exact risk the old "reject the official image,
+      #     its GOTOOLCHAIN=auto would FETCH a toolchain" note pointed at, now
+      #     handled at the source instead of by choosing `go run`.
+      - ../scripts/golangci-lint.sh v2.12.2 run ./...
 
   lint:api:all:
     desc: api - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
@@ -1067,8 +1070,8 @@ tasks:
       # from the other side). THE DISCRIMINATOR IS WHERE THE PATH LANDS, NOT THE
       # PRESENCE OF `../`: resolve it, and ask whether it lands in this worktree or
       # in a foreign tree.
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
+      - ../scripts/golangci-lint.sh v2.12.2 cache clean
+      - ../scripts/golangci-lint.sh v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
   deadcode:api:
     desc: api - unreachable functions, gated against api/.deadcode-baseline (EMPTY)
@@ -1092,9 +1095,12 @@ tasks:
       # spends one deliberate exception on it (the ratchet lives in
       # `.golangci.yml`, invisible here). One is enough.
       #
-      # PINNED `go run`, same shape as `sqlc@v1.30.0` in validate:api and
-      # `golangci-lint@v2.12.2` above: identical version local and in CI, and it
-      # writes nothing to api/go.mod. v0.48.0 is the current release; v0.38.0 was
+      # PINNED `go run`, same version-pin shape as `sqlc@v1.30.0` in validate:api
+      # and the `golangci-lint.sh v2.12.2` binary pin above (that one is a
+      # downloaded release binary since PRD #230 M5, not a `go run`, but shares the
+      # identical-version-local-and-CI and writes-nothing-to-go.mod properties):
+      # identical version local and in CI, and it writes nothing to api/go.mod.
+      # v0.48.0 is the current release; v0.38.0 was
       # measured independently on this tree and gave IDENTICAL counts (1 for api,
       # 0 for controller), which is worth more than a figure from one version.
       #
@@ -1316,8 +1322,8 @@ tasks:
       # 0 today, which is not the same thing as there being nothing there - run
       # `task lint:controller:all` to see it.
       - 'git merge-base "origin/main" HEAD >/dev/null 2>&1 || { echo "lint: no merge-base between origin/main and HEAD - either the ref is missing, or this is a SHALLOW clone whose history does not reach a common ancestor. golangci-lint would NOT skip the ratchet - it reports the ENTIRE unfiltered backlog (exit 1) behind one buried warning line, which reads as a huge new regression. Fix the history first (CI: GIT_DEPTH=0 plus an explicit git fetch; locally: git fetch origin main, and git fetch --unshallow origin if the clone is shallow)." >&2; exit 2; }'
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 config verify
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+      - ../scripts/golangci-lint.sh v2.12.2 config verify
+      - ../scripts/golangci-lint.sh v2.12.2 run ./...
 
   lint:controller:all:
     desc: controller - the UNFILTERED lint backlog; not in any gate, but it EXITS NONZERO
@@ -1332,8 +1338,8 @@ tasks:
       # required. THIS is the module where the caps make no difference (5 either
       # way) - which is exactly why a "do the caps matter?" check must be run
       # against `api`, not here.
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 cache clean
-      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
+      - ../scripts/golangci-lint.sh v2.12.2 cache clean
+      - ../scripts/golangci-lint.sh v2.12.2 run --new-from-merge-base= --max-issues-per-linter=0 --max-same-issues=0 ./...
 
   deadcode:controller:
     desc: controller - unreachable functions, gated against controller/.deadcode-baseline (EMPTY)
