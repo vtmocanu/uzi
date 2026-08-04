@@ -1648,3 +1648,88 @@ and, on the next refresh, a coverage provider one minor off its runner.
   id then does not match `--root`; `pwd -P` fixes it. **A near-uniform failure with one
   plausible survivor is worse than a uniform one**, which at least announces itself as
   an instrument failure.
+
+---
+
+# 🔴 END OF SESSION — 2026-08-04. READ THIS FIRST TOMORROW.
+
+**Branch `prd-103`, tip `f47961e6` at hand-off** (plus the docs commits after it).
+**NOTHING IS PUSHED. THERE IS NO MR. NO PIPELINE HAS EVER RUN AGAINST ANY OF THIS.**
+`git rev-parse @{u}` reports no upstream.
+
+## Done
+
+**Unit A (M5's MR-C) is COMPLETE — 9 code commits, `task gate` rc=0 end to end,
+`task gate:repo` rc=0 with both canaries detected.** M5 is ticked in the PRD.
+
+```
+f9b1f27f  -race on test:controller            (the one M6 item pulled forward)
+1c751ae3  agent: 5 npm advisories -> total=0  (lockfile only)
+121d7610  web: vitest 4.1.10 + postcss 8.5.25
+f2151228  deps-check first in gate:web/agent
+fce6a06d  govulncheck + npm audit, CI wiring, D1/D2/D3
+557b733b  amendments 4/5/6/7
+3903e9d7  deps-check gains the lockfile join
+f47961e6  assert --include=dev rather than only delegating it
+```
+
+## NOT done — this is tomorrow's list, in order
+
+1. **Unit B (M6) — entirely untouched.** Coverage for api/controller/web, the
+   `test.projects` jsdom split, `@vitest/coverage-v8` **pinned exactly at
+   `4.1.10`** (it is an exact-version optional peer of vitest, not a range).
+   **Its first task is now answerable and was not before**: two validators
+   disagreed on whether the docblock pragma outranks `test.projects` in vitest 4,
+   which nobody could settle without vitest 4 installed. It is installed now.
+   Settle it with the **environment census** (identical before/after), not by
+   argument — that criterion is correct under either answer.
+2. **Task #16** — already covered by `557b733b`; verify rather than redo.
+3. **The three doc items the coder correctly routed out** under carry-forward 18
+   and that are the lead's: CHANGELOG + `docs/dev-conventions.md` for the vitest
+   pin, `deps-check` and the two audit scripts. *(The `CLAUDE.md` and
+   `tester.md`/`auditor.md` ones are already done.)*
+4. **The `docs/dev-conventions.md` durable rule** this milestone earned:
+   *a gate script names the environment variables that can shrink its view, and
+   refuses them.* Three instances: `GITLEAKS_CONFIG`, `NPM_CONFIG_OMIT`,
+   `GOPACKAGESDRIVER`/`GOFLAGS=-tags`.
+5. **File the react-router 6→7 issue**, carrying the invariant that
+   `safeNextPath` is a *per-call-site* guard.
+6. Integrated pass, spec sync, MR.
+
+## 🔴 TWO THINGS THAT WILL BITE AT PUSH TIME
+
+1. **CHECK THE TIP FOR THE CI-SKIP MARKER.** `f47961e6` is clean, but **every
+   docs commit on this branch correctly carries it**, and the tip at push time is
+   whatever it then is. GitLab reads the marker from the MR's HEAD commit however
+   the pipeline is triggered; the result is `skipped`, not `failed`; the MR still
+   reports **mergeable** because this project sets
+   `allow_merge_on_skipped_pipeline: true`; and amending needs a force-push this
+   repo forbids. `git log -1 --format=%B | grep -c -F '[skip ci]'`.
+2. **Push the SHA you gated, by refspec** — `git push origin <sha>:refs/heads/prd-103` —
+   not the branch name. A branch name resolves at push time; a gate result is
+   bound to a SHA.
+
+## What this session actually bought, and it was not the code
+
+Four blocking defects, **none of which a green gate would have shown**: the
+govulncheck wrapper failing open on `GOPACKAGESDRIVER`; `deps-check` covering 1 of
+6 dependency changes; a registry outage classifying as "there are advisories"; and
+a one-file `.npmrc` disarming the npm audit gate at exit 0.
+
+**And the lead was the single largest source of error.** Six of my restatements
+were refuted by validators re-deriving rather than agreeing — the react-router
+scope claim, the green-suite proof, the directory-keyed jsdom split, the `npm ls`
+framing, the "no analogue here" banked positive, and Hard constraint 2 (wrong in
+**both** directions across two amendments). Every one arose at the same step:
+another agent's measurement passing through me on its way into the spec, written
+to be read fast. **The brief-amendment protocol concentrates that risk rather than
+reducing it** — worth knowing before trusting any sentence here that is not
+attached to a named measurement.
+
+**The two most transferable findings are about instruments, not about gates.** A
+calibration arm held **three of the four required properties on a completely dead
+arm** (rc=201, tool name in output, sane path) and was separated only by a count
+predicted in advance. And the *"no analogue here"* positive survived because its
+supporting arm used a build tag that excluded nothing — an instrument that could
+not produce the disconfirming answer, returning the reassuring one, banked
+specifically so nobody would look again.
