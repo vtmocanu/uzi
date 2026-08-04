@@ -59,6 +59,56 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   the render-side fix instead (issue #180), which strips the same
   characters on the way out (issue #169).
 
+- **Contributor tooling: dependency vulnerabilities are now scanned on every
+  MR**, for the first time in this repo — `govulncheck` for both Go modules and
+  `npm audit --audit-level=high` for both npm packages. They hang off the
+  existing per-toolchain jobs (`lint:api`, `lint:controller`, `validate:web`,
+  `validate:agent`) rather than adding new ones. Locally they are
+  `task vulncheck` and are **deliberately not part of `task gate`**: their
+  verdict is a function of a remote mutable database, so they can answer
+  differently on two runs of one commit with nobody's diff in between, and a
+  contributor's gate must be deterministic against the tree. All four host jobs
+  are in `*publish_needs`, so this is release-blocking by inheritance — a CVE
+  published on a Tuesday can redden a `v*` tag publish that contains nobody's
+  diff. That is accepted, not overlooked. The npm half gates at `high` rather
+  than zero because two moderate `react-router` advisories have no patched 6.x
+  to move to; clearing them is a React Router 6 → 7 major through **runtime,
+  shipped SPA routing code**, filed as issue #226. Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: the gate now refuses environment variables that would
+  silently narrow what it looks at.** Three tools turned out to have one — a
+  substituted `GITLEAKS_CONFIG`, an `NPM_CONFIG_OMIT=dev` that drops the dev
+  tree and prints "found 0 vulnerabilities" at exit 0, and a `GOPACKAGESDRIVER`
+  stub or `GOFLAGS=-tags` that build-tags the vulnerable call out of the graph.
+  Each produces output shaped exactly like a clean run. The scripts now refuse
+  them, narrowly where a legitimate use exists (`GOFLAGS=-buildvcs=false` is a
+  documented workflow here, so only `-tags` is rejected). Part of PRD #103.
+  Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: `task gate:web` and `task gate:agent` now check that
+  your `node_modules` matches the branch before running anything else.** A stale
+  install does not make lint, knip, `tsc` and vitest *wrong* — it makes them
+  answers about a different tree, all green. The check is two parts because
+  `npm ls` compares against declared ranges only, so a transitive bump is
+  invisible to it; the second part joins against the lockfile. Measured:
+  `gate:agent` was green on a tree holding all five of the vulnerable versions
+  this release bumps. Part of PRD #103. Developer-facing only: no change to how
+  uzi behaves. See [docs/dev-conventions.md](docs/dev-conventions.md).
+
+- **Contributor tooling: `web` moved to vitest 4.1.10, pinned exactly.** A major,
+  taken because the 2.x line is where the remaining high-severity `web`
+  advisories lived. The pin is exact rather than a range, and so is
+  `@vitest/coverage-v8`, which is an exact-version optional peer — the two move
+  together or the install breaks. `environmentMatchGlobs` and `test.workspace`
+  are both gone in 4.x. The upgrade's control was a count written down before the
+  run and reproduced after (118 files / 1660 tests), because a green with a lower
+  collected count is a silently narrowed suite that no exit code reveals. Part of
+  PRD #103. Developer-facing only: no change to how uzi behaves.
+  **Existing checkouts need `npm install --ignore-scripts` in `web/`.**
+
 ### Fixed
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team
