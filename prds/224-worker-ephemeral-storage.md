@@ -1703,3 +1703,89 @@ says only that *a count is not a stable identity across invocations* — which i
 CLAUDE.md's cite-the-shape-not-the-tally rule reached independently by a third agent. **The control
 is invocation-independent and is the thing to re-run:** at `2a63ddb3` the 40Gi case renders clean; at
 `6bf44a86` it fails naming both keys and both values. **That flip is the evidence, not any count.**
+
+### A18 — 2026-08-04, REVIEW of `6bf44a86`. **ONE BLOCKING**, plus a real gap in the guard's default path.
+
+**A18.1 — 🔴 BLOCKING: "fails safe in the direction that matters" is FALSE, and the example the
+sentence gives is the UNSAFE direction.** The claim appears in `preset_contract_test.go`'s header and
+again in the commit message:
+
+> *"the failure is safe in the direction that matters: lowering the chart's max without lowering this
+> makes the test PASS while the cluster rejects claims"*
+
+**A check fails SAFE when its failure mode is a false POSITIVE. The case that sentence names is a
+false NEGATIVE**, and the reviewer executed it rather than arguing it:
+
+```
+helm template … --set workers.limitRange.maxPVCStorage=10Gi   rc=0, 38 docs, clean
+  rendered LimitRange uzi-hosted-workers  ns=uzi-workers  PVC max={'storage': '10Gi'}
+controller nixSize = 20Gi                                     (preset.go:146)
+go test -run TestPresetPVCSizesFitTheChartsLimitRangeMax       --- PASS
+```
+
+A 10Gi ceiling against a 20Gi `/nix` claim: **every restricted worker's PVC is rejected at admission
+and every restricted worker provisions and never appears** — the precise outcome the test was added
+to prevent — with **both guards green**. Neither sees it: the chart guard is docker-tier only, the Go
+test hardcodes 20Gi.
+
+**The mitigation the sentence goes on to describe (cross-referencing comments both ways) is correct
+and is not in question. The SAFETY LABEL is what is wrong, and it is load-bearing** — that sentence
+is what tells the next reader how far to trust a duplicated constant, and as written **it invites
+exactly the edit that breaks the fleet.** One clause: say the duplication fails **unsafe** in this
+direction, and that the cross-reference is the only thing standing in for a gate.
+
+**A18.2 — N1, a real gap: the guard SKIPS the controller's built-in default, and the default path is
+guarded by nothing on either side.** `{{- if $size }}` (`worker-invariants.yaml:139`) means an empty
+or absent `workers.docker.dindDataSize` **bypasses the check entirely**, and `dindDataDefaultSize`
+(`render.go:271`) is referenced by nothing that checks it. Measured, **with a control**:
+
+```
+N  dindDataSize=20Gi (shipped) + max 10Gi   rc=1  guard FIRES     <- the control
+L  dindDataSize=""             + max 10Gi   rc=0  renders clean
+M  dindDataSize=null           + max 10Gi   rc=0  renders clean
+   arm L ships NO UZI_WORKER_DIND_DATA_SIZE  ->  the controller uses its own 20Gi
+```
+
+So a 20Gi claim against a 10Gi ceiling renders clean. **A12.1's traced case was the SET path
+(`40Gi`), which the fix covers exactly; the UNSET path is closed today only by `values.yaml`
+happening to ship a non-empty default.** Fix: `default "20Gi" .Values.workers.docker.dindDataSize` in
+the guard, keeping the two 20Gi's tied by the same cross-reference discipline
+`chartMaxPVCStorage` already uses.
+
+**A18.3 — N2: one Go constant stands in for TWO chart keys.**
+`chartMaxPVCStorage := resource.MustParse("20Gi")` mirrors `workers.limitRange.maxPVCStorage` **and**
+`workers.docker.limitRange.maxPVCStorage`. Equal today, and the comment says so — but nothing
+prevents an operator setting them differently, after which one constant cannot represent either
+faithfully. Same root as A18.1.
+
+**A18.4 — N3: the chart guard is docker-only, which is CORRECT today and READS broader.** The
+restricted tier has no chart-supplied PVC claimant, so the `and .Values.workers.docker.enabled …`
+condition is right. The consequence is that `workers.limitRange.maxPVCStorage` is guarded by nothing
+except the hardcoded Go constant — **the hole A18.1 walks through**. One line in the guard's comment,
+since a reader of `worker-invariants.yaml` alone concludes both tiers are covered.
+
+**A18.5 — all three A15 traps CONFIRMED avoided, over nine arms.** Arm **K** is the discriminating
+one and it is the arm I asked for: `4Gi` under max `20Gi` **renders**, where a string compare would
+have rejected a valid config (`"4Gi" > "20Gi"` lexically). Plus C (both raised to 40Gi → renders, so
+it is the **pair** that is guarded), G/H (`40GB`, `20gi` → fail **closed** naming the suffix, so the
+multiply-to-zero trap really is gone), E/F (mixed units ordered numerically in both directions), I/J
+(tier off / LimitRange off → silent).
+
+**A18.6 — the reviewer caught its OWN instrument failing vacuously and said so.** Its first
+`assert-chart-render.sh` run went through a process substitution and returned **"OK: 0 documents"** —
+a green over nothing. Re-run against a real file: **38 documents**. *"My instrument, not the chart"*
+— and a 0-document OK is exactly the shape this repo calls an instrument failure rather than a
+result.
+
+**A18.7 — A12.2 and A13.7 confirmed closed by the finder.** Restricted `600 → 800Gi` =
+`20 x (20 data + 20 nix)` with `persistentvolumeclaims: 40` = `20 x 2`; docker unchanged at 600Gi.
+**Both tiers now state the worst case rather than coinciding at one number by accident** — which
+closes A13.8/N5 exactly. And A13.7 was closed *better than asked*: the reviewer suggested a comment;
+the commit changed the value **and** added the comment.
+
+**A18.8 — LEAD PROCESS, second instance: I chased a report that was already in flight, again.** The
+reviewer's M-b review (A16) had been sent before my "M-b is still unreviewed" message, exactly as the
+auditor's had (A14). **Both times the worker spent a turn refuting me instead of working.** The rule
+I keep applying to teammates' claims and not to my own: **check whether the artifact exists before
+asserting it does not.** A chase is a claim about the world and deserves the same re-derivation as
+any other.
