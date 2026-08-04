@@ -2012,3 +2012,62 @@ which is the same discipline Unit B's census criterion applies. Everything else 
 the worklist is either an edit whose content is already written down, a decision the
 tester's data already frames, or a validation pass. **A design wave over a spec that
 already carries eight amendments from three waves would re-derive them.**
+
+---
+
+# Amendment 10 — 2026-08-04, the REOPENED gate-recipe review (task #2)
+
+Reviewer's report at pinned `fc44b049`, re-verified byte-identical at `1f609344`
+with `web/vite.config.ts` as a must-be-different positive control. Evidence:
+`probes/prd-103-mrc-b-reviewer/` (p1-p6). **4 blocking, 6 non-blocking, 3 nits.**
+
+**The severity bar is the ORDINARY one, not the raised one, and that is a ruling
+rather than an omission.** The raised bar applies when a round's findings are
+dominated by the previous round's output. These are findings about the
+DELIVERABLE — the three gate scripts — which had never been reviewed at a pinned
+SHA at all, because they were uncommitted at both Unit A review times. Nothing here
+is a finding about a finding.
+
+**The process note is the most valuable line in the report and it is not a
+finding:** `scripts/deps-check-gate.sh` was in scope for **neither** Unit A review
+round **nor** the auditor's wrapper audit, and **B-1, NB-1, NB-3 and NB-4 all live
+in it**. Four of ten findings in the one file nobody had looked at. That is a
+coverage fact about how this milestone was validated, not about the script.
+
+## Dispositions — lead, at `80636226`
+
+Two of the four blocking claims I re-derived myself before acting, because both are
+claims about TOOL behaviour rather than about our code, and the standing caution
+cuts in both directions:
+
+- **B-4 reproduced exactly**, go1.26.5: `GOBIN=<tmp> GOOS=linux GOARCH=amd64 go
+  install …` → `go: cannot install cross-compiled binaries when GOBIN is set`,
+  rc=1, `$GOBIN` never created. So the script's exit 2 on that path comes from the
+  `irc -ne 0` half and never from the `[ ! -x ]` half, and the comment's warning
+  that "if that install check is ever loosened, this hole opens" is backwards.
+- **B-2 confirmed from the reviewer's own control**, which is the part that makes
+  it admissible: the same binary on the same module differing in one flag
+  (`-show verbose`) named **2** GO-IDs where the shipped recipe named **0**. A bare
+  0 would have been indistinguishable from an instrument that read nothing.
+
+| id | disposition |
+|---|---|
+| B-1 | **FIX** — instrument failure must exit 2, not 1. It fails CLOSED today, so nothing shipped broken; what it breaks is the 2/1/0 convention that makes a red readable. |
+| B-2 | **FIX BOTH SIDES** — correct the comment *and* pass `-show verbose`, so the line does what its own justification says. A display flag cannot weaken the gate, and the residual uncalled set is the thing that becomes a red the day somebody calls it. |
+| B-3 | **FIX** — scope both assertions to `scripts.audit` by parsing, instead of a file-wide `grep -F`. |
+| B-4 | **FIX** — comment only; runtime behaviour is already correct. |
+| NB-1 | **FIX, promoted** — the reviewer nominated this one and it is right: line 2 is blind to ABSENCE, so the state a `git pull` adding a transitive dep produces reads `up to date` while `require()` fails. Fix must not resurrect the ~370 spurious rows the intersection exists to suppress. |
+| NB-2 | **DEFER to the coder** — `Taskfile.yml` is in Unit B's file scope and it is live in it. Two comments in one file now disagree about one check's coverage. |
+| NB-3 | **DEFER to the coder** — same file, same reason. |
+| NB-4 | **FIX** — a `lockfileVersion 1` installed lockfile yields zero rows and reads clean. Latent under npm 11, and it is the empty-result-set-looks-clean shape this same file guards against forty lines up. |
+| NB-5 | **FIX, and more broadly than reported** — read `go env GOFLAGS` rather than `$GOFLAGS`, which covers the `GOENV=<file>` route, the persisted `go env -w` route and the environment route with one read. |
+| NB-6 | **FIX** — "10 controller test files" is 11 after the merge `e8230b4d`. Present-tense claim about current code. |
+| N-1 | **FIX** — one omitted flag name in a list; the conclusion it supports is unaffected. |
+| N-2 | **FIX** — `could not install <TOOL> (exit 0)` is reachable and self-contradictory. |
+| N-3 | **ACCEPT** — a raw node stack trace before a correct `INSTRUMENT FAILURE` line and a correct exit 2. Ugly, not wrong. |
+
+**Who does the work, and why not the coder:** `scripts/*.sh` is disjoint from Unit
+B's file scope (`web/`, `Taskfile.yml`, `.gitlab-ci.yml`, `.gitignore`), and the
+coder is mid-census. One writer per file, two writers in the worktree, no overlap —
+the same shape as this session's doc commits. NB-2 and NB-3 are the two that fall
+inside the coder's scope and are the two deferred.
