@@ -211,9 +211,9 @@ const seededTrace: JudgeTraceResponse = {
   // The load-bearing seeded property: NO approve_plan input. The steering log is empty.
   inputs: [],
   // The head holds the implement opening (the seeded skip line), NOT an approval gate;
-  // the tail holds the delivery. This is the message shape sampleMessages' head/tail
-  // comment ("where the plan gate and the delivery live") no longer describes for a
-  // seeded run — and the assertions prove the prompt is well-formed regardless.
+  // the tail holds the delivery. This is the seeded message shape sampleMessages' head/
+  // tail comment now calls out explicitly — and the assertions prove buildJudgePrompt is
+  // well-formed regardless.
   messages: [
     {
       seq: 1,
