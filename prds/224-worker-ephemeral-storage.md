@@ -1669,11 +1669,17 @@ failing.** Both directions of the string-compare trap are now covered — my A15
 | `40GB` / `20gi` | fail **closed** on the suffix, not silently compared as 0 |
 | docker tier OFF | does not fire |
 
-**A17.4 — the Go-side guard duplicates `maxPVCStorage`, acknowledged rather than overlooked, and it
-fails safe in the direction that matters.** Lowering the chart's max without lowering the test's
-leaves the test green while the cluster rejects claims — the mild direction. **Both `maxPVCStorage`
-keys now name the test and the test names both keys**, which is the mitigation A16.2 asked for on the
-fleet-fit constants, applied here without being asked.
+**A17.4 — ~~the Go-side guard duplicates `maxPVCStorage`, acknowledged rather than overlooked, and it
+fails safe in the direction that matters. Lowering the chart's max without lowering the test's leaves
+the test green while the cluster rejects claims — the mild direction.~~ 🔴 STRUCK 2026-08-04. THE
+CLAIM IS FALSE AND THE PHRASE "the mild direction" IS THE ONE THAT INVITES THE BREAKING EDIT.**
+A18.1 refuted it by execution: that case is a false **negative**, so the duplication failed
+**UNSAFE**, and `dae9b799` removed the constant rather than relabelling it. Struck rather than
+deleted because this paragraph is what a reader would otherwise have acted on, and because the record
+should show the lead relaying a safety claim it had not executed. The surviving half — both
+`maxPVCStorage` keys naming the test and the test naming both keys — was the mitigation A16.2 asked
+for, and it is now superseded by reading the values from disk. **Flagged by the coder against the
+lead's own file**, with the code and chart copies already gone (`git grep -F` clean outside this PRD).
 
 **A17.5 — A12.2 landed and both tiers are now EXACTLY self-consistent at their advertised fleet**,
 verified from a yaml parse rather than mental arithmetic:
@@ -2207,3 +2213,62 @@ were **not re-derived** (dev-cluster unreachable; the arithmetic is internally c
 are inherited from A5.2/A7.1); and `api`/`web`/`agent` deliberately not run. **One tester figure is
 already superseded**: it measured the restricted tier exactly honest at 20 x `m`, which is true of
 `2a63ddb3` and not of HEAD, where `6bf44a86` raised `requestsStorage` to 800Gi for the worst case.
+
+### A23 — 2026-08-04, `dae9b799` closes A18.1-A18.4. One residual, and A21 already covers it.
+
+Stack: `35ef2996` → `2a63ddb3` → `6bf44a86` → `936dec8e` → `dae9b799`. Gates rc=0 both, canaries
+DETECTED, 38-document render.
+
+**A23.1 — the Blocking is closed by REMOVING the duplication, not by relabelling it.** A18.1 asked
+for one clause fixing the safety label. The coder went further, correctly: *"the label was describing
+a duplication that did not need to exist."* **Both tiers' `maxPVCStorage` are now read out of
+`values.yaml` and checked separately**, which closes A18.3 in the same move — nothing requires the two
+keys to stay equal, and one constant could not represent either once they diverged. Mutation, A18.1's
+exact case (restricted `maxPVCStorage` 20Gi → 10Gi in `values.yaml`): both `nixSize` and preset `l`'s
+`DataSize` redden, each naming the key.
+
+**A23.2 — 🔴 THE CODER'S FIRST PROBE OF A18.2 WAS A BROKEN INSTRUMENT THAT REPORTED SUCCESS, AND IT
+IS THIS REPO'S OWN DOCUMENTED FAILURE SHAPE.** It passed `--set workers.docker.dindDataSize=` through
+an **unquoted shell variable**; zsh split it, helm rejected an **unknown flag**, and its `&&`/`||`
+test read that non-zero exit as *"the guard fires"*. **All three arms reported guarded; none had
+run.** That is the zsh word-splitting trap and the reporting-expression trap arriving together — both
+in CLAUDE.md, both walked into anyway, and **self-reported rather than buried.** The values-file form
+then confirmed A18.2 exactly. Arms now: `""` and `null` both **fire**, naming the controller's
+built-in default as the source; `40Gi` fires naming the key; and the three controls that must **not**
+fire (shipped defaults, unset at shipped max, `4Gi` under `20Gi`) all render.
+`TestDinDDataDefaultFitsTheChartsLimitRangeMax` ties `dindDataDefaultSize` to the chart's docker
+ceiling from the Go side.
+
+**A23.3 — 🔴 THE RESIDUAL NEITHER HALF CLOSES — AND IT IS EXACTLY WHAT A21 IS FOR.** The Go tests
+read `values.yaml` **from disk**, so they gate an edit to the **shipped defaults** and **cannot see a
+cluster lowering `maxPVCStorage` via `--set` or its own per-cluster values file**. The chart cannot
+check it either, because `nixSize` never reaches it. **So an operator-lowered restricted-tier ceiling
+is ungated on both sides.** The coder stated this as a residual in the test header and the guard
+comment *"rather than implied away — that is the truthful replacement for 'fails safe', not a second
+safety claim."*
+
+**It offered a two-sided contract (a declared floor in the chart + a Go test asserting the constants
+stay under it) and correctly did NOT build it unilaterally**, since it adds a public chart knob.
+**That build is not needed: A21's boot-time check closes this residual by construction and is already
+user-approved.** The controller receives the ceiling **at runtime**, so it sees a value lowered by
+`--set` or a per-cluster file — which is precisely the case a disk-read test structurally cannot
+reach. This is the same convergence A20.2 recorded: both validators reached the boot check
+independently, and the coder has now arrived at the identical gap from the implementation side
+without having read A21.
+
+**A23.4 — LEAD ERROR, and the coder caught it in the lead's own file: A17.4 still asserted the
+refuted claim in the PRESENT TENSE.** Struck this turn. It read as a settled finding two sections
+before A18.1 refutes it, and the phrase *"the mild direction"* is the specific wording that invites
+the breaking edit. Struck rather than deleted, because a reader would otherwise have acted on it and
+because the record should show the lead relaying a safety claim it had not executed. **The code and
+chart copies were already gone** — `git grep -F` clean outside this PRD — so the brief was the last
+place the false claim lived, which is the inversion worth noting: **the document tracking the
+correction was the last artifact carrying the defect.**
+
+**A23.5 — LEAD PROCESS, THIRD instance and this one after I said I would stop.** My `TaskUpdate` on
+task #5 woke the tester, which then spent a turn establishing it had already delivered. I had written
+one turn earlier that I was *"deliberately not touching the task list"* and then touched it, reasoning
+that an agent with no pending dispatch was safe to update. **It is not: any `TaskUpdate` can wake its
+owner.** Three instances now — two chases plus this — and all three are the same root: **asserting
+something about a teammate's state without checking it.** The task list is a coordination
+convenience; **the brief's `## Roster` is the durable record and needs no write to a shared store.**
