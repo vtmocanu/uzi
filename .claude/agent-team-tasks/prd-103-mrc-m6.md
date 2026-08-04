@@ -1698,13 +1698,27 @@ f47961e6  assert --include=dev rather than only delegating it
 
 ## 🔴 TWO THINGS THAT WILL BITE AT PUSH TIME
 
-1. **CHECK THE TIP FOR THE CI-SKIP MARKER.** `f47961e6` is clean, but **every
-   docs commit on this branch correctly carries it**, and the tip at push time is
-   whatever it then is. GitLab reads the marker from the MR's HEAD commit however
-   the pipeline is triggered; the result is `skipped`, not `failed`; the MR still
-   reports **mergeable** because this project sets
-   `allow_merge_on_skipped_pipeline: true`; and amending needs a force-push this
-   repo forbids. `git log -1 --format=%B | grep -c -F '[skip ci]'`.
+1. **🔴 THE TIP CARRIES THE CI-SKIP MARKER RIGHT NOW. AS THIS BRIEF IS WRITTEN,
+   THE BRANCH IS NOT SAFE TO PUSH.** `f47961e6`, the last *code* commit, is clean —
+   but every docs commit on this branch correctly carries the marker, and the docs
+   commits are on top. **`git log -1 --format=%B | grep -c -F '[skip ci]'` returns
+   1 at the tip.** Fix by landing any non-docs commit last, or an empty one whose
+   message omits the marker.
+
+   GitLab reads the marker from the MR's HEAD commit however the pipeline is
+   triggered; the result is `skipped`, not `failed`; the MR still reports
+   **mergeable** because this project sets `allow_merge_on_skipped_pipeline: true`;
+   and amending needs a force-push this repo forbids, so the only way out is
+   another commit.
+
+   **This is a live demonstration rather than a caution, and it happened inside
+   eight minutes.** The coder checked the tip, reported it clean at `f47961e6`, and
+   added the exact warning that *"the branch is only safe while a non-marked commit
+   stays on top — if any docs commit lands last, that check has to be re-run, not
+   remembered."* Two docs commits then landed on top, including this brief's own
+   handoff note. **Re-run it at push time against the tip that will actually be
+   pushed. A check you performed earlier is a fact about a commit, not about the
+   branch.**
 2. **Push the SHA you gated, by refspec** — `git push origin <sha>:refs/heads/prd-103` —
    not the branch name. A branch name resolves at push time; a gate result is
    bound to a SHA.
