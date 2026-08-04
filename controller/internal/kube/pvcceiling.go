@@ -47,15 +47,17 @@ const ceilingProbeID = "ceiling-probe"
 //
 // 🔴 THIS CHECK'S VALUE DEPENDS ON THE CONTROLLER DEPLOYMENT'S `strategy: Recreate`,
 // WHICH LIVES IN ANOTHER FILE IN ANOTHER LANGUAGE. Refusing to boot only helps if the
-// refusing pod is the ONLY one. The controller runs at replicaCount 1 with no readiness,
-// liveness or startup probe of any kind, so under `RollingUpdate` (maxUnavailable 0,
-// maxSurge 1) the new pod is created while the old keeps running, and the old is
-// terminated only once the new is Available. A lowered ceiling makes the new pod exit
-// here and CrashLoopBackOff, so it never becomes Available — and the OLD controller
-// keeps reconciling indefinitely, holding the OLD ceiling, against the NEW LimitRange
-// helm has already applied. That is precisely the mismatch this check exists to catch,
-// with the check firing and being DEFEATED, and with a crash-looping pod beside it that
-// reads like the guard working.
+// refusing pod is the ONLY one. Under `RollingUpdate` a new pod that EXITS AT BOOT never
+// becomes Available, so the old pod is never retired — it keeps reconciling
+// indefinitely, holding the OLD ceiling, against the NEW LimitRange helm has already
+// applied. That is precisely the mismatch this check exists to catch, with the check
+// firing and being DEFEATED, and with a crash-looping pod beside it that reads like the
+// guard working.
+//
+// That holds at ANY replicaCount and with or WITHOUT probes — a crash-looping container
+// is never Ready either way. An earlier version of this paragraph reasoned from
+// "replicaCount 1 and no probes, SO ...", which reads as if adding a readinessProbe
+// would address it. It would not, and the gate would stay green.
 //
 // `Recreate` deletes the old pod FIRST, so the failure is fail-STOPPED (no controller
 // runs at all) rather than fail-STALE (an old one keeps going on stale config).

@@ -178,8 +178,12 @@
       reverted automatically — worth knowing, but this comment cannot rely on it, since
       another installation might sync manually.
 
-  A `helm upgrade` reaches neither: changing the value re-renders the object AND rolls the
-  controller with the new env.
+  A `helm upgrade` reaches neither, but by DIFFERENT mechanisms, and the distinction is
+  the point rather than pedantry: for a lowered ceiling the object is re-rendered and the
+  controller is rolled with the new env; for `limitRange.enabled: false` nothing is
+  re-rendered at all — what removes the stale object is helm deleting resources that
+  dropped out of the release's manifest. One sentence covering both would be true of
+  neither.
 */ -}}
 {{- /*
   NO `ephemeral-storage` IN ANY LimitRange `default` OR `defaultRequest`, EITHER TIER

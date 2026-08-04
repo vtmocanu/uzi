@@ -4,14 +4,16 @@
 # WHY THIS IS A GATE AND NOT A COMMENT (issue #224, A29.1/A31). The controller refuses
 # to boot when a worker PVC exceeds its namespace's LimitRange ceiling
 # (kube.ValidatePVCCeilings). That refusal is only useful if the refusing pod is the
-# ONLY controller running. replicaCount is 1 and the pod declares NO readiness,
-# liveness or startup probe, so under RollingUpdate -- k8s defaults maxUnavailable 0,
-# maxSurge 1 -- the new pod is created while the old keeps running and the old is
-# terminated only once the new is Available. A lowered ceiling makes the new pod exit
-# at that check and CrashLoopBackOff, so it never becomes Available, and the OLD
-# controller keeps reconciling indefinitely against a ceiling it was never told about.
-# The check fires and is defeated, with a crash-looping pod beside it that reads like
-# the guard working.
+# ONLY controller running. Under RollingUpdate a new pod that EXITS AT BOOT never
+# becomes Available, so the old pod is never retired -- it keeps reconciling
+# indefinitely against a ceiling it was never told about. The check fires and is
+# defeated, with a crash-looping pod beside it that reads like the guard working.
+#
+# Stated in that minimal form deliberately. An earlier version reasoned from "replicaCount
+# is 1 and the pod has NO probes, SO ...", and neither is a premise: a crash-looping
+# container is never Ready with or WITHOUT probes, and every replicaCount >= 1 has the
+# same hazard. Written causally it invites the wrong fix -- someone who adds a
+# readinessProbe concludes the concern is addressed, and it is not.
 #
 # THE FAILURE IS A ROLLOUT TOPOLOGY, NOT A RENDERED VALUE, so no Go test can see it:
 # the controller Deployment is a chart template, and the coupling spans two files in
@@ -24,8 +26,8 @@
 #
 # AWK, NOT A YAML PARSER, AND THAT IS FORCED RATHER THAN PREFERRED. The helm_chart CI
 # job runs alpine/helm, which has NO python3 -- verified by running that exact pinned
-# image, not inferred. Its awk is busybox awk, so this stays POSIX. The sibling
-# assert-chart-render.sh is awk for the same reason.
+# image (`command -v python3` is empty; /usr/bin/awk is a symlink to /bin/busybox), not
+# inferred. The sibling assert-chart-render.sh is awk for the same reason.
 #
 # The usual objection to grepping YAML -- "which object did you match?" -- is removed
 # by the CALLER passing a render of this ONE template (`helm template --show-only`),
@@ -54,10 +56,29 @@ awk '
     next
   }
   # Any line NOT indented at least four spaces ends the block without a type:.
-  # Written with substr rather than an interval like /^[ ]{0,3}[^ ]/ -- busybox awk,
-  # which is what the alpine/helm CI image ships, does NOT support interval
-  # expressions and treats {0,3} as literal text, so that form silently never
-  # matches. Verified by running this script in that exact pinned image.
+  #
+  # substr rather than an interval like /^[ ]{0,3}[^ ]/ because it is unambiguous and
+  # assumes NOTHING about the awk dialect -- not because intervals are unavailable.
+  #
+  # *** CORRECTION, and it is worth the space because the wrong version shipped in a
+  # commit message and was nearly propagated into CLAUDE.md. This comment previously
+  # claimed busybox awk "does NOT support interval expressions and treats {0,3} as
+  # literal text, so that form silently never matches". THAT IS FALSE. Re-derived in
+  # the same pinned image (BusyBox v1.37.0) with two probes that DISCRIMINATE:
+  #
+  #     /^a{3}$/ vs "aaa"   -> MATCH      intervals ARE supported
+  #     /^a{3}$/ vs "a{3}"  -> no match   and INTERPRETED, not literal
+  #
+  # and the retired pattern behaves correctly on both inputs that matter: it does not
+  # match "    type: Recreate" (so it would not end the block early) and does match
+  # "selector:" (so it would end it). It was never inert.
+  #
+  # The original measurement was wrong because the natural probe CANNOT DISCRIMINATE:
+  # testing that pattern only against INDENTED lines -- exactly what you reach for when
+  # asking "does this wrongly terminate my block?" -- yields no match under BOTH
+  # hypotheses. Working intervals: four spaces, so <=3-then-non-space fails. Literal
+  # {0,3}: the text is not there. Same answer, different reasons. The careful-looking
+  # probe was the one that could not tell them apart. ***
   in_strategy && substr($0, 1, 4) != "    " { in_strategy = 0 }
   END {
     # An absent strategy block is NOT a pass. A render that never declared one means
@@ -78,12 +99,11 @@ awk '
       print ""
       print "  The controller refuses to boot when a worker PVC exceeds its LimitRange"
       print "  ceiling (kube.ValidatePVCCeilings, issue #224). That helps only if the"
-      print "  refusing pod is the ONLY controller. replicaCount is 1 and the pod has NO"
-      print "  probes, so RollingUpdate creates the new pod while the OLD one keeps"
-      print "  running and only retires it once the new is Available. A pod that exits at"
-      print "  the ceiling check CrashLoopBackOffs and is never Available -- so the OLD"
-      print "  controller runs indefinitely, holding the OLD ceiling, against the NEW"
-      print "  LimitRange the same upgrade already applied."
+      print "  refusing pod is the ONLY controller. Under RollingUpdate a new pod that"
+      print "  EXITS AT BOOT never becomes Available, so the old pod is never retired --"
+      print "  it runs indefinitely, holding the OLD ceiling, against the NEW LimitRange"
+      print "  the same upgrade already applied. This holds at any replicaCount, and with"
+      print "  or without probes: a crash-looping container is never Ready either way."
       print ""
       print "  Recreate makes that failure fail-STOPPED (no controller runs at all)."
       print "  RollingUpdate makes it fail-STALE (an old controller keeps provisioning"

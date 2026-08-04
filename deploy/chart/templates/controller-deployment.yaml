@@ -29,14 +29,15 @@ spec:
     # its tier's LimitRange ceiling (issue #224, kube.ValidatePVCCeilings). Refusing to
     # boot only helps if the refusing pod is the ONLY one.
     #
-    # replicaCount is 1 and this pod has NO readiness, liveness or startup probe of any
-    # kind. So under RollingUpdate (k8s defaults: maxUnavailable 0, maxSurge 1) the new
-    # pod is created while the old keeps running, and the old is terminated only once the
-    # new is Available. A lowered ceiling makes the new pod exit at that check and
-    # CrashLoopBackOff, so it is never Available — and the OLD controller runs
-    # indefinitely, holding the OLD ceiling, against the NEW LimitRange this same upgrade
-    # already applied. The check fires and is DEFEATED, with a crash-looping pod beside it
-    # that reads like the guard working.
+    # Under RollingUpdate a new pod that EXITS AT BOOT never becomes Available, so the
+    # old pod is never retired: it runs indefinitely, holding the OLD ceiling, against
+    # the NEW LimitRange this same upgrade already applied. The check fires and is
+    # DEFEATED, with a crash-looping pod beside it that reads like the guard working.
+    #
+    # This holds at ANY replicaCount, and with or WITHOUT probes — a crash-looping
+    # container is never Ready either way. Said that way on purpose: an earlier draft
+    # reasoned from "replicaCount is 1 and there are no probes, SO ...", which invites
+    # someone adding a readinessProbe to conclude the concern is handled. It is not.
     #
     # Recreate deletes the old pod FIRST: the failure is fail-STOPPED (no controller runs
     # at all) rather than fail-STALE. The original reason still holds too — two
