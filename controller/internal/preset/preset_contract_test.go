@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/yaml"
 )
 
 // The CONSUMER half of PRD #58's two cross-module goldens, and the thing that makes
@@ -198,7 +199,7 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 	}
 }
 
-// The Go half of the PVC-size-vs-LimitRange guard (issue #224, audit A12.1).
+// The Go half of the PVC-size-vs-LimitRange guard (issue #224, audits A12.1 + A18).
 //
 // A per-worker PVC larger than its namespace's limitRange.maxPVCStorage is rejected by
 // the limitranger admission plugin, and NOTHING surfaces that: the chart renders clean,
@@ -207,8 +208,8 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // The worker provisions and never appears — the failure this package's own header
 // describes, arriving through a size instead of through a name.
 //
-// WHY THE CHECK IS SPLIT ACROSS TWO REPOS' WORTH OF TOOLING, since that is the part
-// worth understanding before someone "unifies" it. Three things claim a PVC per worker:
+// WHY THE CHECK IS SPLIT ACROSS TWO TOOLCHAINS, since that is the part worth
+// understanding before someone "unifies" it. Three things claim a PVC per worker:
 //
 //	dindDataSize  chart value      -> guarded in deploy/chart/templates/worker-invariants.yaml
 //	nixSize       Go constant      -> guarded HERE
@@ -220,33 +221,94 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // this package's header exists to prevent. So the chart guards what the chart supplies
 // and this guards what the controller compiles in. Neither half covers all three.
 //
-// chartMaxPVCStorage IS A DUPLICATED CONSTANT AND THAT IS ACKNOWLEDGED, NOT OVERLOOKED.
-// It mirrors workers.limitRange.maxPVCStorage and workers.docker.limitRange.maxPVCStorage,
-// which are both 20Gi. Duplicating ONE ceiling is a far smaller exposure than duplicating
-// the preset table, and the failure is safe in the direction that matters: lowering the
-// chart's max without lowering this makes the test PASS while the cluster rejects claims
-// — so the chart-side comment on maxPVCStorage names this test, and this names those keys.
-// Both defaults currently sit EXACTLY on the ceiling, which is why the comparison is `>`
-// and not `>=`.
+// 🔴 THE CEILINGS ARE READ OUT OF values.yaml, ONE PER TIER, AND THE PREVIOUS VERSION
+// OF THIS TEST WAS WRONG IN A WAY WORTH RECORDING. It hardcoded a single
+// `chartMaxPVCStorage = 20Gi` standing in for BOTH tiers' keys, and its comment called
+// that "safe in the direction that matters: lowering the chart's max without lowering
+// this makes the test PASS while the cluster rejects claims". That is a FALSE NEGATIVE,
+// which is the UNSAFE direction — a check fails safe when it fails toward a false
+// POSITIVE. The reviewer executed it: max 10Gi against nixSize 20Gi rendered clean AND
+// passed this test, while every restricted worker would have been rejected at
+// admission. The label invited exactly the edit that breaks the fleet, so the constant
+// is gone rather than relabelled, and the two tiers are read separately because nothing
+// requires them to stay equal.
+//
+// 🔴 WHAT THIS STILL CANNOT SEE, stated plainly because the sentence it replaces got
+// this wrong: reading values.yaml catches an edit to the SHIPPED DEFAULTS, which is the
+// repo-level change a test can gate. It does NOT catch a cluster lowering maxPVCStorage
+// through `--set` or its own values file — that value never reaches this process, and
+// the chart cannot check it against nixSize either, because nixSize is a Go constant.
+// So an operator-lowered restricted-tier ceiling remains ungated on BOTH sides. That is
+// a real residual, not a covered case; the chart-side comments say so too.
 func TestPresetPVCSizesFitTheChartsLimitRangeMax(t *testing.T) {
-	// deploy/chart/values.yaml: workers.limitRange.maxPVCStorage AND
-	// workers.docker.limitRange.maxPVCStorage. Raise there and here together.
-	chartMaxPVCStorage := resource.MustParse("20Gi")
-
-	if nixSize.Cmp(chartMaxPVCStorage) > 0 {
-		t.Errorf("nixSize = %s exceeds the chart's limitRange.maxPVCStorage = %s, so EVERY worker's /nix claim "+
-			"would be rejected at admission and every worker would provision and never appear. Raise "+
-			"maxPVCStorage on BOTH tiers in deploy/chart/values.yaml (and quota.requestsStorage with it).",
-			nixSize.String(), chartMaxPVCStorage.String())
-	}
-	for name, s := range sizes {
-		if s.DataSize.Cmp(chartMaxPVCStorage) > 0 {
-			t.Errorf("preset %q: DataSize = %s exceeds the chart's limitRange.maxPVCStorage = %s, so a worker of "+
-				"that size would provision and never appear. Raise maxPVCStorage on BOTH tiers in "+
+	for tier, max := range chartMaxPVCStorage(t) {
+		if nixSize.Cmp(max) > 0 {
+			t.Errorf("nixSize = %s exceeds %s = %s, so EVERY worker's /nix claim in that tier would be "+
+				"rejected at admission and every worker would provision and never appear. Raise it in "+
 				"deploy/chart/values.yaml (and quota.requestsStorage with it).",
-				name, s.DataSize.String(), chartMaxPVCStorage.String())
+				nixSize.String(), tier, max.String())
+		}
+		for name, s := range sizes {
+			if s.DataSize.Cmp(max) > 0 {
+				t.Errorf("preset %q: DataSize = %s exceeds %s = %s, so a worker of that size would provision "+
+					"and never appear. Raise it in deploy/chart/values.yaml (and quota.requestsStorage with it).",
+					name, s.DataSize.String(), tier, max.String())
+			}
 		}
 	}
+}
+
+// chartMaxPVCStorage reads both tiers' limitRange.maxPVCStorage out of
+// deploy/chart/values.yaml, keyed by the values path so a failure names the key to edit.
+//
+// PARSED, not grepped: `maxPVCStorage` appears under two different blocks and a regex
+// cannot tell them apart. FATAL on anything unexpected — unreadable file, missing key,
+// unparseable quantity — because a skip or a default would silently restore the
+// hardcoded constant this function exists to remove.
+//
+// The read crosses the module boundary, an established idiom here (this file's own
+// goldenPath reaches into api/), and it is why `task test:controller` carries
+// `-count=1`: Go's test cache hashes only files inside the module root, so an edit to
+// values.yaml changes nothing in this module's cache key and a cached green would hide
+// the regression.
+func chartMaxPVCStorage(t *testing.T) map[string]resource.Quantity {
+	t.Helper()
+	// controller/internal/preset -> repo root.
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
+	}
+	var v struct {
+		Workers struct {
+			LimitRange struct {
+				MaxPVCStorage string `json:"maxPVCStorage"`
+			} `json:"limitRange"`
+			Docker struct {
+				LimitRange struct {
+					MaxPVCStorage string `json:"maxPVCStorage"`
+				} `json:"limitRange"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	out := map[string]resource.Quantity{}
+	for key, val := range map[string]string{
+		"workers.limitRange.maxPVCStorage":        v.Workers.LimitRange.MaxPVCStorage,
+		"workers.docker.limitRange.maxPVCStorage": v.Workers.Docker.LimitRange.MaxPVCStorage,
+	} {
+		if val == "" {
+			t.Fatalf("%s is empty in %s; there is no ceiling to check the preset sizes against", key, path)
+		}
+		q, err := resource.ParseQuantity(val)
+		if err != nil {
+			t.Fatalf("%s = %q in %s is not a resource quantity: %v", key, val, path, err)
+		}
+		out[key] = q
+	}
+	return out
 }
 
 // Burstable, not Guaranteed, and requests strictly below limits on every preset.

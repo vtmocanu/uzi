@@ -262,6 +262,14 @@ const (
 // limitranger validates PVC creates, so a larger value is rejected at admission
 // rather than merely being expensive. Raising this means raising that too.
 //
+// THIS CONSTANT IS DUPLICATED IN deploy/chart/templates/worker-invariants.yaml, which
+// substitutes it when workers.docker.dindDataSize is unset — otherwise the guard there
+// would skip the default path entirely and a lowered maxPVCStorage would render clean
+// while every docker worker's third claim was rejected at admission (audit A18.2).
+// Helm cannot read a Go constant, so the two are tied by comment in both directions
+// plus TestDinDDataDefaultFitsTheChartsLimitRangeMax, which fails if this outgrows the
+// chart's ceiling. Move them together.
+//
 // RESIDUAL, documented rather than built, and it is the identical one nixSize
 // carries for /nix: the cache now PERSISTS across pod rolls and nothing garbage-
 // collects it, so a long-lived docker worker's image cache only grows into this

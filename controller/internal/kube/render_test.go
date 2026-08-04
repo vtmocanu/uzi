@@ -555,6 +555,68 @@ func TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes(t *testing.T) {
 	}
 }
 
+// The controller's OWN dind data-root default must fit the chart's docker-tier PVC
+// ceiling (audit A18.2). This is the UNSET path, and it was unguarded on both sides.
+//
+// An absent or empty workers.docker.dindDataSize does not mean "no claim": the
+// controller falls back to dindDataDefaultSize and creates that PVC anyway. The chart
+// guard originally skipped an empty value, so an empty string plus a lowered
+// maxPVCStorage rendered clean and every docker worker's third claim was rejected at
+// admission — the provisions-and-never-appears failure, through the default rather than
+// through an override.
+//
+// The chart now defaults the value before comparing, which fixes the render-time half.
+// This is the other half: it ties the CONTROLLER's constant to the chart's ceiling, so
+// raising dindDataDefaultSize past maxPVCStorage reddens here rather than in a cluster.
+// The two are a genuine cross-toolchain pair — Helm cannot read a Go constant — and this
+// is what keeps them honest.
+func TestDinDDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
+	max := chartDockerMaxPVCStorage(t)
+	def := resource.MustParse(dindDataDefaultSize)
+	if def.Cmp(max) > 0 {
+		t.Errorf("dindDataDefaultSize = %s exceeds workers.docker.limitRange.maxPVCStorage = %s. Every docker "+
+			"worker that does not override workers.docker.dindDataSize would have its dind data-root PVC "+
+			"rejected at admission and would provision and never appear. Raise maxPVCStorage in "+
+			"deploy/chart/values.yaml (and quota.requestsStorage with it), or lower the constant.",
+			def.String(), max.String())
+	}
+}
+
+// chartDockerMaxPVCStorage reads workers.docker.limitRange.maxPVCStorage out of
+// deploy/chart/values.yaml. Same contract as chartDeploymentQuotas below: parsed rather
+// than grepped (maxPVCStorage appears under two tiers), and FATAL on anything
+// unexpected, because a fallback would silently reinstate the hardcoded ceiling these
+// readers exist to remove.
+func chartDockerMaxPVCStorage(t *testing.T) resource.Quantity {
+	t.Helper()
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
+	}
+	var v struct {
+		Workers struct {
+			Docker struct {
+				LimitRange struct {
+					MaxPVCStorage string `json:"maxPVCStorage"`
+				} `json:"limitRange"`
+			} `json:"docker"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	if v.Workers.Docker.LimitRange.MaxPVCStorage == "" {
+		t.Fatalf("workers.docker.limitRange.maxPVCStorage is empty in %s; there is no ceiling to check against", path)
+	}
+	q, err := resource.ParseQuantity(v.Workers.Docker.LimitRange.MaxPVCStorage)
+	if err != nil {
+		t.Fatalf("workers.docker.limitRange.maxPVCStorage = %q in %s is not a resource quantity: %v",
+			v.Workers.Docker.LimitRange.MaxPVCStorage, path, err)
+	}
+	return q
+}
+
 // chartDeploymentQuotas reads the two tiers' `count/deployments.apps` quotas straight
 // out of deploy/chart/values.yaml, so the fleet-fit assertion above is made against
 // the chart the cluster actually installs rather than against a copy of it.

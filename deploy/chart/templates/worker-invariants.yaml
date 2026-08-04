@@ -119,6 +119,13 @@
   maxPVCStorage 20Gi), which is why `gt` and not `ge`: equal is the shipped, correct
   configuration.
 
+  🔴 THIS GUARD IS DOCKER-TIER ONLY, WHICH IS CORRECT AND READS BROADER THAN IT IS
+  (audit A18.4). The restricted tier has no chart-supplied PVC size — its two claims are
+  sized by Go constants — so there is nothing here for this loop to check and the
+  `workers.docker.enabled` condition is right. The consequence a reader of THIS FILE
+  ALONE would miss: `workers.limitRange.maxPVCStorage` is checked by nothing in the
+  chart at all.
+
   🔴 WHAT THIS CANNOT SEE, stated because a guard's blind spot is the thing that gets
   assumed away: the OTHER two claimants are compiled into the controller, not supplied
   by the chart. `nixSize` (20Gi, also exactly on the ceiling, on BOTH tiers) and each
@@ -127,14 +134,43 @@
   chart a fourth place preset quantities appear and the only one with no golden gating
   it, which is the ungated-skew class preset.go's own header exists to prevent. They are
   guarded on the Go side instead, by TestPresetPVCSizesFitTheChartsLimitRangeMax, which
-  carries maxPVCStorage as a documented constant and fails if a preset outgrows it. The
-  two halves together cover all three claimants; neither covers all three alone.
+  READS both tiers' maxPVCStorage out of values.yaml.
+
+  AND THE RESIDUAL THAT NEITHER HALF CLOSES, since an earlier version of this comment
+  claimed a safety property it did not have: the Go test reads values.yaml FROM DISK, so
+  it gates an edit to the shipped defaults and CANNOT see a cluster lowering
+  maxPVCStorage through `--set` or its own values file. The chart cannot check that
+  either, because nixSize never reaches it. So an operator-lowered RESTRICTED-tier
+  ceiling is ungated on both sides — a real residual, not a covered case. The docker
+  tier's is covered here, at render time, overrides included.
 */ -}}
 {{- if and .Values.workers.docker.enabled .Values.workers.docker.limitRange.enabled }}
 {{- $max := .Values.workers.docker.limitRange.maxPVCStorage }}
 {{- $maxBytes := float64 (include "uzi.quantityBytes" $max) }}
+{{- /*
+  THE UNSET PATH IS CHECKED TOO, and skipping it was a real hole (audit A18.2).
+  An empty or absent dindDataSize does NOT mean "no claim" — it means the controller
+  falls back to its OWN compiled-in default and creates a 20Gi PVC anyway. Guarding
+  only the set value left that claim unchecked, so an empty string plus a lowered max
+  rendered perfectly clean and produced exactly the failure this guard exists to stop.
+  Measured: dindDataSize "" + maxPVCStorage 10Gi rendered with no env var at all.
+
+  The literal below MIRRORS dindDataDefaultSize in controller/internal/kube/render.go
+  and the two must move together. It is a genuine cross-toolchain duplicate — Helm
+  cannot read a Go constant — so it is tied the same way every other one here is: that
+  constant's own comment names this file, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
+  (controller/internal/kube) fails if the controller's default outgrows this max. That
+  test is the mechanical half; this literal is what makes the CHART side honest about
+  what will actually be claimed.
+*/ -}}
+{{- $dindSize := .Values.workers.docker.dindDataSize }}
+{{- $dindKey := "workers.docker.dindDataSize" }}
+{{- if not $dindSize }}
+{{- $dindSize = "20Gi" }}
+{{- $dindKey = "the controller's built-in dind data-root default (workers.docker.dindDataSize is unset, so the controller supplies 20Gi itself)" }}
+{{- end }}
 {{- /* name -> value, so the failure names the key an operator has to edit. */ -}}
-{{- $claimants := dict "workers.docker.dindDataSize" .Values.workers.docker.dindDataSize }}
+{{- $claimants := dict $dindKey $dindSize }}
 {{- range $key, $size := $claimants }}
 {{- if $size }}
 {{- if gt (float64 (include "uzi.quantityBytes" $size)) $maxBytes }}
