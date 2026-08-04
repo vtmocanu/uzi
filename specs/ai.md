@@ -6881,7 +6881,12 @@ Decision 7.
   | `m` (default) | 500m–2 | 2–4Gi | 10Gi |
   | `l` | 1–4 | 4–8Gi | 20Gi |
 
-  `/nix` is a **flat 4Gi outside the table**.
+  `/nix` is a **flat 20Gi outside the table** (`preset.nixSize`). #58 shipped it at **4Gi**; PRD #87
+  bumped it for the prebaked Chromium closure, owner-directed, and it has not moved since.
+  *(Corrected 2026-08-04, issue #224. This line read "flat 4Gi" while sitting directly under a table
+  whose every other figure was current, so it read as a present-tense description of shipped code and
+  was one. The `prds/done/58` and `prds/done/87` occurrences are past-tense records of what each PRD
+  shipped and correctly stay.)*
 - **QoS is BURSTABLE (requests < limits), not Guaranteed** (user). The PRD's own fleet arithmetic
   ("10 users × quota 2 × M ⇒ 10 cores / 20Gi") is only coherent as **requests** — it is impossible as
   a limit given the measurements above — so Guaranteed would contradict the PRD's own math while
@@ -6898,8 +6903,14 @@ Decision 7.
   number.**
 - **`/nix` sits outside the table because it is measured byte-identical across `base` and `jvm`** (209
   MB / 74 store paths — the JDK ships via apk to `/usr/lib/jvm`, never through nix) and does not vary
-  by size. 4Gi is ~2.4× the measured 1,703 MB worst case; storage is the binding fleet constraint
-  (20 × `m` = 10 CPU / 40Gi requested but **280Gi of PVC**).
+  by size. #58 chose 4Gi as ~2.4× the measured 1,703 MB worst case; **PRD #87 took it to 20Gi** once
+  the prebaked Chromium closure moved the baseline to ~2.6 GiB. Storage is the binding fleet
+  constraint — and **the fleet arithmetic moves with `nixSize`, which is the part that went stale.**
+  This clause read *"20 × `m` = 10 CPU / 40Gi requested but **280Gi of PVC**"* until 2026-08-04:
+  #58's `20 × (10Gi data + 4Gi nix)`, wrong from the day #87 landed and wrong in the chart's own
+  quota comment for the same reason (issue #224 found both). The shipped restricted quota is now
+  `requestsStorage: 800Gi` = `20 × (20Gi data + 20Gi nix)`, sized on **`l`** rather than `m` because
+  nothing scopes a size to a tier — see §480.
 - **All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until PRD #51 lands** — cap>1 would
   server-provision the documented intra-user concurrency residuals. A size buys headroom for **one**
   run, never parallelism.
@@ -8323,7 +8334,8 @@ docker posture. Extends #58's controller (§264–275), does not fork it.
   (`docker:28-dind-rootless`, same pin as compose) with `securityContext.privileged: true`; a shared
   `emptyDir` socket volume at the §298 socket path (socket only); the worker container's
   `DOCKER_HOST` set EXPLICITLY (the k8s branch of the resolver — no probe); a `dinddata` volume
-  mounted into `dind` ONLY. The worker container keeps #58 posture VERBATIM (`runAsUser:10001`, drop
+  mounted into `dind` ONLY (an `emptyDir` as #83 shipped it; **a third per-worker PVC since issue
+  #224 M-a — §480**, which is a change of failure mode, not of layout). The worker container keeps #58 posture VERBATIM (`runAsUser:10001`, drop
   ALL, `automountServiceAccountToken:false`) — only the sidecar is privileged; `specHash` covers the
   new container so a change rolls the pod. **The `dind` container mounts NONE of the worker's
   token/`/data`/`/nix` — the test-pinned Decision-3 render invariant (§301), the sole containment on
@@ -8390,9 +8402,16 @@ Serves human Feature #49-adjacent (worker sizing) + the docs requirement.
 - **A docker worker budgets ~1–2 GiB RAM / ~1 CPU extra** (the sidecar) on top of the agent's own,
   plus a `dinddata` volume. `dinddata` for uzi-e2e-in-dind ≈ **5–20 GiB steady-state** (pulls
   postgres:17, builds api/web/agent). Document `dinddata` GC/retention guidance.
+  - **On k8s that volume is a per-worker PVC as of issue #224 M-a, not an emptyDir on node ephemeral
+    storage (§480)** — which is what makes the GC guidance load-bearing rather than advisory: the
+    emptyDir at least died with the pod. `docker system prune`, or delete + reprovision. Compose is
+    unchanged.
 - **`/nix` headroom regression (needs a live measurement, not a guess):** baking go+python+pip grows
-  the baked `/nix` store; `preset.nixSize` (a flat 4 GiB) and the compose `agentnix` guidance may
-  need a bump. M2/M3 re-measure on a real build.
+  the baked `/nix` store; `preset.nixSize` and the compose `agentnix` guidance may need a bump.
+  M2/M3 re-measure on a real build. **CLOSED, and the answer was yes:** PRD #87 measured the
+  prebaked closure at ~2.6 GiB and took `nixSize` to **20Gi**. *(Corrected 2026-08-04, issue #224:
+  this read "`preset.nixSize` (a flat 4 GiB)" — a present-tense claim about a constant that had
+  moved, in a bullet whose own open question was what moved it.)*
 - **Inherited #58 `/nix` warm-volume staleness caveat:** the `/nix` named volume (compose `agentnix`;
   k8s the seeded PVC) seeds from the image on FIRST use only and never refreshes from a newer image,
   so the baked go/python set updates only on `/nix` volume delete + reprovision (or a fresh worker).
@@ -17823,3 +17842,408 @@ later reader has no other way to learn that they were known.
   word-diff on a wholesale rewrite, naming the diff region for assistive tech, and **extracting the
   four diff renderers into one component module**, which M4b wants for the same reason it wants the
   single comparison.
+
+## 479. Issue #224 — worker `ephemeral-storage` is REQUEST-ONLY, on the `worker` container ALONE, from flat constants gated on `w.Docker`
+
+Serves human Feature #58 (hosted k8s workers) and Feature #83 (docker-capable worker), under the
+user's #224 decisions: ship a conservative chart-tunable default now and measure on the fleet after;
+ship it and accept one loss event. PRD `prds/224-worker-ephemeral-storage.md` is the rationale
+record; the amendments are the Decision Log.
+
+**🔴 READ THIS BEFORE ANY OTHER LINE, BECAUSE THE OBVIOUS SUMMARY IS WRONG.** A worker pod evicted
+for node ephemeral-storage pressure loses every in-flight run's working tree, silently: the
+ReplicaSet reschedules, the new pod registers, `RequeueWorkerRuns` fires, and re-claim reseeds the
+clone from origin. **#224 lowers the FREQUENCY of that loss. It does not fix it, and it does not
+make it non-silent or non-total.** A declared request changes kubelet's eviction *ranking*; it does
+not make a pod eviction-proof. The remedy for the loss itself is #218's shutdown-path fetch-back,
+deliberately out of scope — and that fetch-back **cannot fire on a kubelet eviction on this cluster
+as configured**: every threshold is hard (`evictionSoft: null`), so the eviction manager overrides
+the grace period to 0 and the clamp is 2 seconds, not the pod's 30. It *does* cover every
+**voluntary** shutdown — rollout, scale-down, spec-hash roll, node drain — including the fleet roll
+this very fix triggers. Making it fire on eviction needs `evictionSoft` + `evictionMaxPodGracePeriod`
+in the kubelet config: a cluster-config change, not a repo change. **If a report or a CHANGELOG says
+this fixes worker eviction, it is wrong.**
+
+- **REQUEST ONLY. No `limits.ephemeral-storage` anywhere in the pod spec — a limit is strictly worse
+  than nothing.** Three independent mechanisms, any one sufficient:
+  1. `podEphemeralStorageLimitEviction` fires as soon as **any** container declares a limit, and
+     compares the **sum of declared limits** against pod usage that **includes the emptyDirs**. A
+     limit on the worker container alone therefore creates a pod-level ceiling the dind cache counts
+     against — a new **deterministic** eviction path that fires with no node pressure at all. The
+     failure this issue is about, arriving on schedule instead of by luck.
+  2. A limit on the `dind` sidecar is inert at container level anyway:
+     `containerEphemeralStorageLimitEviction` builds its map from `pod.Spec.Containers` only and
+     `dind` is a restartable initContainer, and it measures rootfs+logs only, so emptyDir is excluded
+     from container-level enforcement entirely.
+  3. A **request** adds **no** eviction path: all three arms of `localStorageEviction` are limit- or
+     `sizeLimit`-gated. It buys scheduler placement plus `exceedDiskRequests` ranking, over a
+     `podDiskUsage` that **does** include emptyDir.
+  - **This is `preset.go`'s memory argument one resource over** ("the requests deliberately sit ABOVE
+    the measured peak … kubelet evicts pods whose usage exceeds their REQUESTS first"). Reuse it, do
+    not re-derive it.
+  - **Two mechanisms enforce the prohibition, because "add a limit for symmetry with cpu/memory" is
+    exactly what the next person does.** `TestNoContainerDeclaresAnEphemeralStorageLimit` covers
+    `.spec.containers` **and** `.spec.initContainers` and carries a `seen < 2` vacuity guard, so it
+    cannot pass on a render that stopped producing containers. And the chart **refuses to render** any
+    LimitRange naming `ephemeral-storage` at all — because a LimitRange `default` is injected at
+    **ADMISSION**: the controller would render a pod with no limit and the cluster would admit one
+    *with* it, invisible to every unit test. A `defaultRequest` is the mirror hazard: it would inject
+    a request into the sidecar and the init containers, breaking the one-container invariant below.
+- **The whole budget sits on the `worker` container, and the comment beside it must say why.** Quota
+  and the scheduler use `PodRequests`, which sums containers **plus restartable initContainers**; the
+  eviction ranker's `exceedDiskRequests` uses `GetResourceRequestQuantity`, which is
+  `max(sum(Containers), max(InitContainers))` with **no sidecar special case**. Budget placed on
+  `dind` is therefore charged in full by the quota and credited only partially by the ranker — worker
+  1Gi + dind 8Gi charges 9Gi and credits 8Gi. `.spec.containers` has exactly one entry, so one number
+  there makes the ranker's view, the scheduler's view and the quota's view **all equal to that number
+  with no double count**. Without the reason on the page the next reader "fixes" it by splitting the
+  number across containers, which silently halves the ranking threshold.
+- **Flat constants gated on `w.Docker` — NOT a `preset.Size` field, and not `s`/`m`/`l` at all.** The
+  axis is the tier, and the reason is structural rather than measured: `run-workdir` (§303's emptyDir
+  holding the run's entire working tree) is mounted **only** when `w.Docker`; a plain worker's
+  `/data/runner` falls through to the `data` PVC and its working tree never touches ephemeral storage.
+  **docker = the working tree is on an emptyDir; plain = the working tree is on a PVC.** Supporting
+  arguments: two live docker workers at the same size measured **1.0 MiB and 509.7 MiB — 500× apart**,
+  which an `s`/`m`/`l` split cannot express; `nixSize`'s own argument applies verbatim (a per-size
+  value creeping back is a table with one repeated number); and the right value is a property of the
+  **cluster's nodes**, not of the product — the `dindResources` precedent.
+  - `preset.Size` is untouched, so **neither golden moves** (`hosted_sizes.json` is names-only) and
+    §268's silent-staleness trap on `sizeSpecEntry` is not armed.
+  - **Flat → per-size later is SEQUENCEABLE, which is what makes flat-first non-foreclosing** under
+    the user's "tunable default now, measure after": it is a pure controller-internal refactor with no
+    api and no wire change. Three ways a per-size field could have composed with a chart override were
+    rejected — flat-override-wins (the first tuning silently flattens the table), per-size chart values
+    (makes the chart a **fourth** place preset names appear and the **only** one with no golden gating
+    it, the ungated-skew class `preset.go`'s header exists to prevent), and a multiplier.
+- **512Mi plain / 4Gi docker**, each chart-overridable per tier (`workers.ephemeralRequest`,
+  `workers.docker.ephemeralRequest` → `UZI_WORKER_EPHEMERAL_REQUEST`,
+  `UZI_WORKER_DOCKER_EPHEMERAL_REQUEST`), the docker value **replacing** the plain one rather than
+  adding to it. Both `ParseQuantity`-validated at boot; **the plain var is validated OUTSIDE the
+  docker-tier gate**, or it would go unchecked on every non-docker deployment.
+  - 512Mi is ~10× kubelet's default per-container log-rotation ceiling (10Mi × 5), which is
+    essentially all a plain worker keeps on ephemeral storage (measured 45 KiB).
+  - 4Gi covers ~2 concurrent heavy runs: `run-workdir` is one clone per run × `maxConcurrentRuns`,
+    with `$TMPDIR` pointed at the same volume, and uzi's own repo is a **~170 MiB** runner clone
+    before a single dependency install. **It is 4Gi and not the 6Gi an earlier draft carried BECAUSE
+    of M-a** (§480): the daemon's image cache was ~99% of the measured footprint and is now a PVC.
+    Re-derive what is left on ephemeral storage before raising it.
+  - Fleet check: `10 × 4Gi + 20 × 512Mi = 50 GiB` of a 70.21 GiB worker pool. A controller test
+    parses the two `deployments` counts **out of `values.yaml`** rather than holding a copy, so
+    raising an advertised fleet size changes what the test asserts instead of leaving it green.
+- **"CONSERVATIVE" HERE MEANS ERR *LOW*, which inverts the usual instinct and is the sentence the
+  shipped comment most needs.** Too low is today's behaviour: probabilistic, recoverable, visible in
+  a kubelet message we now know how to read. Too high is **UNSCHEDULABLE** — total, deterministic,
+  **silent**, presenting as `preset.go`'s worker that provisions and never appears — and the quota
+  **cannot warn you**, because a quota on this resource cannot bind. "When unsure, request more" is
+  what everyone writes otherwise.
+- **The premise the whole design rests on: a quota on `requests.ephemeral-storage` is TRACKED BUT
+  NEVER FORCED.** The quota evaluator intersects a quota's tracked resources against a hardcoded set
+  of **cpu and memory only**, which upstream calls a frozen mistake and explicitly says not to extend.
+  So it cannot reject a pod that declares none. Live positive control: the docker tier's quota reports
+  `used.requests.cpu: "3"` and `used.requests.memory: 12Gi`, reproducing exactly under
+  `(worker + restartable sidecar) × 2 pods`, while `used.requests.ephemeral-storage` is `"0"` — the
+  quota controller is demonstrably live and correctly accounting these same pods, and reports zero for
+  the one resource it cannot enforce.
+  - **🔴 THE TEMPTING COROLLARY IS FALSE AND ACTING ON IT WOULD BREAK THE FLEET.** Six in-tree
+    comments claimed a quota on `requests.*` forces declaration, and were corrected to name cpu and
+    memory. That does **not** make the `seedResources` / `dindResources` / `dindInitResources`
+    explicit requests unnecessary: those declare **cpu and memory**, which *are* enforced, so the rule
+    that justifies them holds exactly. The finding invalidates the comment's **scope**, not the
+    constants. Every corrected sentence now says so in place, precisely so nobody reads the correction
+    as licence to relax them.
+- **No LimitRange `max` for the resource.** `maxConstraint` rejects any pod that declares no **limit**
+  for a resource the `max` names — every pod in the namespace, not just workers — so under a
+  request-only design an ephemeral `max` breaks everything there. The existing "`max` must stay >= the
+  largest preset's limits" invariant does **not** acquire a third dimension.
+- **RANKING MITIGATION, NOT CAPACITY GUARANTEE, and the cluster evidence says so out loud.**
+  `kubectl describe node` reports `ephemeral-storage 0 (0%)` requested on nodes physically 51-52%
+  full: nothing else here declares the resource, so the scheduler's ephemeral view is empty and ~10
+  GiB of undeclared usage stays invisible however much we declare. Two further facts from the same
+  reading, both easy to get wrong: **both observed evictions were `imagefs.available`, not
+  `nodefs.available`** (the two pods' threshold quantities differ, and each reproduces to the byte
+  against its own node's imagefs capacity × `float32(0.15)`; the eviction message maps both signals to
+  the same resource name, so the threshold quantity is the only tell), and **the node pool is
+  heterogeneous** — three nodes split `nodefs`/`imagefs`, one merged. On a split node the ranking
+  input is the container writable layer alone (268 KiB measured), so the *value* barely matters there;
+  the real driver is image accumulation against a 5.77 GB agent image, which no ephemeral request can
+  touch. **Filed as issue #225 by user decision, not fixed here.**
+
+## 480. Issue #224 M-a — the DinD data root becomes a third per-worker PVC, chosen for BACKPRESSURE, and the quota triple is made honest at the advertised fleet size
+
+Serves the same human items as §479, plus the user's decisions that the quotas are raised to match
+the advertised fleet rather than the advertised fleet lowered to match the quotas, and that M-c (a
+PVC resize path) is dropped in favour of delete-and-reprovision.
+
+- **The daemon's data root moves from an `emptyDir` to a third per-worker PVC, and the argument is
+  BACKPRESSURE.** Every instrument at this layer — request, container limit, pod limit,
+  `emptyDir.sizeLimit`, quota — is either a ranking hint or an eviction trigger. **None produces
+  backpressure.** A full PVC is a genuinely different mechanism: the filesystem is out of space, the
+  writer gets `ENOSPC`, **no eviction occurs**. The failure changes from *pod eviction destroys the
+  run's tree* to *the docker step fails, the pod lives, the tree lives* — strictly the better failure
+  for this issue's actual complaint. It also removes ~99% of the measured pod ephemeral footprint from
+  the accounting entirely, which is what makes §479's 4Gi defensible.
+- **`emptyDir.sizeLimit` was the considered alternative and is MOOT BY CONSTRUCTION, not deferred.**
+  Two reasons, and the second alone settles it: kubelet enforces a `sizeLimit` by **evicting the
+  pod**, so it is a fourth eviction trigger carrying §479's hazard; and with the data root on a PVC
+  there is no emptyDir left for it to bound. Recorded explicitly so nobody later reads it as
+  delivered. **`run-workdir` is the only remaining emptyDir and must NEVER get a `sizeLimit`** — it
+  holds the checkout this whole issue exists to protect, so bounding it would evict the pod for the
+  run's own growth.
+- **Rejected, named because it looks cheaper: the daemon root on the existing `data` PVC via
+  `subPath`.** `subPath` does confine the container, so the dind-mounts-no-worker-volumes invariant
+  (§301) would survive — but a runaway pull would then `ENOSPC` the **clone cache** too, which is
+  exactly the coupling the PVC is being paid to remove. And absorbing the cache means raising
+  `Size.DataSize`, which moves the display golden and `web/src/lib/workerSizes.ts` (§268's chain) and
+  wastes the increase on every restricted worker that has no daemon.
+- **Flat 20Gi, `workers.docker.dindDataSize` → `UZI_WORKER_DIND_DATA_SIZE`, rendered only when
+  `w.Docker`.** 20Gi is the top of the chart's own documented band, and it is **also the ceiling, not
+  just the default**: the tier's LimitRange `maxPVCStorage` is 20Gi and the limitranger validates PVC
+  creates, so a larger value is rejected at admission (§481 is what catches that). Wiring:
+  `dindDataPVCName(id)` joins `dataPVCName`/`nixPVCName`, `RenderPVCs` gains a third entry gated on
+  `w.Docker`, and the materializer gains an observation flag, a create-gate case and a teardown entry.
+  **The plain render must stay byte-identical** to what it was, or a docker-only change rolls every
+  plain worker through the spec hash.
+- **Three costs, all accepted, all in the CHANGELOG rather than discovered later:**
+  1. **A third RWO PVC is a third Multi-Attach surface, on the exact reschedule path #224 is about.**
+     `Strategy: Recreate` means no surge pod, so the window is the old node's `VolumeAttachment`
+     releasing — unchanged in kind, wider by one volume. This was **not** weighed when the PVC was
+     chosen over the `sizeLimit`; it does not reverse the choice, and it belongs beside the benefit.
+  2. **The image and build cache is now PERSISTENT and nothing GCs it.** The emptyDir died with the
+     pod, which was a crude but real bound; a PVC only grows. This is the identical residual `nixSize`
+     already documents for `/nix`. `docker system prune` is the remedy an agent can run; otherwise
+     delete + reprovision. Secondary: build-arg and layer residue now outlives a restart **for the
+     same user** — a hosted worker is per-user, so no new cross-user surface.
+  3. **Raising `dindDataSize` on a live cluster is a SILENT NO-OP for every existing docker worker**,
+     by design rather than as a bug to report: the pod's spec hash covers the claim's **name** and
+     never its size, and PVCs here are never patched. New workers get the new size; existing ones keep
+     theirs until reprovisioned.
+- **The quota triples are made honest at the fleet each tier advertises** — the user's call, over the
+  alternative of lowering the advertised fleet. Docker: `requestsStorage` 140Gi → **600Gi**
+  (`10 × (20Gi data + 20Gi nix + 20Gi dind)`), `persistentvolumeclaims` 20 → **30**. Restricted:
+  280Gi → **800Gi** (`20 × (20Gi data + 20Gi nix)`), its claim count **unchanged at 40** — that tier
+  gains no third volume. **Raising a quota PROVISIONS NOTHING** — it is a ceiling on claims, not a
+  reservation — so the correction costs zero storage until the workers exist.
+  - **WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER.** Nothing scopes a
+    size to a tier: `SizeNames()` is global and the renderer feeds `spec.Size.DataSize` to both tiers,
+    so any advertised worker may be an `l`. Sizing the restricted tier on `m` gives 600Gi, which caps
+    it at 15 `l` workers against a tier advertising 20 — and the 16th is refused with a **quota**
+    error rather than a scheduling one, which **no test in this repo can see**. If `l` should not be
+    available on a tier, the fix is to scope it off the tier, never to under-budget.
+  - **Neither triple had ever been self-consistent, and both defects predate #224.** The docker tier
+    at 140Gi / 20 claims held **3** `l` workers against the 10 it advertised — before M-a added a
+    third claim. The restricted comment's `= 280Gi` had been wrong since PRD #87 bumped `nixSize` and
+    did not follow the value into the arithmetic (2.86× too small for its own stated fleet; the same
+    drift §268 carried, corrected in the same pass). **If `nixSize` or a preset's `DataSize` moves
+    again, these numbers move with it** — that coupling is now written beside both.
+  - The docker tier's `ephemeralStorage: 200Gi` quota key **stays, and is honest about being
+    decorative**: it is a ceiling on what workers *declare*, never a guard against consumption, and
+    nothing may be sized on the belief that it is. Under §479's premise it cannot force a declaration,
+    and it never observed emptyDir usage even when the cache was one.
+- **M-a precedes M-b in the history, and the ordering is load-bearing rather than a merge artifact.**
+  M-b's 4Gi is *derived from* M-a having moved the cache off ephemeral accounting: one combined commit
+  makes 4Gi unjustifiable from the diff alone, and M-b first would ship 6Gi. And **"one fleet roll
+  instead of three" holds only if all of it lands in ONE release** — three controller rollouts would
+  be three rolls and three loss events. That was the argument that justified enlarging the scope, so
+  it belongs in the release note.
+- **THE ROLL ITSELF: shipping this kills every in-flight run, once, fleet-wide and simultaneously.**
+  `AnnotationSpecHash` is a sha256 over the whole rendered `PodTemplateSpec`, the materializer patches
+  the Deployment whenever that hash moves, and the **worker** Deployment's strategy is `Recreate` (to
+  dodge a Multi-Attach deadlock on the surge pod — a different object and a different reason from the
+  **controller** Deployment's `Recreate`, which §481 shows is load-bearing for the boot check). Adding a resource key to
+  the worker container moves the hash for **every** worker, plain and docker. The team has engineered
+  around this property before — the non-docker render was built as slices specifically to stay
+  byte-identical to #58's, so enabling docker never rolled an existing plain worker — but **there is
+  no engineering around it here, because the change IS a pod-spec change.** The user was shown this
+  with the alternatives and chose to ship and accept one loss event; the CHANGELOG says so plainly,
+  because silence converts an accepted, understood cost into an incident.
+- **M-c (a PVC resize path) was DROPPED, and the premise did not survive measurement.** Both live
+  workers store an identical **2.77 GiB**; the 77%-full reading was a **legacy 4Gi volume**
+  provisioned before #87, while the current 20Gi default sits at **14.2%** with 15.7 GiB free. **n=1
+  affected worker**, and the remedy is the one `nixSize`'s own comment already prescribes: delete +
+  reprovision. Under an already-accepted disrupting roll the marginal cost is zero. **What that
+  avoids is the real argument:** overturning the stated "PVCs are never patched" decision, a `patch`
+  verb on PVCs in the controller Role, observed-**size** tracking in the namespace observation (which
+  records booleans today), and re-arming issue #114 BUG 3 — k8s does not decrement
+  `used.requests.storage` on a redundant admission charge (upstream #119593), which pinned that quota
+  at its hard limit, and **a patch charges the delta the same way**. Expansion also had zero headroom:
+  the StorageClass allows it, but the LimitRange PVC `max` is 20Gi and `nixSize` is already 20Gi, and
+  the limitranger validates PVC **updates**.
+
+## 481. Issue #224 — THREE nets for the PVC ceiling, the boot check that owns the last one, an ABSENT ceiling that SKIPS, and no ADR
+
+Serves the user's decision to build the boot-time ceiling check now. The three nets are complementary
+by design; the shipped comments name all three **and when each fires**, because a coverage claim is
+the class of claim this work refuted twice.
+
+- **The three nets, and what only the third can see.** `helm template` (the chart's `fail` guard, for
+  the one claimant the chart owns — earlier and cheaper than a CrashLoopBackOff), `go test` (the Go
+  constants against the ceiling **parsed out of `values.yaml`** rather than a copied constant), and
+  **controller boot** — the only one that sees what the **cluster** configured rather than what the
+  repo ships.
+  - **Net 2 is TWO tests, not one, and a map that names one is read as exhaustive.** There are three
+    Go-side claimants: `nixSize` and each preset's `DataSize` (`TestPresetPVCSizesFitTheChartsLimitRangeMax`,
+    in `preset`) and `dindDataDefaultSize` (`TestDinDDataDefaultFitsTheChartsLimitRangeMax`, in
+    `kube`). Both parse the ceiling out of `values.yaml` and `Fatal` on a read failure rather than
+    falling back to a constant — the fallback is the defect that had to be fixed in the first of them,
+    and the reason the parse is a **parse** and not a grep is that `maxPVCStorage` appears under two
+    blocks a regex cannot separate. **A reader of a "three nets" map is asking "is every claimant
+    covered?", so naming one test under-sells net 2 by exactly the claimant that started this thread.**
+- **The boot check lives in the CONTROLLER, and that is a missing input rather than a layering
+  violation.** Three things claim a PVC per worker — `nixSize`, each preset's `DataSize`, and the dind
+  data root — and only **one** comes from the chart; the other two are Go constants a Helm template
+  cannot read. Putting preset quantities into `values.yaml` was rejected on its own merits: it would
+  make the chart a **fourth** place preset quantities appear and the **only** one with no golden
+  gating it. The controller is the only place in the system where all of them exist at once, because
+  it is what **constructs** the claims — and it already takes `StorageClass` from the chart, which is
+  the same kind of fact.
+- **What it prevents, and why refusing to boot is proportionate.** An oversized claim is rejected by
+  the limitranger; the materializer returns **before the Deployment is created**; the reconcile loop
+  logs and retries every tick; nothing is reported to the api. **The worker provisions and NEVER
+  APPEARS**, for as long as anyone leaves it, with the cause in one log line. Failing at boot turns a
+  silent permanent stall into a `CrashLoopBackOff` naming every offending claimant, both numbers, the
+  env var to edit and the remedy — the same trade `parseQuantityEnv` already makes for a typo'd
+  quantity, and the same posture as `secretbox` refusing to start on a placeholder key.
+- **Per-tier, and the invariant is a MINIMUM, not an equality.** The two tiers are separate namespaces
+  with separate LimitRanges; they carry the same 20Gi today and nothing requires that to continue.
+  Each tier's claimants are checked against **that tier's** ceiling, so a future divergence is handled
+  by construction; where one value ever serves both, the invariant is
+  `claimant <= min(restricted, docker)` — the min is the fallback shape, per-tier is the general one.
+  **Stating it as the min is what makes a future divergence legible.** Verified across all four
+  on/off combinations: with one tier lowered, the check flags that tier **only**.
+- **🔴 AN ABSENT CEILING SKIPS ITS TIER, AND THE REASON IS STRUCTURAL RATHER THAN PRUDENTIAL.** Each
+  ceiling env var renders under **exactly** the LimitRange's own condition, so **absent env ⟺ no
+  LimitRange ⟺ no ceiling in existence ⟺ nothing to violate.** The check has **no operand**. Skipping
+  is therefore *correct semantics*, not a pragmatic compromise, and a default would be **inventing a
+  constraint the cluster does not have**.
+  - **The harm argument is TRUE and is not the reason — keep them apart.** *"A guessed ceiling too low
+    refuses to boot a healthy fleet, a self-inflicted outage in a function whose whole purpose is
+    preventing one"* is an argument **against defaulting**, which is a different and weaker claim than
+    the one being made; leading with it presents skipping as a trade-off and **invites the next reader
+    to improve it with a default, which the structural argument forecloses outright.** Both validators
+    reached this independently. The general rule worth carrying past it: **fail-closed is right for a
+    MALFORMED value and wrong for an ABSENT one, and the two are not the same case.**
+  - **Two states where the equivalence is imperfect, both recorded rather than guarded.**
+    `limitRange.enabled: true` with an **empty** `maxPVCStorage` renders a LimitRange while omitting
+    the env — benign, since an empty quantity is not a valid LimitRange and there is no effective
+    ceiling either way. And `limitRange.enabled: false` **while a LimitRange from a previous install
+    survives** skips a tier that still has a live ceiling: reachable through a **supported chart
+    value** rather than an out-of-band edit, which puts it in a different class from the residual
+    below. Pruned away by ArgoCD here; not universally.
+- **🔴 `strategy: Recreate` ON THE CONTROLLER DEPLOYMENT IS WHAT CONVERTS THIS CHECK FROM A DETECTOR
+  INTO A STOP, and that coupling lives in a third file.** `replicaCount: 1` and **no probes of any
+  kind** (verified from the rendered manifest, not inferred), so under `RollingUpdate` k8s defaults to
+  `maxUnavailable: 0` / `maxSurge: 1`: the new pod is created while the old keeps running, and the old
+  is terminated only once the new is **Available**. A lowered ceiling makes the new pod `os.Exit(1)`
+  into `CrashLoopBackOff`, so it is **never** Available, so **the old controller runs indefinitely
+  holding the OLD ceiling against the NEW LimitRange helm already applied** — the exact mismatch this
+  check exists to stop, with the check firing and being **defeated**, and a crash-looping pod beside
+  it that a reader takes as *"the guard worked"*. `Recreate` deletes the old pod first, so **no**
+  controller runs: **fail-STOPPED rather than fail-STALE.**
+  - **So "a `helm upgrade` cannot reach the mismatched state" is true ONLY because of `Recreate`** —
+    a roll that never completes is precisely the failure case — and any sentence claiming it must say
+    so where it is claimed.
+  - **The invariant is asserted on the rendered Deployment, not merely commented.** Both validators
+    reached the finding independently, and the reason for a test rather than a third comment is the
+    finding's own shape: the strategy comment presented itself as **discretionary** (*"buys quiet
+    rather than correctness"*), which gives someone adding HA explicit blessing to switch it, and
+    **no rendered value changes — the failure is a rollout topology, so nothing else could notice.**
+  - **The assertion's failure MESSAGE carries the why, and that is not decoration.** The only person
+    who will ever hit it is someone deliberately adding HA; a bare *"strategy.type must be Recreate"*
+    reads as arbitrary to exactly that reader, and **the guard is then deleted by the change it exists
+    to stop** — which is how the comment failed. The message states that `Recreate` is what makes a
+    failed ceiling check fail-stopped rather than fail-stale. **A guard has to survive the person with
+    a reason to remove it, and the only thing that reaches them is the text they see when blocked.**
+- **THE CLAIMANT LIST MUST BE DERIVED FROM THE RENDERER, NOT MAINTAINED BESIDE IT** — and the failure
+  is asymmetric in the direction that hides it. A hand-maintained parallel list **does** catch a typo
+  (mutating an entry reddens named cases, so the shape looks fail-safe), and **does not** catch an
+  **addition**: a fourth PVC added to the renderer is silently unchecked, with no test able to notice.
+  That is this whole chain's failure class — a list that did not learn about a new claimant — arriving
+  **inside the check built to close it**, found independently by both validators. Iterating the
+  renderer's own output per tier covers a fourth claim **the day it is added** and **deletes code**
+  rather than adding it. Two silent narrowings that the derivation subsumes, recorded so they are not
+  lost: a constant map key assigned inside a template × size loop keeps only the last iteration's
+  value for `/nix`, and `/data` is keyed by size but not by template — neither is wrong today, and
+  both rest on a flatness property enforced in **another package**.
+- **🔴 A NEW COST, STATED RATHER THAN WAVED THROUGH: a crash-looping controller stops TEARDOWN as well
+  as provisioning.** Teardown is a pass of the same reconcile loop, so a prolonged crash-loop **leaks
+  PVCs and storage quota for workers the api has already dropped**. Existing worker Deployments and
+  pods are untouched and **runs in flight continue** (the api's run lanes do not go through the
+  controller). The honest framing, kept because it refuses the easy summary: *before this change the
+  same misconfiguration gave a silently stalled fleet with teardown still working; now it gives a loud
+  failure with teardown stopped.* **The trade is still clearly right** — a silent permanent stall is
+  the worse failure and is the one #224 exists to eliminate — but the teardown loss is genuinely new.
+- **Recovery is effectively a chart change.** Both ceiling vars come from the chart, and ArgoCD's
+  `selfHeal: true` **reverts a `kubectl set env`** on the Deployment. Recovery is a values change plus
+  a sync. Acceptable, because the tripping config is one no cluster has today — but an operator who
+  does not know this will try `kubectl set env` first and watch it revert.
+- **A LimitRange edited DIRECTLY IN THE CLUSTER is seen by none of the three nets, and that is out of
+  scope on structural grounds rather than effort ones.** A chart is a **rendering** artifact with no
+  read path against the cluster and no reconcile loop, so there is no point at which it could observe
+  drift — and more precisely: **the chart's contract is that the rendered manifest is the desired
+  state, so an out-of-band `kubectl edit` is BY DEFINITION a desired-state violation, and the remedy
+  for that class is GitOps, not a chart guard.** The controller *could* read the live LimitRange, but
+  that means a new `get limitranges` verb on **the only kube-credentialed component in the system**
+  plus a watch (a boot-time read closes only the window a boot-time env read already closes) — a
+  widening this repo's own "four independent guardrail layers, don't weaken one" posture refuses.
+  **Framed as an operator-discipline residual, not a defect**: the same category as "do not
+  `kubectl edit` a GitOps-managed object", a property of the deployment model rather than of #224.
+  Where `selfHeal` is configured it is additionally reverted — true here, and the record may not
+  **rely** on it, since another installation might sync by hand.
+- **The invariant is VERIFIED AT BOOT, not MAINTAINED.** A running controller does not re-check. In
+  practice a values change that lowers a ceiling rolls the Deployment and therefore trips it, **but
+  that coupling is incidental rather than enforced.**
+- **What the boot check does NOT cover, recorded because the shape is identical.** The ResourceQuota
+  is a **separate object with a separate `enabled` flag**, and a quota rejection on `requests.storage`
+  has the same silent shape: PVC create rejected → the Deployment is never created → infinite retry →
+  a worker that provisions and never appears. The general case is **structurally unfixable at boot**,
+  because a quota is a **cumulative** ceiling whose headroom depends on how many workers already
+  exist, which the controller cannot know before the reconcile loop starts. **One slice is
+  boot-checkable and cheap** — `requestsStorage >= DataSize + nixSize + dindDataSize`, i.e. *"can even
+  the FIRST worker be created"*, a per-claim floor of exactly the shape the check already handles.
+  Candidate follow-up; not built.
+- **NO ADR, with the counter recorded because it is genuinely arguable.** The durable facts here are
+  **k8s semantics, not a uzi seam**, and the uzi-side decision belongs beside `nixSize`'s and
+  `dindResources`' existing arguments in `render.go`; the five-ADR set is deliberately small. The
+  counter: *"never declare an `ephemeral-storage` limit, and never add an ephemeral key to the
+  LimitRange"* is exactly an invariant a future change would silently break, and it spans two
+  components. It was judged sufficient that the invariant is **mechanically enforced** — by the
+  no-limit render test and by the chart `fail` (§479) — rather than only argued, with the comments and
+  these sections as the durable record.
+
+**What #224 does NOT deliver.** A standing list rather than a status note, because a rebuild inherits
+these unmet and has no other way to learn they were known:
+
+- **It does not fix the work loss — frequency only.** §479's opening box is the contract; #218's
+  fetch-back is the remedy and cannot fire on a kubelet eviction on this cluster (2s, not 30s).
+- **Image accumulation on split-`imagefs` nodes is untouched** and is the more likely repeat cause on
+  three of four nodes. **Issue #225**, filed by user decision rather than fixed.
+- **The fleet-measured default is still owed** — the user's "measure after". Two spot reads 515×
+  apart is exactly why a spot read cannot set this number. The statistic is named: per-pod
+  `ephemeral-storage.usedBytes` **with the per-volume breakdown**, sampled on a schedule across every
+  live worker, retaining the max per worker-lifetime, **tagged with the node's `imagefs` topology** —
+  without that tag two runs disagree and nobody finds the reason. **`kubelet_volume_stats` CANNOT
+  answer it:** the kubelet skips every volume whose `PVCRef` is nil, so `run-workdir` has no series,
+  ever, and a Grafana panel built on it would show `/data` and `/nix` and silently omit the volume
+  that matters. The node summary API is the confirmed instrument, and it is read-only.
+- **Admissibility against a live quota + LimitRange, and the `fsGroup` question on a real ROOTLESS
+  provision, both need a cluster.** A rendered-pod parse proves the requests are *present*; it cannot
+  prove the pod is *admissible*. An emptyDir mount root is created writable by `fsGroup` and a
+  freshly-provisioned PVC should get the same treatment, but that is invisible to `helm template` and
+  to every unit test — and the deployed cluster runs the non-rootless posture, so the chart's default
+  rootless posture is the unexercised one. **`e2e:kind-smoke` covers none of this**: it installs the
+  chart with `workers.enabled: false`, so it never renders a worker pod and cannot observe an
+  eviction. A green pipeline must not be read as coverage here.
+- **The boot check's three-line call site in `main.go` is covered by the build and by review, not by a
+  test** — that file has no test file. The validation function itself is table-driven and
+  mutation-proven.
+- **PV reclaim policy is unresolved.** Teardown deletes the PVC; whether the backing PV and its
+  datastore disk are freed depends on the StorageClass `reclaimPolicy`. Under `Retain` the storage
+  leaks per torn-down worker and **no quota can see it**, because a quota counts PVCs, not orphaned
+  PVs. Pre-existing for `/data` and `/nix`; three claims per docker worker now. One command answers
+  it; the apiserver was unreachable, and it is reported unresolved rather than guessed.
+- **Evicted-pod cleanup is a manual one-off deletion by exact name — no controller-side reaper**
+  (user decision: a reaper is a new reconcile responsibility plus an RBAC delete verb plus its own
+  tests, for a cosmetic problem). Lingering `Evicted` pods delete immediately, with no grace to wait
+  out, because a pod already `Failed`/`Succeeded` is deleted with period 0.
+- **The CLI needs no change**, checked rather than assumed: `api/cmd/uzi/` exposes no hosted-worker
+  size or spec surface.
