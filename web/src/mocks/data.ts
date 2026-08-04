@@ -1979,6 +1979,66 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    // run-seeded (PRD #209 M5): a run created WITH a user-authored plan (plan_source
+    // "seeded"). It skips the Phase-1 planning turn and the approval gate, so it NEVER
+    // enters awaiting_approval and PlanPanel never renders — SeededPlanPanel is the only
+    // surface for its plan_md, which is otherwise unreachable on the run page. It also
+    // exercises item 2: agent_source is "repo" from creation while repo_agents is still
+    // null (the worker has not reported the clone's .claude/agents/ yet), which is the
+    // roster-pending state AgentRosterSummary must show instead of an asserted empty
+    // roster. Reachable at /runs/run-seeded.
+    id: "run-seeded",
+    repo_id: "repo-uzi",
+    issue_iid: 34,
+    issue_title: "Add a --since filter to `uzi run list`",
+    issue_description:
+      "Filter the runs list by age. Started from a plan authored locally in Claude Code (PRDLESS + --plan-file).",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "running",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: "agent/issue-34",
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: SEEDED_PLAN(),
+    // The load-bearing field for M5: the run view keys the seeded-plan surface on this.
+    plan_source: "seeded",
+    // Repo source chosen at create time, but the clone's roster has not been reported
+    // yet — the roster-pending state (PRD #209 M5 item 2).
+    repo_agents: null,
+    agent_source: "repo",
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(4),
+    started_at: minsAgo(4),
+    finished_at: null,
+    created_at: minsAgo(5),
+    updated_at: minsAgo(1),
+  },
+  {
     // run-unreadable-question is parked on a clarification question whose payload the
     // UI CANNOT render (PRD #88): the `question` message carries no `question_id`.
     //
@@ -2453,6 +2513,25 @@ export function SAMPLE_PLAN(): string {
   ].join("\n");
 }
 
+// SEEDED_PLAN is a user-authored plan for the PRD #209 seeded-run demo. It is written
+// to be SELF-SUFFICIENT (D7): it names files and steps explicitly and assumes no prior
+// conversation, because a seeded run starts cold with plan_md as its only instructions —
+// unlike SAMPLE_PLAN above, which is the worker's own Phase-1 output.
+export function SEEDED_PLAN(): string {
+  return [
+    "## Add a `--since` filter to `uzi run list`",
+    "",
+    "Goal: let `uzi run list` take `--since <duration>` (e.g. `--since 24h`) and show only runs created within that window.",
+    "",
+    "1. **CLI flag** — in `api/cmd/uzi/run.go`, add a `--since` string flag to the `run list` command; parse it with `time.ParseDuration` and reject an invalid value with a usage error.",
+    "2. **Client** — thread the parsed cutoff to `ListRuns` as an optional `since time.Time`, encoded onto the query string.",
+    "3. **Filter server-side** — in the runs list handler, when `since` is present add `created_at >= $since` to the query rather than filtering in Go.",
+    "4. **Tests** — a unit test for the duration parse (valid + invalid), and a handler test asserting an out-of-window run is excluded.",
+    "",
+    "Roster: the repo's own agents in `.claude/agents/`. No migration. Touches `api/` only.",
+  ].join("\n");
+}
+
 // runListItem decorates a Run into the list shape the API returns.
 // PRD #40 demo: usage for a run that actually ran (terminal or running); a queued /
 // awaiting_approval run has none, so its list row shows no tok/cost — exactly the
@@ -2915,6 +2994,35 @@ export const mockBusyMessages: RunMessage[] = [
   // so the `tester ×2` chip rolls up as `waiting` while X's lane pulses.
   bm("tool_use", "tester", "toolu_01testY", "unit: RunEvent", { id: "b-7", name: "Bash", input: { command: "npx vitest run src/components/RunEvent.test.tsx" } }, 0.4),
   bm("tool_use", "tester", "toolu_01testX", "e2e: approval gate", { id: "b-8", name: "Bash", input: { command: "./e2e/run-e2e.sh" } }, 0.1),
+];
+
+// mockSeededMessages backs the PRD #209 seeded-plan demo run (run-seeded). A seeded run
+// SKIPS the Phase-1 planning turn, so there is deliberately NO `plan` message here — the
+// plan arrives with the claim (SeededPlanPanel renders run.plan_md, not a feed message).
+// Kept short and lead-only so the "roster pending" state on the run page stays coherent:
+// the worker has not yet reported the clone's .claude/agents/, so no subagent lanes have
+// opened.
+export const mockSeededMessages: RunMessage[] = [
+  {
+    seq: 1,
+    kind: "status",
+    agent: null,
+    agent_instance: null,
+    agent_label: null,
+    payload: { event: "init", model: "claude-opus-4-8" },
+    created_at: minsAgo(4),
+  },
+  {
+    seq: 2,
+    kind: "text",
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload: {
+      text: "Implementing the plan you supplied at create time — skipping the planning turn and the approval gate.",
+    },
+    created_at: minsAgo(3),
+  },
 ];
 
 export const mockLaneRuns: Run[] = [
