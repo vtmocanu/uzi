@@ -99,6 +99,36 @@ if ! grep -q -F -- "--audit-level=$LEVEL" "$PKG_DIR/package.json"; then
   exit 2
 fi
 
+# 🔴 AND `--include=dev` IS ASSERTED, NOT MERELY DELEGATED. It is the single flag
+# that keeps this gate armed against BOTH omit vectors -- a `.npmrc` carrying
+# `omit=dev` and an `NPM_CONFIG_OMIT=dev` environment variable -- and without this
+# check, deleting seven characters from `package.json`'s audit script takes the gate
+# green with `found 0 vulnerabilities` and nothing anywhere naming the change.
+#
+# WHY THE FLAG LIVES IN `package.json` AND THIS ASSERTION LIVES HERE, rather than
+# putting the flag on the Taskfile line. The two constraints pull opposite ways:
+# Taskfile.yml's header requires every npm target to DELEGATE ("a target that
+# reimplements the command drops that script's flags SILENTLY"), while the flag must
+# not be droppable. Delegation plus this assertion satisfies both and is STRICTLY
+# STRONGER than the Taskfile-line form, which no assertion guards at all -- there,
+# a future "simplify the gate" edit removes the flag and nothing notices, which is
+# precisely the failure the delegation rule was written about. Here the removal
+# exits 2 and names the file.
+#
+# The invisible-edit hazard the ruling is really about does not reach this file:
+# `package.json` is tracked and every change to it lands in the MR diff. The vectors
+# that leave nothing in a diff are `.npmrc` (an untracked add) and `NPM_CONFIG_OMIT`
+# (a CI variable), and `--include=dev` outranks both -- measured, both ways.
+if ! grep -q -F -- "--include=dev" "$PKG_DIR/package.json"; then
+  echo "npm-audit-gate: $PKG_DIR/package.json's audit script does not carry --include=dev." >&2
+  echo "  REFUSED. That flag is what keeps this gate armed against a .npmrc holding" >&2
+  echo "  'omit=dev' and against an NPM_CONFIG_OMIT=dev environment variable. Without" >&2
+  echo "  it, either one takes this gate to exit 0 printing 'found 0 vulnerabilities'" >&2
+  echo "  over a tree whose only high-severity findings are dev-tree, and npm audit" >&2
+  echo "  has NO in-band canary that would distinguish that from a clean run." >&2
+  exit 2
+fi
+
 # No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.

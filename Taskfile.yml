@@ -1481,6 +1481,16 @@ tasks:
       # Without that assertion the argument would be decorative: the echo would
       # advertise a threshold nothing enforces.
       #
+      # 🔴 AND THE SCRIPT ASSERTS `--include=dev` THE SAME WAY, which is why that
+      # flag is safe to keep in `package.json` rather than on this line. The two
+      # rules pull opposite ways: this file's header requires npm targets to
+      # DELEGATE (a target that reimplements the command drops the script's flags
+      # SILENTLY), while the flag must not be droppable. Delegation plus an
+      # assertion satisfies both and is STRICTLY STRONGER than putting the flag
+      # here, where nothing would guard it. Measured: deleting `--include=dev`
+      # from the audit script exits 2 naming the file, and the same mutated script
+      # under a `.npmrc` holding `omit=dev` exits 0 printing no findings.
+      #
       # WHY `high` AND NOT ZERO: two moderate react-router advisories survive
       # every available option (no patched 6.x exists, `--force` will not touch
       # them, `overrides` has nothing to point at), so clearing them is a React
