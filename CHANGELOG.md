@@ -131,6 +131,28 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   creation, so only a newly-provisioned worker picks up a raised default
   (issue #224).
 
+- **The worker controller now refuses to boot when a rendered worker PVC
+  would exceed its tier's LimitRange storage ceiling, instead of retrying
+  forever on a worker that provisions and never appears.** A preset's
+  `/data`, `/nix`, or the dind data PVC could be sized above what the
+  cluster's LimitRange allows and still pass `helm template` and the
+  controller's own boot cleanly; the PVC create was then rejected on every
+  reconcile tick with the reason visible only in the controller's own log,
+  nothing reported back to the api, and no worker ever appeared. The boot
+  check now names every offending claimant, its size, and its ceiling, and
+  which value to lower, as a `CrashLoopBackOff` an operator will actually
+  see. Existing worker pods and runs in flight are unaffected, since the
+  api's run lanes never go through the controller. **This is a genuine new
+  cost, not a pure improvement: provisioning, drift reconciliation, and
+  teardown all run in the same reconcile loop, so a prolonged crash-loop
+  also stops teardown, leaking PVCs and storage quota for workers the api
+  has already dropped.** Before this change the same misconfiguration gave
+  a silently stalled fleet with teardown still working; now it gives a loud
+  failure with teardown stopped. **Operators:** recovery needs a chart
+  values change plus an ArgoCD sync, not `kubectl set env` on the
+  Deployment: `selfHeal: true` reverts that the moment it notices (issue
+  #224).
+
 ### Security
 
 - **The `uzi` CLI no longer renders server-supplied text on your terminal
