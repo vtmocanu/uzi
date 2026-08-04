@@ -1918,3 +1918,94 @@ purpose but does not say **don't collapse this**. And `worker-invariants.yaml` n
 comment with `*/ -}}` — **not** the CLAUDE.md hazard here (it is followed by `{{- if`, not a `---`,
 and arm A renders identically pre and post, which is the check), but that file is now the one place
 in the chart where the pattern sits next to templating, and the documented failure is silent.
+
+### A20 — 2026-08-04, adversarial read of the parser. **`20m` parses, and both validators converge on one fix.**
+
+**A20.1 — 🔴 `20M` AND `20m` BOTH PARSE AND DIFFER BY 10⁹. It is the only such pair in the table, and
+the guard CANNOT fire on it by construction.** The reviewer extracted the helper into a standalone
+probe chart and enumerated every case variant of every suffix — the axis the helper's own error
+message anticipates (*"the unit is case-sensitive, so \"Gi\" not \"gi\""*):
+
+```
+20Ki ✓  20ki ✗  20KI ✗       20k ✓  20K ✗
+20Mi ✓  20mi ✗                20M ✓  20m ✓   <-- BOTH PARSE
+20Gi ✓  20gi ✗                20G ✓  20g ✗
+20Ti ✓  20ti ✗                20T ✓  20t ✗
+20Pi ✓  20pi ✗                20P ✓  20p ✗
+```
+
+`20M` = 2e+07 bytes; **`20m` = 0.02 bytes.** Nine of ten wrong-case typos fail closed naming the
+mistake; the tenth is accepted **silently**, on a single-keystroke slip, for a suffix an operator
+plausibly reaches for. Verified end to end:
+
+```
+helm template … --set-string workers.docker.dindDataSize=20m
+  rc=0, 38 documents, guard SILENT
+  UZI_WORKER_DIND_DATA_SIZE: "20m"   -> reaches the controller, MustParsed into a 0.02-byte claim
+```
+
+**0.02 bytes is under every ceiling, so the guard cannot fire on it by construction.** *(The reviewer
+verified through the controller's env and explicitly does NOT claim what the apiserver or CSI does
+with a milli-unit `storage` request — only that the guard and the boot validation both pass it.)*
+
+**The fix is deleting one dict entry.** The helper's own comment says *"`m` (milli) is included for
+completeness even though no storage value uses it"* — an accurate description of a suffix that buys
+nothing at either call site (both are storage quantities) and costs the table's only silently-accepted
+case typo. Removing `"m" 0.001` makes `20m` fail closed with the existing message, which already
+spells out the case rule.
+
+Two smaller reads, both fail-**closed**, neither worth changing: `Ei`/`E` are rejected though k8s
+accepts them (a false *rejection*, and the error is honest about the supported set — a deliberate
+subset, not an oversight); and a unit-less number is accepted as bytes, which **matches k8s**
+(`MustParse("20")` is 20 bytes) — but it means `dindDataSize: 20`, the plausible unquoted-YAML typo
+for `20Gi`, sails under any ceiling. **Out of scope by construction: this guard is a ceiling and
+structurally cannot be a floor.** One clause in the comment so nobody later assumes it validates
+plausibility.
+
+Everything else the reviewer threw at the parser fails closed: `2e3`, `1e3Gi`, `"20 Gi"`, `+20Gi`,
+`-20Gi`, `.5Gi`, `20Gi5`, `Gi`, `20GiGi`, `20.0.0Gi`, `0x14Gi`, `20Ei`. `"  20Gi  "` is accepted
+(trim); an absent value fails naming `<nil>`.
+
+**A20.2 — 🔴 BOTH VALIDATORS INDEPENDENTLY REACHED THE SAME FIX: let the ceiling flow to the
+controller and validate at boot.** A19.4 (auditor) and this (reviewer) were produced separately and
+converge on the same mechanism, which is the strongest signal this PRD has produced about a design
+choice. The reviewer's three reasons the prose cross-reference cannot carry the weight:
+
+1. **It is asymmetric in exactly the wrong direction.** The Go test fires when a *developer raises a
+   preset above the ceiling* — an edit made with the test suite in front of them. It is **silent**
+   when an *operator lowers the ceiling below a preset* — an edit in `values.yaml` made with no Go
+   test in sight. **The class of person the cross-reference has to reach is the one furthest from
+   it.**
+2. **It does not cover the third claimant at all.** `dindDataDefaultSize` is checked by nothing on
+   either side, and the chart guard skips it whenever the knob is empty (A18.2).
+3. **The invariant is written down wrong even in prose.** The comment says the two chart keys "are
+   both 20Gi"; the condition the test actually needs is
+   `chartMaxPVCStorage <= min(workers.limitRange.maxPVCStorage, workers.docker.limitRange.maxPVCStorage)`.
+   They coincide today — **stating it as the min is what makes a future divergence legible.**
+
+**The controller is the only place in the system where all four numbers exist at once.** It
+constructs the PVC, so its admission ceiling is a **missing input rather than a layering violation**,
+and it already takes `StorageClass` from the chart, which is the same kind of fact. Fail-closed
+matches `secretbox`'s refuse-to-boot-on-placeholder precedent, and it **subsumes the
+`dindDataDefaultSize` hole for free**.
+
+**Keep the chart guard as well** — a `helm install` error is earlier and cheaper than a
+CrashLoopBackOff, and it covers the one claimant the chart owns. **Complementary, not alternatives.**
+The reviewer's stated fallback if this is more than the PRD should absorb: a gate-runnable script
+asserting the three numbers agree — *"I would still recommend the env-var route, because a script is
+a fourth place the number appears."*
+
+**A20.3 — the new invariant test omits the vacuity guard THIS FILE establishes as an idiom.**
+`readGolden`, **190 lines above it in the same file**, Fatals on an empty list with: *"A golden that
+parsed to nothing would make every assertion below vacuously pass — the 'test that cannot fail' this
+PRD's Decision Log keeps catching."* `TestPresetPVCSizesFitTheChartsLimitRangeMax`'s
+`for name, s := range sizes` has no `len(sizes) == 0` check. Risk is low (a package-level map literal
+cannot empty by accident) — **but the standard is stated in the same file, and M-b's
+`TestNoContainerDeclaresAnEphemeralStorageLimit` applied it (`seen < 2`) in a neighbouring file.** One
+line, and the two new invariant tests become consistent with each other and with the idiom.
+
+**A20.4 — the reviewer's closing point, which is the argument for A20.2 rather than against the
+test:** *"this test is load-bearing in a way its name does not advertise. It is the only thing
+between two Go constants and a whole-fleet silent rejection, and it is gated on a constant that can
+go stale from the other side."* The boot-time check would let it **drop the duplicated constant
+entirely and become an ordinary test of a validation function.**
