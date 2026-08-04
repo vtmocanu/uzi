@@ -183,7 +183,7 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
     );
   };
 
-  it("preserves the clone, the plugin dir and the run HOME when the server parks the run", async () => {
+  it("removes the clone but preserves the plugin dir and the run HOME when the server parks the run", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-ok-"));
     try {
@@ -192,12 +192,17 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
         gitlabClaim(91, { wait_on_limit: true }),
       );
       const p = paths();
-      // All three survive: a resume needs the transcript, the worktree AND the
-      // plugin dir, and preserving only some of them resumes into a broken session.
+      // PRD #218 M6: the clone leg of the carve-out was dropped. M1/M2 moved a
+      // parked run's committed work off the clone and into the worker's bare
+      // (fetch-back into the tracking ref, validated live on dev-cluster
+      // 2026-08-04), so preserving the clone directory buys nothing and it is now
+      // removed on a park too. The plugin dir and the run HOME are still preserved:
+      // a resume needs the transcript and the plugins, and the reseed recreates the
+      // clone at the same path.
       assert.strictEqual(
         fs.existsSync(p.worktree),
-        true,
-        "runner clone must survive a park",
+        false,
+        "runner clone must be removed on a park (PRD #218 M6)",
       );
       assert.strictEqual(
         fs.existsSync(p.pluginDir),
@@ -242,9 +247,11 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
   // PAT and Anthropic token registered in the logger — for the days a seven-day
   // window lasts, on a worker that goes on to run other runs — was green everywhere.
   //
-  // The carve-out is three FILESYSTEM removals. The eviction is not one of them: the
-  // secrets are re-delivered on the next claim, so holding them buys nothing and
-  // costs a widened exposure window on a machine that keeps working.
+  // The finally holds three FILESYSTEM removals (clone, plugin dir, run HOME); the
+  // park carve-out skips two of them (plugin dir + HOME — the clone leg was dropped
+  // in PRD #218 M6). The secret eviction is none of the three: the secrets are
+  // re-delivered on the next claim, so holding them buys nothing and costs a widened
+  // exposure window on a machine that keeps working.
   it("still evicts the run-scoped secrets from the logger when the run parks", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(
@@ -411,10 +418,13 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         api.states.some((s) => s.body.status === "limit_wait"),
         "the run still parks",
       );
+      // PRD #218 M6: the clone leg of the carve-out was dropped once the fetch-back
+      // above proved it makes the committed work durable, so the clone is now
+      // removed on a park (the tracking ref, asserted above, is what survives).
       assert.strictEqual(
         fs.existsSync(worktreeDirFor(iid)),
-        true,
-        "the clone is still preserved by the park carve-out",
+        false,
+        "the clone is removed on a park (PRD #218 M6)",
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });

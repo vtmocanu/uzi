@@ -281,10 +281,14 @@ own decisions, and duplicating them here would create two records to keep in ste
 
 - **Which run kinds park** (`issue`/`ci_fix`/`self_improve` yes; `judge`/`chat` no) —
   PRD Decision 14.
-- **The park acknowledgement contract** (the worker skips its three filesystem
+- **The park acknowledgement contract** (the worker skips its two filesystem
   cleanups **iff** the server's reply reports status `limit_wait`, never *iff*
   `applied`) — PRD Decision 4. It is a cross-component invariant whose failure mode is
   a silent unbounded disk leak, so read it before touching either side.
+  (PRD #218 M6, 2026-08-04: dropped from three cleanups to two — the runner-clone leg
+  was removed once PRD #218 M1/M2 made a parked run's committed work durable via a
+  fetch-back into the worker bare's tracking ref, validated live on dev-cluster. Only
+  the sibling skills plugin dir and the per-run HOME are now skipped on a park.)
 - **The four independent guardrail layers** are untouched by this PRD. Nothing here
   changes what a worker may do, only which credential it is handed and when.
 

@@ -13871,10 +13871,11 @@ predicate looks safer and is not: 0 rows ⇒ 409 ⇒ the worker treats it as "th
 exits, the report **vanishes**, and the run rots at `running` until `RUN_TIMEOUT` fails it with
 something misleading. Same branch point as the budget cap.
 
-**The on-disk carve-out is THREE removals, not two**: the runner clone, the **sibling** skills
+**The on-disk teardown has THREE filesystem removals** — the runner clone, the **sibling** skills
 plugin dir (outside the clone, so removing the clone does not reach it), and the per-run HOME
-holding the resumable transcript. Exactly those three are skipped for a parked run and **nothing
-else in the teardown is**.
+holding the resumable transcript. **As of PRD #218 M6 (2026-08-04) the park carve-out skips TWO of
+them**: the plugin dir and the per-run HOME. The clone leg now runs on a park too (see the corrected
+note below), and **nothing else in the teardown is** skipped for a parked run.
 
 **🔴 CORRECTED 2026-08-04 (PRD #218): the runner-clone leg does NOT preserve the agent's committed
 work, and the resume never read it for that.** This paragraph read *"preserving only some of them
@@ -13888,9 +13889,12 @@ worker SIGTERM) now fetches the agent's branch back into the worker's own bare a
 ref (see §485). Recovery is via the tracking ref in the bare, NOT via the preserved clone dir.
 - The plugin-dir and HOME legs remain load-bearing for **session** resumability (the SDK transcript
   keyed by HOME and cwd); only the clone leg was found redundant.
-- **M6, which removes the now-redundant clone leg, is DEFERRED to a later MR and has NOT landed.**
-  All three removals are still skipped for a parked run today; the clone leg is redundant, not gone.
-  Do not read this as "the carve-out is now two removals": it is still three.
+- **M6 has LANDED (PRD #218, 2026-08-04): the redundant clone leg was removed, so the clone is now
+  cleaned up on a park like on any other terminal path.** Only TWO removals — the plugin dir and the
+  per-run HOME — are skipped for a parked run. M6 was gated on M7 recovering real work on
+  dev-cluster: a live worker eviction reseeded off the tracking ref (seeded_from=tracking,
+  prior_commits=1, marker byte-identical), proving the fetch-back, not the preserved clone, is what
+  carries the committed work.
 
 **🔴 THE OTHER TEARDOWN STEPS MUST STILL RUN ON A PARK, AND THEY DO NOT FAIL ALIKE.** Guarding the
 whole block, or returning early, leaves a steering poller running and a gate deadline registered for
@@ -18471,11 +18475,14 @@ parks or requeues the run, because a park/shutdown that fails is worse than one 
 still lost by design, since `fetchAgentBranch` fetches `refs/heads/<branch>`, and auto-committing a
 half-applied edit that later gets built on is a worse failure than a clean loss.
 
-**Decision 6: the clone leg of PRD #35 Decision 6a is now REDUNDANT, and its removal (M6) is
-DEFERRED.** Once the commits live in the bare, preserving the clone dir buys nothing for committed
+**Decision 6: the clone leg of PRD #35 Decision 6a was REDUNDANT, and M6 REMOVED it (PRD #218,
+2026-08-04).** Once the commits live in the bare, preserving the clone dir buys nothing for committed
 work: the reseed recreates the clone at the same path, so the HOME+cwd-keyed SDK session still
-resolves and the sibling skills-plugin dir is untouched regardless. But M6 (dropping `&& !parked`
-from the `removeRunnerClone` guard) is deferred to a later MR and has NOT landed; removing it before
-M1/M2 are validated would delete the clone the fetch-back must read. So the clone, plugin dir and
-HOME are all still preserved on a park today (see the correction in §435). See PRD #218's Decision
-Log for full rationale (D1-D6) and the measured runs.
+resolves and the sibling skills-plugin dir is untouched regardless. M6 (dropping `&& !parked` from
+the `removeRunnerClone` guard, leaving the `worktreePath` guard so `removeRunnerClone(undefined)`
+never fires) has now LANDED. It was gated on M7 validating a real recovery first — a live worker
+eviction on dev-cluster reseeded off the tracking ref (seeded_from=tracking, prior_commits=1, marker
+byte-identical), proving the fetch-back is what carries committed work and removing the clone before
+that would have deleted the clone the fetch-back reads. So on a park only the plugin dir and the
+per-run HOME are preserved now; the clone is removed like on any terminal path (see the correction in
+§435). See PRD #218's Decision Log for full rationale (D1-D6) and the measured runs.
