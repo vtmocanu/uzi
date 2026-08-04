@@ -48,9 +48,16 @@ repo's own agents if the clone ships a [`.claude/agents/`
 directory](./repo-agents.md), otherwise your own [agent
 templates](./agent-templates.md). Pass `--agent-source own|repo` to pick
 explicitly, and `--exclude-agents a,b` to drop specific ones from that
-source. If you're naming agents, read them out of the clone's
-`.claude/agents/` directory rather than guessing — an excluded or misspelled
-name that doesn't exist in the chosen source is rejected.
+source.
+
+Unlike the plan-approval gate, none of this is checked against the clone's
+actual roster at create time — the clone doesn't exist yet, so there's
+nothing to check against. Confirm the roster from the filesystem before
+naming it (`ls .claude/agents/` in your own clone for `--agent-source
+repo`), not from memory: `--agent-source repo` against a clone that turns
+out to have no `.claude/agents/` runs with **zero subagents** rather than
+failing, and an `--exclude-agents` name that doesn't match anything in the
+chosen source is silently a no-op rather than an error.
 
 ## 4. Create the run
 
