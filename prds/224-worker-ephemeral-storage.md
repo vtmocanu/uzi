@@ -1473,3 +1473,51 @@ leaks. `task scan:secrets`: EXIT=0, `0 findings in tracked files (1495 in the in
 DETECTED (gitlab-pat, gitleaks v8.30.1)`**. Exit codes read off files on the following line, not
 through `${PIPESTATUS[0]}` — the auditor walked into that zsh trap in its M-a report and did not
 repeat it.
+
+### A15 — 2026-08-04, PRE-GUARD CONTROL and three traps in A12.1's own fix
+
+Captured by the auditor at `2a63ddb3` **before** the guard lands, because it gets harder afterwards:
+a post-fix green proves the tree is green, not that the guard *changed* anything.
+
+```
+CONTROL A  shipped defaults (dindDataSize 20Gi)    rc=0  34 docs  UZI_WORKER_DIND_DATA_SIZE=20Gi
+CONTROL B  --set dindDataSize=40Gi vs max 20Gi     rc=0  34 docs  UZI_WORKER_DIND_DATA_SIZE=40Gi
+                                                   stderr: 0 bytes
+```
+
+**B is the disconfirming observation**: today the oversized value renders *completely clean* — zero
+stderr, a full manifest, a controller env happily carrying `40Gi` — and then ships a controller that
+retries a rejected PVC forever. That is the state the guard must flip, now anchored at a known SHA.
+
+**A15.1 — 🔴 THE GUARD MUST BE STRICT `gt`, OR IT BREAKS EVERY INSTALL.** `dindDataSize` (20Gi) and
+`maxPVCStorage` (20Gi) are **equal in the shipped defaults** — by design, since 20Gi is
+simultaneously the default and the ceiling. `{{- if ge ... }}` therefore **rejects the shipped
+defaults**. A coder who tests only the 40Gi case sees a working guard and ships one that fails closed
+on the default path. **Control A is the arm that catches this**, which is why it was flagged before
+the commit rather than after.
+
+**A15.2 — 🔴 HELM'S `ge`/`gt` ARE STRING COMPARISONS: `"4Gi"` > `"20Gi"` IS TRUE.** `"4"` sorts above
+`"2"`, so **4Gi reads as larger than 20Gi**. Sprig has no `resource.Quantity`, so the guard needs
+explicit normalisation — parse the suffix, or restrict to a documented unit and compare `int64`.
+**A guard that silently mis-orders is worse than none**, because it fails in the reassuring direction
+on exactly the values an operator is most likely to try. Same family as every instrument trap in this
+file: clean, repeatable, confident, wrong.
+
+**A15.3 — write the guard against `maxPVCStorage` AS THE CEILING, not against `dindDataSize` as one
+claimant.** `nixSize` is 20Gi in `preset.go`, hard-equal to the same max, with **no chart knob at
+all**. The broad form covers both pairs; the narrow form covers one. Recorded so the narrow choice,
+if taken, is deliberate.
+
+**A15.4 — the four arms that demonstrate the guard.** Two are not enough: the guard is a *constraint
+between two values*, so it must be shown both to fire and **not** to fire.
+
+| arm | pre-guard at `2a63ddb3` | post-guard required |
+|---|---|---|
+| A — shipped defaults | rc=0, 34 docs *(measured)* | **rc=0, 34 docs** — unchanged, or the guard broke the default path |
+| B — `dindDataSize=40Gi` | **rc=0, 0 bytes stderr** *(measured)* | **rc≠0**, message naming both values |
+| C — `maxPVCStorage=40Gi` **and** `dindDataSize=40Gi` | not captured; expect rc=0 | rc=0 — raising them together is the documented escape |
+| D — A12.2's `requestsStorage: 800Gi` | 600Gi | 800Gi, and `800/40 = 20` `l` workers == the 20 advertised |
+
+**Arm C is the one that proves the guard is a constraint rather than a hard-coded rejection of
+40Gi.** The auditor's own framing, which generalises past this guard: *"a guard nobody has seen fire
+is not a guard — and a guard nobody has seen NOT fire is not one either."*
