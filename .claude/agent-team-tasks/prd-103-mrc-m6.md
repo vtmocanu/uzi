@@ -475,6 +475,36 @@ rc goes 0 → 1 again under both the `omit=dev` and `omit[]=dev` spellings. Keep
 severity on the command line too, never in `.npmrc`. And **`web/.npmrc` and
 `agent/.npmrc` join the gate-config file list** that reviewers watch.
 
+**🔴 AMENDMENT 5: THERE IS A SECOND DISARM VECTOR AND IT LEAVES NOTHING IN THE DIFF
+AT ALL — `NPM_CONFIG_OMIT=dev` AS AN ENVIRONMENT VARIABLE.** Six-arm control measured
+at `1c751ae3`, the last commit where a dev-only high still exists so the disarm is
+observable:
+
+```
+0  no .npmrc, no env                        rc=1   crit 1 / high 2 / mod 5
+1  .npmrc: omit=dev                         rc=0   crit 0 / high 0 / mod 2   DISARMED
+2  .npmrc: omit=dev   + --include=dev       rc=1   8 back
+3  .npmrc: omit[]=dev + --include=dev       rc=1   8 back
+4  env NPM_CONFIG_OMIT=dev, NO .npmrc       rc=0   crit 0 / high 0 / mod 2   DISARMED
+5  env NPM_CONFIG_OMIT=dev + --include=dev  rc=1   8 back
+```
+
+**Arm 4 is strictly worse than the `.npmrc` route this section was written about.**
+A2-1's threat model was *"a one-file `.npmrc` would at least appear in the diff"*. A
+**GitLab CI variable named `NPM_CONFIG_OMIT`** reaches every npm invocation in every
+job and **never appears in a merge request at all** — no file, no diff, no review
+surface. It is set in project settings by anyone with the rights, and nothing in the
+repo records it.
+
+**Arm 5 shows the same one-flag remedy closes both — but ONLY if `--include=dev`
+lives in the version-controlled `Taskfile.yml` target.** Put it in a CI job script
+instead and the flag itself becomes editable in the same invisible place as the
+attack. This is the concrete reason the Placement ruling insists the recipe lives in
+the Taskfile and CI merely calls the target.
+
+Reconfirmed across all six arms: `metadata.dependencies` is byte-identical, so there
+is still **no in-band canary** for npm audit.
+
 **A non-remedy, checked and retracted inside the auditor's own probe**:
 `metadata.dependencies` is byte-identical (515/403) armed and disarmed, so it cannot
 serve as an in-band canary. **npm audit has no in-band positive observation that
@@ -490,12 +520,38 @@ network branch. A typo'd level fails closed loudly (`npm warn invalid config`), 
 
 **A2-3. DO AGENT FIRST — the fix ordering is inverted relative to shipped exposure.**
 web's three high-and-above are **all dev-only**: build-time, not in the web image's
-runtime. agent's two are **production dependencies that ship in the worker image**,
-both reached via `@anthropic-ai/claude-agent-sdk` → `@modelcontextprotocol/sdk`, and
-both are trust-boundary code — `GHSA-mwp4-54f8-5fhr` is *"leading-zero octets
-decoded as decimal … allowing SSRF and trust-boundary bypass"*, `GHSA-v2hh-gcrm-f6hx`
-is *"host confusion via literal backslash authority delimiter"*. This repo runs an
-https-only SSRF allowlist as a named control, so that class is not theoretical here.
+runtime. agent's two are **production dependencies that ship in the worker image** —
+confirmed at `agent/templates/base/Dockerfile:191`, `RUN npm ci --omit=dev`, with all
+seven packages `dev=false`.
+
+**🔴 AMENDMENT 5 CORRECTION: THE DEPENDENCY PATH AND THE SSRF LINK WERE BOTH MINE AND
+BOTH WRONG, IN THE OVERSTATING DIRECTION.** This paragraph said the two are *"reached
+via `@anthropic-ai/claude-agent-sdk` → `@modelcontextprotocol/sdk`"* and that *"this
+repo runs an https-only SSRF allowlist as a named control, so that class is not
+theoretical here."*
+
+- **The hop that decides the threat model was missing.** Sole dependents, measured:
+  `ip-address@10.4.0` ← **`express-rate-limit@8.5.2`** (rate-limit key derivation
+  from a client IP), and `fast-uri@3.1.5` ← **`ajv@8.20.0`** and `ajv-formats` (JSON
+  Schema `$ref`/`$id` URI resolution). Both sit under the SDK, but naming the SDK as
+  the consumer skips the layer that says what the flaw can actually reach.
+- **`FORGE_ALLOWED_BASE_URLS` IS GO.** It lives in `api/internal/config/config.go`.
+  **No npm package participates in it**, and the api and the worker are different
+  processes. My sentence connected two things that do not touch.
+
+**The shipped-versus-not argument, which is the one that actually orders the work, is
+unaffected and was correct.** Only the mechanism sentence was inflated.
+
+**And the advisory count is FIVE, not two**: `ip-address` carries three
+(`GHSA-mwp4-54f8-5fhr` high, `GHSA-4xrf-jv44-h6hh`, `GHSA-22jq-vg5j-6vgg`) and
+`fast-uri` two (`GHSA-v2hh-gcrm-f6hx`, plus `GHSA-7p8r-x3mc-p8w7` which the design
+wave never named). All five are genuinely closed by the installed versions, verified
+two ways — range arithmetic against `api.github.com/advisories`'
+`first_patched_version`, and the registry's own matcher via `npm audit` on the
+post-fix tree reporting `total=0`, which is the stronger check because it is the same
+oracle the gate will use. Note `fast-uri@3.1.5` sits at **exactly**
+`GHSA-7p8r-x3mc-p8w7`'s first patched version, zero margin — the next 3.x advisory
+reddens the agent gate with nobody's diff in it.
 **No reachable call path was traced, so this is not a claim of exploitability** — the
 argument is shipped-versus-not, which is measured. The agent fix is nearly free
 (total=0, no `package.json` change, 0 new package names) and **does not depend on the
@@ -1165,6 +1221,109 @@ agent lockfile holds **225 package names before and after**, 0 added, 0 removed.
 **not** Unit A's actual gate recipes — `Taskfile.yml` carried ~97 uncommitted lines
 with the `govulncheck` and `npm audit` targets at the time. Those need their own
 review dispatch, pinned to a SHA, once commits 4-6 land. Expected, not a miss.
+
+### Amendment 5 — 2026-08-04, from the Unit A audit at `121d7610`
+
+**🔴 THE GATE WAS RED AND I BROKE IT, IN A COMMIT ARCHIVING THE EVIDENCE FOR AN
+AMENDMENT ABOUT RIGOUR.** `task scan:secrets` at `121d7610`: rc=201, **60 findings**,
+all in `probes/prd-103-mrc-m6-reviewer/rev-vulnprobe-json.txt`, all
+`sourcegraph-access-token`, all false positives — gitleaks reads the bare 40-hex
+commit SHAs in `go.googlesource.com/<repo>/+/<sha>` fix URLs inside archived
+`govulncheck -format json` output as tokens. Introduced by **`4e54f805`** (my
+Amendment 2 commit); `main` at `0111f01c` is clean. `lint:repo` would have reddened
+the first MR pipeline.
+
+**Two things kept it invisible for hours, and neither is carelessness:**
+
+1. **Every docs commit I made carries the CI-skip marker**, correctly — they are
+   docs-only — so no pipeline ever ran against them. The marker is right and its
+   consequence is that the *repo's* check never fired either.
+2. **`probes/README.md` said, in terms, "Adding or removing files here cannot move a
+   gate."** That sentence is why nobody ran the gate. It is now corrected in place
+   with the failure recorded: `scan:secrets` walks **tracked files**, and everything
+   under `probes/` is tracked, so a committed probe is inside the scan root by
+   construction. The narrower true claim: *removing* a file here cannot redden a
+   gate, **adding one can**.
+
+**And the four component gates that WERE run are exactly the four that do not hold
+the secret scanner.** `gate:api`, `gate:controller`, `gate:web` and `gate:agent` were
+each recorded; `gate:repo` owns `scan:secrets` (`Taskfile.yml:218`) and had no owner
+in this unit's evidence set at all. **Checklists should say `task gate`** — which runs
+`gate:repo` first — rather than enumerating component gates.
+
+**Fixed by redacting the token-shaped bytes**, not by a `.gitleaks.toml`: a
+directory-scoped allowlist is the self-disarming shape M5 spent a milestone closing,
+and `scripts/scan-secrets.sh`'s own message says one scoped to a directory holding no
+canary slips past both canaries. **`task gate:repo` now rc=0, `clean -- 0 findings in
+tracked files (1654 in the index)`, both canaries DETECTED.**
+
+*(My first redaction pass anchored on the literal `/go/+/` quoted in the report and
+took the gate 60 → **1**, missing 2 under `/text/` and 1 under `/net/`. **Anchor on
+the shape, not on the example you were handed** — the same lesson carry-forward 16
+records for sweeps, arriving through a `gsed` pattern.)*
+
+**Other audit findings folded in above**: the `NPM_CONFIG_OMIT=dev` env-var disarm
+(in `A2-1`), and the dependency-path / SSRF-link correction plus the five-advisory
+count (in `A2-3`).
+
+**Three more, recorded rather than actioned:**
+
+- **A probe artifact recording only pass/fail cannot evidence a claim about a
+  VALUE**, and vitest's default reporter makes that the easy mistake — it suppresses
+  `console.log`, so a probe that *logs* a value records nothing. `121d7610`'s
+  `vite.config.ts` comment says both settings were "CONFIRMED IN EFFECT rather than
+  inferred from a green", and its two committed artifacts are five lines each of
+  `Tests 2 passed (2)` + `RC=0`, holding neither value. **The claim is true** — it was
+  re-derived independently, including a mutation where the runner printed
+  `AssertionError: expected 60000 to be 20000`. The technique: **assert the wrong
+  value and let the runner print the actual.** M6's coverage calibration has exactly
+  this shape and should use it.
+- **`obug`'s caret should NOT be pinned.** `vitest` is now exact-pinned at `4.1.10`,
+  so `obug` cannot move without an explicit vitest bump and `npm ci` reinstalls the
+  exact tarball by integrity. An `overrides` entry would be this repo's first and
+  would freeze it against future security patches to buy nothing the lockfile does
+  not already give. It carries **SLSA v1 provenance naming `github.com/sxzz/obug` at
+  `refs/tags/v2.1.4`** — more than 5 of the 12 new/major packages have. The reclaim
+  is real and its live hazard is to *other people's* trees: sxzz republished
+  overlapping `1.0.0` and `1.0.2`, so a 2016-era `^1.0.0` range now resolves to
+  entirely different code. Not ours.
+- **41 packages changed, not 39** — the extra two are `postcss 8.5.16→8.5.25` and its
+  dep `nanoid 3.3.15→3.3.17`; A2-4's 39 was a vitest-only resolve and the commit
+  bundles postcss. **Quote 41 in the MR.** And word the majors carefully:
+  `vite 5.4.21,6.4.3 → 6.4.3` and `esbuild 0.21.5,0.25.12 → 0.25.12` are **dedupes of
+  a nested duplicate, not bumps** — a name→version table renders the first as
+  "5.4.21 → 6.4.3", which reads as a vite major that did not happen. All 462 web and
+  224 agent lockfile entries resolve to `registry.npmjs.org` with **zero** missing
+  `integrity` hashes.
+
+### The react-router deferral is defensible on STRONGER grounds than my ruling gave
+
+This belongs in the MR description, not just "two moderates accepted" — the residual
+is far smaller than the raw advisory list implies, and the next person to run
+`npm audit` needs to know why it is being left.
+
+- **`GHSA-337j-9hxr-rhxg` (constructor injection via `deserializeErrors()`) is
+  STRUCTURALLY UNREACHABLE here.** From the published tarballs: the symbol is absent
+  from `react-router@6.30.4` and `@remix-run/router@1.23.3` (both greps carried live
+  positive controls) and is defined only in `react-router-dom@6.30.4`. Its **only**
+  caller is `parseHydrationData()`, whose **only** callers are `createBrowserRouter()`
+  and `createHashRouter()`. This app mounts `<BrowserRouter>` (`web/src/main.tsx`),
+  and `createBrowserRouter|createHashRouter|RouterProvider|__staticRouterHydrationData`
+  returns **zero matches** across `web/src`. No SSR anywhere, and the sink
+  additionally reads a same-origin `window` global.
+- **Both open-redirect advisories are mitigated at the only attacker-controlled
+  navigation sink, and the mitigation is TESTED.** That sink is
+  `web/src/pages/Login.tsx:74`, `safeNextPath(searchParams.get("next"))`, fed by
+  `CliAuth.tsx`. `safeNextPath` admits only `startsWith("/") && !startsWith("//") &&
+  !includes("\\")` — it rejects **the backslash vector specifically**, which is what
+  both advisories exploit, and `Login.test.tsx:104` asserts it. No other
+  `useSearchParams`/`location.search` value reaches `navigate()` or `<Link to>`.
+- `GHSA-jjmj-jmhj-qwj2` reports `first_patched_version: NONE` for `react-router-dom`
+  — independent confirmation that no patched 6.x exists.
+
+**One invariant the filed 6→7 issue must carry**: `safeNextPath` is a *per-call-site*
+guard, so any future `navigate(<value derived from a URL or the server>)` reopens the
+hole without touching react-router at all.
 
 ### Two instrument failures from the architect, both worth keeping
 
