@@ -27,9 +27,24 @@ export default defineConfig({
   //
   // WHAT HAPPENED. The first vitest 4.1.10 full-suite run was RED: 49 failed, all in
   // src/pages/RunView.test.tsx, exactly one of them a real 20000 ms timeout on a
-  // 150-tick fake-timer poll test, the other 48 an empty-container cascade after it.
-  // The collected pair never moved — 118 files / 1660 tests in every run, red and
-  // green alike — so nothing narrowed; it is a timing fault. That is still true.
+  // 150-tick fake-timer poll test, the other 48 failing in its wake. The collected
+  // pair never moved — 118 files / 1660 tests in every run, red and green alike — so
+  // nothing narrowed; it is a timing fault. That is still true.
+  //
+  // "AN EMPTY-CONTAINER CASCADE" IS WHAT THAT SENTENCE USED TO SAY ABOUT THE 48, AND
+  // THE LOG DOES NOT SUPPORT IT. Re-derived from the archived run rather than quoted:
+  // `probes/prd-103-mrc-tester-tt/conc-c1-2-tt20000.txt` has 49 failure markers and 49
+  // FAIL headers, and **zero** occurrences of either "empty container" or "container is
+  // empty". The 48 are 23 missing-text and 10 missing-role TestingLibraryElementErrors,
+  // 10 `expected '' to contain/match`, 2 `expected null not to be null`, 1 bad-args
+  // assertion — and 2 more whose class none of those patterns names, stated rather than
+  // rounded away, so the categories deliberately do NOT sum to 48. Breakdown archived at
+  // `probes/prd-103-mrc-lead/cascade-characterisation.txt`.
+  //
+  // The MECHANISM the retired phrase was reaching for is right — one starved test leaves
+  // the rest of the file querying components that never rendered — but the phrase names a
+  // single uniform signature the run does not have, and a reader who greps for it finds
+  // nothing and concludes the record is wrong about the run.
   //
   // THE RULING THAT FOLLOWED (raise this to 60000) WAS BUILT ON A RATE THAT DOES NOT
   // REPRODUCE. Three runs gave 1 red; ten further consecutive runs at 20000, in a
@@ -55,7 +70,25 @@ export default defineConfig({
   // because it read as a measurement: "60000 is ~3x the spike that actually failed"
   // was wrong in kind. The test was CANCELLED at 20000 ms, so its true duration on
   // that run is bounded only from below and unknown. 60000 is 3x THE CAP THAT FIRED.
-  // The companion "~15x the measured steady state" is sound.
+  //
+  // 🔴 AND THE COMPANION FIGURE, "~15x the measured steady state", WAS RECORDED HERE AS
+  // "sound" AND IS REFUTED. It is not wrong arithmetic; it is the wrong denominator.
+  // Steady state is not the scale a starvation tail is measured against, and a 73-run
+  // study (matched pairs, Clopper-Pearson intervals, ambient load recorded per run —
+  // `probes/prd-103-mrc-tester-tt/`) supplies the one that is: against the worst
+  // OBSERVED excursion the margin is **1.20x**, not 15x. Both readings, re-derived here
+  // from the raw logs rather than carried:
+  //
+  //   49869 ms  conc-c1... c10-1-tt60000.txt:650  — the largest anywhere. That run was
+  //             RED (`Tests  1 failed | 1659 passed`), red for an unrelated IssueView
+  //             test; this cap test itself PASSED at 83.1% of the ceiling.
+  //   49065 ms  conc-c10-2-tt60000.txt:650        — the largest inside a fully GREEN run
+  //             (`Test Files 118 passed`, `Tests 1660 passed`), 81.8% of the ceiling.
+  //
+  // The brief carried the first as "inside a GREEN run at the shipped cap". The number is
+  // right and the run description is not — a distinction that matters here because the
+  // green-run reading is the one that argues the ceiling is live rather than merely
+  // untested, and it is 49065.
   //
   // Both settings below were CONFIRMED IN EFFECT under vitest 4 rather than inferred
   // from a green, and the technique matters more than the result: assert the WRONG
