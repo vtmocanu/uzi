@@ -1337,25 +1337,34 @@ tasks:
 
   # ------------------------------------------------------------- web (npm) ----
   deps-check:web:
-    desc: web - is node_modules stale against package.json? (npm ls --depth=0, offline)
-    dir: web
+    desc: web - is node_modules stale? (declared ranges AND resolved lockfile, offline)
     cmds:
-      # DELEGATES TO package.json's `deps-check` SCRIPT, as this file's header
-      # requires of every npm target. The script is a bare `npm ls --depth=0`, so
-      # there is nothing here for a rewrite to drop silently - but delegating anyway
-      # keeps the rule uniform, and `--depth=0` is the whole check: without it `npm
-      # ls` walks the entire tree and reports transitive noise this gate has no
-      # opinion about.
+      # A SCRIPT, NOT AN INLINE RECIPE, for `deadcode:api`'s reason: a committed
+      # script gets LINTED by `lint:shell`, an inline `cmds:` string gets nothing.
+      # It still DELEGATES to package.json's `deps-check` script for its first line,
+      # as this file's header requires of every npm target.
+      #
+      # 🔴 TWO LINES, BECAUSE THE FIRST COVERS 1 OF MR-C's 6 DEPENDENCY CHANGES.
+      # `npm ls --depth=0` compares against DECLARED RANGES, so a TRANSITIVE bump --
+      # which has no declared range at all -- is invisible to it. Measured on the
+      # stale state a real `git pull` produces: `gate:agent` was GREEN on a tree
+      # holding every one of the five vulnerable versions this MR bumps, because all
+      # five are transitive and `agent/package.json` never changed. The same blind
+      # spot hits `web` on the security-relevant package: a stale `postcss` reads
+      # 8.5.16 against a declared `^8.4.49`, satisfied, while the lockfile says
+      # 8.5.25 -- and that is the high-severity advisory fix, masked only because
+      # vitest reddens in the same run. The second line is a lockfile join. Read
+      # scripts/deps-check-gate.sh's header for why it joins on the INTERSECTION
+      # (a raw diff gives ~370 spurious rows) and why it uses `node` and not `jq`.
       #
       # NEVER A BARE `npx`: npx fetches from the network when the dep is missing,
       # which a gate may not do. There is no npx form of this anyway; the note is
       # here so a future edit does not invent one.
       #
-      # Why this target exists, why it runs FIRST, what it cannot see, and the one
-      # state in which it reports confidently wrong: see `gate:web`'s comment. It is
-      # written there rather than here because the ORDERING is the load-bearing
-      # decision and that is where a reader meets it.
-      - npm run deps-check
+      # Why this target runs FIRST, and the one state in which it reports
+      # confidently wrong, are in `gate:web`'s comment -- written there because the
+      # ORDERING is the load-bearing decision and that is where a reader meets it.
+      - ./scripts/deps-check-gate.sh web
 
   lint:web:
     desc: oxlint over web/src (correctness + react-hooks/rules-of-hooks)
@@ -1490,12 +1499,14 @@ tasks:
 
   # ----------------------------------------------------------- agent (npm) ----
   deps-check:agent:
-    desc: agent - is node_modules stale against package.json? (npm ls --depth=0, offline)
-    dir: agent
+    desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)
     cmds:
-      # Same delegation, same flag, same reasons - read deps-check:web's comment and
-      # gate:web's ordering paragraph before editing either.
-      - npm run deps-check
+      # Same script, same two lines, same reasons - read deps-check:web's comment and
+      # gate:web's ordering paragraph before editing either. THIS is the package the
+      # second line was added for: all five of MR-C's agent bumps are transitive, so
+      # the first line alone reported this package clean while node_modules held
+      # every vulnerable version.
+      - ./scripts/deps-check-gate.sh agent
 
   lint:agent:
     desc: oxlint over agent/src and agent/test (correctness tier)
