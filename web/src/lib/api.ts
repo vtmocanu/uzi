@@ -874,6 +874,14 @@ export type RunHealth =
 // problem" verdict; null means the fix is not yet verified.
 export type FixVerdict = "verified" | "fix_failed" | "not_code";
 
+// PRD #209: how a run's plan_md was produced. "agent" — the worker planned it at the
+// gate (every pre-feature run, via the server's NOT NULL DEFAULT). "seeded" — the user
+// supplied the plan at create time; the run skips planning and the approval gate. Not
+// exported: the run view keys the seeded-plan surface on a string-literal compare, so
+// nothing consumes the name yet (export it when a cross-file consumer appears — the
+// convention here, mirroring FixVerdict/AgentSource, which ARE imported elsewhere).
+type PlanSource = "agent" | "seeded";
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -928,6 +936,17 @@ export interface Run {
   pipeline_web_url: string | null;
   fix_verdict: FixVerdict | null;
   plan_md: string | null;
+  /** PRD #209: where plan_md came from — `"agent"` for a normal run whose worker wrote
+   *  the plan at the gate, `"seeded"` for a run created WITH a user-authored plan that
+   *  skips planning + the approval gate. The run view reads it to surface a seeded run's
+   *  plan (SeededPlanPanel) and to show the roster-pending state, both otherwise
+   *  unreachable because the approval UI never renders for a seeded run. Server-side the
+   *  column is `NOT NULL DEFAULT 'agent'` so the current api always sends it; OPTIONAL
+   *  here for the SAME api/web rollout skew that makes pending_judge optional — a mid-deploy
+   *  api pod that predates this field omits the key. It is only ever compared with `===`,
+   *  never dereferenced, so an absent value reads as not-seeded and the seeded surfaces
+   *  simply do not render (no `?? null` normalization needed, unlike pending_judge). */
+  plan_source?: PlanSource;
   /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +

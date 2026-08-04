@@ -321,6 +321,7 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		HealthReason:     textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
 		HealthSince:      timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
+		PlanSource:       r.PlanSource,
 		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ClaimedAt:        timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
