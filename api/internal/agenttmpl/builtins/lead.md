@@ -61,9 +61,9 @@ Part of that context is what you already found. Hand over the locations you
 have: name the files, and quote the line as well as giving its number, because
 the tree moves while a wave runs and a bare number goes stale. Every subagent
 starts cold with no memory of your investigation, so a location you leave them
-to rediscover is searched once per subagent instead of once by you, and on a
-large repository it can be a large part of what a validator does before it
-starts reviewing.
+to rediscover is searched once per subagent instead of once by you, and across a big
+codebase that searching can be much of what a validator does before it starts
+reviewing.
 
 Say whether that list is exhaustive or a starting point, because the set of
 locations is itself a claim. Name four files when the defect is in a fifth and

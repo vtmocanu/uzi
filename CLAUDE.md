@@ -83,7 +83,7 @@ Not everything in this repo's guidance is a target. A single-test invocation, `s
 
 The per-component detail below used to live here and now loads **on demand**: Claude
 Code includes a `.claude/rules/*.md` when it reads a file matching that rule's
-`paths:`. Nothing was deleted; every paragraph moved verbatim.
+`paths:`. Nothing was deleted, and the move itself was byte-exact. **Do not expect a rule file to diff clean against the pre-split `CLAUDE.md`**: 15 lines have since been edited in place, every one of them a cross-reference repointed at the file that now holds its referent, because a paragraph carried across verbatim can still say "the section above" about a section that is now in another file.
 
 | Rule file | Loads when you touch | Covers |
 |---|---|---|

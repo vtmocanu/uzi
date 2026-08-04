@@ -13,7 +13,7 @@
 // duplicate `order` among `user` pages, broken relative links (doc->doc and
 // doc->img), and any docs/img/* over the per-image byte budget.
 // Warns (does not fail): a `user` page whose body exceeds the line budget.
-import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -219,11 +219,23 @@ const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
 // are discovered recursively, so you can organize rules into subdirectories"), so a
 // flat read here would skip .claude/rules/frontend/x.md -- a file the loader DOES
 // load. That is the same shape as the bug this block exists to catch.
+// FOLLOWS SYMLINKS, because the loader does: the docs recommend
+// `ln -s ~/shared-claude-rules .claude/rules/shared` for sharing rules across
+// projects, and `Dirent.isDirectory()` is FALSE for a symlink -- so the obvious
+// walk skips exactly the shape the docs recommend, while symlinked *files* work
+// fine and make it look supported. `seen` guards the cycles that following
+// introduces (the docs promise the loader handles circular symlinks; we must too).
+const seen = new Set();
 const walkRules = (abs, rel) => {
   if (!existsSync(abs)) return;
+  const real = realpathSync(abs);
+  if (seen.has(real)) return;
+  seen.add(real);
   for (const e of readdirSync(abs, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const nextAbs = path.join(abs, e.name);
     const nextRel = path.join(rel, e.name);
-    if (e.isDirectory()) walkRules(path.join(abs, e.name), nextRel);
+    const isDir = e.isDirectory() || (e.isSymbolicLink() && existsSync(nextAbs) && statSync(nextAbs).isDirectory());
+    if (isDir) walkRules(nextAbs, nextRel);
     else if (e.name.endsWith(".md")) extraLinkFiles.push(nextRel);
   }
 };
