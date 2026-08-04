@@ -426,6 +426,62 @@ The control for the upgrade was a **predicted count written down before the run*
 a silently narrowed suite and is invisible to the exit code. Re-derive that pair at
 your own tip before quoting it; the suite grows.
 
+### Coverage: measured, printed, and deliberately not a gate
+
+`task test:api` and `task test:controller` write `coverage.out` in their module and
+print the statement total; `task test:web` runs vitest with the v8 provider and prints
+its summary block. All three are gitignored artifacts — nothing is committed.
+
+**No threshold, on purpose.** Nothing in these targets can fail because of the number.
+A threshold picked before the current value was known is either below it (vacuous) or
+above it (blocks every MR on unrelated work); the follow-up chooses one, starting with
+the security-critical packages rather than a global floor.
+
+Four things to know before you quote a figure:
+
+- **The Go totals exclude packages with no test files of their own.** Without
+  `-coverpkg`, each package is measured only by its own tests and an untested package
+  is absent from the profile rather than counted as zero, so the total is an
+  over-estimate of module-wide coverage.
+- **The single percentage GitLab shows on an MR is an unweighted mean across the three
+  jobs**, not a repo-wide number — `coverage_array.sum / coverage_array.size` in
+  GitLab's own pipeline model. It weights a 437-block module the same as an
+  11920-block one. Read the per-job numbers.
+- **`scripts/coverage-total.sh` refuses to summarise a profile that measured nothing.**
+  A run in which no test executed leaves a one-line profile, and `go tool cover -func`
+  reports `total: (statements) 0.0%` for it with rc=0 — a number that reads like
+  terrible coverage and is an absence of data. That guard is an instrument check, not a
+  threshold: it never compares the percentage to anything.
+- **The `coverage:` regexes in `.gitlab-ci.yml` cannot be anchored with `^`.** Task runs
+  with `output: prefixed`, so the totals reach the log as `[test:api] total: …`. They
+  also cannot contain a capturing group — GitLab requires all groups to be
+  non-capturing and extracts the number from the matched text itself. Both constraints
+  are counter-intuitive, both fail silently, and both are recorded with their
+  measurements in that file's `.coverage_notes`.
+
+### `web` test environments: `test.projects`, not a docblock per file
+
+DOM tests in `web/` opted into jsdom one file at a time with
+`// @vitest-environment jsdom`. A file that forgot it ran under node — usually a loud
+`ReferenceError`, but not reliably: `src/lib/prefs.ts` guards every access with
+`typeof window === "undefined"`, so a pragma-less test of it passes while touching no
+DOM at all.
+
+`web/vite.config.ts` now splits the suite into two projects: **`src/lib` and
+`src/mocks` run under node**, and **everything else under `src` runs under jsdom**,
+including any directory added later. Two consequences:
+
+- a new test under `src/components` or `src/pages` gets jsdom with no docblock;
+- a DOM test under `src/lib` or `src/mocks` still needs its docblock, because those
+  two directories hold every node-side test in the suite.
+
+**The docblock still outranks the project's `environment`** — measured on vitest 4.1.10
+with both controls, not carried over from the vitest 2 result it happens to agree with.
+That is what makes the split safe despite both node directories containing
+pragma-carrying files: 14 of them run under jsdom today and still do. The check that
+proves it is a per-file census of what all 118 files actually run under, taken before
+and after and byte-identical, rather than a count or a classification.
+
 ## Scripting the bot setup with `glab`
 
 The UI steps in [GitLab bot setup](./gitlab-bot-setup.md) have `glab`

@@ -70,8 +70,20 @@ deploy/chart/charts/*.tgz
 # Renovate
 renovate-local.log
 renovate-packages.csv
-# Coverage tests
+# Coverage (PRD #103 M6). `coverage.out` was VESTIGIAL until this milestone -- it
+# named tooling nothing produced, and the PRD's fix-the-doc list said M6 must either
+# make it real or delete it. It is real now: `task test:api` and `task
+# test:controller` write api/coverage.out and controller/coverage.out, and this
+# pattern is unanchored so it matches both.
 coverage.out
+# ...and the two artifacts derived from them, plus vitest's. The Go .xml files are
+# written beside their profiles by the cobertura conversion in the CI test jobs;
+# vitest writes web/coverage/cobertura-coverage.xml (reportsDirectory in
+# web/vite.config.ts). Nothing here is committed -- CI regenerates all of it, and
+# `scan:secrets` walks TRACKED files only, so an ignored directory is out of its
+# scope by construction.
+coverage.xml
+web/coverage/
 # dot-ai agent deck
 .dot-agent-deck/
 # ignoreme folder

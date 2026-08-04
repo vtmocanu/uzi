@@ -109,6 +109,28 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   PRD #103. Developer-facing only: no change to how uzi behaves.
   **Existing checkouts need `npm install --ignore-scripts` in `web/`.**
 
+- **Contributor tooling: test coverage is now measured for `api`, `controller`
+  and `web`, and shown on every MR.** `task test:api` and `task test:controller`
+  write a profile and print the statement total; `task test:web` runs vitest with
+  the v8 provider. GitLab reads the number off each job and the Cobertura reports
+  annotate the MR diff. **There is deliberately no failing threshold** — a number
+  picked before the current one was known is either vacuous or blocks unrelated
+  work, so this milestone measures and a later one chooses. Two things worth
+  knowing before reading the figures: the totals exclude packages with no tests of
+  their own, and the single percentage GitLab puts on an MR is an unweighted mean
+  across the three jobs rather than a repo-wide figure — read the per-job numbers.
+  Part of PRD #103. Developer-facing only: no change to how uzi behaves.
+
+- **Contributor tooling: `web` tests now get their environment from
+  `vite.config.ts` instead of relying on a per-file docblock.** A test under
+  `src/components` or `src/pages` that forgets `// @vitest-environment jsdom` used
+  to run under node, which is usually a loud error and is not reliably one. Those
+  directories now default to jsdom via `test.projects`, while `src/lib` and
+  `src/mocks` — where every node-side test in the suite lives — stay on node. The
+  docblock still wins over the config where a file carries one, measured on
+  vitest 4 rather than assumed, so no existing file changed environment: the
+  per-file census is identical before and after. Part of PRD #103.
+
 ### Fixed
 
 - **Subagents in ten of the eleven builtin agent templates now reach the team

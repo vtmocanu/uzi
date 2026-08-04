@@ -1204,7 +1204,51 @@ tasks:
       # UZI_TEST_DATABASE_URL, and go RED if you export it for this run (the
       # package binaries race one shared database). Run those via
       # `./e2e/run-store-it.sh`, which carries `-p 1` for the same reason.
-      - go test -race -count=1 ./...
+      #
+      # -coverprofile/-covermode ADDED BY PRD #103 M6, and they are the whole of the
+      # measurement: the total printed on the next line is what .gitlab-ci.yml's
+      # `coverage:` regex reads off this job. NO THRESHOLD (Decision 6) - nothing
+      # here can fail because of the number.
+      #
+      # -covermode=atomic is REDUNDANT WITH -race AND IS WRITTEN ANYWAY. `go test`
+      # forces atomic whenever -race is on, so the flag changes nothing today; it is
+      # here so that DELETING -race cannot silently downgrade the counters to `set`
+      # and move the number for a reason unrelated to the tests. Same argument as
+      # -count=1 above: a flag whose absence is invisible in the output.
+      #
+      # 🔴 WHAT THIS NUMBER EXCLUDES, because whoever sets a threshold later needs
+      # it: without -coverpkg, each package is measured only by its OWN tests, and a
+      # package with no test files at all is absent from the profile rather than
+      # counted as 0%. The total is therefore an over-estimate of module-wide
+      # coverage. -coverpkg=./... would fix that and re-instruments every package on
+      # every run; that trade is a threshold-time decision, not a measurement-time one.
+      - go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      # A script, not `go tool cover ... | tail -1`: the pipe would put the verdict on
+      # `tail`, and it guards against summarising a profile that measured nothing.
+      - sh ../scripts/coverage-total.sh coverage.out
+
+  coverage-xml:api:
+    desc: api - Cobertura XML from coverage.out (run test:api first; used by CI only)
+    dir: api
+    cmds:
+      # 🔴 NOT A GATE AND NOT IN `task gate`. It converts an artifact for GitLab's MR
+      # diff annotations; there is no MR diff locally, so nothing here can fail a
+      # local run and nothing depends on its output. It is a Taskfile target rather
+      # than a `script:` line in .gitlab-ci.yml only so the pinned tool version lives
+      # in one file instead of two.
+      #
+      # NO `deps: [test:api]`. CI runs test:api and then this, and a dependency would
+      # run the whole -race suite a second time. If coverage.out is absent the
+      # redirect fails and the target reddens, which is the wanted behaviour: an
+      # empty XML is worse than a missing one.
+      #
+      # -by-files makes each <class> a FILE, so the report carries `filename=` paths
+      # GitLab can match against the diff. Those paths are MODULE-relative
+      # (`internal/store/x.go`) with the module root in <source> -- GitLab's
+      # documented class-path correction is what turns that into `api/internal/...`.
+      # Verified locally only as far as the XML's own shape; the annotation itself
+      # needs a pipeline, and is called out as unverified in the MR.
+      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------ controller (Go) -----
   fmt-check:controller:
@@ -1333,7 +1377,19 @@ tasks:
       # nothing about a red there. If this reddens in CI, the finding is a real
       # race in the controller: file it as its own issue rather than deleting the
       # flag, which is PRD #103 Decision 3's branch.
-      - go test -race -count=1 ./...
+      #
+      # -coverprofile/-covermode, PRD #103 M6: read test:api's comment for what the
+      # number excludes and why -covermode=atomic is written next to -race even
+      # though -race already forces it. Same recipe, same reasons, one module over.
+      - go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - sh ../scripts/coverage-total.sh coverage.out
+
+  coverage-xml:controller:
+    desc: controller - Cobertura XML from coverage.out (run test:controller first; CI only)
+    dir: controller
+    cmds:
+      # Same recipe, same reasons, one module over - read coverage-xml:api's comment.
+      - go run github.com/boumenot/gocover-cobertura@v1.4.0 -by-files < coverage.out > coverage.xml
 
   # ------------------------------------------------------------- web (npm) ----
   deps-check:web:

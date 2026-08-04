@@ -1,4 +1,8 @@
 import { defineConfig } from "vite";
+// configDefaults.exclude, so the `jsdom` project below can add ONE exclusion without
+// silently dropping vitest's own (node_modules, dist, the *.config.* family). Setting
+// `exclude` REPLACES the default list rather than extending it.
+import { configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // In production the SPA is served by nginx, which also proxies /api to the API
@@ -103,6 +107,110 @@ export default defineConfig({
     // Raises Testing Library's own 1s async default too — a SEPARATE knob from testTimeout,
     // and the one the Repos/Agents failures were hitting. See src/test-setup.ts.
     setupFiles: ["./src/test-setup.ts"],
+
+    // PRD #103 M6. `provider` is declared rather than left to the default for a
+    // reason that is not about coverage at all: M4's `task deadcode:web` runs knip
+    // with `"devDependencies": "error"`, a GATING tier, and a devDependency that
+    // nothing references is a finding. Measured three-arm control, restored and
+    // `git status`-verified — baseline rc=0; `@vitest/coverage-v8` added with no
+    // coverage config rc=1 naming `Unused devDependencies (1) @vitest/coverage-v8
+    // package.json:39:6`; this block added rc=0 with zero mentions. The alternative
+    // was an `ignoreDependencies` entry in knip.jsonc, and it is the wrong fix:
+    // declaring the provider makes knip's finding genuinely FALSE, where the ignore
+    // would silence a TRUE one.
+    //
+    // `reporter` is explicit because the DEFAULT WRITES HTML into web/coverage/ —
+    // a directory of thousands of files that nobody reads and .gitignore now covers.
+    // `text-summary` prints the totals block the GitLab `coverage:` regex in
+    // .gitlab-ci.yml reads; `cobertura` is the artifact that annotates the MR diff.
+    // NO THRESHOLD (PRD #103 Decision 6): this milestone measures, and a threshold
+    // chosen before the number is known is either vacuous or blocks unrelated work.
+    coverage: {
+      provider: "v8",
+      reporter: ["text-summary", "cobertura"],
+      reportsDirectory: "./coverage",
+    },
+
+    // 🔴 THE jsdom SPLIT (PRD #103 M6). Read the measurement before editing the
+    // globs, because the obvious edit is the one that breaks it.
+    //
+    // WHAT WAS WRONG. Every DOM test opts in per-file with a
+    // `// @vitest-environment jsdom` docblock. Measured at 98c99d76: 118 test files
+    // under web/src, 76 carrying the pragma, 42 not — and there is no `environment`
+    // in this block, so those 42 ran under node. A new test under src/components or
+    // src/pages that forgets the pragma therefore runs a DOM test under node, which
+    // is usually a loud ReferenceError and is NOT reliably one: src/lib/prefs.ts
+    // guards every access with `typeof window === "undefined"`, so a pragma-less
+    // test of it passes 2/2 under node while touching no DOM at all.
+    //
+    // WHY NOT JUST SET environment: "jsdom" HERE. That moves all 42 from node to
+    // jsdom — the same silent-wrong-environment bug pointing the other way, which
+    // the PRD warns about by name. All 42 are node-side: zero are .tsx and zero
+    // import @testing-library/react.
+    //
+    // WHY THE DIRECTORIES AND NOT THE PRAGMA SET. src/lib (42 files, 6 with the
+    // pragma) and src/mocks (14 files, 8 with the pragma) are MIXED, so a
+    // directory-keyed split assigns 14 files that run under jsdom today to the node
+    // project. That is only safe because of a measurement, not because of a reading:
+    //
+    //   vitest 4.1.10, four cells, both controls behaving
+    //   (probes/prd-103-mrc-m6-coder/b2-vitest4-projects-precedence.{sh,txt}):
+    //     projects env=node  + pragma      typeof document = object     <- PRAGMA WINS
+    //     projects env=node  + no pragma   typeof document = undefined  <- control
+    //     projects env=jsdom + pragma      typeof document = object
+    //     projects env=jsdom + no pragma   typeof document = object     <- control
+    //
+    // => the docblock pragma OUTRANKS a project's `environment` on vitest 4, exactly
+    // as it outranked `environmentMatchGlobs` on 2.1.9. The 76 are frozen by their
+    // own pragmas; only the 42 are movable by anything in this file. That is what
+    // makes the mixed directories harmless HERE — and it is also why this split
+    // cannot be verified by reading it.
+    //
+    // THE ACCEPTANCE CRITERION WAS A PER-FILE CENSUS, NOT A COUNT. All 118 files
+    // were enumerated by the environment they ACTUALLY RUN UNDER, before and after,
+    // and the two are byte-identical — 76 jsdom, 42 node, same files
+    // (probes/prd-103-mrc-m6-coder/b4-census-{before,after}.txt). A wrong partition
+    // shows up as a changed line and a file that stopped running shows up as a
+    // missing one, so being right about precedence was not required.
+    //
+    // WHAT IT BUYS, STATED NARROWLY. A new pragma-less test under src/components or
+    // src/pages now gets jsdom instead of node. Under src/lib and src/mocks it still
+    // gets node and a DOM test there still needs its pragma — those two directories
+    // hold every node-side test in the suite, so the alternative was to give up the
+    // fix for the other 62 files. It does NOT retire the pragmas; per the table
+    // above they outrank this config and remain the per-file authority.
+    //
+    // 🔴 `extends: true` IS LOAD-BEARING: a project inherits NOTHING from this block
+    // without it, and the two things it inherits here are `testTimeout: 20000` and
+    // `setupFiles` — a suite-wide timeout and Testing Library's 5s asyncUtilTimeout,
+    // both of which this file's own comment above says must be re-asserted rather
+    // than trusted. Both were re-asserted under the projects config by the
+    // assert-the-wrong-value technique, NOT by a passing suite:
+    // probes/prd-103-mrc-m6-coder/b6-projects-inherit.txt.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "jsdom",
+          environment: "jsdom",
+          // Deliberately the WHOLE of src minus the two node directories, rather
+          // than a list of the three DOM ones. A new top-level directory under src/
+          // must default INTO this project; enumerating src/components and
+          // src/pages would leave its tests collected by no project at all, and a
+          // suite that silently stops running a directory is green.
+          include: ["src/**/*.test.{ts,tsx}"],
+          exclude: [...configDefaults.exclude, "src/lib/**", "src/mocks/**"],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "node",
+          environment: "node",
+          include: ["src/lib/**/*.test.{ts,tsx}", "src/mocks/**/*.test.{ts,tsx}"],
+        },
+      },
+    ],
   },
   server: {
     // The docs viewer raw-imports repo-root `docs/*.md` (a sibling of `web/`),

@@ -10,7 +10,7 @@
     "knip": "knip",
     "build": "npm run check-docs && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "preview": "vite preview",
     "deps-check": "npm ls --depth=0",
     "audit": "npm audit --audit-level=high --include=dev"
@@ -29,6 +29,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "4.1.10",
     "autoprefixer": "^10.4.20",
     "jsdom": "^25.0.1",
     "knip": "6.31.0",
