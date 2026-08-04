@@ -2778,3 +2778,20 @@ the coder's next commit, not retroactively to these.
 | a rendered-Deployment assertion that `strategy.type == "Recreate"` | A29.1 (lead decision) |
 | net 2 names **both** Go tests | A30.2 |
 | the `limitRange.enabled: false` sub-case, and the GitOps framing for the out-of-band one | A30.3 / A30.4 |
+
+### A31 — 2026-08-04, refinement to the `strategy.type` assertion: PUT THE WHY IN THE FAILURE MESSAGE
+
+**The assertion A29.1 mandates must carry its own reason in the failure text, not just the pin.** A
+bare `strategy.type must be Recreate` **reads as arbitrary to the only person who will ever hit it**
+— someone deliberately adding HA — and that person has a reason to change it and **no way to see the
+coupling.** The message must say that `Recreate` is what makes a failed `ValidatePVCCeilings`
+**fail-STOPPED rather than fail-stale**, and that under `RollingUpdate` the old controller **outlives
+the new one's CrashLoopBackOff and keeps provisioning against a ceiling it was never told about.**
+
+**Otherwise the assertion gets deleted by exactly the change it exists to stop — which is how the
+comment failed.** That is the whole finding: A29.1 replaces a comment that was ignored because it
+disclaimed its own importance, and a test that does not explain itself is the same defect wearing a
+different hat. **A guard has to survive the person with a reason to remove it**, and the only thing
+that reaches that person is the text they see at the moment they are blocked.
+
+Queued with the rest; it modifies A30.6's fourth row rather than adding an item.
