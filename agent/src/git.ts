@@ -125,6 +125,20 @@ function runnerTrackingRef(branch: string): string {
   return `${RUNNER_TRACKING_PREFIX}${branch}`;
 }
 
+// PRD #218 — the run-identity ANCHOR for a tracking ref. `refs/uzi-runner/<branch>` is
+// per-BRANCH and nothing ever deletes it, so on its own it cannot tell "the run that
+// wrote this parked its own work" from "a DIFFERENT, permanently-dead run left an orphan
+// on the same issue" — the auditor's counterexample (run A parks and dies; a fresh run B
+// on the same issue is later killed mid-turn and requeued, and would seed off A's commits
+// while claiming to have recovered its own). So alongside the ref we stamp the writing
+// run's id into the worker bare's own config, and the reseed reads the tracking ref back
+// ONLY when the stamp matches the claiming run. This is a worker-owned `config --local`
+// write, the same posture as disableAutoMaintenance — no new trust boundary. The key is
+// dot/slash-free so the dotted git-config name parses (`git config uzi-trackowner.<x>`).
+function runnerTrackingOwnerKey(branch: string): string {
+  return `uzi-trackowner.${branch.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
 export interface RunnerClone {
   /** Absolute path to the runner clone's working tree (the ONLY working tree under
    *  (b) — the worker is bare-only). The agent checks out + commits here. */
@@ -316,8 +330,8 @@ export class GitCache {
    * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
    * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachRunnerClone(barePath: string, issueIid: number, resume = false): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, resume);
+  async createOrAttachRunnerClone(barePath: string, issueIid: number, runId?: string): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId);
   }
 
   /**
@@ -329,25 +343,28 @@ export class GitCache {
    * per-run clone dir means a stale dir is simply removed and recloned.
    *
    * Base resolution (PRD #218 M2). Three candidates: `refs/remotes/origin/<branch>`
-   * (pushed work), the worker-side tracking ref `refs/uzi-runner/<branch>` (the
-   * interrupted attempt's fetched-back work), and the default branch.
-   *   - `resume` FALSE (a fresh claim): unchanged and the tracking ref is IGNORED
-   *     entirely — origin/<branch> if it exists, else the default. A fresh run must
-   *     never inherit a stale tracking ref a permanently-dead run left behind (that
-   *     would reintroduce issue #105's silent redo through this very fix), so the
-   *     WHOLE tracking-ref consideration is gated on the claim being a resume.
-   *   - `resume` TRUE, origin AND tracking both exist: the tracking ref ONLY when
+   * (pushed work), the worker-side tracking ref `refs/uzi-runner/<branch>` (an
+   * interrupted attempt's fetched-back work), and the default branch. The tracking ref
+   * is consulted ONLY when it is OWNED BY THIS RUN — its stamp (see
+   * runnerTrackingOwnerKey) equals `runId`. That anchor is what stops a fresh run, or a
+   * different run on the same issue, from inheriting a dead run's orphan ref (it would
+   * reintroduce issue #105's silent redo through this very fix). `ownedHere` gates the
+   * WHOLE tracking-ref consideration:
+   *   - NOT owned here (a fresh run, a stale ref from another run, or `runId` undefined):
+   *     the tracking ref is IGNORED entirely — origin/<branch> if it exists, else the
+   *     default. This is today's pre-#218 behaviour.
+   *   - owned here, origin AND tracking both exist: the tracking ref ONLY when
    *     `merge-base --is-ancestor origin <tracking>` holds (it strictly descends from
    *     origin); on divergence, origin — another worker pushed and silently preferring
    *     local work would drop a published commit.
-   *   - `resume` TRUE, tracking exists but no origin branch (the first-park case): the
+   *   - owned here, tracking exists but no origin branch (the first-park case): the
    *     tracking ref, with NO ancestry test — there is no competing published work to
    *     protect and the current default tip is not a meaningful reference (it may have
    *     moved far past the fork point, which is exactly the case a uniform ancestor
    *     test discards the recovered work on).
-   *   - otherwise: origin/<branch> if it exists, else the default.
-   * The git layer is claim-agnostic: `resume` is a plain boolean the runner threads
-   * from `claim.session_id != null`; nothing here knows about sessions.
+   * The git layer is claim-agnostic: `runId` is a plain string the runner threads from
+   * `claim.run_id`; nothing here knows about sessions. `runId` undefined ⇒ never owned ⇒
+   * today's behaviour, which keeps the no-runId test call sites compiling.
    *
    * The seed is a LOCAL `clone --shared` from the worker bare: fast (objects are
    * referenced read-only from the bare via the clone's objects/info/alternates — the
@@ -357,7 +374,7 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    */
-  async runnerCloneForBranch(barePath: string, branch: string, key: string, resume = false): Promise<RunnerClone> {
+  async runnerCloneForBranch(barePath: string, branch: string, key: string, runId?: string): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
@@ -375,19 +392,23 @@ export class GitCache {
       const originRef = `refs/remotes/origin/${branch}`;
       const trackingRef = runnerTrackingRef(branch);
       const originExists = await this.refExists(barePath, originRef);
-      // The tracking ref is consulted ONLY on a resume (gating the whole consideration —
-      // see the doc comment for why a fresh claim must ignore it).
-      const trackingExists = resume && (await this.refExists(barePath, trackingRef));
+      // The tracking ref is consulted ONLY when its stamp says THIS run wrote it — the
+      // run-identity anchor that gates the whole consideration (see the doc comment).
+      const trackingExists = await this.refExists(barePath, trackingRef);
+      const owner = trackingExists
+        ? await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)])
+        : "";
+      const ownedHere = trackingExists && runId !== undefined && owner === runId;
 
       let baseRef: string;
       let seededFrom: RunnerClone["seededFrom"];
-      if (trackingExists && originExists) {
+      if (ownedHere && originExists) {
         // Both present: prefer the recovered local work ONLY when it strictly descends
         // from origin; on divergence origin wins so a published commit is never dropped.
         const descends = await this.isAncestor(barePath, originRef, trackingRef);
         baseRef = descends ? trackingRef : originRef;
         seededFrom = descends ? "tracking" : "origin";
-      } else if (trackingExists) {
+      } else if (ownedHere) {
         // First park: recovered work with no competing published branch — no ancestry
         // test, because the current default tip is not a meaningful reference here.
         baseRef = trackingRef;
@@ -539,7 +560,7 @@ export class GitCache {
    * clone (objects-integrity win). Returns the worker-side tracking ref pushBranch/
    * changedFiles then read.
    */
-  async fetchAgentBranch(barePath: string, clonePath: string, branch: string): Promise<string> {
+  async fetchAgentBranch(barePath: string, clonePath: string, branch: string, runId: string): Promise<string> {
     const dst = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
       await this.runGit(barePath, [
@@ -547,6 +568,11 @@ export class GitCache {
         "fetch", "--no-tags", `file://${clonePath}`,
         `+refs/heads/${branch}:${dst}`,
       ]);
+      // PRD #218: stamp the run that owns this ref, under the SAME lock as the ref write
+      // so the two are always consistent. The reseed (runnerCloneForBranch) reads it back
+      // and takes the tracking ref only when this run wrote it — the anchor that stops a
+      // different run on the same issue from inheriting orphaned work.
+      await this.runGit(barePath, ["config", "--local", runnerTrackingOwnerKey(branch), runId]);
     });
     return dst;
   }

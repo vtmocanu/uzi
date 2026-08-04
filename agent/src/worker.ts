@@ -128,9 +128,12 @@ export class Worker {
    * free, so the worker never manufactures a claimed-but-waiting run and
    * `SweepClaimedNeverStarted` semantics are untouched (Decision 8; no new claim
    * SQL). At the default cap of 1 this is the pre-#42 serial loop at the observable
-   * level. Mirrors chatClaimLoop's tracked-promise pool (the RUN lane has no
-   * per-execution signal — a run drives its own cancel via steering, so shutdown
-   * drains rather than aborts; see below).
+   * level. Mirrors chatClaimLoop's tracked-promise pool. The RUN lane takes no
+   * per-execution signal here, but shutdown is ABORT-THEN-DRAIN, not drain-only
+   * (PRD #218): `Runner.shutdown()` (from main.ts's SIGTERM handler) aborts each
+   * in-flight run's own cancel controller so it unwinds and fetches its committed work
+   * back into the worker bare, and the `Promise.allSettled` drain below then awaits
+   * those unwinding executes; see below.
    */
   private async claimLoop(signal: AbortSignal): Promise<void> {
     const cap = this.config.maxConcurrentRuns;
@@ -175,10 +178,14 @@ export class Worker {
       // cap). Otherwise wait a poll before asking again.
       if (!claimed) await sleep(this.config.pollIntervalMs, signal);
     }
-    // On shutdown, drain every in-flight run (mirrors chatClaimLoop's drain). A run
-    // carries no shutdown signal — it runs to its terminal state; the container's
-    // SIGKILL grace is the hard backstop and the sweeper requeues anything the kill
-    // interrupts, so a stuck run can't wedge shutdown past the grace window.
+    // On shutdown, drain every in-flight run (mirrors chatClaimLoop's drain). Post-#218
+    // shutdown is abort-then-drain: `Runner.shutdown()` (main.ts SIGTERM handler) has
+    // already aborted each run's cancel controller, so each run unwinds — reaping its
+    // agent tree, then fetching its committed work back into the worker bare — and is
+    // left NON-terminal for the sweeper to requeue onto the recovered tree. This drain
+    // awaits those unwinding fetch-backs, and process exit is gated on `worker.run`, so
+    // they complete inside the container's termination grace. The SIGKILL grace is the
+    // hard backstop: a stuck run can't wedge shutdown past the grace window.
     //
     // The Set is passed directly rather than spread (PRD #103 M3, oxlint
     // unicorn/no-useless-spread). Equivalent, not merely tidier: Promise.allSettled

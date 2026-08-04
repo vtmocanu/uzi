@@ -457,13 +457,16 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-resume-"));
     try {
       const iid = 202;
-      // 1) First attempt: commit + park (writes the tracking ref).
+      // A resume keeps the SAME run_id (a requeue re-claims the same run row), so both
+      // claims carry it — that identity is what the tracking-ref owner stamp matches on.
+      const runId = "20200000-0000-4000-8000-000000000202";
+      // 1) First attempt: commit + park (writes the tracking ref, stamped with runId).
       const { factory: parkFactory, sha } = commitThenParkFactory(
         homeRoot,
         "WORK.txt",
       );
       await runnerWith(parkFactory, gitlab).execute(
-        gitlabClaim(iid, { wait_on_limit: true }),
+        gitlabClaim(iid, { run_id: runId, wait_on_limit: true }),
       );
 
       // 2) Resume (a claim with a session id): the reseed must read the tracking ref
@@ -483,8 +486,13 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
         },
       });
       const resumeClaim = gitlabClaim(iid, {
+        run_id: runId,
         wait_on_limit: true,
         session_id: SID,
+        // A real resume carries the last seq the run reached before parking; without it
+        // the resume's feed seqs would collide with the park run's (same run_id) and the
+        // server dedups them, hiding the recovered-count status this test asserts on.
+        last_seq: 1000,
       });
       await runnerWith(resumeFactory, gitlab).execute(resumeClaim);
 
@@ -558,21 +566,91 @@ describe("RunRunner — durable park (PRD #218 M1/M2/M3)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  it("M2/anchor: a DIFFERENT run on the same issue does NOT inherit a dead run's orphan ref (auditor counterexample)", async () => {
+    // Run A parks and dies, leaving refs/uzi-runner/agent/issue-<iid> stamped with A.
+    // Run B is a fresh run on the SAME issue that was killed mid-turn before it could
+    // fetch its own work back, then requeued and resumed. Without the run-identity
+    // anchor B would seed off A's commits and falsely claim to have recovered its own
+    // work. With it, B (a different run_id) does not own A's ref and seeds off default.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-anchor-"));
+    try {
+      const iid = 250;
+      const runA = "25000000-0000-4000-8000-0000000250aa";
+      const runB = "25000000-0000-4000-8000-0000000250bb";
+      // A: commit + park → tracking ref owned by A.
+      const { factory: parkA, sha: shaA } = commitThenParkFactory(homeRoot, "A.txt");
+      await runnerWith(parkA, gitlab).execute(
+        gitlabClaim(iid, { run_id: runA, wait_on_limit: true }),
+      );
+      assert.strictEqual(
+        shaInBare(git.barePathFor(fx.originPath), trackingRef(iid)),
+        shaA(),
+        "precondition: A's work is in the tracking ref",
+      );
+
+      // B: a resume claim on the same issue, DIFFERENT run_id, which never fetched its
+      // own work back.
+      let sawA = true;
+      let priorWork: unknown;
+      const bFactory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            sawA = fs.existsSync(path.join(ctx.worktreePath, "A.txt"));
+            priorWork = ctx.priorWork;
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      const claimB = gitlabClaim(iid, {
+        run_id: runB,
+        wait_on_limit: true,
+        session_id: SID,
+      });
+      await runnerWith(bFactory, gitlab).execute(claimB);
+      assert.strictEqual(
+        sawA,
+        false,
+        "B must NOT inherit A's commits — the ref is anchored to A",
+      );
+      assert.strictEqual(priorWork, undefined, "and B is told of no recovery");
+      const texts = api
+        .messages(claimB.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      assert.strictEqual(
+        texts.some((t) => /recovered \d+ commit/.test(t)),
+        false,
+        "B must NOT falsely claim to have recovered A's work",
+      );
+      assert.ok(
+        texts.some((t) => /no earlier work could be recovered/.test(t)),
+        "B honestly reports its own tree could not be recovered",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── PRD #218 M2 — the reseed's per-leg base resolution (git level) ────────────
 //
 // The two legs a UNIFORM ancestor test gets wrong are the point: a first park with a
 // MOVED default (tracking must win) and a pushed branch that DIVERGED (origin must
-// win). Driven at the git layer, where the resolution lives, with `resume` as the
-// plain boolean the runner threads from `claim.session_id != null`.
+// win). Driven at the git layer, where the resolution lives, with `runId` as the
+// run-identity anchor the runner threads from `claim.run_id`. `fetchAgentBranch` stamps
+// the writing run's id, so passing the SAME id to the reseed makes the ref "owned here".
 describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", () => {
+  const RUN = "run-owner-aaaa-bbbb-cccc-dddddddddddd";
+
   it("first park + MOVED default branch: the tracking ref wins, with no ancestry test", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Commit locally off the fork point and fetch it back (a first park — never pushed).
-    const rc = await git.createOrAttachRunnerClone(bare, 210);
+    const rc = await git.createOrAttachRunnerClone(bare, 210, RUN);
     const local = commitInTree(rc.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-210");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-210", RUN);
     await git.removeRunnerClone(rc.path);
 
     // The default branch moves PAST the fork point, then the bare is refreshed.
@@ -583,7 +661,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-210",
       "issue-210",
-      /* resume */ true,
+      RUN,
     );
     assert.strictEqual(resumed.seededFrom, "tracking");
     assert.strictEqual(
@@ -608,18 +686,21 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
 
   it("resume with a pushed branch that DIVERGED: origin wins (never drop a published commit)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    // Push O1 to origin's agent/issue-211.
-    const first = await git.createOrAttachRunnerClone(bare, 211);
+    // Push O1 to origin's agent/issue-211 (this fetch-back stamps the owner = RUN).
+    const first = await git.createOrAttachRunnerClone(bare, 211, RUN);
     const o1 = commitInTree(first.path, "ORIGIN.txt", "origin\n");
-    await git.fetchAgentBranch(bare, first.path, "agent/issue-211");
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-211", RUN);
     await git.pushBranch(bare, "agent/issue-211", "", fx.originPath);
     await git.removeRunnerClone(first.path);
     await git.ensureClone(fx.originPath); // learn origin/agent/issue-211 = O1
 
-    // A DIVERGED tracking ref: a commit off main that is NOT a descendant of O1.
-    const tmp = await git.createOrAttachRunnerClone(bare, 2110);
+    // A DIVERGED tracking ref: a commit off main that is NOT a descendant of O1. Bring
+    // l1 into the bare via a throwaway branch, then repoint issue-211's ref at it; the
+    // owner stamp for issue-211 stays RUN (a different branch's fetch-back does not touch
+    // it), so RUN still owns the (now diverged) ref.
+    const tmp = await git.createOrAttachRunnerClone(bare, 2110, "run-tmp");
     const l1 = commitInTree(tmp.path, "LOCAL.txt", "local\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110");
+    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-2110", "run-tmp");
     await git.removeRunnerClone(tmp.path);
     gitUpdateRef(bare, trackingRef(211), l1);
 
@@ -627,7 +708,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-211",
       "issue-211",
-      true,
+      RUN,
     );
     assert.strictEqual(resumed.seededFrom, "origin");
     assert.strictEqual(
@@ -639,13 +720,13 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
 
   it("resume where the tracking ref DESCENDS from origin: tracking wins and the base moves past origin (Success Criterion 4)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 212);
+    const rc = await git.createOrAttachRunnerClone(bare, 212, RUN);
     const o1 = commitInTree(rc.path, "O.txt", "o\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
     await git.pushBranch(bare, "agent/issue-212", "", fx.originPath);
     // Build ON TOP of the pushed tip (descends), fetch that back — do NOT push it.
     const l1 = commitInTree(rc.path, "L.txt", "l\n");
-    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212");
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-212", RUN);
     await git.removeRunnerClone(rc.path);
     await git.ensureClone(fx.originPath); // origin/agent/issue-212 stays at O1
 
@@ -653,7 +734,7 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
       bare,
       "agent/issue-212",
       "issue-212",
-      true,
+      RUN,
     );
     assert.strictEqual(resumed.seededFrom, "tracking");
     assert.strictEqual(
@@ -669,28 +750,38 @@ describe("GitCache.runnerCloneForBranch — tracking-ref reseed (PRD #218 M2)", 
     assert.strictEqual(fs.existsSync(path.join(resumed.path, "L.txt")), true);
   });
 
-  it("a FRESH claim (resume=false) IGNORES a stale tracking ref (issue #105 reintroduction guard)", async () => {
+  it("a DIFFERENT run does NOT own a stale tracking ref, so the reseed ignores it (issue #105 reintroduction guard)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    // A tracking ref a permanently-dead run left behind, no origin branch.
-    const tmp = await git.createOrAttachRunnerClone(bare, 213);
+    // A tracking ref a permanently-dead run (run-dead) left behind, no origin branch.
+    const tmp = await git.createOrAttachRunnerClone(bare, 213, "run-dead");
     commitInTree(tmp.path, "STALE.txt", "stale\n");
-    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213");
+    await git.fetchAgentBranch(bare, tmp.path, "agent/issue-213", "run-dead");
     await git.removeRunnerClone(tmp.path);
     assert.ok(shaInBare(bare, trackingRef(213)), "precondition: the stale ref exists");
 
+    // A different run (run-fresh) reseeds the same branch — it does not own the ref.
     const fresh = await git.runnerCloneForBranch(
       bare,
       "agent/issue-213",
       "issue-213",
-      /* resume */ false,
+      "run-fresh",
     );
     assert.strictEqual(
       fresh.seededFrom,
       "default",
-      "a fresh claim must never inherit a dead run's tracking ref",
+      "a run that did not write the ref must never inherit it",
     );
     assert.strictEqual(fresh.baseCommit, originHead());
     assert.strictEqual(fs.existsSync(path.join(fresh.path, "STALE.txt")), false);
+
+    // And a no-runId call (the pre-#218 createOrAttachRunnerClone test call sites) also
+    // ignores the ref — undefined never owns.
+    const noOwner = await git.runnerCloneForBranch(
+      bare,
+      "agent/issue-213",
+      "issue-213",
+    );
+    assert.strictEqual(noOwner.seededFrom, "default");
   });
 });
 

@@ -359,35 +359,34 @@ export class RunRunner {
       });
 
       // PRD #218 M3: say what a resume recovered, in a WORKER status rather than by the
-      // lead noticing the tree changed under it. Only meaningful on a resume (the fresh
-      // path never consults the tracking ref); `claim.session_id != null` is the same
-      // signal M2's reseed gates on. Two honest outcomes:
-      //   - the tracking-ref leg fired with commits ahead of default → name the count of
-      //     work recovered from the interrupted attempt;
-      //   - a resume fell all the way back to the default branch → neither an origin
-      //     branch nor a tracking ref was here (a cross-worker resume, R1), so the tree
-      //     is genuinely lost. Admit it; the session may still resume with full context
-      //     (a separate signal above), and this keeps the TREE honest too.
-      if (claim.session_id != null) {
-        if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text: `recovered ${runnerClone.priorCommits} commit(s) of work from the interrupted session`,
-            },
-          });
-        } else if (runnerClone.seededFrom === "default") {
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: {
-              text:
-                "no earlier work could be recovered for this run on this worker — " +
-                "starting from the default branch, so some work may be repeated",
-            },
-          });
-        }
+      // lead noticing the tree changed under it. Two honest outcomes:
+      //   - the tracking-ref leg fired with commits ahead of default. That leg is reached
+      //     ONLY when the ref's owner stamp matches THIS run (M2), so the work provably
+      //     belongs to this run's own interrupted attempt — the message says so without
+      //     hedging about "an earlier run".
+      //   - a RESUME (session id present) fell all the way back to the default branch:
+      //     no origin branch and no tracking ref THIS run owns was here — a cross-worker
+      //     resume (R1) or a ref that belongs to a different run. The tree is lost for
+      //     this run; admit it (the session may still resume with full context, a
+      //     separate signal above — this keeps the TREE honest too).
+      if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
+          },
+        });
+      } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "no earlier work could be recovered for this run on this worker — " +
+              "starting from the default branch, so some work may be repeated",
+          },
+        });
       }
 
       // Resume preflight (issue #105). The claim carries the session id the run last
@@ -634,6 +633,7 @@ export class RunRunner {
         barePath,
         runnerClone.path,
         result.branch,
+        runId,
       );
 
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
@@ -791,7 +791,11 @@ export class RunRunner {
         // existed to fetch from. Best-effort: a park that fails is worse than a park
         // that loses work (D4), so a failed fetch-back must not undo the park.
         if (parked && barePath && worktreePath && branch) {
-          await this.fetchBackBestEffort(barePath, worktreePath, branch, runLog);
+          // Belt-and-braces reap before we read the runner-owned clone, matching the
+          // done path and the shutdown branch — safe today (the executor's run() finally
+          // reaps first) but kept consistent across all three fetch-back sites.
+          executor.killAgentTree?.();
+          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
         }
       } else if (active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
@@ -803,7 +807,7 @@ export class RunRunner {
         // security boundary before we read the runner-owned clone.
         executor.killAgentTree?.();
         if (barePath && worktreePath && branch) {
-          await this.fetchBackBestEffort(barePath, worktreePath, branch, runLog);
+          await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
         }
         runLog.info("run interrupted by worker shutdown; leaving it for requeue");
         await batcher.close().catch(() => undefined);
@@ -978,9 +982,10 @@ export class RunRunner {
     barePath: string,
     worktreePath: string,
     branch: string,
+    runId: string,
     runLog: Logger,
   ): Promise<void> {
-    await this.git.fetchAgentBranch(barePath, worktreePath, branch).catch((e) =>
+    await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId).catch((e) =>
       runLog.warn("fetch-back on interruption failed; work may not be recoverable", {
         error: errMessage(e),
       }),
@@ -1178,10 +1183,12 @@ export class RunRunner {
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
   private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
-    // PRD #218 M2: a resume is a claim that carries a session id. The git layer stays
-    // claim-agnostic — it takes this plain boolean and consults the tracking ref only
-    // when it is true, so a fresh claim can never inherit a dead run's stale ref.
-    const resume = claim.session_id != null;
+    // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
+    // stays claim-agnostic — it consults the tracking ref only when its stamp matches
+    // this run id, so neither a fresh run nor a different run on the same issue can
+    // inherit a dead run's orphan ref. A requeue/resume keeps the same run_id, so a run
+    // resuming its OWN parked work matches; every other run does not.
+    const runId = claim.run_id;
     if (claim.kind === "ci_fix" && claim.pipeline) {
       const defaultBranch = claim.repo.default_branch?.trim();
       const fixBranch =
@@ -1192,7 +1199,7 @@ export class RunRunner {
         barePath,
         fixBranch,
         fixBranch.replace(/\//g, "-"),
-        resume,
+        runId,
       );
     }
     if (claim.kind === "self_improve") {
@@ -1203,12 +1210,12 @@ export class RunRunner {
         barePath,
         SELF_IMPROVE_BRANCH,
         SELF_IMPROVE_BRANCH.replace(/\//g, "-"),
-        resume,
+        runId,
       );
     }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, resume);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
