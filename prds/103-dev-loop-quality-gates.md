@@ -2031,11 +2031,38 @@ which previously prescribed only the fail-open form.
       Prefer an explicit per-directory project config over flipping the
       global default — a blanket default flips the remaining non-pragma files
       from node to jsdom, which is the same class of silent-wrong-environment
-      bug in the opposite direction. (`environmentMatchGlobs` does the same job
-      and works on the pinned `vitest ^2.1.9`, but it is deprecated from
-      Vitest 3 in favour of the projects/workspace config, so it buys a
-      migration later.) Removes the
+      bug in the opposite direction. Removes the
       vestigial `coverage.out` line from `.gitignore` or makes it real.
+
+      > **🔴 CORRECTED 2026-08-04, and BOTH HALVES of what stood here were false
+      > by the time M6 started.** This paragraph ended with a parenthetical
+      > recommending `environmentMatchGlobs` because it *"does the same job and
+      > works on the pinned `vitest ^2.1.9`, but it is deprecated from Vitest 3
+      > … so it buys a migration later."* M5's MR-C took `web` to an **exact
+      > `4.1.10`** pin, so neither clause survives: the pin is not `^2.1.9`, and
+      > the option is not deprecated in 4.1.10 — it is **absent**. Settled
+      > against three package tarballs rather than doc prose: 2.1.9 implements it
+      > with no `@deprecated` tag; 3.0.0 has it with a `@deprecated` JSDoc *and* a
+      > runtime `logger.warn`; **4.1.10 has zero occurrences of it in the entire
+      > package.**
+      >
+      > **The route is `test.projects`, and `test.workspace` is not an
+      > alternative** — it was removed in Vitest 4 and throws *"The
+      > `test.workspace` option was removed in Vitest 4. Please, migrate to
+      > `test.projects` instead."* That one fails loud, so it is a spec-precision
+      > fix rather than a live hazard; `environmentMatchGlobs` is the dangerous
+      > half, because a config key vitest 4 does not know is simply ignored.
+      >
+      > Two further facts M6 must start from, both measured and neither derivable
+      > from the paragraph above. **`test.projects` inherits NOTHING from the root
+      > `test:` block without `extends`** — and that block holds the suite-wide
+      > `testTimeout` and `setupFiles`, so a projects config that does not
+      > re-assert them silently drops both. And **the per-directory split this
+      > paragraph recommends cannot be keyed on directory alone**: `web/src/lib`
+      > and `web/src/mocks` are MIXED (6 of 42 and 8 of 14 respectively carry the
+      > pragma today), so assigning those two directories to node would move 14
+      > files that run under jsdom now — the exact silent-wrong-environment bug
+      > this paragraph warns about, introduced by the fix.
 
 ## Parallelization
 
