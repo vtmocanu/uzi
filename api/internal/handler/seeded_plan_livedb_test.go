@@ -81,7 +81,7 @@ func newSeededPlanFixture(ctx context.Context, t *testing.T) seededPlanFixture {
 	// A unique project id per fixture so parallel LiveDB rows on the shared database
 	// never collide on forge_connections' project/bot uniqueness.
 	projectID := int64(uuid.New().ID())
-	sealedPAT, err := box.Seal([]byte("glpat-dummy-fixture-token-000000"))
+	sealedPAT, err := box.Seal([]byte("glpat-dummy-fixture-token-000000")) //gitleaks:allow synthetic PAT fixture for a test forge_connection row; sealed, never a real credential
 	if err != nil {
 		t.Fatalf("seal PAT: %v", err)
 	}
