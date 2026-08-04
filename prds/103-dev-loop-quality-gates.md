@@ -1,7 +1,7 @@
 # PRD #103: Dev-loop quality gates — task runner, linters, dead code, formatting, coverage
 
 **GitLab Issue**: [#103](https://gitlab.example.com/vtmocanu/uzi/-/issues/103)
-**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning; **MR-C deferred** (`govulncheck`, `npm audit`, the `go.mod` bumps, vitest 2→4). **M5 stays unticked and Success Criterion 5 unmet until MR-C lands**, since that criterion is atomic across all three security tools. **M6 open.** M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
+**Status**: In progress (created 2026-07-21) — **M1 merged 2026-08-02** (MR !154), **M2 merged 2026-08-02** (MR !155), **M3 and M4 merged 2026-08-03** (MR !157, merge commit `4ebfb572`, one MR carrying both; main pipeline 20285 green 18/18). **M5's MR-A and MR-B merged 2026-08-03** (MR [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175), merge commit `d77e651b`, one MR carrying both; pipeline 20333 green 18/18 at `f0e3c438`). Shell, YAML, formula and secret scanning. **M5's MR-C built 2026-08-04 on branch `prd-103`, 7 commits, tip `3903e9d7`, `task gate` rc=0 end to end — NOT YET PUSHED, NOT YET IN AN MR, AND NO PIPELINE HAS RUN AGAINST ANY OF IT.** `govulncheck` + `npm audit` gating at zero, the agent lockfile's five advisories cleared, vitest 2.1.9→4.1.10 exact-pinned, a `deps-check` staleness slot, and `-race` on `test:controller` pulled forward from M6. **M5 is now ticked**; Success Criterion 5 was amended (see its entry — its text never named the three tools, and its literal predicate had been met since MR-B). **M6 open and untouched.** **Two deferrals, both filed rather than absorbed**: react-router 6→7 (no patched 6.x exists, so `web` keeps two ungating *moderate* advisories in a runtime dependency; reachability audited and small) and the `RunView.test.tsx` per-test cap. **Before the MR: the branch tip must be checked for the CI-skip marker**, since most commits here are docs-only and correctly carry it, while GitLab reads it from the MR's HEAD commit and a `skipped` pipeline still reports mergeable. M2 closed Success Criterion 7 and took the exclusive lock on `api/**/*.go`, so M5 and M6 are freely parallel (modulo the `web/package.json` contention in Parallelization, now a two-way between M6 and nothing else, since M3 and M4 have taken their share).
 
 *(M4's box was ticked only after its interrupted validation wave was re-run: four validators against `bb3de70b` plus a delta review at `88f0bde7`. The pre-merge blocks for both milestones are kept verbatim under the merged notes, because M4's warning that the two blocks were **not the same kind of claim** is what caused the re-run, and deleting it would erase the reason.)*
 **Priority**: Medium
@@ -1782,7 +1782,73 @@ which previously prescribed only the fail-open form.
       > carrying its counts (web 22, agent 53, 2026-08-02) so Decision 3's "a
       > warning nobody must act on" does not become the end state by default.
 
-- [ ] **M5 — The long tail: shell, YAML, secrets, vulns**:
+- [x] **M5 — The long tail: shell, YAML, secrets, vulns**:
+
+      > **COMPLETE 2026-08-04 on branch `prd-103`, tip `3903e9d7`. MR-A + MR-B
+      > merged (!175); MR-C built but NOT PUSHED and NEVER RUN IN CI.**
+      >
+      > MR-C's 7 commits: `-race` on `test:controller` (pulled forward from M6, the
+      > only cross-unit move); the agent lockfile's five advisories cleared to
+      > `total=0`; vitest 2.1.9→4.1.10 exact-pinned plus postcss; a `deps-check`
+      > staleness slot first in `gate:web`/`gate:agent`; `govulncheck` +
+      > `npm audit` gating at zero via `scripts/{govulncheck,npm-audit}-gate.sh`
+      > called from `Taskfile.yml` targets that CI invokes as extra script lines;
+      > and two brief-amendment commits.
+      >
+      > **Four blocking defects were found by validators, none visible in a green
+      > gate**, and all four reproduced before being acted on:
+      >
+      > 1. **The govulncheck wrapper FAILED OPEN.** A three-line
+      >    `GOPACKAGESDRIVER` stub returning an empty package set made it print
+      >    *"No vulnerabilities found"* and *"clean (0 called vulnerabilities)"* at
+      >    rc=0 over a module with a genuinely CALLED vulnerability. Same class as
+      >    `GITLEAKS_CONFIG`, which `scan-secrets.sh` already refuses. Both guards
+      >    added, exiting **2**; `GOFLAGS` refused narrowly (`-tags` only) so the
+      >    documented `-buildvcs=false` export survives, asserted both ways.
+      > 2. **`deps-check` covered 1 of 6 dependency changes.** On the real
+      >    git-pull stale state, `npm ls --depth=0` gave rc=0 with zero findings
+      >    over an agent tree holding all five vulnerable versions, and missed
+      >    web's high-severity postcss fix too. Fixed with a lockfile join on the
+      >    **intersection** of the two lockfiles.
+      > 3. **A registry outage classified as "there are advisories."**
+      >    `npm run --silent audit` suppressed npm's own error line, so the
+      >    unreachable-registry branch fell through to the findings branch — the
+      >    exact failure the script exists to prevent, introduced by a flag added
+      >    for tidiness. The findings branch now requires a positive observation.
+      > 4. **A one-file `.npmrc`, or an invisible `NPM_CONFIG_OMIT` CI variable,
+      >    disarmed the npm audit gate at exit 0.** Closed by `--include=dev` on
+      >    the command line **in the version-controlled Taskfile target** — in a
+      >    CI job script it would be editable in the same invisible place as the
+      >    attack.
+      >
+      > **The durable artifact is the generalisation of 1 and 4**, which belongs
+      > in `docs/dev-conventions.md`: *a gate script names the environment
+      > variables that can shrink its view, and refuses them.* Three tools, three
+      > variables, one shape — `GITLEAKS_CONFIG` (already refused),
+      > `NPM_CONFIG_OMIT`, `GOPACKAGESDRIVER`/`GOFLAGS`.
+      >
+      > **Two calibration non-controls were produced and caught, both by a
+      > predicted count rather than by the four-property bar.** One arm replaced
+      > `web/package.json` wholesale with a pre-upgrade copy that predates the
+      > `deps-check` script, so npm died with *"Missing script"* — **rc=201, the
+      > tool name in the output, and a sane path: three of the four properties
+      > held on a completely dead arm.** What separated them was one invalid line
+      > predicted against zero measured.
+      >
+      > **Deferred, filed rather than absorbed:** react-router 6→7. No patched 6.x
+      > exists (`fixAvailable: true` is npm's flag for *a fixed version exists
+      > somewhere*, not *`npm audit fix` will do it*), so `--audit-level=high`
+      > leaves two **moderate** advisories in `web`'s runtime router permanently
+      > ungating. Reachability audited and small: the constructor-injection
+      > advisory is structurally unreachable (no `createBrowserRouter` /
+      > `createHashRouter` / `RouterProvider` anywhere, no SSR), and both
+      > open-redirect ones are blocked at the only attacker-controlled sink by
+      > `safeNextPath`, which rejects the backslash vector specifically and is
+      > tested. **The invariant the follow-up issue must carry:** `safeNextPath`
+      > is a per-call-site guard, so any future `navigate(<value from a URL or the
+      > server>)` reopens the hole without touching react-router at all.
+      >
+      > Full record: `.claude/agent-team-tasks/prd-103-mrc-m6.md`, 8 amendments.
 
       > **STATUS 2026-08-03: MR-A AND MR-B MERGED, M5 NOT COMPLETE.** MR
       > [!175](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/175),

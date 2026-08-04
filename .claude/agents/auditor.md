@@ -113,19 +113,46 @@ proven otherwise.
 
 ## For this repo (uzi)
 
-Security-scan slot: **secrets are covered as of PRD #103 M5 MR-B; dependency
-vulnerabilities are not.** `task scan:secrets` (gitleaks) runs inside
+Security-scan slot: **secrets AND dependency vulnerabilities are both covered as
+of PRD #103 M5 — MR-B for secrets, MR-C (`fce6a06d`) for dependencies.**
+`task scan:secrets` (gitleaks) runs inside
 `gate:repo`, inside `task gate`, wrapped in `scripts/scan-secrets.sh` — which
 plants its own canary tokens and exits 2 if either goes undetected, so a
 disarmed or misconfigured scanner fails loud rather than reporting a false
 clean. **It is now the tester's slot, not yours**: it runs on every `task gate`
 the tester already runs, unlike the general case above where a scanner exists
-but nothing else invokes it. `govulncheck` and `npm audit` still do not exist
-(PRD #103's MR-C, not yet landed), so **Success Criterion 5 — which names
-gitleaks *and* `govulncheck` *and* `npm audit` in one sentence — is not yet
-met.** Treat the dependency-vulnerability half as a `noted` gap and audit by
-reading, not by re-reporting it; do not report the secrets half as a gap, it
-has a scanner now. One thing worth knowing before you read a gate log rather
+but nothing else invokes it.
+
+**`govulncheck` and `npm audit` now exist too** (`fce6a06d`), as
+`scripts/govulncheck-gate.sh` and `scripts/npm-audit-gate.sh`, invoked from
+`Taskfile.yml` targets that CI calls as extra script lines on
+`validate:{api,controller,web,agent}`. **They are deliberately NOT in `task gate`
+or any `gate:*`** — their verdict is a function of a remote mutable database
+rather than of the tree, so a contributor's gate would answer differently on two
+runs of one commit. Run them explicitly when auditing. **Neither has a canary**,
+unlike gitleaks: `npm audit` has no in-band observation separating an armed run
+from a disarmed one, so both scripts instead *refuse* the environment variables
+that shrink their view (`GOPACKAGESDRIVER`, `GOFLAGS=-tags`, and
+`--include=dev` outranking `NPM_CONFIG_OMIT`). A refusal exits **2**, never 1.
+
+**Do not report either half as a gap.** The one real residual is two
+**moderate** react-router advisories in `web`'s runtime dependency, deliberately
+ungating under `--audit-level=high` and filed as their own issue — no patched
+6.x exists, so clearing them needs a router major. Their reachability was
+audited: the constructor-injection advisory is structurally unreachable here (no
+`createBrowserRouter`/`createHashRouter`/`RouterProvider` anywhere, no SSR) and
+both open-redirect ones are blocked at the only attacker-controlled sink by
+`safeNextPath`, which rejects the backslash vector specifically and is tested.
+
+*(This paragraph previously said the two tools "still do not exist" and that
+**Success Criterion 5 — which names gitleaks *and* `govulncheck` *and*
+`npm audit` in one sentence — is not yet met**. The first half went stale with
+`fce6a06d`. The second half was never true of the criterion's text: SC5 reads
+only "`.claude/agents/auditor.md` no longer documents the absence of a secret
+scanner, because one runs", and the whole Success Criteria section contains zero
+occurrences of any of the three tool names. The three-tool reading was repeated
+in five documents including this one; the PRD is being amended to make it true
+rather than the five restatements amended to match.)* One thing worth knowing before you read a gate log rather
 than a report: gitleaks does not honour `.gitignore`, so in an agent worktree
 it prints an untracked, non-gating NOTE for `.entire/…/full.jsonl` (the
 harness's own session transcript) — that is not a finding, see
