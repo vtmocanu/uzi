@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-04
+
 ### Changed
 
 - **A worker no longer keeps a parked run's on-disk clone around.** When a run
