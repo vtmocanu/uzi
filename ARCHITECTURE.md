@@ -534,6 +534,16 @@ chain in the diagram above, with no intervening `running`.
   with the plan turn — and, on human-gated runs, the `awaiting_approval` wait
   — and is joined before the first implement turn, so the agent's own
   dependency install never races it (PRD #121).
+- **A run can also be born already past the gate** (PRD #209, `plan_source='seeded'`):
+  `POST /api/repos/{id}/runs` accepts an externally-authored `plan_md` (+ an
+  optional agent selection and a planned-against base commit) at create time,
+  and such a run skips the planning turn and the `awaiting_approval` bullet
+  below entirely — the worker implements the supplied plan directly, and the
+  human checkpoint moves from the plan gate to the merge request. Reachable
+  from the CLI only (`uzi run create --plan-file`, [docs/cli.md](docs/cli.md),
+  [docs/seeded-plans.md](docs/seeded-plans.md)); the web board's start button
+  is unchanged. Everything else about the run — status machine, sweeper
+  coverage, guardrails below — is the same run this bullet describes.
 - **running → awaiting_approval → running** — the lead agent produces a plan;
   the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
   at the gate until the user approves or rejects it in the run view, or
