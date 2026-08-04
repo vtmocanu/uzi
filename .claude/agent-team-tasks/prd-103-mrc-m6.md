@@ -2207,3 +2207,108 @@ proposed remedy verbatim (`require 'found 0 vulnerabilities'`) and it was refute
 by the shipped configuration inside a minute, because **no calibration arm covered
 the configuration this repo actually ships**. Both are recorded where they happened
 rather than summarised away.
+
+---
+
+# Amendment 11 — 2026-08-04, the audit of the gate-script fixes
+
+The lead wrote `2841c7d7` (the reviewer's ten findings). The auditor was dispatched
+at that commit **because the lead wrote it** — six of the lead's restatements were
+refuted by validators in session 1, and this commit rewrites security guards.
+Evidence: `probes/prd-103-mrc-b-auditor/` (index `a0-index.txt`).
+
+**5 findings. All acted on. Two of them are about the lead's process rather than
+about the scripts, and those are the ones worth reading.**
+
+| id | disposition |
+|---|---|
+| 1 HIGH | `2841c7d7` reddened `gate:repo`. **FIXED** in `fc80b39c`. |
+| 2 MEDIUM | `CGO_ENABLED=0` disarms govulncheck. **NAMED IN THE SCRIPT, NOT REFUSED** — filed as **#228**. |
+| 3 MEDIUM | npm-audit's CLEAN arm had no positive observation. **FIXED** in `4f48085d`, on the second attempt. |
+| 4 LOW | deps-check's vocabulary test was a substring over free text. **FIXED** in `4f48085d`, on the second attempt. |
+| 5 LOW | the `-h` enumeration was still incomplete. **FIXED**. |
+
+## Finding 1 — the lead broke a gate and reported a green over it
+
+`2841c7d7`'s message says *"task lint:shell clean, 26 tracked scripts"* and names no
+secret scan. The commit added **twelve `.txt` files** under `probes/`, one of which
+tripped gitleaks `generic-api-key` on the literal `p5-verbose.log` — a scratchpad
+FILENAME inside `Logs: scratchpad/p5-vulncheck-api.log, p5-verbose.log`.
+`scan:secrets` → `gate:repo` → `task gate`, all red.
+
+**`lint:shell` walks `git ls-files -- '*.sh'`. The added files are `.txt`.** The
+check the lead ran was *structurally incapable* of seeing the check the lead broke,
+and its green reads as coverage it never had. Found independently by the auditor and
+by the coder, minutes apart, both with the same control: rc=201 at `2841c7d7`
+against rc=0 at the parent `80636226`.
+
+**And the first fix failed silently in the reassuring direction.** The
+`gitleaks:allow` directive must sit **ON** the offending line; putting the
+justification on the lines below left the finding standing at rc=201. A reader who
+annotates and does not re-scan ships believing it fixed. The note is now in the file
+beside the directive.
+
+## Finding 3 — and the proposed remedy was WRONG, which is the part to keep
+
+The audit is right: the same commit hardened the *findings* branch of both scripts to
+require a positive observation and left the branch that fails **open** requiring
+none, so any rc=0 was reported "clean". Two fixtures, both passing the two flag
+assertions — so moving the read from the file to `scripts.audit` did not close it;
+the decoy simply moves INSIDE the audit script.
+
+**Its one-line remedy — require npm's own `found 0 vulnerabilities` — was
+implemented verbatim and refuted by the shipped configuration inside a minute.**
+`npm audit --audit-level=high` exits 0 on `web`, whose only findings are MODERATE,
+while PRINTING the full moderate report: the output says *"2 moderate severity
+vulnerabilities"* and never *"found 0 vulnerabilities"*. The strict form took
+`vulncheck:web` — the configuration this repo actually ships — to exit 2
+"INSTRUMENT FAILURE" over a perfectly good run.
+
+The test is **"npm produced a VERDICT"**, not "npm found nothing": accept either
+literal, or the `# npm audit report` header the findings branch already requires.
+
+**The lead-side finding is not the wrong literal, it is the missing arm.** Neither
+the auditor nor the lead caught it by reasoning; the tree did. The calibration had
+no arm covering `web`, i.e. no arm covering the *thresholded* configuration this
+repo ships — only `agent`, which happens to be at zero findings. The arm that
+catches it is arm 5 of `fix-calibration-round2.txt`, and it did not exist until
+after the failure.
+
+## Finding 4 — and the obvious repair was insufficient, also recorded
+
+A deps-check script printing `missing:` in its own output was classified as a
+FINDING at exit 1 — the exact inversion the previous commit's B-1 fix existed to
+close, reached through text instead of an exit code. Stripping npm's `> `
+script-echo lines was the obvious repair and it is **not** sufficient: the token is
+in what the script PRINTS, not only in npm's echo of its body. Re-measured after
+that repair, the same fixture still returned 1.
+
+**No refinement of a substring test reaches a difference the substring cannot see.**
+The discriminator is now `npm ls --depth=0 --json`'s structured `problems` array,
+with the assumption that the delegated script *is* an `npm ls` invocation asserted
+rather than assumed.
+
+## Finding 2 — named rather than refused, and the repo's Dockerfiles are why
+
+`CGO_ENABLED=0` takes the gate to exit 0 over a genuinely called vulnerability
+behind `//go:build cgo` — mechanically the `-tags` case, since cgo is a build
+constraint. **But `api/Dockerfile:41` and `controller/Dockerfile:19` both build with
+`CGO_ENABLED=0`**, so a call reachable only under cgo is in no image, and refusing
+the setting would refuse the configuration that matches what ships. The honest
+statement, now in the script: this gate already scans a different file set than
+ships on **two** axes, `GOOS` and `CGO_ENABLED`, and pins neither. Filed as **#228**
+rather than smuggled in, because pinning is a behaviour change needing its own
+calibration — and because `go install` refuses to cross-install with `GOBIN` set,
+so pinning `GOOS` requires separating the install from the run.
+
+## The audit's attack on the lead's calibration, which stands
+
+- **Arm 2 of `fix-calibration.txt` proves less than its label.** Labelled B-3, but
+  its decoy lives in a *second* script — the only shape the fix addressed — so it
+  **cannot fail** in the presence of the surviving hole (finding 3). It
+  demonstrates "the read moved from the file to the script", not "the assertion
+  observes what runs".
+- **No arm covered any govulncheck change** — not NB-5's three routes, not N-2, not
+  B-4. NB-5 carries the largest security surface in that commit and shipped on the
+  reviewer's single measurement plus reasoning. All three routes have since been
+  measured by the auditor and pass.
