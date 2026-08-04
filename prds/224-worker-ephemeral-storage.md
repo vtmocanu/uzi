@@ -2348,3 +2348,58 @@ reddens the shipped-ceilings case, dropping the dind claimant reddens exactly th
 nix-drift sites (A13.9); `docs/worker-setup.md:122` (A13.10); A12.6's pre-provision quota check;
 A22.6/A12.5's `fsGroup` question on a real **rootless** provision; A1/A9.1's manual pod cleanup and
 worker reprovision.
+
+### A25 — 2026-08-04, `efd60dcc`: the boot check falsified two comments about itself
+
+**A25.1 — the coder swept its OWN commit's blast radius and found it had made two of its own comments
+false.** At `dae9b799` it wrote, in `preset_contract_test.go` and `worker-invariants.yaml`, that an
+operator-lowered ceiling *"is ungated on both sides — a real residual, not a covered case."* **True
+when written. `13d02609` — its own next commit, the one that added the boot check — made it false,
+and the sweep did not happen until my message about A21 prompted it.**
+
+**This is A18.1's defect from the opposite direction: UNDERSTATING coverage rather than overstating
+it.** Milder, not harmless — it was on its way to sending the next reader to build the two-sided
+contract I had just said not to build.
+
+**A25.2 — the replacement is itself a coverage claim, and it was verified across the whole chain
+rather than asserted:**
+
+```
+--set workers.limitRange.maxPVCStorage=10Gi
+  -> rendered LimitRange maxPVC          = 10Gi
+  -> injected UZI_WORKER_MAX_PVC_STORAGE = 10Gi
+  -> ValidatePVCCeilings rejects it against nixSize 20Gi
+```
+
+Both comments now state **three nets and when each fires** — `helm template`, `go test`, controller
+boot — and name the one that sees what the **cluster** configured rather than what the repo ships.
+Dispatched to both validators as a claim to check, not a fact to accept: a coverage claim is exactly
+the class A18.1 refuted.
+
+**A25.3 — the surviving residual is narrower and is deliberately NOT closed.** A LimitRange edited
+**directly in the cluster**, out of band from the chart, is seen by none of the three nets. A
+`helm upgrade` cannot reach that state, since changing the value rolls the controller with the new
+env. The coder's reasoning, which I accept: *"an admin editing admission objects by hand is outside
+what the chart can defend, and saying so is more useful than another guard."*
+
+**A25.4 — 🔴 THE PATTERN, NOW TWICE IN TWO HOURS, AND NEITHER OF US CAUGHT OUR OWN.** I caught A17.4
+outliving the code it described; the coder caught these two outliving the guard they described.
+**Its formulation is the one to keep: *a correction is a claim with a shelf life, and the commit that
+changes the mechanism is the one that has to re-read every sentence about it.*** The sharpest detail:
+**`13d02609`'s own commit message enumerated what it closed — and still did not sweep the two
+comments that said it was open.** Knowing what you closed is not the same as sweeping for sentences
+that assumed it was open. That is the argument for the sweep being **mechanical rather than
+remembered**.
+
+**A25.5 — 🔴 LEAD ERROR: I OPENED A TWO-WRITER WINDOW AND CLOSED IT ONLY AFTER THE FACT.** I gave the
+documenter the writer token and told it the coder was frozen — **and never told the coder.**
+`efd60dcc` landed into a tree already holding the documenter's uncommitted `CHANGELOG.md` and
+`docs/worker-setup.md`.
+
+**No harm, and the reason is not luck: the coder committed BY EXPLICIT PATH**, so `efd60dcc` contains
+only its two files and neither of the documenter's was swept. **A `git add -A` would have taken
+both.** That is the standing rule earning its keep in precisely the situation it was written for —
+and it is the second time this session that a coder's own discipline covered a lead's coordination
+gap (the first being A3.12's moving tree, which the auditor had already defended against with a
+detached worktree). Coder is now explicitly frozen; if a validator finding needs it, I freeze the
+documenter first and say so to both.
