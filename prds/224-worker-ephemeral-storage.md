@@ -1380,3 +1380,96 @@ is:** no `fmt-check`, no `lint` (it set no `GOLANGCI_LINT_CACHE` because it ran 
 did not `cache clean`); `go vet` on `./internal/kube/` only; `go build` covered implicitly by the
 test compile. Everything else it re-ran end to end, including `go test -count=1 -race ./...` at
 `RUN=182 PASS=182 FAIL=0 SKIP=0`.
+
+### A14 — 2026-08-04, AUDIT of M-b at `2a63ddb3`. Clean. Coverage of both commits confirmed.
+
+**A14.1 — the `validateDockerTier` split is CORRECT and load-bearing, proved two independent ways.**
+`UZI_WORKER_EPHEMERAL_REQUEST` is validated in `loadWorkerSettings` (`config.go:284-289`), outside
+the gate; the docker vars stay inside it. The reasoning is sound rather than merely plausible:
+`validateDockerTier` opens with `if ns == "" && img == "" { return nil }`, a genuine early return, so
+a plain-tier var placed there is **silently ignored on every non-docker deployment**.
+
+*Proof 1, Go-side mutation* — moved the plain var into the docker list, i.e. built exactly the
+mistake the comment says it avoids. `go vet` **rc=0** (behavioural, not a build error), and the
+plain subtest reddened with a self-explaining message while the docker subtest stayed green.
+*Proof 2, chart-side render* — the Go split only matters if the chart injects the same way:
+
+```
+=== DOCKER ON (34 docs) ===              === DOCKER OFF (26 docs) ===
+UZI_WORKER_EPHEMERAL_REQUEST     512Mi   UZI_WORKER_EPHEMERAL_REQUEST     512Mi
+UZI_WORKER_DOCKER_EPHEMERAL_REQ  4Gi     UZI_WORKER_DOCKER_EPHEMERAL_REQ  <ABSENT>
+UZI_WORKER_DIND_DATA_SIZE        20Gi    UZI_WORKER_DIND_DATA_SIZE        <ABSENT>
+```
+
+**With the tier off the plain var is injected ALONE** — which is the deployment the placement
+argument names, now an observation rather than an argument.
+
+**A14.2 — 🔴 "MERGED TO `main`" IS NOT "DEPLOYED" FOR THIS CHANGE, AND THE DELIVERY STEP IS IN A
+DIFFERENT REPOSITORY.** This closes the item A12.6 had to leave open; the cluster came back at
+`06:11:43Z` and **still carries the OLD quotas** (docker `140Gi`/`20`, restricted `280Gi`). That is
+expected, and the reason is the operative part:
+
+The quota raise lives in **`deploy/chart/values.yaml`** — inside the chart, which ArgoCD takes from
+Harbor OCI at `targetRevision: 0.14.0` (source 1) — **not** in `deploy/values/dev-cluster.yaml`
+(source 2, tracking `main`). **So merging to `main` delivers neither the quota raise nor the new
+controller.** Both arrive only with a `v*` release tag **plus a manual `targetRevision` bump in
+`argo-apps/apps/uzi/app.uzi.yaml`**, which is a different repo.
+
+**No skew window exists, and that was checked rather than assumed:** `controller-deployment.yaml:58`
+renders the image tag as `.Values.workers.controller.image.tag | default .Chart.AppVersion`, and
+`workers.controller.image` is **unset** per-cluster (verified by parsing the file, not by grep) —
+live confirms `controller:0.14.0` against `targetRevision: 0.14.0`. **Image and quotas cannot arrive
+separately.** Even a hypothetical skew is bounded: under the old 140Gi, the two existing docker
+workers gaining a 20Gi dind PVC each takes `used` 64Gi → **104Gi** (PVCs 4→6 of 20), which fits; only
+a *third* worker would be refused, at 164Gi. **→ A9.4 gains a line.**
+
+**A14.3 — M-b's substance encodes the mechanisms correctly.** `ephemeralRequest`'s header states,
+with reasoning beside each: the three-formula asymmetry (`PodRequests` sums restartable sidecars,
+`GetResourceRequestQuantity` does not, so 1Gi+8Gi is charged 9 and credited 8), the three
+independent reasons never to declare a limit, the `max`-needs-a-`default` trap, and that
+**"conservative" means err LOW** because too high is unschedulable, silent and total. The auditor's
+note: that last is the one it would have written itself.
+
+**A14.4 — the invariant test is real, confirmed by a third party.** It walks
+`.spec.initContainers` **and** `.spec.containers` across plain / docker-rootless /
+docker-non-rootless and carries `if seen < 2 { t.Fatalf }` with the reason stated. Mutation on
+M-b's load-bearing site (removing the request) reddened both intended tests; `go vet` rc=0 first, so
+it was behavioural rather than a build break; restored by `cp` backup, `git status` clean, full suite
+green.
+
+**A14.5 — the doc sweep verified against the auditor's OWN original enumeration**, not against the
+coder's claim — it found the six sites in the design wave, so it is the right checker.
+`git grep -F 'quota on requests.*'` and `'ResourceQuota on requests.*'` both **rc=1, no matches**.
+The three surviving `presetRequestsDominateTheSeed` hits are all correct: `render.go:440` is a
+deliberate past-tense record (*"It named `presetRequestsDominateTheSeed` until issue #224; no such
+symbol has ever existed in this tree"*) and two are this PRD's own record. **That is CLAUDE.md's
+past-tense-is-a-typo / present-tense-is-a-wrong-doc distinction applied the right way round.**
+
+**A14.6 — both M-a findings STILL STAND at `2a63ddb3`** (already dispatched to the coder):
+`worker-invariants.yaml` still carries six guards and none mentions `dindDataSize`, `maxPVCStorage`
+or `ephemeralRequest`; the restricted tier still holds 15 `l` workers against the 20 it advertises.
+**M-b adds no new instance of the Medium, correctly** — neither tier declares an ephemeral `max`, so
+`ephemeralRequest` has no admission ceiling to collide with, and adding one would need a `default`
+that hands the deterministic-eviction trap to every pod in the namespace.
+
+**A14.7 — the 200Gi `ephemeralStorage` quota key finally does something.** M-b is the first change
+that makes any pod declare the resource, so `used.requests.ephemeral-storage` stops being
+permanently `0`. It cannot wedge anything: 10 workers x 4Gi = 40Gi against 200Gi hard; the key binds
+at 50 workers against a 10-deployment cap; even at a 20Gi override it is reached exactly as the
+deployment cap is. **Worth knowing because a reader who remembers "that key reads 0" will now see
+40Gi and wonder what changed.**
+
+**A14.8 — two below the bar, both deliberate asymmetries worth one sentence each if anyone edits
+nearby.** A garbage `UZI_WORKER_DOCKER_EPHEMERAL_REQUEST` with the tier OFF is **silently ignored**
+until the tier is switched on — the pre-existing behaviour of all five docker knobs, and the correct
+trade-off (refusing to boot over an inert knob is worse), but it is the mirror image of the bug the
+plain-var placement avoids. And `ephemeralRequest(w)` returns the built-in `4Gi` for a docker worker
+whose docker override is empty, **never falling through to the plain value** — which is what
+"REPLACES" means and is implemented correctly, but the two values.yaml comments say "replaces"
+without saying what an empty docker override does, and a reader could guess either way.
+
+**A14.9 — scanners, armed.** `gitleaks` over `35ef2996~1..2a63ddb3`: exit 0, 3 commits, 64.65 KB, no
+leaks. `task scan:secrets`: EXIT=0, `0 findings in tracked files (1495 in the index)`, **`canaries
+DETECTED (gitlab-pat, gitleaks v8.30.1)`**. Exit codes read off files on the following line, not
+through `${PIPESTATUS[0]}` — the auditor walked into that zsh trap in its M-a report and did not
+repeat it.
