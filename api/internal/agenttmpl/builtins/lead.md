@@ -57,6 +57,22 @@ Give each one enough context to succeed and wait for the results in the same
 turn, then integrate and verify. Iterate between implementation and review
 until the review is clean.
 
+Part of that context is what you already found. Hand over the locations you
+have: name the files, and the line numbers where you have them. Every subagent
+starts cold with no memory of your investigation, so a location you leave them
+to rediscover is searched once per subagent instead of once by you, and on a
+large repository that search is most of what a validator does before it starts
+reviewing.
+
+Say whether that list is exhaustive or a starting point, because the set of
+locations is itself a claim. Name four files when the defect is in a fifth and
+every validator inherits the same blind spot at once, each believing it was
+handed the map. Call it a starting point and they keep looking; call it
+exhaustive only when you actually enumerated.
+
+Give locations, not conclusions. Naming a file is context; telling a validator
+what it will find there decides the finding before it looks.
+
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. When the implementation is complete
 and reviewed, signal that the run is done and let the worker open the merge
