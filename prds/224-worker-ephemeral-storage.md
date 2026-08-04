@@ -849,3 +849,172 @@ clamp is a **floor**). No preStop hooks exist, so nothing subtracts from it. **T
   finding; at 30s it is a real, repo-size-dependent question. Relevant to #218, not to A6.1.
 - Minor, and it touches A1 rather than A5.1: `CheckGracefulDelete` sets `period = 0` for pods already
   `Failed`/`Succeeded`, so **the lingering Evicted pods delete immediately** — no grace to wait out.
+
+### A8 — 2026-08-04, architect (re-derived under A6) + auditor (storage facts). Design complete bar two user calls.
+
+**A8.1 — 🔴 THE LEAD WAS WRONG IN A6.4, AND THE CORRECTION STRENGTHENS THE DESIGN.** A6.4 said the
+post-M-a residual is "the measured ~4 MiB" and speculated the docker/plain split might collapse.
+**That 3.2 MiB is a spot read of `run-workdir` on one pod at one instant, and `run-workdir` is not a
+residual — it is the run's entire working tree**, which the brief's own A3.4 already says. Bounds,
+none of them spot reads: `dindWorkdirDir = /data/runner` (`render.go:203`) is `git.ts`'s
+`runnerRoot`, one clone per run; `$TMPDIR` for docker workers points at the **same** volume
+(`render.go:681`); and `WORKER_MAX_CONCURRENT_RUNS` **multiplies** it. This repo's checkout alone is
+**26 MiB** (1495 tracked files) and its bare-clone cache measured **139.7 MiB** live, so a runner
+clone is ~**170 MiB before a single `npm install`**. Realistic range is **0.5-2 GiB per concurrent
+run**. The 3.2 MiB was a tree that had barely started.
+
+**The split does not collapse — it survives for a BETTER reason than the one it had.**
+`render.go:787` mounts `run-workdir` **only** `if w.Docker`. For a plain worker there is no such
+emptyDir, so `/data/runner` falls through to the **`data` PVC** and the working tree is never on
+ephemeral storage at all. So the rule is now structural rather than measured:
+
+> **docker = the working tree is on an emptyDir. plain = the working tree is on a PVC.**
+
+Everything else in A6.4 holds: the fleet-unschedulability ceiling dissolves, and the binding
+constraint moves to the PVC quotas.
+
+**A8.2 — M-a: dind data root → third per-docker-worker PVC, flat 20Gi, chart-overridable.**
+`dindDataVolume`'s source changes from `EmptyDir` (`render.go:793`) to `PersistentVolumeClaim`;
+`RenderPVCs` (`:442-448`) gains a third entry **only when `w.Docker`**; `dindDataPVCName(id)` joins
+`dataPVCName`/`nixPVCName`; `materializer.go` gains `HasDinDDataPVC` in `observeNamespace`, a
+create-gate case and a teardown entry. 20Gi is the top of the chart's own documented band and is now
+a **ceiling producing ENOSPC** rather than a reservation producing eviction. `X <= 20Gi` is a hard
+admission ceiling, not a budget choice — the LimitRange PVC `max` is 20Gi.
+
+**Rejected alternative, named because it looks cheaper:** the daemon root on the existing `data` PVC
+via `subPath: dind`. `subPath` does confine the container, so Decision 3 survives — but a runaway
+pull would then ENOSPC the **clone cache** too, which is exactly the coupling the PVC is being paid
+to remove, and absorbing the cache means raising `Size.DataSize`, which moves the display golden and
+`workerSizes.ts` (A3.7's chain) and wastes the increase on every restricted worker with no daemon.
+
+**A8.3 — M-b: values re-derived. 6Gi is RETIRED and must not be carried forward.**
+
+| constant | value | basis |
+|---|---|---|
+| `workerDefaultEphemeralRequest` | **512Mi** | plain: working tree is on the PVC, so ephemeral is logs + writable layer. Measured 45 KiB; kubelet default log-rotation ceiling 10Mi x 5 per container. ~10x that ceiling. |
+| `workerDefaultDockerEphemeralRequest` | **4Gi** | docker: `run-workdir` = working tree x `WORKER_MAX_CONCURRENT_RUNS`, ~170 MiB per clone before deps, plus `node_modules`, plus `$TMPDIR`. Covers ~2 concurrent heavy runs. |
+
+Fleet check: `10 x 4Gi + 20 x 512Mi = 50 GiB` of 70.21 GiB = **71%**, 4 docker workers per node
+against a tier cap of 10. **No unschedulability at any fleet size the quotas permit.** A7.6's "err
+low" still applies but no longer binds, which is why plain is 512Mi rather than 1Gi. Everything in
+A4.3 stands: request on the `worker` container only, **no `limits.ephemeral-storage` anywhere**,
+`preset.Size` untouched.
+
+**A8.4 — 🔴 THE DOCKER TIER'S QUOTA TRIPLE HAS NEVER BEEN SELF-CONSISTENT, AND M-a FORCES THE
+CONVERSATION.** Independently derived by both agents. Live, `2026-08-04T05:25:46Z`:
+
+```
+hard: {deployments 10, persistentvolumeclaims 20, requests.storage 140Gi}
+used: {deployments  2, persistentvolumeclaims  4, requests.storage  64Gi}   <- 2 x `l`
+```
+
+`requests.storage` **binds today**, at ~3 `l` workers, while `deployments` advertises 10. The tier
+has room for **exactly one more worker right now**. After M-a, at `X >= 10Gi` with `l`, that
+headroom is gone and **the tier is full at its current occupancy** — the next worker is refused with
+a quota error, not a scheduling one, and **no test in this repo can see it.**
+
+Auditor's table, D docker workers at three PVCs each (`requests.storage` binds in every cell; the
+PVC-count cap is D<=6 and deployments D<=10, never reached):
+
+| X (Gi) | `s` | `m` | `l` |
+|---|---|---|---|
+| 0 *(today)* | 5 | 4 | **3** |
+| 10 | 4 | 3 | **2** |
+| 20 | 3 | 2 | **2** |
+
+Restricted tier, untouched by M-a but carrying the same latent inconsistency: `requests.storage`
+caps it at **7-11** against a tier designed for 20.
+
+**A8.5 — MEDIUM, pre-existing, and it is the CAUSE of A8.4: `values.yaml:380-382`'s sizing comment
+is FALSE.** It reads *"20 x (10Gi data + 4Gi nix) = 280Gi"*. That arithmetic is correct for
+**`nix = 4Gi`, the PRE-#87 value**. `nixSize` is now **20Gi** (`preset.go:146`). True requirement for
+the comment's own stated fleet is 20 x (10+20) = **600Gi**; at 280Gi the tier holds **9**. The quota
+is **2.14x too small for the fleet its own comment says it was sized for.** PRD #87 bumped `nixSize`
+and did not follow the value into the quota comment. Fix-the-doc owed; M-b's doc sweep is the home.
+
+**A8.6 — M-c: THE TWO AGENTS DISAGREE, AND THE AUDITOR'S EVIDENCE UNDERCUTS THE PREMISE.**
+
+*Auditor, measured across the entire fleet (n=2, which is every worker that exists):*
+
+| worker | nix PVC | used | fill |
+|---|---|---|---|
+| `0b83f044` | **19.52 GiB** (current 20Gi default) | 2.77 GiB | **14.2%** |
+| `8e1fef71` | **3.86 GiB** (legacy 4Gi) | 2.77 GiB | **71.7%** |
+
+**Both store exactly the same 2.77 GiB.** Only the denominator differs. So A4.10's 77% is **not**
+evidence the current default is too small — it is evidence that **one worker predates PRD #87's
+bump**, and newly-provisioned workers sit at 14.2% with 15.7 GiB free. **n=1 affected worker**, and
+`nixSize`'s own comment already prescribes the remedy: *"v1's remedy is delete + reprovision"*.
+
+*And the expansion path has ZERO headroom:* `allowVolumeExpansion: true` on `storage-class` (resizer runs
+`--handle-volume-inuse-error=false`, so online-capable), **but the LimitRange PVC `max` is 20Gi and
+`nixSize` is already 20Gi.** The limitranger validates PVC **updates** (only *Pod* updates are
+exempt, `admission.go:427-429`), so a patch beyond 20Gi is rejected at admission. M-c can take the
+legacy 4Gi to 20Gi and no further without also raising `maxPVCStorage`.
+
+*Architect, if M-c is built:* make it **generic, not nix-specific** — after the create-gate, for each
+rendered PVC, if `desired > observed`, patch `spec.resources.requests.storage`; **never** when
+`desired <= observed` (k8s forbids shrinking, so a preset going down must be a no-op, not an error).
+Never block reconcile on completion. **Two things it must carry:** it overturns a stated decision
+(`materializer.go:489-491`, *"never patched: PVC specs are near-immutable, so a size change is
+delete + reprovision"*), which must change in the same commit; and it sits beside issue #114 BUG 3 —
+an unconditional PVC create charged `used.requests.storage` at admission and k8s does **not**
+decrement on `AlreadyExists` (upstream #119593), pinning the quota at its limit. **A patch charges
+the delta the same way**, so the gate must be on an *observed size*, which means `observeNamespace`
+must record sizes and not just today's booleans. Under either online or offline CSI the design is
+identical — patch, don't wait; offline resizes land on the roll M-a and M-b already pay for.
+
+**Lead's read: the auditor's premise-level evidence is the stronger claim and it arrived after the
+architect's design.** Going to the user (A9).
+
+**A8.7 — two costs M-a adds, both agreed by both agents, neither a redesign.**
+
+1. **A third RWO PVC is a third Multi-Attach surface, on the exact code path #224 is about.** Issue
+   #224's own Cleanup paragraph records the 19:04 replacement hitting `Multi-Attach error` on
+   **both** existing PVCs; this makes it three. `Strategy: Recreate` means no surge pod, so the
+   window is the old node's `VolumeAttachment` releasing — unchanged in kind, wider by one volume.
+   **A6.3 did not weigh this when it chose the PVC over the sizeLimit.** It does not reverse the
+   choice (backpressure still beats eviction), but it belongs beside the benefit. Release note.
+2. **The image cache becomes PERSISTENT and has no GC.** Today the emptyDir dies with the pod, which
+   is a crude but real bound; on a PVC it only grows. This is the identical residual `nixSize`'s
+   comment documents for `/nix` (`preset.go:143-145`) and the identical failure A4.10 found live.
+   **Write it beside the constant, in `nixSize`'s own words**, and note `docker system prune` as the
+   remedy an agent could run. It is the honest cost of trading eviction for backpressure.
+
+**A8.8 — `fsGroup` is the most likely thing to break M-a in practice and NO unit test reaches it.**
+The rootless daemon runs as uid 1000 (`render.go:206-213`); the pod's `fsGroup` is 10001. An emptyDir
+mount root is created writable by fsGroup, and a freshly-provisioned PVC should get the same
+treatment (`fsGroupPolicy: ReadWriteOnceWithFSType`, confirmed live on this CSI driver) — **but it is
+invisible to `helm template` and to every unit test, and only a real provision shows it.** First
+thing to check on the dev-cluster run.
+
+**A8.9 — the `data` PVC is the largest quota term and is measurably near-empty.** `0b83f044` 0.0%,
+`8e1fef71` 0.7%, both on 19.52 GiB. `l`'s `DataSize` of 20Gi is the single biggest term in both
+tiers' arithmetic. If A8.4's headroom is what M-a runs into, the cheapest release valve may be
+re-examining `l`'s `/data` rather than raising `requestsStorage`. **Not proposed as a change** — two
+near-idle workers at one instant is not a basis for resizing a preset. Filed as the measurement A6.6's
+follow-up should take, since the same sweep answers both.
+
+**A8.10 — sequencing confirmed, with a stronger reason than file-disjointness, and one condition.**
+M-a **must** precede M-b because M-b's values are *derived from* M-a having moved `dind-data` off
+ephemeral: shipping M-b first ships 6Gi, and shipping both in one commit makes the 4Gi
+unjustifiable from the diff alone. M-c last, so its resizes ride the roll the first two already pay
+for. **"One fleet roll instead of three" holds ONLY if all three land in one release** — three
+controller rollouts would be three rolls and three loss events. That was the argument that justified
+the enlarged scope, so it belongs in the release note.
+
+**A8.11 — A5.4 does NOT touch M-a, and this is on the record so nobody mis-applies it.** A5.4
+refutes "`emptyDir.sizeLimit` blocks writes with ENOSPC" — correct, it evicts. **A full PVC is a
+different mechanism**: the filesystem is genuinely out of space, the writer gets `ENOSPC`, no
+eviction occurs. M-a's backpressure claim rests on the PVC and never on `sizeLimit`.
+
+**A8.12 — verification additions beyond A4.8.** M-a: a render test that a **plain** worker gets no
+`dind-data` PVC and no third volume (the `render.go:690-692` byte-identity property for non-docker
+renders must survive, or a docker-only change rolls every plain worker); a test that the docker
+render's `dind-data` volume is a `PersistentVolumeClaim` and not an `EmptyDir`; a materializer test
+for the third PVC's create-gate; and the A8.8 ownership check on a real cluster. M-c, if built: a
+materializer test that `desired < observed` issues **no** patch — the case that would otherwise
+produce a rejected update every tick.
+
+**A8.13 — issue #225 FILED** (`https://gitlab.example.com/vtmocanu/uzi/-/issues/225`) for A7.3's
+imagefs/image-accumulation defect, per the user's decision to file rather than fix.
