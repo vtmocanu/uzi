@@ -20,8 +20,43 @@ export default defineConfig({
   // surfaced last. It only ever delays a failure — no assertion is loosened, and a passing
   // test costs nothing extra. A 1-in-10 red trains people to re-run instead of read, which is
   // the actual damage.
+  // 🔴 20000 WAS NOT A SPARE MARGIN EITHER, AND THE vitest 2 -> 4 MAJOR (PRD #103 M5
+  // MR-C) IS WHAT EXPOSED IT. Measured 2026-08-04 on this tree, darwin/arm64,
+  // node v26.4.0, five full-suite runs:
+  //
+  //   vitest 2.1.9, testTimeout 20000     118 files / 1660 tests   GREEN
+  //   vitest 4.1.10, testTimeout 20000    118 files / 1660 tests   RED once, green twice
+  //   vitest 4.1.10, testTimeout 120000   118 files / 1660 tests   GREEN
+  //
+  // THE COLLECTED PAIR NEVER MOVED, which is the point of quoting it: the red run
+  // collected the same 118/1660 and failed 49 of them, so nothing narrowed and this
+  // is a timing fault rather than a suite that lost tests. All 49 were in ONE file,
+  // src/pages/RunView.test.tsx, and exactly one of them timed out — the 150-tick
+  // fake-timer poll test — with the other 48 the cascade after it, presenting as an
+  // EMPTY container ("expected '' to contain …"). That file passes 100/100 when run
+  // alone, under vitest 4, with no flag.
+  //
+  // AND THE FAILING TEST'S OWN STEADY-STATE DURATION IS 3.90s (per-test JSON
+  // reporter, whole suite, same host). So it did not get slower, it got STARVED:
+  // a >5x spike over its own median under contention. Tuning to "just above the
+  // worst observed" is what made agent/package.json's --test-timeout a knife-edge
+  // at 30000 (see Taskfile.yml's test:agent comment); 60000 is ~15x the measured
+  // steady state and ~3x the spike that actually failed, and the flag's real job is
+  // catching a HANG, which is unbounded, so headroom costs a healthy run nothing.
+  //
+  // What this does NOT fix, stated so nobody reads the green as structural: that one
+  // file holds 100 tests, and under any per-file scheduling a large test file is a
+  // serialization point no timeout value repairs. Splitting it is the durable fix
+  // and is not this MR's scope.
+  //
+  // Both settings below were CONFIRMED IN EFFECT under vitest 4 rather than inferred
+  // from a green — a throwaway test asserted getConfig().asyncUtilTimeout === 5000
+  // (so setupFiles ran) and config.testTimeout === 20000 before this change. That
+  // matters because vitest 4's `test.projects` inherits NOTHING from this block
+  // without `extends`, so whoever adds one must re-assert both rather than trust
+  // that a passing suite implies them.
   test: {
-    testTimeout: 20000,
+    testTimeout: 60000,
     // Raises Testing Library's own 1s async default too — a SEPARATE knob from testTimeout,
     // and the one the Repos/Agents failures were hitting. See src/test-setup.ts.
     setupFiles: ["./src/test-setup.ts"],
