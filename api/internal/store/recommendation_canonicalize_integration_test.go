@@ -15,13 +15,16 @@ import (
 )
 
 // canonicalTargetSQL mirrors the 00097 backfill expression AND handler.canonicalizeTarget
-// (issue #232) on ASCII input: lowercase, collapse whitespace/ASCII-punctuation runs to one
-// space, trim. Used as the test's own oracle for the fixtures below.
+// (issue #232): lowercase, collapse whitespace/ASCII-punctuation runs to one space, trim.
+// Used as the test's own oracle for the fixtures below. It carries the SAME COLLATE "C" the
+// migration does, so the fold is ASCII-only and locale-independent (see 00097's header): on
+// the ASCII fixtures here that changes nothing, but keeping it identical to what ships stops
+// this oracle from silently drifting from the migration if a non-ASCII fixture is ever added.
 func canonicalTargetSQL(ctx context.Context, t *testing.T, pool *pgxpool.Pool, raw string) string {
 	t.Helper()
 	var got string
 	if err := pool.QueryRow(ctx,
-		`SELECT lower(btrim(regexp_replace($1, '[[:space:][:punct:]]+', ' ', 'g')))`, raw).Scan(&got); err != nil {
+		`SELECT lower(btrim(regexp_replace($1 COLLATE "C", '[[:space:][:punct:]]+', ' ', 'g')))`, raw).Scan(&got); err != nil {
 		t.Fatalf("canonical SQL for %q: %v", raw, err)
 	}
 	return got

@@ -332,6 +332,29 @@ func TestCanonicalizeTarget(t *testing.T) {
 		t.Errorf("canonicalizeTarget already-canonical = %q, want unchanged", got)
 	}
 
+	// ASCII-ONLY FOLD BOUNDARY (issue #232 review). The canonicalizer folds ONLY ASCII
+	// punctuation/whitespace and lowercases ONLY ASCII A–Z; every non-ASCII byte passes
+	// through UNCHANGED. This is deliberate, not an oversight: it is the only way Go can
+	// agree BYTE-FOR-BYTE with the 00097 backfill's lower(btrim(regexp_replace(target
+	// COLLATE "C", …))), which is ASCII-only, regardless of the DB's UTF-8 locale. The
+	// consequence is an accepted UNDER-merge — a target with a STRAIGHT apostrophe (U+0027,
+	// ASCII punctuation) folds to a space, while the same phrase with a CURLY apostrophe
+	// (U+2019, non-ASCII) keeps it — so the two do NOT collapse. Under-merge (a cosmetic
+	// duplicate) is the safe direction; over-merge would be the unsafe one. Pinning this
+	// stops a future edit from "helpfully" Unicode-folding one side and silently
+	// reintroducing the ingest/backfill divergence this fix closed.
+	straight := canonicalizeTarget("Worker's Git", max)
+	curly := canonicalizeTarget("Worker’s Git", max)
+	if straight != "worker s git" {
+		t.Errorf("straight-apostrophe fold = %q, want %q", straight, "worker s git")
+	}
+	if curly != "worker’s git" {
+		t.Errorf("curly-apostrophe kept = %q, want %q (U+2019 is non-ASCII, left intact)", curly, "worker’s git")
+	}
+	if straight == curly {
+		t.Fatalf("ASCII-only fold must NOT merge straight vs curly apostrophe: both folded to %q", straight)
+	}
+
 	// IDEMPOTENCE: folding a canonical value is a no-op, so ingest-then-backfill (or a
 	// double ingest) can never drift the coordinate. Asserted over a spread of shapes.
 	for _, in := range []string{
