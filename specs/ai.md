@@ -18547,3 +18547,55 @@ which is the sole `Taskfile.yml` change (SC-1's one exception).
   **M6b (caching the `task`/shellcheck tarballs) was DROPPED** — a version-only cache key shared
   across the MR/protected boundary reintroduces the #211 vector (a cache hit serves the binary
   without re-verifying, and that binary then runs the whole gate).
+
+## 487. Issue #232 — one recurring finding stopped fragmenting into N backlog rows: two EXACT-KEY changes on the `(category, target)` coordinate, no fuzzy/embedding clustering
+
+Serves human.md Feature #46 (the judge-recommendation backlog: "Recommendations land in an
+inbox/notifications surface"). No product-contract change and no `human.md` entry proposed: the
+existing `(category, target)` dedup (§358/§359) is unchanged in shape; this only stops the same
+finding from re-deriving a *different* `target` per run and forming separate rows. Design record:
+issue #232 (no PRD file). The two changes are independent, deterministic, and exact-key, so
+neither can OVER-merge.
+
+- **Rejected fuzzy / embedding / similarity-threshold clustering, on the triage-safety
+  argument.** In a triage tool OVER-merging two distinct findings is the unsafe failure (dismissing
+  the merged group buries a real recommendation); under-merging is merely noisy. Both shipped
+  changes are exact-key and cannot over-merge. **pgvector is not in the stack and is explicitly out
+  of scope** — no embeddings, no distance threshold.
+- **Part C — canonicalize `target` in place at ingest (read-side safety net), NO new column.**
+  `handler.canonicalizeTarget` folds only COSMETIC drift: ASCII-lowercase, collapse runs of ASCII
+  whitespace/punctuation to one space, trim. It never reorders tokens, stems, or drops stopwords, so
+  it cannot fuse two genuinely different findings. Runs LAST at ingest — after `sanitizeSelfReported`
+  (control/Cf strip) + `slacksvc.ScrubSecrets` — wired in the review-POST path (`judge_worker.go`).
+  Grouping (§358/§359), route disposition (§279), and filed-issue keying (§306/§310) then all key on
+  the canonical value with ZERO query changes; `rationale_md` preserves the human-readable detail.
+  - **Migration `00097` backfills existing rows across all THREE coordinate-bearing tables** —
+    `review_recommendations` plus the two UNIQUE side tables `recommendation_dispositions` and
+    `recommendation_filed_issues` (§331/§310) — collision-safely, so a pre-migration disposition or
+    filed link stays joined to its now-canonical rec.
+  - **Canonicalization is strictly ASCII-only and byte-deterministic on BOTH the Go ingest path AND
+    the SQL backfill, deliberately.** Go uses ASCII-only lowercase + RE2 ASCII POSIX classes +
+    ASCII-space trim (NO Unicode NFC / lower / trim); the migration forces the same via `COLLATE "C"`
+    on every `regexp_replace(target …)`, which propagates ASCII-only semantics to `btrim`/`lower`.
+    Rationale: Postgres's locale-dependent Unicode class/lower/trim semantics cannot be matched to
+    Go's Unicode tables portably, so ASCII-only on both sides is the only way to guarantee
+    byte-for-byte agreement between ingest and backfill regardless of DB locale or glibc/Go
+    Unicode-table drift. Non-ASCII (e.g. a curly apostrophe U+2019) passes through UNCHANGED on both
+    sides — an intentional under-merge (the safe direction). A disagreement here would de-link a
+    pre-migration disposition, resurfacing a resolved item as todo.
+- **Part B — the judge REUSES an existing coordinate (write-side, the durable fix).** The judge
+  claim carries `known_improve_uzi_targets` (§103 claim assembly): the run owner's own existing
+  `improve_uzi` target coordinates — canonical, deduped, frequency-ranked (`count DESC`, `target ASC`
+  tiebreak), owner-scoped by `run_reviews.user_id`, empty target excluded, capped at
+  `judgeKnownTargetsCap = 50`, delivered `omitempty` (`ListKnownImproveUziTargetsForUser`). The agent
+  renders it in the judge prompt as a bounded, per-prompt-nonce-fenced (a SEPARATE nonce from the
+  trace fence, §216), INERT list, instructing the judge to reuse a matching `target` VERBATIM rather
+  than invent a new phrasing — so a future recurrence lands on the same exact key the cross-run dedup
+  already collapses. A deliberate, bounded departure from the judge's otherwise-decoupled, toolless
+  posture: the menu is capped and framed as untrusted data (its contents originated from prior judge
+  output over untrusted traces, §345/§356), never as instructions. An empty list appends nothing, so
+  the prompt stays byte-for-byte its pre-#232 shape for a user with no `improve_uzi` history.
+- **Forward-looking only.** Part B does not retroactively merge existing distinct-phrasing recs;
+  Part C only folds cosmetic drift. Historical recs that differ in REAL words (e.g. "worker clone
+  setup (git identity)" vs "worker runner clone setup") are intentionally NOT merged — they can be
+  bulk-dismissed manually (§359 group disposition).
