@@ -8,11 +8,14 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"golang.org/x/text/unicode/norm"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -80,6 +83,67 @@ func sanitizeSelfReported(s string, max int) string {
 	// groups a human reads as identical. Newly reachable as of the Cf strip, and it now
 	// looks CLEAN rather than obviously junk, which is worse.
 	return strings.TrimSpace(b.String())
+}
+
+// canonicalizeTargetRe matches any run of Unicode whitespace or ASCII punctuation, which
+// canonicalizeTarget collapses to a single ASCII space. [:punct:] in Go's RE2 is the
+// POSIX class — ASCII punctuation ONLY — and that narrowness is deliberate: folding
+// cosmetic ASCII drift ("git-identity" ↔ "git identity", "foo.bar" ↔ "foo bar") must not
+// reach into any script's letters or digits, so it can never fuse two adjacent words into
+// one token. It mirrors the 00097 backfill's regexp_replace(target, '[[:space:][:punct:]]+',
+// ' ', 'g') EXACTLY: Postgres's POSIX classes are the same ASCII-only classes RE2 uses, so
+// ingest and the historical rows fold identically.
+var canonicalizeTargetRe = regexp.MustCompile(`[[:space:][:punct:]]+`)
+
+// canonicalizeTarget folds a recommendation target's COSMETIC drift so the same finding
+// phrased with different casing/whitespace/punctuation collapses to one (category, target)
+// coordinate — the exact key the cross-run backlog dedup and the disposition/filed-issue
+// joins already match on (issue #232). "Worker Git-Identity Setup " and
+// "worker  git-identity   setup" both become "worker git identity setup".
+//
+// It folds ONLY three cosmetic axes — Unicode case, whitespace runs, ASCII punctuation
+// runs — and DELIBERATELY does NOT reorder tokens, drop stopwords, or stem. That
+// restraint is the whole safety argument, not a shortcut: this feeds a TRIAGE backlog, and
+// over-merge (collapsing two genuinely different findings into one row a human then reads
+// as identical) is the unsafe failure mode, strictly worse than under-merge (a cosmetic
+// duplicate the human skims past). "worker clone setup (git identity)" and
+// "worker runner clone setup" must stay distinct, and they do — nothing here moves or
+// removes a word.
+//
+// It runs AFTER sanitizeSelfReported + ScrubSecrets at ingest (judge_worker.go), so the
+// control/Cf strip and secret redaction have already run on this string. It mirrors the
+// 00097 backfill SQL — lower(btrim(regexp_replace(target, '[[:space:][:punct:]]+', ' ',
+// 'g'))) — so a value ingested today folds to the same coordinate the migration produced
+// for the historical rows. The one difference is the leading norm.NFC here, which the
+// backfill omits: existing rows already passed the Cf-stripping ingest, and NFC is a no-op
+// on the ASCII coordinate identifiers targets are in practice, so the two agree on every
+// realistic/tested input — the SQL simply has one fewer step it does not need.
+//
+// `max` mirrors sanitizeSelfReported/sanitizeReviewText's (s, max) shape and re-bounds to
+// the caller's cap. Today's sole caller passes ReviewTargetMaxBytes, so unparam flags it —
+// suppressed below because the parameter is the byte-bound contract the plan requires and
+// keeps this uniform with the two sibling scrubbers it runs beside on the ingest path.
+//
+//nolint:unparam // max is the byte-bound contract, uniform with the sibling scrubbers (see above)
+func canonicalizeTarget(s string, max int) string {
+	s = norm.NFC.String(s)                            // Unicode canonical composition (no-op on ASCII)
+	s = strings.ToLower(s)                            // Unicode-aware lowercasing
+	s = canonicalizeTargetRe.ReplaceAllString(s, " ") // whitespace/punct runs → one space
+	s = strings.TrimSpace(s)
+	// Re-apply the byte bound rune-safely. Canonicalization only ever SHORTENS a string
+	// that already passed sanitizeSelfReported's max cap (folding runs of bytes to one
+	// space), so this is a belt-and-suspenders bound the plan requires rather than a live
+	// truncation — but if it ever fires it must never split a multi-byte rune. Back the cut
+	// off to the nearest rune boundary ≤ max, mirroring sanitizeSelfReported's whole-rune
+	// cap style, then trim again in case the cut exposed a fresh edge space.
+	if len(s) > max {
+		cut := max
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = strings.TrimSpace(s[:cut])
+	}
+	return s
 }
 
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by

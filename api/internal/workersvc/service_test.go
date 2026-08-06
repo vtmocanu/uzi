@@ -168,11 +168,18 @@ type fakeStore struct {
 	// error to the service. pendingJudgeLookups records every target asked for, so a test
 	// can assert the read was never ISSUED (the not-visible case must short-circuit on
 	// the visibility gate, before any pending query).
-	pendingJudgeRow         store.GetActiveJudgeRunForTargetRow
-	pendingJudgeErr         error
-	pendingJudgeLookups     []pgtype.UUID
-	toolTraceRows           []store.ListToolTraceForRunRow
-	toolTraceRowsErr        error
+	pendingJudgeRow     store.GetActiveJudgeRunForTargetRow
+	pendingJudgeErr     error
+	pendingJudgeLookups []pgtype.UUID
+	toolTraceRows       []store.ListToolTraceForRunRow
+	toolTraceRowsErr    error
+	// knownTargets is the improve_uzi menu the judge claim carries (issue #232);
+	// knownTargetsErr fails the lookup (which must NOT fail the claim — the menu is an
+	// optimization). knownTargetsParams records the (user, lim) asked for, proving the
+	// menu is owner-scoped and capped.
+	knownTargets            []string
+	knownTargetsErr         error
+	knownTargetsParams      *store.ListKnownImproveUziTargetsForUserParams
 	runInputs               []store.RunUserInput
 	workerPageMessages      []store.RunMessage
 	workerPageErr           error
@@ -594,6 +601,10 @@ func (f *fakeStore) GetActiveJudgeRunForTarget(_ context.Context, targetRunID pg
 }
 func (f *fakeStore) ListToolTraceForRun(context.Context, store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error) {
 	return f.toolTraceRows, f.toolTraceRowsErr
+}
+func (f *fakeStore) ListKnownImproveUziTargetsForUser(_ context.Context, arg store.ListKnownImproveUziTargetsForUserParams) ([]string, error) {
+	f.knownTargetsParams = &arg
+	return f.knownTargets, f.knownTargetsErr
 }
 func (f *fakeStore) ListRunInputsForRun(context.Context, store.ListRunInputsForRunParams) ([]store.RunUserInput, error) {
 	return f.runInputs, nil

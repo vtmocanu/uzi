@@ -447,6 +447,13 @@ export interface ClaimResponse {
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */
   judge_signal?: JudgeSignal | null;
+  /** The run owner's existing improve_uzi target coordinates (issue #232), delivered on
+   *  a judge claim so the judge reuses a matching target string verbatim instead of
+   *  inventing a new phrasing — future recurrences then land on the same exact key the
+   *  server's cross-run dedup collapses. Absent/empty for a user with no improve_uzi
+   *  history. UNTRUSTED-posture data (it is the user's own prior targets, but the judge
+   *  runs toolless over untrusted traces): rendered nonce-fenced, never as instructions. */
+  known_improve_uzi_targets?: string[];
   /** The plan already captured for this run (PRD #35 Decision 6b). The server has
    *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
    *  nothing read it. A resumed run whose plan was already approved replays THIS

@@ -106,7 +106,10 @@ func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
 	req.Model = "haiku\u200D-x"
 	req.Recommendations[0].Rationale = "line1\nline2\ttabbed \u2066spoofed\u2069"
 	// The headline case: a target is a FILENAME, so a surviving override lets a review name
-	// one file while pointing at another.
+	// one file while pointing at another. The bidi override is stripped by
+	// sanitizeSelfReported, which runs BEFORE canonicalizeTarget (issue #232) \u2014 so the
+	// no-Cf-survives property below still holds on the target even though canonicalization
+	// additionally folds the path punctuation into spaces (asserted by value further down).
 	req.Recommendations[0].Target = "api/internal/\u202Eforge/gitlab.go"
 	sub, err := validateAndScrubReview(req)
 	if err != nil {
@@ -138,8 +141,12 @@ func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
 	if sub.SummaryMd != "The review approved this change" {
 		t.Errorf("summary = %q, want the same prose with the format chars gone", sub.SummaryMd)
 	}
-	if sub.Recommendations[0].Target != "api/internal/forge/gitlab.go" {
-		t.Errorf("target = %q, want the honest filename", sub.Recommendations[0].Target)
+	// The override is gone (the honesty fix) AND the target is now CANONICAL (issue #232):
+	// casing/whitespace/ASCII-punctuation folded, so "api/internal/forge/gitlab.go" collapses
+	// to space-separated tokens. This is the (category, target) coordinate the cross-run dedup
+	// keys on; the fold is what makes two runs' cosmetically-different phrasings one row.
+	if sub.Recommendations[0].Target != "api internal forge gitlab go" {
+		t.Errorf("target = %q, want the canonicalized coordinate", sub.Recommendations[0].Target)
 	}
 	if sub.JudgeModel != "haiku-x" {
 		t.Errorf("model = %q, want %q", sub.JudgeModel, "haiku-x")

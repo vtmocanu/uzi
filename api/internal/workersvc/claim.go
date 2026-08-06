@@ -128,6 +128,14 @@ type ClaimPayload struct {
 	// fails it is the deterministic fallback recommendation. The regex only flags.
 	JudgeSignal *JudgeSignal `json:"judge_signal,omitempty"`
 
+	// KnownImproveUziTargets is the run owner's existing improve_uzi target coordinates
+	// (issue #232): the judge reuses a matching one verbatim instead of inventing a new
+	// phrasing, so future recurrences land on the same exact key the cross-run dedup
+	// already collapses. Present only for a judge claim; omitempty because an empty menu
+	// (a new user with no improve_uzi history) is normal and must not appear on the wire.
+	// Inert data rendered nonce-fenced by the agent — never instructions.
+	KnownImproveUziTargets []string `json:"known_improve_uzi_targets,omitempty"`
+
 	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
 	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted

@@ -299,6 +299,67 @@ func TestSanitizeSelfReported(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeTarget(t *testing.T) {
+	const max = workersvc.ReviewTargetMaxBytes
+
+	// COSMETIC FOLD: casing, whitespace runs, and ASCII punctuation runs all collapse, so
+	// the same finding phrased differently across runs lands on ONE (category, target)
+	// coordinate the cross-run dedup keys on (issue #232). The two inputs below are the
+	// motivating case — a trailing space + mixed case + a hyphen vs. doubled interior
+	// spaces — and both MUST reach the identical canonical value.
+	const want = "worker git identity setup"
+	if a, b := canonicalizeTarget("Worker Git-Identity Setup ", max), canonicalizeTarget("worker  git-identity   setup", max); a != b {
+		t.Fatalf("cosmetic variants must collapse: %q vs %q", a, b)
+	}
+	if got := canonicalizeTarget("Worker Git-Identity Setup ", max); got != want {
+		t.Fatalf("canonicalizeTarget(%q) = %q, want %q", "Worker Git-Identity Setup ", got, want)
+	}
+
+	// NEGATIVE OVER-MERGE GUARD. This is the load-bearing test: it pins that the
+	// canonicalizer folds ONLY cosmetic drift and NEVER reorders tokens, drops stopwords,
+	// or stems. "worker clone setup (git identity)" and "worker runner clone setup" share
+	// most words but describe different findings, and they MUST stay distinct — if someone
+	// "improves" canonicalizeTarget into a token-set / stopword / stemming merge, these two
+	// collapse and two genuinely different backlog rows fuse into one a human then reads as
+	// identical (the unsafe over-merge failure mode). Do not relax this into a fuzzy match.
+	if a, b := canonicalizeTarget("worker clone setup (git identity)", max), canonicalizeTarget("worker runner clone setup", max); a == b {
+		t.Fatalf("different findings must NOT merge: both folded to %q", a)
+	}
+	if got := canonicalizeTarget("worker clone setup (git identity)", max); got != "worker clone setup git identity" {
+		t.Errorf("canonicalizeTarget punctuation fold = %q, want %q", got, "worker clone setup git identity")
+	}
+	if got := canonicalizeTarget("worker runner clone setup", max); got != "worker runner clone setup" {
+		t.Errorf("canonicalizeTarget already-canonical = %q, want unchanged", got)
+	}
+
+	// IDEMPOTENCE: folding a canonical value is a no-op, so ingest-then-backfill (or a
+	// double ingest) can never drift the coordinate. Asserted over a spread of shapes.
+	for _, in := range []string{
+		"Worker Git-Identity Setup ", "worker  git-identity   setup",
+		"worker clone setup (git identity)", "api/internal/forge/gitlab.go",
+		"UPPER.snake_case--dashes", "", "   ", "trailing punctuation!!!",
+	} {
+		once := canonicalizeTarget(in, max)
+		if twice := canonicalizeTarget(once, max); once != twice {
+			t.Errorf("not idempotent for %q: once=%q twice=%q", in, once, twice)
+		}
+	}
+
+	// A few more shape assertions: empty/whitespace-only fold to empty; a filename-style
+	// target folds its separators (that is the point — one coordinate per file, not per
+	// punctuation style).
+	for _, tc := range []struct{ name, in, want string }{
+		{"empty stays empty", "", ""},
+		{"whitespace only folds to empty", "  \t \n ", ""},
+		{"leading/trailing punctuation trimmed", "  --foo bar--  ", "foo bar"},
+		{"case folded", "ShellCheck", "shellcheck"},
+	} {
+		if got := canonicalizeTarget(tc.in, max); got != tc.want {
+			t.Errorf("%s: canonicalizeTarget(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestWorkerRegisterSanitizesVersion(t *testing.T) {
 	// A hostile worker smuggles a control char (terminal escape) in `version`.
 	// Register succeeds and the persisted/echoed version is stripped clean.

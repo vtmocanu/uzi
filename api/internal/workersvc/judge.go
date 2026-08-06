@@ -63,6 +63,10 @@ const (
 	judgeMissCandidateCap = 2 * judgeMaxMissingTools
 )
 
+// judgeKnownTargetsCap bounds the improve_uzi target menu delivered on a judge claim
+// (issue #232). Bounded so a user with a large backlog cannot bloat the claim/prompt.
+const judgeKnownTargetsCap int32 = 50
+
 // JudgeSignal is the API-side deterministic pre-scan the judge claim carries (PRD #46
 // Decision 4): command-not-found / missing-executable hits found in the reviewed
 // run's tool_result output. The judge interprets them (which tool, which agent) and,
@@ -747,19 +751,35 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		}
 	}
 
+	// The owner's existing improve_uzi target coordinates (issue #232), read best-effort:
+	// a lookup failure must NOT fail the claim — the menu is an optimization that helps the
+	// judge reuse an exact target string, and the review still lands without it. Warn and
+	// proceed with a nil menu, mirroring judgeSignal's best-effort posture above. Owner-
+	// scoped (run.UserID), so it can never carry another user's targets.
+	var knownTargets []string
+	if kt, err := s.q.ListKnownImproveUziTargetsForUser(ctx, store.ListKnownImproveUziTargetsForUserParams{
+		UserID: run.UserID,
+		Lim:    judgeKnownTargetsCap,
+	}); err != nil {
+		slog.Warn("judge claim: list known improve_uzi targets", "user", run.UserID.String(), "error", err)
+	} else {
+		knownTargets = kt
+	}
+
 	return &ClaimPayload{
-		RunID:            run.ID.String(),
-		Kind:             run.Kind,
-		IssueTitle:       run.IssueTitle,
-		IssueDescription: run.IssueDescription,
-		Status:           run.Status,
-		TargetRunID:      targetRunID,
-		JudgeModel:       judgeModel,
-		JudgeSignal:      signal,
-		SessionID:        textPtr(run.SessionID),
-		LastSeq:          run.LastSeq,
-		IterationCount:   run.IterationCount,
-		RequeueCount:     run.RequeueCount,
+		RunID:                  run.ID.String(),
+		Kind:                   run.Kind,
+		IssueTitle:             run.IssueTitle,
+		IssueDescription:       run.IssueDescription,
+		Status:                 run.Status,
+		TargetRunID:            targetRunID,
+		JudgeModel:             judgeModel,
+		JudgeSignal:            signal,
+		KnownImproveUziTargets: knownTargets,
+		SessionID:              textPtr(run.SessionID),
+		LastSeq:                run.LastSeq,
+		IterationCount:         run.IterationCount,
+		RequeueCount:           run.RequeueCount,
 		Secrets: ClaimSecrets{
 			// ForgeUsername/ForgePAT are left empty by design: a judge never touches a
 			// repo. The wire still carries the (empty) forge_pat key because a judge run

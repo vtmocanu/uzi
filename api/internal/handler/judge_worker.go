@@ -365,8 +365,14 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 			return workersvc.ReviewSubmission{}, errors.New("confidence must be empty|low|medium|high")
 		}
 		sub.Recommendations = append(sub.Recommendations, workersvc.ReviewRecommendation{
-			Category:    rec.Category,
-			Target:      slacksvc.ScrubSecrets(sanitizeSelfReported(rec.Target, workersvc.ReviewTargetMaxBytes)),
+			Category: rec.Category,
+			// canonicalizeTarget runs LAST, AFTER control/Cf stripping (sanitizeSelfReported)
+			// and secret scrubbing (ScrubSecrets), so those still see the raw bytes and this
+			// only folds the already-clean result's cosmetic casing/whitespace/punctuation
+			// drift (issue #232). Re-bounded to the same ReviewTargetMaxBytes — folding never
+			// grows a string, so the cap is a formality here, but keeping it makes the byte
+			// bound hold no matter which order a future edit reshuffles these into.
+			Target:      canonicalizeTarget(slacksvc.ScrubSecrets(sanitizeSelfReported(rec.Target, workersvc.ReviewTargetMaxBytes)), workersvc.ReviewTargetMaxBytes),
 			RationaleMd: slacksvc.ScrubSecrets(sanitizeReviewText(rec.Rationale, workersvc.ReviewRationaleMaxBytes)),
 			Confidence:  rec.Confidence,
 		})
