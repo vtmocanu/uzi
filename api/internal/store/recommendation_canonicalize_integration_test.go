@@ -174,11 +174,38 @@ func TestCanonicalizeRecommendationTargetsMigrationLiveDB(t *testing.T) {
 		`INSERT INTO recommendation_filed_issues (id, review_id, category, target, filing_since)
 		 VALUES ($1, $2, 'improve_agent', 'bar--baz', now())`, uuid.New(), r3)
 
+	// ── R4: non-ASCII discrimination — COLLATE "C" in 00097 is load-bearing ──
+	// The raw target carries a curly apostrophe U+2019 (a NON-ASCII byte run). Both
+	// handler.canonicalizeTarget (RE2's ASCII-only [:punct:]) and the migration (via
+	// COLLATE "C") treat that byte run as opaque and KEEP it, folding only the ASCII casing,
+	// whitespace and ASCII punctuation around it. Drop COLLATE "C" from the migration and
+	// Postgres's locale-aware POSIX [:punct:] would fold U+2019 → space under en_US.utf8,
+	// yielding "worker s git identity" — a value ingest never produces, so a pre-migration
+	// disposition would de-link and resurface as todo. One rec + one disposition on the SAME
+	// raw coordinate so the join-consistency check exercises that de-link path. This fixture
+	// is the ONLY one here that discriminates COLLATE "C"; the ASCII fixtures above are no-ops
+	// for it (see 00097's header).
+	const rawCurly = "Worker’s  Git-Identity"
+	r4 := newReview(104)
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, 'improve_agent', $2, 'r', 'high')`, r4, rawCurly)
+	mustExec(ctx, t, pool,
+		`INSERT INTO recommendation_dispositions (review_id, category, target, status, rationale_hash, set_by_user_id)
+		 VALUES ($1, 'improve_agent', $2, 'done', 'h', $3)`, r4, rawCurly, userID)
+
 	// Sanity: the fixtures fold to what we expect, computed via the migration's own SQL
 	// expression (the test's oracle) — so a fixture typo can't quietly pass the asserts.
 	wantJoin := canonicalTargetSQL(ctx, t, pool, rawJoin)
 	if wantJoin != "worker git identity setup" {
 		t.Fatalf("fixture oracle drift: %q folded to %q", rawJoin, wantJoin)
+	}
+	// The oracle (canonicalTargetSQL) carries its OWN COLLATE "C" independent of 00097, so
+	// wantCurly stays "worker’s git identity" (U+2019 KEPT) even if the migration's COLLATE "C"
+	// is later dropped — that is precisely what turns such a drop into a test failure below.
+	wantCurly := canonicalTargetSQL(ctx, t, pool, rawCurly)
+	if wantCurly != "worker’s git identity" {
+		t.Fatalf("fixture oracle drift: %q folded to %q, want the U+2019 KEPT (\"worker’s git identity\")", rawCurly, wantCurly)
 	}
 
 	// ── replay the migration's EXACT Up SQL against the pre-canonical rows ──
@@ -205,6 +232,24 @@ func TestCanonicalizeRecommendationTargetsMigrationLiveDB(t *testing.T) {
 		   ON rr.review_id = f.review_id AND rr.category = f.category AND rr.target = f.target
 		 WHERE f.review_id = $1`, r1); n != 1 {
 		t.Errorf("R1 filed link must stay LINKED to its rec after the fold, joined rows = %d", n)
+	}
+
+	// R4: the curly apostrophe (U+2019) SURVIVES the fold — proving COLLATE "C" kept the
+	// transform ASCII-only — while the ASCII casing/whitespace/punctuation around it folds.
+	// Comparing against wantCurly (oracle, which keeps its own COLLATE "C") is the discriminator:
+	// drop COLLATE "C" from 00097 and the migration folds this rec to "worker s git identity",
+	// mismatching the expected "worker’s git identity", so this assertion FAILS.
+	if got := scalarText(ctx, t, pool,
+		`SELECT target FROM review_recommendations WHERE review_id = $1`, r4); got != wantCurly {
+		t.Errorf("R4 rec target = %q, want canonical %q (U+2019 preserved, ASCII folded/lowercased)", got, wantCurly)
+	}
+	// And the disposition on that coordinate stays LINKED to its rec — no de-link across the fold.
+	if n := scalarInt(ctx, t, pool,
+		`SELECT count(*) FROM recommendation_dispositions d
+		 JOIN review_recommendations rr
+		   ON rr.review_id = d.review_id AND rr.category = d.category AND rr.target = d.target
+		 WHERE d.review_id = $1 AND rr.target = $2`, r4, wantCurly); n != 1 {
+		t.Errorf("R4 disposition must stay LINKED to its rec on the canonical (U+2019-preserving) target, joined rows = %d", n)
 	}
 
 	// R2: exactly one disposition survives the collision, and it is the deterministic winner
