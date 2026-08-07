@@ -4,7 +4,7 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-## [Unreleased]
+## [0.19.0] - 2026-08-07
 
 ### Added
 
