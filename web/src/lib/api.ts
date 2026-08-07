@@ -2485,6 +2485,11 @@ const realApi = {
   },
   unreadNotificationCount: () =>
     request<{ unread: number }>("GET", "/notifications/unread_count"),
+  // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
+  // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')
+  // — the same scope predicate the /runs page's ListRunsForUser uses (Decision 4).
+  runsInProgressCount: () =>
+    request<{ count: number }>("GET", "/me/runs/in-progress-count"),
   markNotificationRead: (id: string) =>
     request<{ notification: Notification }>(
       "POST",

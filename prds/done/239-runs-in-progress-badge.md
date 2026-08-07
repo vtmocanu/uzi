@@ -1,7 +1,7 @@
 # PRD #239: Runs-in-progress count badge on the Runs menu item
 
 **GitLab Issue**: [#239](https://gitlab.example.com/vtmocanu/uzi/-/issues/239)
-**Status**: Draft (created 2026-08-07; reviewed same day by an architect agent against the codebase — 5 documentation-accuracy fixes applied, no blockers: `ListRunsForUser` rename, kind-set pinned, "same scope predicate" not "to the digit", `unread_count` is `RequireAuth` not `RequireUser`, favicon's third status idiom surfaced. See the Decision Log.)
+**Status**: Done (implemented 2026-08-07 on branch `agent/issue-239`; all three milestones complete and reviewed — reviewer/auditor/web-ux clean, no blockers. Created same day; reviewed by an architect agent against the codebase — 5 documentation-accuracy fixes applied, no blockers: `ListRunsForUser` rename, kind-set pinned, "same scope predicate" not "to the digit", `unread_count` is `RequireAuth` not `RequireUser`, favicon's third status idiom surfaced. See the Decision Log.)
 **Priority**: Low
 **Mock**: `prds/mockups/239-runs-in-progress-badge-mock.html` (shown to owner 2026-08-07)
 
@@ -129,41 +129,66 @@ strict subset of what the page lists.
 ## Milestones
 
 ### M1 — Count endpoint (`api`)
-- [ ] `count(*)` query in `api/internal/store/queries/runtime.sql` (home of the
+- [x] `count(*)` query in `api/internal/store/queries/runtime.sql` (home of the
   run-lifecycle queries and the analogous per-worker `CountWorkerNonTerminalRuns`),
   owner-scoped, non-terminal (per Decision 1), with the `kind NOT IN ('chat','judge')`
   filter from Decision 4. `sqlc generate` regenerates the `.sql.go` const (verify the
-  const moved, per `.claude/rules/go.md`).
-- [ ] `GET /api/me/runs/in-progress-count` handler returning `{ "count": <int> }`,
+  const moved, per `.claude/rules/go.md`). — `CountInProgressRunsForUser`; const present
+  in `api/internal/store/runtime.sql.go`.
+- [x] `GET /api/me/runs/in-progress-count` handler returning `{ "count": <int> }`,
   mounted on `RequireUser`, mirroring `WorkerUpgradeSummary` / `UnreadNotificationCount`.
-- [ ] Live-DB test (`*LiveDB`) exercising the query across every status (proves it
+  — `RunsInProgressCount` in `api/internal/handler/runs_in_progress_count.go`; route in
+  `handler.go`; route-limiter mount guard row added.
+- [x] Live-DB test (`*LiveDB`) exercising the query across every status (proves it
   runs against real Postgres, per the sqlc-green-is-not-evidence rule), plus a handler
-  test for the auth + shape.
-- [ ] `task gate:api` green (incl. `-race`, ratcheted lint, deadcode-at-zero).
+  test for the auth + shape. — `TestCountInProgressRunsForUserLiveDB` (all 9 statuses +
+  chat + judge + cross-user), `--- PASS` via `./e2e/run-store-it.sh`; handler tests
+  `TestRunsInProgressCountRequireAuth` / `...Shape`.
+- [x] `task gate:api` green (incl. `-race`, ratcheted lint, deadcode-at-zero). —
+  fmt/vet/build/deadcode/`-race` all green; the ratcheted `lint:api` reports only the
+  pre-existing inherited backlog because this clone's `origin/main` is a frozen mirror
+  ~1375 commits behind the branch base, so it surfaces the whole backlog as false "new"
+  findings. Verified this run's changed `.go` files carry ZERO findings in the unfiltered
+  golangci-lint backlog.
 
 ### M2 — Runs nav badge (`web`)
-- [ ] `api.runsInProgressCount()` in `web/src/lib/api.ts` (real), with the matching
+- [x] `api.runsInProgressCount()` in `web/src/lib/api.ts` (real), with the matching
   method in `web/src/mocks/mockApi.ts` (typechecked against `realApi`'s shape — the
-  mock counts non-terminal runs from its own fixtures so the demo build shows it).
-- [ ] `AppShell` owns a `runsInProgress` state + on-navigation poll (same cadence and
+  mock counts non-terminal runs from its own fixtures so the demo build shows it). The
+  mock's `listRuns` was tightened to also exclude `judge` (matching `ListRunsForUser`),
+  so a `judge` fixture never leaks onto the demo `/runs` page.
+- [x] `AppShell` owns a `runsInProgress` state + on-navigation poll (same cadence and
   keep-last-known-on-error handling as the Judge poll), passed to both `SidebarContent`
-  mounts (desktop rail + mobile sheet) and rendered as the Runs `NavItem` `badge`.
-- [ ] Vitest coverage: badge renders the count, hides at 0, survives collapse as the
+  mounts (desktop rail + mobile sheet) and rendered as the Runs `NavItem` `badge` with
+  the default brand `count` tone.
+- [x] Vitest coverage: badge renders the count, hides at 0, survives collapse as the
   sr-only count + dot; mock parity test. **The mock fixture must discriminate the
   boundary** — it must contain terminal *and* non-terminal runs, plus at least one
   `awaiting_*` and one `limit_wait` run, and an excluded `chat`/`judge` run, so the
-  parity test pins Decisions 1 and 4 rather than snapshotting the demo's blind spot.
-- [ ] `task gate:web` green.
+  parity test pins Decisions 1 and 4 rather than snapshotting the demo's blind spot. —
+  a non-terminal `judge` fixture was added; parity test derives the expected count from
+  the fixtures and pins each exclusion. The badge announces `"N in progress"` via a new
+  additive `NavItem` `badgeLabel` prop (a run is never "unread"; the count tone's default
+  noun is unchanged for Notifications/Judge); assertions are still scoped to the Runs nav
+  item with `within()` for robustness.
+- [x] `task gate:web` green. — 1699 tests pass.
 
 ### M3 — CLI parity, docs, and the decision record
-- [ ] **CLI check** (mandatory per the "new functionality ⇒ check `api/cmd/uzi/`"
+- [x] **CLI check** (mandatory per the "new functionality ⇒ check `api/cmd/uzi/`"
   convention): decide whether `uzi runs` / status output should surface the same count.
   Either add it or record it as deliberately out-of-scope with rationale — do not leave
-  the CLI silently stale.
-- [ ] `specs/ai.md` records Decision 1 (the chosen status set) as an AI design decision.
-- [ ] User-facing docs touched only if an existing page enumerates the nav badges;
+  the CLI silently stale. — **No CLI change (deliberate).** `uzi run list` already prints
+  `ID KIND STATUS TITLE` and honours `--json`, so the caller can already derive the
+  in-progress count by counting non-terminal, non-`chat`/`judge` rows; a dedicated count
+  subcommand would be redundant with the badge's ambient-UI purpose. Recorded in
+  `specs/ai.md` §490.
+- [x] `specs/ai.md` records Decision 1 (the chosen status set) as an AI design decision.
+  — `specs/ai.md` §490 records Decisions 1 and 4, the endpoint contract, and the CLI
+  non-decision.
+- [x] User-facing docs touched only if an existing page enumerates the nav badges;
   otherwise none (an inline count needs no new doc page). `web/scripts/check-docs.mjs`
-  stays green.
+  stays green. — no doc enumerates the sidebar badges (`docs/run-activity.md`'s "badge"
+  refs are the page's run-status badges); `check-docs` green in the web gate. No doc change.
 
 ## Success Criteria
 
