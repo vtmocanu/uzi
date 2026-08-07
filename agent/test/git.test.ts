@@ -113,6 +113,47 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.strictEqual(gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-7"]), agentSha, "branch landed at origin");
   });
 
+  it("plants a git author identity so the agent's first commit succeeds with no ambient identity (#234)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 234);
+
+    // The clone carries the planted identity, written repo-local (see runnerCloneForBranch).
+    assert.strictEqual(gitIn(rc.path, ["config", "--get", "user.name"]), "uzi-agent");
+    assert.strictEqual(gitIn(rc.path, ["config", "--get", "user.email"]), "uzi-agent@uzi.local");
+
+    // Behavioral proof: a commit with the auto-detect fallback DISABLED (the passwd-less
+    // runner uid's real condition) succeeds and is authored by the planted identity.
+    fs.writeFileSync(path.join(rc.path, "WORK.txt"), "hi\n");
+    gitIn(rc.path, ["add", "WORK.txt"]);
+    gitIn(rc.path, ["-c", "user.useConfigOnly=true", "commit", "-m", "agent work"]);
+    assert.strictEqual(
+      gitIn(rc.path, ["log", "-1", "--pretty=%an <%ae>"]),
+      "uzi-agent <uzi-agent@uzi.local>",
+    );
+  });
+
+  it("without the planted identity, that same commit fails exit 128 — the control the fix removes (#234)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 235);
+    // Undo the fix's plant to reconstruct the pre-#234 clone state.
+    gitIn(rc.path, ["config", "--unset", "user.name"]);
+    gitIn(rc.path, ["config", "--unset", "user.email"]);
+
+    fs.writeFileSync(path.join(rc.path, "WORK.txt"), "hi\n");
+    gitIn(rc.path, ["add", "WORK.txt"]);
+    let code: number | undefined;
+    try {
+      gitIn(rc.path, ["-c", "user.useConfigOnly=true", "commit", "-m", "agent work"]);
+    } catch (err) {
+      code = (err as { status?: number }).status;
+    }
+    assert.strictEqual(
+      code,
+      128,
+      "no identity + no auto-detect fallback must be the exit-128 failure the fix removes",
+    );
+  });
+
   it("resumes off the branch's origin tip when it already exists at origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // First cycle: commit + fetch-back + push agent/issue-9 to origin.

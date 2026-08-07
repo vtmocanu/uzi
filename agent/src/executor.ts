@@ -23,7 +23,7 @@ import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { LimitReachedError } from "./limit.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
-import { gitEnv } from "./git.js";
+import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
@@ -799,9 +799,9 @@ export class StubExecutor implements Executor {
     await this.git(ctx.worktreePath, ["add", "UZI_RUN.md"]);
     await this.git(ctx.worktreePath, [
       "-c",
-      "user.name=uzi-agent",
+      `user.name=${AGENT_GIT_IDENTITY.name}`,
       "-c",
-      "user.email=uzi-agent@uzi.local",
+      `user.email=${AGENT_GIT_IDENTITY.email}`,
       "-c",
       "commit.gpgsign=false",
       "commit",

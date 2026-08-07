@@ -453,6 +453,20 @@ export class GitCache {
       // the image puts `worker` in the `runner` group, so a worker-uid write here would
       // likely SUCCEED QUIETLY rather than fail loudly.
       await this.disableAutoMaintenance(clonePath, /* asRunner */ true);
+      // Issue #234 — plant the SDK agent's commit identity so its very FIRST `git commit`
+      // does not fail exit-128 (`unable to auto-detect email address`) on the passwd-less
+      // runner uid, which has no /etc/passwd GECOS for git to fall back to. Written
+      // repo-local AS THE RUNNER uid, for the same ownership reason disableAutoMaintenance
+      // is (the clone is runner-owned; a worker-uid write would break the ownership
+      // invariant the plant-a-key analysis above rests on) — and, being repo-local, it
+      // additionally covers the AGENT's own git (the SDK Bash tool), which does NOT go
+      // through gitEnv. `commit.gpgsign=false` mirrors the stub executor so a signing
+      // config reachable from the agent's HOME `.gitconfig` cannot block the commit.
+      // Kept as explicit inline calls (NOT folded into disableAutoMaintenance, whose name
+      // would hide the identity write).
+      await this.runGitAsRunner(clonePath, ["config", "user.name", AGENT_GIT_IDENTITY.name]);
+      await this.runGitAsRunner(clonePath, ["config", "user.email", AGENT_GIT_IDENTITY.email]);
+      await this.runGitAsRunner(clonePath, ["config", "commit.gpgsign", "false"]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
       return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom };
     });
@@ -746,6 +760,10 @@ export class GitCache {
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;
 }
+
+/** The git author identity planted on every runner clone (issue #234) and used by the
+ *  M2 stub executor's own commit, kept in one place so the two paths cannot drift. */
+export const AGENT_GIT_IDENTITY = { name: "uzi-agent", email: "uzi-agent@uzi.local" } as const;
 
 /**
  * git subprocess env. safe.directory=* trusts the daemon-managed dirs
