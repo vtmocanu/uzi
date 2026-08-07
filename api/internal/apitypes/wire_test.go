@@ -71,7 +71,12 @@ var runDTOKeys = []string{
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve", "milestones", "worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	"auto_approve", "milestones",
+	// PRD #122 M2: live progress (id arrays, nil ⇒ null) and the effective per-run
+	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
+	// branches per field. budget_* are load-bearing on the state-ack, not just display.
+	"milestones_completed", "milestones_in_progress", "budget_max_iterations", "budget_wall_seconds",
+	"worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",

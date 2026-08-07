@@ -329,7 +329,7 @@ hook, so it can never reach a signal tool.
       milestones stores exactly the approved list; a run whose lead submits none
       stores NULL and behaves exactly as today; an over-cap, mis-shaped, or
       non-member id is rejected by the api, not merely by the worker.
-- [ ] **M2 — Progress reporting + budget resize (executor AND server)**: the
+- [x] **M2 — Progress reporting + budget resize (executor AND server)**: the
       implement loop reports `completed` (unioned) and `in_progress`
       (overwritten) at each boundary; the iteration cap becomes a total turn
       ceiling scaled by milestone count (Decision 5); **the effective wall clock

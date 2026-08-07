@@ -111,6 +111,80 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 	return encoded
 }
 
+// progressParams validates a worker-reported progress update (Decision 3/12): every
+// reported id MUST be a member of the run's FROZEN list, or the whole set is DROPPED
+// (nil → column untouched), never persisted and never fails the report. Kind-gated to
+// issue runs (Decision 13). Returns (completedJSON, inProgressJSON) jsonb, each nil to
+// leave its column untouched.
+//
+// completed and inProgress are validated INDEPENDENTLY: one being reported (or bad)
+// says nothing about the other. A nil input pointer yields nil output (not reported).
+// A present-but-rejected list also yields nil — additive-optional, a bad set is
+// dropped, not an error. A valid empty list encodes to `[]` (a distinct, meaningful
+// value the SQL union/overwrite handles).
+func progressParams(kind string, frozen []byte, completed, inProgress *[]string) (completedJSON, inProgressJSON []byte) {
+	if kind != RunKindIssue {
+		return nil, nil
+	}
+	ms, err := DecodeMilestones(frozen)
+	if err != nil || len(ms) == 0 {
+		// Nothing to validate membership against — drop both (Decision 12: a non-member
+		// id must never be persisted, and with no frozen list every id is a non-member).
+		return nil, nil
+	}
+	members := make(map[string]bool, len(ms))
+	for _, m := range ms {
+		members[m.ID] = true
+	}
+	return validateProgressIDs(members, completed), validateProgressIDs(members, inProgress)
+}
+
+// validateProgressIDs re-checks one reported id set against the frozen members and
+// encodes it, or returns nil to drop it. nil input → nil output (not reported). The
+// WHOLE list is rejected (→ nil) if it exceeds maxMilestonesPerRun, or any id is
+// empty, mis-shaped (milestoneIDRe), not a frozen member, or a duplicate of another —
+// mirroring validateMilestones' all-or-nothing rule.
+func validateProgressIDs(members map[string]bool, ids *[]string) []byte {
+	if ids == nil {
+		return nil
+	}
+	if len(*ids) > maxMilestonesPerRun {
+		return nil
+	}
+	seen := make(map[string]bool, len(*ids))
+	out := make([]string, 0, len(*ids))
+	for _, id := range *ids {
+		if id == "" || len([]rune(id)) > maxMilestoneIDRunes || !milestoneIDRe.MatchString(id) {
+			return nil
+		}
+		if !members[id] || seen[id] {
+			return nil
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	encoded, err := encodeJSONArray(out)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+// DecodeMilestoneIDs reads a runs.milestones_completed (or _in_progress) jsonb column
+// — an ARRAY OF IDS, not {id,title} objects — into a string slice. A NULL/empty column
+// yields a NIL slice ("nothing reported"), which the DTO renders as JSON null. Malformed
+// jsonb is an error the caller degrades to nil-and-log, mirroring DecodeMilestones.
+func DecodeMilestoneIDs(raw []byte) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DecodeMilestones reads a runs.milestones_frozen (or _candidate) jsonb column into
 // the wire shape. A NULL/empty column yields a NIL slice — "no list", which the
 // claim omits (omitempty) and the run DTO renders as JSON null. Malformed jsonb is

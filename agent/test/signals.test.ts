@@ -291,10 +291,120 @@ describe("buildSignalMcpServer milestones schema gate (PRD #122 M1)", () => {
   });
 });
 
+describe("scanSignals report_progress (PRD #122 M2)", () => {
+  const PROGRESS = "mcp__uzi__report_progress";
+
+  it("extracts progress from a main-thread report_progress tool_use", () => {
+    const r = scanSignals(
+      toolUse(PROGRESS, { completed: ["m1", "m2"], in_progress: ["m3"] }),
+    );
+    assert.deepStrictEqual(r.progress, {
+      completed: ["m1", "m2"],
+      in_progress: ["m3"],
+    });
+  });
+
+  it("does NOT latch progress from a subagent frame (the main-thread guard holds)", () => {
+    // A subagent must never be able to move the run's progress. Both markers together,
+    // and each independently, must be dropped by the isSubagentFrame guard.
+    assert.strictEqual(
+      scanSignals(subagentToolUse(PROGRESS, { completed: ["m1"], in_progress: [] })).progress,
+      undefined,
+    );
+    assert.strictEqual(
+      scanSignals(
+        subagentToolUse(PROGRESS, { completed: ["m1"] }, { subagent_type: "coder" }),
+      ).progress,
+      undefined,
+    );
+    assert.strictEqual(
+      scanSignals(
+        subagentToolUse(PROGRESS, { completed: ["m1"] }, { parent_tool_use_id: "toolu_x" }),
+      ).progress,
+      undefined,
+    );
+  });
+
+  it("drops malformed input without throwing (empty arrays, never a throw)", () => {
+    // A completely empty call still sets progress with two empty arrays (the tool fired).
+    assert.deepStrictEqual(scanSignals(toolUse(PROGRESS, {})).progress, {
+      completed: [],
+      in_progress: [],
+    });
+    // Non-array sides ⇒ empty arrays.
+    assert.deepStrictEqual(
+      scanSignals(toolUse(PROGRESS, { completed: "nope", in_progress: 42 })).progress,
+      { completed: [], in_progress: [] },
+    );
+    // Junk entries dropped, blanks removed, ids trimmed, numbers/booleans coerced, deduped.
+    assert.deepStrictEqual(
+      scanSignals(
+        toolUse(PROGRESS, {
+          completed: ["m1", " m2 ", "m1", "", "  ", null, {}, [], 7, true],
+          in_progress: [],
+        }),
+      ).progress,
+      { completed: ["m1", "m2", "7", "true"], in_progress: [] },
+    );
+  });
+
+  it("clamps an over-long id (worker-side hygiene, not the real cap)", () => {
+    const longId = "x".repeat(200);
+    const r = scanSignals(toolUse(PROGRESS, { completed: [longId], in_progress: [] }));
+    assert.strictEqual([...r.progress!.completed[0]!].length, 64);
+  });
+
+  it("last-wins within one message when report_progress is called twice", () => {
+    const msg = {
+      type: "assistant",
+      session_id: "s",
+      message: {
+        content: [
+          { type: "tool_use", id: "a", name: PROGRESS, input: { completed: ["m1"], in_progress: ["m2"] } },
+          { type: "tool_use", id: "b", name: PROGRESS, input: { completed: ["m1", "m2"], in_progress: [] } },
+        ],
+      },
+    };
+    assert.deepStrictEqual(scanSignals(msg).progress, {
+      completed: ["m1", "m2"],
+      in_progress: [],
+    });
+  });
+});
+
+describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () => {
+  // Mirrors the milestones/prd_done_path schema-gate tests: the tool is registered only
+  // for issue runs (Decision 13), so the model never sees it on a non-issue run.
+  const registeredTools = (server: unknown): Record<string, unknown> => {
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, unknown> } | undefined)?._registeredTools;
+    assert.ok(tools, "expected the sdk server to expose its registered tools");
+    return tools!;
+  };
+
+  it("does NOT register report_progress by default (ci_fix / self_improve)", () => {
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({}), buildSignalMcpServer({ progress: false })]) {
+      const tools = registeredTools(server);
+      assert.ok(!("report_progress" in tools), `report_progress must be absent; got ${Object.keys(tools).join(", ")}`);
+    }
+  });
+
+  it("registers report_progress (with both id-array params) when enabled", () => {
+    const tools = registeredTools(buildSignalMcpServer({ progress: true }));
+    const progress = tools["report_progress"] as { inputSchema?: { shape?: Record<string, unknown> } } | undefined;
+    assert.ok(progress, `expected a report_progress tool; got ${Object.keys(tools).join(", ")}`);
+    const shape = progress!.inputSchema?.shape;
+    assert.ok(shape, "expected a zod object schema with a shape");
+    assert.ok("completed" in shape! && "in_progress" in shape!, `expected completed + in_progress; got ${Object.keys(shape!).join(", ")}`);
+  });
+});
+
 describe("isSignalToolName", () => {
   it("matches the qualified signal tools only", () => {
     assert.strictEqual(isSignalToolName("mcp__uzi__submit_plan"), true);
     assert.strictEqual(isSignalToolName("mcp__uzi__signal_done"), true);
+    // PRD #122 M2: report_progress is filtered from the persisted stream too.
+    assert.strictEqual(isSignalToolName("mcp__uzi__report_progress"), true);
     assert.strictEqual(isSignalToolName("submit_plan"), false);
     assert.strictEqual(isSignalToolName("Bash"), false);
     assert.strictEqual(isSignalToolName(undefined), false);

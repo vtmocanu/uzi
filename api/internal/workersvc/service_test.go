@@ -146,8 +146,12 @@ type fakeStore struct {
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
 	claimCutoff pgtype.Timestamptz
-	runCutoff   pgtype.Timestamptz
-	sweepMax    int32
+	// PRD #122 M2 (Decision 5b): SweepRunningTimeout takes a per-run cutoff now — the
+	// server passes `now` and the global timeout, and the SQL subtracts the per-run
+	// effective wall clock. These capture what the sweep passed.
+	runNow                  pgtype.Timestamptz
+	runGlobalTimeoutSeconds int32
+	sweepMax                int32
 	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
 	sweptClaimed  []store.SweepClaimedNeverStartedRow
 	sweptTimeout  []store.SweepRunningTimeoutRow
@@ -558,7 +562,8 @@ func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (
 	return 1, nil
 }
 func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
-	f.runCutoff = arg.Cutoff
+	f.runNow = arg.Now
+	f.runGlobalTimeoutSeconds = arg.GlobalTimeoutSeconds
 	f.callOrder = append(f.callOrder, "running_timeout")
 	return f.sweptTimeout, nil
 }
@@ -1545,8 +1550,13 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	if !fs.claimCutoff.Time.Equal(fixed.Add(-5 * time.Minute)) {
 		t.Fatalf("claim cutoff = %v, want now-5m", fs.claimCutoff.Time)
 	}
-	if !fs.runCutoff.Time.Equal(fixed.Add(-2 * time.Hour)) {
-		t.Fatalf("run cutoff = %v, want now-2h", fs.runCutoff.Time)
+	// PRD #122 M2 (Decision 5b): the sweep passes `now` and the GLOBAL timeout (2h in
+	// seconds); the per-run subtraction happens in SQL against each run's budget.
+	if !fs.runNow.Time.Equal(fixed) {
+		t.Fatalf("run sweep now = %v, want %v", fs.runNow.Time, fixed)
+	}
+	if fs.runGlobalTimeoutSeconds != 7200 {
+		t.Fatalf("run global timeout = %d, want 7200", fs.runGlobalTimeoutSeconds)
 	}
 	if fs.sweepMax != 1 {
 		t.Fatalf("max requeues passed = %d, want 1", fs.sweepMax)

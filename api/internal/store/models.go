@@ -310,6 +310,10 @@ type Run struct {
 	RequireBaseMatch      bool               `json:"require_base_match"`
 	MilestonesCandidate   []byte             `json:"milestones_candidate"`
 	MilestonesFrozen      []byte             `json:"milestones_frozen"`
+	MilestonesCompleted   []byte             `json:"milestones_completed"`
+	MilestonesInProgress  []byte             `json:"milestones_in_progress"`
+	BudgetMaxIterations   pgtype.Int4        `json:"budget_max_iterations"`
+	BudgetWallSeconds     pgtype.Int4        `json:"budget_wall_seconds"`
 }
 
 type RunMessage struct {

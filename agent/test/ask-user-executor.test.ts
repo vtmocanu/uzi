@@ -282,7 +282,11 @@ describe("PRD #88 — fail-open and the shared budget", () => {
       [askUser(Q), resultSuccess()], // iteration 1: asks
       [assistantText("implementing"), signalDone(), resultSuccess()], // still iteration 1
     ]);
-    const probe = makeCtx({ reportIteration: (n) => iterations.push(n) });
+    const probe = makeCtx({
+      reportIteration: (n) => {
+        iterations.push(n);
+      },
+    });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepEqual(iterations, [1, 1], "the clarification turn must not advance the iteration counter");
   });

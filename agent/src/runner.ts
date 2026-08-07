@@ -16,6 +16,7 @@ import type {
   AskUserQuestion,
   ClaimConfig,
   ClaimResponse,
+  IterationBudget,
   Milestone,
   StateAck,
   StateRequest,
@@ -685,13 +686,37 @@ export class RunRunner {
             claim.config ?? null,
           ),
         pullFollowUp: () => steering.pullFollowUp(),
-        reportIteration: (iteration) => {
-          void reportState({
-            status: "running",
-            iteration_count: iteration,
-          }).catch((e) =>
-            runLog.warn("could not report iteration", { error: errMessage(e) }),
-          );
+        // PRD #122 M2: carry the lead's live progress into the `running` report and return
+        // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
+        // forget void) so the loop can apply the budget — but still fire-and-forget in
+        // spirit: reportState has bounded retries, and the try/catch here guarantees a
+        // failed report returns undefined ("no budget update") rather than failing the run.
+        reportIteration: async (iteration, progress) => {
+          try {
+            const ack = await reportState({
+              status: "running",
+              iteration_count: iteration,
+              // Omit the fields entirely when the lead has reported no progress, so the
+              // wire shape matches an old worker's (additive-optional, never null/[]).
+              ...(progress
+                ? {
+                    milestones_completed: progress.completed,
+                    milestones_in_progress: progress.in_progress,
+                  }
+                : {}),
+            });
+            const b: IterationBudget = {};
+            if (typeof ack.budgetMaxIterations === "number")
+              b.maxIterations = ack.budgetMaxIterations;
+            if (typeof ack.budgetWallSeconds === "number")
+              b.wallSeconds = ack.budgetWallSeconds;
+            return b.maxIterations !== undefined || b.wallSeconds !== undefined
+              ? b
+              : undefined;
+          } catch (e) {
+            runLog.warn("could not report iteration", { error: errMessage(e) });
+            return undefined;
+          }
         },
       };
 

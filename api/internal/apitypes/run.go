@@ -54,9 +54,27 @@ type RunDTO struct {
 	// nil on the create/worker DTO paths. The pre-approval CANDIDATE list is never
 	// exposed here — only the frozen list is served.
 	Milestones []Milestone `json:"milestones"`
-	WorkerID   *string     `json:"worker_id"`
-	Branch     *string     `json:"branch"`
-	MrIID      *int64      `json:"mr_iid"`
+	// MilestonesCompleted and MilestonesInProgress are the run's live progress (PRD #122
+	// M2), decoded from runs.milestones_completed / _in_progress: arrays of frozen
+	// milestone IDS (not {id,title} objects — the titles live on Milestones above; these
+	// reference into it). completed is the server-unioned monotone done set; in_progress
+	// the latest-reported snapshot. A nil slice marshals to JSON null — the back-compat
+	// contract, so a run whose lead never reported progress reads null and the web derives
+	// nothing. Populated only on the run reads (where the store is in reach); nil on the
+	// create/worker DTO paths.
+	MilestonesCompleted  []string `json:"milestones_completed"`
+	MilestonesInProgress []string `json:"milestones_in_progress"`
+	// BudgetMaxIterations and BudgetWallSeconds are the run's EFFECTIVE budget (PRD #122
+	// M2, Decision 5/5b), derived server-side from the frozen milestone count at freeze
+	// and persisted. Each is null when the run is on the GLOBAL default (a 0/1-milestone
+	// run, byte-for-byte today). This is load-bearing on the state-report ack, not just
+	// display: the worker reads these off the {run: RunDTO} response to learn its scaled
+	// turn ceiling and wall clock mid-run.
+	BudgetMaxIterations *int    `json:"budget_max_iterations"`
+	BudgetWallSeconds   *int    `json:"budget_wall_seconds"`
+	WorkerID            *string `json:"worker_id"`
+	Branch              *string `json:"branch"`
+	MrIID               *int64  `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL

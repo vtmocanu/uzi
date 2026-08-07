@@ -1540,9 +1540,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
-			RunTimeoutSeconds:      int(s.p.RunTimeout.Seconds()),
+			// PRD #122 M2 (Decision 5/5b): serve the EFFECTIVE per-run budget from the
+			// persisted columns, falling back to the global default when NULL (a 0/1-
+			// milestone run, byte-for-byte today). The worker also reads the scaled wall
+			// clock off the state-ack, but the claim carries it too for a fresh resume.
+			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
-			MaxIterations:          s.p.RunMaxIterations,
+			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
@@ -2316,6 +2320,16 @@ type StateRequest struct {
 	// and kind-gated here (Decision 12/13), never trusted from the worker — a rejected
 	// list is DROPPED, not persisted, and never fails the report.
 	Milestones *[]Milestone `json:"milestones"`
+	// MilestonesCompleted and MilestonesInProgress are the run's live PROGRESS report
+	// (PRD #122 M2), each a POINTER to a slice of frozen milestone IDS for the same
+	// tri-state as RepoAgents/Milestones: absent (nil) = this call reports nothing about
+	// that set; `[]` = an explicitly empty set; non-empty = the ids. They ride `running`
+	// reports only. completed is UNIONED server-side (monotone, dedup); in_progress is
+	// OVERWRITTEN wholesale (Decision 3). Every id is membership-checked against the run's
+	// FROZEN list and kind-gated here (progressParams, Decision 12/13); a rejected set is
+	// DROPPED, never persisted, and never fails the report.
+	MilestonesCompleted  *[]string `json:"milestones_completed"`
+	MilestonesInProgress *[]string `json:"milestones_in_progress"`
 	// AgentSelection is the default an AUTOPILOT run resolved for itself (Decision 6).
 	// Such a run self-approves the gate and never receives a SubmitInput, so the state
 	// report is its only channel for recording which roster it used. A human-gated run
@@ -2374,6 +2388,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.SessionID = sessionID
 		runningParams.ID = runID
 		runningParams.WorkerID = pgUUID(wkr.ID)
+		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the SQL freeze reads.
+		// Harmless on every heartbeat (the query COALESCEs the derived budget against the
+		// existing immutable columns, so only the FIRST report that carries a frozen list
+		// writes it — a later report re-supplies the same config and changes nothing).
+		runningParams.RunMaxIterations = int32(s.p.RunMaxIterations)
+		runningParams.RunTimeoutSeconds = int32(s.p.RunTimeout.Seconds())
+		runningParams.MilestoneBudgetCap = milestoneBudgetCap
+		runningParams.BudgetWallCeilingSeconds = budgetWallCeilingSeconds
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
@@ -2469,6 +2491,13 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	// RepoAgents/AgentSelection paths below, a bad milestone list is DROPPED rather
 	// than failing the report — additive-optional.
 	p.MilestonesFrozen = milestonesParam(run.Kind, req.Milestones)
+
+	// PRD #122 M2 (Decision 3/12): the live progress sets. Validated + membership-checked
+	// against the run's FROZEN list and kind-gated (progressParams); a bad or non-issue
+	// set is DROPPED to NULL, which the query leaves the column untouched for. completed
+	// is unioned server-side, in_progress overwritten. Additive-optional, never fails the
+	// report.
+	p.MilestonesCompleted, p.MilestonesInProgress = progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, req.MilestonesInProgress)
 
 	if req.RepoAgents != nil {
 		if err := validateRepoAgents(*req.RepoAgents); err != nil {
@@ -3492,6 +3521,14 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	}
 	if _, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
 		RunID: run.ID, Body: pgText(string(body)), AgentSource: pgText(sel.Source), AgentExclusions: exclusions,
+		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
+		// this run's effective budget from its frozen milestone count, atomically with the
+		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
+		// same config and never changes a budget frozen once.
+		RunMaxIterations:         int32(s.p.RunMaxIterations),
+		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
+		MilestoneBudgetCap:       milestoneBudgetCap,
+		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}
@@ -3672,7 +3709,6 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	now := s.now()
 	staleCutoff := pgTime(now.Add(-s.p.WorkerHeartbeatStale))
 	claimCutoff := pgTime(now.Add(-s.p.ClaimGrace))
-	runCutoff := pgTime(now.Add(-s.p.RunTimeout))
 	max := int32(s.p.RunMaxRequeues)
 
 	var res SweepResult
@@ -3694,9 +3730,13 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.persistFail.evict(r.ID)
 	}
 
+	// PRD #122 M2 (Decision 5b): a PER-RUN cutoff now — the sweep honours each run's
+	// persisted budget_wall_seconds, falling back to the global RUN_TIMEOUT for a
+	// NULL-budget run, so a scaled run is not failed at the global 2h.
 	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
-		FailureReason: pgText("run exceeded RUN_TIMEOUT"),
-		Cutoff:        runCutoff,
+		FailureReason:        pgText("run exceeded RUN_TIMEOUT"),
+		Now:                  pgTime(now),
+		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
 	})
 	if err != nil {
 		return res, fmt.Errorf("sweep running-timeout: %w", err)
@@ -3965,6 +4005,16 @@ func textPtr(t pgtype.Text) *string {
 	}
 	s := t.String
 	return &s
+}
+
+// coalesceInt returns the persisted int4 when present and def otherwise (PRD #122
+// M2): a NULL budget column means "use the global default", so a 0/1-milestone run
+// serves the same caps as a pre-feature run.
+func coalesceInt(v pgtype.Int4, def int) int {
+	if !v.Valid {
+		return def
+	}
+	return int(v.Int32)
 }
 
 // isUniqueViolation reports whether err is a Postgres unique-constraint failure.
