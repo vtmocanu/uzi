@@ -16,7 +16,9 @@
 > - **M6 shrinks to a delta over #218**, not a foundation. #218 fetches back only on park + graceful SIGTERM, so a hard **SIGKILL** (OOM, node kill with no grace window) still loses everything since the last fetch-back. M6's residual value is the *proactive milestone-boundary checkpoint* (reap + fetch-back while the run is alive), bounding that loss to "since the last milestone", and it must adopt #218's `uzi-trackowner` anchor + `seededFrom` machinery rather than re-deriving Decision 9.
 > - **Phase 2 file:line citations are STALE** — written against a pre-#218 tree that #218 rewrote. Re-derive against HEAD before citing (current symbols: `RUNNER_TRACKING_PREFIX`, `seededFrom`, `fetchBackBestEffort`).
 > - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
-> - **The one open Phase-1 decision the review flagged**: the budget **hard ceiling** (Decision 5, Risks) is still hand-waved as "capped" with no number. Pin a concrete milestone-count cap AND an absolute turn/wall-clock ceiling before M2, and enforce them server-side (Decision 12). This needs a maintainer call, not an invented default.
+> - **The budget hard ceiling is now DECIDED (2026-08-07)**: profile "Generous" — milestone-count cap **12**, total turn ceiling `RUN_MAX_ITERATIONS × min(n, 12)` (≤ 60 turns), absolute wall-clock ceiling **8h**; single-milestone plans stay at today's 5 turns / 2h, and the count cap is enforced server-side (Decision 12). M2 implements it. See the 2026-08-07 Decision Log entry.
+>
+> **M1 status (2026-08-07): DONE, merged (MR !194, `3d0720ee`).** `submit_plan.milestones` + main-thread extraction + the `00098` two-column store + DTO + Decision-12 validation all landed. M2 is next: progress reporting (union) + the budget resize, whose server half (Decision 5b) is the load-bearing part.
 
 ## Problem
 
@@ -626,3 +628,32 @@ hook, so it can never reach a signal tool.
   re-derivation at implementation time. The open Phase-1 decision remains the
   budget **hard ceiling** — still unnumbered, a maintainer call before M2. This
   is a documentation re-scope only; no code changed.
+- **2026-08-07 — M1 landed (MR !194, merge `3d0720ee`), and the budget hard
+  ceiling was decided.** M1 shipped via a seeded uzi run (`bc631d9c`) as
+  `feat(milestones): M1 …` (`52598983`): `submit_plan.milestones` (schema-gated to
+  issue runs, Decision 13), main-thread-only extraction, the two-column store
+  (`00098_run_milestones.sql`: `milestones_candidate` / `milestones_frozen` jsonb,
+  `NULL ≠ '[]'`), the DTO field, and the Decision 12 server-side validation. Notes
+  for whoever picks up M2, none of which change the design but all of which the M2
+  plan should assume rather than rediscover:
+  - **The milestone type lives in `apitypes` (`Milestone{ID,Title}`) with a
+    `workersvc.Milestone` type ALIAS** (`api/internal/workersvc/milestones.go`),
+    mirroring `RepoAgent`/`AgentSelection`, so `apitypes` stays the stdlib-only
+    leaf the CLI links (PRD #64 M1). M2 reads the frozen list from there.
+  - **The Decision 12 count cap landed at 50** (`maxMilestonesPerRun`), a
+    whole-list reject (not a clamp), with a strict ASCII id-shape regex
+    `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, dup-id reject, and a 200-rune title cap
+    through `hasUnsafeChar` + `stripNUL`. This is the storage/hygiene cap and is
+    **independent of the budget-scaling cap below** — a run may legitimately store
+    up to 50 milestones while M2 scales the budget on only the first N of them.
+  - **The budget hard ceiling (the open Phase-1 decision above) is now set:
+    profile "Generous" — milestone-count cap 12, total turn ceiling
+    `RUN_MAX_ITERATIONS × min(n, 12)` (so ≤ 60 turns), absolute wall-clock ceiling
+    8h.** A single-milestone plan stays exactly at today's 5 turns / 2h; the 10m
+    idle timeout remains the real stall detector. M2 enforces the count cap
+    **server-side** (Decision 12's chokepoint), not worker-side, since a
+    worker-side cap is not a control. Decision 5 (the scaling formula) and Decision
+    5b (the persisted per-run effective timeout that `SweepRunningTimeout` must
+    honour, plus the run-health "slow" clamp) are M2's load-bearing halves — the
+    server change is what makes the wall-clock scale real, since the sweeper, not
+    the worker, is the enforcement.
