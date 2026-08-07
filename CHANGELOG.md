@@ -16,6 +16,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   the existing `--run` anchor, the filter runs before the server's row cap, so narrowing
   by label makes the "backlog was truncated" banner less likely to bite, not more. (#235)
 
+### Changed
+
+- **Built-in agent roles refreshed from the role library.** The shipped agent roster
+  (architect, coder, auditor, documenter, fact-checker, researcher, lead, web-ux) picked
+  up judge-recommendation improvements and was re-synced from the role library, so new
+  runs get sharper role instructions. (8199f8e8)
+
 ## [0.18.0] - 2026-08-07
 
 ### Added
