@@ -1565,3 +1565,143 @@ func TestJudgeBacklogIsTenantScopedLiveDB(t *testing.T) {
 			"because someone else settled theirs", got.DispositionStatus.String)
 	}
 }
+
+// TestJudgeBacklogCategoryFilterPreCapLiveDB pins the load-bearing property of the
+// ?category= filter (PRD #235 M1): it is enforced in SQL BEFORE the row-cap LIMIT, in the
+// same owner-scoped WHERE the run_anchor semi-join already lives in — NOT in Go after the
+// grouper. Two guarantees live only in that predicate and nowhere in Go:
+//
+//  1. PRE-CAP ORDERING. The cap (JudgeBacklogMaxRows) is applied BEFORE grouping, so a
+//     post-cap Go filter would let a whole label truncate off-page: if the only rows of a
+//     category sort past the LIMIT, a Go filter renders NOTHING while the true answer is
+//     "several, past the cap". The SQL predicate narrows the rows FIRST, so the cap then
+//     bounds only the selected label and its rows come back even when they would otherwise
+//     be off-page. This test seeds a category whose only rows sort PAST a small Lim behind a
+//     larger block of a different category, filters to it, and asserts they still return.
+//  2. NULL = all labels; ANY(...) = the OR-union. A nil Categories slice maps to SQL NULL
+//     and is a no-op (every label); a multi-value slice returns the union of those labels.
+//
+// WHY THIS MUST BE A LIVE-DB TEST. The handler's fake backlogStore returns its seeded rows
+// VERBATIM and ignores every param (Categories included), so it cannot demonstrate a SQL
+// filter at all — worse, a fake-store test would apply the filter in Go AFTER the cap and
+// therefore PASS on the very off-page bug this predicate exists to prevent. Only real
+// Postgres, ordering and cutting the rows itself, can show the filter running before the
+// LIMIT. Modelled on TestJudgeBacklogRunAnchorLiveDB; SKIPs without UZI_TEST_DATABASE_URL.
+func TestJudgeBacklogCategoryFilterPreCapLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	owner := uuid.New()
+	connID, repoID := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		owner, fmt.Sprintf("catfilter-%s@e2e", owner))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, owner, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	// One recommendation per run/review, with an EXPLICIT updated_at so the ORDER BY
+	// (rv.updated_at DESC, …) is exact rather than dependent on insert speed — the same
+	// technique TestJudgeBacklogPreviewRecencyLiveDB uses. Targets are namespaced so they
+	// cannot collide with another live-DB test's target-scoped fixture on the shared database.
+	iid := int64(0)
+	seed := func(category, target, updatedAt string) {
+		iid++
+		runID, reviewID := uuid.New(), uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, $5, 'd', 'completed')`, runID, owner, repoID, iid,
+			fmt.Sprintf("run %d", iid))
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict, created_at, updated_at)
+			 VALUES ($1, $2, $3, 'issues', $4::timestamptz, $4::timestamptz)`,
+			reviewID, runID, owner, updatedAt)
+		mustExec(ctx, t, pool,
+			`INSERT INTO review_recommendations (review_id, category, target, rationale_md)
+			 VALUES ($1, $2, $3, 'because')`, reviewID, category, target)
+	}
+
+	// A BLOCK of improve_agent that sorts AHEAD (newest updated_at), and the ONLY rows of two
+	// other labels sitting BEHIND it (older). With a small Lim, the improve_agent block alone
+	// fills the page and the other labels' rows are off-page — which is exactly the truncation
+	// the pre-cap filter must survive.
+	const aheadBlock = 5
+	for i := 0; i < aheadBlock; i++ {
+		seed("improve_agent", fmt.Sprintf("catfilter-agent-%d", i),
+			fmt.Sprintf("2026-07-1%d 09:00:00+00", i)) // 2026-07-10 .. 2026-07-14, all newest
+	}
+	seed("improve_uzi", "catfilter-uzi-a", "2026-07-01 09:00:00+00")
+	seed("improve_uzi", "catfilter-uzi-b", "2026-07-02 09:00:00+00")
+	seed("enable_tool", "catfilter-tool-a", "2026-07-03 09:00:00+00")
+
+	fetch := func(categories []string, lim int32) []store.ListJudgeRecommendationRowsForUserRow {
+		t.Helper()
+		rows, err := q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+			UserID: owner, Categories: categories, Lim: lim,
+		})
+		if err != nil {
+			t.Fatalf("ListJudgeRecommendationRowsForUser(categories=%v, lim=%d): %v", categories, lim, err)
+		}
+		return rows
+	}
+	countByCategory := func(rows []store.ListJudgeRecommendationRowsForUserRow) map[string]int {
+		out := map[string]int{}
+		for _, r := range rows {
+			out[r.Category]++
+		}
+		return out
+	}
+
+	// ---- 1. nil Categories is the no-op: SQL NULL → all labels --------------------------
+	all := fetch(nil, 100)
+	if got := countByCategory(all); len(all) != 8 ||
+		got["improve_agent"] != aheadBlock || got["improve_uzi"] != 2 || got["enable_tool"] != 1 {
+		t.Fatalf("nil filter returned %d rows %v, want all 8 across 3 labels (a NULL predicate must not filter)",
+			len(all), got)
+	}
+
+	// ---- 2. CONTROL: unfiltered, the small cap drops the other labels off-page ----------
+	// This is what makes the pre-cap proof below unambiguous: with Lim smaller than the
+	// improve_agent block, an UNFILTERED read returns only improve_agent — the improve_uzi
+	// rows genuinely sit past the LIMIT, so a Go post-cap filter would see none of them.
+	const smallLim = 3 // < aheadBlock
+	control := fetch(nil, smallLim)
+	if got := countByCategory(control); len(control) != smallLim || got["improve_agent"] != smallLim {
+		t.Fatalf("unfiltered Lim=%d returned %v, want %d rows ALL improve_agent — the other labels must "+
+			"be off-page for the pre-cap proof to mean anything", smallLim, got, smallLim)
+	}
+
+	// ---- 3. THE DECISIVE ONE: the filter runs BEFORE the LIMIT --------------------------
+	// Filter to improve_uzi with the same small Lim. Its rows sort PAST that Lim (proven by
+	// the control above), so if the predicate ran in Go AFTER the cap it would filter the
+	// top-3 (all improve_agent) down to ZERO. Getting both improve_uzi rows back proves the
+	// predicate is in SQL, ahead of the LIMIT.
+	uzi := fetch([]string{"improve_uzi"}, smallLim)
+	if got := countByCategory(uzi); len(uzi) != 2 || got["improve_uzi"] != 2 {
+		t.Fatalf("category=improve_uzi with Lim=%d returned %v, want BOTH improve_uzi rows even though "+
+			"they sort past the cap — the filter must run in SQL before the LIMIT, not in Go after it",
+			smallLim, got)
+	}
+
+	// ---- 4. multi-value is the OR-union -------------------------------------------------
+	union := fetch([]string{"improve_uzi", "enable_tool"}, 100)
+	if got := countByCategory(union); len(union) != 3 ||
+		got["improve_uzi"] != 2 || got["enable_tool"] != 1 || got["improve_agent"] != 0 {
+		t.Fatalf("category=improve_uzi,enable_tool returned %v, want the OR-union (2 improve_uzi + "+
+			"1 enable_tool, no improve_agent)", got)
+	}
+}

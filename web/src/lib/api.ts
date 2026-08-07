@@ -2394,10 +2394,14 @@ const realApi = {
   // the notification deep-link anchor (/judge?run={id}) — it keeps groups recurring in
   // that run while preserving their other-run occurrences. `triage` in the response is
   // the canonical count; render it, never re-derive from `groups`.
-  getJudgeBacklog: (bucket?: JudgeBacklogBucket, run?: string) => {
+  getJudgeBacklog: (bucket?: JudgeBacklogBucket, run?: string, categories?: string[]) => {
     const qs = new URLSearchParams();
     if (bucket) qs.set("bucket", bucket);
     if (run) qs.set("run", run);
+    // ?category= is a comma-joined list, enforced server-side before the row cap (PRD #235,
+    // same shape as ?bucket=/?run=). Empty/absent → no param → all labels. The server does
+    // NOT echo it back on the DTO (Decision 9); the page owns its own ?category= URL state.
+    if (categories && categories.length) qs.set("category", categories.join(","));
     const suffix = qs.toString();
     return request<JudgeBacklog>(
       "GET",

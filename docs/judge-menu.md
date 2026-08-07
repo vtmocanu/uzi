@@ -63,9 +63,9 @@ recurrence, never a competing total.
 
 **If you see a "backlog was truncated" banner, read it as *unknown*, not
 *empty*.** The cap applies before rows are grouped, so a group can be missing
-entirely, and a group that *is* shown can have understated counts. Narrowing by
-`?run=` is the only filter applied before the cap; the bucket tabs filter what
-survived it.
+entirely, and a group that *is* shown can have understated counts. `?run=` and
+the label filter (below) are the two filters applied before the cap; the
+bucket tabs filter what survived it.
 
 ## 4. Where a review shows up now
 
@@ -109,6 +109,31 @@ Two preconditions, both easy to trip:
 
 There is no forge call of its own here and no token spent — it reads the cache
 the normal poll already refreshed.
+
+## 6. Filter by label
+
+Above the bucket tabs, a row of chips — one per recommendation label (Enable
+a tool or skill, Install a worker tool, Adjust an agent template, Improve an
+agent, Add a missing agent, Improve uzi) — narrows the worklist to whichever
+you tick. It's the same six labels every group already shows on its badge,
+now usable as a filter.
+
+Tick more than one and you see groups in **any** of the selected labels, not
+all of them — a recommendation carries exactly one label, so "match all" would
+always show nothing. **Clear** drops the filter and returns every label.
+
+The filter lives in the URL as `?category=`, so it's shareable and
+reproducible from the link alone, and it stacks with everything else: switch
+bucket tabs, follow a `?run=` notification link, or do both, and the label
+selection stays. Like `?run=`, it's applied **before** the row cap (see
+[the tabs, above](#3-the-tabs-and-the-one-number)), so narrowing to one or two
+labels makes the truncation banner *less* likely to show, not more.
+
+The chips don't carry a count today — there's no per-label total the way the
+tabs have a per-bucket one, only the whole-backlog tally at the top of the
+page — so an empty filtered list reads the same as anywhere else on this
+page: nothing in that label *right now*, or unknown if the truncation banner
+is also showing.
 
 ## From the terminal
 

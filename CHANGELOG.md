@@ -4,6 +4,18 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+### Added
+
+- **Filter the Judge backlog by recommendation label.** A row of chips above the bucket
+  tabs — one per label (enable a tool, install a worker tool, adjust a template, improve
+  an agent, add an agent, improve uzi) — narrows the cross-run worklist to whichever you
+  tick. It's multi-select (OR: tick two and see either), lives in the URL as a shareable
+  `?category=`, and `uzi review backlog --category` does the same from the terminal. Like
+  the existing `--run` anchor, the filter runs before the server's row cap, so narrowing
+  by label makes the "backlog was truncated" banner less likely to bite, not more. (#235)
+
 ## [0.18.0] - 2026-08-07
 
 ### Added

@@ -98,8 +98,8 @@ describe("Judge — bucket tabs read the canonical triage, not the groups on scr
     // …but the To-triage tab shows the canonical per-recommendation count (5), NOT 2.
     const tab = screen.getByRole("tab", { name: /To triage/ });
     expect(tab.textContent).toContain("5");
-    // The default fetch is the todo bucket.
-    expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined);
+    // The default fetch is the todo bucket, with an empty category filter (PRD #235).
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, []);
   });
 });
 
@@ -523,14 +523,14 @@ describe("Judge — clearing the run filter keeps the bucket (PRD #98 review N5)
         <Judge />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("all", "run-1"));
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("all", "run-1", []));
 
     fireEvent.click(screen.getByRole("button", { name: /Clear filter/ }));
 
     // Still `all`. Dropping the anchor used to re-derive the default to `todo`, so the rows
     // the user was looking at vanished — they asked to stop filtering by run, not to change
     // which rung they were on.
-    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("all", undefined));
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("all", undefined, []));
   });
 });
 
@@ -668,7 +668,89 @@ describe("Judge — the ?run= deep-link anchor (PRD #98 Decision 4)", () => {
 
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
     // An anchored deep-link defaults to the `all` bucket so the run's recs always show.
-    expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("all", "run-1");
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("all", "run-1", []);
     expect(screen.getByText(/Filtered to one run's recommendations/i)).toBeTruthy();
+  });
+});
+
+// PRD #235 M2 — the recommendation-label filter. The chips are aria-pressed toggle buttons
+// whose accessible name is recommendationLabel(cat); a group's category Badge renders the
+// same text but is a <span>, so a `role: "button"` query addresses the chip unambiguously.
+describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", () => {
+  const chip = (name: string) => screen.getByRole("button", { name });
+
+  it("clicking a chip writes ?category= and re-fetches the backlog narrowed to that label", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    // First fetch is unfiltered.
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, []);
+
+    fireEvent.click(chip("Install a worker tool"));
+
+    // The chip is now pressed and the backlog re-fetches with the selected category — the
+    // param reaches the request, which is the URL write and the re-fetch in one assertion.
+    await waitFor(() =>
+      expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, ["install_worker_tool"]),
+    );
+    expect(chip("Install a worker tool").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("reads a ?category= URL as the selected chip and passes it to the backlog read", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, ["improve_uzi"]));
+    expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("passes a comma-separated multi-select as an OR set of labels", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge(["/judge?category=install_worker_tool,improve_uzi"]);
+
+    // Order follows JUDGE_CATEGORIES, not URL order, so the request query is canonical.
+    await waitFor(() =>
+      expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, [
+        "install_worker_tool",
+        "improve_uzi",
+      ]),
+    );
+    expect(chip("Install a worker tool").getAttribute("aria-pressed")).toBe("true");
+    expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("silently drops an unknown ?category= value rather than rendering an empty list", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge(["/judge?category=bogus"]);
+
+    // `bogus` is not a known category, so it is dropped and the fetch is unfiltered — the same
+    // silent-guard behaviour isBucket gives ?bucket=. No chip is pressed, and nothing crashed.
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, []));
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("shows the labels empty-state copy when a filter yields no groups", async () => {
+    // A non-empty todo backlog (triage.todo > 0) so this is NOT inbox-zero — the filter just
+    // matched nothing in this bucket.
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [], triage: { total: 5, todo: 5, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    renderJudge(["/judge?category=improve_uzi"]);
+
+    expect(await screen.findByText(/No groups match these labels in this bucket/i)).toBeTruthy();
+    // Not the inbox-zero view, which a filtered empty result must never claim.
+    expect(screen.queryByText(/Inbox zero/i)).toBeNull();
+  });
+
+  it("Clear removes ?category= entirely and re-fetches unfiltered", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge(["/judge?category=improve_uzi"]);
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, ["improve_uzi"]));
+
+    fireEvent.click(screen.getByRole("button", { name: /Clear/ }));
+
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, []));
+    expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
   });
 });

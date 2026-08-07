@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -269,6 +270,10 @@ func TestJudgeRecommendationsRejectsBadParams(t *testing.T) {
 		{"empty-but-present bucket falls back to the default", "bucket=", http.StatusOK},
 		{"unparseable run", "run=not-a-uuid", http.StatusBadRequest},
 		{"unknown run is simply empty", "run=" + uuid.New().String(), http.StatusOK},
+		{"unknown category", "category=nope", http.StatusBadRequest},
+		{"one good one bad category still 400", "category=improve_uzi,nope", http.StatusBadRequest},
+		{"empty-but-present category is all labels", "category=", http.StatusOK},
+		{"category with only empty tokens is all labels", "category=,", http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRunsHandler(t, &backlogStore{rows: rows})
@@ -348,6 +353,81 @@ func TestJudgeRecommendationsPushesRunAnchorToTheQuery(t *testing.T) {
 	h.JudgeRecommendations(httptest.NewRecorder(), backlogReq(caller, ""))
 	if st.backlogArg == nil || st.backlogArg.RunAnchor.Valid {
 		t.Fatalf("no ?run= must send a NULL anchor, got %+v", st.backlogArg)
+	}
+}
+
+// TestJudgeRecommendationsPushesCategoriesToTheQuery: the ?category= filter is parsed,
+// normalized, and handed to the QUERY as the Categories param (it is filtered inside the
+// owner-scoped WHERE before the row cap, not in Go afterwards). The load-bearing cases:
+// multiple values become the OR-union; an absent or present-but-empty ?category= sends a
+// NIL slice (→ SQL NULL → all labels), NEVER an empty slice (which would map to an empty
+// Postgres array and match nothing); and an empty token is dropped, not treated as a value.
+func TestJudgeRecommendationsPushesCategoriesToTheQuery(t *testing.T) {
+	rows, _ := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"multi-value is the OR union", "category=improve_uzi,install_worker_tool", []string{"improve_uzi", "install_worker_tool"}},
+		{"single value", "category=improve_uzi", []string{"improve_uzi"}},
+		{"absent category is a nil slice, not empty", "", nil},
+		{"present-but-empty category is a nil slice", "category=", nil},
+		{"leading empty token is dropped, not a value", "category=,improve_uzi", []string{"improve_uzi"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &backlogStore{rows: rows}
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.JudgeRecommendations(rec, backlogReq(caller, tc.query))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET ?%s = %d, want 200; body=%s", tc.query, rec.Code, rec.Body.String())
+			}
+			if st.backlogArg == nil {
+				t.Fatalf("the query was never called")
+			}
+			got := st.backlogArg.Categories
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("Categories param = %#v, want %#v", got, tc.want)
+			}
+			// A nil expectation is specifically nil, not len-0: an empty []string{} would
+			// map to an empty Postgres array and filter the whole backlog away.
+			if tc.want == nil && got != nil {
+				t.Fatalf("no ?category= must send a NIL slice (→ SQL NULL → all labels), got %#v", got)
+			}
+		})
+	}
+}
+
+// TestJudgeRecommendationsComposesAllThreeFilters: ?bucket=, ?run= and ?category= at once
+// each reach the query as their own parameter — bucket echoed on the DTO, the run anchor
+// pushed down as a valid UUID, and the category set threaded through — proving the three
+// filters compose rather than clobber one another.
+func TestJudgeRecommendationsComposesAllThreeFilters(t *testing.T) {
+	rows, anchor := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+	st := &backlogStore{rows: rows}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.JudgeRecommendations(rec, backlogReq(caller, "bucket=all&run="+anchor.String()+"&category=improve_uzi"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	got := decodeBacklog(t, rec)
+	if got.Bucket != "all" {
+		t.Errorf("echoed bucket = %q, want all", got.Bucket)
+	}
+	if st.backlogArg == nil {
+		t.Fatal("the query was never called")
+	}
+	if !st.backlogArg.RunAnchor.Valid || uuid.UUID(st.backlogArg.RunAnchor.Bytes) != anchor {
+		t.Errorf("run anchor param = %+v, want %v pushed into the query", st.backlogArg.RunAnchor, anchor)
+	}
+	if !slices.Equal(st.backlogArg.Categories, []string{"improve_uzi"}) {
+		t.Errorf("Categories param = %#v, want [improve_uzi]", st.backlogArg.Categories)
 	}
 }
 

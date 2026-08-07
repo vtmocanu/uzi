@@ -563,11 +563,25 @@ function backlogMaxRows(): number {
 }
 
 // computeBacklog assembles GET /me/judge/recommendations out of the pieces above, in the
-// server's order: join (backlogRowsFromReviews) → cap → group → anchor → bucket filter.
-// triage is the canonical aggregate, NEVER tallied from the returned groups.
-function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
-  // The cap sits between the join and the grouper, which is where the server's LIMIT sits.
-  const capped = capBacklogRows(backlogRowsFromReviews(), backlogMaxRows());
+// server's order: join (backlogRowsFromReviews) → category filter → cap → group → anchor →
+// bucket filter. triage is the canonical aggregate, NEVER tallied from the returned groups.
+function computeBacklog(
+  bucket: JudgeBacklogBucket,
+  runAnchor: string,
+  categories: string[] = [],
+): JudgeBacklog {
+  // ?category= is a ROW filter applied BEFORE the cap, mirroring the SQL predicate that sits
+  // before the LIMIT (PRD #235). Filtering here — not on the grouped output after the cap —
+  // is the whole point: a category whose only rows sit past the cap would otherwise be
+  // entirely off-page, so filtering groups post-cap reintroduces the exact off-page bug the
+  // server design avoids. Empty/absent categories = all rows (a no-op).
+  const rows = backlogRowsFromReviews();
+  const selected = categories.length
+    ? rows.filter((r) => categories.includes(r.category))
+    : rows;
+  // The cap sits between the (category-filtered) rows and the grouper, which is where the
+  // server's LIMIT sits.
+  const capped = capBacklogRows(selected, backlogMaxRows());
   let groups = groupJudgeRecommendations(capped.rows);
   // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
   // run, but keep ALL its occurrences (so a notification still shows the other runs it
@@ -2424,9 +2438,9 @@ export const mockApi = {
   },
 
   // ── Judge menu — cross-run backlog + bulk disposition (PRD #98 M3) ───────────
-  getJudgeBacklog: async (bucket: JudgeBacklogBucket = "todo", run?: string) => {
+  getJudgeBacklog: async (bucket: JudgeBacklogBucket = "todo", run?: string, categories?: string[]) => {
     requireSession();
-    return delay(computeBacklog(bucket, run ?? ""), 80);
+    return delay(computeBacklog(bucket, run ?? "", categories ?? []), 80);
   },
   bulkSetJudgeDisposition: async (
     items: JudgeDispositionCoord[],

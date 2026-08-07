@@ -164,6 +164,47 @@ func TestReviewBacklogRunAnchorForwarded(t *testing.T) {
 	}
 }
 
+// --category is forwarded VERBATIM (the comma-separated `?category=a,b` wire form), and an
+// unset flag omits the parameter so the SERVER's "all labels" default applies. Both halves
+// matter: the CLI holds no label predicate, so it must forward the raw value and never
+// substitute a default — a second definition here could drift from the enforcing one.
+func TestReviewBacklogCategoryForwardedVerbatim(t *testing.T) {
+	const want = "improve_uzi,install_worker_tool"
+	fc := backlogFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "review", "backlog", "--category", want); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastBacklogCategory != want {
+		t.Errorf("category forwarded as %q, want %q", fc.LastBacklogCategory, want)
+	}
+
+	fc2 := backlogFake()
+	if _, _, code := runCLI(t, fakeEnv(fc2), "review", "backlog"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc2.LastBacklogCategory != "" {
+		t.Errorf("an unset --category must send nothing (server default), got %q", fc2.LastBacklogCategory)
+	}
+}
+
+// An unknown category is the SERVER's 400, surfacing as the usage exit code — never a
+// silently empty list. Same pass-through payoff as --bucket: the CLI holds no category
+// predicate, so nothing here can fail quietly.
+func TestReviewBacklogUnknownCategoryIsAUsageError(t *testing.T) {
+	fc := backlogFake()
+	fc.Err = uzicli.Exitf(uzicli.ExitUsage, "invalid category")
+	out, errb, code := runCLI(t, fakeEnv(fc), "review", "backlog", "--category", "improve_uzii")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errb, "invalid category") {
+		t.Errorf("want the server's own message on stderr, got:\n%s", errb)
+	}
+	if strings.Contains(out, "groups") {
+		t.Errorf("a rejected category must render no listing:\n%s", out)
+	}
+}
+
 // Both truncation warnings must name a remedy that WORKS. `--bucket all` does not: every
 // bucket truncates identically, because `truncated` is computed and the rows sliced before
 // the bucket filter runs, so no bucket value reaches what the cap cut. Naming it was the
@@ -395,6 +436,34 @@ func TestBacklogBucketUsageMatchesServerEnum(t *testing.T) {
 	} {
 		if !advertised[want] {
 			t.Errorf("--bucket help does not advertise the valid bucket %q", want)
+		}
+	}
+}
+
+// The --category help text is the one place the CLI writes the recommendation-label set
+// down. It is documentation (the value is forwarded, the server validates), but an unpinned
+// enumeration rots: this asserts BOTH directions against workersvc's real
+// RecommendationCategories set — every label the help advertises is one the server accepts,
+// and every server label is advertised — so the CLI help can never silently drift from the
+// server enum.
+func TestBacklogCategoryUsageMatchesServerEnum(t *testing.T) {
+	_, rest, ok := strings.Cut(backlogCategoryFlagUsage, ": ")
+	if !ok {
+		t.Fatalf("--category usage lost its %q separator, cannot be checked: %q", ": ", backlogCategoryFlagUsage)
+	}
+	advertised := map[string]bool{}
+	for _, part := range strings.Split(rest, "|") {
+		name := strings.TrimSpace(part)
+		if !workersvc.ValidRecommendationCategory(name) {
+			t.Errorf("--category help advertises %q, which the server's validator rejects", name)
+		}
+		advertised[name] = true
+	}
+	// Every label in the server's source-of-truth set must be advertised, so a new category
+	// added server-side cannot ship without a matching CLI help entry.
+	for cat := range workersvc.RecommendationCategories {
+		if !advertised[cat] {
+			t.Errorf("--category help does not advertise the valid label %q", cat)
 		}
 	}
 }

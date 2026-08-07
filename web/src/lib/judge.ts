@@ -53,6 +53,21 @@ export function recommendationLabel(category: string): string {
   );
 }
 
+// JUDGE_CATEGORIES is the ordered taxonomy the label-filter chips iterate (PRD #235 M2).
+// It is the keys of RECOMMENDATION_LABELS, in map (spec/human.md) order, so the chip row
+// and the ?category= URL guard share ONE source of truth — a category added to the map is
+// a chip and a valid URL value for free, and cannot exist in one place but not the other.
+export const JUDGE_CATEGORIES = Object.keys(
+  RECOMMENDATION_LABELS,
+) as readonly RecommendationCategory[];
+
+// isCategory validates a ?category= token the way isBucket (Judge.tsx) guards ?bucket=: the
+// input is a raw URL string, so tsc cannot narrow it, and an unknown value must be dropped
+// silently rather than rendering an empty list. Mirrors the closed-set membership check.
+export function isCategory(v: string | null): v is RecommendationCategory {
+  return v !== null && (JUDGE_CATEGORIES as readonly string[]).includes(v);
+}
+
 // coordKey is the ONE (category, target) key that matches a recommendation to its filed
 // link and its disposition (PRD #68/#94/#98). It MUST be used at both the build and the
 // lookup site: a separator mismatch silently drops a persisted filed link back to the

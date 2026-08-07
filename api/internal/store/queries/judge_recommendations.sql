@@ -97,6 +97,16 @@ WHERE rv.user_id = @user_id
             AND rr2.target = rr.target
       )
   )
+  -- The ?category= label filter, pushed DOWN here for the SAME reason as run_anchor above:
+  -- rr.category is a RAW STORED column, not a computed rollup, so it is filtered before the
+  -- LIMIT — the cap then bounds the SELECTED categories rather than truncating a whole label
+  -- off-page (the ?bucket= rollup, by contrast, stays in Go because it is the shared BucketOf
+  -- ladder; see the header). NULL is the no-op, exactly like run_anchor IS NULL: an absent
+  -- filter means all labels. Grouping/bucketing still happen entirely in Go.
+  AND (
+      sqlc.narg('categories')::text[] IS NULL
+      OR rr.category = ANY(sqlc.narg('categories')::text[])
+  )
 ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
 -- A hard row bound: an all-time backlog with ?bucket=all is otherwise unbounded (the PRD's
 -- Risks section concedes this). The caller passes cap+1 and reports `truncated` when the

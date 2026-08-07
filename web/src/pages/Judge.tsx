@@ -25,6 +25,7 @@ import {
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
   type JudgeSettledMember,
+  type RecommendationCategory,
   type Repo,
 } from "../lib/api";
 import {
@@ -36,7 +37,7 @@ import {
   rollupTone,
   seenInRunsLabel,
 } from "../lib/judgeBacklog";
-import { coordKey, recommendationLabel } from "../lib/judge";
+import { coordKey, JUDGE_CATEGORIES, isCategory, recommendationLabel } from "../lib/judge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { judgeBadge } from "../lib/judgeBadge";
 import { TriageSummary } from "./RunView";
@@ -100,6 +101,19 @@ export function Judge() {
       ? "all"
       : "todo";
 
+  // ?category= is a comma-separated, multi-select label filter (PRD #235), enforced
+  // server-side before the row cap — the same shape as ?bucket=/?run=. Unknown tokens are
+  // dropped SILENTLY here, the way isBucket guards ?bucket=: an unrecognised URL value must
+  // not render as an empty list. Parsed off the raw string in a useMemo so the derived array
+  // is referentially stable for `load`'s deps (a fresh array every render would re-fetch on
+  // every keystroke elsewhere in the URL). Order follows JUDGE_CATEGORIES, not URL order, so
+  // the request query and the chip row cannot disagree.
+  const categoryParam = searchParams.get("category") ?? "";
+  const categories: RecommendationCategory[] = useMemo(() => {
+    const set = new Set(categoryParam.split(",").map((s) => s.trim()).filter(isCategory));
+    return JUDGE_CATEGORIES.filter((c) => set.has(c));
+  }, [categoryParam]);
+
   const [backlog, setBacklog] = useState<JudgeBacklog | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -117,7 +131,7 @@ export function Judge() {
     setLoading(true);
     setError("");
     try {
-      const data = await api.getJudgeBacklog(bucket, runAnchor || undefined);
+      const data = await api.getJudgeBacklog(bucket, runAnchor || undefined, categories);
       setBacklog(data);
       // Keep the nav badge in step with every canonical triage this page learns, not only
       // the ones a disposition produces (PRD #98 review BLK-BADGE). `triage` here IS the
@@ -130,7 +144,7 @@ export function Judge() {
     } finally {
       setLoading(false);
     }
-  }, [bucket, runAnchor, setJudgeTodo]);
+  }, [bucket, runAnchor, categories, setJudgeTodo]);
 
   useEffect(() => {
     // Selection is keyed on coordinates that may not survive a reload; drop it whenever
@@ -185,6 +199,28 @@ export function Judge() {
     const next = new URLSearchParams(searchParams);
     next.delete("run");
     next.set("bucket", bucket);
+    setSearchParams(next, { replace: true });
+  };
+
+  // toggleCategory flips one label in the ?category= set (PRD #235), a mirror of setBucket's
+  // URLSearchParams writer. The joined value is ordered by JUDGE_CATEGORIES so the URL is
+  // canonical regardless of click order, and an EMPTY selection DELETES the param rather than
+  // leaving `?category=` behind — an empty value is "all labels" and must read as the
+  // absent-param case (the server normalizes `[""]` away, but a clean URL states it too).
+  const toggleCategory = (cat: RecommendationCategory) => {
+    const set = new Set(categories);
+    if (set.has(cat)) set.delete(cat);
+    else set.add(cat);
+    const ordered = JUDGE_CATEGORIES.filter((c) => set.has(c));
+    const next = new URLSearchParams(searchParams);
+    if (ordered.length) next.set("category", ordered.join(","));
+    else next.delete("category");
+    setSearchParams(next, { replace: true });
+  };
+
+  const clearCategories = () => {
+    const next = new URLSearchParams(searchParams);
+    next.delete("category");
     setSearchParams(next, { replace: true });
   };
 
@@ -316,8 +352,16 @@ export function Judge() {
   // so a bulk action that drops todo to 0 does not yank the just-acted-on rows out from
   // under the user mid-interaction (they stay, re-rendered at their new rollup, with Undo);
   // the zero-state appears on the next load/navigation instead.
+  // A category-filtered view that comes back empty is NOT inbox-zero — the todo backlog may
+  // be full of other labels — so a filter narrows out of the zero-state into the "no groups
+  // match these labels" empty state below.
   const showZeroState =
-    bucket === "todo" && !runAnchor && triage != null && triage.todo === 0 && (backlog?.groups.length ?? 0) === 0;
+    bucket === "todo" &&
+    !runAnchor &&
+    categories.length === 0 &&
+    triage != null &&
+    triage.todo === 0 &&
+    (backlog?.groups.length ?? 0) === 0;
 
   return (
     <div className="space-y-6 pb-24">
@@ -354,6 +398,13 @@ export function Judge() {
         <TriageSummary triage={triage} title="Recommendations · all your runs" aside="all time" />
       )}
 
+      {/* Recommendation-label filter (PRD #235): multi-select chips ABOVE the bucket tabs.
+          The filter narrows the GROUP LIST only — the tabs and nav badge stay whole-backlog
+          (they read the canonical triage aggregate), so there are deliberately NO per-chip
+          counts (Decision 6: no canonical per-category aggregate, and tallying off the
+          truncated/bucket-filtered groups is the anti-pattern the codebase forbids). */}
+      <LabelFilter selected={categories} onToggle={toggleCategory} onClear={clearCategories} />
+
       {/* Bucket tabs — counts straight from the canonical triage aggregate, never tallied
           off the (possibly filtered/truncated) groups on screen. */}
       {triage && (
@@ -388,6 +439,27 @@ export function Judge() {
         />
       )}
 
+      {/* A plain view hint reading the length of the RETURNED (filtered) groups — open
+          question 4's "result line", deliberately not a restyled triage strip. It reads the
+          groups actually on screen, so it can never be mistaken for the canonical triage
+          counts the tabs and badge show. */}
+      {!loading && backlog && !showZeroState && (
+        <p className="text-sm text-faint">
+          {categories.length > 0 ? (
+            <>
+              Showing <b className="font-semibold text-muted tabular-nums">{backlog.groups.length}</b>{" "}
+              {backlog.groups.length === 1 ? "group" : "groups"} matching{" "}
+              {categories.map((c) => recommendationLabel(c)).join(", ")}
+            </>
+          ) : (
+            <>
+              Showing <b className="font-semibold text-muted tabular-nums">{backlog.groups.length}</b>{" "}
+              {backlog.groups.length === 1 ? "group" : "groups"}
+            </>
+          )}
+        </p>
+      )}
+
       {loading && <ListSkeleton rows={5} />}
 
       {!loading && backlog && (
@@ -397,11 +469,19 @@ export function Judge() {
           ) : backlog.groups.length === 0 ? (
             <EmptyState
               icon={<ScaleIcon />}
-              title={runAnchor ? "No recommendations for this run" : `Nothing under ${bucketTabLabel(bucket)}`}
+              title={
+                categories.length > 0
+                  ? "No groups match these labels in this bucket"
+                  : runAnchor
+                    ? "No recommendations for this run"
+                    : `Nothing under ${bucketTabLabel(bucket)}`
+              }
               description={
-                runAnchor
-                  ? "This run has no recommendations in the selected bucket. Clear the filter or switch buckets."
-                  : "Switch buckets to see recommendations in another state."
+                categories.length > 0
+                  ? "Clear a label or pick another, or switch buckets to see more groups."
+                  : runAnchor
+                    ? "This run has no recommendations in the selected bucket. Clear the filter or switch buckets."
+                    : "Switch buckets to see recommendations in another state."
               }
             />
           ) : (
@@ -455,6 +535,64 @@ export function Judge() {
 // error AT THE ARRAY, and this validator follows automatically.
 function isBucket(v: string | null): v is JudgeBacklogBucket {
   return v !== null && (JUDGE_BUCKETS as readonly string[]).includes(v);
+}
+
+// LabelFilter is the recommendation-label chip row (PRD #235 M2): one toggle chip per
+// JUDGE_CATEGORIES key, multi-select (OR semantics — a group has one category, so AND is
+// meaningless), driving the ?category= URL param. It carries NO per-chip counts by design
+// (Decision 6). The Clear control appears only when something is selected and removes the
+// param entirely. Chips are aria-pressed toggle buttons labelled by recommendationLabel, so
+// their accessible name matches the badge each group already renders.
+function LabelFilter({
+  selected,
+  onToggle,
+  onClear,
+}: {
+  selected: RecommendationCategory[];
+  onToggle: (cat: RecommendationCategory) => void;
+  onClear: () => void;
+}) {
+  const active = new Set(selected);
+  return (
+    <section
+      aria-label="Filter by recommendation label"
+      className="rounded-lg border border-brand/30 bg-brand/[0.05] px-3 py-3"
+    >
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted">Filter by label</span>
+        {active.size > 0 && (
+          <button
+            type="button"
+            onClick={onClear}
+            className="ml-auto inline-flex items-center gap-1 text-sm font-medium text-brand underline underline-offset-2 hover:text-brand-hover"
+          >
+            <XIcon /> Clear
+          </button>
+        )}
+      </div>
+      <div role="group" aria-label="Recommendation labels" className="flex flex-wrap gap-2">
+        {JUDGE_CATEGORIES.map((cat) => {
+          const on = active.has(cat);
+          return (
+            <button
+              key={cat}
+              type="button"
+              aria-pressed={on}
+              onClick={() => onToggle(cat)}
+              className={cx(
+                "inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium transition-colors",
+                on
+                  ? "border-brand/60 bg-brand/[0.13] text-brand"
+                  : "border-edge bg-raised text-muted hover:border-edge-strong hover:text-fg",
+              )}
+            >
+              {recommendationLabel(cat)}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
 }
 
 // GroupRow is one deduped (category, target) row: the category + target header, the "seen

@@ -79,7 +79,7 @@ uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
-uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all]
+uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--category label,label]
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
@@ -353,9 +353,23 @@ row reading `seen in 5 runs` — the terminal form of the
 uzi review backlog                                           # what still needs triage
 uzi review backlog --bucket all --json                       # settled groups too, for an agent
 uzi review backlog --run <run-id>                            # only coordinates that recur in that run
+uzi review backlog --category improve_uzi,install_worker_tool  # only these recommendation labels
 uzi review resolve --category <c> --target <t>               # mark the whole group done
 uzi review dismiss --category <c> --target <t> --reason wont-do
 ```
+
+`--category` narrows `backlog` to one or more recommendation labels. It is
+multi-value — pass a comma-separated list (`--category improve_uzi,install_worker_tool`)
+to show groups in *any* of the named labels — and server-validated: an unknown
+label is a usage error (exit 2), never a silently empty list, exactly like an
+unknown `--bucket`. An empty or omitted `--category` means all labels. The valid
+labels are `enable_tool`, `install_worker_tool`, `adjust_template`, `improve_agent`,
+`add_agent` and `improve_uzi`. Like `--run` (and unlike `--bucket`), the label
+predicate is applied *before* the server's row cap, so narrowing by label makes
+truncation less likely to bite; it composes cleanly with `--bucket`. Note this
+`backlog --category` is a **distinct** flag from the `--category` on
+`resolve`/`dismiss`: there it is one literal group coordinate to act on, here it is a
+multi-value label filter.
 
 Three things to know before acting on a group action's output:
 
