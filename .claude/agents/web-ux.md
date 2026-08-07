@@ -134,3 +134,16 @@ here, and it is usually false.** On 2026-07-21 a PRD that built an entire new pa
 because the lead judged that web-ux needed a running stack — while the mock build
 named two paragraphs above sat in this very file. If a dispatch tells you no
 instance is available, check for the mock before accepting it.
+
+**Screenshots go inside the run worktree, never `/tmp`.** The worker's file-access
+guardrail rejects reads and writes outside the worktree, so `agent-browser screenshot
+/tmp/...` (and the `Read` that follows) is denied; pass an absolute path under the
+worktree instead.
+
+**Reaching the onboarding card in the mock.** The mock seeds all four dashboard
+onboarding preconditions as already satisfied, so the "Get the factory running" card is
+hidden by default. To exercise it, mutate state through the UI to un-satisfy a
+precondition — never by editing the URL or reloading, which resets the in-memory mock and
+re-seeds it. A headless browser against `VITE_UZI_MOCK=1 npm run dev` does work and can
+read computed styles, which is what makes a visual criterion here genuinely verifiable
+rather than hand-waved.

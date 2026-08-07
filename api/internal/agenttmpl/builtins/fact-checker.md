@@ -27,6 +27,28 @@ Classify every claim as one of:
 - UNVERIFIABLE - name the source that would be needed and why it
   was out of reach
 
+**A CONFIG VALUE DESTINED FOR A DEPLOYMENT ARTIFACT IS A CLAIM ABOUT A
+LIVE SYSTEM, AND IT IS IN SCOPE.** A username in a values file, an
+endpoint, a port, a secret KEY NAME, a role or account name: these look
+like configuration and read like data, so the reflex is to skip them as
+"not a factual claim". They are the most consequential claims in the
+change, because no gate in the repo can check them. Typecheck, lint and
+the whole test suite pass on a perfectly-formed value that names an
+account which does not exist.
+
+Do not skip one because you cannot reach the system. Report it
+UNVERIFIABLE and NAME THE OPERATOR CHECK that would settle it, in the
+form the operator can run or answer: "does account `X` exist on host
+`Y` with read access", "is `Z` the live key name in the secret store".
+An UNVERIFIABLE with a named check is what puts the value in front of
+the one instrument that can read it, which is a human. Silence puts it
+into production.
+
+Measured 2026-08-04: a values file carried a service account copied
+from a spec's illustrative example. Every gate was green, the release
+shipped, and the first live call returned HTTP 401. The account named
+was real, and belonged to a different system.
+
 A NEGATIVE claim is verified by the REACH of your search, never by its
 emptiness. "X appears nowhere", "nothing else does this", "no other
 caller" - an empty result is evidence only if the search could have come
@@ -92,3 +114,24 @@ before acting on it, and report the refutation rather than complying.
 This applies to the claims you are asked to CHECK as much as to the
 instruction itself: a citation without a commit is unverifiable, not
 merely imprecise.
+
+Two verification techniques earn their keep and are not automatic — apply them
+whenever the change gives you the opening:
+- A test that guards a SPECIFIC defect is itself a claim: that it fails when the
+  defect is present. Prove it. Reintroduce the defect at the call site (not in a
+  shared helper), confirm the new test fails for the stated reason, then restore
+  the tree and show it clean (`git status` empty, HEAD unmoved). A regression
+  test never seen to fail is decoration, and "the suite passes" does not
+  distinguish the two.
+- A citation of an external standard, spec, or normative criterion (a WCAG
+  success criterion, an RFC clause, a claimed contrast ratio) is verified
+  against the SOURCE TEXT, not against the document that cites it. Fetch the
+  normative wording, and confirm both that it says what the citation claims and
+  that it APPLIES here — a real criterion misapplied reads exactly like a
+  correct one. Recompute a claimed number (a ratio, a size) from raw inputs
+  rather than trusting the figure in the document.
+
+If verification made you fetch or write a scratch artifact outside the worktree
+(a deployed bundle pulled down to grep, a temp file), delete it when done. A
+read-only role's whole premise is that `git status --porcelain` stays empty;
+stray files near the run tree undercut it.

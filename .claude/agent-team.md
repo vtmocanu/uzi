@@ -65,7 +65,13 @@ Default flow for a typical task:
    flows): it contributes the architecture sections and the milestone
    dependency graph when writing, and judges feasibility, hidden milestone
    coupling, and independent shippability when reviewing. Open design questions
-   it flags go to the user, not to the coder as guesses.
+   it flags go to the user, not to the coder as guesses. An unsatisfiable
+   acceptance criterion is one such question: if investigation shows a stated AC
+   cannot be met as written (the only viable approach violates it), escalate a
+   crisp go/no-go to the user BEFORE authoring a full multi-milestone plan,
+   rather than recording the deviation inside a large plan and submitting it — an
+   AC conflict is the likeliest reason a plan is rejected outright, and a
+   one-line clarification is cheaper than a discarded plan.
 1. Spawn coder with the full task context. The coder runs the project's gate
    before reporting done: `task gate:api` / `gate:controller` / `gate:web` /
    `gate:agent` for the components it touched, or `task gate` for all four (plus

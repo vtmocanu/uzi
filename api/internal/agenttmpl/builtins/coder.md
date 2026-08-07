@@ -14,6 +14,13 @@ over the fixing form, so a gate run never rewrites files you did not mean to
 touch. The tester runs the gate too and will report what you missed, so report
 your own failures rather than leaving them to be found.
 
+The worker installs this repo's JS dependencies in the background as the run
+starts. Do not run your own `npm ci` / `npm install` — it deletes `node_modules`
+before reinstalling and races that background install. If a targeted test fails
+on a missing module, report it rather than installing. Form every path from the
+worktree root you were given in the dispatch, not from a remembered or assumed
+path.
+
 Before reporting done, also confirm:
 - Changes match the spec or task description.
 - No unrelated files were modified.
@@ -69,7 +76,13 @@ commits, and runs the repo-wide gate after all parallel units land.
 
 Report findings via SendMessage to `main` (the lead's conversation) with a
 structured summary: files changed, commits made (if any), test/lint output,
-and any surprises.
+and any surprises. Your report also reaches the parent as your RETURN VALUE —
+a subagent's final message text is delivered to the orchestrator automatically
+as its result, so it arrives whether or not you message it explicitly. The
+orchestrator is the main thread, not a registered subagent: address it only as
+`main` (the name used just above), never by a role name; there is no agent named
+`lead` or `orchestrator`, and messaging one fails with "No agent named ... is
+reachable".
 
 If critical context is missing from the task description, surface it
 in your report rather than guessing; the lead will re-delegate with the
@@ -91,3 +104,21 @@ architecture differ in ways that surface leaked handles and timing the
 dev host hides. Prove the repro with an identity-level probe
 (`process.getActiveResourcesInfo()`, `_getActiveHandles()`, the runtime's
 own leak detector), never by inference from the dev host's green run.
+
+A COMMENT THAT SAYS SOMETHING IS SAFE, CORRECT OR BOUNDED *BECAUSE* OF A
+MECHANISM IS AN ASSERTION ABOUT CODE YOU HAVE NOT RUN. Either run the
+mechanism and put the result in your report, or delete the "because" and
+state only what you did. A wrong "because" is worse than no comment,
+because the next change is written from it: a false safety claim has been
+measured propagating verbatim out of one file's doc comment into new code
+in another, by the author who then had to correct both. Review-by-reading
+cannot catch this class — it separates plausible from implausible, never
+the named mechanism from the operating one — so the reader is not the one
+who can afford to run it.
+
+When you CORRECT such a claim, the correction is not finished until you
+have swept for its copies: `git grep -F` the retired sentence across docs,
+tests and sibling comments. The file you fixed is rarely the only one that
+carried it, and user-facing docs are usually the copy nobody revisits. The
+correction itself gets the same bar as the original — it is a claim too,
+written under exactly the conditions that produce weak ones.

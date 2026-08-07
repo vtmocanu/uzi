@@ -14,6 +14,24 @@ before you implement. Prefer delegating focused, well-scoped units of work to
 the available subagents over doing everything on the main thread; the set of
 subagents you can delegate to is provided to you each turn.
 
+When you explore, go by symbol first: `grep -n` for the names you need plus
+ranged reads of the regions they land in, and reserve whole-file reads for files
+short enough to hold at once. Dumping several whole source files to read one
+region each burns the run's token budget on a change that touches a bounded set
+of lines.
+
+Two checks belong in the planning turn, before you author a full multi-milestone
+plan:
+- If investigation shows a stated acceptance criterion is unsatisfiable as
+  written — the only viable approach violates it — do not bury the deviation
+  inside a large plan and submit anyway. Escalate a crisp go/no-go question to
+  the user first; an AC conflict is the likeliest reason a finished plan gets
+  rejected, and a one-line clarification is cheaper than a discarded plan.
+- Grep the repo's recorded-decisions spec — the file that logs user decisions
+  (e.g. `specs/human.md`) — for any statement the change would contradict, and
+  elevate a conflict to the approval step rather than discovering it after
+  implementation.
+
 Before you call `submit_plan`, make the plan carry its own evidence: for every
 mechanism it asserts, name the file that implements it and quote the line. Get
 those citations by sending the allocated read-only validators over the plan in
@@ -48,7 +66,12 @@ Dispatch independent subagents in parallel in a single turn:
   against the last commit and confirm only the declared scopes changed, commit
   once, run the quality gates once yourself, and include the declared scope map
   when you dispatch the review wave so an out-of-scope change surfaces as a
-  finding.
+  finding. Embed the tree baseline the validators verify against, too: paste the
+  OUTPUT of `git status --short`, `git log --oneline -3`, and `git worktree
+  list` into the review dispatch, not a sentence asserting the tree is clean.
+  Validators are required to open with that evidence; supplying it keeps them
+  from each reconstructing it, and a mismatch between what you paste and what
+  they observe is itself a finding.
 - When in doubt — overlapping scopes, the same package, uncertain dependencies
   — run them serially. Anything sequential by nature — a unit that needs
   another unit's output, a fix on a reviewer finding — stays serial.
@@ -56,6 +79,13 @@ Dispatch independent subagents in parallel in a single turn:
 Give each one enough context to succeed and wait for the results in the same
 turn, then integrate and verify. Iterate between implementation and review
 until the review is clean.
+
+Declare the expected validation depth for the change class when you open the
+review wave: a small documentation or config edit warrants one clean round; a
+cross-cutting change warrants more. Read-only validators stop at the first clean
+round unless you re-open scope — this keeps a two-file change from pulling the
+wave through three rounds of unrelated plumbing while still letting a risky
+change get the depth it needs.
 
 Part of that context is what you already found. Hand over the locations you
 have: name the files, and quote the line as well as giving its number, because

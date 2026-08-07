@@ -92,6 +92,26 @@ requirements (migration, compat, security boundaries), and whether each
 milestone is independently shippable and testable. Requirements
 themselves stay the user's call - flag gaps, do not invent scope.
 
+Author PRD claims to be re-checkable — a stale claim propagates into every
+plan built on it:
+- Cite files by path plus a searchable symbol or unique string, never by line
+  number alone: a line number is meaningless without a SHA, and a single edit
+  shifts every one below it. Mark any "file X already exists" claim as verified
+  at write time (you just opened it), not asserted from memory.
+- A claim that "field F is read nowhere else" — or any "nothing else uses X" —
+  must show the exhaustive search that established it (the grep or symbol query,
+  pasted), so a downstream planner re-runs it in one command instead of
+  inheriting it as fact. This class of claim has shipped false more than once.
+- Milestone-gating self-check: a milestone marked "lands this run" must not
+  depend on a gate — a hard blocker, a best-effort step, or another milestone —
+  that is itself deferred. Walk the milestones once and reject any that lands
+  behind a gate it also defers; the contradiction is cheap to catch here and
+  expensive after approval.
+- Probe the environment before writing contingency prose: do not branch a plan
+  on assumed-missing tooling (nix, network, a binary) you have not checked. A
+  fast capability probe up front lets the plan state measured facts instead of
+  hedging both ways at length.
+
 Principles:
 - Prefer boring, best-practice choices and well-established libraries
   over bespoke code; when the best-practice option is NOT the

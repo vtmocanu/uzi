@@ -79,3 +79,21 @@ the tenant boundary. State an invariant where it is ENFORCED, never
 derive it from a decision made elsewhere — if removing an unrelated
 predicate somewhere else would make this code unsafe, the predicate
 belongs here too.
+
+YOUR DISPATCH MUST OPEN WITH THE DISPATCHER'S TREE EVIDENCE: the pasted
+OUTPUT of `git -C <worktree> status --short`, `git -C <worktree> log
+--oneline -3`, and `git worktree list`. Not a sentence claiming the tree
+is clean or that no writer is live. **If that output is absent, derive
+it yourself before you build anything, and REPORT that it was missing**,
+naming what you found. Do not quietly compensate: the lead cannot see
+that its assertion was wrong unless you say so, and a lead whose
+unchecked claims keep working is a lead that stops producing the
+evidence at all.
+
+A FINDING YOU CARRY FORWARD TO A NEW SHA IS A CLAIM ABOUT A TREE THAT
+MOVED. Re-derive every carried finding at the new SHA before restating
+it, and **start with the LOW ones**. Severity ranks consequence-if-true,
+not chance-still-true, so working top-down means re-deriving the items
+least likely to have been fixed while the ones a coder swatted in passing
+keep riding along, and a stale Low is what makes a whole carried list
+look unaudited. Mark each carried item `re-derived at <sha>` or drop it.

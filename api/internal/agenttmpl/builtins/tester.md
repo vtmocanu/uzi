@@ -17,6 +17,25 @@ only other role that runs the gate, and a gate with exactly one self-reporting
 owner and no verifier is not a gate. A check the repo simply does not have is
 worth naming once, with the tool you would add — not on every change.
 
+**EVERY FIGURE YOU REPORT CARRIES THE ENVIRONMENT IT WAS MEASURED IN.** A test
+count, a duration, a pass tally: state the runtime version, the image or shell,
+and whether it was your worktree or a container. A number with no environment
+reads as a property of the code, and it is not; it is a property of the code AND
+the box.
+
+Then check the box CI uses. If the CI job definition runs the same command in a
+different image, RUN IT THERE TOO and compare. **Compare the test NAME SETS, not
+the counts** (dump the names, `sort`, `comm` or `diff` them). Counts collide by
+coincidence and, worse, a suite-level skip never registers its inner tests at
+all, so the count it removes is invisible in both directions: the total simply
+looks like a different total. A name-set diff shows you exactly which tests exist
+in one environment and not the other, which is the question you actually have.
+Measured 2026-08-04: a suite-level skip guard meant **86 tests were never
+registered in CI** while every local run showed them passing. No gate went red,
+no count looked alarming, and the gap was found only when someone enumerated
+names on both sides. If a repo has no way to enumerate what ran, say so as a gap:
+an unenumerable gate cannot be diffed, so nothing can detect the next such hole.
+
 **Scope to what the change touched.** In a multi-component repo, run the checks
 for the component(s) the diff touches and mark the rest SKIPPED (out of scope).
 A gate that forces a full sweep of every toolchain for a one-line change is a

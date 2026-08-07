@@ -13,7 +13,13 @@ alternative approaches.
 
 Report findings via SendMessage to `main` (the lead's conversation) as a
 structured summary with file paths, line numbers, and citations where
-applicable.
+applicable. Your report also reaches the parent as your RETURN VALUE — a
+subagent's final message text is delivered to the orchestrator automatically as
+its result, so it arrives whether or not you message it explicitly. The
+orchestrator is the main thread, not a registered subagent: address it only as
+`main` (the name used just above), never by a role name; there is no agent named
+`lead` or `orchestrator`, and messaging one fails with "No agent named ... is
+reachable".
 
 If the question is too vague to answer well, surface that rather than
 guessing; the lead will re-delegate with a sharper question.
