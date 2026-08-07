@@ -1,7 +1,7 @@
 # PRD #239: Runs-in-progress count badge on the Runs menu item
 
 **GitLab Issue**: [#239](https://gitlab.example.com/vtmocanu/uzi/-/issues/239)
-**Status**: Draft (created 2026-08-07; reviewed same day by an architect agent against the codebase — 5 documentation-accuracy fixes applied, no blockers: `ListRunsForUser` rename, kind-set pinned, "same scope predicate" not "to the digit", `unread_count` is `RequireAuth` not `RequireUser`, favicon's third status idiom surfaced. See the Decision Log.)
+**Status**: Done (implemented 2026-08-07 on branch `agent/issue-239`; all three milestones complete and reviewed — reviewer/auditor/web-ux clean, no blockers. Created same day; reviewed by an architect agent against the codebase — 5 documentation-accuracy fixes applied, no blockers: `ListRunsForUser` rename, kind-set pinned, "same scope predicate" not "to the digit", `unread_count` is `RequireAuth` not `RequireUser`, favicon's third status idiom surfaced. See the Decision Log.)
 **Priority**: Low
 **Mock**: `prds/mockups/239-runs-in-progress-badge-mock.html` (shown to owner 2026-08-07)
 
@@ -167,9 +167,10 @@ strict subset of what the page lists.
   `awaiting_*` and one `limit_wait` run, and an excluded `chat`/`judge` run, so the
   parity test pins Decisions 1 and 4 rather than snapshotting the demo's blind spot. —
   a non-terminal `judge` fixture was added; parity test derives the expected count from
-  the fixtures and pins each exclusion. Badge assertions are scoped to the Runs nav item
-  because the `count` tone shares the `"N unread"` aria-label with the Judge/Notifications
-  badges (a global query is ambiguous).
+  the fixtures and pins each exclusion. The badge announces `"N in progress"` via a new
+  additive `NavItem` `badgeLabel` prop (a run is never "unread"; the count tone's default
+  noun is unchanged for Notifications/Judge); assertions are still scoped to the Runs nav
+  item with `within()` for robustness.
 - [x] `task gate:web` green. — 1699 tests pass.
 
 ### M3 — CLI parity, docs, and the decision record

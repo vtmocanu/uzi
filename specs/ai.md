@@ -18702,9 +18702,9 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
   `api/internal/store/queries/runtime.sql` — one `count(*)`, no join.
 
 - **Kind scope = the /runs page's own predicate, so the badge is a strict SUBSET of the page (Decision 4).**
-  The query additionally filters `kind NOT IN ('chat','judge')`, byte-identical to `ListRunsForUser`'s
-  kind guard, so the badge counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat`
-  or `judge` meta-run. The invariant is **same scope predicate (owner + kind-set)**, deliberately NOT
+  The query additionally filters `kind NOT IN ('chat','judge')`, the same kind guard `ListRunsForUser`
+  applies (which writes it aliased as `r.kind NOT IN (...)`; semantically identical), so the badge
+  counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat` or `judge` meta-run. The invariant is **same scope predicate (owner + kind-set)**, deliberately NOT
   numeric equality with what the page renders: the /runs page also lists TERMINAL runs, so the badge
   is a non-terminal subset of the page's list, never equal to its row count. Framed as a subset
   because that is the property a reader can check (a badge count can never exceed, or include a kind

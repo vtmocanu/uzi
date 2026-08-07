@@ -357,16 +357,16 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
 // PRD #239: the Runs nav count badge. Brand "count" tone (Decision 2), not the Workers
 // alert red — in-progress runs are healthy activity, a queue to get to.
 describe("Runs nav count badge (PRD #239)", () => {
-  // The count tone reuses the shared "N unread" aria-label the Judge and Notifications
-  // badges also use, so — unlike the Workers "N needing attention" label — a GLOBAL query
-  // is ambiguous: another nav item's count badge (or one leaked by a prior test, since
-  // clearAllMocks keeps mock implementations and beforeEach re-zeroes only `unread`) can
-  // satisfy it. Every assertion below is therefore scoped to the Runs link with within().
+  // The accessible noun is "in progress" (badgeLabel), NOT the count tone's default
+  // "unread" — a run is never unread. That also makes "N in progress" a label unique to
+  // this badge; assertions are still scoped to the Runs link with within() for robustness
+  // (belt-and-braces against a future badge reusing the noun, and against a prior test's
+  // leaked count since clearAllMocks keeps mock implementations).
   it("badges the Runs nav item with the in-progress count, brand-toned", async () => {
     mockApi.runsInProgressCount.mockResolvedValue({ count: 5 });
     renderShell("/dashboard");
     const runs = await screen.findByRole("link", { name: /Runs/ });
-    const badge = await within(runs).findByLabelText("5 unread");
+    const badge = await within(runs).findByLabelText("5 in progress");
     // Brand pill, NOT the Workers alert red (Decision 2): "there is a queue", not "go look".
     expect(badge.textContent).toBe("5");
     expect(badge.className).toContain("bg-brand");
@@ -381,20 +381,24 @@ describe("Runs nav count badge (PRD #239)", () => {
     // label and no digit, and no count pill of its own.
     await new Promise((r) => setTimeout(r, 0));
     expect(runs.textContent).not.toMatch(/\d/);
-    expect(within(runs).queryByLabelText(/unread/)).toBeNull();
+    expect(within(runs).queryByLabelText(/in progress/)).toBeNull();
   });
 
   it("keeps the last known count when the poll fails, rather than blanking to zero", async () => {
     mockApi.runsInProgressCount.mockResolvedValue({ count: 4 });
     renderShell("/dashboard");
     const runs = await screen.findByRole("link", { name: /Runs/ });
-    expect((await within(runs).findByLabelText("4 unread")).textContent).toBe("4");
+    expect((await within(runs).findByLabelText("4 in progress")).textContent).toBe("4");
 
-    // A transient failure keeps the last known count (the empty catch) rather than dropping
-    // to zero, which would read as "the factory went idle" when it did not.
+    // The poll re-fires only on a location.pathname change, so a bare mock swap would never
+    // invoke the rejecting fetch — the empty catch would go untested (measured: this test
+    // stayed green with the catch mutated to blank the count). Navigate to actually run the
+    // failing poll, then assert the badge KEPT its last known 4 rather than dropping to zero
+    // (which would read as "the factory went idle" when it did not).
     mockApi.runsInProgressCount.mockRejectedValue(new Error("network"));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(within(runs).queryByLabelText("4 unread")).toBeTruthy();
+    fireEvent.click(runs); // /dashboard → /runs: a real pathname change re-fires the poll.
+    await waitFor(() => expect(mockApi.runsInProgressCount).toHaveBeenCalledTimes(2));
+    expect(within(runs).getByLabelText("4 in progress").textContent).toBe("4");
   });
 
   it("keeps the count reachable by name in the collapsed rail (BLK-4)", async () => {
@@ -404,11 +408,11 @@ describe("Runs nav count badge (PRD #239)", () => {
     // reuses the DOM node), and once collapsed its only text is the sr-only count — so its
     // accessible name is no longer "Runs" and it could not be re-found by that name.
     const runs = await screen.findByRole("link", { name: /Runs/ });
-    await within(runs).findByLabelText("3 unread");
+    await within(runs).findByLabelText("3 in progress");
     // Collapse the rail: the expanded pill is gated on !collapsed and the rail dot is
-    // aria-hidden, so the sr-only count is the only carrier left. Brand tone → "N unread".
+    // aria-hidden, so the sr-only count is the only carrier left. Brand tone → "N in progress".
     fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
-    expect(await within(runs).findByText("3 unread")).toBeTruthy();
+    expect(await within(runs).findByText("3 in progress")).toBeTruthy();
   });
 });
 

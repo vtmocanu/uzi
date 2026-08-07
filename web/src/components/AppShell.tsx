@@ -201,6 +201,7 @@ function NavItem({
   collapsed = false,
   badge = 0,
   badgeTone = "count",
+  badgeLabel,
 }: {
   to: string;
   icon?: ReactNode;
@@ -228,12 +229,22 @@ function NavItem({
   // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
   // no room to distinguish them by anything but colour.
   badgeTone?: "count" | "alert";
+  // badgeLabel is the NOUN the accessible count announces — "in progress" for the Runs
+  // badge, so a screen reader says "Runs, 5 in progress" rather than the meaningless
+  // "5 unread" (a run is never unread). Defaults per tone when unset: the `count` tone
+  // falls back to "unread" (correct for Notifications) and `alert` to "needing attention"
+  // (Workers), so every existing badge is byte-for-byte unchanged. The NavItem comment
+  // above already states the label must say what the number MEANS; this makes that
+  // reachable per-item instead of one hardcoded string for the whole tone.
+  badgeLabel?: string;
 }) {
   const { pathname } = useLocation();
   let active = exactOnly ? pathname === to : isNavActive(pathname, to);
   if (active && excludeSubpath && isNavActive(pathname, excludeSubpath)) active = false;
   const hasBadge = badge > 0;
   const alert = badgeTone === "alert";
+  // The accessible noun: explicit override, else the per-tone default.
+  const badgeNoun = badgeLabel ?? (alert ? "needing attention" : "unread");
   return (
     <Link
       to={to}
@@ -271,14 +282,14 @@ function NavItem({
           sr-only rather than an aria-label on the Link, so the destination name and the
           count stay separate strings rather than one run-on label. */}
       {collapsed && hasBadge && (
-        <span className="sr-only">{alert ? `${badge} needing attention` : `${badge} unread`}</span>
+        <span className="sr-only">{`${badge} ${badgeNoun}`}</span>
       )}
       {!collapsed && hasBadge && (
         <span
           // The label says what the number MEANS. "3 unread" for a worker count would be
           // wrong in a way a screen-reader user could not recover from — nothing else on
           // the page would explain it.
-          aria-label={alert ? `${badge} needing attention` : `${badge} unread`}
+          aria-label={`${badge} ${badgeNoun}`}
           className={cx(
             "ml-auto min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none",
             // text-on-brand, NOT text-white: measured 2.69:1 for white on bg-danger at 10px/600
@@ -459,7 +470,17 @@ function SidebarContent({
             ))}
           {/* Runs badge (PRD #239): the caller's in-progress run count. Default
               "count" tone — brand, "there is a queue", not the Workers alert red. */}
-          <NavItem to="/runs" icon={<ActivityIcon />} label="Runs" badge={runsInProgress} onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem
+            to="/runs"
+            icon={<ActivityIcon />}
+            label="Runs"
+            badge={runsInProgress}
+            // "in progress", not the count tone's default "unread": a run is never unread,
+            // and the mock spec'd this noun. Brand tone (Decision 2), not the Workers alert red.
+            badgeLabel="in progress"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
           <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 
