@@ -18599,3 +18599,35 @@ neither can OVER-merge.
   Part C only folds cosmetic drift. Historical recs that differ in REAL words (e.g. "worker clone
   setup (git identity)" vs "worker runner clone setup") are intentionally NOT merged — they can be
   bulk-dismissed manually (§359 group disposition).
+
+## 488. Activity-feed auto-expand: the terminal input is FROZEN AT MOUNT so a live `running → terminal` transition no longer flings collapsed lanes open
+
+Serves human.md Feature #95 (activity pane v2, collapse-by-default): a run finishing while watched
+must preserve the user's prior (collapsed) view. Design record: brief at
+`.claude/agent-team-tasks/activity-autoexpand-on-finish.md` (no PRD file — bug on branch `bug`).
+The §95 "S5" auto-expand (`web/src/components/ActivityFeed.tsx`) collapses lanes by default but
+auto-expands a terminal or single-actor run so reading a done N-agent run is not death-by-clicks.
+
+- **Root cause.** `terminal` is a live prop; `autoExpand = terminal || actorKeys.length <= 1` was
+  read live, so a live multi-agent run (`autoExpand === false`, collapsed) flipped to `true` the
+  instant it went terminal, expanding every lane with no explicit override — discarding the
+  collapsed view mid-read. The feed persists NO per-lane state (in-memory `useState` only), so that
+  expansion is unrecoverable except by re-collapsing each lane by hand.
+- **Fix — freeze the terminal half at mount:** `const arrivedTerminal = useRef(terminal).current`
+  (`ActivityFeed.tsx:512`), and `autoExpand = arrivedTerminal || actorKeys.length <= 1`. So lanes
+  auto-expand only when the run is ALREADY terminal at mount (opening an already-finished run — the
+  case where auto-expand helps), never on a live `running → terminal` transition.
+- **`actorKeys.length <= 1` stays LIVE by design.** A single-actor run is already expanded
+  throughout its life, so nothing jumps when it goes terminal; freezing it would buy nothing.
+- **Precedence unchanged.** Explicit per-lane overrides (user click) and Expand-all / Collapse-all
+  (`bulk`) still win over `autoExpand` in both the arrived-terminal and watched-it-finish cases.
+- **Chosen from two AI-proposed options; the pick is the user's.** Alternative was "never
+  auto-expand a terminal run at all"; the user chose freeze-at-mount, which keeps the
+  arrive-at-done convenience §95 shipped while fixing the watched-it-finish regression.
+- **The freeze is coupled to the per-run remount** (`f1a55f2f` hardening comment,
+  `ActivityFeed.tsx:506-511`). It stays correct across run→run navigation ONLY because
+  `useRunStream` calls `setRun(null)` on an id change → `RunView.tsx`'s `if (!run)` gate → the
+  component remounts and re-captures `terminal` per run. A future "keep the previous run visible
+  while the next loads" (anti-flash) change would drop that remount and let `arrivedTerminal` leak
+  a stale `false` across navigation; no test covers cross-run nav, so pin it with one before making
+  that change.
