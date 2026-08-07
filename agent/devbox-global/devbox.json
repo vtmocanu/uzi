@@ -191,6 +191,42 @@
   // openssl/file note above records — a versioned/`devbox add` form pins each to its own
   // nixpkgs rev; bare attrs lock as `source: "nixpkg"` at 20535e48…, matching every entry.
   //
+  // `shellcheck.bin` (2026-08-07) closes the open `install_worker_tool` judge rec for
+  // `shellcheck` (run 84b6a933, review 4d950db6). Same "every worker should have it" class as
+  // openssl/file/perl/coreutils/go-task/jq — a general shell linter, NOT a repo-specific extra
+  // like the root devbox.json's `ruby@3.3` (which is tier-2 only because uzi ships a Homebrew
+  // formula). The concrete gap it fills: uzi's OWN shell-lint gate. `Taskfile.yml`'s `lint:shell`
+  // (PRD #103 M5) shells out to `shellcheck` over every tracked `.sh` via `scripts/lint-shell.sh`,
+  // and it is reached by `task gate:repo` — which a worker can now actually invoke because
+  // `go-task` was baked in just above (2026-08-07). Without `shellcheck` on PATH that gate hits
+  // `shellcheck: command not found` and `task gate:repo` exits 127.
+  //
+  // THE ATTR MUST BE `shellcheck.bin`, NOT bare `shellcheck` — this is the file.out trap again,
+  // and it was MEASURED at the pinned rev, not assumed. nixpkgs shellcheck is multi-output
+  // (outputs [bin man doc out]); its CLI lives in `bin`. A bare `shellcheck` given to devbox
+  // resolves to the plain `out` output (store path …-shellcheck-0.11.0, no `-bin` suffix), which
+  // ships NO `bin/shellcheck` at all — the realized profile ends up with no `bin` dir, exactly
+  // like bare `file` did in 0.11.11. (`meta.outputsToInstall` == [bin man doc] here yet devbox
+  // still lands only `out` — confirming again that outputsToInstall is NOT what devbox's resolver
+  // uses.) `shellcheck.bin` names the CLI-bearing output and lands `bin/shellcheck` in the
+  // profile. Verified against the PROFILE (readlink -f .devbox/nix/profile/default then `ls bin/`),
+  // never `command -v` inside `devbox run` — the check that would have caught the `file` regression.
+  //
+  // VERSION IS LOAD-BEARING, not incidental: this rev carries shellcheck **0.11.0**, which is the
+  // EXACT pin `lint:shell` asserts (`scripts/lint-shell.sh warning 0.11.0`, `exit 2` on any other
+  // build — 0.10.0 does not emit SC3067 at all). So baking THIS build makes `task gate:repo` pass;
+  // baking any other shellcheck would turn the current exit 127 into a hard exit 2 (a broken
+  // instrument), which is worse, not better. If a future rev bump moves shellcheck off 0.11.0,
+  // this attr and the `lint:shell` pin must move together.
+  //
+  // Written BARE of any version/`@latest` suffix (the `.bin` is an OUTPUT selector, not a version)
+  // for the pinning reason recorded above; locks as `source: "nixpkg"` at 20535e48…. Verified at
+  // the pinned rev (2026-08-07): `shellcheck.bin` lands bin/shellcheck in the profile via live
+  // `devbox install`, `shellcheck --version` → 0.11.0; its bin-output narinfo
+  // (ixvpvkr2s92pbi6si1ki8yk3fs1gvlf2) is HTTP 200 on cache.nixos.org for x86_64-linux (1.5 MiB
+  // download / 7.5 MiB unpacked), so CI's amd64-only kaniko build SUBSTITUTES it rather than
+  // compiling shellcheck (a Haskell binary) from source — the non-negotiable condition for baking it.
+  //
   // NOT added, deliberately:
   //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
   //     any cluster by construction: `automountServiceAccountToken: false` at BOTH the
@@ -229,6 +265,7 @@
     "kubernetes-helm",
     "kubeconform",
     "go-task",
-    "jq.bin"
+    "jq.bin",
+    "shellcheck.bin"
   ]
 }
