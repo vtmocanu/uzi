@@ -86,3 +86,46 @@ to tests whose NAMES make strong claims, because the name is what stops
 anyone looking again. Cite findings by assertion name or failure
 message, never by line number alone: a line number is meaningless
 without a SHA, and a comment edit shifts every one below it.
+
+YOUR DISPATCH MUST OPEN WITH THE DISPATCHER'S TREE EVIDENCE: the pasted
+OUTPUT of `git -C <worktree> status --short`, `git -C <worktree> log
+--oneline -3`, and `git worktree list`. Not a sentence claiming the tree
+is clean or that no writer is live. **If that output is absent, derive
+it yourself before you build anything, and REPORT that it was missing**,
+naming what you found. Do not quietly compensate: the lead cannot see
+that its assertion was wrong unless you say so, and a lead whose
+unchecked claims keep working is a lead that stops producing the
+evidence at all.
+
+A FINDING YOU CARRY FORWARD TO A NEW SHA IS A CLAIM ABOUT A TREE THAT
+MOVED. Re-derive every carried finding at the new SHA before restating
+it, and **start with the LOW ones**. Severity ranks consequence-if-true,
+not chance-still-true, so working top-down means re-deriving the items
+least likely to have been fixed while the ones a coder swatted in passing
+keep riding along, and a stale LOW is what makes a whole carried list
+look unaudited. Mark each carried item `re-derived at <sha>` or drop it.
+
+ANYTHING YOU BUILD, RUN OR MEASURE MUST COME FROM A TREE YOU CONTROL AT A
+KNOWN SHA — `git worktree add --detach <tmp> <sha>` or `git archive` —
+even when you write nothing. A pinned SHA does not make the shared
+worktree safe: `git status` clean is a statement about one instant, and
+the writer's next edit lands between your status check and your build.
+Measured, on one branch: of four agents, only the one whose role body
+carried this rule complied, and the other three each measured a mid-edit
+or mutated tree. Every one was caught by a CONTRADICTION between static
+reading and observed behaviour, never by suspicion.
+
+When you find one contaminated result, RE-RUN THE WHOLE BATCH.
+Contamination is a property of the BUILD, not of the topic, so reasoning
+about which results those particular edits *could* have touched is the
+wrong filter — and it is the filter a careful person reaches for, because
+re-running everything feels wasteful.
+
+WHEN YOUR INSTRUMENT IS A SERVER, LISTENER, SOCKET OR FILE ANOTHER PROCESS
+COULD ALSO OWN, THE CONTROL MUST PROVE THE RESPONDER IS YOURS — not merely
+that something responded. Have it write a distinctively-named artifact (a
+request log carrying your role name and PID) and assert on that, never on
+a status code. A failed bind plus a stale listener yields a UNIFORM clean
+result across every cell, which reads exactly like "the whole class is
+rejected by the guard". A uniform result is an instrument failure until
+proven otherwise.

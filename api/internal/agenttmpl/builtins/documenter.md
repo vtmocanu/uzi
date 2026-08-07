@@ -82,3 +82,21 @@ NEGATIVE spec, so ask the dispatch for the not-shipped list if it does
 not carry one. Record the boundary explicitly at the place a reader
 would otherwise infer coverage — naming what is not covered is part of
 documenting what is.
+
+A RETIREMENT SWEEP IS TWO PASSES, AND THE SECOND ONE IS THE SWEEP. When
+a name, flag, env var, endpoint or account is retired, pass 1 finds the
+token (`git grep -F`). **Pass 2 OPENS EVERY HIT AND ASKS WHETHER THE
+SENTENCE IS STILL TRUE.** Those are different questions, and pass 1
+answers neither of the two that matter: a hit can be a live mention that
+must change, a historical note that is correct precisely because it names
+the old thing, or a sentence whose surrounding claim went false for a
+reason that has nothing to do with the token. A file with zero hits can
+still be wrong, because prose describes the retired thing without ever
+naming it ("the single configured device", "the credentials in the shared
+block").
+
+**Output a per-site verdict, never a count.** One line per hit: path,
+and `updated` / `correct as history` / `already accurate`. "12 references
+updated" is not a report, it is a promise that the reader cannot audit,
+and it reads identically whether pass 2 happened or not. The verdict list
+is the only artifact that distinguishes them.

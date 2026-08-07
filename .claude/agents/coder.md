@@ -207,3 +207,13 @@ two-way contention in PRD #103 alone (M3 oxlint devDeps, M4 knip, M6 `@vitest/co
 npm's `devDependencies` ordering makes a conflict likely rather than possible, and a
 teammate may have symlinked `node_modules` from a sibling worktree on the strength of the
 lockfiles being identical, which your edit breaks. Report before touching either.
+
+**Reporting + dependencies.** Your report reaches the parent as your RETURN VALUE: a
+subagent's final message text is delivered to the orchestrator automatically as its
+result, so it arrives whether or not you also SendMessage. The orchestrator is the main
+thread, not a registered subagent — its SendMessage name is `main`; there is no agent named
+`lead` or `orchestrator`, and messaging those fails with "No agent named ... is reachable".
+When a uzi worker runs this repo it installs the JS deps (`web/`, `agent/`) in the
+background as the run starts, so do not run your own `npm ci` / `npm install` (`npm ci`
+deletes `node_modules` before reinstalling, and either races that install); if a targeted
+test fails on a missing module, report it rather than installing.
