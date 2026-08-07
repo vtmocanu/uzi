@@ -316,7 +316,7 @@ hook, so it can never reach a signal tool.
 
 **Phase 1 — the progress feature (no new security surface).**
 
-- [ ] **M1 — Milestone list on the plan (agent + wire + store, no UI)**:
+- [x] **M1 — Milestone list on the plan (agent + wire + store, no UI)**:
       `submit_plan` gains optional `milestones`; `scanSignals` extracts them
       (main-thread-only, as today); candidate rides `awaiting_approval` and is
       frozen at approve, with the autopilot path on a `running` report (Decision
