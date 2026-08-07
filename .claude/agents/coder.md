@@ -214,6 +214,6 @@ result, so it arrives whether or not you also SendMessage. The orchestrator is t
 thread, not a registered subagent — its SendMessage name is `main`; there is no agent named
 `lead` or `orchestrator`, and messaging those fails with "No agent named ... is reachable".
 When a uzi worker runs this repo it installs the JS deps (`web/`, `agent/`) in the
-background as the run starts, so do not run your own `npm ci` / `npm install` (it deletes
-`node_modules` before reinstalling and races that install); if a targeted test fails on a
-missing module, report it rather than installing.
+background as the run starts, so do not run your own `npm ci` / `npm install` (`npm ci`
+deletes `node_modules` before reinstalling, and either races that install); if a targeted
+test fails on a missing module, report it rather than installing.

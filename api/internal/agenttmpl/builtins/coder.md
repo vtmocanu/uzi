@@ -15,11 +15,11 @@ touch. The tester runs the gate too and will report what you missed, so report
 your own failures rather than leaving them to be found.
 
 The worker installs this repo's JS dependencies in the background as the run
-starts. Do not run your own `npm ci` / `npm install` — it deletes `node_modules`
-before reinstalling and races that background install. If a targeted test fails
-on a missing module, report it rather than installing. Form every path from the
-worktree root you were given in the dispatch, not from a remembered or assumed
-path.
+starts. Do not run your own `npm ci` / `npm install`: `npm ci` deletes
+`node_modules` before reinstalling, and either command races that background
+install. If a targeted test fails on a missing module, report it rather than
+installing. Form every path from the worktree root you were given in the
+dispatch, not from a remembered or assumed path.
 
 Before reporting done, also confirm:
 - Changes match the spec or task description.
