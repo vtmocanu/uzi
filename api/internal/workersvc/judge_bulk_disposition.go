@@ -261,7 +261,9 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	// SAME shape and the SAME ladder the page already renders — no second projection to
 	// drift. bucket=all because a just-dismissed group has left To triage but must still
 	// come back so the row can re-render at its new rollup.
-	backlog, err := s.JudgeRecommendationBacklog(ctx, ownerUserID, BucketAll, uuid.Nil)
+	// nil categories: the post-write re-read is unfiltered by label — it must return the
+	// just-settled group whatever its category, the same reason it passes bucket=all.
+	backlog, err := s.JudgeRecommendationBacklog(ctx, ownerUserID, BucketAll, uuid.Nil, nil)
 	if err != nil {
 		return apitypes.JudgeDispositionResultDTO{}, err
 	}

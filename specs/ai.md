@@ -18631,3 +18631,53 @@ auto-expands a terminal or single-actor run so reading a done N-agent run is not
   while the next loads" (anti-flash) change would drop that remount and let `arrivedTerminal` leak
   a stale `false` across navigation; no test covers cross-run nav, so pin it with one before making
   that change.
+
+## 489. PRD #235 — the label filter is a raw-column SQL predicate BEFORE the `LIMIT`, composed with (not replacing) the Go bucket ladder, and ships with no DTO echo and no chip counts
+
+Serves human.md Feature #46 (the judge-recommendation backlog: "Recommendations land in an
+inbox/notifications surface", §358's cross-run worklist) and the verdict taxonomy enumerated at
+`specs/human.md:300-303`. Design record: `prds/235-judge-label-filter.md`. Adds a `?category=` /
+`--category` filter over the same six-label taxonomy already rendered on every group's badge
+(`web/src/lib/judge.ts`), with no new product contract — the taxonomy and the group shape are
+unchanged; this only adds a way to narrow which groups come back.
+
+- **Server-side, in SQL, before the `LIMIT` — not a client render filter and not Go-after-grouping.**
+  The backlog read is capped at `JudgeBacklogMaxRows = 2000` (`judge_backlog.go`), and the cap is
+  applied to raw rows BEFORE `GroupJudgeRecommendations` dedups them. A category filter applied
+  post-cap (in Go, or by hiding rows in React) can therefore make a WHOLE category vanish rather
+  than narrow: if every row of some label sits past row 2000, a post-cap filter for that label
+  returns nothing where the true answer is "several, past the cap." `rr.category` on
+  `review_recommendations` is a raw stored column (not a rollup), so it belongs in the same place
+  the `run_anchor` semi-join already lives — an optional predicate in
+  `judge_recommendations.sql`'s `WHERE`, evaluated before `ORDER BY … LIMIT`:
+  `sqlc.narg('categories')::text[] IS NULL OR rr.category = ANY(sqlc.narg('categories')::text[])`.
+  A NULL slice is the no-op ("all labels"), the same sentinel shape `run_anchor IS NULL` already
+  uses. Narrowing the filter therefore makes the row cap bind LESS often for what was asked, never
+  more — the opposite of a post-cap filter's failure mode.
+- **`bucket` stays in Go, deliberately, and the two compose across two layers.** `bucket` matches
+  the GROUP rollup — computed by the shared `BucketOf` ladder (PRD #94 Decision 2, §332) — not a
+  stored column, and moving it into SQL would be the second bucket ladder #94 already forbids by
+  name. So the pipeline is: SQL narrows rows to the selected categories → the row cap applies to
+  that narrowed set → Go groups the survivors by `(category, target)` → Go bucket-filters the
+  rollups. Category and bucket are independent predicates from two different data shapes (raw
+  column vs. computed rollup) that happen to compose cleanly because each stays in the layer that
+  can see the thing it filters on.
+- **Validated against the ingest-time enum, not a fresh list.** `ValidRecommendationCategory`
+  (`judge_backlog.go`) reads the same `RecommendationCategories` map the review-POST ingest path
+  already enforces (`judge_review.go`), so the filter's accepted set can never drift from what the
+  data can actually hold. An unknown value is a 400 (web) / exit 2 (CLI), never a silently empty
+  list — the same "a typo can never look like an empty backlog" posture `?bucket=`/`?run=` already
+  have. A present-but-empty `?category=` (or its absence) means "all labels": the comma-split empty
+  token is dropped before validation rather than rejected, so `?category=` alone does not 400.
+- **No DTO echo.** `JudgeBacklogDTO` (`apitypes/review.go`) echoes `Bucket` and `Run` but gained no
+  `Category`/`Categories` field — unlike bucket/run, the client and the CLI already own the
+  `?category=`/`--category` value they sent (it is their own request, not server-derived), so
+  echoing it back would cost a `wire_test.go` pinned-tag-set update for no new information. This was
+  an explicit PRD decision (Decision 9), not an oversight.
+- **No per-label chip counts in v1.** There is no canonical per-category aggregate — `/me/judge/stats`
+  is bucketed (todo/filed/done/dismissed), not per-label — and tallying a count off the delivered
+  `groups` is the anti-pattern this codebase already forbids by name for `triage` (§358: "NEVER
+  tallied from `groups`"), for the same reason: it would be wrong under truncation and under the
+  active bucket filter. `LabelFilter` (`Judge.tsx`) ships chips with no counts; a count is a
+  deliberate follow-up that would need its own aggregate, not a tally off what happens to be on
+  screen.

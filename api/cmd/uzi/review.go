@@ -70,6 +70,11 @@ func newReviewCmd(env Env, gf *globalFlags) *cobra.Command {
 	// ?run= since M1. A well-formed but unknown/foreign run id is an EMPTY list, never a 404
 	// (no existence oracle), so a typo cannot be told from a run with nothing in it.
 	backlog.Flags().String("run", "", "narrow to the coordinates that also occur in this run id — the one filter applied BEFORE the server's row cap")
+	// --category is a DISTINCT flag from the single-coordinate --category on resolve/dismiss
+	// (addCoordFlags): there it is one literal group coordinate, here it is a multi-value,
+	// enum-validated, comma-separated recommendation-label filter forwarded verbatim like
+	// --bucket. No cobra collision — flags are per-subcommand.
+	backlog.Flags().String("category", "", backlogCategoryFlagUsage)
 
 	resolve := &cobra.Command{
 		Use:   "resolve <run-id> <rec-id> | --category C --target T",
@@ -204,6 +209,16 @@ func newReviewCmd(env Env, gf *globalFlags) *cobra.Command {
 // stale unnoticed — a help string nothing asserts is a help string anyone can let rot.
 const backlogBucketFlagUsage = "filter by triage bucket: todo (default) | filed | done | dismissed | all"
 
+// backlogCategoryFlagUsage is the --category help text for `uzi review backlog`. Like
+// backlogBucketFlagUsage it is the ONE place the CLI writes the label set down, and it is
+// documentation rather than enforcement: the value is forwarded VERBATIM (a comma-separated
+// list) to the server, which owns the validator, so a stale line here misinforms but cannot
+// misbehave — an unknown label is the server's 400 → exit 2, never a silently empty list.
+// TestBacklogCategoryUsageMatchesServerEnum pins it to workersvc's RecommendationCategories
+// set both ways, so it cannot drift from the server enum unnoticed. This --category is a
+// DISTINCT flag from the single-coordinate --category on `resolve`/`dismiss`.
+const backlogCategoryFlagUsage = "filter by recommendation label (comma-separated): enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi"
+
 // addCoordFlags adds the group-form flags shared by `resolve` and `dismiss`. The pair is
 // the (category, target) coordinate the Judge backlog groups by — the same grain the web
 // menu's per-group action uses, and deliberately not a recommendation id, since one group
@@ -251,14 +266,16 @@ func reviewCoord(cmd *cobra.Command, args []string) (apitypes.JudgeDispositionCo
 	}
 }
 
-// runReviewBacklog fetches and renders the deduped backlog. --bucket is forwarded verbatim
-// (empty omits the parameter, so the server's default applies); --json passes the server's
-// envelope through unchanged, so an agent sees `truncated` and the canonical `triage`
-// alongside the groups.
+// runReviewBacklog fetches and renders the deduped backlog. --bucket and --category are
+// forwarded verbatim (empty omits the parameter, so the server's default applies — "todo"
+// for bucket, "all labels" for category); an unknown --category label is the server's 400,
+// never a silent empty list. --json passes the server's envelope through unchanged, so an
+// agent sees `truncated` and the canonical `triage` alongside the groups.
 func runReviewBacklog(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command) error {
 	bucket, _ := cmd.Flags().GetString("bucket")
 	runAnchor, _ := cmd.Flags().GetString("run")
-	b, err := c.JudgeBacklog(cmd.Context(), strings.TrimSpace(bucket), strings.TrimSpace(runAnchor))
+	category, _ := cmd.Flags().GetString("category")
+	b, err := c.JudgeBacklog(cmd.Context(), strings.TrimSpace(bucket), strings.TrimSpace(runAnchor), strings.TrimSpace(category))
 	if err != nil {
 		return err
 	}

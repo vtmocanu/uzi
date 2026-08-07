@@ -407,7 +407,7 @@ export function EmptyState({
         </div>
       )}
       <div className="max-w-sm space-y-1">
-        <p className="text-sm font-medium text-fg">{title}</p>
+        <h3 className="text-sm font-medium text-fg">{title}</h3>
         {description && <p className="text-sm text-faint">{description}</p>}
       </div>
       {action}

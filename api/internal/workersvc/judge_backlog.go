@@ -43,6 +43,13 @@ const (
 // rejects anything else with a 400 rather than silently ignoring the filter.
 func ValidJudgeBacklogBucket(s string) bool { return judgeBacklogBuckets[s] }
 
+// ValidRecommendationCategory reports whether s is an accepted ?category= label. It reads
+// the ingest-time RecommendationCategories set (judge_review.go) — the SAME closed
+// taxonomy the review-POST path already enforces — so the filter can never accept a label
+// the data cannot hold. The handler rejects anything else with a 400 rather than silently
+// ignoring the filter, exactly as it does for an unknown ?bucket=.
+func ValidRecommendationCategory(s string) bool { return RecommendationCategories[s] }
+
 // bucketRank orders the #94 ladder for the GROUP rollup (PRD #98 Decision 2:
 // dismissed > done > filed > todo). It ranks the OUTPUT of BucketOf; it is not a second
 // bucketing implementation — nothing here decides which bucket a recommendation is in.
@@ -145,18 +152,27 @@ const JudgeBacklogMaxRows = 2000
 //
 // runAnchor (the notification deep-link's /judge?run={id}) is pushed DOWN into the query's
 // owner-scoped WHERE as a semi-join, so an anchored pull reads only rows it will return
-// while still carrying each kept group's other-run occurrences. bucket filters the
-// resulting GROUPS in Go, because it matches the group ROLLUP, which is computed from the
-// shared BucketOf (a SQL bucket filter would be the forbidden second ladder).
+// while still carrying each kept group's other-run occurrences. categories (the ?category=
+// label filter) is pushed down the SAME way — rr.category is a raw stored column, so the
+// filter runs before the cap and a whole label can never truncate off-page. bucket, by
+// contrast, filters the resulting GROUPS in Go, because it matches the group ROLLUP, which
+// is computed from the shared BucketOf (a SQL bucket filter would be the forbidden second
+// ladder). A nil categories slice is the no-op "all labels" (see the param comment below).
 //
 // Triage is deliberately read from the SEPARATE #94 stats query rather than tallied off
 // these rows. That is what makes it the ONE canonical number (Success Criteria: nav badge
 // == notification == To-triage tab): it is literally the aggregate GET /me/judge/stats
 // serves, so neither the ?bucket=/?run= narrowing nor a truncated page can move it.
-func (s *Service) JudgeRecommendationBacklog(ctx context.Context, ownerUserID uuid.UUID, bucket string, runAnchor uuid.UUID) (apitypes.JudgeBacklogDTO, error) {
+func (s *Service) JudgeRecommendationBacklog(ctx context.Context, ownerUserID uuid.UUID, bucket string, runAnchor uuid.UUID, categories []string) (apitypes.JudgeBacklogDTO, error) {
 	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
 		UserID:    ownerUserID,
 		RunAnchor: nullableUUID(runAnchor), // uuid.Nil → SQL NULL → the anchor predicate is a no-op
+		// categories is a NULL-sentinel slice, the same idea as nullableUUID's uuid.Nil → NULL:
+		// a NIL slice maps to SQL NULL, so the category predicate is a no-op and all labels
+		// return. A non-nil EMPTY slice ([]string{}) is NOT the same — it maps to an empty
+		// Postgres array, which `= ANY({})` matches for nothing, filtering the whole backlog
+		// away. The handler therefore passes nil (never []string{}) when no ?category= is set.
+		Categories: categories,
 		// One over the cap, so a full page is distinguished from an exactly-full one
 		// without a second COUNT.
 		Lim: JudgeBacklogMaxRows + 1,

@@ -146,6 +146,7 @@ type FakeClient struct {
 	JudgeBacklogResult    apitypes.JudgeBacklogDTO
 	LastBacklogBucket     string
 	LastBacklogRun        string
+	LastBacklogCategory   string
 	BulkDispositionResult apitypes.JudgeDispositionResultDTO
 	LastBulkItems         []apitypes.JudgeDispositionCoordDTO
 	LastBulkStatus        string
@@ -313,9 +314,10 @@ func (f *FakeClient) JudgeStats(context.Context) (apitypes.TriageDTO, error) {
 	return f.JudgeStatsResult, nil
 }
 
-func (f *FakeClient) JudgeBacklog(_ context.Context, bucket, runAnchor string) (apitypes.JudgeBacklogDTO, error) {
+func (f *FakeClient) JudgeBacklog(_ context.Context, bucket, runAnchor, category string) (apitypes.JudgeBacklogDTO, error) {
 	f.LastBacklogBucket = bucket
 	f.LastBacklogRun = runAnchor
+	f.LastBacklogCategory = category
 	if f.Err != nil {
 		return apitypes.JudgeBacklogDTO{}, f.Err
 	}

@@ -4,7 +4,7 @@
 **Area**: `web/src/pages/Judge.tsx` (the chip row + the `?category=` URL param) · `web/src/lib/api.ts` (`getJudgeBacklog` gains a categories arg) · `web/src/mocks/mockApi.ts` (mock-mode parity) · `api/internal/handler/judge_recommendations.go` (param parse + validation) · `api/internal/workersvc/judge_backlog.go` (signature + a `ValidRecommendationCategory` helper) · `api/internal/store/queries/judge_recommendations.sql` (one optional predicate) · `api/cmd/uzi/review.go` (`--category` on `uzi review backlog`).
 **Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](mockups/235-judge-label-filter-mock.html) — interactive; the label chips filter a sample backlog live.
 **Line references** are against `dd342cb7`.
-**Status**: open.
+**Status**: complete (2026-08-07) — all four milestones implemented, tested, and reviewed on branch `agent/issue-235`.
 
 **Reviewed 2026-08-07** by a verification subagent that opened every code citation against
 `dd342cb7`. Verdict: the design is sound (category is a raw stored column filtered pre-`LIMIT`
@@ -287,20 +287,20 @@ server-side-filter decision.
 
 ## Milestones
 
-- [ ] **M1 — Server: `?category=` end to end.** The SQL predicate (regenerated),
+- [x] **M1 — Server: `?category=` end to end.** The SQL predicate (regenerated),
       `ValidRecommendationCategory`, the handler parse+validate+400 (with empty-token
       normalization), the `JudgeRecommendationBacklog` signature, and the DTO echo (which
       also updates `wire_test.go`'s pinned tag set — or is dropped per Decision 9). Ships
       with the **live-DB pre-cap proof** test, the handler-level threading assertion, the
       unknown-category 400, and the bucket/run/category composition tests. No web change
       yet; the endpoint is exercised by tests and `curl`.
-- [ ] **M2 — Web: the label filter.** The chip row, `?category=` in the URL, the Clear
+- [x] **M2 — Web: the label filter.** The chip row, `?category=` in the URL, the Clear
       control, the empty state, the result line (open question 4), `api.getJudgeBacklog`
       and the DTO, and `mockApi` parity. Unit tests + the fidelity test. The Judge page can
       filter to any subset of labels, shareable by URL.
-- [ ] **M3 — CLI parity.** `uzi review backlog --category` forwarded verbatim and
+- [x] **M3 — CLI parity.** `uzi review backlog --category` forwarded verbatim and
       validated server-side (open question 5), `docs/cli.md`. Independent of M2.
-- [ ] **M4 — Docs, changelog, mock parity check.** The user-facing docs and the changelog
+- [x] **M4 — Docs, changelog, mock parity check.** The user-facing docs and the changelog
       entry, and a browser check that the shipped filter matches
       `prds/mockups/235-judge-label-filter-mock.html` against a mock-mode build
       (`VITE_UZI_MOCK=1`, never a live-proxying `vite dev`/`preview`, per CLAUDE.md).

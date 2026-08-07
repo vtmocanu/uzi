@@ -77,14 +77,25 @@ WHERE rv.user_id = $1
             AND rr2.target = rr.target
       )
   )
+  -- The ?category= label filter, pushed DOWN here for the SAME reason as run_anchor above:
+  -- rr.category is a RAW STORED column, not a computed rollup, so it is filtered before the
+  -- LIMIT — the cap then bounds the SELECTED categories rather than truncating a whole label
+  -- off-page (the ?bucket= rollup, by contrast, stays in Go because it is the shared BucketOf
+  -- ladder; see the header). NULL is the no-op, exactly like run_anchor IS NULL: an absent
+  -- filter means all labels. Grouping/bucketing still happen entirely in Go.
+  AND (
+      $3::text[] IS NULL
+      OR rr.category = ANY($3::text[])
+  )
 ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
-LIMIT $3
+LIMIT $4
 `
 
 type ListJudgeRecommendationRowsForUserParams struct {
-	UserID    uuid.UUID   `json:"user_id"`
-	RunAnchor pgtype.UUID `json:"run_anchor"`
-	Lim       int32       `json:"lim"`
+	UserID     uuid.UUID   `json:"user_id"`
+	RunAnchor  pgtype.UUID `json:"run_anchor"`
+	Categories []string    `json:"categories"`
+	Lim        int32       `json:"lim"`
 }
 
 type ListJudgeRecommendationRowsForUserRow struct {
@@ -147,7 +158,12 @@ type ListJudgeRecommendationRowsForUserRow struct {
 // triage tally is deliberately NOT computed from these rows (the service reads the #94
 // stats query for that), so the canonical counts stay whole even when this page is cut.
 func (q *Queries) ListJudgeRecommendationRowsForUser(ctx context.Context, arg ListJudgeRecommendationRowsForUserParams) ([]ListJudgeRecommendationRowsForUserRow, error) {
-	rows, err := q.db.Query(ctx, listJudgeRecommendationRowsForUser, arg.UserID, arg.RunAnchor, arg.Lim)
+	rows, err := q.db.Query(ctx, listJudgeRecommendationRowsForUser,
+		arg.UserID,
+		arg.RunAnchor,
+		arg.Categories,
+		arg.Lim,
+	)
 	if err != nil {
 		return nil, err
 	}

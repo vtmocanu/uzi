@@ -51,3 +51,33 @@ describe("request() global 401 handling", () => {
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 });
+
+// PRD #235 M2: getJudgeBacklog appends the selected labels as a comma-joined ?category=,
+// enforced server-side before the row cap (the same shape as ?bucket=/?run=). The DTO does
+// NOT echo it back (Decision 9); this only pins the REQUEST the client builds.
+describe("getJudgeBacklog builds the ?category= query string (PRD #235)", () => {
+  const emptyBacklog = { bucket: "todo", run: "", groups: [], truncated: false, triage: {} };
+
+  it("joins the selected categories into a single comma-separated ?category= param", async () => {
+    const fetchMock = vi.fn(async (_url: string) => fakeResponse(200, emptyBacklog));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getJudgeBacklog("todo", undefined, ["install_worker_tool", "improve_uzi"]);
+
+    const url = fetchMock.mock.calls[0][0];
+    expect(url).toContain("/api/me/judge/recommendations");
+    const qs = new URLSearchParams(url.split("?")[1] ?? "");
+    expect(qs.get("category")).toBe("install_worker_tool,improve_uzi");
+    expect(qs.get("bucket")).toBe("todo");
+  });
+
+  it("omits ?category= when no labels are selected (empty means all)", async () => {
+    const fetchMock = vi.fn(async (_url: string) => fakeResponse(200, emptyBacklog));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getJudgeBacklog("todo", undefined, []);
+
+    const url = fetchMock.mock.calls[0][0];
+    expect(url).not.toContain("category");
+  });
+});

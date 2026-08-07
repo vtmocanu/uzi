@@ -145,6 +145,38 @@ describe("demo-mode backlog truncation: the cut", () => {
     expect(capBacklogRows([], 0), "an empty backlog at cap 0 must not be truncated").toEqual({ rows: [], truncated: false });
   });
 
+  // PRD #235 M2: the ?category= filter cuts ROWS before the cap, mirroring the SQL predicate
+  // that runs before the LIMIT. This rides the truncation leg (not the golden fidelity
+  // fixture) because it is a pre-cap row operation — exactly like ?run= — and the fidelity
+  // fixture deliberately excludes those.
+  it("filters category ROWS before the cap: a category whose only rows sit past the cap still returns", async () => {
+    setScenario(SCENARIO);
+    // Unfiltered, the cap cuts enable_tool/ripgrep off-page entirely — its only rows sit past
+    // the 6-row cut. The truncation suite above pins this same disappearance.
+    const unfiltered = (await mockApi.getJudgeBacklog("all")).groups;
+    expect(
+      find(unfiltered, "enable_tool", "ripgrep"),
+      "precondition: enable_tool/ripgrep must be truncated off the unfiltered page, or this test proves nothing",
+    ).toBeUndefined();
+
+    // Filtered to that category, it comes back. The ONLY way it can is if the category
+    // predicate ran BEFORE the cap. Filtering the grouped output AFTER the cap would return
+    // nothing here — the exact off-page bug the server's predicate-before-LIMIT avoids, now
+    // reproduced in the mock if the order is wrong.
+    const filtered = await mockApi.getJudgeBacklog("all", undefined, ["enable_tool"]);
+    expect(
+      find(filtered.groups, "enable_tool", "ripgrep"),
+      "the category filter ran AFTER the cap: enable_tool/ripgrep's rows were cut before the filter saw them, " +
+        "which is the off-page bug the server's predicate-before-LIMIT exists to avoid",
+    ).toBeTruthy();
+    // And the filtered set fits under the cap, so nothing is truncated — a second signal that
+    // the cap runs on the already-narrowed rows, not the whole backlog.
+    expect(
+      filtered.truncated,
+      "the selected category's rows fit under the cap, so the filtered page must not report truncated",
+    ).toBe(false);
+  });
+
   // Mutating: keep last. bulkSetJudgeDisposition writes to the shared demo state.
   it("carries truncated through the bulk-disposition re-read", async () => {
     setScenario(SCENARIO);

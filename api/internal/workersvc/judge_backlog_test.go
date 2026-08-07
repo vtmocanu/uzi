@@ -424,7 +424,7 @@ func TestJudgeRecommendationBacklogFilters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.bucket, func(t *testing.T) {
-			got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, tc.bucket, uuid.Nil)
+			got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, tc.bucket, uuid.Nil, nil)
 			if err != nil {
 				t.Fatalf("backlog: %v", err)
 			}
@@ -471,7 +471,7 @@ func TestJudgeRecommendationBacklogRunAnchorIsPushedDown(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	owner := uuid.New()
 
-	got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, "all", anchor)
+	got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, "all", anchor, nil)
 	if err != nil {
 		t.Fatalf("backlog: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestJudgeRecommendationBacklogTruncates(t *testing.T) {
 			rows := mk(tc.rows)
 			svc := New(backlogStoreFor(rows), newBox(t), testParams())
 
-			got, err := svc.JudgeRecommendationBacklog(context.Background(), uuid.New(), "all", uuid.Nil)
+			got, err := svc.JudgeRecommendationBacklog(context.Background(), uuid.New(), "all", uuid.Nil, nil)
 			if err != nil {
 				t.Fatalf("backlog: %v", err)
 			}
@@ -556,7 +556,7 @@ func TestJudgeRecommendationBacklogTriageIgnoresFilters(t *testing.T) {
 		{"run anchor", "all", anchor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, tc.bucket, tc.run)
+			got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, tc.bucket, tc.run, nil)
 			if err != nil {
 				t.Fatalf("backlog: %v", err)
 			}

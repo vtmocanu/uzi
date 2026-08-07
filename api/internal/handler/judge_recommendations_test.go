@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -39,7 +40,25 @@ type backlogStore struct {
 func (s *backlogStore) ListJudgeRecommendationRowsForUser(_ context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
 	s.calls = append(s.calls, "ListJudgeRecommendationRowsForUser")
 	s.backlogArg = &arg
-	return s.rows, nil
+	// Mirror the query's `rr.category = ANY(@categories)` push-down: a nil/empty slice is
+	// the "all labels" no-op, otherwise only rows whose category is in the set survive. This
+	// is what lets a ?category= request actually NARROW the backlog under the fake, so the
+	// triage-invariance test's group assertion is a real check and not vacuous. The triage
+	// method below deliberately does NOT filter — categories must never reach that path.
+	if len(arg.Categories) == 0 {
+		return s.rows, nil
+	}
+	keep := make(map[string]bool, len(arg.Categories))
+	for _, c := range arg.Categories {
+		keep[c] = true
+	}
+	out := make([]store.ListJudgeRecommendationRowsForUserRow, 0, len(s.rows))
+	for _, r := range s.rows {
+		if keep[r.Category] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // ListJudgeTriageRowsForUser projects the wide rows onto the narrow three-column shape —
@@ -269,6 +288,10 @@ func TestJudgeRecommendationsRejectsBadParams(t *testing.T) {
 		{"empty-but-present bucket falls back to the default", "bucket=", http.StatusOK},
 		{"unparseable run", "run=not-a-uuid", http.StatusBadRequest},
 		{"unknown run is simply empty", "run=" + uuid.New().String(), http.StatusOK},
+		{"unknown category", "category=nope", http.StatusBadRequest},
+		{"one good one bad category still 400", "category=improve_uzi,nope", http.StatusBadRequest},
+		{"empty-but-present category is all labels", "category=", http.StatusOK},
+		{"category with only empty tokens is all labels", "category=,", http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRunsHandler(t, &backlogStore{rows: rows})
@@ -348,6 +371,122 @@ func TestJudgeRecommendationsPushesRunAnchorToTheQuery(t *testing.T) {
 	h.JudgeRecommendations(httptest.NewRecorder(), backlogReq(caller, ""))
 	if st.backlogArg == nil || st.backlogArg.RunAnchor.Valid {
 		t.Fatalf("no ?run= must send a NULL anchor, got %+v", st.backlogArg)
+	}
+}
+
+// TestJudgeRecommendationsPushesCategoriesToTheQuery: the ?category= filter is parsed,
+// normalized, and handed to the QUERY as the Categories param (it is filtered inside the
+// owner-scoped WHERE before the row cap, not in Go afterwards). The load-bearing cases:
+// multiple values become the OR-union; an absent or present-but-empty ?category= sends a
+// NIL slice (→ SQL NULL → all labels), NEVER an empty slice (which would map to an empty
+// Postgres array and match nothing); and an empty token is dropped, not treated as a value.
+func TestJudgeRecommendationsPushesCategoriesToTheQuery(t *testing.T) {
+	rows, _ := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"multi-value is the OR union", "category=improve_uzi,install_worker_tool", []string{"improve_uzi", "install_worker_tool"}},
+		{"single value", "category=improve_uzi", []string{"improve_uzi"}},
+		{"absent category is a nil slice, not empty", "", nil},
+		{"present-but-empty category is a nil slice", "category=", nil},
+		{"leading empty token is dropped, not a value", "category=,improve_uzi", []string{"improve_uzi"}},
+		{"repeated value is deduped to one", "category=improve_uzi,improve_uzi", []string{"improve_uzi"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &backlogStore{rows: rows}
+			h := newRunsHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.JudgeRecommendations(rec, backlogReq(caller, tc.query))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET ?%s = %d, want 200; body=%s", tc.query, rec.Code, rec.Body.String())
+			}
+			if st.backlogArg == nil {
+				t.Fatalf("the query was never called")
+			}
+			got := st.backlogArg.Categories
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("Categories param = %#v, want %#v", got, tc.want)
+			}
+			// A nil expectation is specifically nil, not len-0: an empty []string{} would
+			// map to an empty Postgres array and filter the whole backlog away.
+			if tc.want == nil && got != nil {
+				t.Fatalf("no ?category= must send a NIL slice (→ SQL NULL → all labels), got %#v", got)
+			}
+		})
+	}
+}
+
+// TestJudgeRecommendationsCategoryDoesNotAffectTriage pins the PRD success criterion that
+// the bucket-tab counts and nav badge are byte-identical with and without a category filter:
+// triage is the canonical GET /me/judge/stats aggregate and the category filter must never
+// reach it. Two requests over the SAME fixture — one unfiltered, one filtered to a label
+// present in the fixture — must return an IDENTICAL got.Triage (the fake's triage method
+// ignores the category param, so any leak of categories into the triage/stats path would
+// have to come from the handler, and this catches it). The filtered request's Groups are
+// asserted strictly narrower so the test isn't vacuous: triage holds steady precisely
+// because the page narrowed underneath it.
+func TestJudgeRecommendationsCategoryDoesNotAffectTriage(t *testing.T) {
+	rows, _ := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+
+	unfiltered := &backlogStore{rows: rows}
+	recAll := httptest.NewRecorder()
+	newRunsHandler(t, unfiltered).JudgeRecommendations(recAll, backlogReq(caller, "bucket=all"))
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("unfiltered GET = %d, want 200; body=%s", recAll.Code, recAll.Body.String())
+	}
+	all := decodeBacklog(t, recAll)
+
+	filtered := &backlogStore{rows: rows}
+	recCat := httptest.NewRecorder()
+	// improve_uzi is one label present in backlogFixtureRows.
+	newRunsHandler(t, filtered).JudgeRecommendations(recCat, backlogReq(caller, "bucket=all&category=improve_uzi"))
+	if recCat.Code != http.StatusOK {
+		t.Fatalf("filtered GET = %d, want 200; body=%s", recCat.Code, recCat.Body.String())
+	}
+	cat := decodeBacklog(t, recCat)
+
+	if cat.Triage != all.Triage {
+		t.Fatalf("triage differs across a category filter: filtered=%+v unfiltered=%+v — the category filter must never reach the triage/stats path", cat.Triage, all.Triage)
+	}
+	// Non-vacuity: the category request really did narrow the page (the fixture spans three
+	// labels; improve_uzi is one), yet triage above stayed byte-identical.
+	if len(cat.Groups) >= len(all.Groups) {
+		t.Fatalf("category filter did not narrow the backlog: filtered %d groups, unfiltered %d — the test would be vacuous", len(cat.Groups), len(all.Groups))
+	}
+}
+
+// TestJudgeRecommendationsComposesAllThreeFilters: ?bucket=, ?run= and ?category= at once
+// each reach the query as their own parameter — bucket echoed on the DTO, the run anchor
+// pushed down as a valid UUID, and the category set threaded through — proving the three
+// filters compose rather than clobber one another.
+func TestJudgeRecommendationsComposesAllThreeFilters(t *testing.T) {
+	rows, anchor := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+	st := &backlogStore{rows: rows}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.JudgeRecommendations(rec, backlogReq(caller, "bucket=all&run="+anchor.String()+"&category=improve_uzi"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	got := decodeBacklog(t, rec)
+	if got.Bucket != "all" {
+		t.Errorf("echoed bucket = %q, want all", got.Bucket)
+	}
+	if st.backlogArg == nil {
+		t.Fatal("the query was never called")
+	}
+	if !st.backlogArg.RunAnchor.Valid || uuid.UUID(st.backlogArg.RunAnchor.Bytes) != anchor {
+		t.Errorf("run anchor param = %+v, want %v pushed into the query", st.backlogArg.RunAnchor, anchor)
+	}
+	if !slices.Equal(st.backlogArg.Categories, []string{"improve_uzi"}) {
+		t.Errorf("Categories param = %#v, want [improve_uzi]", st.backlogArg.Categories)
 	}
 }
 
