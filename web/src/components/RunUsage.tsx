@@ -5,11 +5,22 @@ import { formatTokens, formatCost } from "../lib/formatTokens";
 import { formatDuration } from "./RunEvent";
 import { cx } from "./ui";
 
-// PRD #40 §1: the run view's usage surfaces — a header strip, a collapsible
-// per-phase table, and a collapsible per-agent table — all derived client-side
-// from the message stream (lib/runUsage.ts), so they fold in live as new result
-// frames arrive (Decision 9) with no accumulator. Pre-feature runs derive
-// hasUsage=false upstream, so this renders nothing rather than a fabricated 0.
+// PRD #40 §1 + issue #237: the run view's usage surfaces — a header strip, a
+// collapsible per-phase table, and a collapsible per-agent table — all derived
+// client-side from the message stream (lib/runUsage.ts), so they fold in live as
+// new result frames arrive (Decision 9) with no accumulator.
+//
+// TWO states, gated by two independent flags off deriveRunUsage:
+//   • CONFIRMED (`hasConfirmed`, once a result frame carried per-model usage): the
+//     billed surface — the 4-stat strip, per-phase table, per-agent table, cost.
+//   • LIVE-ONLY (`hasLiveTokens && !hasConfirmed`, from the first assistant-usage
+//     frame until the first result frame lands): a provisional IN-FLIGHT view of
+//     input tokens only. Deliberately NO output and NO cost — per-call output is a
+//     message_start snapshot capturing ~1-4% of the truth, so a live out/cost figure
+//     would be wrong by ~25-100x (see runUsage.ts). Once `hasConfirmed` flips true the
+//     confirmed surfaces take over and this disappears — we never show the deduped
+//     live table beside the raw confirmed per-agent one.
+// A pre-feature run has neither flag, so this renders nothing rather than a fabricated 0.
 
 const K_CLASS = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
 
@@ -108,8 +119,9 @@ function totalModelCell(models: string[]): ReactNode {
 }
 
 export function RunUsagePanel({ usage }: { usage: RunUsage }) {
-  if (!usage.hasUsage) return null;
-  const { total, model, phases, agents, agentTotal, agentModels } = usage;
+  if (!usage.hasLiveTokens && !usage.hasConfirmed) return null;
+  const { hasConfirmed, hasLiveTokens, total, model, phases, agents, agentTotal, agentModels } = usage;
+  const { liveByModel, liveByAgent, liveTotal } = usage;
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);
@@ -117,6 +129,12 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
 
   return (
     <div>
+      {/* The CONFIRMED/billed surfaces. Gated on `hasConfirmed` so a live-only run
+          (assistant frames, no result frame yet) never renders a fabricated 0 strip
+          or an empty per-phase table — the LIVE section below stands in until a
+          result frame lands. Markup below is unchanged from the confirmed-only design. */}
+      {hasConfirmed && (
+        <>
       {/* role="group" is required for the aria-label to be reliable: the default
           role of a bare div is `generic`, and ARIA does not permit a name on it, so
           Chrome exposes it while NVDA/VoiceOver generally do not. The two table
@@ -271,6 +289,80 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
             cost is not available).
           </p>
         </details>
+      )}
+        </>
+      )}
+
+      {/* The LIVE / in-flight surface. Rendered ONLY before any result frame confirms a
+          billed total (`hasLiveTokens && !hasConfirmed`); the moment `hasConfirmed` flips
+          the confirmed surfaces above replace it. Input tokens only — DELIBERATELY no Out
+          column and no cost, because per-call output is a message_start snapshot worth
+          ~1-4% of the truth (see runUsage.ts). Figures are deduped per (agent_instance,
+          usage) upstream, so a repeated call collapses to one row. Region/table names are
+          kept distinct from the confirmed tables' ("Per-phase usage"/"Per-agent usage") so
+          a screen-reader user is never in two identically-named regions. */}
+      {hasLiveTokens && !hasConfirmed && (
+        <div>
+          <div className={K_CLASS}>In-flight tokens · live, not billed yet</div>
+          <p className="mt-1 text-[11px] text-faint">
+            Provisional input-token counts from in-flight assistant messages, deduplicated per call. Output and cost
+            are not shown until a phase completes and reports its billed total.
+          </p>
+
+          <div className="mt-2 overflow-x-auto" role="region" aria-label="In-flight per-model tokens, scrollable">
+            <table aria-label="In-flight per-model tokens" className="w-full min-w-[420px] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <Th left>Model</Th>
+                  <Th>In (fresh)</Th>
+                  <Th>In (cached)</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {liveByModel.map((r) => (
+                  <tr key={r.model}>
+                    <Td left mono>{r.model}</Td>
+                    <Td>{formatTokens(r.fresh)}</Td>
+                    <Td>{formatTokens(r.cached)}</Td>
+                  </tr>
+                ))}
+                <tr>
+                  <Td left total>In-flight total</Td>
+                  <Td total>{formatTokens(liveTotal.fresh)}</Td>
+                  <Td total>{formatTokens(liveTotal.cached)}</Td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-3 overflow-x-auto" role="region" aria-label="In-flight per-agent tokens, scrollable">
+            <table aria-label="In-flight per-agent tokens" className="w-full min-w-[420px] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <Th left>Agent</Th>
+                  <Th>In (fresh)</Th>
+                  <Th>In (cached)</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {liveByAgent.map((r) => (
+                  <tr key={r.agent}>
+                    <Td left>
+                      <AgentChip agent={r.agent} />
+                    </Td>
+                    <Td>{formatTokens(r.fresh)}</Td>
+                    <Td>{formatTokens(r.cached)}</Td>
+                  </tr>
+                ))}
+                <tr>
+                  <Td left total>In-flight total</Td>
+                  <Td total>{formatTokens(liveTotal.fresh)}</Td>
+                  <Td total>{formatTokens(liveTotal.cached)}</Td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -691,7 +691,7 @@ export function RunView() {
         <AgentRosterSummary run={run} />
       )}
 
-      {usage.hasUsage && (
+      {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">
           <RunUsagePanel usage={usage} />
         </Card>

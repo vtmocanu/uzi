@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mockBusyMessages, mockLaneMessages, mockLaneRuns } from "./data";
+import { mockBusyMessages, mockLaneMessages, mockLaneRuns, mockLiveTokensMessages } from "./data";
 
 // Mock mode is the only way to browse this feature without a live worker, and until
 // PRD #99's M6 every fixture in data.ts hardcoded agent_instance/agent_label to null.
@@ -56,7 +56,7 @@ describe("PRD #99 mock lane fixtures", () => {
   });
 
   it("registers the demo runs so they are reachable in mock mode", () => {
-    expect(mockLaneRuns.map((r) => r.id).sort()).toEqual(["run-busy", "run-lanes", "run-stalled"]);
+    expect(mockLaneRuns.map((r) => r.id).sort()).toEqual(["run-busy", "run-lanes", "run-live-tokens", "run-stalled"]);
   });
 
   it("makes run-stalled differ from run-busy ONLY in health", () => {
@@ -69,5 +69,52 @@ describe("PRD #99 mock lane fixtures", () => {
     expect(busy?.health).toBe("ok");
     expect(stalled?.health).toBe("looping");
     expect(stalled?.status).toBe(busy?.status);
+  });
+});
+
+// PRD #237: the live-only token fixture. These assertions guard the three properties the
+// run-page's LIVE token section needs to be demoable — usage-bearing frames spanning two
+// model keys, byte-identical (agent_instance, usage) duplicates the panel must collapse,
+// and NO result frame — so a later edit that "tidies" the fixture into a shape that can no
+// longer exhibit the state fails here rather than silently in a browser.
+describe("PRD #237 mock live-token fixture", () => {
+  const usageFrames = mockLiveTokensMessages.filter(
+    (m) => m.kind === "text" && !!(m.payload as { usage?: unknown }).usage,
+  );
+
+  it("has per-call usage frames spanning exactly two model keys", () => {
+    expect(usageFrames.length).toBeGreaterThan(0);
+    const models = new Set(usageFrames.map((m) => (m.payload as { model?: string }).model));
+    expect(models).toEqual(new Set(["claude-opus-4-8", "claude-sonnet-5"]));
+  });
+
+  it("carries a lead lane (null instance) and a subagent lane (non-null instance)", () => {
+    expect(usageFrames.some((m) => m.agent === "lead" && m.agent_instance === null)).toBe(true);
+    expect(usageFrames.some((m) => m.agent === "coder" && m.agent_instance !== null)).toBe(true);
+  });
+
+  it("includes a duplicate (agent_instance, usage) pair the panel must collapse", () => {
+    const keys = usageFrames.map((m) =>
+      JSON.stringify([m.agent_instance, (m.payload as { usage: unknown }).usage]),
+    );
+    // A byte-identical (agent_instance, usage) appears at least twice — the SDK's
+    // repeat-usage behaviour the dedup exists to absorb.
+    expect(keys.length - new Set(keys).size).toBeGreaterThanOrEqual(1);
+  });
+
+  it("carries NO result frame, so tokens are live-only (nothing confirmed)", () => {
+    expect(
+      mockLiveTokensMessages.some((m) => (m.payload as { event?: string }).event === "result"),
+    ).toBe(false);
+  });
+
+  it("keeps each agent's usage frames on a single model", () => {
+    const byAgent = new Map<string, Set<string | undefined>>();
+    for (const m of usageFrames) {
+      const set = byAgent.get(m.agent!) ?? new Set();
+      set.add((m.payload as { model?: string }).model);
+      byAgent.set(m.agent!, set);
+    }
+    for (const models of byAgent.values()) expect(models.size).toBe(1);
   });
 });

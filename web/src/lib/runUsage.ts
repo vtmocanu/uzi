@@ -159,9 +159,11 @@ export interface AgentUsage {
 }
 
 export interface RunUsage {
-  /** True once any result frame carried per-model usage — gates the whole UI (a
-   *  pre-feature run has none → the strip/tables never render, never a fabricated 0). */
-  hasUsage: boolean;
+  /** True once any result frame carried per-model usage — gates the CONFIRMED/billed
+   *  surface (phases, total, modelTotals). A pre-feature run has none → the confirmed
+   *  strip/tables never render, never a fabricated 0. Renamed from `hasUsage` (issue
+   *  #237): the live token surface below has its own gate, `hasLiveTokens`. */
+  hasConfirmed: boolean;
   phases: PhaseUsage[];
   /** One row per model, five columns each — the client's copy of this run's
    *  `run_usage` rows, which is the granularity the server actually stores. `total`
@@ -200,6 +202,39 @@ export interface RunUsage {
   agentModels: string[];
   /** Per-result-frame delta, keyed by seq (the finish line reads its own phase). */
   phaseUsageBySeq: Map<number, PhaseUsage>;
+
+  // ── The LIVE aggregate (issue #237) ──────────────────────────────────────────
+  // A SEPARATE surface from the confirmed ones above, summed from the assistant
+  // frames' per-call `usage` and DEDUPED by `(agent_instance, usage)`. It is what the
+  // run page shows WHILE a phase is still running, before any result frame has
+  // confirmed a billed total. `agent_instance` is null on the lead lane, so two
+  // byte-identical lead calls collapse to one record — the #194-validated key. A
+  // subagent invocation carries a distinct `agent_instance`, so its calls never
+  // collapse into another lane's. This dedup is applied ONLY here; the confirmed
+  // per-agent sum (`agents`/`agentTotal`) counts every frame raw and is unchanged.
+  //
+  // 🔴 THERE IS DELIBERATELY NO `out` AND NO COST FIELD on any live aggregate. Per-call
+  // `output_tokens` is a message_start snapshot that captures only 1-4% of the true
+  // output, so a live output figure would be wrong by ~25-100x, and a live cost derived
+  // from it would repeat issue #194's self-contradiction (a "cost" that shrinks as the
+  // real output grows). Only the two INPUT-side columns — fresh (input +
+  // cache_creation) and cached (cache_read) — are live-trustworthy, so only they are
+  // exposed.
+
+  /** True when ≥1 deduped live-usage record exists. Gates the LIVE surface, the way
+   *  `hasConfirmed` gates the billed one — the two are independent (a run mid-phase has
+   *  live tokens and no confirmed total; a pre-feature run has neither). */
+  hasLiveTokens: boolean;
+  /** The deduped live run total. NO `out`, NO cost — see the header above. */
+  liveTotal: { fresh: number; cached: number };
+  /** One row per model that co-gated a live usage frame (the same per-frame `model`
+   *  read the confirmed per-agent path uses). Sorted by model id ascending, codepoint
+   *  compare like `modelTotals`. NO `out`, NO cost. Keyed via a `Map`, not a `{}`,
+   *  because a model id is untrusted worker payload (same rationale as `agentMap`). */
+  liveByModel: { model: string; fresh: number; cached: number }[];
+  /** One row per agent (lane), keyed by `agent ?? "lead"`, in insertion order. NO
+   *  `out`, NO cost. Untrusted-key `Map` for the same reason as `liveByModel`. */
+  liveByAgent: { agent: string; fresh: number; cached: number }[];
 }
 
 /**
@@ -485,6 +520,17 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   const agentMap = new Map<string, AgentAcc>();
   let model: string | null = null;
 
+  // The LIVE aggregate (issue #237), DEDUPED by `(agent_instance, usage)`. All state
+  // is local to this one call — the reduction stays pure and idempotent under the
+  // ws→reconnect→REST-replay overlap, exactly like the confirmed accumulators. The
+  // dedup NEVER touches the raw `agents`/`agentTotal` sum above: those count every
+  // frame. `Map` (not `{}`) for both bucket maps because agent/model ids are untrusted
+  // payload (same rationale as `agentMap`/`readModelUsage`).
+  const seenLiveKeys = new Set<string>();
+  const liveTotal = { fresh: 0, cached: 0 };
+  const liveByAgentMap = new Map<string, { fresh: number; cached: number }>();
+  const liveByModelMap = new Map<string, { fresh: number; cached: number }>();
+
   // Each model's RUNNING HIGH-WATER MARK, per column, to difference into per-phase
   // deltas. Not the last-seen value: see the header for why the two are not the same
   // fold, and why only this one equals the server's. Entries are only ever added or
@@ -593,6 +639,35 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
         const fm = str(payload["model"]);
         if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
         agentMap.set(agent, acc);
+
+        // LIVE surface (issue #237): a SEPARATE dedup pass on the SAME frame. The raw
+        // `acc.*` above already counted this frame unconditionally; the live buckets
+        // count it only once per `(agent_instance, usage)` signature. The key is built
+        // from the RAW usage fields (not the folded `u`), so two calls collapse only
+        // when their four wire columns are byte-identical on the same lane.
+        const rawUsage = rec(payload["usage"]) ?? {};
+        const liveKey = JSON.stringify([
+          m.agent_instance,
+          num(rawUsage["input_tokens"]),
+          num(rawUsage["cache_read_input_tokens"]),
+          num(rawUsage["cache_creation_input_tokens"]),
+          num(rawUsage["output_tokens"]),
+        ]);
+        if (!seenLiveKeys.has(liveKey)) {
+          seenLiveKeys.add(liveKey);
+          liveTotal.fresh += u.fresh;
+          liveTotal.cached += u.cached;
+          const la = liveByAgentMap.get(agent) ?? { fresh: 0, cached: 0 };
+          la.fresh += u.fresh;
+          la.cached += u.cached;
+          liveByAgentMap.set(agent, la);
+          if (fm) {
+            const lm = liveByModelMap.get(fm) ?? { fresh: 0, cached: 0 };
+            lm.fresh += u.fresh;
+            lm.cached += u.cached;
+            liveByModelMap.set(fm, lm);
+          }
+        }
       }
     }
   }
@@ -625,8 +700,15 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     .map(([m, f]) => ({ model: m, ...f }))
     .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
 
+  // Live buckets → arrays. Models sorted by id ascending (codepoint compare, like
+  // modelTotals); agents in insertion order (the lanes as first seen on the stream).
+  const liveByModel = [...liveByModelMap.entries()]
+    .map(([m, f]) => ({ model: m, fresh: f.fresh, cached: f.cached }))
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+  const liveByAgent = [...liveByAgentMap.entries()].map(([a, f]) => ({ agent: a, fresh: f.fresh, cached: f.cached }));
+
   return {
-    hasUsage: phases.length > 0,
+    hasConfirmed: phases.length > 0,
     phases,
     total,
     modelTotals,
@@ -636,5 +718,9 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     agentTotal,
     agentModels,
     phaseUsageBySeq,
+    hasLiveTokens: seenLiveKeys.size > 0,
+    liveTotal,
+    liveByModel,
+    liveByAgent,
   };
 }

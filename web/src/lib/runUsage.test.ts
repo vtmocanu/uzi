@@ -87,6 +87,18 @@ function assistantUsage(
   });
 }
 
+// Like assistantUsage but with a chosen agent_instance, to exercise the live dedup
+// key `(agent_instance, usage)` (issue #237). The base `msg` hard-codes agent_instance
+// null (the lead lane, where two byte-identical calls collapse); a subagent invocation
+// carries a distinct non-null id, so its calls never collapse into another lane's.
+function assistantUsageInst(
+  agent: string,
+  agentInstance: string | null,
+  u: { input: number; cacheRead?: number; cacheCreation?: number; output: number; model?: string },
+): RunMessage {
+  return { ...assistantUsage(agent, u), agent_instance: agentInstance };
+}
+
 describe("deriveRunUsage", () => {
   it("differences cumulative result frames into per-phase deltas; total is the high-water mark", () => {
     beforeEachReset();
@@ -97,7 +109,7 @@ describe("deriveRunUsage", () => {
     ];
     const d = deriveRunUsage(messages);
 
-    expect(d.hasUsage).toBe(true);
+    expect(d.hasConfirmed).toBe(true);
     expect(d.model).toBe("claude-sonnet-5");
     expect(d.phases.map((p) => p.label)).toEqual(["Plan", "Implement · iteration 1"]);
 
@@ -146,7 +158,7 @@ describe("deriveRunUsage", () => {
       msg("text", "lead", { text: "done" }),
     ];
     const d = deriveRunUsage(messages);
-    expect(d.hasUsage).toBe(false);
+    expect(d.hasConfirmed).toBe(false);
     expect(d.phases).toHaveLength(0);
     expect(d.agents).toHaveLength(0);
     expect(d.modelTotals).toEqual([]);
@@ -158,7 +170,7 @@ describe("deriveRunUsage", () => {
       resultFrame("lead", { input: 500, cacheRead: 0, output: 120, cost: 0.03 }, { turns: 7, durationMs: 44_000, kind: "error" }),
     ];
     const d = deriveRunUsage(messages);
-    expect(d.hasUsage).toBe(true);
+    expect(d.hasConfirmed).toBe(true);
     expect(d.phases[0]).toMatchObject({ fresh: 500, out: 120, isError: true });
     expect(d.total.out).toBe(120);
   });
@@ -262,7 +274,7 @@ describe("deriveRunUsage", () => {
         usage: { input_tokens: 9_000, cache_read_input_tokens: 1_000, output_tokens: 400 },
       }),
     ]);
-    expect(d.hasUsage).toBe(false);
+    expect(d.hasConfirmed).toBe(false);
     expect(d.phases).toHaveLength(0);
     expect(d.agents).toHaveLength(0);
     expect(d.agentTotal).toMatchObject({ fresh: 0, cached: 0, out: 0 });
@@ -306,7 +318,7 @@ describe("deriveRunUsage", () => {
       duration_ms: 1,
       modelUsage: { "": { inputTokens: 10, outputTokens: 1 } },
     })]);
-    expect(d.hasUsage).toBe(false);
+    expect(d.hasConfirmed).toBe(false);
     expect(d.phases).toHaveLength(0);
     expect(d.total).toMatchObject({ fresh: 0, out: 0 });
     expect(d.modelTotals).toEqual([]);
@@ -324,7 +336,7 @@ describe("deriveRunUsage", () => {
       duration_ms: 1,
       modelUsage: { "": { inputTokens: 10 }, "claude-opus-5": { inputTokens: 7, outputTokens: 2 } },
     })]);
-    expect(d.hasUsage).toBe(true);
+    expect(d.hasConfirmed).toBe(true);
     expect(d.total).toMatchObject({ fresh: 7, out: 2 });
     expect(d.modelTotals.map((t) => t.model)).toEqual(["claude-opus-5"]);
   });
@@ -341,7 +353,7 @@ describe("deriveRunUsage", () => {
         modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": 5 },
       }),
     ]);
-    expect(d.hasUsage).toBe(false);
+    expect(d.hasConfirmed).toBe(false);
     expect(d.phases).toHaveLength(0);
   });
 
@@ -357,7 +369,7 @@ describe("deriveRunUsage", () => {
         modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": [] },
       }),
     ]);
-    expect(d.hasUsage).toBe(false);
+    expect(d.hasConfirmed).toBe(false);
     expect(d.phases).toHaveLength(0);
     expect(d.modelTotals).toEqual([]);
   });
@@ -378,7 +390,7 @@ describe("deriveRunUsage", () => {
         modelUsage: { "claude-opus-5": { inputTokens: 100, outputTokens: 10, costUSD: 1 }, "claude-sonnet-5": null },
       }),
     ]);
-    expect(d.hasUsage).toBe(true);
+    expect(d.hasConfirmed).toBe(true);
     expect(d.phases).toHaveLength(1);
     expect(d.total).toMatchObject({ fresh: 100, out: 10 });
     expect(d.modelTotals).toEqual([
@@ -714,6 +726,105 @@ describe("deriveRunUsage", () => {
     // The map itself has no prototype, and nothing leaked onto Object.prototype.
     expect(Object.getPrototypeOf(d.agents[0].modelCounts)).toBeNull();
     expect(({} as Record<string, unknown>)["__proto__"]).toBe(Object.prototype);
+  });
+
+  // ── Issue #237: the LIVE aggregate, DEDUPED by `(agent_instance, usage)` ───────
+  // A separate surface from the confirmed per-agent sum. The dedup collapses byte-
+  // identical calls on one lane; it must NOT leak into `agents`/`agentTotal`, which
+  // keep counting every frame raw.
+
+  it("dedups two identical (agent_instance, usage) frames into ONE live record, on the lead lane", () => {
+    beforeEachReset();
+    // agent_instance null is the lead lane: two byte-identical calls collapse.
+    const d = deriveRunUsage([
+      assistantUsageInst("lead", null, { input: 100, cacheRead: 50, cacheCreation: 10, output: 5, model: "claude-opus-4-8" }),
+      assistantUsageInst("lead", null, { input: 100, cacheRead: 50, cacheCreation: 10, output: 5, model: "claude-opus-4-8" }),
+    ]);
+    // Live: counted ONCE. fresh = input + cache_creation = 110, cached = cache_read = 50.
+    expect(d.hasLiveTokens).toBe(true);
+    expect(d.liveTotal).toEqual({ fresh: 110, cached: 50 });
+    expect(d.liveByAgent).toEqual([{ agent: "lead", fresh: 110, cached: 50 }]);
+    expect(d.liveByModel).toEqual([{ model: "claude-opus-4-8", fresh: 110, cached: 50 }]);
+    // The raw confirmed per-agent sum STILL counts BOTH frames — dedup did not leak.
+    expect(d.agents[0]).toMatchObject({ agent: "lead", fresh: 220, cached: 100, out: 10 });
+    expect(d.agentTotal).toEqual({ fresh: 220, cached: 100, out: 10 });
+  });
+
+  it("dedups two identical frames on a SUBAGENT lane too (same non-null agent_instance)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsageInst("coder", "inv-1", { input: 200, cacheRead: 20, output: 2, model: "claude-sonnet-5" }),
+      assistantUsageInst("coder", "inv-1", { input: 200, cacheRead: 20, output: 2, model: "claude-sonnet-5" }),
+    ]);
+    // Live: once. fresh = 200 (no cache_creation), cached = 20.
+    expect(d.liveTotal).toEqual({ fresh: 200, cached: 20 });
+    expect(d.liveByAgent).toEqual([{ agent: "coder", fresh: 200, cached: 20 }]);
+    expect(d.liveByModel).toEqual([{ model: "claude-sonnet-5", fresh: 200, cached: 20 }]);
+    // Raw sum still counts both frames.
+    expect(d.agents[0]).toMatchObject({ agent: "coder", fresh: 400, cached: 40, out: 4 });
+  });
+
+  it("does NOT over-dedup: same agent_instance but DIFFERENT usage each counts once", () => {
+    beforeEachReset();
+    // Same lane, distinct usage signatures → distinct keys → both counted.
+    const d = deriveRunUsage([
+      assistantUsageInst("coder", "inv-9", { input: 100, output: 5 }),
+      assistantUsageInst("coder", "inv-9", { input: 200, output: 5 }),
+    ]);
+    expect(d.liveTotal).toEqual({ fresh: 300, cached: 0 });
+    expect(d.liveByAgent).toEqual([{ agent: "coder", fresh: 300, cached: 0 }]);
+  });
+
+  it("splits the deduped live totals across models and agents on a multi-agent fixture", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsageInst("lead", null, { input: 100, cacheRead: 10, output: 1, model: "claude-opus-4-8" }),
+      // A byte-identical lead call: collapses, so lead contributes 100/10 ONCE.
+      assistantUsageInst("lead", null, { input: 100, cacheRead: 10, output: 1, model: "claude-opus-4-8" }),
+      assistantUsageInst("coder", "inv-1", { input: 200, cacheRead: 20, output: 2, model: "claude-sonnet-5" }),
+      assistantUsageInst("coder", "inv-1", { input: 300, cacheRead: 30, output: 3, model: "claude-sonnet-5" }),
+    ]);
+    // liveTotal == the DEDUPED sum of the underlying per-call fresh/cached.
+    expect(d.liveTotal).toEqual({ fresh: 100 + 200 + 300, cached: 10 + 20 + 30 });
+    // liveByModel: keyed by the co-gated model, sorted by model id ascending.
+    expect(d.liveByModel).toEqual([
+      { model: "claude-opus-4-8", fresh: 100, cached: 10 },
+      { model: "claude-sonnet-5", fresh: 500, cached: 50 },
+    ]);
+    // liveByAgent: keyed by agent, in insertion order (lead first, coder second).
+    expect(d.liveByAgent).toEqual([
+      { agent: "lead", fresh: 100, cached: 10 },
+      { agent: "coder", fresh: 500, cached: 50 },
+    ]);
+  });
+
+  it("carries NO out and NO cost on any live aggregate (per-call output is a snapshot)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsageInst("lead", null, { input: 100, cacheRead: 10, output: 5, model: "claude-opus-4-8" }),
+    ]);
+    expect("out" in d.liveTotal).toBe(false);
+    expect(Object.keys(d.liveTotal).sort()).toEqual(["cached", "fresh"]);
+    expect("out" in d.liveByModel[0]).toBe(false);
+    expect("costUsd" in d.liveByModel[0]).toBe(false);
+    expect(Object.keys(d.liveByModel[0]).sort()).toEqual(["cached", "fresh", "model"]);
+    expect(Object.keys(d.liveByAgent[0]).sort()).toEqual(["agent", "cached", "fresh"]);
+  });
+
+  it("gates confirmed and live INDEPENDENTLY", () => {
+    beforeEachReset();
+    // Assistant usage only, no result frame: live is up, confirmed is not.
+    const live = deriveRunUsage([assistantUsageInst("lead", null, { input: 100, output: 5 })]);
+    expect(live.hasLiveTokens).toBe(true);
+    expect(live.hasConfirmed).toBe(false);
+
+    // A result frame only, no assistant usage: confirmed is up, live is not.
+    beforeEachReset();
+    const confirmed = deriveRunUsage([
+      resultFrame("lead", { input: 100, cacheRead: 0, output: 5, cost: 0.1 }, { turns: 1, durationMs: 1 }),
+    ]);
+    expect(confirmed.hasConfirmed).toBe(true);
+    expect(confirmed.hasLiveTokens).toBe(false);
   });
 });
 

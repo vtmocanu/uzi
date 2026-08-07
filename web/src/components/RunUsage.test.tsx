@@ -123,8 +123,9 @@ function assistantFrame(agent: string, out: number, model?: string): RunMessage 
     usage: { input_tokens: 1_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: out },
   });
 }
-// Only here to make hasUsage true so the panel renders; its modelUsage model is never
-// displayed (the per-agent Model column reads assistant frames, the strip reads init).
+// Only here to make hasConfirmed true so the confirmed surfaces render; its modelUsage
+// model is never displayed (the per-agent Model column reads assistant frames, the strip
+// reads init).
 function resultFrame(): RunMessage {
   return result({ input: 3_000, cacheRead: 0, output: 300, cost: 0.5 }, { turns: 3, durationMs: 5_000 });
 }
@@ -384,5 +385,112 @@ describe("RunUsagePanel accessibility (item 8)", () => {
     );
     expect(glyphs.length).toBe(4); // two per <details>, one for each open state
     for (const g of glyphs) expect(g.getAttribute("aria-hidden")).toBe("true");
+  });
+});
+
+// Issue #237: the LIVE / in-flight surface. It appears from the first assistant-usage
+// frame (before any result frame confirms a billed total) and hands over to the confirmed
+// surfaces the moment one lands. Input tokens only — no Out column, no cost — because
+// per-call output is a message_start snapshot (see runUsage.ts).
+function liveFrame(
+  agent: string,
+  model: string,
+  u: { input: number; cacheRead: number; cacheCreation?: number; output: number },
+): RunMessage {
+  return m("text", agent, {
+    text: "…",
+    model,
+    usage: {
+      input_tokens: u.input,
+      cache_read_input_tokens: u.cacheRead,
+      cache_creation_input_tokens: u.cacheCreation ?? 0,
+      output_tokens: u.output,
+    },
+  });
+}
+
+describe("RunUsagePanel live in-flight surface (issue #237)", () => {
+  it("shows the in-flight tokens with ZERO result frames, and none of the confirmed billed surfaces", () => {
+    seq = 0;
+    const { container, getByText, queryByText, getAllByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          m("status", "lead", { event: "init", model: "claude-opus-4-8" }),
+          liveFrame("lead", "claude-opus-4-8", { input: 40_000, cacheRead: 300_000, output: 5_000 }),
+          liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
+        ])}
+      />,
+    );
+
+    // The live heading is unmistakable that these are provisional, not the billed figure.
+    expect(getByText(/In-flight tokens · live, not billed yet/)).toBeTruthy();
+
+    // The CONFIRMED billed surfaces are all absent: no strip, no per-phase table, no cost.
+    expect(queryByText("Tokens in")).toBeNull();
+    expect(queryByText("Per-phase breakdown")).toBeNull();
+    expect(queryByText("Run total")).toBeNull();
+
+    // No live output and no live cost: no "Out" header anywhere, and no "$" figure.
+    expect(queryByText("Out")).toBeNull();
+    expect(container.textContent).not.toContain("$");
+
+    // Deduped input figures render, split fresh/cached, per model and per agent.
+    expect(getByText("claude-opus-4-8")).toBeTruthy();
+    expect(getByText("claude-sonnet-5")).toBeTruthy();
+    // liveTotal fresh = 40k + 60k = 100.0k, cached = 300k + 500k = 800.0k — each total row
+    // appears once in the per-model table and once in the per-agent table.
+    expect(getAllByText("100.0k").length).toBe(2);
+    expect(getAllByText("800.0k").length).toBe(2);
+
+    // Exactly two live tables in two named, distinct scroll regions.
+    const wrappers = [...container.querySelectorAll("div.overflow-x-auto")];
+    expect(wrappers.length).toBe(2);
+    const labels = wrappers.map((w) => w.getAttribute("aria-label") ?? "");
+    for (const label of labels) {
+      expect(label).toMatch(/scrollable$/);
+      expect(label).not.toMatch(/\btable\b/);
+    }
+    expect(labels[0]).not.toBe(labels[1]);
+    // Names distinct from the confirmed tables' names (which never render here).
+    for (const label of labels) expect(label).not.toMatch(/Per-(phase|agent) usage/);
+    const tables = [...container.querySelectorAll("table")];
+    expect(tables.length).toBe(2);
+    for (const th of container.querySelectorAll("th")) expect(th.getAttribute("scope")).toBe("col");
+  });
+
+  it("collapses a duplicate (agent_instance, usage) live pair to a single figure", () => {
+    seq = 0;
+    // Two byte-identical calls on the same lead-less lane (agent_instance null) → one record.
+    const { queryByText, getAllByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
+          liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
+        ])}
+      />,
+    );
+    // Deduped: the coder lane reads 60.0k fresh, not the doubled 120.0k.
+    expect(queryByText("120.0k")).toBeNull();
+    // 60.0k appears as the per-model row + per-model total + per-agent row + per-agent total.
+    expect(getAllByText("60.0k").length).toBe(4);
+    expect(getAllByText("500.0k").length).toBe(4);
+  });
+
+  it("hands over to the confirmed surfaces once a result frame lands, hiding the live section", () => {
+    seq = 0;
+    const { getByText, queryByText, getAllByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+          liveFrame("coder", "claude-sonnet-5", { input: 60_000, cacheRead: 500_000, output: 8_000 }),
+          result({ input: 80_000, cacheRead: 500_000, output: 8_000, cost: 1.5 }, { turns: 5, durationMs: 10_000 }),
+        ])}
+      />,
+    );
+    // Confirmed strip + cost are back…
+    expect(getByText("Tokens in")).toBeTruthy();
+    expect(getAllByText("$1.50").length).toBeGreaterThanOrEqual(1);
+    // …and the live in-flight section is gone.
+    expect(queryByText(/In-flight tokens/)).toBeNull();
   });
 });
