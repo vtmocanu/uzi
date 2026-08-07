@@ -1,7 +1,7 @@
 # PRD #241: Scheduled runs (one-time + recurring; pinned issue, label sweep, or ad-hoc prompt) from web + CLI
 
 **GitLab Issue**: [#241](https://gitlab.example.com/vtmocanu/uzi/-/issues/241)
-**Status**: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. See the Decision Log.)
+**Status**: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. **Owner resolved both open decisions 2026-08-08: auto-approve defaults ON (Decision 4); the prompt target is NOT admin-gated (Decision 10).** See the Decision Log.)
 **Priority**: Medium
 **Mock**: `prds/mockups/241-schedule-runs-mock.html` (approved 2026-08-07)
 
@@ -193,21 +193,21 @@ robfig's `CRON_TZ=` spec prefix; the M2 DST test guards whichever is chosen. Thi
 new dependency; flag for review. (Presets in the UI are a thin translation layer to/from cron
 strings, Decision 6.)
 
-### Decision 4 — Auto-approve is opt-in per schedule, reusing autopilot's `auto_approve` (the one guardrail-adjacent choice)
+### Decision 4 — Auto-approve is per-schedule, defaulting ON (owner decision 2026-08-08)
 
 `runs.auto_approve` already exists (true for autopilot/selfimprove runs, false for manual).
 A scheduled run that fires at 02:00 and **stops at the plan-approval gate** waits until a
-human shows up — which defeats "work overnight." But **auto-approving a run nobody is
-watching** is a trust decision, not a default to make silently.
+human shows up — which defeats "work overnight."
 
-**Recommended:** a per-schedule `auto_approve` toggle, **defaulting off** (safe: the run
-plans and then waits at the gate, exactly like a manual run), with the modal and docs
-making explicit that turning it on is what makes unattended runs actually proceed, and that
-it reuses the *same* semantics autopilot already runs under (so it is not a new privilege,
-just a new trigger for an existing one). The primary directive is untouched either way:
-`main` is never written, and all four guardrail layers (PRD guardrails section) still apply
-— auto-approve only skips the *plan* gate, not any guardrail. **Owner sign-off wanted on the
-default.**
+**Decided (owner, 2026-08-08): a per-schedule `auto_approve` toggle, defaulting ON.** The
+whole point of a schedule is unattended off-hours work, so the default makes runs actually
+proceed; a user who wants a review gate flips it off per schedule. It reuses the *same*
+semantics autopilot already runs under (not a new privilege, just a new trigger for an
+existing one). The primary directive is untouched: `main` is never written, and all four
+main-protection guardrail layers still apply — auto-approve only skips the *plan* gate, not
+any guardrail, and delivery is still an MR a human merges. (The earlier draft recommended
+default-off; the owner overrode to on, matching the dark-factory posture and autopilot's own
+auto-approve default.)
 
 ### Decision 5 — One-time schedules go terminal, not hard-deleted (recommended)
 
@@ -349,9 +349,11 @@ ownership (`GetRepoForUser`). What changes is *policy*: the owner can run arbitr
 prompts against a repo they own. **One extra sub-risk (review):** `self_improve` MRs get
 guard-critical-path flagging (`GUARD_CRITICAL_PATTERNS`, `self-improve.ts`) because they target
 uzi's own repo; a `prompt` run pointed at the uzi repo would get **no** such flag — so either
-add that flag for prompt runs on the uzi repo, or gate the prompt target away from it. **Owner
-sign-off wanted** on the bypass, and on whether the prompt target is admin-gated like
-`self_improve` (default-off) or a normal user capability.
+add that flag for prompt runs on the uzi repo, or gate the prompt target away from it.
+**Decided (owner, 2026-08-08): the prompt target is NOT admin-gated** — it is a normal user
+capability, gated only by repo ownership (`GetRepoForUser`), exactly like the other targets.
+The bypass is accepted (`main` stays protected by the four layers); the guard-critical-path
+flag for uzi-repo prompt runs remains the one worker-side follow-up (M8).
 
 ## Milestones
 
@@ -481,8 +483,8 @@ sign-off wanted** on the bypass, and on whether the prompt target is admin-gated
    cadences (Decision 8); one-time schedules fire exactly once.
 4. The Schedules page and `uzi schedule list` show the same schedules with correct
    next/last-fire times; the modal's "next fires" preview matches what actually fires.
-5. Auto-approve is opt-in and, when off, a scheduled run stops at the plan gate like a
-   manual run; `main` is never written under any path.
+5. Auto-approve defaults on (owner decision) and is per-schedule; when a user turns it off, the
+   scheduled run stops at the plan gate like a manual run; `main` is never written under any path.
 6. A label sweep fires only on matching issues that also pass the run-creation gate
    (Decision 9); an ad-hoc prompt run opens an MR with no issue, keys dedup on the schedule,
    and has `PreToolUse`/PAT/branch guardrails identical to any other run (Decision 10).
@@ -499,16 +501,19 @@ sign-off wanted** on the bypass, and on whether the prompt target is admin-gated
 - **Sweep forge fan-out.** A sweep issues N `GetIssue` calls at fire time, and the scheduler
   (a background actor) is not behind the HTTP forge per-user limiter. Mitigate with per-tick
   pacing and note the rate-limit exposure (review N1).
-- **Unattended auto-approve.** Mitigated by opt-in default-off (Decision 4) and by the
-  guardrail layers being independent of the plan gate; called out for owner sign-off.
+- **Unattended auto-approve (now default-on, Decision 4).** The owner chose default-on for the
+  off-hours posture; residual risk is that a scheduled run implements its plan without review.
+  Mitigated by the four main-protection guardrail layers being independent of the plan gate
+  (`main` never written), the per-schedule opt-out, and MR-based delivery (a human still merges).
 - **Timezone/DST correctness.** Mitigated by storing IANA tz + delegating next-fire to the
   cron library, with an explicit DST unit test (M2).
 - **Second definition of "eligible."** Mitigated by reusing autopilot's candidate predicate
   (Decision 7) instead of inventing one.
 - **Ad-hoc prompt bypasses the PRD-issue sanction gate (Decision 10).** Mitigated: the four
   main-protection guardrail layers are untouched (`main` safe), consent is repo ownership, and
-  non-PRD runs already exist (`ci_fix`, `self_improve`). Residual *policy* risk flagged for
-  owner sign-off; consider admin-gating the prompt target like `self_improve` (default-off).
+  non-PRD runs already exist (`ci_fix`, `self_improve`). Owner decided it is **not** admin-gated
+  (a normal user capability); the one worker-side follow-up is the guard-critical-path flag for
+  prompt runs on the uzi repo.
 - **Label sweep over-promises.** A selector picks candidates but the gate picks what runs
   (Decision 9); mitigated by stating it in the UI, so a `bug` sweep over non-PRD issues without
   PRDLESS does not look broken when it fires nothing.
