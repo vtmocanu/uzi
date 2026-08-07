@@ -20,6 +20,7 @@ import {
   mockLaneMessages,
   mockLaneRuns,
   mockLimitWaitMessages,
+  mockLiveTokensMessages,
   mockProposals,
   mockRuns,
   mockSeededMessages,
@@ -56,6 +57,9 @@ function seed(): MockState {
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
   messages.set("run-busy", mockBusyMessages.map((m) => ({ ...m })));
+  // PRD #237: a running run mid-first-turn — per-call `usage` frames but no result frame,
+  // so the usage panel's LIVE / in-flight token section renders before anything is billed.
+  messages.set("run-live-tokens", mockLiveTokensMessages.map((m) => ({ ...m })));
   // Same stream, degraded health — see the run-stalled comment in data.ts.
   messages.set("run-stalled", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));

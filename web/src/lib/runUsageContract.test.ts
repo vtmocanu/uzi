@@ -195,7 +195,7 @@ describe("deriveRunUsage matches the server's run_usage fold", () => {
     const d = deriveRunUsage(messages());
     const server = serverTotal();
 
-    expect(d.hasUsage).toBe(true);
+    expect(d.hasConfirmed).toBe(true);
     expect(d.phases).toHaveLength(frames.length);
 
     // THREE aggregates, not four: `fresh` is input + cache_creation on the client side

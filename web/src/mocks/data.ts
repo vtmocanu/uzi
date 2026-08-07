@@ -3025,6 +3025,62 @@ export const mockSeededMessages: RunMessage[] = [
   },
 ];
 
+// ── PRD #237: live-only token counts (run mid-first-turn) ────────────────────
+// run-live-tokens exercises the run-page state this issue adds: a running run that has
+// emitted per-call assistant `usage` frames but NO result frame yet, so the usage panel
+// must show a LIVE / in-flight token section BEFORE any confirmed/billed figure exists.
+// Every other running fixture either carries no usage frames or (like run-done) a result
+// frame, so none of them could exhibit the live-before-confirmed state on its own.
+//
+// Two dedup properties the panel relies on are baked in deliberately: the SDK emits
+// several frames per API call all repeating ONE usage, so the fixture includes
+// byte-identical (agent_instance, usage) pairs — two lead frames (instance null) and two
+// coder frames (same non-null instance) — that the panel must COLLAPSE rather than
+// double-count. Model attribution is kept internally consistent per agent: lead on opus
+// (agent_instance null), coder on sonnet (non-null agent_instance, mirroring
+// mockLaneMessages), so the live breakdown spans exactly two model keys.
+let liveTokensSeq = 0;
+const ltm = (
+  kind: string,
+  agent: string | null,
+  instance: string | null,
+  label: string | null,
+  payload: unknown,
+  minAgo: number,
+): RunMessage => ({
+  seq: ++liveTokensSeq,
+  kind,
+  agent,
+  agent_instance: instance,
+  agent_label: label,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+export const mockLiveTokensMessages: RunMessage[] = [
+  // Init frame → the strip's main-thread (lead) model; matches the lead's opus frames.
+  ltm("status", null, null, null, { event: "init", model: "claude-opus-4-8" }, 6),
+  // Lead's first API call (opus). The SDK repeats one usage across several frames per
+  // call, so this exact usage appears TWICE back-to-back — the panel must collapse the
+  // duplicate (agent_instance=null, usage) to a single contribution.
+  ltm("text", "lead", null, null, { text: "Scoping the token-panel work and dispatching a coder for the web side.", model: "claude-opus-4-8", usage: { input_tokens: 12_400, cache_read_input_tokens: 88_000, cache_creation_input_tokens: 1_500, output_tokens: 3_200 } }, 6),
+  ltm("text", "lead", null, null, { text: "Scoping the token-panel work and dispatching a coder for the web side.", model: "claude-opus-4-8", usage: { input_tokens: 12_400, cache_read_input_tokens: 88_000, cache_creation_input_tokens: 1_500, output_tokens: 3_200 } }, 6),
+  ltm("tool_use", "lead", null, null, { id: "lt-1", name: "Agent", input: { description: "web token panel", subagent_type: "coder" } }, 5),
+  // Coder subagent (sonnet), a distinct instance/lane. Its first call's usage ALSO
+  // repeats byte-for-byte across two adjacent frames sharing the SAME agent_instance —
+  // the second dedup case (a per-instance one, not just the lead's null-instance one).
+  ltm("text", "coder", "toolu_01coderLT", "web token panel", { text: "Reading the run-view usage rendering to add the live section.", model: "claude-sonnet-5", usage: { input_tokens: 22_600, cache_read_input_tokens: 143_000, cache_creation_input_tokens: 0, output_tokens: 8_400 } }, 4),
+  ltm("text", "coder", "toolu_01coderLT", "web token panel", { text: "Reading the run-view usage rendering to add the live section.", model: "claude-sonnet-5", usage: { input_tokens: 22_600, cache_read_input_tokens: 143_000, cache_creation_input_tokens: 0, output_tokens: 8_400 } }, 4),
+  ltm("tool_use", "coder", "toolu_01coderLT", "web token panel", { id: "lt-2", name: "Read", input: { file_path: "web/src/components/RunUsage.tsx" } }, 4),
+  // A SECOND, distinct call from each agent (new usage numbers) so the live totals are a
+  // real sum across calls, not one repeated figure. Coder still on sonnet, lead still on
+  // opus → two model keys in the live breakdown.
+  ltm("text", "coder", "toolu_01coderLT", "web token panel", { text: "Adding the in-flight token section above the confirmed figures.", model: "claude-sonnet-5", usage: { input_tokens: 24_900, cache_read_input_tokens: 167_400, cache_creation_input_tokens: 0, output_tokens: 9_700 } }, 2),
+  ltm("text", "lead", null, null, { text: "Watching the coder's progress before the reviewer pass.", model: "claude-opus-4-8", usage: { input_tokens: 13_800, cache_read_input_tokens: 96_500, cache_creation_input_tokens: 0, output_tokens: 2_100 } }, 1),
+  // Deliberately NO result frame: the run is mid-first-turn, so there are live tokens but
+  // nothing confirmed/billed yet — the whole point of this fixture.
+];
+
 export const mockLaneRuns: Run[] = [
   demoIssueRun({
     id: "run-lanes",
@@ -3076,6 +3132,18 @@ export const mockLaneRuns: Run[] = [
     health: "looping",
     health_reason: "no new tool calls in the last few minutes",
     health_since: minsAgo(3),
+  }),
+  // run-live-tokens (PRD #237) — a running run mid-first-turn: assistant `usage` frames
+  // have arrived but NO result frame has, so the usage panel shows a LIVE / in-flight
+  // token section with nothing confirmed yet. Streams mockLiveTokensMessages.
+  demoIssueRun({
+    id: "run-live-tokens",
+    issue_iid: 237,
+    issue_title: "Live token counts before the first result frame (PRD #237)",
+    issue_description: "Demo run: per-call usage frames with no result frame, so tokens are live-only.",
+    branch: "agent/issue-237",
+    status: "running",
+    health: "ok",
   }),
 ];
 
