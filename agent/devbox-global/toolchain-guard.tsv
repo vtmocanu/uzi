@@ -38,3 +38,5 @@ perl	perl	perl -e exit
 coreutils	fmt	fmt --version
 kubernetes-helm	helm	helm version --short
 kubeconform	kubeconform	kubeconform -v
+go-task	task	task --version
+jq.bin	jq	jq --version

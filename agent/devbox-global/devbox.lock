@@ -17,6 +17,8 @@
     "perl": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#perl", "source": "nixpkg" },
     "coreutils": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#coreutils", "source": "nixpkg" },
     "kubernetes-helm": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#kubernetes-helm", "source": "nixpkg" },
-    "kubeconform": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#kubeconform", "source": "nixpkg" }
+    "kubeconform": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#kubeconform", "source": "nixpkg" },
+    "go-task": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#go-task", "source": "nixpkg" },
+    "jq.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#jq.bin", "source": "nixpkg" }
   }
 }

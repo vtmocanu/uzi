@@ -163,6 +163,34 @@
   // and `kubeconform`; both narinfos are HTTP 200 on cache.nixos.org for x86_64-linux
   // (79 MiB and 9.1 MiB), so the amd64 kaniko build substitutes rather than compiles.
   //
+  // `go-task` + `jq` (2026-08-07) close two more open `install_worker_tool` judge recs,
+  // both surfaced by the deterministic pre-scan on run 5bf8edb3 reporting them not-found
+  // on the worker. Same "every worker should have it" class as openssl/file/perl/coreutils,
+  // NOT a repo-specific extra like the Homebrew formula's `ruby` (which stays tier-2 in the
+  // root devbox.json), so they live here in the baked toolchain:
+  //   * `go-task` — closes a local-vs-CI gate-FIDELITY gap. This repo drives its canonical
+  //     gates through `Taskfile.yml` (`task gate:*`); a worker without `task` cannot exercise
+  //     those recipes and falls back to invoking `go build` / `tsc` / `node --test` by hand,
+  //     a worse mirror of what CI runs. The attr is `go-task`; its mainProgram is `task`, so
+  //     it puts bin/task on PATH. Single-output Go build, so the bare attr is correct (no
+  //     `.bin`/`.out` suffix). (This is the BAKED global manifest; the root CLAUDE.md note
+  //     that `task` "does NOT go in devbox.json" is about the repo's TIER-2 root devbox.json,
+  //     a different file with a different purpose — no contradiction.)
+  //   * `jq` — near-universal JSON CLI reached for across scripts. Requested as `jq.bin`, not
+  //     bare `jq`, the same defensive split-output attr as `openssl.bin` / `file.out`: jq is a
+  //     multi-output nixpkgs package (measured at this rev: outputs bin/doc/man/dev/out) and its
+  //     CLI lives in `bin`, so `jq.bin` names the CLI-bearing output unambiguously. NOTE this is
+  //     a milder case than `file`: at this pinned rev `jq.meta.outputsToInstall` == [bin man], so
+  //     a BARE `jq` would in fact still land bin/jq — jq does NOT reproduce the file-broke-in-
+  //     0.11.11 failure here (that was `file`, whose outputsToInstall excluded its CLI output).
+  //     `jq.bin` is chosen anyway because it is explicit and stays correct if outputsToInstall
+  //     ever changes. Whichever attr, verify against the PROFILE (readlink -f the profile then
+  //     `ls bin/`), never `command -v` inside `devbox run` — the check that would have caught
+  //     the `file` regression.
+  // Both written BARE (never `go-task@latest` / `jq.bin@latest`) for the pinning reason the
+  // openssl/file note above records — a versioned/`devbox add` form pins each to its own
+  // nixpkgs rev; bare attrs lock as `source: "nixpkg"` at 20535e48…, matching every entry.
+  //
   // NOT added, deliberately:
   //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
   //     any cluster by construction: `automountServiceAccountToken: false` at BOTH the
@@ -181,6 +209,11 @@
   //   * `typescript`/`vitest` (runs a6322954, bdc4c634, 95afd872) are repo-pinned dev
   //     dependencies, not toolchain; baking them would drift from whatever the clone pins.
   //     PRD #121's agent/src/js-deps.ts installs them from the repo's own lockfile.
+  //   * `eslint` (open judge rec, dismissed 2026-08-07). This repo lints with OXLINT — both
+  //     web/ and agent/ `package.json` `lint` scripts run `oxlint` (pinned 1.76.0) and there
+  //     is no eslint anywhere in the tree. eslint is otherwise a repo-pinned dev dependency,
+  //     the same class as typescript/vitest above (js-deps.ts installs those from the clone's
+  //     own lockfile), so baking it globally would help nothing here.
   "packages": [
     "go",
     "gcc",
@@ -194,6 +227,8 @@
     "perl",
     "coreutils",
     "kubernetes-helm",
-    "kubeconform"
+    "kubeconform",
+    "go-task",
+    "jq.bin"
   ]
 }
