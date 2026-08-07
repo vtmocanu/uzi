@@ -186,9 +186,9 @@ The run view in the web UI shows a terse, one-line-per-event feed (tool calls wi
 
 | Var | Default | Notes |
 |---|---|---|
-| `RUN_TIMEOUT` | `2h` | Wall-clock cap on a `running` run; the sweeper fails it past this. Also sent to the worker in the claim payload (`RunTimeoutSeconds`) for its own reference; the server's own sweeper is the actual enforcement. The admin-tunable [Run health](admin-settings.md#run-health) "slow" threshold is clamped to stay below this at read time, so it always warns before this ends the run. |
-| `RUN_IDLE_TIMEOUT` | `10m` | No-SDK-message idle cap, enforced **worker-side**; read here and shipped in the claim payload (`IdleTimeoutSeconds`). |
-| `RUN_MAX_ITERATIONS` | `5` | Cap on the implement ⇄ review loop count, enforced worker-side; read here and shipped in the claim payload. |
+| `RUN_TIMEOUT` | `2h` | Wall-clock cap on a `running` run; the sweeper fails it past this. Also sent to the worker in the claim payload (`RunTimeoutSeconds`) for its own reference; the server's own sweeper is the actual enforcement. The admin-tunable [Run health](admin-settings.md#run-health) "slow" threshold is clamped to stay below this at read time, so it always warns before this ends the run. On an `issue` run with an approved (frozen) milestone list, this value is the base the effective wall clock scales from — see [Milestone-scaled budgets](#milestone-scaled-budgets-prd-122-m2) below. |
+| `RUN_IDLE_TIMEOUT` | `10m` | No-SDK-message idle cap, enforced **worker-side**; read here and shipped in the claim payload (`IdleTimeoutSeconds`). Unaffected by milestone-scaled budgets (below) — it stays the real stall detector regardless of how large the iteration or wall-clock budget grows. |
+| `RUN_MAX_ITERATIONS` | `5` | Cap on the implement ⇄ review loop count, enforced worker-side; read here and shipped in the claim payload. On an `issue` run with an approved (frozen) milestone list, this value is the base the effective iteration ceiling scales from — see [Milestone-scaled budgets](#milestone-scaled-budgets-prd-122-m2) below. |
 | `PLAN_MAX_REVISIONS` | `3` | Cap on the number of `revise_plan` rounds per run before the plan-approval gate refuses more (PRD #41). Enforced **server-side** (the authoritative bound, counting all persisted revise rows) and again worker-side; read here and shipped in the claim payload. |
 | `QUESTION_MAX` | `5` | Cap on the number of clarifying questions (`ask_user`, PRD #88) the lead may ask per run attempt, enforced **worker-side** — read here and shipped in the claim payload, the same shape as `PLAN_MAX_REVISIONS`, because a hosted worker pod only ever gets the one tuning var the controller renders. The counter is worker-in-memory, so a worker-death requeue resets it: the honest lifetime bound is `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` — 10 questions on the defaults, not 5. |
 | `QUESTION_TIMEOUT_SECONDS` | `86400` (24h) | How long a run may sit at `awaiting_input` before the worker fails it with "clarification timed out" — fail-closed, no configurable default action. Same worker-in-memory caveat as `QUESTION_MAX`: a requeue resets the timer, so the honest worst case is `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 48h on the defaults, not 24. |
@@ -200,6 +200,41 @@ The run view in the web UI shows a terse, one-line-per-event feed (tool calls wi
 | `WORKER_AFFINITY_GRACE` | `2m` | How long a re-queued run is claimable only by the worker that was already running it, before any of the user's other workers may claim it (gives a resume a chance to land back on the disk that still holds the session + git worktree). |
 
 Invalid values for any of the above fall back to their defaults (the same lenient-parse behavior as the core table) and none is a boot guard, except `UZI_AUTOSTOP_ENABLED`, which aborts boot on a set-but-unparseable value (see its own row). All twelve are wired into the `api` service's `environment:` block in `docker-compose.yml` and documented in `.env.example`, so setting them in `.env` takes effect on the bundled stack.
+
+### Milestone-scaled budgets (PRD #122 M2)
+
+On an `issue` run whose plan carries a milestone breakdown approved at the plan
+gate (see [`prds/122-milestone-structured-runs.md`](../prds/122-milestone-structured-runs.md),
+Decisions 5 and 5b), `RUN_MAX_ITERATIONS` and `RUN_TIMEOUT` above are the **base**
+values a per-run budget scales from, not the budget itself. A plan may store up to
+50 milestones, but only the first **12** count toward this scaling — the count used
+below is always `min(n, 12)`.
+
+A run whose plan carries **zero or one** milestone is unaffected: it gets exactly
+`RUN_MAX_ITERATIONS` (5 turns) and `RUN_TIMEOUT` (2h) at their plain defaults, with
+no scaling applied.
+
+For a plan with `n` frozen milestones, the effective budget is:
+
+- **Iteration ceiling** = `RUN_MAX_ITERATIONS × min(n, 12)` — at most 60 turns on
+  the defaults.
+- **Wall clock** = `min(RUN_TIMEOUT × min(n, 12), 8h)` — at most 8h on the
+  defaults, an **absolute** ceiling that holds regardless of how many milestones
+  the plan carries.
+
+Both numbers are derived **server-side, once, at plan-approval (freeze) time**,
+from the count of milestones actually frozen onto that run's row — not from
+anything a worker reports afterward, so a worker cannot grant itself a larger
+budget by claiming more milestones later. The iteration ceiling is shipped to the
+worker in the claim payload and enforced the same way `RUN_MAX_ITERATIONS` always
+was; the wall clock is enforced the same way `RUN_TIMEOUT` always was — by the
+sweeper — except checked against this **per-run effective timeout** instead of a
+single global cutoff, so a scaled run is not swept to failed at the plain
+`RUN_TIMEOUT` value.
+
+`RUN_IDLE_TIMEOUT` takes no part in any of this and is unchanged: it remains the
+real stall detector no matter how large the scaled iteration or wall-clock budget
+gets.
 
 **A parked run's disk cost.** A run that parks at `limit_wait` deliberately keeps its git clone/worktree, its skills plugin dir, and its per-run SDK home on the worker's disk instead of cleaning up, so a resume can pick up the same session rather than starting fresh. One run's SDK home alone has been measured holding 167.3 MB of Go module cache (see `UZI_HOME_RECLAIM` below). So size worker disk for roughly `RUN_LIMIT_MAX_WAITS` concurrently parked runs times (one clone + one plugin dir + up to ~170 MB of run HOME) — the caps above bound *how many* parks and *how long*, not how much each one holds on disk.
 

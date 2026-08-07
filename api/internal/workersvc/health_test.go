@@ -442,12 +442,15 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 
 func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
 	fs := &healthFakeStore{}
-	// testParams RunTimeout is 2h; a 3h slow threshold forces the read-time clamp.
+	// testParams RunTimeout is 2h; a 3h slow threshold at/above the GLOBAL timeout is the
+	// operator misconfiguration this warns on. PRD #122 M2 (Decision 5b): slowThreshold
+	// now returns the RAW value (the per-run clamp moved to clampSlow/runningTarget), but
+	// the once-per-value warn stays here.
 	svc := healthSvc(fs, fakeHealthSettings{enabled: true, slow: 3 * 60 * 60})
 	ctx := context.Background()
 
-	if d := svc.slowThreshold(ctx); d != testParams().RunTimeout-time.Minute {
-		t.Fatalf("clamped = %v, want RunTimeout-1m", d)
+	if d := svc.slowThreshold(ctx); d != 3*time.Hour {
+		t.Fatalf("raw = %v, want the unclamped 3h", d)
 	}
 	if svc.lastSlowClampWarn != 3*time.Hour {
 		t.Fatalf("lastSlowClampWarn = %v, want 3h recorded after the first clamp warn", svc.lastSlowClampWarn)
@@ -461,10 +464,69 @@ func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
 	// Reconfiguring below the timeout clears the tracker so a later re-break warns again.
 	svc.healthSettings = fakeHealthSettings{enabled: true, slow: 300}
 	if d := svc.slowThreshold(ctx); d != 5*time.Minute {
-		t.Fatalf("slow = %v, want 5m (no clamp)", d)
+		t.Fatalf("slow = %v, want 5m raw", d)
 	}
 	if svc.lastSlowClampWarn != 0 {
 		t.Fatalf("lastSlowClampWarn = %v, want reset to 0 once configured below the timeout", svc.lastSlowClampWarn)
+	}
+}
+
+// clampSlow is the per-run clamp (PRD #122 M2, Decision 5b): raw unchanged below the
+// effective timeout, pulled just under at/above it, 0 stays 0.
+func TestClampSlow(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw, eff time.Duration
+		want     time.Duration
+	}{
+		{"raw below eff is unchanged", 45 * time.Minute, 2 * time.Hour, 45 * time.Minute},
+		{"raw at eff pulls under", 2 * time.Hour, 2 * time.Hour, 2*time.Hour - time.Minute},
+		{"raw above eff pulls under", 3 * time.Hour, 2 * time.Hour, 2*time.Hour - time.Minute},
+		{"zero raw stays zero", 0, 2 * time.Hour, 0},
+		{"tiny eff falls back to eff/2", 30 * time.Second, 30 * time.Second, 15 * time.Second},
+		{"scaled eff keeps a big raw", 3 * time.Hour, 8 * time.Hour, 3 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampSlow(tc.raw, tc.eff); got != tc.want {
+				t.Fatalf("clampSlow(%v,%v) = %v, want %v", tc.raw, tc.eff, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthSlowClampsPerRunBudget (Decision 5b): a scaled run (budget_wall = 8h) with
+// a raw slow threshold >= the GLOBAL RUN_TIMEOUT and started 3h ago is NOT slow — its
+// effective ceiling is 8h, so the clamp lands near 8h, not near 2h. The SAME run with a
+// NULL budget (global 2h) started the same 3h ago IS slow.
+func TestHealthSlowClampsPerRunBudget(t *testing.T) {
+	// Raw slow = 4h: above the global 2h RUN_TIMEOUT (misconfig path exercised) and above
+	// the 3h elapsed, but below the 8h scaled ceiling — so the scaled run's clamped
+	// threshold (4h) has not fired at 3h, while the unscaled run's (clamped to ~2h) has.
+	settings := fakeHealthSettings{enabled: true, slow: 4 * 60 * 60}
+
+	scaled := runRow("running")
+	scaled.StartedAt = ago(3 * time.Hour)
+	scaled.LastActivityAt = ago(1 * time.Minute) // recent → not stalled
+	scaled.BudgetWallSeconds = pgtype.Int4{Int32: 8 * 60 * 60, Valid: true}
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{scaled}}
+	svc := healthSvc(fs, settings)
+	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
+		w := lastWrite(t, fs, scaled.ID)
+		t.Fatalf("a scaled run 3h into an 8h budget must not flag; wrote %q", w.Health)
+	}
+
+	unscaled := runRow("running")
+	unscaled.StartedAt = ago(3 * time.Hour)
+	unscaled.LastActivityAt = ago(1 * time.Minute)
+	// BudgetWallSeconds left zero/invalid → global 2h ceiling, clamp near 2h-1m.
+	fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{unscaled}}
+	svc2 := healthSvc(fs2, settings)
+	if n := svc2.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (an unscaled run 3h in is slow)", n)
+	}
+	if w := lastWrite(t, fs2, unscaled.ID); w.Health != healthSlow {
+		t.Fatalf("health = %q, want slow for the NULL-budget run", w.Health)
 	}
 }
 

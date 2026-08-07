@@ -161,7 +161,20 @@ export class WorkerClient {
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
         if (res.status === 200 || res.status === 409) {
-          const ack: StateAck = { applied: res.status === 200, status: await readRunStatus(res) };
+          // Read the `{run: RunDTO}` body ONCE (a Response body is single-use) and pull
+          // status + the PRD #122 M2 effective budget off it together. The budget rides
+          // the ACK so a FRESH run — frozen mid-run at plan-approval, after its claim was
+          // already issued — learns its scaled cap here (a resume gets it on the claim
+          // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
+          const fields = await readRunAck(res);
+          const ack: StateAck = {
+            applied: res.status === 200,
+            status: fields.status,
+          };
+          if (fields.budgetMaxIterations !== undefined)
+            ack.budgetMaxIterations = fields.budgetMaxIterations;
+          if (fields.budgetWallSeconds !== undefined)
+            ack.budgetWallSeconds = fields.budgetWallSeconds;
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -338,26 +351,49 @@ export class WorkerClient {
 }
 
 /**
- * Pull `run.status` out of a /state response body (`{"run": <RunDTO>}`, the shape
- * both the 200 and the 409 path return).
+ * Pull `run.status` and the PRD #122 M2 effective budget out of a /state response body
+ * (`{"run": <RunDTO>}`, the shape both the 200 and the 409 path return). Reads the body
+ * ONCE — a Response body is single-use — so status and both budget numbers must come out
+ * of one parse.
  *
  * TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
- * body with no run, a non-string status, an older server that sent nothing — yields
- * `undefined` rather than throwing. That is not defensiveness for its own sake: the
- * caller's rule is a POSITIVE test for one literal, so `undefined` means "not
- * parked", which is the safe answer to every one of those failures. A throw here
- * would instead surface as a state report that appears to have failed, and would be
- * retried against a server that already applied it.
+ * body with no run, a non-string status, a non-numeric budget, an older server that sent
+ * nothing — yields the field absent rather than throwing. That is not defensiveness for
+ * its own sake: the status caller's rule is a POSITIVE test for one literal, so a missing
+ * status means "not parked", and a missing budget means "no budget update" — both the safe
+ * answer to every one of those failures. A throw here would instead surface as a state
+ * report that appears to have failed, and would be retried against a server that already
+ * applied it.
  */
-async function readRunStatus(res: Response): Promise<string | undefined> {
+async function readRunAck(res: Response): Promise<{
+  status?: string;
+  budgetMaxIterations?: number;
+  budgetWallSeconds?: number;
+}> {
   try {
     const text = await res.text();
-    if (!text) return undefined;
-    const parsed = JSON.parse(text) as { run?: { status?: unknown } };
-    const status = parsed?.run?.status;
-    return typeof status === "string" ? status : undefined;
+    if (!text) return {};
+    const parsed = JSON.parse(text) as {
+      run?: {
+        status?: unknown;
+        budget_max_iterations?: unknown;
+        budget_wall_seconds?: unknown;
+      };
+    };
+    const run = parsed?.run;
+    const out: {
+      status?: string;
+      budgetMaxIterations?: number;
+      budgetWallSeconds?: number;
+    } = {};
+    if (typeof run?.status === "string") out.status = run.status;
+    if (typeof run?.budget_max_iterations === "number")
+      out.budgetMaxIterations = run.budget_max_iterations;
+    if (typeof run?.budget_wall_seconds === "number")
+      out.budgetWallSeconds = run.budget_wall_seconds;
+    return out;
   } catch {
-    return undefined;
+    return {};
   }
 }
 

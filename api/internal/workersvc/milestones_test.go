@@ -78,6 +78,128 @@ func TestValidateMilestones(t *testing.T) {
 	}
 }
 
+func frozenThree() []byte {
+	return []byte(`[{"id":"m1","title":"One"},{"id":"m2","title":"Two"},{"id":"m3","title":"Three"}]`)
+}
+
+func strptr(s ...string) *[]string { return &s }
+
+// TestProgressParams is the Decision 3/12 ceiling for the live progress report: every
+// reported id must be a FROZEN member or the whole set is dropped (nil), independently
+// for completed and in_progress; a non-issue kind or a NULL frozen list drops both.
+func TestProgressParams(t *testing.T) {
+	frozen := frozenThree()
+
+	// Non-issue kind → both dropped regardless of a valid set.
+	if c, ip := progressParams(RunKindCIFix, frozen, strptr("m1"), strptr("m2")); c != nil || ip != nil {
+		t.Fatalf("non-issue kind must drop both, got completed=%q in_progress=%q", c, ip)
+	}
+	// NULL frozen list → nothing to validate against → both dropped.
+	if c, ip := progressParams(RunKindIssue, nil, strptr("m1"), strptr("m2")); c != nil || ip != nil {
+		t.Fatalf("NULL frozen must drop both, got completed=%q in_progress=%q", c, ip)
+	}
+
+	// A valid subset encodes; completed and in_progress independently.
+	c, ip := progressParams(RunKindIssue, frozen, strptr("m1", "m3"), strptr("m2"))
+	if string(c) != `["m1","m3"]` {
+		t.Fatalf("completed = %q, want [\"m1\",\"m3\"]", c)
+	}
+	if string(ip) != `["m2"]` {
+		t.Fatalf("in_progress = %q, want [\"m2\"]", ip)
+	}
+
+	// nil pointer → nil output (not reported), leaving the other set intact.
+	c, ip = progressParams(RunKindIssue, frozen, nil, strptr("m1"))
+	if c != nil {
+		t.Fatalf("absent completed must be nil, got %q", c)
+	}
+	if string(ip) != `["m1"]` {
+		t.Fatalf("in_progress = %q, want [\"m1\"]", ip)
+	}
+
+	// An empty (reported) set encodes to `[]` — distinct from nil (not reported).
+	if c, _ := progressParams(RunKindIssue, frozen, strptr(), nil); string(c) != "[]" {
+		t.Fatalf("empty completed must encode to [], got %q", c)
+	}
+
+	// Each rejection drops ONLY the offending set (nil), never the other.
+	overCap := make([]string, maxMilestonesPerRun+1)
+	for i := range overCap {
+		overCap[i] = "m1" // membership is fine; the length is the violation
+	}
+	reject := []struct {
+		name string
+		set  *[]string
+	}{
+		{"non-member id", strptr("m1", "nope")},
+		{"mis-shaped id", strptr("../x")},
+		{"empty id", strptr("")},
+		{"duplicate id", strptr("m1", "m1")},
+		{"over the count cap", &overCap},
+	}
+	for _, tc := range reject {
+		t.Run(tc.name, func(t *testing.T) {
+			// Put the bad set on completed, a valid one on in_progress, and assert only
+			// completed dropped.
+			c, ip := progressParams(RunKindIssue, frozen, tc.set, strptr("m2"))
+			if c != nil {
+				t.Fatalf("bad completed must drop to nil, got %q", c)
+			}
+			if string(ip) != `["m2"]` {
+				t.Fatalf("valid in_progress must survive the other set's rejection, got %q", ip)
+			}
+		})
+	}
+}
+
+// SetState `running` must pass the validated progress params through to the SQL, and a
+// non-member id must never reach the store.
+func TestSetStateRunningPassesProgressParams(t *testing.T) {
+	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs.runOwned.MilestonesFrozen = frozenThree()
+
+	if _, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{
+		State:                "running",
+		MilestonesCompleted:  strptr("m1"),
+		MilestonesInProgress: strptr("m2"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if string(fs.setRunningParams.MilestonesCompleted) != `["m1"]` {
+		t.Fatalf("completed param = %q, want [\"m1\"]", fs.setRunningParams.MilestonesCompleted)
+	}
+	if string(fs.setRunningParams.MilestonesInProgress) != `["m2"]` {
+		t.Fatalf("in_progress param = %q, want [\"m2\"]", fs.setRunningParams.MilestonesInProgress)
+	}
+
+	// A non-member completed id is dropped to NULL; the report still applies.
+	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, RunKindIssue)
+	fs2.runOwned.MilestonesFrozen = frozenThree()
+	if _, applied, err := svc2.SetState(context.Background(), wkr2, runID2, StateRequest{
+		State:               "running",
+		MilestonesCompleted: strptr("ghost"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if fs2.setRunningParams.MilestonesCompleted != nil {
+		t.Fatalf("a non-member id must be dropped to NULL, got %q", fs2.setRunningParams.MilestonesCompleted)
+	}
+}
+
+// SetState `running` must always supply the budget-scaling config (harmless on a
+// heartbeat, COALESCE-guarded in SQL).
+func TestSetStateRunningPassesBudgetConfig(t *testing.T) {
+	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	if _, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running"}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	p := fs.setRunningParams
+	if p.RunMaxIterations != 5 || p.RunTimeoutSeconds != 7200 ||
+		p.MilestoneBudgetCap != milestoneBudgetCap || p.BudgetWallCeilingSeconds != budgetWallCeilingSeconds {
+		t.Fatalf("budget config = %+v, want {5,7200,%d,%d}", p, milestoneBudgetCap, budgetWallCeilingSeconds)
+	}
+}
+
 // milestonesRunFixture is a run-owned SetState fixture with a chosen kind, so the
 // kind gate (Decision 13) can be exercised on both the awaiting_approval and running
 // paths.
@@ -278,6 +400,42 @@ func TestClaimServesFrozenMilestones(t *testing.T) {
 		}
 		if b, _ := json.Marshal(payload); strings.Contains(string(b), "milestones") {
 			t.Fatalf("omitempty must drop the key entirely: %s", b)
+		}
+	})
+
+	// PRD #122 M2 (Decision 5/5b): the claim serves the EFFECTIVE budget from the
+	// persisted columns, falling back to the global default when NULL.
+	t.Run("scaled budget served from the persisted columns", func(t *testing.T) {
+		fs := &fakeStore{
+			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+				IssueIid:            pgtype.Int8{Int64: 7, Valid: true},
+				BudgetMaxIterations: pgtype.Int4{Int32: 35, Valid: true},
+				BudgetWallSeconds:   pgtype.Int4{Int32: 28800, Valid: true}},
+			claimCtx: claimCtx, anthropic: sealedTok,
+		}
+		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if payload.Config.MaxIterations != 35 || payload.Config.RunTimeoutSeconds != 28800 {
+			t.Fatalf("scaled budget = {%d,%d}, want {35,28800}", payload.Config.MaxIterations, payload.Config.RunTimeoutSeconds)
+		}
+	})
+
+	// Regression gate: a NULL-budget run (0/1-milestone, or pre-feature) serves the
+	// GLOBAL default — byte-for-byte today.
+	t.Run("null budget serves the global default", func(t *testing.T) {
+		fs := &fakeStore{
+			claimRun: store.Run{ID: uuid.New(), Kind: RunKindIssue, Status: "claimed",
+				IssueIid: pgtype.Int8{Int64: 8, Valid: true}},
+			claimCtx: claimCtx, anthropic: sealedTok,
+		}
+		payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if payload.Config.MaxIterations != 5 || payload.Config.RunTimeoutSeconds != 7200 {
+			t.Fatalf("default budget = {%d,%d}, want {5,7200}", payload.Config.MaxIterations, payload.Config.RunTimeoutSeconds)
 		}
 	})
 }

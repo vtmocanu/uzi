@@ -7,7 +7,7 @@ import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
+import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger } from "./helpers.js";
@@ -184,7 +184,9 @@ function makeCtx(
       return v;
     },
     pullFollowUp: () => undefined,
-    reportIteration: (n) => iterations.push(n),
+    reportIteration: (n) => {
+      iterations.push(n);
+    },
     ...overrides,
   };
   return { ctx, emits, sessionIds, gated, iterations };
@@ -510,7 +512,7 @@ describe("SdkExecutor implement/review loop", () => {
     const probe = makeCtx({ config: { max_iterations: 3 } });
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
-      /maximum implement\/review iterations/,
+      /milestone-scaled implement\/review iteration budget/,
     );
     assert.deepStrictEqual(probe.iterations, [1, 2, 3]); // reported each iteration
     assert.strictEqual(turns.length, 1 /*plan*/ + 3 /*loop*/);
@@ -530,6 +532,126 @@ describe("SdkExecutor implement/review loop", () => {
     assert.match(turns[2]!.promptText ?? "", /please also add tests/);
     assert.match(turns[2]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
     assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/);
+  });
+});
+
+// PRD #122 M2: the server-served budget scales the loop's iteration cap and the
+// worker's own wall reference, and reported progress rides the next `running` report.
+function reportProgress(
+  completed: string[],
+  in_progress: string[],
+  sessionId = "sess-1",
+): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [
+        { type: "tool_use", id: "tp", name: "mcp__uzi__report_progress", input: { completed, in_progress } },
+      ],
+    },
+  } as unknown as SDKMessage;
+}
+
+describe("SdkExecutor budget resize + progress (PRD #122 M2)", () => {
+  it("raises the iteration cap to the server-served budget so a scaled run runs past the default", async () => {
+    // Default max_iterations is 5; the ack serves 35, so a run that signals done at
+    // iteration 7 completes instead of tripping the cap. fakeTurns repeats the last
+    // script, but the scripts here are explicit through the done turn.
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("w1"), resultSuccess()],
+      [assistantText("w2"), resultSuccess()],
+      [assistantText("w3"), resultSuccess()],
+      [assistantText("w4"), resultSuccess()],
+      [assistantText("w5"), resultSuccess()],
+      [assistantText("w6"), resultSuccess()],
+      [assistantText("w7"), signalDone(), resultSuccess()],
+    ]);
+    const seen: number[] = [];
+    const probe = makeCtx({
+      reportIteration: async (n) => {
+        seen.push(n);
+        return { maxIterations: 35 };
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.ok(seen.includes(7), `the loop reached iteration 7, past the default cap of 5; saw ${seen.join(",")}`);
+  });
+
+  it("still trips the cap at the default when the ack serves no budget (single/zero-milestone unchanged)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("still working"), resultSuccess()],
+    ]);
+    const seen: number[] = [];
+    const probe = makeCtx({
+      reportIteration: async (n) => {
+        seen.push(n);
+        return undefined; // no budget served
+      },
+    });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /milestone-scaled implement\/review iteration budget/,
+    );
+    assert.deepStrictEqual(seen, [1, 2, 3, 4, 5], "the default cap of 5 is unchanged when no budget is served");
+  });
+
+  it("scales the wall reference off the ack so a legitimately-scaled run does not self-trip REASON_WALL", async () => {
+    // Small initial wall (100ms). A loop turn that only finishes after 500ms would trip
+    // the unscaled wall; the ack scales it to an hour, so the run completes instead.
+    const slowDone = (): AsyncIterable<unknown> =>
+      (async function* () {
+        await new Promise((r) => setTimeout(r, 500));
+        yield signalDone();
+        yield resultSuccess();
+      })();
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], slowDone]);
+    const probe = makeCtx({
+      config: { run_timeout_seconds: 0.1 },
+      reportIteration: async () => ({ wallSeconds: 3600 }),
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+  });
+
+  it("without a scaled wall, the same slow turn trips REASON_WALL (regression gate for the scaling)", async () => {
+    const slowDone = (): AsyncIterable<unknown> =>
+      (async function* () {
+        await new Promise((r) => setTimeout(r, 500));
+        yield signalDone();
+        yield resultSuccess();
+      })();
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], slowDone]);
+    // Default reportIteration serves no budget, so the 100ms wall is never scaled.
+    const probe = makeCtx({ config: { run_timeout_seconds: 0.1 } });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /wall-clock timeout/,
+    );
+  });
+
+  it("carries progress reported via report_progress into the NEXT iteration's report", async () => {
+    const calls: Array<{ iteration: number; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan
+      [reportProgress(["m1"], ["m2"]), resultSuccess()], // iter 1: reports progress, no done
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2: done
+    ]);
+    const probe = makeCtx({
+      reportIteration: (iteration, progress) => {
+        calls.push({ iteration, progress });
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(calls[0]!.progress, undefined, "iteration 1 has no progress reported yet");
+    assert.deepStrictEqual(
+      calls[1]!.progress,
+      { completed: ["m1"], in_progress: ["m2"] },
+      "iteration 2's report carries the progress the lead reported in iteration 1",
+    );
   });
 });
 

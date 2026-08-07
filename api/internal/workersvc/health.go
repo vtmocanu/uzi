@@ -293,8 +293,17 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 		}
 	}
 
-	// slow: wall clock since start, regardless of activity or in-flight state.
-	if th.slow > 0 && r.StartedAt.Valid && now.Sub(r.StartedAt.Time) >= th.slow {
+	// slow: wall clock since start, regardless of activity or in-flight state. The RAW
+	// threshold (th.slow) is clamped PER-RUN against this run's EFFECTIVE timeout (PRD
+	// #122 M2, Decision 5b): the global RUN_TIMEOUT unless the run froze a scaled budget,
+	// in which case its persisted budget_wall_seconds. Without this a scaled run would
+	// render "slow" for its whole extended life (the global-clamped threshold fires ~2h
+	// into an 8h run). Byte-for-byte today for an unscaled run (NULL budget → eff = global).
+	effTimeout := s.p.RunTimeout
+	if r.BudgetWallSeconds.Valid && r.BudgetWallSeconds.Int32 > 0 {
+		effTimeout = time.Duration(r.BudgetWallSeconds.Int32) * time.Second
+	}
+	if slow := clampSlow(th.slow, effTimeout); slow > 0 && r.StartedAt.Valid && now.Sub(r.StartedAt.Time) >= slow {
 		return healthSlow, reasonSlow
 	}
 
@@ -491,11 +500,16 @@ func healthDur(secs int, _ error) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// slowThreshold reads health_slow_seconds and applies the read-time RUN_TIMEOUT
-// clamp (Decision 5): a slow threshold at or beyond RUN_TIMEOUT would never fire —
-// the run is failed by the timeout first — so it is clamped just under and logged.
-// RUN_TIMEOUT is an env value that can change across restarts, which is why this
-// lives here and not in the pure settings.Validate().
+// slowThreshold reads health_slow_seconds and returns it RAW (unclamped) — the clamp
+// against a run's effective timeout is applied PER-RUN in runningTarget (PRD #122 M2,
+// Decision 5b), not here, because a scaled run's ceiling is its persisted
+// budget_wall_seconds, not the global RUN_TIMEOUT, and this pass has no run in hand.
+//
+// The once-per-value operator-misconfig WARN stays here: a health_slow_seconds at or
+// beyond the GLOBAL RUN_TIMEOUT is a misconfiguration worth a log, since the common
+// (unscaled) run is still failed by the global timeout first and the flag would never
+// fire for it. RUN_TIMEOUT is an env value that can change across restarts, which is
+// why this lives here and not in the pure settings.Validate().
 func (s *Service) slowThreshold(ctx context.Context) time.Duration {
 	slow := healthDur(s.healthSettings.HealthSlowSeconds(ctx))
 	if slow == 0 {
@@ -503,22 +517,37 @@ func (s *Service) slowThreshold(ctx context.Context) time.Duration {
 		return 0
 	}
 	if s.p.RunTimeout > 0 && slow >= s.p.RunTimeout {
-		clamped := s.p.RunTimeout - time.Minute
-		if clamped <= 0 {
-			clamped = s.p.RunTimeout / 2
-		}
-		// Log once per distinct misconfigured value, not on every 15s sweep: the
-		// clamp is re-evaluated each pass, so an unconditional Warn would spam the log
-		// for as long as the misconfiguration stands.
+		// Log once per distinct misconfigured value, not on every 15s sweep: the check
+		// is re-evaluated each pass, so an unconditional Warn would spam the log for as
+		// long as the misconfiguration stands.
 		if s.lastSlowClampWarn != slow {
-			slog.Warn("health: health_slow_seconds >= RUN_TIMEOUT; clamping so the slow flag can fire before the run is timed out",
-				"configured", slow.String(), "clamped", clamped.String(), "run_timeout", s.p.RunTimeout.String())
+			slog.Warn("health: health_slow_seconds >= RUN_TIMEOUT; the slow flag will be clamped per-run so it can fire before a run is timed out",
+				"configured", slow.String(), "run_timeout", s.p.RunTimeout.String())
 			s.lastSlowClampWarn = slow
 		}
-		return clamped
+		return slow
 	}
 	s.lastSlowClampWarn = 0 // configured below the timeout now; a later re-break warns again
 	return slow
+}
+
+// clampSlow clamps a RAW slow threshold against a run's EFFECTIVE timeout (PRD #122
+// M2, Decision 5b): a threshold at or beyond the effective timeout would never fire —
+// the run is failed by the timeout first — so it is pulled just under. Returns raw
+// unchanged when raw < eff (the common case, byte-for-byte today for an unscaled run),
+// eff - 1m otherwise (or eff/2 when that would be non-positive), and 0 when raw is 0.
+func clampSlow(raw, eff time.Duration) time.Duration {
+	if raw == 0 {
+		return 0
+	}
+	if eff <= 0 || raw < eff {
+		return raw
+	}
+	clamped := eff - time.Minute
+	if clamped <= 0 {
+		clamped = eff / 2
+	}
+	return clamped
 }
 
 // -------------------------------------------------------------------------

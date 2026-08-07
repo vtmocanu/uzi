@@ -685,6 +685,28 @@ UPDATE runs SET
     -- one wins; the common heartbeat omits it and passes NULL, leaving it untouched
     -- (a human-gated run freezes through CreateApprovePlanInput instead).
     milestones_frozen = COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb),
+    -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
+    -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
+    -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
+    -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
+    budget_max_iterations = COALESCE(budget_max_iterations,
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb)), 0) <= 1 THEN NULL
+             ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb)), sqlc.arg('milestone_budget_cap')::int) END),
+    budget_wall_seconds = COALESCE(budget_wall_seconds,
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb)), 0) <= 1 THEN NULL
+             ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
+    -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
+    -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
+    -- Ids are validated + membership-checked server-side (progressParams) before here.
+    milestones_completed = CASE
+        WHEN sqlc.narg('milestones_completed')::jsonb IS NULL THEN milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || sqlc.narg('milestones_completed')::jsonb) AS e), '[]'::jsonb)
+    END,
+    milestones_in_progress = CASE
+        WHEN sqlc.narg('milestones_in_progress')::jsonb IS NULL THEN milestones_in_progress
+        ELSE sqlc.narg('milestones_in_progress')::jsonb
+    END,
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
     -- and an unconditional reset would clear the detector's flag on every heartbeat;
@@ -1187,11 +1209,26 @@ WHERE id = @id AND status = 'claimed';
 -- reconcile loop a marker to restore the origin column later. Chat runs are exempt
 -- (Decision 3): a chat legitimately parks for a long time between turns, so its own
 -- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
+--
+-- PRD #122 M2 (Decision 5b): the cutoff is now PER-RUN, not a single global @cutoff.
+-- A run that froze a scaled budget carries budget_wall_seconds; the sweep honours it,
+-- falling back to global_timeout_seconds (RUN_TIMEOUT) for a NULL-budget run — so a
+-- 0/1-milestone run is still failed at the global 2h and a seven-milestone run gets its
+-- derived 8h. Computed against now rather than a pre-subtracted cutoff so the per-run
+-- interval can be applied in SQL.
+--
+-- The 8h wall CEILING (budget_wall_ceiling_seconds) is NOT re-applied here: it is
+-- enforced by the freeze WRITERS (SetRunRunning / CreateApprovePlanInput), which LEAST()
+-- it in before persisting. This consumer trusts budget_wall_seconds as an already-capped,
+-- server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
+-- would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status = 'running' AND started_at < @cutoff AND kind <> 'chat'
+WHERE status = 'running'
+  AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
+  AND kind <> 'chat'
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -1580,6 +1617,17 @@ WITH selected AS (
         -- resume) never changes a list that was frozen once. A run with no candidate
         -- freezes NULL, which is correct: nothing to approve, nothing frozen.
         milestones_frozen = COALESCE(runs.milestones_frozen, runs.milestones_candidate),
+        -- PRD #122 M2 (Decision 5/5b): the per-run budget is derived at the SAME freeze,
+        -- from the same COALESCE'd frozen source, and written IDEMPOTENTLY via COALESCE —
+        -- a double-approve or a re-gate resume never changes a budget frozen once. NULL for
+        -- a 0/1-milestone plan (byte-for-byte the global default). See SetRunRunning for the
+        -- autopilot mirror of this compute.
+        budget_max_iterations = COALESCE(runs.budget_max_iterations,
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+                 ELSE sqlc.arg('run_max_iterations')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int) END),
+        budget_wall_seconds = COALESCE(runs.budget_wall_seconds,
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), 0) <= 1 THEN NULL
+                 ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
     WHERE id = @run_id
     RETURNING id
@@ -1758,9 +1806,13 @@ WHERE id = @id;
 -- broadcast) when nothing changed, and health_since so it can PRESERVE the original
 -- flag time when only the reason changes within the same enum (a queued run whose
 -- reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
+-- PRD #122 M2 (Decision 5b): budget_wall_seconds rides this read so the running-run
+-- "slow" clamp uses the run's EFFECTIVE timeout, not the global one — a scaled run must
+-- not render slow for its whole extended life. NULL for a run on the global default.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
-       health, health_reason, health_since, health_notified_at
+       health, health_reason, health_since, health_notified_at,
+       budget_wall_seconds
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';

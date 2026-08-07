@@ -393,6 +393,32 @@ export interface Milestone {
 }
 
 /**
+ * The lead's live progress over the frozen milestone list (PRD #122 M2). `completed`
+ * and `in_progress` are sets of milestone ids the lead reports as it works; the server
+ * unions `completed` (monotone, Decision 3) and overwrites `in_progress`. Reported on
+ * `running` state reports only, fire-and-forget — an informational field never fails a
+ * run. The worker carries these unchanged from the `report_progress` signal to the wire;
+ * the api is the authority on membership + shape (Decision 12).
+ */
+export interface MilestoneProgress {
+  completed: string[];
+  in_progress: string[];
+}
+
+/**
+ * The server-computed effective per-run budget (PRD #122 M2, Decision 5/5b), read off
+ * a state-report ACK and applied by the implement loop. Both optional: a field absent
+ * means "no update for this dimension, keep the worker's current budget". `maxIterations`
+ * is the total implement/review turn ceiling scaled by milestone count; `wallSeconds` is
+ * the effective wall-clock the sweeper enforces, mirrored here as the worker's own soft
+ * reference so a legitimately-scaled run does not self-trip its wall.
+ */
+export interface IterationBudget {
+  maxIterations?: number;
+  wallSeconds?: number;
+}
+
+/**
  * Response body of a successful (200) claim.
  *
  * The server also sends top-level run fields the worker does not consume
@@ -963,6 +989,16 @@ export interface StateRequest {
    *  Never sent on any other report in M1. Reporting is fire-and-forget: the server
    *  validates the list (Decision 12) and an informational field never fails a run. */
   milestones?: Milestone[];
+  /** The lead's live milestone progress (PRD #122 M2, Decision 3). Additive + optional
+   *  and OMITTED ENTIRELY when the lead has reported no progress — never `null` or `[]` —
+   *  so an old worker's payload and a new worker's "no progress" payload stay the same
+   *  shape on the wire. Sent on `running` reports only, alongside `iteration_count`, when
+   *  a `report_progress` signal has been observed. `milestones_completed` is unioned
+   *  server-side (monotone); `milestones_in_progress` is a snapshot the server overwrites.
+   *  Reporting is fire-and-forget: the server validates membership + shape (Decision 12)
+   *  and an informational field never fails a run. */
+  milestones_completed?: string[];
+  milestones_in_progress?: string[];
   /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
    *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
    *  `number` in the typings with no unit declared, so the WORKER normalizes it
@@ -1010,6 +1046,16 @@ export interface StateAck {
    *  server, an unparseable body, or a 4xx recognised as already-terminal by its
    *  text. Undefined must always be treated as "not parked". */
   status?: string;
+  /** The server-computed effective per-run budget (PRD #122 M2, Decisions 5/5b), read
+   *  off the SAME `{run: RunDTO}` body as `status`. `budgetMaxIterations` is the scaled
+   *  total implement/review turn ceiling; `budgetWallSeconds` is the effective wall clock
+   *  the sweeper enforces. Both are the mechanism by which a FRESH run (frozen mid-run at
+   *  plan-approval, after its claim was already issued) learns its scaled budget — a
+   *  resume gets the same numbers on the claim config instead. Null/absent (older server,
+   *  a run with no milestones, an unparseable body, a non-numeric value) ⇒ leave the
+   *  worker's current budget unchanged. */
+  budgetMaxIterations?: number;
+  budgetWallSeconds?: number;
 }
 
 export interface UserInput {

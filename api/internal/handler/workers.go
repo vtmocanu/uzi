@@ -402,6 +402,28 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 	} else {
 		dto.Milestones = milestones
 	}
+	// PRD #122 M2: live progress (id arrays) + the effective per-run budget. Progress
+	// degrades to nil on a decode error, same as the frozen list above (the columns
+	// carry a jsonb_typeof CHECK). The budget columns are pgtype.Int4 → *int, null when
+	// the run is on the global default (a 0/1-milestone run).
+	if completed, err := workersvc.DecodeMilestoneIDs(r.MilestonesCompleted); err != nil {
+		slog.Error("decode run milestones completed", "run_id", r.ID, "error", err)
+	} else {
+		dto.MilestonesCompleted = completed
+	}
+	if inProgress, err := workersvc.DecodeMilestoneIDs(r.MilestonesInProgress); err != nil {
+		slog.Error("decode run milestones in progress", "run_id", r.ID, "error", err)
+	} else {
+		dto.MilestonesInProgress = inProgress
+	}
+	if r.BudgetMaxIterations.Valid {
+		v := int(r.BudgetMaxIterations.Int32)
+		dto.BudgetMaxIterations = &v
+	}
+	if r.BudgetWallSeconds.Valid {
+		v := int(r.BudgetWallSeconds.Int32)
+		dto.BudgetWallSeconds = &v
+	}
 	// The failing pipeline's URL rides the frozen snapshot, not a column (the
 	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has
 	// one, an issue run has no snapshot.

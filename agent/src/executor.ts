@@ -13,9 +13,11 @@ import type {
   ClaimSkill,
   ClaimSkillDrop,
   FixVerdict,
+  IterationBudget,
   MemoryEntry,
   MessageKind,
   Milestone,
+  MilestoneProgress,
   RunKind,
 } from "./protocol.js";
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
@@ -178,8 +180,22 @@ export interface RunContext {
   askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
-  /** M4: report a running/iteration heartbeat (server persists via GREATEST). */
-  reportIteration?(iteration: number): void;
+  /**
+   * M4: report a running/iteration heartbeat (server persists via GREATEST).
+   *
+   * PRD #122 M2: it also carries the lead's live milestone `progress` (unioned +
+   * overwritten server-side) and RETURNS the server-computed effective per-run budget.
+   * The call stays fire-and-forget for reliability — the runner's implementation swallows
+   * a failed report so it can never fail the run — but its resolved value, WHEN present, is
+   * the budget the implement loop applies (Decisions 5/5b): a scaled iteration ceiling and
+   * an effective wall clock. Callers that do not need the budget may ignore the return —
+   * the stub executor's `ctx.reportIteration?.(1)` stays valid — and a `void`-returning
+   * implementation (or an absent budget) leaves the loop's current budget unchanged.
+   */
+  reportIteration?(
+    iteration: number,
+    progress?: MilestoneProgress,
+  ): Promise<IterationBudget | undefined> | void;
 }
 
 export interface ExecutorResult {

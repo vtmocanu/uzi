@@ -16,17 +16,23 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
-import type { AskUserQuestion, Milestone } from "./protocol.js";
+import type {
+  AskUserQuestion,
+  Milestone,
+  MilestoneProgress,
+} from "./protocol.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
 export const SUBMIT_PLAN_TOOL = "submit_plan";
 export const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
+export const REPORT_PROGRESS_TOOL = "report_progress";
 
 const SUBMIT_PLAN_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SUBMIT_PLAN_TOOL}`;
 const SIGNAL_DONE_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SIGNAL_DONE_TOOL}`;
 const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
+const REPORT_PROGRESS_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${REPORT_PROGRESS_TOOL}`;
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
@@ -46,6 +52,12 @@ export interface ScannedSignals {
    *  isSubagentFrame guard as the plan) and defensive — a malformed list yields
    *  nothing rather than throwing, and is only set when at least one entry parsed. */
   milestones?: Milestone[];
+  /** PRD #122 M2: the milestone progress a report_progress call carried, if the message
+   *  made one. MAIN-THREAD-ONLY (extracted behind the same isSubagentFrame guard as the
+   *  plan and milestones), so a subagent frame can never move the run's progress. Both
+   *  arrays are defensively parsed — malformed input yields empty arrays, never a throw.
+   *  Present whenever a report_progress tool_use was seen on a main-thread frame. */
+  progress?: MilestoneProgress;
 }
 
 /** Options for the signal server's tool schemas. */
@@ -63,6 +75,11 @@ export interface SignalServerOptions {
    *  to self-scale its budget off a milestone count. Gating the SCHEMA keeps the
    *  model from ever seeing the parameter on a non-issue run. */
   milestones?: boolean;
+  /** PRD #122 M2: expose the `report_progress` tool. Issue runs only (Decision 13),
+   *  gated on the same discriminator as `milestones` — a non-issue run has no milestone
+   *  list to progress against, so the tool is invisible to the model there rather than
+   *  present-and-inert. */
+  progress?: boolean;
 }
 
 /**
@@ -192,6 +209,42 @@ export function buildSignalMcpServer(
           ],
         }),
       ),
+      // PRD #122 M2. Issue runs only (opts.progress, gated on kind==="issue"). Unlike
+      // submit_plan/signal_done, this does NOT end the turn — it is a pure progress
+      // signal the lead fires WHILE it keeps working. The handler only acknowledges; the
+      // authoritative capture is the worker observing the tool_use in scanSignals.
+      ...(opts.progress
+        ? [
+            tool(
+              REPORT_PROGRESS_TOOL,
+              "Report which milestones from your approved plan are complete or in progress, so the run's progress is visible. " +
+                "Call this whenever a milestone COMPLETES or a new one STARTS. Pass milestone ids exactly as you gave them in your plan: " +
+                "`completed` is every id finished so far (it is fine to repeat ids you already reported — the server unions them), and " +
+                "`in_progress` is the ids you are actively working on right now. This does NOT end your turn — keep working after calling it. " +
+                "It is purely informational: it does not commit, checkpoint, or gate anything.",
+              {
+                completed: z
+                  .array(z.string())
+                  .optional()
+                  .default([])
+                  .describe("Milestone ids reported complete (cumulative; repeats are fine)."),
+                in_progress: z
+                  .array(z.string())
+                  .optional()
+                  .default([])
+                  .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
+              },
+              async () => ({
+                content: [
+                  {
+                    type: "text",
+                    text: "Progress recorded. Keep working — this did not end your turn.",
+                  },
+                ],
+              }),
+            ),
+          ]
+        : []),
     ],
   });
 }
@@ -208,7 +261,11 @@ export function isSignalToolName(name: unknown): boolean {
   return (
     name === SUBMIT_PLAN_QUALIFIED ||
     name === SIGNAL_DONE_QUALIFIED ||
-    name === ASK_USER_QUALIFIED
+    name === ASK_USER_QUALIFIED ||
+    // PRD #122 M2: report_progress is surfaced via the `running` state report, not the
+    // feed, so its raw tool_use payload is filtered out of the persisted stream like the
+    // other signalling tools — otherwise the model-authored id arrays would persist twice.
+    name === REPORT_PROGRESS_QUALIFIED
   );
 }
 
@@ -227,6 +284,14 @@ const MAX_OPTION_RUNES = 200;
 const MAX_MILESTONES = 200;
 const MAX_MILESTONE_ID_RUNES = 64;
 const MAX_MILESTONE_TITLE_RUNES = 200;
+
+/** Bounds on model-authored progress ids (PRD #122 M2). HYGIENE ONLY, mirroring the
+ *  milestone caps above — the api validates membership + shape and is the authoritative
+ *  control (Decision 12); these just keep a garbage payload from ballooning worker memory
+ *  before it is reported. A progress list can name at most the whole milestone set on
+ *  each side, so the count cap matches MAX_MILESTONES and the id cap matches ids. */
+const MAX_PROGRESS_IDS = MAX_MILESTONES;
+const MAX_PROGRESS_ID_RUNES = MAX_MILESTONE_ID_RUNES;
 
 function clamp(s: string, n: number): string {
   const runes = [...s];
@@ -298,6 +363,36 @@ function parseMilestones(raw: unknown): Milestone[] {
       id: clamp(id, MAX_MILESTONE_ID_RUNES),
       title: clamp(title, MAX_MILESTONE_TITLE_RUNES),
     });
+  }
+  return out;
+}
+
+/**
+ * Parse + clamp one side (`completed` or `in_progress`) of a report_progress call
+ * (PRD #122 M2). Defensive in the same register as parseMilestones: a non-array yields
+ * []; each entry is coerced to a trimmed string, blanks are dropped, ids are clamped to
+ * 64 runes and deduped, and the list is capped at MAX_PROGRESS_IDS. Never throws. The cap
+ * here is HYGIENE — the api validates membership against the frozen list (Decision 12).
+ */
+function parseProgressIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= MAX_PROGRESS_IDS) break;
+    // Coerce only actual scalars to a string — an object/array id is garbage, not a
+    // stringifiable id, so it is dropped rather than turned into "[object Object]".
+    const id =
+      typeof item === "string"
+        ? item.trim()
+        : typeof item === "number" || typeof item === "boolean"
+          ? String(item).trim()
+          : "";
+    if (id === "") continue;
+    const clamped = clamp(id, MAX_PROGRESS_ID_RUNES);
+    if (seen.has(clamped)) continue;
+    seen.add(clamped);
+    out.push(clamped);
   }
   return out;
 }
@@ -393,6 +488,18 @@ export function scanSignals(message: unknown): ScannedSignals {
       const parsed = parseQuestions(asRecord(block["input"])?.["questions"]);
       if (parsed.length > 0)
         out.questions = [...(out.questions ?? []), ...parsed];
+    } else if (name === REPORT_PROGRESS_QUALIFIED) {
+      // PRD #122 M2. Extracted HERE, inside the content loop that isSubagentFrame already
+      // guards, for the SAME reason milestones is nested inside submit_plan's branch: a
+      // subagent frame never reaches this loop, so a prompt-injected or buggy subagent can
+      // NEVER move the run's progress. Both sides are defensively parsed (ids coerced,
+      // deduped, bad entries dropped, never throws). Last-wins within the turn if the lead
+      // reports twice — the latest snapshot is the one that describes where the run is.
+      const input = asRecord(block["input"]);
+      out.progress = {
+        completed: parseProgressIds(input?.["completed"]),
+        in_progress: parseProgressIds(input?.["in_progress"]),
+      };
     }
   }
   return out;

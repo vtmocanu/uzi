@@ -49,6 +49,7 @@ import {
   type AskUserQuestion,
   type ClaimConfig,
   type Milestone,
+  type MilestoneProgress,
 } from "./protocol.js";
 import {
   buildCIFixPlanPrompt,
@@ -97,9 +98,14 @@ import { clampToDirCharset, errMessage } from "./util.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
 // (PRD §Configuration); converted to ms at the timer.
+// PRD #122 M2: this and DEFAULT_MAX_ITERATIONS are the SINGLE-milestone / global
+// defaults. On a milestone-structured run the server scales the effective budget by
+// milestone count (Decisions 5/5b) and serves the scaled numbers — on the claim config
+// for a resume, on the per-iteration state-report ACK for a fresh run — which the loop
+// applies over these. A run with no milestones keeps exactly these values.
 const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
-const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5
+const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5 (single-milestone)
 // PRD #41: the plan-revision cap (PLAN_MAX_REVISIONS, default 3). The server also
 // enforces it at submit time (rejects the 4th revise), so the worker counter is a
 // belt-and-suspenders guard that rarely trips.
@@ -122,7 +128,7 @@ const REASON_NO_PLAN =
 const REASON_NO_PLAN_AFTER_CLARIFICATION =
   "the agent kept asking clarifying questions without ever submitting a plan";
 const REASON_MAX_ITERATIONS =
-  "run reached the maximum implement/review iterations without completing";
+  "run reached its milestone-scaled implement/review iteration budget without completing";
 
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
@@ -191,6 +197,10 @@ interface TurnResult {
   /** PRD #122 M1: the candidate milestone list the lead passed to submit_plan this
    *  turn, if any. Rides the gate call so the human approves the breakdown. */
   milestones?: Milestone[];
+  /** PRD #122 M2: the latest milestone progress the lead reported via report_progress
+   *  during this turn (last-wins within the turn). The loop carries it into the NEXT
+   *  iteration's `running` report. */
+  progress?: MilestoneProgress;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -395,10 +405,15 @@ export class SdkExecutor implements Executor {
     let depsTruncated = false;
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
-    const maxIterations = positive(
-      ctx.config?.max_iterations,
-      DEFAULT_MAX_ITERATIONS,
-    );
+    // PRD #122 M2: `let`, not `const` — the implement loop raises it to the server's
+    // milestone-scaled ceiling when the state-report ACK serves one (Decisions 5/5b). The
+    // claim config already carries the scaled value on a RESUME (the run is frozen); the
+    // ACK path is for a FRESH run frozen mid-run at plan-approval, whose claim predated the
+    // freeze. Seeded from the claim's max_iterations (scaled on a resume) or the default.
+    let maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
+    // PRD #122 M2: the newest progress snapshot the lead has reported, carried into the
+    // next iteration's `running` report so the server sees it. Updated after each turn.
+    let latestProgress: MilestoneProgress | undefined;
     const maxRevisions = planMaxRevisionsOf(ctx.config);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -495,6 +510,9 @@ export class SdkExecutor implements Executor {
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
         milestones: isIssueRun,
+        // PRD #122 M2: report_progress, gated identically — a non-issue run has no
+        // milestone list to progress against.
+        progress: isIssueRun,
       }),
     };
     if (this.client) {
@@ -580,12 +598,19 @@ export class SdkExecutor implements Executor {
     );
     if (leadModel) baseOptions.model = leadModel;
 
+    // PRD #122 M2: the wall budget the run STARTED with, kept so the loop can scale the
+    // worker's own soft wall reference by the server-served delta exactly once (below).
+    // On a resume this is already the scaled claim value; on a fresh run it is the global
+    // default until the ACK serves the scaled seconds.
+    const initialWallMs = seconds(
+      ctx.config?.run_timeout_seconds,
+      DEFAULT_RUN_TIMEOUT_SECONDS,
+    );
+    // Applied-once latch so a repeated ACK cannot keep inflating the wall reference.
+    let wallScaled = false;
     const state: RunDrive = {
       currentChild: {},
-      wallRemainingMs: seconds(
-        ctx.config?.run_timeout_seconds,
-        DEFAULT_RUN_TIMEOUT_SECONDS,
-      ),
+      wallRemainingMs: initialWallMs,
       reportedSessionId: false,
     };
     const idleMs = seconds(
@@ -1018,7 +1043,31 @@ export class SdkExecutor implements Executor {
       let declaredPrdPath: string | undefined;
       for (;;) {
         iteration++;
-        ctx.reportIteration?.(iteration);
+        // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
+        // apply the server-served effective budget. The cap only ever RISES (a scaled run
+        // gets more turns; a single/zero-milestone run's ACK carries none, so this is
+        // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
+        const served = await ctx.reportIteration?.(iteration, latestProgress);
+        if (served) {
+          if (
+            typeof served.maxIterations === "number" &&
+            served.maxIterations > maxIterations
+          ) {
+            maxIterations = served.maxIterations;
+          }
+          if (typeof served.wallSeconds === "number") {
+            const servedMs = served.wallSeconds * 1000;
+            // The wall is PAUSED across the plan gate and debited only in-turn
+            // (armWall/disarmWall), so at loop-top only the plan turn has been debited and
+            // essentially the full initial budget remains. Adding the delta ONCE scales the
+            // worker's soft reference to match the sweeper's effective timeout, so a
+            // legitimately-scaled run does not self-trip REASON_WALL at the global 2h.
+            if (servedMs > initialWallMs && !wallScaled) {
+              state.wallRemainingMs += servedMs - initialWallMs;
+              wallScaled = true;
+            }
+          }
+        }
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -1063,6 +1112,10 @@ export class SdkExecutor implements Executor {
         );
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
+        // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
+        // `running` report. Only overwrite when the turn reported something, so a quiet
+        // turn keeps the last known progress rather than blanking it.
+        if (turn.progress) latestProgress = turn.progress;
         if (turn.done) break;
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
 
@@ -1508,6 +1561,7 @@ export class SdkExecutor implements Executor {
         const sig = scanSignals(msg);
         if (sig.plan !== undefined) result.plan = sig.plan;
         if (sig.milestones) result.milestones = sig.milestones; // last-wins, alongside plan (PRD #122 M1)
+        if (sig.progress) result.progress = sig.progress; // last-wins (PRD #122 M2)
         if (sig.done) result.done = true;
         // Last-wins within the turn, mirroring `plan` rather than `done`'s latch:
         // if the lead somehow signals twice, the LAST declaration is the one that
