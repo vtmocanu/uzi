@@ -381,6 +381,34 @@ describe("ActivityFeed collapse-by-default", () => {
     // …and the +N pill counted it.
     expect(container.textContent).toContain("+1");
   });
+
+  it("a run finishing WHILE watched keeps un-touched lanes collapsed (no auto-expand on live transition)", () => {
+    // The auto-expand-on-done convenience must not fire when `terminal` flips live: it
+    // would fling every lane open and discard the collapsed view the user was reading.
+    // arrivedTerminal freezes the terminal half at mount, so watched-it-finish stays put
+    // while opened-when-done (the test above) still auto-expands.
+    const { getAllByRole, rerender } = renderFeed(leadWorkerLead(), {
+      status: "running",
+      health: "ok",
+    });
+    for (const t of getAllByRole("button", { name: /activity$/ }))
+      expect(t.getAttribute("aria-expanded")).toBe("false");
+
+    // The run finishes in front of the user: status → completed, terminal flips true.
+    rerender(
+      <ActivityFeed
+        messages={leadWorkerLead()}
+        run={runFixture({ status: "completed", health: "ok" })}
+        runningLive={false}
+        connected={true}
+        terminal={true}
+      />,
+    );
+
+    // Lanes stay collapsed — the collapsed view is preserved across the transition.
+    for (const t of getAllByRole("button", { name: /activity$/ }))
+      expect(t.getAttribute("aria-expanded")).toBe("false");
+  });
 });
 
 // ── Opt-in Follow (Decision 3) ────────────────────────────────────────────────

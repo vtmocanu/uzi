@@ -6,6 +6,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Fixed
+
+- **Activity feed no longer springs every lane open when a run finishes while you
+  watch it.** Auto-expand still applies when you open an already-finished run, but a
+  live `running → completed` transition now preserves the collapsed view you were
+  reading instead of discarding it.
+
 ## [0.17.0] - 2026-08-04
 
 ### Added
