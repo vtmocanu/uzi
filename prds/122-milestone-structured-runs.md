@@ -3,7 +3,20 @@
 **GitLab Issue**: [#122](https://gitlab.example.com/vtmocanu/uzi/-/issues/122)
 **Status**: Draft (created 2026-07-24; revised same day after a fable adversarial review that opened every cited reference and verified each load-bearing claim against the code — the review found all citations sound but corrected the loss model in Problem §3, exposed an unscoped server-side change in M2, pinned down Decision 9, and added the server-validation decision; see the Decision Log)
 **Priority**: Medium
-**Related**: [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; **this PRD reopens the door its analysis closed, by a route that PRD did not consider — see Decision 8**), [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105) (session lost on a different-worker requeue), [#41](https://gitlab.example.com/vtmocanu/uzi/-/issues/41) (plan revision — the gate loop this must not break), [#51](https://gitlab.example.com/vtmocanu/uzi/-/issues/51) (worker uid split), [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58) (single-uid non-root start — the k8s posture that made #110 unsafe)
+**Related**: [#218](https://gitlab.example.com/vtmocanu/uzi/-/issues/218) (**park/requeue work-loss — SHIPPED 0.15.0 + branch `218-m6`, validated live 2026-08-04; it built the durability primitive this PRD's Phase 2 proposed, so Phase 2 is superseded in part — see the banner below and Decisions 7 & 9**), [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; **this PRD reopens the door its analysis closed, by a route that PRD did not consider — see Decision 8**), [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105) (session lost on a different-worker requeue), [#41](https://gitlab.example.com/vtmocanu/uzi/-/issues/41) (plan revision — the gate loop this must not break), [#51](https://gitlab.example.com/vtmocanu/uzi/-/issues/51) (worker uid split), [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58) (single-uid non-root start — the k8s posture that made #110 unsafe). Durability cluster that landed or was filed AFTER this PRD was drafted and that Phase 2 must be reconciled against: [#216](https://gitlab.example.com/vtmocanu/uzi/-/issues/216) (worker load-balancing / `ClaimRun` rewrite + affinity grace), [#217](https://gitlab.example.com/vtmocanu/uzi/-/issues/217) (which credential a resume spends), [#224](https://gitlab.example.com/vtmocanu/uzi/-/issues/224) (requeue work-loss with no usage limit), [#222](https://gitlab.example.com/vtmocanu/uzi/-/issues/222) (steering-channel staleness across a re-clone).
+
+> **⚠️ 2026-08-07 — PHASE 2 IS SUPERSEDED IN PART BY PRD #218.** #218 (`prds/done/218-park-resume-work-loss.md`, SHIPPED 0.15.0 + branch `218-m6`, validated live on dev-cluster 2026-08-04) built the exact durability primitive Phase 2 here proposed, and this PRD predates it and references it nowhere. **Read `prds/done/218-park-resume-work-loss.md` and `agent/src/git.ts` before starting any Phase-2 work.** What #218 shipped:
+> - The `refs/uzi-runner/<branch>` tracking ref and the credential-free `file://` `fetchAgentBranch` fetch-back into the worker's bare on `/data` — this PRD's **Decision 7**, verbatim (`git.ts` `RUNNER_TRACKING_PREFIX`, `fetchAgentBranch`).
+> - The reseed preferring the tracking ref under the **strict-descendant** rule `git merge-base --is-ancestor origin <tracking>`, origin winning on divergence — this PRD's **Decision 9's** rule (`git.ts` `seededFrom: "origin" | "tracking" | "default"`).
+> - A settlement of Decision 9's one **open** question, the stale-ref lifecycle: a **run-identity anchor** (`uzi-trackowner.<branch>` worker-bare config stamp; the reseed reads the tracking ref only when the stamp equals `claim.run_id`) — stronger than the resume-gating Decision 9 sketched.
+> - The fetch-back wired on the **park and graceful-shutdown (SIGTERM)** paths (`fetchBackBestEffort`, `agent/src/runner.ts`).
+>
+> **Consequences for this PRD (applied below):**
+> - **M7 (resume precision) is DELIVERED by #218 M2/M3** (recovered-commit count carried into the resume and stated in the feed). Dropped.
+> - **M6 shrinks to a delta over #218**, not a foundation. #218 fetches back only on park + graceful SIGTERM, so a hard **SIGKILL** (OOM, node kill with no grace window) still loses everything since the last fetch-back. M6's residual value is the *proactive milestone-boundary checkpoint* (reap + fetch-back while the run is alive), bounding that loss to "since the last milestone", and it must adopt #218's `uzi-trackowner` anchor + `seededFrom` machinery rather than re-deriving Decision 9.
+> - **Phase 2 file:line citations are STALE** — written against a pre-#218 tree that #218 rewrote. Re-derive against HEAD before citing (current symbols: `RUNNER_TRACKING_PREFIX`, `seededFrom`, `fetchBackBestEffort`).
+> - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
+> - **The one open Phase-1 decision the review flagged**: the budget **hard ceiling** (Decision 5, Risks) is still hand-waved as "capped" with no number. Pin a concrete milestone-count cap AND an absolute turn/wall-clock ceiling before M2, and enforce them server-side (Decision 12). This needs a maintainer call, not an invented default.
 
 ## Problem
 
@@ -38,6 +51,8 @@ run doing more than one coherent unit of work, and nothing scales them to the
 size of the task the plan describes.
 
 ### 3. Durability is all-or-nothing
+
+> **2026-08-07 — this section was written pre-#218 and is now half-mitigated.** PRD #218 (shipped) added a best-effort `fetchAgentBranch` fetch-back on the **park and graceful-shutdown (SIGTERM)** paths, plus a reseed that prefers the checkpointed tracking ref, so a same-worker resume after a park or a graceful requeue now recovers committed work. The residual, and the only durability gap Phase 2 still addresses, is a **hard SIGKILL** with no grace window and, more usefully, **loss between the last park/shutdown and now** — which the proactive milestone-boundary checkpoint (M6, re-scoped) bounds to "since the last milestone". The correction to #110's loss model below stands and #218 makes the same correction independently (its Problem section).
 
 A run pushes **exactly once**, after the executor returns: the worker reaps the
 agent tree (`agent/src/runner.ts:345`) and only then pushes
@@ -169,7 +184,7 @@ config source**, the exact thing the (b) topology exists to prevent
 (`git.ts:166-170`). Either run it through `runGitAsRunner`, or check tip
 movement only, which is computable entirely in the worker's own bare.
 
-**7. The checkpoint fetch-back carries NO credential.** `fetchAgentBranch`
+**7. The checkpoint fetch-back carries NO credential.** *(2026-08-07: SHIPPED by PRD #218 — `fetchAgentBranch` is the current no-credential primitive and `fetchBackBestEffort` already fires it on park + SIGTERM. This decision is now the design record for a mechanism that exists; M6 reuses it rather than building it.)* `fetchAgentBranch`
 (`git.ts:353`) is a local `file://` pack fetch from the runner clone into the
 worker's bare, already hardened by six B2 invariants, and takes no PAT. It moves
 the agent's commits from the ephemeral runner clone onto the `/data` PVC
@@ -197,7 +212,7 @@ one per milestone, with the agent re-spawned between them. The M8 security revie
 must weigh N windows, not one.
 
 **9. The clone seed must prefer the checkpointed ref — under a rule that is
-stated exactly, not by feel.** `runnerCloneForBranch` bases a resume off
+stated exactly, not by feel.** *(2026-08-07: SHIPPED by PRD #218. The strict-descendant rule below is implemented as `seededFrom` in `git.ts`, and the "open decision" in the third bullet — the tracking-ref lifecycle on terminal failure — was settled by #218's `uzi-trackowner.<branch>` run-identity anchor, which gates the tracking-ref read on the config stamp equalling `claim.run_id`. Treat the bullets below as the rationale for shipped behaviour; M6 must not re-derive them.)* `runnerCloneForBranch` bases a resume off
 `refs/remotes/origin/<branch>` (`git.ts:291-293`). The checkpoint writes to
 `refs/uzi-runner/<branch>` in the same bare. Without teaching the seed to prefer
 that ref, the checkpoint saves work the next attempt then ignores — the
@@ -290,6 +305,7 @@ hook, so it can never reach a signal tool.
 - `api/internal/workersvc/health.go` — clamp the "slow" threshold against the per-run timeout, not the global one (Decision 5b)
 - `api/internal/apitypes/run.go` — DTO
 - `web/src/pages/RunView.tsx`, `Dashboard.tsx`, `RunsList.tsx` + tests; `web/src/mocks/{data,mockApi,engine}.ts`
+  - *2026-08-07 coordination note: PRD #237 (live token counts, merged) also touches `RunView.tsx` (usage-panel region, ~`:691`) and `web/src/mocks/data.ts`. No semantic overlap with M3 (its `hasUsage → hasConfirmed` rename is confined to `runUsage.ts`/`RunUsage.tsx`, which M3 never touches; the milestone badge/checklist sits at the iteration-badge region ~`:515`, a different hunk). Write M3 against the post-#237 tree — textual merge only.*
 - `api/internal/slacksvc/notifier.go` — root-line counter + thread line on count-advance (M4)
 - `api/internal/store/queries/slack.sql` (+ sqlc regen) — extend `GetSlackRunContext` with the milestone columns; new "last-notified count" column on `slack_run_messages` + a generation-guarded setter modelled on `SetSlackRunGateGen` (M4)
 - one migration for that `slack_run_messages` column (M4; folds into M1's migration if landed together)
@@ -362,29 +378,36 @@ hook, so it can never reach a signal tool.
       convention. **Verified**: `uzi run show <id> --json` carries the milestone
       fields and the human output shows the same state the web does.
 
-**Phase 2 — durability (still no credential).**
+**Phase 2 — durability (still no credential). RE-SCOPED 2026-08-07 against PRD #218 — read the banner at the top and `prds/done/218-park-resume-work-loss.md` before starting. #218 shipped the tracking-ref + fetch-back + strict-descendant-reseed foundation this phase was originally built around; only the delta below remains, and it is optional (Phase 1 is the feature).**
 
-- [ ] **M6 — Checkpoint boundary + local fetch-back**: new `checkpoint` signal
-      tool; on it the executor ends the turn, the runner calls `killAgentTree()`,
-      the worker rejects a no-op checkpoint (tip unmoved / tree dirty, Decision
-      6) and otherwise fetch-backs into the bare on the PVC (Decision 7); the
-      clone seed prefers the tracking ref under the strict-descendant rule and
-      the ref lifecycle is settled (Decision 9); the iteration boundary
-      fetch-backs as a fallback, without reaping (Decisions 10, 10b).
-      **Verified**: killing a worker pod mid-run and letting the same worker
-      re-claim resumes with the checkpointed commits present. **Honest bound**:
-      this holds when the same worker re-claims. A docker-capable pod must re-pull
-      and reseed nix (~2.6 GiB; PRD #113's incident wedged one for 14 minutes)
-      before it can claim anything, so with more than one worker per user the 2m
-      `WORKER_AFFINITY_GRACE` can expire and a different worker takes the run onto
-      a different PVC, where the checkpoint is invisible. Extending the grace when
-      a checkpoint exists is a cheap follow-up, not part of M6.
-- [ ] **M7 — Resume precision**: the claim carries the frozen list + completed
-      set; the planning prompt for a dropped-resume run names what is already
-      committed by milestone instead of by commit count (Decision 11); the issue
-      #105 feed notice is updated to match. **Verified**: a run resumed after a
-      dropped session states which milestones are done and starts at the first
-      incomplete one.
+- [ ] **M6 — Proactive milestone-boundary checkpoint (delta over #218)**: new
+      `checkpoint` signal tool; on it the executor ends the turn, the runner calls
+      `killAgentTree()`, the worker rejects a no-op checkpoint (tip unmoved / tree
+      dirty, Decision 6) and otherwise runs #218's existing `fetchAgentBranch`
+      into the bare on the PVC (Decisions 7, 10, 10b). **This is a NEW trigger for
+      an existing mechanism, not the mechanism itself** — do not re-build the
+      tracking ref, the `seededFrom` reseed rule, the `uzi-trackowner` run-identity
+      anchor, or the park/SIGTERM fetch-back; all shipped in #218. The value M6
+      adds over #218: #218 fetches back only on park + graceful SIGTERM, so a hard
+      **SIGKILL** (OOM, node kill with no grace window) still loses everything
+      since the last fetch-back; a proactive fetch-back *while the run is alive* at
+      each milestone bounds that loss to "since the last milestone". **Verified**:
+      with #218 already in the tree, `SIGKILL`ing a worker mid-run **between two
+      milestones** and letting the same worker re-claim resumes with the
+      already-checkpointed milestones present (the pre-M6 baseline loses them,
+      since the last fetch-back was the previous park/shutdown, which may never
+      have happened). **Honest bound (unchanged from #218's R1)**: this holds when
+      the same worker re-claims within `WORKER_AFFINITY_GRACE` (2m); a docker-
+      capable pod that must re-pull and reseed nix (~2.6 GiB; PRD #113 wedged one
+      for 14 minutes) can lose the affinity and a different worker takes the run
+      onto a different PVC where the checkpoint is invisible. Cross-worker recovery
+      is M8 (origin push), still deferred.
+- [ ] ~~**M7 — Resume precision**~~ — **DELIVERED by PRD #218 (M2/M3), dropped
+      2026-08-07.** #218 already carries the recovered-commit count into the resume
+      (`priorWork` widened) and states it in the feed either way. The only piece
+      this PRD adds on top is naming progress by **milestone** rather than by
+      commit count, which is a trivial rider on M6 once the completed set rides the
+      claim (Decision 11) — folded into M6, not a milestone of its own.
 
 **Phase 3 — deferred, gated on evidence.**
 
@@ -546,7 +569,12 @@ hook, so it can never reach a signal tool.
   tolerable" section says a same-worker requeue inside the affinity grace means
   "no loss", which conflates the resumed session with the destroyed commits — see
   Problem §3. Both corrections should be made to #110 in the same MR that lands
-  M1, with a pointer to this PRD.
+  M1, with a pointer to this PRD. *(2026-08-07: partly overtaken — PRD #218's R2
+  already engaged #110's push-during-run argument at park time and made the same
+  temporal-closure point, so the #110 correction is now a reconcile-three-records
+  task (#110 ↔ #122 ↔ #218), not a fresh edit. #110 is also still an open
+  `prds/*.md` file rather than archived; whoever lands Phase 1 should reconcile
+  all three so the durability records stop contradicting each other.)*
 - **2026-07-24 — fable adversarial review, verified against `main`.** Every
   cited `file:line` in this PRD was opened and checked; all held. The review's
   substantive findings are folded in above rather than listed here, but four
@@ -577,3 +605,24 @@ hook, so it can never reach a signal tool.
   rendering (`3/7`) and softening the criterion. Also corrected: `PublishState`
   fires on every `running` report (`service.go:1549`), so the notifier wiring is
   smaller than first written, not larger.
+- **2026-08-07 — Phase 2 re-scoped against PRD #218 (which shipped after this PRD
+  was drafted); Phase 1 unchanged.** #218 built the durability primitive Phase 2
+  was designed around — the `refs/uzi-runner/<branch>` tracking ref, the
+  credential-free `fetchAgentBranch` fetch-back on park + graceful SIGTERM
+  (`fetchBackBestEffort` in `agent/src/runner.ts`), the strict-descendant reseed
+  rule (`seededFrom` in `git.ts`, exactly Decision 9's rule), AND a run-identity
+  anchor (`uzi-trackowner.<branch>`) that settled Decision 9's one open question,
+  the stale-ref lifecycle. Verified against HEAD, not from the review summary:
+  the symbols are present in `agent/src/git.ts` and `agent/src/runner.ts`.
+  Changes made here: banner added at top and #218/#216/#217/#224/#222 added to
+  Related; Decisions 7 and 9 marked SHIPPED-BY-#218 (now design records for
+  existing code, not build tasks); M7 dropped as delivered by #218 M2/M3; M6
+  narrowed to the one residual gap — a *proactive* milestone-boundary fetch-back
+  that also covers a hard SIGKILL, reusing #218's mechanism rather than
+  re-deriving it; Problem §3 annotated as half-mitigated; the #110-corrections
+  action item flagged as partly overtaken by #218's R2. **Phase 2 file:line
+  citations are stale** (pre-#218 tree) and one Phase-1 citation drifted (the
+  iteration badge is now `RunView.tsx:515-517`); both flagged inline for
+  re-derivation at implementation time. The open Phase-1 decision remains the
+  budget **hard ceiling** — still unnumbered, a maintainer call before M2. This
+  is a documentation re-scope only; no code changed.
