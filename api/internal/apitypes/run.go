@@ -5,6 +5,20 @@ import (
 	"time"
 )
 
+// Milestone is one entry of a run's milestone list (PRD #122): a stable machine id
+// and a human-readable title. The id is a strict key (validated server-side at the
+// worker state-report chokepoint); the title is UNTRUSTED display text a consumer
+// writing it to a terminal must sanitize, the same obligation RepoAgent.Description
+// carries.
+//
+// The definition lives here so the run DTO that embeds it stays a stdlib-only leaf
+// (PRD #64 M1). workersvc.Milestone is a type alias of this, keeping the workersvc
+// validators and every reference compiling unchanged.
+type Milestone struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
 // RunDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type RunDTO struct {
@@ -32,9 +46,17 @@ type RunDTO struct {
 	RequeueCount   int32   `json:"requeue_count"`
 	IterationCount int32   `json:"iteration_count"`
 	AutoApprove    bool    `json:"auto_approve"`
-	WorkerID       *string `json:"worker_id"`
-	Branch         *string `json:"branch"`
-	MrIID          *int64  `json:"mr_iid"`
+	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
+	// decoded from runs.milestones_frozen. A nil slice marshals to JSON null, which is
+	// the back-compat contract: a run with no milestones (every pre-feature run, and
+	// every run that never proposed a list) reads null and the web keeps rendering
+	// today's plain badge. Populated only where the store is in reach (the run reads);
+	// nil on the create/worker DTO paths. The pre-approval CANDIDATE list is never
+	// exposed here — only the frozen list is served.
+	Milestones []Milestone `json:"milestones"`
+	WorkerID   *string     `json:"worker_id"`
+	Branch     *string     `json:"branch"`
+	MrIID      *int64      `json:"mr_iid"`
 	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
 	// creation (PRD #65 D8), null on runs created before it landed. The web renders
 	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL

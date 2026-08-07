@@ -16,6 +16,7 @@ import type {
   AskUserQuestion,
   ClaimConfig,
   ClaimResponse,
+  Milestone,
   StateAck,
   StateRequest,
 } from "./protocol.js";
@@ -657,10 +658,11 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: (planMd) =>
+        gatePlan: (planMd, milestones) =>
           this.gatePlan(
             runId,
             planMd,
+            milestones,
             batcher,
             steering,
             reportState,
@@ -1354,6 +1356,10 @@ export class RunRunner {
   private async gatePlan(
     runId: string,
     planMd: string,
+    // PRD #122 M1: the CANDIDATE milestone list from the just-submitted plan. Rides
+    // the awaiting_approval report (human-gated) or the autopilot running report as
+    // the FROZEN list (Decision 2). Additive-optional — only included when non-empty.
+    milestones: Milestone[] | undefined,
     batcher: MessageBatcher,
     steering: SteeringChannel,
     // Ignored by the gate, but typed to match the client (PRD #35): a gate that
@@ -1393,6 +1399,11 @@ export class RunRunner {
       };
       if (repoAgents.length > 0)
         autopilotState.repo_agents = repoAgentSummaries(repoAgents);
+      // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
+      // the FROZEN milestone list rides this self-contained running report instead —
+      // mirroring the repo_agents conditional above. Only when non-empty (additive-
+      // optional, never []). Reporting stays fire-and-forget via the .catch below.
+      if (milestones?.length) autopilotState.milestones = milestones;
       await reportState(autopilotState).catch((e) =>
         runLog.warn("could not persist autopilot agent selection", {
           error: errMessage(e),
@@ -1418,7 +1429,15 @@ export class RunRunner {
     // here, after v2 is reported, stamps such a mid-revision approve at the PRIOR
     // epoch, so it is discarded with a feed notice. The FIRST gate for a run does
     // NOT bump: epoch 0 lets a verdict already queued when the gate opens apply.
-    await reportState({ status: "awaiting_approval", plan_md: planMd });
+    // PRD #122 M1: the CANDIDATE milestone list rides the awaiting_approval report so
+    // the human approves the breakdown (Decision 2). Only include the key when
+    // non-empty — additive-optional, never `null`/`[]`, so a no-milestone run's report
+    // stays byte-for-byte as today. The api freezes candidate→frozen at approve.
+    await reportState({
+      status: "awaiting_approval",
+      plan_md: planMd,
+      ...(milestones?.length ? { milestones } : {}),
+    });
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
     const epoch = steering.currentEpoch();

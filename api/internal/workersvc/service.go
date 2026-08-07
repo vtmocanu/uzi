@@ -1455,6 +1455,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		pipeline = claimPipelineFromSnapshot(run.FailureSnapshot)
 	}
 
+	// PRD #122 M1: replay the FROZEN milestone list on every claim. A malformed column
+	// degrades to nil-and-log rather than failing the claim, matching the repo_agents
+	// decode on the DTO path — the column is data a prior write left, not an invariant
+	// of this claim, and stranding a run over it would be worse than serving no list.
+	milestones, err := DecodeMilestones(run.MilestonesFrozen)
+	if err != nil {
+		slog.Error("workersvc: decode run milestones", "run_id", run.ID, "error", err)
+		milestones = nil
+	}
+
 	return &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
@@ -1510,6 +1520,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
 		AgentSelection: persistedSelection(run),
+		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
+		// milestone-less run's claim byte-identical to today's.
+		Milestones: milestones,
 		Repo: ClaimRepo{
 			ID:            uuid.UUID(run.RepoID.Bytes).String(),
 			URL:           rc.RepoWebUrl,
@@ -2295,6 +2308,14 @@ type StateRequest struct {
 	// detected agents. Only `running` carries it; it is re-validated below, never
 	// trusted from the worker.
 	RepoAgents *[]RepoAgent `json:"repo_agents"`
+	// Milestones is the run's milestone list (PRD #122 M1), a POINTER to a slice for
+	// the same tri-state as RepoAgents: absent (nil) = this report says nothing about
+	// milestones; `[]` = an explicitly empty list; non-empty = the entries. The worker
+	// sends the CANDIDATE list on the `awaiting_approval` report and the FROZEN list on
+	// the autopilot `running` report; it is absent on every other report. Re-validated
+	// and kind-gated here (Decision 12/13), never trusted from the worker — a rejected
+	// list is DROPPED, not persisted, and never fails the report.
+	Milestones *[]Milestone `json:"milestones"`
 	// AgentSelection is the default an AUTOPILOT run resolved for itself (Decision 6).
 	// Such a run self-approves the gate and never receives a SubmitInput, so the state
 	// report is its only channel for recording which roster it used. A human-gated run
@@ -2355,8 +2376,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams.WorkerID = pgUUID(wkr.ID)
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
+		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
+		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
+		// when the list is absent, rejected, or from a non-issue run — the query writes
+		// that directly, clearing the candidate (Decision 2: replaced each round).
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			MilestonesCandidate: milestonesParam(owned.Kind, req.Milestones),
 		})
 	case "awaiting_input":
 		// PRD #88 M1: park on a clarification question. The question id is REQUIRED
@@ -2435,6 +2461,14 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 // them there.
 func (s *Service) runningStateParams(ctx context.Context, run store.Run, req StateRequest) (store.SetRunRunningParams, error) {
 	var p store.SetRunRunningParams
+
+	// PRD #122 M1: an AUTOPILOT run reports its FROZEN milestone list on this report.
+	// Validated + kind-gated exactly like the candidate path (Decision 12/13); a
+	// rejected/absent/non-issue list is NULL, which the query COALESCEs away, so it
+	// never overwrites a frozen list and never disturbs the heartbeat. Unlike the
+	// RepoAgents/AgentSelection paths below, a bad milestone list is DROPPED rather
+	// than failing the report — additive-optional.
+	p.MilestonesFrozen = milestonesParam(run.Kind, req.Milestones)
 
 	if req.RepoAgents != nil {
 		if err := validateRepoAgents(*req.RepoAgents); err != nil {

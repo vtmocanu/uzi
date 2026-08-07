@@ -237,6 +237,42 @@ export function planThenDoneQuery(): SdkQueryFn {
   };
 }
 
+/** Like planThenDoneQuery, but the submit_plan call carries a `milestones` list
+ *  (PRD #122 M1). Passing `undefined` omits the field entirely, proving the
+ *  back-compat "no milestones" shape. */
+export function planWithMilestonesThenDoneQuery(
+  milestones: Array<{ id: string; title: string }> | undefined,
+): SdkQueryFn {
+  const planInput: Record<string, unknown> = { plan_md: "# PLAN\n- do it" };
+  if (milestones !== undefined) planInput["milestones"] = milestones;
+  const scripts: SDKMessage[][] = [
+    [
+      assistant([
+        { type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: planInput },
+      ]),
+      resultOk(),
+    ],
+    [
+      assistant([
+        { type: "text", text: "done implementing" },
+        { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} },
+      ]),
+      resultOk(),
+    ],
+  ];
+  let i = 0;
+  return (params) => {
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    i++;
+    return (async function* () {
+      for await (const _ of params.prompt) {
+        /* drain */
+      }
+      for (const m of script) yield m;
+    })();
+  };
+}
+
 export function input(kind: UserInput["kind"], body?: string): UserInput {
   return { id: 1, kind, body: body ?? null };
 }

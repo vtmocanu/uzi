@@ -394,6 +394,14 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		dto.AgentExclusions = excl
 	}
 	dto.AgentSource = textPtrValue(r.AgentSource.Valid, r.AgentSource.String)
+	// PRD #122 M1: the FROZEN milestone list. Degrades gracefully on a decode error
+	// (impossible in practice — every write is validated and the column carries a
+	// jsonb_typeof CHECK), logged and treated as "no list" rather than failing the read.
+	if milestones, err := workersvc.DecodeMilestones(r.MilestonesFrozen); err != nil {
+		slog.Error("decode run milestones", "run_id", r.ID, "error", err)
+	} else {
+		dto.Milestones = milestones
+	}
 	// The failing pipeline's URL rides the frozen snapshot, not a column (the
 	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has
 	// one, an issue run has no snapshot.

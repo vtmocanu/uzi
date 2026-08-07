@@ -15,6 +15,7 @@ import type {
   FixVerdict,
   MemoryEntry,
   MessageKind,
+  Milestone,
   RunKind,
 } from "./protocol.js";
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
@@ -157,8 +158,12 @@ export interface RunContext {
    * M4 plan gate. Called by the executor after the lead submits a plan: the
    * runner posts /state awaiting_approval with the plan and returns the user's
    * verdict (approve/reject/cancel), polled from /inputs. Absent in M2/M3.
+   *
+   * PRD #122 M1: the optional CANDIDATE milestone list rides the awaiting_approval
+   * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
+   * the report (additive-optional; a run with no milestones is unchanged).
    */
-  gatePlan?(planMd: string): Promise<PlanVerdict>;
+  gatePlan?(planMd: string, milestones?: Milestone[]): Promise<PlanVerdict>;
   /**
    * PRD #88 M1 clarification park. Called by the executor after a turn that made an
    * ask_user call: the runner emits the `question` run-message, posts /state

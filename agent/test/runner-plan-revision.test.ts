@@ -93,6 +93,45 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
     assert.strictEqual(calls.length, 1);
   });
 
+  // PRD #122 M1 (Decision 2): the CANDIDATE milestone list is REPLACED across a
+  // revision round — the later awaiting_approval body reflects the NEW list, never a
+  // union or the stale round-1 list. Drives the REAL runner gatePlan (not a mock) so
+  // the candidate→report threading is what is under test.
+  it("replaces the candidate milestone list across a revision round", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(85);
+    const round1 = [{ id: "m1", title: "first cut" }];
+    const round2 = [
+      { id: "a", title: "restructured" },
+      { id: "b", title: "second unit" },
+    ];
+    const reviseExec: Executor = {
+      run: async (ctx) => {
+        const v1 = await ctx.gatePlan!("# PLAN v1", round1);
+        assert.strictEqual(v1.kind, "revise");
+        const v2 = await ctx.gatePlan!("# PLAN v2", round2);
+        if (v2.kind !== "approve")
+          throw new Error(`expected approve, got ${v2.kind}`);
+        return { branch: ctx.branch };
+      },
+    };
+    api.setInputs(claim.run_id, [input("revise_plan", "restructure it")]);
+    const approve = onGateRound(claim.run_id, 2, [input("approve_plan")]);
+    await runner(reviseExec, gitlab).execute(claim);
+    await approve;
+
+    const gates = api.states
+      .filter(
+        (s) =>
+          s.runId === claim.run_id && s.body.status === "awaiting_approval",
+      )
+      .map((s) => s.body);
+    assert.strictEqual(gates.length, 2);
+    assert.deepStrictEqual(gates[0]!.milestones, round1);
+    // The round-2 report carries the NEW list wholesale, not the round-1 list.
+    assert.deepStrictEqual(gates[1]!.milestones, round2);
+  });
+
   // The BLOCKING bug (PRD #41 Decision 3): the gate epoch must advance at the
   // awaiting_approval RE-report, NOT when a revise is taken. A revision planning turn
   // runs BETWEEN rounds; if the epoch is bumped when the revise is TAKEN, that whole
