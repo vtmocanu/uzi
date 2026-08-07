@@ -261,6 +261,14 @@ where the lead declared a milestone complete and therefore expects a boundary.
 (M8, which does carry a credential, must reap at every checkpoint including the
 fallback — another reason it is a separate decision.)
 
+*(2026-08-07, superseded for the brokered path by Decision 14.) The brokered M8
+push carries no PAT on the worker, so M8 no longer needs to reap at the FALLBACK
+checkpoint: it publishes only at the model-cooperative checkpoint, which M6 already
+reaps, and the iteration-boundary fallback stays M6's credential-free fetch-back
+with no push. The "reap at every checkpoint including the fallback" rule above holds
+only for the rejected worker-side push fallback (Decision 8 / Option A), not for the
+broker.)*
+
 **11. Milestone state rides the claim.** `ClaimResponse` carries the frozen list
 and the completed set, so a requeued run's planning prompt can name what is
 already committed. This is a strict improvement on issue #105's `priorWork`
@@ -292,6 +300,66 @@ the judge are out by construction and need no guard: chat runs a separate
 executor (and `SweepRunningTimeout` already excludes `kind='chat'`,
 `runtime.sql:571`), and the judge denies every tool via a deny-all `PreToolUse`
 hook, so it can never reach a signal tool.
+
+**14. The checkpoint push is BROKERED through the api, not run on the worker
+(supersedes Decision 8's reap-then-push for M8; see `adr/0122`).** M8 publishes each
+checkpoint so work survives a *different* worker re-claiming the run. Doing that
+with the worker's own push (Decision 8) is safe only if the reap is complete — and
+it is not: `killAgentTree` process-group-kills the SDK CLI pid, so a
+`setsid`/new-session child escapes it (demonstrated, 2026-08-07 security review)
+and, on single-uid k8s where agent uid == worker uid == 10001, reads the PAT out of
+the push child's `/proc/<pid>/environ`. M8 would spawn one such push child at each
+of N checkpoints with the agent re-spawned between them, multiplying today's single
+end-of-run window by N. The broker removes that exposure: after M6's reap +
+`fetchAgentBranch` the worker already holds the agent's objects in its bare as
+`refs/uzi-runner/<branch>` with **no credential**; it ships the delta pack
+(`origin/<branch>..refs/uzi-runner/<branch>`) to a new, authorization-scoped
+worker→api endpoint, and **the api pushes to origin with the PAT it already
+decrypts** (`secretbox` lives in the api — the api is the credential's *original*
+holder, the worker a derived copy). The PAT-bearing push therefore runs in the api
+pod, a container/uid the agent cannot reach, and **M8 adds zero new PAT-bearing
+git-child windows under the agent uid over today's baseline.**
+
+The **security invariant** this satisfies, stated exactly: *no forge PAT is present
+in the environment or memory of any process the untrusted agent can read (same uid
++ pid-namespace) while any agent-controlled process is alive.* The broker satisfies
+it by **spatial** closure (the PAT never enters the worker for the push), strictly
+stronger than reap-then-push's **temporal** closure, which depends on
+`killAgentTree` catching a `setsid` escapee at each of N windows.
+
+**Authorization is load-bearing, not optional.** The publish RPC MUST be scoped to
+the calling run's own repo and branch via the worker join token that already scopes
+claims — a worker can never ask the api to push an arbitrary repo or ref; the api
+pushes only `refs/heads/<run-branch>`, never forced, CI suppressed (`ci.skip`).
+
+**Implementation is pure-Go; the api image stays distroless-static.** The api has
+never execed git (it is `distroless/static-debian12`, no git binary; the Forge
+interface is pure REST), so the broker uses a pure-Go smart-HTTP push client
+(go-git). A 2026-08-07 source check confirmed go-git's `PushOptions.Options
+[]string` carries push-options, so `ci.skip` is expressible without a git binary;
+adding a git binary was considered and rejected because it would fatten the
+secrets-holder's image and CVE surface for no capability the pure-Go path lacks. The
+one residual is forge-specific smart-HTTP behaviour, validated by a real push
+against `gitlab.example.com` when M8 is built.
+
+This reuses uzi's "api is the sole holder of secrets" boundary rather than adding a
+new one, and reframes PRD #110's "a server-side push duplicates push authority into
+a second component" objection: in uzi the api is the *first* holder, so the broker
+**consolidates** push authority rather than duplicating it. The bot's Developer role
+is unchanged (it can already push non-protected branches — that is how the worker
+pushes today), so this is not a privilege change.
+
+**Considered and rejected:** Infisical agent-vault (a forward-MITM proxy — needs the
+vault on a separate uid/pod single-uid k8s cannot give it, needs a network egress
+lock uzi lacks so the agent can `unset HTTPS_PROXY`, and it moves push capability to
+the agent, weakening the SDK deny-`git push` guardrail); short-lived scoped tokens
+(the Developer bot cannot mint project-access tokens, PAT minimum expiry is 1 day,
+job tokens cannot `git push`); the forge REST Commits API (squashes each checkpoint
+into one synthetic commit, collides non-fast-forward with the end-of-run real push,
+needs a Forge-interface change across both drivers + five fakes). Worker-side
+reap-then-push (Decision 8) remains the **validated fallback** if the real-forge
+go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
+`/proc` and a cgroup-based reap that catches the `setsid` escape.
 
 ## Touchpoints
 
@@ -413,12 +481,37 @@ hook, so it can never reach a signal tool.
 
 **Phase 3 — deferred, gated on evidence.**
 
-- [ ] **M8 — Origin push at checkpoints (DEFERRED)**: push the branch to origin
-      at each checkpoint so work survives a **different** worker re-claiming the
-      run. Blocked on: (a) the `requeue_count` measurement in Risks showing this
-      actually happens, (b) an explicit security review of Decision 8, (c) a
-      decision on CI-trigger suppression (`-o ci.skip`) so N checkpoints do not
-      fire N pipelines. **Not** to be started with M6.
+- [ ] **M8 — Brokered origin publish at checkpoints (DEFERRED, gated on evidence)**:
+      publish the branch to origin at each model-cooperative checkpoint so work
+      survives a **different** worker re-claiming the run — via the **api push
+      broker** (Decision 14, `adr/0122`), NOT the worker's own push. Mechanism:
+      after M6's reap + `fetchAgentBranch`, the worker ships the delta pack
+      (`origin/<branch>..refs/uzi-runner/<branch>`, already in its bare, no
+      credential) to a new authorization-scoped `POST /api/worker/runs/{id}/publish`;
+      the api pushes to origin with the stored PAT via a pure-Go smart-HTTP client
+      (go-git — the api image is distroless-static, no git binary), targeting
+      `refs/heads/<branch>`, never forced, CI suppressed (`ci.skip`, confirmed
+      expressible via go-git `PushOptions.Options`). The api's outbound push reuses
+      the existing `FORGE_ALLOWED_BASE_URLS` SSRF allowlist. Publish fires **only at
+      the reaped model-cooperative checkpoint** (Decision 10b as amended), never at
+      the fallback.
+
+      **Blocked on, in order:** (a) the `requeue_count` measurement in Risks — now
+      calibrating URGENCY, not go/no-go (the maintainer wants the feature): it sizes
+      how often cross-worker reclaim happens, which M6 structurally cannot cover (its
+      tracking ref lives on one worker's PVC, #218 R1); (b) a real-forge go-git
+      send-pack validation against `gitlab.example.com` (the push-options half is
+      already confirmed in source) — if fragile, fall back to **Option A** (worker
+      reap-then-push hardened with `hidepid=2` + a cgroup reap that catches the
+      `setsid` escape, per Decision 14); (c) ADR `adr/0122-checkpoint-push-broker.md`.
+
+      **Not** to be started with M6. **Verified**: a run publishing at a checkpoint,
+      then killed and re-claimed by a **different** worker on a **different** PVC,
+      resumes with the checkpointed milestones' commits present (the pre-M8 baseline
+      loses them — R1); the forge PAT never enters a worker git child on the publish
+      path (verified by test — no PAT-bearing spawn under the agent uid); N
+      checkpoints fire **zero** extra pipelines (`ci.skip`); the end-of-run push + MR
+      path is byte-for-byte unchanged.
 
 ## Success Criteria
 
@@ -510,9 +603,14 @@ hook, so it can never reach a signal tool.
 
 - None blocking. PRD #41's gate loop must keep working across the freeze point
   (Decision 2); the #105 resume path is improved, not replaced.
-- M8 additionally depends on the Decision 8 security review and, if that review
-  goes the other way, on the k8s two-container uid split that PRD #110 names as
-  its revisit condition.
+- M8 depends on: (a) the Risks `requeue_count` reading (now urgency-calibration, not
+  a hard gate — the maintainer wants the feature); (b) a real-forge go-git send-pack
+  validation deciding broker vs the Option-A worker-push fallback; (c) ADR
+  `adr/0122-checkpoint-push-broker.md` recording Decision 14. It no longer depends on
+  the k8s two-container uid split — the broker (Decision 14) provides spatial closure
+  without it — but the uid split (#51/#58) remains the primitive that would let M8
+  retire the broker and publish with a plain worker `git push`, safe by construction
+  (#110's named revisit condition).
 
 ## Validation
 
