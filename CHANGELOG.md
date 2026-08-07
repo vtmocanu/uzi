@@ -4,7 +4,11 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-## [0.19.0] - 2026-08-07
+## [0.19.1] - 2026-08-07
+
+First published cut of the 0.19.0 content: the `v0.19.0` tag was blocked by the release
+changelog-coverage gate — a builtin-role refresh merged during the release cut and was not
+yet cited — and `v*` tags are immutable here, so the identical code ships as 0.19.1.
 
 ### Added
 
