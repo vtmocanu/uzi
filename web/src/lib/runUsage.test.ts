@@ -826,6 +826,29 @@ describe("deriveRunUsage", () => {
     expect(confirmed.hasConfirmed).toBe(true);
     expect(confirmed.hasLiveTokens).toBe(false);
   });
+
+  it("does not flip hasLiveTokens for an all-zero usage frame (never a fabricated 0)", () => {
+    beforeEachReset();
+    // `readUsage` returns {fresh:0,cached:0,out:0} for any `usage` that is merely an
+    // object, so a record IS seen for an empty/all-zero frame. The gate keys off POSITIVE
+    // input tokens, not record presence, so the live panel never renders a fabricated 0 —
+    // the same refusal the confirmed gate makes. An all-zero record still counts as seen
+    // (it does not throw), but contributes nothing to liveTotal, so the gate stays false.
+    const d = deriveRunUsage([
+      msg("text", "lead", { text: "…", usage: {} }),
+      msg("text", "lead", { text: "…", usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } }),
+    ]);
+    expect(d.hasLiveTokens).toBe(false);
+    expect(d.liveTotal).toEqual({ fresh: 0, cached: 0 });
+    expect(d.liveByModel).toEqual([]);
+    // The very next positive frame flips it true, so the gate is not merely always-false.
+    beforeEachReset();
+    const withReal = deriveRunUsage([
+      msg("text", "lead", { text: "…", usage: {} }),
+      assistantUsage("lead", { input: 1, output: 0 }),
+    ]);
+    expect(withReal.hasLiveTokens).toBe(true);
+  });
 });
 
 // ── The cache-percentage display invariant (issue #195 web-ux follow-up) ───────

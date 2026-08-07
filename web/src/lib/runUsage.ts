@@ -221,9 +221,11 @@ export interface RunUsage {
   // cache_creation) and cached (cache_read) — are live-trustworthy, so only they are
   // exposed.
 
-  /** True when ≥1 deduped live-usage record exists. Gates the LIVE surface, the way
-   *  `hasConfirmed` gates the billed one — the two are independent (a run mid-phase has
-   *  live tokens and no confirmed total; a pre-feature run has neither). */
+  /** True when the deduped live input tokens (fresh + cached) are POSITIVE — not merely
+   *  when a usage record was seen, so an all-zero `usage` frame never renders a fabricated
+   *  0 live table. Gates the LIVE surface, the way `hasConfirmed` gates the billed one —
+   *  the two are independent (a run mid-phase has live tokens and no confirmed total; a
+   *  pre-feature run has neither). */
   hasLiveTokens: boolean;
   /** The deduped live run total. NO `out`, NO cost — see the header above. */
   liveTotal: { fresh: number; cached: number };
@@ -718,7 +720,12 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     agentTotal,
     agentModels,
     phaseUsageBySeq,
-    hasLiveTokens: seenLiveKeys.size > 0,
+    // POSITIVE tokens, not merely a seen record: `readUsage` returns {0,0,0} for any
+    // `usage` that is just an object (even `usage: {}`), so gating on record presence
+    // would flip this true for an all-zero frame and render a fabricated 0 live table —
+    // the exact thing the confirmed gate refuses (and what #194 died of). Only the two
+    // live-trustworthy input columns count toward "is there anything to show".
+    hasLiveTokens: liveTotal.fresh + liveTotal.cached > 0,
     liveTotal,
     liveByModel,
     liveByAgent,
