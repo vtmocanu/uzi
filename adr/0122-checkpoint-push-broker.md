@@ -86,18 +86,35 @@ therefore strictly stronger.
   would fatten the secrets-holder's base image and CVE surface for no capability the
   pure-Go path lacks. (The git-binary cost is image posture, not a new PAT-leak
   vector — the api has no untrusted co-resident, unlike the worker.)
-- **`ci.skip` is GitLab-only; the zero-extra-pipelines guarantee is not
-  forge-portable (added 2026-08-07, PRD #238 R8).** "go-git carries the push-option"
-  is confirmed; "the push-option skips the pipeline" is a **GitLab** fact. Verified
-  against docs.github.com: **GitHub Actions has no push-option to skip a run** —
-  skipping is a commit-message marker only (`[skip ci]`, `[skip actions]`, …, on
-  push/PR events). So when the GitHub driver (PRD #238) lands, a brokered checkpoint
-  push to a GitHub repo fires a fresh Actions run each time and feeds #238's CI-fix
-  watcher a spurious in-flight/red build. The broker's GitHub path must suppress CI a
-  different way (annotate the checkpoint tip commit with a `[skip ci]` marker before
-  the push, or skip publishing checkpoints to a GitHub branch with a `push`-triggered
-  workflow). This is per-forge knowledge and belongs at the driver/broker layer;
-  whichever of PRD #122-M8 / #238 lands second owns it.
+- **`ci.skip` is GitLab-ONLY among all three forges; the zero-extra-pipelines
+  guarantee is broken for the SHIPPING Forgejo driver today, not just future GitHub
+  (added 2026-08-07; PRD #238 R8; corrected same day after the maintainer noted
+  Forgejo).** "go-git carries the push-option" is confirmed; "the push-option skips
+  the pipeline" is a **GitLab-only** fact. Verified from source: **Forgejo Actions
+  (= Gitea Actions) skips only via a commit-message marker** (`commit.MessageRaw`
+  matched against `setting.Actions.SkipWorkflowStrings`, default `[skip ci]`/
+  `[ci skip]`/`[no ci]`/`[skip actions]`/`[actions skip]`; `services/actions/
+  notifier_helper.go`, no push-option path), and **GitHub Actions likewise has no
+  push-option skip** (docs.github.com, marker-only). So a brokered checkpoint push
+  fires a fresh Actions run on **any Forgejo repo now** (uzi's CI-fix loop is wired
+  for Forgejo Actions, PRD #65) and **any GitHub repo once #238 lands**, feeding
+  uzi's CI-fix watcher a spurious in-flight/red build. **The marker is not a clean
+  substitute for the push-option:** off GitLab the only skip lever is a
+  commit-message marker, but the broker pushes the agent's *real* commits to
+  `refs/heads/<branch>`, so marking the pushed head means rewriting the tip (→
+  non-fast-forward → the force-push this ADR forbids) or stacking a throwaway marker
+  commit (same divergence) — both fight the never-forced invariant that GitLab's
+  content-free push-option respected. The **forge-agnostic fix is to publish
+  checkpoints to a ref no workflow watches** (a `refs/uzi-checkpoints/<branch>` on
+  origin, mirroring the local `refs/uzi-runner/<branch>` tracking ref): workflows
+  trigger on `refs/heads/*`/tags/PRs, not arbitrary refs, so CI fires on **no** forge
+  and only the end-of-run push to `refs/heads/<branch>` triggers a pipeline — no
+  push-option and no marker needed anywhere. Open question: whether the Developer bot
+  may push a non-`refs/heads/*` ref, per forge. Belongs at the driver/broker layer.
+  **Consequence for M8's own validation plan:** a real send-pack against
+  `gitlab.example.com` cannot catch this — GitLab is the one forge where `ci.skip`
+  works — so M8 must additionally validate the suppression against a Forgejo (and
+  later GitHub) target, or ship the marker-based path from the start.
 - **`main` is still never touched**, the bot's Developer role is unchanged (it can
   already push non-protected branches, which is how the worker pushes today), and the
   end-of-run push + MR path is unchanged. This is not a privilege change.
