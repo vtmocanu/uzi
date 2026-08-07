@@ -4,10 +4,26 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-## [Unreleased]
+## [0.18.0] - 2026-08-07
+
+### Added
+
+- **Worker toolchain now ships `task` and `jq`.** The baked worker image includes
+  the `task` runner, so agents can drive a repo's own `Taskfile` gate recipes
+  instead of reconstructing them by hand, plus `jq`. Closes two
+  `install_worker_tool` judge recommendations. (#233)
 
 ### Fixed
 
+- **Judge recommendation backlog no longer fragments one recurring finding into
+  separate rows.** Recommendations are deduped on a canonicalized
+  `(category, target)` key, so a finding that recurs across runs collapses to a
+  single row carrying its true "seen in N runs" frequency instead of splitting N
+  ways. (#232)
+- **Worker runner clones now carry a git author identity.** The clone the agent
+  works in is pre-configured with `user.name`/`user.email`, so the agent's first
+  `git commit` no longer fails with "Author identity unknown" (exit 128) and
+  self-heals, which was burning an iteration on every commit-producing run. (#234)
 - **Activity feed no longer springs every lane open when a run finishes while you
   watch it.** Auto-expand still applies when you open an already-finished run, but a
   live `running → completed` transition now preserves the collapsed view you were
