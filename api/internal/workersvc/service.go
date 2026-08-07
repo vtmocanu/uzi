@@ -245,6 +245,10 @@ type Store interface {
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
 	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
 	ListToolTraceForRun(ctx context.Context, arg store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error)
+	// ListKnownImproveUziTargetsForUser is the owner's existing improve_uzi target menu
+	// carried on a judge claim (issue #232): frequency-ranked, canonical-deduped, capped,
+	// so the judge reuses an exact coordinate instead of inventing new phrasing.
+	ListKnownImproveUziTargetsForUser(ctx context.Context, arg store.ListKnownImproveUziTargetsForUserParams) ([]string, error)
 	ListRunInputsForRun(ctx context.Context, arg store.ListRunInputsForRunParams) ([]store.RunUserInput, error)
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.

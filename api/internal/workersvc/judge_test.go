@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -67,6 +68,95 @@ func TestClaimJudgeSkipsRepoJoinAndPAT(t *testing.T) {
 	}
 	if payload.Repo.ID != "" || payload.Repo.CloneURL != "" {
 		t.Errorf("judge claim must carry no repo, got %+v", payload.Repo)
+	}
+}
+
+// TestClaimJudgeCarriesKnownImproveUziTargets pins issue #232's write-side fix: a judge
+// claim carries the run owner's existing improve_uzi target menu (frequency-ranked,
+// canonical, capped) so the judge reuses an exact coordinate instead of inventing new
+// phrasing. It asserts the menu is delivered verbatim, that the lookup is owner-scoped and
+// capped at judgeKnownTargetsCap, and — the second sub-case — that a user with no
+// improve_uzi history yields a nil menu that is OMITTED from the wire (omitempty).
+func TestClaimJudgeCarriesKnownImproveUziTargets(t *testing.T) {
+	box := newBox(t)
+	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
+	uid := uuid.New()
+
+	// ── populated menu ──
+	menu := []string{"worker git identity setup", "shellcheck", "flaky e2e retry"}
+	fs := &fakeStore{
+		claimRun:     judgeRun(uid, uuid.New()),
+		anthropic:    sealedTok,
+		knownTargets: menu,
+	}
+	svc := New(fs, box, testParams())
+
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	if err != nil || payload == nil {
+		t.Fatalf("Claim: payload=%v err=%v", payload, err)
+	}
+	if got := payload.KnownImproveUziTargets; len(got) != len(menu) {
+		t.Fatalf("KnownImproveUziTargets = %v, want %v", got, menu)
+	}
+	for i := range menu {
+		if payload.KnownImproveUziTargets[i] != menu[i] {
+			t.Fatalf("KnownImproveUziTargets[%d] = %q, want %q", i, payload.KnownImproveUziTargets[i], menu[i])
+		}
+	}
+	// The lookup must be owner-scoped (the claimed run's owner) and capped.
+	if fs.knownTargetsParams == nil {
+		t.Fatal("ListKnownImproveUziTargetsForUser was never called")
+	}
+	if fs.knownTargetsParams.UserID != uid {
+		t.Errorf("menu lookup user = %s, want the run owner %s", fs.knownTargetsParams.UserID, uid)
+	}
+	if fs.knownTargetsParams.Lim != judgeKnownTargetsCap {
+		t.Errorf("menu lookup lim = %d, want the cap %d", fs.knownTargetsParams.Lim, judgeKnownTargetsCap)
+	}
+	// It rides the wire under the agreed field name.
+	if raw, _ := json.Marshal(payload); !strings.Contains(string(raw), `"known_improve_uzi_targets"`) {
+		t.Errorf("populated menu must appear on the wire, got: %s", raw)
+	}
+
+	// ── empty menu is omitted from the wire ──
+	fsEmpty := &fakeStore{claimRun: judgeRun(uid, uuid.New()), anthropic: sealedTok}
+	svcEmpty := New(fsEmpty, box, testParams())
+	empty, err := svcEmpty.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	if err != nil || empty == nil {
+		t.Fatalf("Claim (empty): payload=%v err=%v", empty, err)
+	}
+	if empty.KnownImproveUziTargets != nil {
+		t.Errorf("no improve_uzi history must yield a nil menu, got %v", empty.KnownImproveUziTargets)
+	}
+	if raw, _ := json.Marshal(empty); strings.Contains(string(raw), "known_improve_uzi_targets") {
+		t.Errorf("an empty menu must be omitted from the wire (omitempty), got: %s", raw)
+	}
+}
+
+// TestClaimJudgeSurvivesKnownTargetsLookupError pins the best-effort posture (issue #232):
+// the menu is an optimization, so a lookup failure must WARN and proceed with a nil menu,
+// never fail the claim — mirroring judgeSignal. Without this a transient DB hiccup on an
+// optional read would abort an otherwise-fine judge claim.
+func TestClaimJudgeSurvivesKnownTargetsLookupError(t *testing.T) {
+	box := newBox(t)
+	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
+	uid := uuid.New()
+	fs := &fakeStore{
+		claimRun:        judgeRun(uid, uuid.New()),
+		anthropic:       sealedTok,
+		knownTargetsErr: errors.New("db down"),
+	}
+	svc := New(fs, box, testParams())
+
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	if err != nil {
+		t.Fatalf("a known-targets lookup error must NOT fail the claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a judge claim payload despite the menu lookup error")
+	}
+	if payload.KnownImproveUziTargets != nil {
+		t.Errorf("a failed menu lookup must leave the menu nil, got %v", payload.KnownImproveUziTargets)
 	}
 }
 
