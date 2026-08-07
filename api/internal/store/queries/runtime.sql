@@ -266,6 +266,15 @@ WHERE worker_id = @worker_id
   AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: CountInProgressRunsForUser :one
+-- The Runs nav badge count (PRD #239): the caller's non-terminal runs, scoped to the
+-- same kinds the Runs page (ListRunsForUser) shows — chat and judge excluded, so the
+-- badge is a strict subset of what /runs lists.
+SELECT count(*) FROM runs
+WHERE user_id = @user_id
+  AND kind NOT IN ('chat', 'judge')
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: MarkStaleWorkersOffline :execrows
 -- Sweeper: workers past the heartbeat-stale window go offline.
 UPDATE workers SET status = 'offline', updated_at = now()

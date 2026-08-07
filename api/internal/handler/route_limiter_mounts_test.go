@@ -183,6 +183,12 @@ var wantRouteMounts = []routeMount{
 	// user doing nothing wrong — and the endpoint spends nothing: one indexed
 	// user-scoped query, no forge call, no model call (PRD #113 M6).
 	{"GET", "/api/me/workers/upgrade-summary", noLimiter},
+	// noLimiter, same class and reasoning as the two badge-count reads above
+	// (/me/judge/stats, /me/workers/upgrade-summary): AppShell polls it for every
+	// logged-in user to feed the Runs nav badge (PRD #239), so a per-user budget would
+	// throttle the app's own shell; it spends nothing — one indexed user-scoped
+	// count(*), no forge or model call.
+	{"GET", "/api/me/runs/in-progress-count", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},

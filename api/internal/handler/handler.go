@@ -567,6 +567,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/upgrade-summary", h.WorkerUpgradeSummary)
 		})
 
+		// Runs-in-progress count for the Runs nav badge (PRD #239). Its own endpoint +
+		// AppShell poll, mirroring /me/workers/upgrade-summary and /me/judge/stats.
+		r.Route("/me/runs", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/in-progress-count", h.RunsInProgressCount)
+		})
+
 		// Global judge-triage strip (PRD #94 Decision 8): the caller's "across all your
 		// runs" tally. RequireUser (mirrors /me/memory) so `uzi review stats` works from a
 		// CLI token; owner-scoped by the query's user_id filter, bucketed by the shared

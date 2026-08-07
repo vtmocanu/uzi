@@ -18681,3 +18681,57 @@ unchanged; this only adds a way to narrow which groups come back.
   active bucket filter. `LabelFilter` (`Judge.tsx`) ships chips with no counts; a count is a
   deliberate follow-up that would need its own aggregate, not a tally off what happens to be on
   screen.
+
+## 490. PRD #239 — the Runs nav badge counts the caller's NON-terminal, non-chat/judge runs: a strict SUBSET of the /runs page, its own endpoint, and no CLI subcommand
+
+Serves the live-run-visibility surface of human.md Feature #4 ("which agents are live/idle") as
+ambient navigation, alongside the existing Judge (§482) and Workers (§Feature #113 M6) nav badges.
+Design record: `prds/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
+in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-scoped count endpoint.
+
+- **"In progress" = every NON-terminal status, not the narrower "actively working" set (Decision 1).**
+  The count is `status NOT IN ('completed','failed','cancelled')` — the six non-terminal statuses
+  the `runs_status_check` constraint enumerates (`queued`, `claimed`, `running`, `awaiting_approval`,
+  `awaiting_input`, `limit_wait`; migration 00092). Chosen over the narrower
+  `IN ('claimed','running','awaiting_approval','awaiting_input')` idiom used by the rate-limit
+  in-flight count (`anthropic_rate_limits.sql`, which excludes `limit_wait` deliberately) and over
+  the favicon "running" set: a queued or limit-parked run is still work the user has in the factory,
+  and the badge answers "how much of mine is not yet done", so the terminal-set complement is the
+  right predicate. This is also the dominant store idiom (`ListRunsForUser`, `ListActiveRunsAll` both
+  key off the same three-value terminal set). Source of truth: `CountInProgressRunsForUser` in
+  `api/internal/store/queries/runtime.sql` — one `count(*)`, no join.
+
+- **Kind scope = the /runs page's own predicate, so the badge is a strict SUBSET of the page (Decision 4).**
+  The query additionally filters `kind NOT IN ('chat','judge')`, byte-identical to `ListRunsForUser`'s
+  kind guard, so the badge counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat`
+  or `judge` meta-run. The invariant is **same scope predicate (owner + kind-set)**, deliberately NOT
+  numeric equality with what the page renders: the /runs page also lists TERMINAL runs, so the badge
+  is a non-terminal subset of the page's list, never equal to its row count. Framed as a subset
+  because that is the property a reader can check (a badge count can never exceed, or include a kind
+  absent from, the page) — a fragile "equals the page" claim would be false the moment any run
+  completes.
+
+- **Endpoint: `GET /api/me/runs/in-progress-count` → `{ "count": <int> }`, on `RequireUser`.**
+  Handler `RunsInProgressCount` (`api/internal/handler/runs_in_progress_count.go`); mounted under a
+  `/me/runs` route with `RequireUser` (`handler.go`), mirroring `/me/judge/stats` and
+  `/me/workers/upgrade-summary` so a user-scoped CLI token can read it, not only a session cookie.
+  Owner-scoped in the DB by the query's `user_id = @user_id` filter (not a service check). Its OWN
+  lightweight endpoint rather than deriving the badge from the Runs page's data: AppShell owns the
+  poll so the badge stays live wherever the operator navigates, not only while the Runs page is
+  mounted — the same "a page-local poll is stale exactly when the operator is elsewhere" rationale
+  the Workers badge records.
+
+- **Client: AppShell polls on navigation and renders the brand `count` tone, NOT the Workers `alert` red.**
+  `api.runsInProgressCount()` (`web/src/lib/api.ts`) is polled in an AppShell `useEffect` keyed on
+  `[user, location.pathname]` — the same on-navigation cadence as the Judge badge, deliberately
+  without the Workers badge's fixed interval (an in-progress count is not an incident that must
+  surface while the operator sits still). A failed fetch keeps the last known count rather than
+  blanking to zero. The count renders on the Runs `NavItem` via the default `badge`/`count` tone
+  (brand pill = "there is a queue"), explicitly not `badgeTone="alert"` (red = "go look"), which is
+  reserved for the Workers attention badge.
+
+- **CLI: deliberately NO new command (recorded as out-of-scope, not an oversight).** `uzi run list`
+  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run.go`), so an agent or
+  script derives an in-progress tally client-side from `ListRuns`. A dedicated count subcommand would
+  duplicate the badge's purely-ambient-UI purpose with no headless capability the list verb lacks, so
+  none was added.

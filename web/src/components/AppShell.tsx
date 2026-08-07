@@ -324,6 +324,7 @@ function SidebarContent({
   onToggleCollapse,
   unread = 0,
   judgeTodo = 0,
+  runsInProgress = 0,
   workersAttention = 0,
 }: {
   onNavigate?: () => void;
@@ -335,6 +336,11 @@ function SidebarContent({
   // `unread`, sourced from /me/judge/stats.todo — the ONE canonical number, so the badge
   // agrees with the Judge page's To-triage tab and the judge notification to the digit.
   judgeTodo?: number;
+  // In-progress run count for the Runs nav badge (PRD #239). Owned by AppShell alongside
+  // `judgeTodo`, sourced from /me/runs/in-progress-count — the caller's non-terminal runs
+  // (kind NOT IN chat/judge, Decision 4). Brand "count" tone, NOT the Workers `alert` red:
+  // in-progress runs are healthy activity / a queue to get to, not "go look now".
+  runsInProgress?: number;
   // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
   // badge showing zero, which would be a permanent ornament that means nothing.
   workersAttention?: number;
@@ -451,7 +457,9 @@ function SidebarContent({
                 onNavigate={onNavigate}
               />
             ))}
-          <NavItem to="/runs" icon={<ActivityIcon />} label="Runs" onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Runs badge (PRD #239): the caller's in-progress run count. Default
+              "count" tone — brand, "there is a queue", not the Workers alert red. */}
+          <NavItem to="/runs" icon={<ActivityIcon />} label="Runs" badge={runsInProgress} onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 
@@ -660,6 +668,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // needs a propagation channel as well as a shared source: JudgeTodoContext publishes this
   // setter, and the Judge page pushes the fresh canonical `triage.todo` it already has.
   const [judgeTodo, setJudgeTodo] = useState(0);
+  // In-progress runs badge (PRD #239). Owned here alongside `judgeTodo`, from
+  // /me/runs/in-progress-count — the caller's non-terminal, non-chat/judge run count.
+  const [runsInProgress, setRunsInProgress] = useState(0);
   // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
@@ -708,6 +719,26 @@ export function AppShell({ children }: { children: ReactNode }) {
       .getJudgeStats()
       .then((stats) => {
         if (alive) setJudgeTodo(stats.todo);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [user, location.pathname]);
+
+  // Runs-in-progress poll (PRD #239): the same on-navigation cadence as the Judge poll
+  // above, reading /me/runs/in-progress-count. A failed fetch keeps the last known count
+  // rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setRunsInProgress(0);
+      return;
+    }
+    let alive = true;
+    api
+      .runsInProgressCount()
+      .then(({ count }) => {
+        if (alive) setRunsInProgress(count);
       })
       .catch(() => {});
     return () => {
@@ -781,6 +812,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           onToggleCollapse={() => setCollapsed((c) => !c)}
           unread={unread}
           judgeTodo={judgeTodo}
+          runsInProgress={runsInProgress}
           workersAttention={workersAttention}
         />
       </aside>
@@ -813,7 +845,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} workersAttention={workersAttention} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} workersAttention={workersAttention} />
           </div>
         </div>
       )}
