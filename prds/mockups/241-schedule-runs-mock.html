@@ -149,8 +149,9 @@
     Today a run can only start <em>now</em> — the board "Start run" button, <code>uzi run create</code>, or
     autopilot when a label appears. This adds a <b style="color:rgb(var(--fg))">time-driven</b> path so the dark
     factory can work off-hours: fire a run once at a future moment, or on a recurring cadence, against a
-    <b style="color:rgb(var(--fg))">pinned issue</b> or a recurring <b style="color:rgb(var(--fg))">sweep</b> of every
-    eligible PRD issue. All chrome below is painted from the app's real tokens; the shapes reuse existing
+    <b style="color:rgb(var(--fg))">pinned issue</b>, a <b style="color:rgb(var(--fg))">label sweep</b>
+    (e.g. every issue labeled <code>bug</code>), or an <b style="color:rgb(var(--fg))">ad-hoc prompt</b> with no
+    issue at all. All chrome below is painted from the app's real tokens; the shapes reuse existing
     components (table, badges, toggle, modal).
   </p>
 
@@ -164,7 +165,7 @@
       <div class="phead">
         <div>
           <h3>Schedules</h3>
-          <p>4 schedules · 3 active · next fire in 6h 12m</p>
+          <p>5 schedules · 4 active · next fire in 6h 12m</p>
         </div>
         <button class="btn primary"><span class="ic">+</span> New schedule</button>
       </div>
@@ -244,10 +245,31 @@
                 </div>
               </td>
             </tr>
-            <!-- paused -->
+            <!-- ad-hoc prompt -->
+            <tr>
+              <td>
+                <div class="tgt">Prompt: hunt flaky tests, open MR <span class="badge" style="color:rgb(var(--ok));background:rgb(var(--ok) / 0.1);border-color:rgb(var(--ok) / 0.4)"><span class="dot"></span>prompt</span></div>
+                <div class="repo">vtmocanu/uzi · no issue</div>
+              </td>
+              <td>
+                <div class="when">0 9 * * 1</div>
+                <div class="human">Every Monday at 09:00 · Europe/Bucharest</div>
+              </td>
+              <td class="stamp">Mon 09:00<div class="rel">in 13h 12m</div></td>
+              <td class="stamp">Mon 09:00<div class="rel">MR !312 opened</div></td>
+              <td><span class="chip">auto-approve</span></td>
+              <td>
+                <div class="rowacts">
+                  <button class="btn ghost sm" title="Run now">▶</button>
+                  <button class="btn ghost sm" title="Edit">✎</button>
+                  <span class="sw on" title="Enabled"></span>
+                </div>
+              </td>
+            </tr>
+            <!-- paused: label sweep -->
             <tr class="off">
               <td>
-                <div class="tgt">Sweep eligible PRD issues <span class="badge violet"><span class="dot"></span>sweep</span></div>
+                <div class="tgt">Sweep · label <span class="chip">bug</span> <span class="badge violet"><span class="dot"></span>sweep</span></div>
                 <div class="repo">vtmocanu/board-svc</div>
               </td>
               <td>
@@ -270,8 +292,9 @@
       </div>
       <div class="legend">
         <span><span class="badge brand"><span class="dot"></span>once</span> fires a single time, then auto-removes</span>
-        <span><span class="badge violet"><span class="dot"></span>sweep</span> fires against every currently-eligible PRD issue</span>
-        <span><span class="sw on" style="width:28px;height:16px"></span> per-row pause / resume (no delete needed)</span>
+        <span><span class="badge violet"><span class="dot"></span>sweep</span> fires on issues matching a label (default: PRD)</span>
+        <span><span class="badge" style="color:rgb(var(--ok));background:rgb(var(--ok) / 0.1);border-color:rgb(var(--ok) / 0.4)"><span class="dot"></span>prompt</span> issue-less run, opens an MR</span>
+        <span><span class="sw on" style="width:28px;height:16px"></span> per-row pause / resume</span>
       </div>
     </div>
   </section>
@@ -299,15 +322,28 @@
             <span class="flabel">Target</span>
             <div class="seg">
               <label class="segopt">
-                <div class="t"><span class="rdot"></span> A specific issue</div>
-                <div class="d">Pin one PRD issue by IID</div>
+                <div class="t"><span class="rdot"></span> Issue</div>
+                <div class="d">Pin one PRD issue</div>
               </label>
               <label class="segopt on">
-                <div class="t"><span class="rdot"></span> Sweep eligible issues</div>
-                <div class="d">Every eligible PRD issue at fire time</div>
+                <div class="t"><span class="rdot"></span> Label sweep</div>
+                <div class="d">Issues matching a label</div>
+              </label>
+              <label class="segopt">
+                <div class="t"><span class="rdot"></span> Prompt</div>
+                <div class="d">No issue → opens an MR</div>
               </label>
             </div>
-            <span class="fhint">Sweep skips issues that already have an active run (same dedup autopilot uses).</span>
+            <span class="fhint">Sweep skips issues with an active run (same dedup autopilot uses). Empty label ⇒ the PRD label.</span>
+            <div style="margin-top:12px;">
+              <span class="flabel">Labels</span>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;align-items:center;">
+                <span class="chip" style="background:rgb(var(--brand) / 0.12);border-color:rgb(var(--brand) / 0.4);color:rgb(var(--brand))">bug ✕</span>
+                <span class="chip" style="background:rgb(var(--brand) / 0.12);border-color:rgb(var(--brand) / 0.4);color:rgb(var(--brand))">PRD ✕</span>
+                <input class="input" style="width:auto;flex:1;min-width:120px;padding:5px 9px;font-size:12px;" placeholder="add label…" />
+              </div>
+              <span class="fhint" style="margin-top:6px;display:block;">Only issues that also pass the run-creation gate (PRD link, or PRDLESS) actually fire.</span>
+            </div>
           </div>
 
           <!-- Timing -->
@@ -387,6 +423,13 @@
           plan gate defeats the point; auto-approving one that nobody is watching is a trust decision. It reuses
           autopilot's existing <code>auto_approve</code> semantics and is opt-in per schedule — see Decision 4 in the PRD.</div>
       </div>
+      <div class="note" style="border-color:rgb(var(--ok) / 0.3);background:rgb(var(--ok) / 0.06);">
+        <span class="ic" style="color:rgb(var(--ok))">◆</span>
+        <div><b>Prompt target (no issue).</b> Choosing <b>Prompt</b> swaps the label field for a textarea —
+          e.g. <i>"hunt for flaky tests and open an MR."</i> It runs against the repo with no forge issue (a new
+          run kind on the self-improve shape) and <b>bypasses the PRD-issue gate by design</b>; <code>main</code>
+          stays protected by the unchanged guardrail layers. See Decision 10.</div>
+      </div>
     </div>
   </section>
 
@@ -445,12 +488,23 @@
 <span class="p">$</span> <span class="c">uzi schedule create</span> <span class="o">--repo</span> uzi <span class="o">--issue</span> 158 <span class="o">--at</span> <span class="v">"2026-08-08T09:00+03:00"</span>
 <span class="g">✓</span> created schedule <span class="v">sch_9Qm4</span> · fires once at Aug 8 09:00 (in 13h 12m)
 
+<span class="cm"># recurring label sweep — every issue labeled bug, Mondays 09:00</span>
+<span class="p">$</span> <span class="c">uzi schedule create</span> <span class="o">--repo</span> uzi <span class="o">--sweep</span> <span class="o">--label</span> bug <span class="o">--cron</span> <span class="v">"0 9 * * 1"</span>
+<span class="g">✓</span> created schedule <span class="v">sch_Lb5x</span> · next fire Mon 09:00 (in 13h 12m)
+
+<span class="cm"># ad-hoc prompt — no issue, opens an MR (bypasses the PRD gate; auto-approve)</span>
+<span class="p">$</span> <span class="c">uzi schedule create</span> <span class="o">--repo</span> uzi <span class="o">--prompt</span> <span class="v">"hunt for flaky tests and open an MR"</span> \
+    <span class="o">--cron</span> <span class="v">"0 9 * * 1"</span> <span class="o">--auto-approve</span>
+<span class="g">✓</span> created schedule <span class="v">sch_Pr0m</span> · next fire Mon 09:00 (in 13h 12m)
+
 <span class="p">$</span> <span class="c">uzi schedule list</span>
 <span class="o">ID        TARGET                REPO           WHEN            NEXT           ON</span>
 sch_7Kd2  sweep                 vtmocanu/uzi    0 2 * * 1-5     in 6h 12m      yes
 sch_9Qm4  #158                  vtmocanu/uzi    once            in 13h 12m     yes
 sch_3Bf1  #142                  vtmocanu/uzi    0 3 * * *       in 7h 12m      yes
-sch_Zt88  sweep                 board-svc      0 */6 * * *     —              <span class="o">paused</span>
+sch_Lb5x  sweep:bug             vtmocanu/uzi    0 9 * * 1      in 13h 12m     yes
+sch_Pr0m  prompt                vtmocanu/uzi    0 9 * * 1      in 13h 12m     yes
+sch_Zt88  sweep:bug             board-svc      0 */6 * * *     —              <span class="o">paused</span>
 
 <span class="p">$</span> <span class="c">uzi schedule pause</span> sch_7Kd2      <span class="cm"># resume, run-now, get, delete all present</span>
 <span class="g">✓</span> paused sch_7Kd2
