@@ -18,7 +18,7 @@
 > - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
 > - **The budget hard ceiling is now DECIDED (2026-08-07)**: profile "Generous" — milestone-count cap **12**, total turn ceiling `RUN_MAX_ITERATIONS × min(n, 12)` (≤ 60 turns), absolute wall-clock ceiling **8h**; single-milestone plans stay at today's 5 turns / 2h, and the count cap is enforced server-side (Decision 12). M2 implements it. See the 2026-08-07 Decision Log entry.
 >
-> **M1 status (2026-08-07): DONE, merged (MR !194, `3d0720ee`).** `submit_plan.milestones` + main-thread extraction + the `00098` two-column store + DTO + Decision-12 validation all landed. M2 is next: progress reporting (union) + the budget resize, whose server half (Decision 5b) is the load-bearing part.
+> **Status (2026-08-07): Phase 1 backend DONE — M1 (MR !194) + M2 (MR !195) merged.** M1 = `submit_plan.milestones` + the `00098` two-column store + DTO + Decision-12 validation; M2 = progress reporting (union/overwrite/membership) + the milestone-scaled budget with Decision 5b's per-run sweeper timeout + `00099`. **M3/M4/M5 (web UI, Slack, CLI) are NOT built and were deliberately not seeded.** Active work is **M8 — per-checkpoint origin publish via a server-side push broker** (see the two 2026-08-07 Decision Log entries at the bottom; Decision 8/14 + M8 rewrite pending approval).
 
 ## Problem
 
@@ -657,3 +657,52 @@ hook, so it can never reach a signal tool.
     honour, plus the run-health "slow" clamp) are M2's load-bearing halves — the
     server change is what makes the wall-clock scale real, since the sweeper, not
     the worker, is the enforcement.
+- **2026-08-07 — M2 landed (MR !195), Phase 1 backend complete.** M2 shipped via a
+  seeded uzi run (`1de50700`) with migration `00099_run_milestone_progress.sql`.
+  Both halves landed and were verified against the merged diff:
+  - **Budget resize, server-authoritative.** `api/internal/workersvc/budget.go`
+    pins the Generous ceiling — `milestoneBudgetCap = 12`,
+    `budgetWallCeilingSeconds = 8h` — and the freeze SQL derives
+    `budget_max_iterations = run_max_iterations × LEAST(frozen_count, 12)` and
+    `budget_wall_seconds = LEAST(run_timeout × LEAST(frozen_count, 12), 8h)`,
+    written idempotently via `COALESCE` at BOTH the human-approve
+    (`CreateApprovePlanInput`) and autopilot (`SetRunRunning`) freeze paths, and
+    NULL for a 0/1-milestone run so single-milestone budgets are byte-for-byte
+    today's (5 turns / 2h). The cap is applied in the freeze SQL, not worker-side.
+  - **Decision 5b done correctly.** `SweepRunningTimeout` now compares
+    `started_at` against a PER-RUN cutoff
+    (`now - make_interval(secs => COALESCE(budget_wall_seconds, global_timeout))`),
+    and `budget_wall_seconds` rides the running-run health read so the "slow" clamp
+    follows the effective timeout — a scaled run is not swept at 2h and is not
+    flagged slow for its whole life. The 8h ceiling is enforced at the WRITE
+    (freeze) path, with a source comment warning future writers to keep it there.
+  - **Progress: Decision 3.** `milestones_completed` is UNIONED (dedup via
+    `jsonb_agg(DISTINCT …)`), `milestones_in_progress` is OVERWRITTEN, a NULL param
+    leaves the column untouched, and every reported id is membership-checked against
+    the frozen list server-side before the write (Decision 12's M2 half). Live-DB
+    integration test (`run_milestone_progress_integration_test.go`, +337) covers it.
+  - **Still no UI** (M3/M4/M5 unbuilt). The remaining Phase-1 milestones were
+    deliberately NOT seeded — the maintainer redirected to the M8 work below.
+- **2026-08-07 — M8 (per-checkpoint origin publish) reopened and re-designed to a
+  SERVER-SIDE PUSH BROKER (design agreed; PRD Decision 8/14 + M8 rewrite pending).**
+  At the maintainer's direction ("I want per-checkpoint publish, as secure as
+  possible"), a three-agent code-grounded security review (researcher + auditor +
+  architect) reached a unanimous recommendation. The auditor **demonstrated** that
+  reap-then-push does NOT close the vector on single-uid k8s: `killAgentTree`
+  process-group-kills only the SDK CLI pid, so a `setsid`/new-session child escapes
+  the reap and can read the push child's `/proc/environ` (agent uid == worker uid
+  == 10001). Chosen design: the worker ships its credential-free pack
+  (`origin/<b>..refs/uzi-runner/<b>`, already in its bare from #218's
+  `fetchAgentBranch`) to a new authorization-scoped
+  `POST /api/worker/runs/{id}/publish`, and the api pushes with the PAT it already
+  decrypts — no PAT-bearing git child ever runs under the agent-reachable uid
+  (spatial closure, strictly stronger than reap-then-push's temporal closure).
+  Rejected: Infisical agent-vault (needs a separate-pod/egress isolation single-uid
+  k8s can't give, and moves push capability to the agent) and scoped tokens (the
+  Developer bot can't mint them). **go-git spike (2026-08-07): `PushOptions.Options
+  []string` in the go-git source confirms the client can send `ci.skip`**, so the
+  api push client stays pure-Go and the api image stays distroless-static — no git
+  binary needed. Fallback if a real-forge push proves fragile: Option A (worker
+  reap-then-push hardened with `hidepid=2` + a cgroup reap that catches the setsid
+  escape). ADR `adr/0122-checkpoint-push-broker.md` to be authored on approval of
+  the Decision 8/14 rewrite.
