@@ -48,6 +48,7 @@ import {
   type AgentSelectionParse,
   type AskUserQuestion,
   type ClaimConfig,
+  type Milestone,
 } from "./protocol.js";
 import {
   buildCIFixPlanPrompt,
@@ -187,6 +188,9 @@ interface TurnResult {
   /** PRD #88: questions the lead asked via ask_user during this turn. Present and
    *  non-empty ⇒ the caller parks the run OUTSIDE driveTurn. */
   questions?: AskUserQuestion[];
+  /** PRD #122 M1: the candidate milestone list the lead passed to submit_plan this
+   *  turn, if any. Rides the gate call so the human approves the breakdown. */
+  milestones?: Milestone[];
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -486,7 +490,12 @@ export class SdkExecutor implements Executor {
     // runs.kind is NOT NULL.
     const isIssueRun = (ctx.kind ?? "issue") === "issue";
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
-      [SIGNAL_SERVER_NAME]: buildSignalMcpServer({ prdDonePath: isIssueRun }),
+      [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
+        prdDonePath: isIssueRun,
+        // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
+        // gated on the same isIssueRun discriminator as prd_done_path.
+        milestones: isIssueRun,
+      }),
     };
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
@@ -820,7 +829,11 @@ export class SdkExecutor implements Executor {
         if (!ctx.gatePlan)
           throw new Error("plan gate is not wired for this run");
         approvedPlan = plan.plan;
-        let verdict = await ctx.gatePlan(approvedPlan);
+        // PRD #122 M1: the CANDIDATE milestone list rides every gate call so the human
+        // approves the breakdown. It is REPLACED on each revision round (Decision 2),
+        // tracked alongside approvedPlan.
+        let candidateMilestones = plan.milestones;
+        let verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
         let revisions = 0;
         while (verdict.kind === "revise") {
           const feedback = verdict.feedback;
@@ -848,7 +861,7 @@ export class SdkExecutor implements Executor {
                 text: "revision budget exhausted — not revising the plan further",
               },
             });
-            verdict = await ctx.gatePlan(approvedPlan);
+            verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
             continue;
           }
           revisions++;
@@ -871,7 +884,9 @@ export class SdkExecutor implements Executor {
           );
           resumeId = turn.sessionId ?? resumeId;
           approvedPlan = turn.plan;
-          verdict = await ctx.gatePlan(approvedPlan);
+          // Decision 2: the candidate is REPLACED across a revision round.
+          candidateMilestones = turn.milestones;
+          verdict = await ctx.gatePlan(approvedPlan, candidateMilestones);
         }
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason);
@@ -1492,6 +1507,7 @@ export class SdkExecutor implements Executor {
         }
         const sig = scanSignals(msg);
         if (sig.plan !== undefined) result.plan = sig.plan;
+        if (sig.milestones) result.milestones = sig.milestones; // last-wins, alongside plan (PRD #122 M1)
         if (sig.done) result.done = true;
         // Last-wins within the turn, mirroring `plan` rather than `done`'s latch:
         // if the lead somehow signals twice, the LAST declaration is the one that

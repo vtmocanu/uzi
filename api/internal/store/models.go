@@ -308,6 +308,8 @@ type Run struct {
 	PlanSource            string             `json:"plan_source"`
 	PlannedBaseCommit     pgtype.Text        `json:"planned_base_commit"`
 	RequireBaseMatch      bool               `json:"require_base_match"`
+	MilestonesCandidate   []byte             `json:"milestones_candidate"`
+	MilestonesFrozen      []byte             `json:"milestones_frozen"`
 }
 
 type RunMessage struct {

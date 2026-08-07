@@ -114,6 +114,13 @@ type ClaimPayload struct {
 	// an old worker ignores the key and behaves exactly as it does today.
 	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
 
+	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
+	// decoded from runs.milestones_frozen and replayed on every claim so a resumed
+	// worker carries the immutable list. omitempty because a run with no frozen list
+	// (never proposed one, or is not an issue run) keeps today's claim wire shape
+	// exactly — an old worker ignores the key. Nil when the run has none.
+	Milestones []Milestone `json:"milestones,omitempty"`
+
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
 	// the Bearer worker trace endpoint (M3); the claim itself stays small and carries

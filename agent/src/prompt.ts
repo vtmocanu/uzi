@@ -560,6 +560,15 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "the plan as Markdown and STOP. Do NOT implement anything yet — a human must",
     "approve the plan first.",
     "",
+    // PRD #122 M1. Optional milestone breakdown on submit_plan. Unconditional inside
+    // this builder because it is issue-only by construction (the executor calls it
+    // for kind==="issue" only); the schema gate (signals.ts) is the belt to this
+    // suspenders. Kept terse and OPT-OUT so small work degrades to today's behavior.
+    "You MAY optionally decompose the work into a short list of milestones and pass",
+    "them as `submit_plan`'s `milestones` — each `{id, title}` with a short stable id",
+    "like `m1` — so the human approves the breakdown along with the plan. OMIT",
+    "milestones for small single-unit work.",
+    "",
     // PRD #72 Decision 15. The done-condition clause is present during planning
     // too, but nothing asked the plan to SAY the PRD will be updated and possibly
     // moved — so a human could approve a plan and the run would then also rewrite

@@ -71,6 +71,11 @@ describe("buildPlanPrompt", () => {
     assert.match(p, /No subagents are available/);
   });
 
+  it("offers the optional milestone breakdown (PRD #122 M1)", () => {
+    assert.match(prompt, /milestone/i);
+    assert.match(prompt, /`milestones`/);
+  });
+
   it("injects NO memory block when the run has no cross-run memory (PRD #90)", () => {
     assert.ok(!/untrusted_memory/.test(prompt), "no memory fence without entries");
     const p = buildPlanPrompt({

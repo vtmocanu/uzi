@@ -69,7 +69,9 @@ func TestAgentSelectionTags(t *testing.T) {
 var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
-	"auto_approve", "worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
+	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
+	// with no milestones, which is every pre-feature run).
+	"auto_approve", "milestones", "worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",

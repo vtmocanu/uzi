@@ -679,6 +679,12 @@ UPDATE runs SET
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself.
+    -- Written IMMUTABLY — COALESCE keeps the EXISTING value, so a later `running`
+    -- report can never overwrite a frozen list. Only the first report that carries
+    -- one wins; the common heartbeat omits it and passes NULL, leaving it untouched
+    -- (a human-gated run freezes through CreateApprovePlanInput instead).
+    milestones_frozen = COALESCE(milestones_frozen, sqlc.narg('milestones_frozen')::jsonb),
     -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
     -- running. This statement is also the running→running heartbeat (idempotent),
     -- and an unconditional reset would clear the detector's flag on every heartbeat;
@@ -756,6 +762,13 @@ UPDATE runs SET
     -- the fix the create-time 422-on-empty (service.go) is the OTHER half of — the 422
     -- closes the blank-plan ENTRY path, this closes every other fall-through. Both.
     plan_source = 'agent',
+    -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
+    -- DIRECT assignment, not COALESCE — the candidate is REPLACED each revision round
+    -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
+    -- A report with no milestones passes NULL and clears the candidate, which is
+    -- correct: the candidate reflects only the latest proposal. The immutable
+    -- frozen list is untouched here (it is written at approve / by autopilot).
+    milestones_candidate = sqlc.narg('milestones_candidate')::jsonb,
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
     -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
     -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
@@ -1561,6 +1574,12 @@ WITH selected AS (
     UPDATE runs SET
         agent_source     = @agent_source,
         agent_exclusions = @agent_exclusions,
+        -- PRD #122 M1: the SERVER-AUTHORITATIVE freeze for the human path. Copy the
+        -- approved candidate into the immutable frozen list at approve time, IDEMPOTENTLY
+        -- — COALESCE keeps an already-frozen value, so a double-approve (or a re-gate
+        -- resume) never changes a list that was frozen once. A run with no candidate
+        -- freezes NULL, which is correct: nothing to approve, nothing frozen.
+        milestones_frozen = COALESCE(runs.milestones_frozen, runs.milestones_candidate),
         updated_at       = now()
     WHERE id = @run_id
     RETURNING id

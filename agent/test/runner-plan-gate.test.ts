@@ -17,6 +17,7 @@ import {
   installHarness,
   isAlive,
   planThenDoneQuery,
+  planWithMilestonesThenDoneQuery,
   resultOk,
   runner,
   waitDead,
@@ -634,5 +635,86 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.ok(failed, "cancelled run reports failed");
     assert.match(failed!.body.failure_reason ?? "", /run cancelled/);
     assert.strictEqual(calls.length, 0, "no MR on cancel");
+  });
+});
+
+// PRD #122 M1: the CANDIDATE milestone list rides awaiting_approval (human-gated)
+// and the FROZEN list rides the autopilot running report (Decision 2). All additive-
+// optional: a plan with no milestones is byte-for-byte unchanged from today.
+describe("RunRunner — milestones on the plan gate (PRD #122 M1)", () => {
+  const MS = [
+    { id: "m1", title: "Wire the protocol" },
+    { id: "m2", title: "Plumb the executor" },
+  ];
+
+  it("carries the candidate milestones on the awaiting_approval report", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(90);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn: planWithMilestonesThenDoneQuery(MS),
+      }),
+      gitlab,
+    ).execute(claim);
+
+    const gate = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body)
+      .find((s) => s.status === "awaiting_approval")!;
+    assert.ok(gate, "run halted at the plan gate");
+    assert.deepStrictEqual(gate.milestones, MS);
+  });
+
+  it("BACK-COMPAT: omits the milestones key entirely when the plan carries none", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(91);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn: planWithMilestonesThenDoneQuery(undefined),
+      }),
+      gitlab,
+    ).execute(claim);
+
+    const gate = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body)
+      .find((s) => s.status === "awaiting_approval")! as unknown as Record<
+      string,
+      unknown
+    >;
+    assert.ok(gate, "run halted at the plan gate");
+    assert.ok(
+      !("milestones" in gate),
+      "no milestones key on the wire (not null/[]), so an old api sees today's shape",
+    );
+  });
+
+  it("AUTOPILOT: the frozen milestones ride the running report and the run never parks", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(26, { auto_approve: true });
+    // No inputs: an autopilot run resolves the gate itself and never awaits a human.
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, {
+        queryFn: planWithMilestonesThenDoneQuery(MS),
+      }),
+      gitlab,
+    ).execute(claim);
+
+    const bodies = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
+    assert.ok(
+      !bodies.some((s) => s.status === "awaiting_approval"),
+      "autopilot run never enters awaiting_approval",
+    );
+    // The frozen list rides the SAME self-contained running report that carries the
+    // autopilot agent_selection (Decision 2).
+    const autopilotReport = bodies.find(
+      (s) => s.status === "running" && s.agent_selection !== undefined,
+    )!;
+    assert.ok(autopilotReport, "autopilot agent-selection running report present");
+    assert.deepStrictEqual(autopilotReport.milestones, MS);
   });
 });

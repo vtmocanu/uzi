@@ -16,7 +16,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
-import type { AskUserQuestion } from "./protocol.js";
+import type { AskUserQuestion, Milestone } from "./protocol.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
@@ -41,6 +41,11 @@ export interface ScannedSignals {
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
+  /** PRD #122 M1: the milestone breakdown extracted from a submit_plan call, if the
+   *  message carried one. Main-thread-only (the extraction sits behind the same
+   *  isSubagentFrame guard as the plan) and defensive — a malformed list yields
+   *  nothing rather than throwing, and is only set when at least one entry parsed. */
+  milestones?: Milestone[];
 }
 
 /** Options for the signal server's tool schemas. */
@@ -52,6 +57,12 @@ export interface SignalServerOptions {
    *  parameter on a non-issue run, rather than seeing it and having the value
    *  silently dropped two hops downstream. */
   prdDonePath?: boolean;
+  /** PRD #122 M1: expose the `milestones` param on submit_plan. Issue runs only
+   *  (Decision 13) — a `ci_fix` diagnoses one failure and a `self_improve` cycle
+   *  picks one improvement, neither is milestone-shaped, and neither should be able
+   *  to self-scale its budget off a milestone count. Gating the SCHEMA keeps the
+   *  model from ever seeing the parameter on a non-issue run. */
+  milestones?: boolean;
 }
 
 /**
@@ -81,6 +92,22 @@ export function buildSignalMcpServer(
           "PRD is only partially complete and stayed where it was, and when the issue links no PRD at all.",
       );
   }
+  // PRD #122 M1. Built the same way as doneShape: a Record mutated only when the
+  // option is set, so the `milestones` param is invisible to the model on a
+  // non-issue run (Decision 13) rather than present-and-silently-dropped.
+  const planShape: Record<string, z.ZodTypeAny> = {
+    plan_md: z.string().describe("The full implementation plan, as Markdown."),
+  };
+  if (opts.milestones) {
+    planShape["milestones"] = z
+      .array(z.object({ id: z.string(), title: z.string() }))
+      .optional()
+      .describe(
+        "An OPTIONAL breakdown of the work into milestones, each {id, title} with a " +
+          "short stable id like m1. The human approves this breakdown at the gate. " +
+          "Omit it entirely for small single-unit work.",
+      );
+  }
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
@@ -88,11 +115,7 @@ export function buildSignalMcpServer(
       tool(
         SUBMIT_PLAN_TOOL,
         "Submit your implementation plan for human approval. Call this EXACTLY ONCE when the plan is ready, then STOP and end your turn — do not begin implementing. A human approves or rejects the plan out of band; you will be re-prompted to implement only after approval.",
-        {
-          plan_md: z
-            .string()
-            .describe("The full implementation plan, as Markdown."),
-        },
+        planShape,
         async () => ({
           content: [
             {
@@ -198,6 +221,13 @@ const MAX_QUESTION_RUNES = 2000;
 const MAX_HEADER_RUNES = 60;
 const MAX_OPTION_RUNES = 200;
 
+/** Bounds on model-authored milestone data (PRD #122 M1). HYGIENE ONLY, not the
+ *  authoritative cap — the api is the real control (Decision 12); these keep a
+ *  garbage payload from ballooning worker memory before it is even reported. */
+const MAX_MILESTONES = 200;
+const MAX_MILESTONE_ID_RUNES = 64;
+const MAX_MILESTONE_TITLE_RUNES = 200;
+
 function clamp(s: string, n: number): string {
   const runes = [...s];
   return runes.length <= n ? s : runes.slice(0, n).join("");
@@ -242,6 +272,32 @@ function parseQuestions(raw: unknown): AskUserQuestion[] {
     }
     if (q["multiSelect"] === true) parsed.multiSelect = true;
     out.push(parsed);
+  }
+  return out;
+}
+
+/**
+ * Parse + clamp the `milestones` argument of a submit_plan call (PRD #122 M1).
+ * Modelled exactly on parseQuestions: defensive, never throws. A non-array yields
+ * []; entries that are not `{id: string, title: string}` with non-empty trimmed id
+ * and title are dropped; id is clamped to 64 runes and title to 200; the count is
+ * capped at 200. The cap here is HYGIENE, NOT the authoritative control — the api
+ * validates and is the real cap (Decision 12).
+ */
+function parseMilestones(raw: unknown): Milestone[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Milestone[] = [];
+  for (const item of raw.slice(0, MAX_MILESTONES)) {
+    const m = asRecord(item);
+    if (!m) continue;
+    const id = typeof m["id"] === "string" ? m["id"].trim() : "";
+    if (id === "") continue;
+    const title = typeof m["title"] === "string" ? m["title"].trim() : "";
+    if (title === "") continue;
+    out.push({
+      id: clamp(id, MAX_MILESTONE_ID_RUNES),
+      title: clamp(title, MAX_MILESTONE_TITLE_RUNES),
+    });
   }
   return out;
 }
@@ -301,6 +357,14 @@ export function scanSignals(message: unknown): ScannedSignals {
       const plan = input?.["plan_md"];
       if (typeof plan === "string") out.plan = plan;
       else out.plan = out.plan ?? ""; // a submit_plan with no/blank body still counts as "a plan was submitted"
+      // PRD #122 M1. Extracted HERE, inside the submit_plan branch and therefore
+      // behind the isSubagentFrame guard at the top of scanSignals — that guard is
+      // what gives milestones the main-thread-only guarantee, exactly as it does for
+      // the plan itself. A subagent frame never reaches this loop, so no rejection or
+      // latch handling is needed here. Only set out.milestones when at least one entry
+      // parsed, so a submit_plan with no/garbage milestones stays additive-absent.
+      const milestones = parseMilestones(input?.["milestones"]);
+      if (milestones.length > 0) out.milestones = milestones;
     } else if (name === SIGNAL_DONE_QUALIFIED) {
       out.done = true;
       // PRD #72 M4. THE ONLY extraction point for prd_done_path, deliberately.

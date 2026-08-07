@@ -189,6 +189,108 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
   });
 });
 
+describe("scanSignals milestones (PRD #122 M1)", () => {
+  const PLAN = "mcp__uzi__submit_plan";
+
+  it("extracts milestones from a main-thread submit_plan tool_use", () => {
+    const r = scanSignals(
+      toolUse(PLAN, {
+        plan_md: "# Plan",
+        milestones: [
+          { id: "m1", title: "Wire the protocol" },
+          { id: "m2", title: "Plumb the executor" },
+        ],
+      }),
+    );
+    assert.strictEqual(r.plan, "# Plan");
+    assert.deepStrictEqual(r.milestones, [
+      { id: "m1", title: "Wire the protocol" },
+      { id: "m2", title: "Plumb the executor" },
+    ]);
+  });
+
+  it("does NOT latch milestones from a subagent frame", () => {
+    const r = scanSignals(
+      subagentToolUse(PLAN, {
+        plan_md: "# injected",
+        milestones: [{ id: "m1", title: "escape" }],
+      }),
+    );
+    // The whole frame is dropped by the isSubagentFrame guard, so nothing latches.
+    assert.strictEqual(r.milestones, undefined);
+  });
+
+  it("drops malformed milestones without throwing", () => {
+    // Non-array ⇒ no milestones key (plan still captured).
+    const nonArray = scanSignals(toolUse(PLAN, { plan_md: "p", milestones: "nope" })) as Record<string, unknown>;
+    assert.ok(!("milestones" in nonArray), "non-array milestones must not be captured");
+
+    // Array of junk / entries missing id or title ⇒ all dropped, no key set.
+    const junk = scanSignals(
+      toolUse(PLAN, {
+        plan_md: "p",
+        milestones: [
+          42,
+          "str",
+          null,
+          {},
+          { id: "m1" }, // no title
+          { title: "no id" }, // no id
+          { id: "  ", title: "blank id" }, // trimmed-empty id
+          { id: "m2", title: "   " }, // trimmed-empty title
+        ],
+      }),
+    ) as Record<string, unknown>;
+    assert.ok(!("milestones" in junk), "all-junk milestones must not be captured");
+
+    // A mixed list keeps only the well-formed entries.
+    const mixed = scanSignals(
+      toolUse(PLAN, {
+        plan_md: "p",
+        milestones: [{ id: "m1", title: "good" }, { id: "m2" }, 7],
+      }),
+    );
+    assert.deepStrictEqual(mixed.milestones, [{ id: "m1", title: "good" }]);
+  });
+
+  it("clamps over-long id and title (worker-side hygiene, not the real cap)", () => {
+    const longId = "x".repeat(200);
+    const longTitle = "y".repeat(500);
+    const r = scanSignals(toolUse(PLAN, { plan_md: "p", milestones: [{ id: longId, title: longTitle }] }));
+    assert.strictEqual([...(r.milestones![0]!.id)].length, 64);
+    assert.strictEqual([...(r.milestones![0]!.title)].length, 200);
+  });
+});
+
+describe("buildSignalMcpServer milestones schema gate (PRD #122 M1)", () => {
+  // Mirrors the prd_done_path schema-gate test: gating the schema keeps the model
+  // from ever seeing `milestones` on a non-issue run (Decision 13).
+  const planToolShape = (server: unknown): Record<string, unknown> => {
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, { inputSchema?: unknown }> } | undefined)?._registeredTools;
+    assert.ok(tools, "expected the sdk server to expose its registered tools");
+    const plan = tools!["submit_plan"];
+    assert.ok(plan, `expected a submit_plan tool; got ${Object.keys(tools!).join(", ")}`);
+    const shape = (plan.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+    assert.ok(shape, "expected a zod object schema with a shape");
+    return shape!;
+  };
+
+  it("omits milestones by default (and so on ci_fix / self_improve)", () => {
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({}), buildSignalMcpServer({ milestones: false })]) {
+      const shape = planToolShape(server);
+      assert.ok(!("milestones" in shape), `milestones must be absent; got ${Object.keys(shape).join(", ")}`);
+      assert.ok("plan_md" in shape, "the pre-existing plan_md param is unchanged");
+    }
+  });
+
+  it("exposes milestones when enabled", () => {
+    const shape = planToolShape(buildSignalMcpServer({ milestones: true }));
+    assert.ok("milestones" in shape, `expected milestones; got ${Object.keys(shape).join(", ")}`);
+    assert.ok("plan_md" in shape);
+  });
+});
+
 describe("isSignalToolName", () => {
   it("matches the qualified signal tools only", () => {
     assert.strictEqual(isSignalToolName("mcp__uzi__submit_plan"), true);

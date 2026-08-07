@@ -382,6 +382,17 @@ export interface ClaimConfig {
 }
 
 /**
+ * A single milestone in a plan's breakdown (PRD #122 M1). `id` is a short stable
+ * handle (e.g. "m1") the lead assigns; `title` is a terse human label. The pair is
+ * the whole wire shape — additive, optional, and validated server-side (Decision
+ * 12); a worker-side cap is hygiene only, never the authoritative control.
+ */
+export interface Milestone {
+  id: string;
+  title: string;
+}
+
+/**
  * Response body of a successful (200) claim.
  *
  * The server also sends top-level run fields the worker does not consume
@@ -460,6 +471,11 @@ export interface ClaimResponse {
    *  text instead of re-planning, so the field is now load-bearing.
    *  Null on a fresh run and on any run that never reached the gate. */
   plan_md?: string | null;
+  /** The FROZEN milestone list for this run (PRD #122 M1, Decision 11), carried so a
+   *  future resume's planning prompt can name what is already committed. Null/absent
+   *  when the approved plan had no milestones. Additive + optional; nothing consumes
+   *  it in M1 — the field is declared now so the wire contract is complete. */
+  milestones?: Milestone[] | null;
   /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
    *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is
    *  autopilot". On a resume with a resumable session this lets the worker skip the
@@ -938,6 +954,15 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  /** The plan's milestone breakdown (PRD #122 M1, Decision 2). Additive + optional
+   *  and OMITTED ENTIRELY when absent — never `null` or `[]` — so an old worker's
+   *  payload and a new worker's "no milestones" payload stay the same shape on the
+   *  wire. Sent on exactly two reports: the CANDIDATE list on the `awaiting_approval`
+   *  report (what the human approves at the gate), and the FROZEN list on the
+   *  autopilot `running` report (an autopilot run never reports awaiting_approval).
+   *  Never sent on any other report in M1. Reporting is fire-and-forget: the server
+   *  validates the list (Decision 12) and an informational field never fails a run. */
+  milestones?: Milestone[];
   /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
    *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
    *  `number` in the typings with no unit declared, so the WORKER normalizes it
