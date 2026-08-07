@@ -503,6 +503,12 @@ export function ActivityFeed({
   const actorKeys = byAgent ? lanes.map((l) => l.key) : crew.order;
   const countFor = (key: string): number =>
     byAgent ? (laneAgg.get(key)?.count ?? 0) : (crew.count.get(key) ?? 0);
+  // Freezing at mount stays correct across run→run navigation only because useRunStream
+  // (useRunStream.ts) calls setRun(null) on an id change, which trips RunView.tsx's
+  // `if (!run)` gate and remounts this component, so `terminal` is re-captured per run.
+  // A future "keep the previous run visible while the next loads" (anti-flash) change would
+  // drop that remount and let arrivedTerminal leak a stale `false` across navigation — pin
+  // this with a cross-run test before making it.
   const arrivedTerminal = useRef(terminal).current;
   const autoExpand = arrivedTerminal || actorKeys.length <= 1;
   const isExpanded = (key: string): boolean => {
