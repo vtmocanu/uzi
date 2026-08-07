@@ -444,7 +444,7 @@ export function Judge() {
           groups actually on screen, so it can never be mistaken for the canonical triage
           counts the tabs and badge show. */}
       {!loading && backlog && !showZeroState && (
-        <p className="text-sm text-faint">
+        <p role="status" aria-live="polite" className="text-sm text-faint">
           {categories.length > 0 ? (
             <>
               Showing <b className="font-semibold text-muted tabular-nums">{backlog.groups.length}</b>{" "}

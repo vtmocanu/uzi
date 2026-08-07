@@ -40,7 +40,25 @@ type backlogStore struct {
 func (s *backlogStore) ListJudgeRecommendationRowsForUser(_ context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
 	s.calls = append(s.calls, "ListJudgeRecommendationRowsForUser")
 	s.backlogArg = &arg
-	return s.rows, nil
+	// Mirror the query's `rr.category = ANY(@categories)` push-down: a nil/empty slice is
+	// the "all labels" no-op, otherwise only rows whose category is in the set survive. This
+	// is what lets a ?category= request actually NARROW the backlog under the fake, so the
+	// triage-invariance test's group assertion is a real check and not vacuous. The triage
+	// method below deliberately does NOT filter — categories must never reach that path.
+	if len(arg.Categories) == 0 {
+		return s.rows, nil
+	}
+	keep := make(map[string]bool, len(arg.Categories))
+	for _, c := range arg.Categories {
+		keep[c] = true
+	}
+	out := make([]store.ListJudgeRecommendationRowsForUserRow, 0, len(s.rows))
+	for _, r := range s.rows {
+		if keep[r.Category] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // ListJudgeTriageRowsForUser projects the wide rows onto the narrow three-column shape —
@@ -376,6 +394,7 @@ func TestJudgeRecommendationsPushesCategoriesToTheQuery(t *testing.T) {
 		{"absent category is a nil slice, not empty", "", nil},
 		{"present-but-empty category is a nil slice", "category=", nil},
 		{"leading empty token is dropped, not a value", "category=,improve_uzi", []string{"improve_uzi"}},
+		{"repeated value is deduped to one", "category=improve_uzi,improve_uzi", []string{"improve_uzi"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &backlogStore{rows: rows}
@@ -398,6 +417,46 @@ func TestJudgeRecommendationsPushesCategoriesToTheQuery(t *testing.T) {
 				t.Fatalf("no ?category= must send a NIL slice (→ SQL NULL → all labels), got %#v", got)
 			}
 		})
+	}
+}
+
+// TestJudgeRecommendationsCategoryDoesNotAffectTriage pins the PRD success criterion that
+// the bucket-tab counts and nav badge are byte-identical with and without a category filter:
+// triage is the canonical GET /me/judge/stats aggregate and the category filter must never
+// reach it. Two requests over the SAME fixture — one unfiltered, one filtered to a label
+// present in the fixture — must return an IDENTICAL got.Triage (the fake's triage method
+// ignores the category param, so any leak of categories into the triage/stats path would
+// have to come from the handler, and this catches it). The filtered request's Groups are
+// asserted strictly narrower so the test isn't vacuous: triage holds steady precisely
+// because the page narrowed underneath it.
+func TestJudgeRecommendationsCategoryDoesNotAffectTriage(t *testing.T) {
+	rows, _ := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+
+	unfiltered := &backlogStore{rows: rows}
+	recAll := httptest.NewRecorder()
+	newRunsHandler(t, unfiltered).JudgeRecommendations(recAll, backlogReq(caller, "bucket=all"))
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("unfiltered GET = %d, want 200; body=%s", recAll.Code, recAll.Body.String())
+	}
+	all := decodeBacklog(t, recAll)
+
+	filtered := &backlogStore{rows: rows}
+	recCat := httptest.NewRecorder()
+	// improve_uzi is one label present in backlogFixtureRows.
+	newRunsHandler(t, filtered).JudgeRecommendations(recCat, backlogReq(caller, "bucket=all&category=improve_uzi"))
+	if recCat.Code != http.StatusOK {
+		t.Fatalf("filtered GET = %d, want 200; body=%s", recCat.Code, recCat.Body.String())
+	}
+	cat := decodeBacklog(t, recCat)
+
+	if cat.Triage != all.Triage {
+		t.Fatalf("triage differs across a category filter: filtered=%+v unfiltered=%+v — the category filter must never reach the triage/stats path", cat.Triage, all.Triage)
+	}
+	// Non-vacuity: the category request really did narrow the page (the fixture spans three
+	// labels; improve_uzi is one), yet triage above stayed byte-identical.
+	if len(cat.Groups) >= len(all.Groups) {
+		t.Fatalf("category filter did not narrow the backlog: filtered %d groups, unfiltered %d — the test would be vacuous", len(cat.Groups), len(all.Groups))
 	}
 }
 

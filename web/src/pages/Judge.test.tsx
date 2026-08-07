@@ -257,7 +257,10 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
 
     fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
-    const toast = await screen.findByRole("status");
+    // The result line is also a role="status" live region now (issue #235 a11y polish), so
+    // findByRole("status") is ambiguous; the toast is the status region carrying the Dismiss
+    // (X) button, whose accessible name comes from aria-label — the result line has none.
+    const toast = (await screen.findByLabelText("Dismiss")).closest("[role='status']") as HTMLElement;
     fireEvent.click(within(toast).getByText("Undo"));
 
     await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(2));
@@ -288,7 +291,10 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
 
-    const toast = await screen.findByRole("status");
+    // The result line is also a role="status" live region now (issue #235 a11y polish), so
+    // findByRole("status") is ambiguous; the toast is the status region carrying the Dismiss
+    // (X) button, whose accessible name comes from aria-label — the result line has none.
+    const toast = (await screen.findByLabelText("Dismiss")).closest("[role='status']") as HTMLElement;
     expect(within(toast).queryByText("Undo")).toBeNull();
   });
 
@@ -332,7 +338,10 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     renderJudge();
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
-    const toast = await screen.findByRole("status");
+    // The result line is also a role="status" live region now (issue #235 a11y polish), so
+    // findByRole("status") is ambiguous; the toast is the status region carrying the Dismiss
+    // (X) button, whose accessible name comes from aria-label — the result line has none.
+    const toast = (await screen.findByLabelText("Dismiss")).closest("[role='status']") as HTMLElement;
     fireEvent.click(within(toast).getByText("Undo"));
 
     // Exactly UNDO_CONCURRENCY calls start, and no more, while all of them are outstanding.
@@ -391,7 +400,10 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     renderJudge();
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
-    const toast = await screen.findByRole("status");
+    // The result line is also a role="status" live region now (issue #235 a11y polish), so
+    // findByRole("status") is ambiguous; the toast is the status region carrying the Dismiss
+    // (X) button, whose accessible name comes from aria-label — the result line has none.
+    const toast = (await screen.findByLabelText("Dismiss")).closest("[role='status']") as HTMLElement;
     fireEvent.click(within(toast).getByText("Undo"));
 
     // Every member is attempted despite the failure in the middle — not abandoned.
@@ -741,6 +753,19 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
     expect(await screen.findByText(/No groups match these labels in this bucket/i)).toBeTruthy();
     // Not the inbox-zero view, which a filtered empty result must never claim.
     expect(screen.queryByText(/Inbox zero/i)).toBeNull();
+  });
+
+  // A11y polish (issue #235 follow-up): the "Showing N groups…" result line is a live
+  // region so a screen reader announces the new count when a chip toggles the filter —
+  // otherwise the count updates silently. role="status" implies aria-live="polite".
+  it("announces the filtered result count via an aria-live status region", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    renderJudge();
+
+    const line = await screen.findByText(/Showing/);
+    const region = line.closest("[role='status']");
+    expect(region).not.toBeNull();
+    expect(region!.getAttribute("aria-live")).toBe("polite");
   });
 
   it("Clear removes ?category= entirely and re-fetches unfiltered", async () => {

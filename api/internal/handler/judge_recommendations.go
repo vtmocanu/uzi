@@ -72,6 +72,12 @@ func (h *Handler) JudgeRecommendations(w http.ResponseWriter, r *http.Request) {
 	// the same NULL-sentinel distinction the service's Categories param comment spells out.
 	var categories []string
 	if raw := r.URL.Query().Get("category"); raw != "" {
+		// DEDUP as we parse. The category set is a CLOSED 6-value enum, so a valid slice
+		// carries at most one of each value — deduping here bounds it to ≤6 elements no
+		// matter how many comma tokens the client sends (?category=improve_uzi,improve_uzi,…
+		// is otherwise capped only by max header size and would build a large text[] that
+		// costs a needless linear array scan in Postgres). Order of first appearance is kept.
+		seen := make(map[string]bool)
 		for _, tok := range strings.Split(raw, ",") {
 			tok = strings.TrimSpace(tok)
 			if tok == "" {
@@ -81,6 +87,10 @@ func (h *Handler) JudgeRecommendations(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusBadRequest, "invalid category")
 				return
 			}
+			if seen[tok] {
+				continue
+			}
+			seen[tok] = true
 			categories = append(categories, tok)
 		}
 	}
