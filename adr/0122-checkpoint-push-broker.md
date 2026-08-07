@@ -86,6 +86,18 @@ therefore strictly stronger.
   would fatten the secrets-holder's base image and CVE surface for no capability the
   pure-Go path lacks. (The git-binary cost is image posture, not a new PAT-leak
   vector — the api has no untrusted co-resident, unlike the worker.)
+- **`ci.skip` is GitLab-only; the zero-extra-pipelines guarantee is not
+  forge-portable (added 2026-08-07, PRD #238 R8).** "go-git carries the push-option"
+  is confirmed; "the push-option skips the pipeline" is a **GitLab** fact. Verified
+  against docs.github.com: **GitHub Actions has no push-option to skip a run** —
+  skipping is a commit-message marker only (`[skip ci]`, `[skip actions]`, …, on
+  push/PR events). So when the GitHub driver (PRD #238) lands, a brokered checkpoint
+  push to a GitHub repo fires a fresh Actions run each time and feeds #238's CI-fix
+  watcher a spurious in-flight/red build. The broker's GitHub path must suppress CI a
+  different way (annotate the checkpoint tip commit with a `[skip ci]` marker before
+  the push, or skip publishing checkpoints to a GitHub branch with a `push`-triggered
+  workflow). This is per-forge knowledge and belongs at the driver/broker layer;
+  whichever of PRD #122-M8 / #238 lands second owns it.
 - **`main` is still never touched**, the bot's Developer role is unchanged (it can
   already push non-protected branches, which is how the worker pushes today), and the
   end-of-run push + MR path is unchanged. This is not a privilege change.

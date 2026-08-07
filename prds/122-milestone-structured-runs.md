@@ -340,7 +340,11 @@ interface is pure REST), so the broker uses a pure-Go smart-HTTP push client
 adding a git binary was considered and rejected because it would fatten the
 secrets-holder's image and CVE surface for no capability the pure-Go path lacks. The
 one residual is forge-specific smart-HTTP behaviour, validated by a real push
-against `gitlab.example.com` when M8 is built.
+against `gitlab.example.com` when M8 is built. **The concrete instance of that
+residual is now known: the `ci.skip` pipeline-suppression is GitLab-only and inert
+on GitHub (PRD #238 R8) — so a real push against `gitlab.example.com` validates
+GitLab and says nothing about the GitHub path, which needs a commit-message-marker
+skip. See the 🔴 note in M8 below.**
 
 This reuses uzi's "api is the sole holder of secrets" boundary rather than adding a
 new one, and reframes PRD #110's "a server-side push duplicates push authority into
@@ -495,6 +499,24 @@ go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
       the existing `FORGE_ALLOWED_BASE_URLS` SSRF allowlist. Publish fires **only at
       the reaped model-cooperative checkpoint** (Decision 10b as amended), never at
       the fallback.
+
+      **🔴 `ci.skip` IS THE "forge-specific smart-HTTP behaviour" residual, and it
+      is GitLab-ONLY — it does nothing on GitHub (PRD #238 R8, verified against
+      docs.github.com 2026-08-07).** The `ci.skip` push-option is a GitLab feature;
+      **GitHub Actions has no push-option to skip a run** — skipping is a
+      commit-message marker only (`[skip ci]`, `[skip actions]`, …, on push/PR
+      events). So the moment PRD #238 lands a GitHub driver, the "N checkpoints fire
+      **zero** extra pipelines" guarantee below is **false on GitHub**: every
+      brokered checkpoint push would trigger a fresh Actions run, and those in-flight
+      checkpoint pipelines would also feed PRD #238's Actions-watching CI-fix loop a
+      spurious mid-implementation "red build". The push-options half being "confirmed
+      in source" is confirmed for **go-git carrying the option**, not for the option
+      meaning anything on GitHub. Whichever of #122-M8 / #238 lands second owns this
+      seam; the GitHub-side fix is per-forge and belongs at the driver/broker layer
+      (annotate the checkpoint tip commit with a `[skip ci]` marker before the
+      brokered push, or do not publish checkpoints to a GitHub branch carrying a
+      `push`-triggered workflow). Do not treat the zero-extra-pipelines criterion as
+      forge-portable.
 
       **Blocked on, in order:** (a) the `requeue_count` measurement in Risks — now
       calibrating URGENCY, not go/no-go (the maintainer wants the feature): it sizes
