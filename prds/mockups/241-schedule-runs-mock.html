@@ -1,0 +1,467 @@
+<title>uzi — Scheduled runs (mock, PRD #241)</title>
+<style>
+  /* Single-theme by design: reproduces uzi's ember dark chrome (the real app is
+     color-scheme: dark, dark-only). Colours painted from the app's own tokens
+     (web/src/index.css); badges/chips/inputs mirror ui.tsx. Nothing here is a
+     component yet — this is the design target for PRD #241. */
+  :root {
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38;
+    --edge: 39 45 60; --edge-strong: 58 66 86;
+    --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+    --brand: 251 146 60; --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133;
+    --violet: 167 139 250;
+    --radius: 0.75rem;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; font-size: 15px; line-height: 1.5;
+    font-family: var(--sans); -webkit-font-smoothing: antialiased;
+    color: rgb(var(--fg));
+    background: radial-gradient(1200px 640px at 8% -12%, rgb(var(--brand) / 0.06), transparent 58%), rgb(var(--bg));
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 120px; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: rgb(var(--brand)); margin: 0 0 12px; }
+  h1 { margin: 0; font-size: 28px; font-weight: 650; letter-spacing: -0.02em; text-wrap: balance; }
+  .lede { margin: 14px 0 0; max-width: 70ch; color: rgb(var(--muted)); font-size: 15px; }
+  .lede code, .sub code { font-family: var(--mono); font-size: 0.86em; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 5px; }
+  section { margin-top: 54px; }
+  h2 { margin: 0 0 4px; font-size: 15px; font-family: var(--mono); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .sub { margin: 0 0 16px; font-size: 13.5px; color: rgb(var(--muted)); max-width: 78ch; }
+
+  .frame { position: relative; border: 1px dashed rgb(var(--edge-strong)); border-radius: 14px; padding: 28px 22px 24px; background: rgb(var(--bg) / 0.4); }
+  .frame::before { content: attr(data-w); position: absolute; top: -9px; left: 20px; font-family: var(--mono); font-size: 10.5px; color: rgb(var(--faint)); background: rgb(var(--bg)); padding: 0 8px; }
+
+  .card { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: var(--radius); overflow: hidden; }
+
+  /* page header row inside the mock */
+  .phead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
+  .phead h3 { margin: 0; font-size: 19px; font-weight: 620; letter-spacing: -0.01em; }
+  .phead p { margin: 3px 0 0; font-size: 13px; color: rgb(var(--muted)); }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 7px; border-radius: 8px; border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--raised)); color: rgb(var(--fg)); font-size: 13.5px; font-weight: 500; padding: 8px 13px; cursor: pointer; white-space: nowrap; }
+  .btn.primary { background: rgb(var(--brand)); border-color: rgb(var(--brand)); color: #201203; font-weight: 600; }
+  .btn.ghost { background: transparent; border-color: transparent; color: rgb(var(--muted)); padding: 6px 8px; }
+  .btn.sm { font-size: 12px; padding: 5px 9px; }
+  .btn .ic { font-size: 15px; line-height: 1; }
+
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+  thead th { font-weight: 500; color: rgb(var(--muted)); padding: 11px 16px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; font-size: 12.5px; }
+  tbody td { padding: 13px 16px; vertical-align: middle; }
+  tbody tr + tr td { border-top: 1px solid rgb(var(--edge)); }
+  tbody tr.off td { opacity: 0.55; }
+
+  .tgt { font-weight: 500; color: rgb(var(--fg)); }
+  .tgt .repo { font-size: 12px; color: rgb(var(--faint)); margin-top: 1px; font-family: var(--mono); }
+  .when { font-family: var(--mono); font-size: 12.5px; color: rgb(var(--fg)); }
+  .when .human { font-family: var(--sans); font-size: 12px; color: rgb(var(--muted)); margin-top: 2px; }
+  .stamp { font-size: 12.5px; color: rgb(var(--muted)); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .stamp .rel { font-size: 11px; color: rgb(var(--faint)); }
+  .dash { color: rgb(var(--faint)); }
+
+  .badge { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px; border: 1px solid; padding: 2px 8px; font-size: 11px; font-weight: 500; white-space: nowrap; }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: none; }
+  .badge.ok { color: rgb(var(--ok)); background: rgb(var(--ok) / 0.1); border-color: rgb(var(--ok) / 0.4); }
+  .badge.neutral { color: rgb(var(--muted)); background: rgb(var(--raised)); border-color: rgb(var(--edge)); }
+  .badge.brand { color: rgb(var(--brand)); background: rgb(var(--brand) / 0.1); border-color: rgb(var(--brand) / 0.4); }
+  .badge.violet { color: rgb(var(--violet)); background: rgb(var(--violet) / 0.1); border-color: rgb(var(--violet) / 0.4); }
+
+  .chip { display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); font-size: 11px; padding: 1px 7px; }
+
+  /* toggle */
+  .sw { position: relative; width: 34px; height: 19px; border-radius: 999px; background: rgb(var(--edge-strong)); flex: none; display: inline-block; }
+  .sw.on { background: rgb(var(--brand)); }
+  .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 999px; background: #fff; transition: none; }
+  .sw.on::after { left: 17px; }
+
+  .rowacts { display: flex; align-items: center; gap: 4px; justify-content: flex-end; }
+
+  /* nav badge preview */
+  .navrow { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 10px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); width: fit-content; }
+  .navrow .ic { color: rgb(var(--brand)); font-size: 15px; }
+  .navrow .lbl { font-size: 13.5px; }
+  .navpill { margin-left: auto; background: rgb(var(--brand) / 0.16); color: rgb(var(--brand)); border-radius: 999px; font-size: 11px; font-weight: 600; padding: 1px 8px; font-variant-numeric: tabular-nums; }
+
+  /* modal / drawer */
+  .modal { max-width: 560px; border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--surface)); border-radius: 14px; box-shadow: 0 24px 60px rgb(0 0 0 / 0.5); overflow: hidden; }
+  .modal .mh { padding: 18px 20px 14px; border-bottom: 1px solid rgb(var(--edge)); display: flex; align-items: flex-start; justify-content: space-between; }
+  .modal .mh h3 { margin: 0; font-size: 17px; font-weight: 620; }
+  .modal .mh p { margin: 3px 0 0; font-size: 12.5px; color: rgb(var(--muted)); }
+  .modal .mb { padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
+  .modal .mf { padding: 14px 20px; border-top: 1px solid rgb(var(--edge)); display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgb(var(--bg) / 0.35); }
+
+  .field { display: flex; flex-direction: column; gap: 7px; }
+  .flabel { font-size: 12px; font-weight: 600; color: rgb(var(--muted)); letter-spacing: 0.01em; }
+  .fhint { font-size: 11.5px; color: rgb(var(--faint)); }
+  .input, .select { width: 100%; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge-strong)); border-radius: 8px; color: rgb(var(--fg)); font-size: 13.5px; padding: 9px 11px; font-family: var(--sans); }
+  .input.mono { font-family: var(--mono); font-size: 13px; }
+  .select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, rgb(var(--muted)) 50%), linear-gradient(135deg, rgb(var(--muted)) 50%, transparent 50%); background-position: calc(100% - 16px) 17px, calc(100% - 11px) 17px; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+
+  /* segmented radio group */
+  .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; }
+  .segopt { border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--raised)); border-radius: 9px; padding: 11px 12px; cursor: pointer; }
+  .segopt.on { border-color: rgb(var(--brand)); background: rgb(var(--brand) / 0.08); }
+  .segopt .t { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+  .segopt .t .rdot { width: 13px; height: 13px; border-radius: 999px; border: 2px solid rgb(var(--edge-strong)); flex: none; }
+  .segopt.on .t .rdot { border-color: rgb(var(--brand)); background: radial-gradient(circle at center, rgb(var(--brand)) 0 3px, transparent 4px); }
+  .segopt .d { font-size: 11.5px; color: rgb(var(--faint)); margin-top: 5px; margin-left: 20px; }
+
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .optline { display: flex; align-items: center; gap: 10px; }
+  .optline .txt { font-size: 13px; }
+  .optline .txt small { display: block; color: rgb(var(--faint)); font-size: 11.5px; }
+
+  /* preview box */
+  .preview { border: 1px solid rgb(var(--edge)); border-radius: 9px; background: rgb(var(--bg) / 0.5); padding: 11px 13px; }
+  .preview .pt { font-size: 11px; font-weight: 600; color: rgb(var(--muted)); text-transform: uppercase; letter-spacing: 0.08em; font-family: var(--mono); margin-bottom: 7px; }
+  .preview ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+  .preview li { font-family: var(--mono); font-size: 12.5px; color: rgb(var(--fg)); font-variant-numeric: tabular-nums; display: flex; gap: 9px; }
+  .preview li .rel { color: rgb(var(--faint)); }
+
+  .adv { border-top: 1px dashed rgb(var(--edge)); padding-top: 14px; }
+  .adv summary { cursor: pointer; font-size: 12.5px; color: rgb(var(--brand)); font-weight: 500; list-style: none; }
+  .adv summary::-webkit-details-marker { display: none; }
+  .adv[open] summary { margin-bottom: 12px; }
+
+  /* CLI block */
+  .term { background: #0a0c12; border: 1px solid rgb(var(--edge)); border-radius: 12px; padding: 18px 20px; font-family: var(--mono); font-size: 12.5px; line-height: 1.65; overflow-x: auto; }
+  .term .p { color: rgb(var(--brand)); }
+  .term .c { color: rgb(var(--fg)); }
+  .term .o { color: rgb(var(--muted)); }
+  .term .cm { color: rgb(var(--faint)); }
+  .term .g { color: rgb(var(--ok)); }
+  .term .v { color: rgb(var(--violet)); }
+
+  .note { display: flex; gap: 10px; align-items: flex-start; border: 1px solid rgb(var(--brand) / 0.3); background: rgb(var(--brand) / 0.06); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; color: rgb(var(--muted)); margin-top: 14px; }
+  .note b { color: rgb(var(--fg)); font-weight: 600; }
+  .note .ic { color: rgb(var(--brand)); flex: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 14px; font-size: 12px; color: rgb(var(--muted)); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Work › Schedules — PRD #241</p>
+  <h1 style="max-width: 26ch;">Schedule runs: one-time or recurring, from web and CLI</h1>
+  <p class="lede">
+    Today a run can only start <em>now</em> — the board "Start run" button, <code>uzi run create</code>, or
+    autopilot when a label appears. This adds a <b style="color:rgb(var(--fg))">time-driven</b> path so the dark
+    factory can work off-hours: fire a run once at a future moment, or on a recurring cadence, against a
+    <b style="color:rgb(var(--fg))">pinned issue</b> or a recurring <b style="color:rgb(var(--fg))">sweep</b> of every
+    eligible PRD issue. All chrome below is painted from the app's real tokens; the shapes reuse existing
+    components (table, badges, toggle, modal).
+  </p>
+
+  <!-- ============================================================= -->
+  <section>
+    <h2>1 · The Schedules page</h2>
+    <p class="sub">A new <code>/schedules</code> destination in the sidebar's <b>Work</b> group (beside Runs and Chat).
+      Owner-scoped list: what each schedule targets, when it next fires, when it last fired, and a per-row
+      enable toggle. Recurring rows persist; one-time rows disappear the moment they fire.</p>
+    <div class="frame" data-w="≈ 980px content column">
+      <div class="phead">
+        <div>
+          <h3>Schedules</h3>
+          <p>4 schedules · 3 active · next fire in 6h 12m</p>
+        </div>
+        <button class="btn primary"><span class="ic">+</span> New schedule</button>
+      </div>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:30%;">Target</th>
+              <th style="width:24%;">When</th>
+              <th>Next run</th>
+              <th>Last run</th>
+              <th>Options</th>
+              <th style="text-align:right;">On</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- recurring sweep -->
+            <tr>
+              <td>
+                <div class="tgt">Sweep eligible PRD issues <span class="badge violet"><span class="dot"></span>sweep</span></div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">0 2 * * 1-5</div>
+                <div class="human">Weekdays at 02:00 · Europe/Bucharest</div>
+              </td>
+              <td class="stamp">Mon 02:00<div class="rel">in 6h 12m</div></td>
+              <td class="stamp">Fri 02:00<div class="rel">4 runs started</div></td>
+              <td><span class="chip">wait-on-limit</span> <span class="chip">auto-approve</span></td>
+              <td>
+                <div class="rowacts">
+                  <button class="btn ghost sm" title="Run now">▶</button>
+                  <button class="btn ghost sm" title="Edit">✎</button>
+                  <span class="sw on" title="Enabled"></span>
+                </div>
+              </td>
+            </tr>
+            <!-- recurring pinned issue -->
+            <tr>
+              <td>
+                <div class="tgt">#142 · Nightly dependency bump</div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">0 3 * * *</div>
+                <div class="human">Every day at 03:00 · Europe/Bucharest</div>
+              </td>
+              <td class="stamp">Tomorrow 03:00<div class="rel">in 7h 12m</div></td>
+              <td class="stamp">Today 03:00<div class="rel">completed</div></td>
+              <td><span class="chip">wait-on-limit</span></td>
+              <td>
+                <div class="rowacts">
+                  <button class="btn ghost sm" title="Run now">▶</button>
+                  <button class="btn ghost sm" title="Edit">✎</button>
+                  <span class="sw on" title="Enabled"></span>
+                </div>
+              </td>
+            </tr>
+            <!-- one-time -->
+            <tr>
+              <td>
+                <div class="tgt">#158 · Forge read tools <span class="badge brand"><span class="dot"></span>once</span></div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">Aug 8, 09:00</div>
+                <div class="human">One time · Europe/Bucharest</div>
+              </td>
+              <td class="stamp">Tomorrow 09:00<div class="rel">in 13h 12m</div></td>
+              <td class="dash">—</td>
+              <td><span class="dash">defaults</span></td>
+              <td>
+                <div class="rowacts">
+                  <button class="btn ghost sm" title="Run now">▶</button>
+                  <button class="btn ghost sm" title="Edit">✎</button>
+                  <span class="sw on" title="Enabled"></span>
+                </div>
+              </td>
+            </tr>
+            <!-- paused -->
+            <tr class="off">
+              <td>
+                <div class="tgt">Sweep eligible PRD issues <span class="badge violet"><span class="dot"></span>sweep</span></div>
+                <div class="repo">vtmocanu/board-svc</div>
+              </td>
+              <td>
+                <div class="when">0 */6 * * *</div>
+                <div class="human">Every 6 hours · UTC</div>
+              </td>
+              <td class="stamp"><span class="badge neutral">paused</span></td>
+              <td class="stamp">Aug 5, 18:00<div class="rel">2 runs started</div></td>
+              <td><span class="chip">auto-approve</span></td>
+              <td>
+                <div class="rowacts">
+                  <button class="btn ghost sm" title="Run now">▶</button>
+                  <button class="btn ghost sm" title="Edit">✎</button>
+                  <span class="sw" title="Disabled"></span>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="legend">
+        <span><span class="badge brand"><span class="dot"></span>once</span> fires a single time, then auto-removes</span>
+        <span><span class="badge violet"><span class="dot"></span>sweep</span> fires against every currently-eligible PRD issue</span>
+        <span><span class="sw on" style="width:28px;height:16px"></span> per-row pause / resume (no delete needed)</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= -->
+  <section>
+    <h2>2 · New / edit schedule</h2>
+    <p class="sub">One modal for both timing modes and both targets. The two segmented pickers (Target, Timing) swap
+      the fields below them; a live <b>Next fires</b> preview computes the upcoming times from the chosen cadence, so
+      you never commit a cron string you can't read. Presets cover the common cases; <b>Advanced</b> reveals a raw
+      cron field + timezone for power users.</p>
+    <div class="frame" data-w="modal — recurring + sweep">
+      <div class="modal">
+        <div class="mh">
+          <div>
+            <h3>New schedule</h3>
+            <p>vtmocanu/uzi · fires as you, on your Anthropic token</p>
+          </div>
+          <button class="btn ghost sm">✕</button>
+        </div>
+        <div class="mb">
+
+          <!-- Target -->
+          <div class="field">
+            <span class="flabel">Target</span>
+            <div class="seg">
+              <label class="segopt">
+                <div class="t"><span class="rdot"></span> A specific issue</div>
+                <div class="d">Pin one PRD issue by IID</div>
+              </label>
+              <label class="segopt on">
+                <div class="t"><span class="rdot"></span> Sweep eligible issues</div>
+                <div class="d">Every eligible PRD issue at fire time</div>
+              </label>
+            </div>
+            <span class="fhint">Sweep skips issues that already have an active run (same dedup autopilot uses).</span>
+          </div>
+
+          <!-- Timing -->
+          <div class="field">
+            <span class="flabel">Timing</span>
+            <div class="seg">
+              <label class="segopt"><div class="t"><span class="rdot"></span> Once</div><div class="d">A single future moment</div></label>
+              <label class="segopt on"><div class="t"><span class="rdot"></span> Recurring</div><div class="d">On a repeating cadence</div></label>
+            </div>
+          </div>
+
+          <!-- Recurring: preset -->
+          <div class="field">
+            <span class="flabel">Cadence</span>
+            <div class="row2">
+              <select class="select">
+                <option>Weekdays</option>
+                <option>Every day</option>
+                <option>Every week</option>
+                <option>Every 6 hours</option>
+                <option>Custom (cron)…</option>
+              </select>
+              <input class="input" type="text" value="02:00" placeholder="time" />
+            </div>
+          </div>
+
+          <!-- Advanced -->
+          <details class="adv" open>
+            <summary>Advanced — raw cron &amp; timezone</summary>
+            <div class="field">
+              <span class="flabel">Cron expression</span>
+              <input class="input mono" type="text" value="0 2 * * 1-5" />
+              <span class="fhint">Standard 5-field cron. The preset above stays in sync; edit here to go beyond it.</span>
+            </div>
+            <div class="field" style="margin-top:12px;">
+              <span class="flabel">Timezone</span>
+              <select class="select"><option>Europe/Bucharest</option><option>UTC</option></select>
+            </div>
+          </details>
+
+          <!-- Options -->
+          <div class="field">
+            <span class="flabel">Run options</span>
+            <div class="optline">
+              <span class="sw on"></span>
+              <span class="txt">Wait on usage limit
+                <small>Park the run until the Anthropic window reopens instead of failing it</small></span>
+            </div>
+            <div class="optline" style="margin-top:10px;">
+              <span class="sw on"></span>
+              <span class="txt">Auto-approve the plan
+                <small>Skip the approval gate so unattended runs proceed (like autopilot). Off = the run waits at the gate.</small></span>
+            </div>
+          </div>
+
+          <!-- Preview -->
+          <div class="preview">
+            <div class="pt">Next fires</div>
+            <ul>
+              <li>Mon 11 Aug&nbsp;·&nbsp;02:00 <span class="rel">in 6h 12m</span></li>
+              <li>Tue 12 Aug&nbsp;·&nbsp;02:00 <span class="rel">in 1d 6h</span></li>
+              <li>Wed 13 Aug&nbsp;·&nbsp;02:00 <span class="rel">in 2d 6h</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="mf">
+          <span class="fhint">Recurring · sweep · auto-approve</span>
+          <div style="display:flex; gap:8px;">
+            <button class="btn">Cancel</button>
+            <button class="btn primary">Create schedule</button>
+          </div>
+        </div>
+      </div>
+      <div class="note">
+        <span class="ic">◆</span>
+        <div><b>Auto-approve is the one guardrail-adjacent choice.</b> An unattended overnight run that stops at the
+          plan gate defeats the point; auto-approving one that nobody is watching is a trust decision. It reuses
+          autopilot's existing <code>auto_approve</code> semantics and is opt-in per schedule — see Decision 4 in the PRD.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= -->
+  <section>
+    <h2>3 · Entry point from the issue view</h2>
+    <p class="sub">Alongside today's immediate <b>Start run</b>, a <b>Schedule…</b> action opens the same modal
+      pre-pinned to this issue (Target = "This issue", locked). No new concept to learn from the board.</p>
+    <div class="frame" data-w="issue header actions">
+      <div class="card" style="padding:18px 20px; max-width:640px;">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px;">
+          <div>
+            <div style="font-size:12px; color:rgb(var(--faint)); font-family:var(--mono);">vtmocanu/uzi · #241</div>
+            <div style="font-size:17px; font-weight:620; margin-top:3px;">Scheduled runs from web + CLI</div>
+            <div style="margin-top:8px; display:flex; gap:6px;">
+              <span class="chip">PRD</span><span class="badge ok"><span class="dot"></span>eligible</span>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; flex:none;">
+            <button class="btn primary"><span class="ic">▶</span> Start run</button>
+            <button class="btn"><span class="ic">🕑</span> Schedule…</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= -->
+  <section>
+    <h2>4 · Sidebar &amp; nav badge</h2>
+    <p class="sub">The <code>/schedules</code> item joins the <b>Work</b> group. Optional count badge = your enabled
+      schedules (same brand "count" tone as Notifications/Judge/Runs), so paused ones don't nag.</p>
+    <div class="frame" data-w="Work nav group">
+      <div style="display:flex; flex-direction:column; gap:8px; width:260px;">
+        <div class="navrow"><span class="ic">▦</span><span class="lbl">Boards</span></div>
+        <div class="navrow"><span class="ic">◔</span><span class="lbl">Runs</span><span class="navpill">3</span></div>
+        <div class="navrow" style="border-color:rgb(var(--brand) / 0.5); background:rgb(var(--brand) / 0.08);"><span class="ic">🕑</span><span class="lbl" style="color:rgb(var(--brand));font-weight:600;">Schedules</span><span class="navpill">3</span></div>
+        <div class="navrow"><span class="ic">💬</span><span class="lbl">Chat</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= -->
+  <section>
+    <h2>5 · CLI parity</h2>
+    <p class="sub">Everything the web does, <code>uzi schedule …</code> does — built for agents (<code>--json</code>,
+      documented exit codes) as much as humans. The <code>--cron</code>/<code>--at</code> split mirrors the modal's
+      timing modes; <code>--sweep</code> vs <code>--issue</code> mirrors Target.</p>
+    <div class="term">
+<span class="cm"># recurring sweep — weekdays 02:00, auto-approve, park on limit</span>
+<span class="p">$</span> <span class="c">uzi schedule create</span> <span class="o">--repo</span> uzi <span class="o">--sweep</span> \
+    <span class="o">--cron</span> <span class="v">"0 2 * * 1-5"</span> <span class="o">--tz</span> Europe/Bucharest <span class="o">--auto-approve</span> <span class="o">--wait-on-limit</span>
+<span class="g">✓</span> created schedule <span class="v">sch_7Kd2</span> · next fire Mon 11 Aug 02:00 (in 6h 12m)
+
+<span class="cm"># one-time — a single issue, tomorrow 09:00</span>
+<span class="p">$</span> <span class="c">uzi schedule create</span> <span class="o">--repo</span> uzi <span class="o">--issue</span> 158 <span class="o">--at</span> <span class="v">"2026-08-08T09:00+03:00"</span>
+<span class="g">✓</span> created schedule <span class="v">sch_9Qm4</span> · fires once at Aug 8 09:00 (in 13h 12m)
+
+<span class="p">$</span> <span class="c">uzi schedule list</span>
+<span class="o">ID        TARGET                REPO           WHEN            NEXT           ON</span>
+sch_7Kd2  sweep                 vtmocanu/uzi    0 2 * * 1-5     in 6h 12m      yes
+sch_9Qm4  #158                  vtmocanu/uzi    once            in 13h 12m     yes
+sch_3Bf1  #142                  vtmocanu/uzi    0 3 * * *       in 7h 12m      yes
+sch_Zt88  sweep                 board-svc      0 */6 * * *     —              <span class="o">paused</span>
+
+<span class="p">$</span> <span class="c">uzi schedule pause</span> sch_7Kd2      <span class="cm"># resume, run-now, get, delete all present</span>
+<span class="g">✓</span> paused sch_7Kd2
+<span class="p">$</span> <span class="c">uzi schedule run-now</span> sch_3Bf1
+<span class="g">✓</span> started run <span class="v">run_c81a</span> from sch_3Bf1 (#142)
+    </div>
+    <div class="note">
+      <span class="ic">◆</span>
+      <div><b>One seam, honoured everywhere.</b> Web, CLI, and the scheduler goroutine all create runs through the
+        same shared path autopilot uses — so PRDLESS gating, forge issue fetch, active-run dedup and the usage-limit
+        park behave identically no matter what triggered the run. A schedule can never do something a manual start can't.</div>
+    </div>
+  </section>
+</div>
