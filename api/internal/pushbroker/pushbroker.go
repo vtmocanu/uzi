@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -68,12 +69,17 @@ var (
 	// ErrTipMissing means the declared tip object is not present after applying the
 	// pack — the worker's pack did not actually contain the commit it named.
 	ErrTipMissing = errors.New("pushbroker: declared tip not present after applying pack")
-	// ErrPackTooLarge means the worker's pack declares more RECONSTRUCTED bytes (per
-	// object or cumulatively) or more objects than the budget allows. It is enforced
-	// by a header + delta-header pre-pass, before any object is resolved into the
-	// unbounded in-memory storer, so a decompression- or delta-bomb pack is refused
-	// rather than OOMing the shared api. The caller maps it to a best-effort
-	// "unsupported" skip.
+	// ErrPackTooLarge means the worker's pack exceeds the budget along ANY of the axes
+	// scanPackBudget bounds: too many objects, an over-cap per-object inflated/declared
+	// size, too many cumulative RECONSTRUCTED bytes (the heap the apply allocates into
+	// the storer), or too much cumulative INFLATION WORK (the bytes the scanner
+	// zlib-inflates, summed over EVERY object — delta and non-delta alike). It is
+	// enforced by a header + delta-header pre-pass, before any object is resolved into
+	// the unbounded in-memory storer, so a decompression or delta bomb is refused
+	// rather than OOMing the shared api (the reconstructed-size axis) OR pinning a core
+	// inflating instruction streams whose declared targets are tiny (the inflation-work
+	// axis — the variant a reconstructed-size-only budget waved through). The caller
+	// maps it to a best-effort "unsupported" skip.
 	ErrPackTooLarge = errors.New("pushbroker: pack exceeds inflation budget")
 	// ErrPackInvalid means the pack header or an object header could not be parsed —
 	// a genuinely malformed pack, distinct from an oversize one. The caller maps it to
@@ -89,11 +95,42 @@ var (
 // each object by the size it will RECONSTRUCT to in the storer (the delta target
 // size for deltas), so the ceiling on heap the subsequent apply allocates is
 // maxPackTotalBytes, not the wire size.
+//
+// The reconstructed-size caps defend the STORER (heap/OOM) path. They do NOT bound
+// the scanner's own CPU: to READ each object the pre-pass zlib-inflates its declared
+// Length (≤ maxPackObjectBytes per object — for a delta that is the INSTRUCTION
+// stream, not the reconstructed target). A REF_DELTA can declare targetSz=0 behind a
+// ~32 MiB instruction stream, so it contributes 0 to maxPackTotalBytes yet still
+// forces ~32 MiB of inflation; many such deltas up to the 64 MiB wire cap forced
+// ~900 MiB of uncancellable single-core inflation from an 897 KiB pack (measured,
+// and ACCEPTED, before this cap). maxPackInflationWorkBytes bounds the CUMULATIVE
+// bytes the scanner inflates across EVERY object, so total inflation CPU is bounded
+// regardless of declared target sizes; it coexists with — does not replace — the
+// reconstructed-size caps.
 const (
-	maxPackObjectBytes = 32 << 20  // 32 MiB per declared object
-	maxPackTotalBytes  = 128 << 20 // 128 MiB cumulative declared inflated size
-	maxPackObjects     = 50000     // object-count ceiling
+	maxPackObjectBytes = 32 << 20 // 32 MiB per declared object
+
+	maxPackTotalBytes = 128 << 20 // 128 MiB cumulative declared RECONSTRUCTED size (storer/OOM defense)
+
+	// maxPackInflationWorkBytes caps the cumulative bytes scanPackBudget zlib-inflates
+	// across all objects (the sum of every object's declared Length, delta and
+	// non-delta), bounding total inflation CPU independent of declared target size (the
+	// tiny-target / huge-instruction-stream delta bomb). Generous vs. any legitimate
+	// checkpoint delta (a handful of commits) while capping worst-case work well under
+	// the ~GiBs a 64 MiB wire body of packed deltas could otherwise force.
+	maxPackInflationWorkBytes = 256 << 20 // 256 MiB cumulative inflated (CPU defense)
+
+	maxPackObjects = 50000 // object-count ceiling
 )
+
+// maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
+// untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
+// non-forced push combined. /publish carries no request timeout of its own, and a
+// worst-case pack can force tens of seconds of otherwise-uncancellable CPU; this
+// makes any one publish cancellable and time-bounded regardless of pack contents or
+// a slow forge. Generous for a legitimate checkpoint push, tight enough that a single
+// request can never run unbounded.
+const maxPublishDuration = 60 * time.Second
 
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
@@ -106,6 +143,13 @@ const checkpointRefPrefix = "refs/uzi-checkpoints/"
 // NOTE: the go-git round-trip against a REAL forge is a manual/e2e validation step
 // (see the package tests, which prove the algorithm against a local bare fixture).
 func Publish(ctx context.Context, o Options) (Result, error) {
+	// Bound the WHOLE publish — the untrusted-pack budget scan, the origin fetch, and
+	// the push — by a hard wall-clock ceiling, so a single request can never run
+	// unbounded on a hostile pack or a slow forge. The derived ctx threads into
+	// scanPackBudget (which checks it per object), fetchBaseRefs, and PushContext.
+	ctx, cancel := context.WithTimeout(ctx, maxPublishDuration)
+	defer cancel()
+
 	ref := checkpointRefPrefix + o.Branch
 	result := Result{Ref: ref}
 
@@ -117,10 +161,13 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	}
 
 	// Step 1: BEFORE resolving anything into the unbounded in-memory storer, walk the
-	// pack and enforce the reconstruction budget (per-object and cumulative, deltas
-	// bounded by their declared target size). A worker-supplied pack is untrusted;
-	// this is what keeps a decompression or delta bomb from OOM-killing the api.
-	if err := scanPackBudget(o.Pack); err != nil {
+	// pack and enforce the budget — per-object and cumulative RECONSTRUCTED size
+	// (deltas bounded by their declared target), AND cumulative INFLATION WORK (the
+	// bytes actually zlib-inflated, which the reconstructed-size counter misses for a
+	// tiny-target delta). A worker-supplied pack is untrusted; this is what keeps a
+	// decompression or delta bomb from OOM-killing OR pinning a core of the api. The
+	// scan honours ctx, so the wall-clock ceiling above bounds it too.
+	if err := scanPackBudget(ctx, o.Pack); err != nil {
 		return Result{}, err
 	}
 
@@ -223,11 +270,13 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	}
 }
 
-// scanPackBudget walks the pack and rejects it (ErrPackTooLarge) the instant a
-// bound on the RECONSTRUCTED object size is exceeded, before any object is resolved
-// into the unbounded in-memory storer. It reads the object count from the pack
-// header, then for each object reads its header (NextObjectHeader) and fully
-// consumes its inflated body (NextObject) to keep the scanner aligned.
+// scanPackBudget walks the pack and rejects it (ErrPackTooLarge) the instant any
+// budget bound is exceeded, before any object is resolved into the unbounded
+// in-memory storer. It reads the object count from the pack header, then for each
+// object reads its header (NextObjectHeader) and fully consumes its inflated body
+// (NextObject) to keep the scanner aligned. It honours ctx, checking cancellation at
+// the top of every object iteration so a timed-out/cancelled publish stops promptly
+// rather than inflating the whole pack.
 //
 // The subtlety this pre-pass exists for: an object header's declared Length bounds
 // the INFLATED, UNRESOLVED content — for a non-delta object that is the object
@@ -240,18 +289,29 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 //
 // Therefore, for a delta object we inflate its (Length-bounded, ≤ maxPackObjectBytes)
 // body and read the target size — the SECOND unsigned LEB128 varint of the delta
-// header (`[base-size][target-size][ops...]`) — and cap THAT. The cumulative counter
+// header (`[base-size][target-size][ops...]`) — and cap THAT. The `total` counter
 // tracks reconstructed bytes (targetSz for deltas, Length otherwise), which is
 // exactly what lands in the storer, so it genuinely bounds the apply. Because this
 // validates the SAME immutable pack []byte that UpdateObjectStorage later parses,
 // there is no TOCTOU.
+//
+// The reconstructed-size counter is NOT enough on its own: the DUAL of the bomb above
+// is a delta with a tiny (even zero) declared target behind a ~maxPackObjectBytes
+// INSTRUCTION stream. It contributes ~0 to `total`, so the reconstructed caps wave it
+// through, yet the scanner must still zlib-inflate its whole instruction stream to
+// stay aligned — and many such deltas up to the wire cap force ~GiBs of uncancellable
+// single-core CPU. The `inflationWork` counter sums every object's declared Length
+// (the bytes this scanner actually inflates, delta and non-delta alike) and caps it
+// at maxPackInflationWorkBytes, checked BEFORE inflating the object that would cross
+// it — so total inflation is bounded regardless of declared target sizes. The two
+// counters coexist: `total` defends the storer/OOM path, `inflationWork` the CPU path.
 //
 // A pack whose header or an object header cannot be parsed is a genuinely malformed
 // pack: it returns ErrPackInvalid (a best-effort "unsupported" skip), never a 5xx.
 // A declared-size overrun (a lying delta/object whose zlib stream inflates past its
 // header Length) surfaces from the scanner's bounded writer as
 // ErrInflatedSizeMismatch and is treated as ErrPackTooLarge.
-func scanPackBudget(pack []byte) error {
+func scanPackBudget(ctx context.Context, pack []byte) error {
 	if len(pack) == 0 {
 		return nil
 	}
@@ -263,8 +323,14 @@ func scanPackBudget(pack []byte) error {
 	if objects > maxPackObjects {
 		return ErrPackTooLarge
 	}
-	var total int64
+	var total int64         // cumulative RECONSTRUCTED bytes (targetSz for deltas, Length otherwise)
+	var inflationWork int64 // cumulative bytes this scanner zlib-inflates across all objects
 	for i := uint32(0); i < objects; i++ {
+		// Inflating an object is uncancellable single-core work; honour a
+		// cancelled/timed-out publish before starting the next one.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h, err := scanner.NextObjectHeader()
 		if err != nil {
 			// A declared-size overrun on the PREVIOUS object surfaces here as a size
@@ -279,6 +345,14 @@ func scanPackBudget(pack []byte) error {
 		// oversize non-delta object and keeps the delta body we inflate below to
 		// ≤ maxPackObjectBytes.
 		if h.Length < 0 || h.Length > maxPackObjectBytes {
+			return ErrPackTooLarge
+		}
+		// Bound the CUMULATIVE inflation work BEFORE inflating this object. h.Length is
+		// exactly the number of bytes the scanner will zlib-inflate for it, so summing
+		// it over every object bounds total inflation CPU — the axis a tiny-target
+		// delta bomb slips past the reconstructed-size caps below.
+		inflationWork += h.Length
+		if inflationWork > maxPackInflationWorkBytes {
 			return ErrPackTooLarge
 		}
 
