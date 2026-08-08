@@ -566,6 +566,38 @@ can change. There's also no `--token` flag: a credential must never land on
 `argv`, readable via `ps`/`/proc`. Use `$UZI_TOKEN`, or `uzi auth token`,
 which reads a token from stdin.
 
+### The `--json` envelope shape is per-verb
+
+The `--json` wrapper is **not uniform** across the run verbs, so don't reuse one
+verb's unwrapping for another:
+
+| Verb | `--json` shape |
+|---|---|
+| `run create` | run nested under a top-level `run` key: `{"run": {…}}` |
+| `run get` | the run object at the top level: `{…}` |
+| `run list` | a top-level array: `[{…}, …]` |
+| `run logs` | **NDJSON** — one JSON object per line, not a single document |
+
+### Run status, and what `--follow` waits for
+
+A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:
+`queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
+`limit_wait`, `completed`, `failed`, `cancelled`. Only the last three are
+**terminal**, and `uzi run logs --follow` returns **only** on those three. The
+three non-terminal parks it will *not* stop at:
+
+- `awaiting_approval` — the plan gate;
+- `awaiting_input` — a clarifying question, answered with `run answer`;
+- `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
+  `queued` once past its `retry_not_before`.
+
+So to wait for a plan gate or a clarification, **poll `uzi run get`** — leaning on
+`--follow` there blocks until the run truly finishes, which may be never while it
+waits on a human. If you see a `status` outside this list, the server is newer
+than this binary — upgrade rather than trusting it to mean "active". (The live
+`/api/ws` stream and `uzi tui` rewrite an unrecognised status to `unknown`; plain
+`run get`/`run list --json` pass it through as-is.)
+
 ## Bundled skill and session-start hook
 
 **The skill itself.** The CLI installs (and self-upgrades)

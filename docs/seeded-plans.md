@@ -12,6 +12,10 @@ part where uzi plans it again. Hand over a written plan and the worker goes
 straight to implementing it: no planning turn, no approval gate. The human
 checkpoint moves from the plan to the merge request.
 
+This is what people mean by **seed it to uzi** / **ship it to uzi** / **send it
+to uzi**: author the plan locally and run `uzi run create --plan-file <path>`,
+which bypasses uzi's own planning turn *and* the approval gate.
+
 A run started with no `--plan-file` is completely unaffected: same planning
 turn, same gate, same everything.
 
@@ -81,6 +85,22 @@ The worker then clones, checks out, and implements the plan directly. Watch
 it the same way as any other run — `uzi run logs --follow` or `uzi tui
 <run-id>` — the run view's usual plan panel just doesn't apply, since there
 was never a gate to show it at.
+
+## Budget: a seeded run gets the default, not a scaled one
+
+A seeded run never reaches the plan gate, so it freezes no milestones — and the
+milestone-scaled budget only exists on the gated path, where the milestone count
+drives it. With no milestones its budget columns stay empty and it runs on the
+**global default**: `RUN_MAX_ITERATIONS` iterations and `RUN_TIMEOUT` wall-clock
+(out of the box 5 iterations / 2h; both are configurable server settings, not
+constants).
+
+So for a large, multi-component change, pick deliberately:
+
+- **Split it into per-component seeded runs**, each small enough to finish inside
+  the default budget; or
+- **Use the gated `uzi run create`** (no `--plan-file`) so the lead proposes
+  milestones and the budget scales to them — at the cost of one approval.
 
 ## No PRD file? PRDLESS composes with this
 
