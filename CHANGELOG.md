@@ -23,6 +23,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   stream; the user-visible progress UI (web, Slack, CLI) is not part of this
   release. (#122 M1, M2, M6, M8)
 
+- **The run page shows live in-flight token counts.** Usage on the run page
+  updates from the first model call rather than only after the run records
+  usage, so a running agent's token spend is visible as it happens. (#237)
+
+- **The Runs menu item carries an in-progress count badge.** The nav badge shows
+  how many runs are currently in progress at a glance. (#239)
+
 - **The version popover and `uzi version` now show PRD roadmap progress.** A
   `PRDs  N done · M open` row (sidebar popover) and matching `prds  N done, M
   open` line (`uzi version`) count completed PRDs (`prds/done/*.md`) and active
@@ -47,6 +54,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   templates (builtins already said `main`). A repo that registers a real subagent
   literally named `lead` is unaffected: the rewrite only fires when no such
   subagent is registered. (61795aac)
+
+- **The judge triage meter's "to do" segment is now amber.** It previously read
+  as grey/"dismissed", making outstanding recommendations look already handled;
+  amber distinguishes to-do from dismissed. (#243)
 
 ## [0.19.1] - 2026-08-07
 
