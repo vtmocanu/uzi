@@ -3538,6 +3538,15 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if terminalStatuses[run.Status] {
 		return SubmitInputResult{}, ErrRunTerminal
 	}
+	// A chat run's turns MUST ride SubmitChatMessage, which counts persisted
+	// follow_ups against ChatMaxTurns before enqueuing (chat.go). A follow_up posted
+	// to the generic /inputs endpoint would skip that count and burn spend past the
+	// cap, so reject it here — at the service boundary, before any row is written, so
+	// the guard covers HTTP/CLI/future Slack. Only follow_up is blocked: cancel (which
+	// EndChat rides), reject_plan, approve_plan and answer stay legal on a chat run.
+	if run.Kind == RunKindChat && kind == "follow_up" {
+		return SubmitInputResult{}, ErrChatInputNotAllowed
+	}
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
 	}

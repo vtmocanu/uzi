@@ -478,6 +478,23 @@ func TestCreateRunInputRevisePlanCap(t *testing.T) {
 	}
 }
 
+// TestCreateRunInputChatFollowUp409 pins the chat-cap hole fix (issue #258 M5): a
+// follow_up posted to the generic /inputs endpoint against a CHAT run is rejected at
+// the service boundary and the handler maps ErrChatInputNotAllowed → 409. Chat turns
+// must ride the chat message endpoint, which enforces CHAT_MAX_TURNS.
+func TestCreateRunInputChatFollowUp409(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "running", Kind: workersvc.RunKindChat}}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(owner, runID, `{"kind":"follow_up","body":"keep going"}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("chat follow_up on /inputs = %d, want 409", rec.Code)
+	}
+}
+
 func TestListRunsReturnsUsersRuns(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	st := &runsStore{userRuns: []store.ListRunsForUserRow{
@@ -612,7 +629,7 @@ func TestServeWSDeliversLiveEventsToOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.CloseNow()
+	defer func() { _ = c.CloseNow() }()
 
 	// Publish repeatedly until the read lands: the subscription is registered a
 	// beat after the handshake, so a single early publish could race it.
@@ -642,7 +659,7 @@ func TestServeWSDeliversLiveEventsToOwner(t *testing.T) {
 	if ev.Type != "message" || ev.Seq != 1 {
 		t.Fatalf("unexpected frame: %+v", ev)
 	}
-	c.Close(websocket.StatusNormalClosure, "")
+	_ = c.Close(websocket.StatusNormalClosure, "")
 }
 
 func TestServeWSRejectsCrossOrigin(t *testing.T) {

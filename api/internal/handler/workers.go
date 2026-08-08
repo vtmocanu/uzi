@@ -1018,6 +1018,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "run has already finished")
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
+		case errors.Is(err, workersvc.ErrChatInputNotAllowed):
+			// 409: a chat run must steer through the chat message endpoint, which
+			// enforces the turn cap. The generic /inputs follow_up path would bypass it.
+			httpx.Error(w, http.StatusConflict, "chat runs accept messages only through the chat endpoint")
 		case errors.Is(err, workersvc.ErrRunNotAwaitingInput):
 			httpx.Error(w, http.StatusConflict, "run is not waiting for an answer")
 		case errors.Is(err, workersvc.ErrStaleAnswer):
