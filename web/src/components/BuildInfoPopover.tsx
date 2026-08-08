@@ -386,7 +386,6 @@ export function BuildInfoPopover({
               delete. The 7-char display stays: it is the standard git short SHA
               and it is what fits. */}
           {commit && <Row label="Commit" value={commit.slice(0, 7)} full={commit} />}
-          {uptime && <Row label="Uptime" value={uptime} />}
           {/* Both-or-neither (#245): the count is stamped as a pair in CI and
               travels together, so a lone field is treated as unknown and the row
               is dropped — the same "unknown beats wrong" rule the rest of the
@@ -403,6 +402,10 @@ export function BuildInfoPopover({
               }
             />
           )}
+          {/* Uptime LAST: it is the one live-updating value in the panel, so it
+              reads at the bottom rather than sitting between the static build
+              coordinates and the PRD counts. */}
+          {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
       </div>
     </div>
