@@ -6,6 +6,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-08-08
+
+### Fixed
+
+- **The checkpoint push broker no longer OOM-kills the api on a real repository.**
+  M8's broker fetched the run branch's full history into an in-memory git store
+  before pushing; on a real repo that unpacked the entire pack into RAM (~740 MB
+  RSS for uzi's 130 MiB pack) and OOM-killed the 512Mi api pod at every milestone
+  checkpoint. The base fetch is now **shallow (depth 1)** — it pulls only the tip
+  snapshot the delta pack actually references (~190 MB peak, measured against the
+  real forge) — and the api memory limit is raised 512Mi → 1Gi for concurrency
+  headroom. This surfaced on the first real deploy of 0.20.1; the broker's unit
+  tests use a one-commit local fixture where fetch depth is a no-op. (#122 M8)
+
 ## [0.20.1] - 2026-08-08
 
 First **published** build of the 0.20.0 changeset. The `v0.20.0` tag was created

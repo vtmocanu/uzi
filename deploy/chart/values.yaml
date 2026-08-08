@@ -66,7 +66,14 @@ api:
       cpu: 50m
       memory: 128Mi
     limits:
-      memory: 512Mi
+      # 512Mi -> 1Gi (PRD #122 M8). The api's steady state is tiny (~37Mi measured),
+      # but the M8 checkpoint push broker (pushbroker) spikes ~194 MB RSS per publish
+      # (a shallow go-git base fetch + thin-pack apply + push; the pre-shallow full
+      # fetch spiked 742 MB and OOM-killed this pod). 1Gi is headroom for a few
+      # CONCURRENT publishes (single-publish already fits under 512Mi post-shallow-fix).
+      # A publish-concurrency semaphore in the api would let this drop back; tracked as
+      # a follow-up.
+      memory: 1Gi
   # The api Service. Named "api" (see uzi.apiServiceName) so the web nginx
   # `proxy_pass http://api:8080` resolves it — same-origin, no CORS.
   service:
