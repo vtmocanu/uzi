@@ -52,6 +52,8 @@ const (
 	TypeGitLab Type = "gitlab"
 	// TypeForgejo is the Forgejo REST driver.
 	TypeForgejo Type = "forgejo"
+	// TypeGitHub is the GitHub REST driver (github.com only, classic PAT).
+	TypeGitHub Type = "github"
 )
 
 // Role is a bot's effective permission level on a project, in forge-neutral
@@ -170,6 +172,27 @@ type BranchProtection struct {
 	// naming the bot user directly. Same group-level gap; likewise GitLab-only and
 	// meaningful only when Protected is true.
 	BotCanMerge bool
+	// ProtectionUnverified is true when the driver could not authoritatively
+	// determine the write role's push/merge rights on a PROTECTED branch — it is
+	// meaningful only when Protected is true. It exists for the GitHub D6
+	// legacy-branch-protection case (PRD #238): GitHub's admin-gated
+	// /branches/{b}/protection endpoint 403s a write-role bot, and legacy branch
+	// protection is invisible through the reader-gated rulesets endpoint, so on a
+	// legacy-protected repo the bot can read that the branch is Protected but not
+	// who may push or merge. There the driver reports WriteRoleCanPush=false and
+	// WriteRoleCanMerge=false (NEVER a fabricated true) AND sets this flag, so
+	// "undetermined" is never conflated with an authoritatively-verified false.
+	//
+	// The zero value is false = verified, which is the safe default the five test
+	// fakes and the GitLab/Forgejo drivers get for free: they always determine
+	// push/merge authoritatively, so they never set it. A consumer must treat
+	// `Protected && ProtectionUnverified` as FAIL-CLOSED — the same tier as a
+	// detected write-role-can-push violation — because the Can* fields being false
+	// here means "could not tell", not "safe". Reading them as safe reopens the R12
+	// inversion on exactly the case the flag exists to mark. This is a consumer
+	// requirement recorded for PRD #66; adding the field changes no interface
+	// method, so it does not break the fakes.
+	ProtectionUnverified bool
 }
 
 // Project is a repo the bot has membership on.
@@ -436,6 +459,8 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 		return newGitLab(baseURL, token, timeout)
 	case TypeForgejo:
 		return newForgejo(baseURL, token, timeout)
+	case TypeGitHub:
+		return newGitHub(baseURL, token, timeout)
 	default:
 		return nil, fmt.Errorf("forge: unsupported forge type %q", t)
 	}

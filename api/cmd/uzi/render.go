@@ -36,12 +36,13 @@ func int64Or(p *int64, fallback string) string {
 func boolStr(b bool) string { return fmt.Sprintf("%t", b) }
 
 // mrAbbrev is the compact per-run label for the merge/pull request, forge-aware:
-// GitLab "MR", Forgejo "PR" (PRD #65 D2). It is the CLI's twin of the web's
-// mrAbbrev (web/src/lib/forgeNoun.ts) and slacksvc's forgeMrAbbrev — same 2-forge
+// GitLab "MR", Forgejo AND GitHub "PR" (PRD #65 D2, #238 D2). It is the CLI's twin of
+// the web's mrAbbrev (web/src/lib/forgeNoun.ts) and slacksvc's forgeMrAbbrev — same
 // mapping, kept in sync so `uzi run get` reads in the run's own forge vocabulary.
+// Both PR-forges are named explicitly so a missing github arm never renders "MR".
 // Any unknown/absent forge_type is GitLab's form (the default connection kind).
 func mrAbbrev(forgeType string) string {
-	if forgeType == "forgejo" {
+	if forgeType == "forgejo" || forgeType == "github" {
 		return "PR"
 	}
 	return "MR"

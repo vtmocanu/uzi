@@ -17,7 +17,9 @@ import { BranchIcon } from "../components/icons";
 // to the one for the forge the user is connecting, not always GitLab's. gitlab (and
 // any unknown/absent type — the only kind pre-M6b) keeps the exact GitLab path.
 function botSetupDoc(forgeType: string): string {
-  return forgeType === "forgejo" ? "/docs/forgejo-bot-setup" : "/docs/gitlab-bot-setup";
+  if (forgeType === "forgejo") return "/docs/forgejo-bot-setup";
+  if (forgeType === "github") return "/docs/github-bot-setup";
+  return "/docs/gitlab-bot-setup";
 }
 
 // ConnectHints is the connect form's inline token guidance for one forge. On a
@@ -48,6 +50,18 @@ function connectHints(forgeType: string): ConnectHints {
       scopeWord: "scopes",
       roleClause: "at the write role",
       placeholder: "your Forgejo token",
+    };
+  }
+  if (forgeType === "github") {
+    // GitHub classic PATs are coarse (PRD #238 D7): the single `repo` scope is the
+    // minimum that grants private-repo contents write, issues, PRs, and Actions read.
+    // VerifyToken requires exactly `{repo}`, so the form must instruct exactly `repo`.
+    return {
+      scopeLabel: "scope: repo",
+      scopeCode: "repo",
+      scopeWord: "scope",
+      roleClause: "as a collaborator with write access",
+      placeholder: "ghp_…",
     };
   }
   return {

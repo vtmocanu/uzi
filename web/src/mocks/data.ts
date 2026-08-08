@@ -758,6 +758,20 @@ export const mockForgeConfigMultiForge = {
   forge_types: ["gitlab", "forgejo"],
 };
 
+// A three-forge config variant (PRD #238 D2/D11) advertising GitHub alongside GitLab
+// and Forgejo, for exercising the connect-form picker with GitHub's arm. Like the
+// two-forge variant, deliberately NOT wired into mockApi.forgeConfig — production
+// advertises only ["gitlab"] until the go-live flip (M10), so the picker stays hidden
+// in the demo (dark landing).
+export const mockForgeConfigAllForges = {
+  allowed_base_urls: [
+    "https://gitlab.example.com",
+    "https://forge.example.com",
+    "https://github.com",
+  ],
+  forge_types: ["gitlab", "forgejo", "github"],
+};
+
 export const mockRepos: Repo[] = [
   {
     id: "repo-uzi",

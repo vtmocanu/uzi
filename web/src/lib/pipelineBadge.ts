@@ -13,23 +13,44 @@ import type { BadgeTone } from "./runBadge";
 //  - neutral   → cancelled / skipped, and any status we do not recognize (defensive)
 export type PipelineTone = "passed" | "failed" | "running" | "attention" | "neutral";
 
-// ONE merged map across BOTH forges (PRD #65 D2/R5): the pipeline badge is
-// forge-BLIND — it is never keyed off forge_type. The collision claim holds because
-// every string the two forges share (`success`, `running`, `skipped`, `pending`)
-// means the same thing, so one map is sound. Two Forgejo-only traps this map exists
-// to close (R5 — either one renders a red build benign otherwise):
+// ONE merged map across ALL THREE forges (PRD #65 D2/R5, #238 D8): the pipeline
+// badge is forge-BLIND — it is never keyed off forge_type. The collision claim holds
+// because every string more than one forge shares means the same thing, so one map
+// is sound. The audit, shown not asserted (#238 N10):
+//   - `success`/`failure`/`cancelled`/`skipped` — GitHub Actions spells these exactly
+//     as Forgejo Actions (two-L `cancelled`, GitHub matches Forgejo not GitLab), same
+//     meaning, so the existing Forgejo keys already cover GitHub. ✓
+//   - `pending` — GitHub's commit-status API uses it for in-flight, same as the
+//     existing →running entry. ✓
+//   - `waiting` is the ONE genuine cross-forge collision (#238 D8): Forgejo Actions
+//     `waiting` means in-flight (→running), while GitHub's run `waiting` means blocked
+//     on a deployment-protection gate — a HUMAN must approve (nearer `action_required`
+//     →attention). The map is forge-blind and the driver stores the raw string, so the
+//     two cannot be told apart here. KNOWINGLY kept →running: the tone is a nuance, not
+//     a failure/pass, so no fix run is mis-triggered and no red build renders benign —
+//     the properties TestMirrorsWebPipelineBadge actually guards. Escape hatch if this
+//     confuses in practice: the GitHub driver translates its own `waiting` before
+//     storing (not the default).
+// Two Forgejo-only traps this map exists to close (R5 — either one renders a red build
+// benign otherwise):
 //   - Forgejo spells it `cancelled` (two Ls); GitLab `canceled` (one). BOTH keys are
-//     present, or a Forgejo-cancelled build falls through `?? "neutral"` by accident
-//     (harmless here, but it must be deliberate, not luck).
+//     present, or a Forgejo/GitHub-cancelled build falls through `?? "neutral"` by
+//     accident (harmless here, but it must be deliberate, not luck).
 //   - Forgejo Actions reports a failure as `failure`, not GitLab's `failed`; a
 //     commit-status failure as `error`. WITHOUT these keys a failed Forgejo build
 //     has no `failed` entry and renders neutral/benign — the whole point of R5.
+// Two GitHub-only traps (#238 D8): GitHub says `in_progress`, not `running`; `queued`,
+// not `pending`. Both must be present or an in-flight GitHub build renders neutral.
 // Forgejo has two status enums (the PRD's "two enums, not one"): Actions run status
 // (unknown|waiting|running|success|failure|cancelled|skipped|blocked) and
-// CommitStatusState (pending|success|error|failure|warning|skipped). Both are folded
-// in below so uzi never mis-reads whichever the driver surfaces.
+// CommitStatusState (pending|success|error|failure|warning|skipped). GitHub Actions
+// folds two SEQUENTIAL fields into one stored string (#238 D8): a run/job `status`
+// (queued|in_progress|requested|waiting|pending) until completion, then a `conclusion`
+// (success|failure|cancelled|skipped|timed_out|action_required|neutral|stale|
+// startup_failure). All are folded in below so uzi never mis-reads whichever the
+// driver surfaces.
 const PIPELINE_TONES: Record<string, PipelineTone> = {
-  // shared, same meaning on both forges
+  // shared, same meaning on both/all forges
   success: "passed",
   running: "running",
   pending: "running",
@@ -42,15 +63,26 @@ const PIPELINE_TONES: Record<string, PipelineTone> = {
   scheduled: "running",
   manual: "attention",
   canceled: "neutral",
-  // Forgejo Actions run status
+  // Forgejo Actions run status (also covers GitHub's shared strings — see audit above)
   failure: "failed", // R5: must map to failed, or a red build renders benign
-  cancelled: "neutral", // R5: two-L spelling, distinct from GitLab's `canceled`
-  waiting: "running",
+  cancelled: "neutral", // R5: two-L spelling (Forgejo AND GitHub), distinct from GitLab's `canceled`
+  waiting: "running", // #238 D8: GitHub deployment-gate `waiting` is knowingly shown running, not attention
   blocked: "running",
   unknown: "neutral",
   // Forgejo CommitStatusState extras
   error: "failed", // an errored status is a failure, never benign
   warning: "attention",
+  // GitHub Actions run/job status (in-flight — traps: `in_progress` not `running`,
+  // `queued` not `pending`)
+  queued: "running",
+  in_progress: "running",
+  requested: "running",
+  // GitHub Actions conclusion (terminal)
+  timed_out: "failed",
+  startup_failure: "failed",
+  action_required: "attention", // a human must approve a gate/first-run — attention, not a code failure
+  neutral: "neutral",
+  stale: "neutral",
 };
 
 // pipelineTone maps a raw forge pipeline status to its UI tone. An unknown status

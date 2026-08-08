@@ -14,6 +14,7 @@
 // the noun. Those surfaces do not call this helper.
 
 const FORGEJO = "forgejo";
+const GITHUB = "github";
 
 // MR_NOUN is the one place the GitLab noun is spelled. The default (unknown / absent
 // forge_type) is GitLab's noun — every connection that can exist today is GitLab
@@ -22,6 +23,7 @@ const FORGEJO = "forgejo";
 const MR_NOUN: Record<string, string> = {
   gitlab: "Merge Request",
   [FORGEJO]: "Pull Request",
+  [GITHUB]: "Pull Request",
 };
 
 // forgeNoun is the Title-Case noun for a button/label (GitLab vs Forgejo phrasing).
@@ -42,15 +44,19 @@ export function forgeNounSentence(forgeType: string | null | undefined): string 
 }
 
 // mrAbbrev is the compact prefix a meta chip shows before the number: GitLab "MR",
-// Forgejo "PR".
+// Forgejo AND GitHub "PR". Not a binary ternary defaulting to GitLab: an unlisted
+// github arm would silently render "MR" for a GitHub card (the D2 trap), so both
+// PR-forges are named explicitly and only unknown/absent falls to GitLab's "MR".
 export function mrAbbrev(forgeType: string | null | undefined): string {
-  return forgeType === FORGEJO ? "PR" : "MR";
+  return forgeType === FORGEJO || forgeType === GITHUB ? "PR" : "MR";
 }
 
 // mrRefSymbol is the forge's reference sigil for the request number: GitLab writes
-// "!42" for a merge request, Forgejo "#42" for a pull request.
+// "!42" for a merge request, Forgejo "#42" for a pull request, GitHub "#42" (its PRs
+// and issues share one number namespace, so "#42" is correct). Both # forges are
+// named explicitly so a missing github arm never renders "!42".
 export function mrRefSymbol(forgeType: string | null | undefined): string {
-  return forgeType === FORGEJO ? "#" : "!";
+  return forgeType === FORGEJO || forgeType === GITHUB ? "#" : "!";
 }
 
 // PLATFORM is the display name of the forge, for copy that names the destination
@@ -58,9 +64,10 @@ export function mrRefSymbol(forgeType: string | null | undefined): string {
 const PLATFORM: Record<string, string> = {
   gitlab: "GitLab",
   [FORGEJO]: "Forgejo",
+  [GITHUB]: "GitHub",
 };
 
-// forgePlatform names the forge for user copy: "GitLab" | "Forgejo".
+// forgePlatform names the forge for user copy: "GitLab" | "Forgejo" | "GitHub".
 export function forgePlatform(forgeType: string | null | undefined): string {
   return PLATFORM[forgeType ?? ""] ?? PLATFORM.gitlab;
 }
