@@ -928,6 +928,33 @@ func TestNotifierPostsMilestoneLineOnAdvance(t *testing.T) {
 	}
 }
 
+// The initial root post (the ErrNoRows first-transition branch) must NEVER carry a
+// milestone progress line, even when the run is already mid-progress when Slack is
+// first linked. handleMilestone lives only in the existing-message branch; this pins
+// that so a future edit that hoists the call above the switch is caught. Without this
+// test every other milestone case (all take the existing-message branch) still passes.
+func TestNotifierFirstPostCarriesNoMilestoneLine(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "m4") // already 3/7 done at first link
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msgErr: pgx.ErrNoRows}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 1 || fp.posts[0].thread != "" {
+		t.Fatalf("want exactly one top-level root post, no threaded line: %+v", fp.posts)
+	}
+	if strings.Contains(fp.posts[0].text, "✓") {
+		t.Fatalf("first post must not carry a milestone advance line: %q", fp.posts[0].text)
+	}
+	if len(fs.milestoneSet) != 0 {
+		t.Fatalf("first post must not record a notified count: %+v", fs.milestoneSet)
+	}
+	// The root itself still shows the compact counter — that is the root suffix, not a line.
+	if !strings.Contains(fp.posts[0].text, "3/7") {
+		t.Fatalf("root should still carry the `3/7` counter suffix: %q", fp.posts[0].text)
+	}
+}
+
 // When nothing is in progress, the thread line drops the ` · working …` suffix.
 func TestNotifierMilestoneLineDropsWorkingSuffixWhenIdle(t *testing.T) {
 	rc := milestoneRun(t, 1, 7, "") // no in-progress id

@@ -730,10 +730,11 @@ func (n *Notifier) handleMilestone(ctx context.Context, rc store.GetSlackRunCont
 	}
 }
 
-// inProgressTitle returns the human title of the FIRST in-progress milestone (looked up
-// in the frozen list by id), or "" when nothing is in progress or the id is unknown — in
-// which case the thread line drops its ` · working …` suffix. The title is UNTRUSTED
-// display text, so the caller routes it through EscapeMrkdwn like every other field.
+// inProgressTitle returns the human title of the first in-progress milestone that HAS a
+// non-empty title in the frozen list (skipping any in-progress id that is unknown or has
+// a blank title), or "" when nothing is in progress or no in-progress id resolves to a
+// title — in which case the thread line drops its ` · working …` suffix. The title is
+// UNTRUSTED display text, so the caller routes it through EscapeMrkdwn like every other field.
 func inProgressTitle(rc store.GetSlackRunContextRow) string {
 	ids := decodeMilestoneIDs(rc.MilestonesInProgress)
 	if len(ids) == 0 {
