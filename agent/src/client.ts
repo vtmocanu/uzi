@@ -1,6 +1,8 @@
+import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
+  type PublishResponse,
   type ChatClaimResponse,
   type ClaimResponse,
   type CreateProposalRequest,
@@ -201,6 +203,46 @@ export class WorkerClient {
         await this.sleep(delay);
       }
     }
+  }
+
+  /**
+   * PRD #122 M8 — brokered origin publish of a checkpoint pack, BEST-EFFORT. Unlike every
+   * other worker RPC this is NOT JSON: the packfile is the raw `application/octet-stream`
+   * body (streamed — a pack can be large, so `pack` is a Readable and `duplex: "half"` is
+   * required by undici for a streamed request body), and the checkpoint tip OID rides the
+   * `X-Uzi-Checkpoint-Tip` header rather than a JSON field.
+   *
+   * Best-effort by contract: a publish must NEVER fail the run, so ANY non-2xx
+   * (404/413/400/500) returns null rather than throwing, and a 2xx with an empty body reads
+   * as null too. The caller (runner.ts publishCheckpointBestEffort) additionally wraps this
+   * in a warn-and-swallow. The bearer/version header assembly mirrors fetchRaw; the same
+   * per-request timeout is used — generous enough for a real pack, and an abort is just
+   * another best-effort miss.
+   */
+  async publishCheckpoint(
+    runId: string,
+    tipOid: string,
+    pack: Readable,
+  ): Promise<PublishResponse | null> {
+    const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Checkpoint-Tip": tipOid,
+      },
+      body: pack,
+      // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
+      // the fetch throws before sending. (oxlint no-invalid-fetch-options accepts this shape.)
+      duplex: "half",
+      signal: AbortSignal.timeout(this.httpTimeoutMs),
+    };
+    const res = await fetch(this.baseUrl + path, init);
+    if (res.status < 200 || res.status >= 300) return null;
+    const text = await res.text();
+    return text ? (JSON.parse(text) as PublishResponse) : null;
   }
 
   async getInputs(runId: string): Promise<UserInput[]> {

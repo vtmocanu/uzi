@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/pushbroker"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
@@ -680,6 +682,18 @@ type Service struct {
 	// it carries its own mutex. Do not copy that field's lock-free reasoning here —
 	// see persistfail.go.
 	persistFail *persistFailTracker
+	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
+	// #122): it reports whether a run's forge base URL is on the configured
+	// allowlist before the api will fetch/push against it. Set via
+	// SetForgeBaseURLAllowed with config.Config.ForgeBaseURLAllowed. A nil gate is a
+	// loud misconfiguration — Publish refuses (500) rather than fail-open — so a
+	// deployment that never wired it can never broker a push to an arbitrary host.
+	forgeBaseURLAllowed func(string) bool
+	// publishFn is the go-git checkpoint publisher (PRD #122 M8). Defaults to
+	// pushbroker.Publish (set in New); a setter lets handler/service tests stub it so
+	// the whole Publish path is exercised without a real forge. Injected as a seam
+	// rather than called directly so pushbroker stays the ONE place go-git lives.
+	publishFn func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error)
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -715,6 +729,19 @@ func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 // workers wholly unaffected.
 func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
 
+// SetForgeBaseURLAllowed wires the SSRF gate for the M8 checkpoint-publish path
+// (PRD #122). Call once at startup with config.Config.ForgeBaseURLAllowed. Leaving
+// it unset (nil) makes Publish refuse — it is a loud misconfiguration, never
+// fail-open — so the broker can never be pointed at an un-allowlisted host.
+func (s *Service) SetForgeBaseURLAllowed(fn func(string) bool) { s.forgeBaseURLAllowed = fn }
+
+// SetPublishFn overrides the go-git checkpoint publisher (PRD #122 M8). Production
+// leaves the pushbroker.Publish default New installs; tests stub it to exercise the
+// service's derivation/authorization/skip mapping without a real forge.
+func (s *Service) SetPublishFn(fn func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error)) {
+	s.publishFn = fn
+}
+
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
 func (s *Service) notify(runID uuid.UUID, status string) {
@@ -731,7 +758,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
-	return &Service{q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker()}
+	return &Service{q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), publishFn: pushbroker.Publish}
 }
 
 // -------------------------------------------------------------------------
@@ -2744,6 +2771,141 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		return store.Run{}, err
 	}
 	return run, nil
+}
+
+// PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
+// true only when the push landed. Skipped names the benign reason a publish did NOT
+// advance the ref ("no_ref" | "not_descendant" | "unsupported"); it is empty on a
+// successful publish. Either way Ref is the checkpoint ref the worker asked about.
+type PublishResult struct {
+	Published bool
+	Ref       string
+	Skipped   string
+}
+
+// Publish is the api side of the M8 brokered origin push: the worker ships a delta
+// PACK plus the tip OID it claims, and the api — the SOLE holder of forge secrets —
+// derives the repo, branch, and PAT ENTIRELY from the run row, fetches origin's
+// base objects, applies the pack, and pushes it NON-FORCED to
+// refs/uzi-checkpoints/<branch>. A worker can never name the repo/ref/credential:
+// authorization is server-derived.
+//
+// It returns a benign PublishResult skip (nil error) for the outcomes the worker
+// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
+// the worker ignores as best-effort.
+func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
+	// 1. Server-derived authorization: the run must be owned by THIS worker.
+	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
+	// named (the run id), and it can only reach its own runs.
+	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return PublishResult{}, err
+	}
+
+	// 2. Branch is derived SERVER-SIDE from the run's issue iid — never from the
+	// worker, and never from owned.Branch. runs.branch is written ONLY at completion
+	// (SetRunCompleted), so it is NULL/empty for a `running` run; a checkpoint
+	// publish fires MID-RUN, so reading it would make the whole feature inert.
+	// Checkpoints only ever fire for issue runs (the agent gates the tool to
+	// kind==="issue"), so any other kind, or a run missing its issue iid, is an
+	// unsupported publish we skip (best-effort) rather than fault. Deriving the
+	// branch from the int-typed iid — exactly the worker's agent/issue-<iid> naming —
+	// also means no worker-controlled string ever flows into the refspec.
+	if owned.Kind != RunKindIssue || !owned.IssueIid.Valid {
+		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
+	}
+	branch := agentIssueBranch(owned.IssueIid.Int64)
+	ref := "refs/uzi-checkpoints/" + branch
+
+	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
+	// sealed PAT) come from the run claim context — the same INNER JOIN the claim
+	// path uses.
+	rc, err := s.q.GetRunClaimContext(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The run is owned but has no repo/forge connection (e.g. a repo-less
+			// run): there is nothing to push to. Treat as a no-ref skip.
+			return PublishResult{Published: false, Ref: ref, Skipped: "no_ref"}, nil
+		}
+		return PublishResult{}, fmt.Errorf("publish claim context: %w", err)
+	}
+	cloneURL := rc.RepoWebUrl + ".git"
+
+	// 4. SSRF gate, BEFORE decrypting the PAT. A nil gate — or a nil publisher — is a
+	// loud misconfiguration (handler → 500), never fail-open: the broker must never be
+	// pointed at an arbitrary host.
+	if s.forgeBaseURLAllowed == nil {
+		return PublishResult{}, fmt.Errorf("publish: forge base URL allowlist is not configured")
+	}
+	if s.publishFn == nil {
+		return PublishResult{}, fmt.Errorf("publish: publisher is not configured")
+	}
+	// The allowlist must cover BOTH the declared base_url AND the host go-git actually
+	// DIALS (cloneURL = repo_web_url + ".git"): the two columns can diverge, and only
+	// the dialed host is the real SSRF target. Normalize the clone URL to scheme+host
+	// (the shape the gate matches) and assert it too.
+	if !s.forgeBaseURLAllowed(rc.BaseUrl) {
+		return PublishResult{}, fmt.Errorf("publish: forge base URL is not allowlisted")
+	}
+	cloneHost, err := forgeHostFromURL(cloneURL)
+	if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
+		return PublishResult{}, fmt.Errorf("publish: clone host is not allowlisted")
+	}
+
+	// 5. Decrypt the bot PAT under the master box. box.Open errors carry no
+	// plaintext; wrap without exposing it (mirrors assembleClaim).
+	botPAT, err := s.box.Open(rc.TokenCiphertext)
+	if err != nil {
+		return PublishResult{}, fmt.Errorf("publish: bot PAT could not be decrypted")
+	}
+
+	// 6. Hand the mechanical push to the go-git broker (stubbable seam). Map its
+	// benign sentinels to skips; anything else is a best-effort 5xx.
+	// The broker's Result.Ref equals the ref computed above; the service returns its
+	// own derived ref (never a value shaped by the worker's input), so the Result is
+	// consulted only for the error.
+	_, err = s.publishFn(ctx, pushbroker.Options{
+		CloneURL:      cloneURL,
+		BaseURL:       rc.BaseUrl,
+		Branch:        branch,
+		DefaultBranch: rc.DefaultBranch.String,
+		Username:      rc.BotUsername,
+		PAT:           string(botPAT),
+		DeclaredTip:   tipOid,
+		Pack:          pack,
+	})
+	switch {
+	case err == nil:
+		return PublishResult{Published: true, Ref: ref}, nil
+	case errors.Is(err, pushbroker.ErrNotDescendant):
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	case errors.Is(err, pushbroker.ErrTipMissing),
+		errors.Is(err, pushbroker.ErrPackTooLarge),
+		errors.Is(err, pushbroker.ErrPackInvalid):
+		// A tip the pack never delivered, a pack over the reconstruction budget, or a
+		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
+		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, nil
+	default:
+		return PublishResult{}, fmt.Errorf("publish: %w", err)
+	}
+}
+
+// forgeHostFromURL reduces a URL (here the clone URL, repo_web_url + ".git") to the
+// scheme+host form the forge allowlist gate matches: https-only, lowercased host,
+// no path/query/fragment. It mirrors config.NormalizeForgeBaseURL deliberately —
+// kept local so workersvc does not depend on the config package — so the value
+// handed to forgeBaseURLAllowed is the same shape the allowlist was built from.
+func forgeHostFromURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(u.Scheme, "https") || u.Host == "" {
+		return "", fmt.Errorf("clone URL %q must be https with a host", raw)
+	}
+	return "https://" + strings.ToLower(u.Host), nil
 }
 
 // -------------------------------------------------------------------------

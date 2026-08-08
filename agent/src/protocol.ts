@@ -933,6 +933,21 @@ export function resolveAgentSelection(
  *  which line, and that ambiguity has already produced one wrong citation acted on by
  *  three people — `protocol.ts:451` was read as the claim payload when it is
  *  `WorkerRunDetail`. Scope to the enclosing interface before concluding anything. */
+/**
+ * PRD #122 M8 — response to `POST /api/worker/runs/{id}/publish`, the brokered origin
+ * publish of a checkpoint pack. The REQUEST has no JSON type: the packfile is the raw
+ * `application/octet-stream` body and the checkpoint tip OID travels in the
+ * `X-Uzi-Checkpoint-Tip: <40-hex-lowercase-sha>` header. On success `published` is true
+ * and `ref` names the landed `refs/uzi-checkpoints/<branch>`; a best-effort skip sets
+ * `published` false and carries `skipped`. Any non-2xx is ignored by the worker — a
+ * publish failure never fails the run.
+ */
+export interface PublishResponse {
+  published: boolean;
+  ref: string;
+  skipped?: "no_ref" | "not_descendant" | "unsupported";
+}
+
 export interface StateRequest {
   status: RunState;
   /** awaiting_approval carries the captured plan. */

@@ -440,6 +440,19 @@ export class RunRunner {
             text: `recovered ${runnerClone.priorCommits} commit(s) of work from this run's interrupted attempt`,
           },
         });
+      } else if (runnerClone.seededFrom === "checkpoint" && runnerClone.priorCommits > 0) {
+        // PRD #122 M8: seeded off ANOTHER worker's brokered checkpoint (origin's
+        // refs/uzi-checkpoints/<branch>) — a cross-worker recovery the lead cannot infer
+        // from the tree alone. priorCommits counts what the checkpoint carries. Gated on
+        // priorCommits > 0 (like the tracking notice above) so it never claims to have
+        // "recovered 0 commit(s) from a checkpoint".
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `recovered ${runnerClone.priorCommits} commit(s) from a checkpoint on another worker`,
+          },
+        });
       } else if (claim.session_id != null && runnerClone.seededFrom === "default") {
         batcher.emit({
           kind: "status",
@@ -448,6 +461,19 @@ export class RunRunner {
             text:
               "no earlier work could be recovered for this run on this worker — " +
               "starting from the default branch, so some work may be repeated",
+          },
+        });
+      }
+      // PRD #122 M8: a mirrored checkpoint existed but DIVERGED from origin, so origin won
+      // and the checkpointed work was set aside. Independent of the seed leg (the base is
+      // origin/default here, not the checkpoint) — say so LOUDLY rather than dropping it
+      // silently.
+      if (runnerClone.checkpointSetAside) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "checkpointed work was set aside — origin diverged; starting from origin",
           },
         });
       }
@@ -763,6 +789,20 @@ export class RunRunner {
             runId,
             runLog,
           );
+          // PRD #122 M8: broker the checkpoint pack to origin (refs/uzi-checkpoints/<branch>)
+          // so another worker can recover it cross-worker. ONLY on the cooperative reap path
+          // (Decision 10b) — the reap:false fallback must not publish — and STRICTLY after
+          // the fetch-back, which updated the tracking ref checkpointPack reads. The pack
+          // computation is credential-free but stays after the reap for the callback's
+          // temporal-closure invariant. Best-effort: a publish never fails the run.
+          if (opts.reap) {
+            await this.publishCheckpointBestEffort(
+              barePath,
+              runnerClone.branch,
+              runId,
+              runLog,
+            );
+          }
           // Report the checkpointed milestone as a `running` report — additive-optional
           // (milestone fields omitted when no progress) and wrapped so it never throws. NO
           // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
@@ -1197,6 +1237,31 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
+  }
+
+  /**
+   * PRD #122 M8 — broker the checkpoint pack to origin, best-effort. Mirrors
+   * fetchBackBestEffort for symmetry: compute the delta pack of
+   * `<origin|default>..refs/uzi-runner/<branch>` (null ⇒ nothing to publish) and ship it
+   * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
+   * worker to recover cross-worker. Fired ONLY on a cooperative (reap:true) checkpoint and
+   * AFTER the fetch-back updated the tracking ref checkpointPack reads. Every failure — a
+   * null pack, a non-2xx (returned as null by the client), a thrown error — is swallowed
+   * with a warn so a publish NEVER fails the run.
+   */
+  private async publishCheckpointBestEffort(
+    barePath: string,
+    branch: string,
+    runId: string,
+    runLog: Logger,
+  ): Promise<void> {
+    try {
+      const packed = await this.git.checkpointPack(barePath, branch);
+      if (!packed) return;
+      await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
+    } catch (e) {
+      runLog.warn("checkpoint publish failed", { error: errMessage(e) });
+    }
   }
 
   /**

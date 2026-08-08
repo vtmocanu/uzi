@@ -1,7 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
@@ -213,8 +214,19 @@ export interface RunnerClone {
    *  worker-side tracking ref `refs/uzi-runner/<branch>` (the interrupted attempt's
    *  recovered work), `"default"` when neither applied and the seed is the default
    *  tip. Read by the runner to decide what M3's feed status says: `"tracking"` names
-   *  the recovered commit count, `"default"` on a RESUME admits the tree was lost. */
-  seededFrom: "origin" | "tracking" | "default";
+   *  the recovered commit count, `"default"` on a RESUME admits the tree was lost.
+   *
+   *  PRD #122 M8 adds `"checkpoint"`: on a NOT-ownedHere leg (cross-worker / fresh)
+   *  the base came from origin's mirrored `refs/uzi-checkpoints/<branch>` — a DIFFERENT
+   *  worker's brokered checkpoint that strictly descends the floor (origin branch, else
+   *  default). It is a resume leg like `"tracking"`, so priorCommits counts the recovered
+   *  commits. */
+  seededFrom: "origin" | "tracking" | "default" | "checkpoint";
+  /** PRD #122 M8 — true when a mirrored checkpoint ref existed but LOST to origin/default
+   *  because it had diverged (not a strict descendant of the floor). Origin/default wins on
+   *  divergence — never a silent merge or discard — and the runner emits a LOUD worker
+   *  notice so the set-aside work is not lost silently. Absent/false on every other leg. */
+  checkpointSetAside?: boolean;
 }
 
 /**
@@ -362,6 +374,17 @@ export class GitCache {
    *     protect and the current default tip is not a meaningful reference (it may have
    *     moved far past the fork point, which is exactly the case a uniform ancestor
    *     test discards the recovered work on).
+   *
+   * PRD #122 M8 adds a FOURTH candidate, `refs/uzi-checkpoints/<branch>`, the CROSS-WORKER
+   * signal path: a DIFFERENT worker brokered its checkpoint to origin (M8 publish), and
+   * `fetch()` mirrored origin's checkpoint refs into this bare. It matters ONLY on the
+   * NOT-ownedHere legs — when THIS run owns the local tracking ref, that ref is
+   * equal-or-ahead of any checkpoint (the checkpoint was pushed FROM the tracking state),
+   * so the checkpoint adds nothing and the ownedHere legs above are unchanged. On a
+   * not-ownedHere leg the floor is the origin branch if pushed, else the default; the
+   * checkpoint is preferred ONLY when it strictly descends that floor. On divergence
+   * origin/default WINS — never a silent merge or discard — and `checkpointSetAside` is set
+   * so the runner emits a loud notice.
    * The git layer is claim-agnostic: `runId` is a plain string the runner threads from
    * `claim.run_id`; nothing here knows about sessions. `runId` undefined ⇒ never owned ⇒
    * today's behaviour, which keeps the no-runId test call sites compiling.
@@ -399,9 +422,14 @@ export class GitCache {
         ? await this.tryGitStdout(barePath, ["config", "--get", runnerTrackingOwnerKey(branch)])
         : "";
       const ownedHere = trackingExists && runId !== undefined && owner === runId;
+      // PRD #122 M8 cross-worker candidate: origin's checkpoint ref, mirrored into the bare
+      // by fetch(). Consulted ONLY on the not-ownedHere legs (see the doc comment).
+      const checkpointRef = `refs/uzi-checkpoints/${branch}`;
+      const checkpointExists = await this.refExists(barePath, checkpointRef);
 
       let baseRef: string;
       let seededFrom: RunnerClone["seededFrom"];
+      let checkpointSetAside = false;
       if (ownedHere && originExists) {
         // Both present: prefer the recovered local work ONLY when it strictly descends
         // from origin; on divergence origin wins so a published commit is never dropped.
@@ -413,12 +441,39 @@ export class GitCache {
         // test, because the current default tip is not a meaningful reference here.
         baseRef = trackingRef;
         seededFrom = "tracking";
-      } else if (originExists) {
-        baseRef = originRef;
-        seededFrom = "origin";
       } else {
-        baseRef = await this.defaultBranchRef(barePath);
-        seededFrom = "default";
+        // NOT owned here — cross-worker / fresh. Floor = origin branch if pushed, else
+        // default. A mirrored checkpoint (PRD #122 M8) from another worker wins ONLY when
+        // it strictly descends the floor; on divergence origin/default wins, LOUDLY.
+        const floorRef = originExists ? originRef : await this.defaultBranchRef(barePath);
+        const floorFrom: RunnerClone["seededFrom"] = originExists ? "origin" : "default";
+        baseRef = floorRef;
+        seededFrom = floorFrom;
+        if (checkpointExists) {
+          // isAncestor (merge-base --is-ancestor) is TRUE at EQUALITY, so an ancestor test
+          // alone would seed a checkpoint that EQUALS the floor as "checkpoint" though nothing
+          // was recovered. Require a STRICT descendant: reachable from the floor AND a
+          // different commit. Compare the resolved SHAs (the isAncestor pass already proved
+          // both refs resolve).
+          if (await this.isAncestor(barePath, floorRef, checkpointRef)) {
+            const checkpointSha = (
+              await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${checkpointRef}^{commit}`])
+            ).trim();
+            const floorSha = (
+              await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${floorRef}^{commit}`])
+            ).trim();
+            if (checkpointSha !== "" && checkpointSha !== floorSha) {
+              baseRef = checkpointRef;
+              seededFrom = "checkpoint";
+            }
+            // else EQUAL to the floor: fall through to the floor. Equality is NOT divergence,
+            // so checkpointSetAside stays false — nothing was set aside.
+          } else {
+            // Diverged: the checkpoint is not reachable from the floor. origin/default WINS,
+            // loudly (checkpointSetAside → feed notice).
+            checkpointSetAside = true;
+          }
+        }
       }
       const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
       // How many commits the seed carries ahead of the default branch. On the origin
@@ -468,7 +523,7 @@ export class GitCache {
       await this.runGitAsRunner(clonePath, ["config", "user.email", AGENT_GIT_IDENTITY.email]);
       await this.runGitAsRunner(clonePath, ["config", "commit.gpgsign", "false"]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
-      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom };
+      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom, checkpointSetAside };
     });
   }
 
@@ -610,6 +665,44 @@ export class GitCache {
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
+  /**
+   * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
+   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack }` where `tipOid`
+   * is the tracking-ref tip (the same the checkpoint fetched back) and `pack` STREAMS the
+   * packfile bytes; null when there is no tracking ref yet (nothing to publish).
+   *
+   * The exclude boundary mirrors the reseed's floor: `refs/remotes/origin/<branch>` when
+   * origin carries the branch, else the default branch — so the pack carries only what the
+   * checkpoint added beyond what origin already has.
+   *
+   * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
+   * this spawns `git pack-objects --revs --stdout` and hands back its stdout as a Readable
+   * for the client to upload directly. Credential-free: this is a LOCAL read of the
+   * WORKER-OWNED bare by the worker uid (base gitEnv, no PAT, no runner-uid switch — the
+   * runner does not own the bare). A shared lock is not taken: pack-objects reads a
+   * consistent object snapshot, and this is a read, not a mutation.
+   */
+  async checkpointPack(
+    barePath: string,
+    branch: string,
+  ): Promise<{ tipOid: string; pack: Readable } | null> {
+    const tipOid = await this.trackingTip(barePath, branch);
+    if (!tipOid) return null;
+    const originRef = `refs/remotes/origin/${branch}`;
+    const excludeRef = (await this.refExists(barePath, originRef))
+      ? originRef
+      : await this.defaultBranchRef(barePath);
+    const trackingRef = runnerTrackingRef(branch);
+    // pack-objects reads the wanted/excluded revs on stdin (one ref per line, `^` excludes)
+    // and writes the packfile to stdout.
+    const { stdout } = this.spawnGit(
+      barePath,
+      ["pack-objects", "--revs", "--stdout"],
+      `${trackingRef}\n^${excludeRef}\n`,
+    );
+    return { tipOid, pack: stdout };
+  }
+
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string): Promise<void> {
@@ -666,6 +759,20 @@ export class GitCache {
     // Refresh origin/HEAD so a remote default-branch change takes effect. Best
     // effort: defaultBranchRef has fallbacks if this symref is absent.
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
+    // PRD #122 M8 — mirror origin's brokered checkpoint refs into the bare, BEST-EFFORT.
+    // This is the CROSS-WORKER signal path: a worker with no local refs/uzi-runner/<branch>
+    // can still pull ANOTHER worker's published refs/uzi-checkpoints/<branch> and seed off
+    // it (runnerCloneForBranch's checkpoint candidate). Rides the authenticated fetch (the
+    // PAT is available here). Tolerates absence — origin may carry no such refs (fetch
+    // succeeds fetching nothing), and the `.catch` covers an older server or a permission
+    // edge that would otherwise surface as a fetch error.
+    await this.runGit(
+      barePath,
+      ["fetch", "origin", "+refs/uzi-checkpoints/*:refs/uzi-checkpoints/*"],
+      pat,
+      scope,
+      username,
+    ).catch(() => undefined);
   }
 
   /** Resolve a ref for the repo's default branch (the runner-clone base + the
@@ -716,6 +823,40 @@ export class GitCache {
     } catch (err) {
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     }
+  }
+
+  /**
+   * Spawn a git subprocess and STREAM its stdout (PRD #122 M8), for an output that can
+   * exceed runGit's 64 MiB `maxBuffer` cap — a checkpoint packfile. Plain `spawn` as the
+   * WORKER uid on the credential-free base gitEnv: the worker owns the bare it reads, so
+   * there is no runner-uid switch and no PAT. Writes the optional `stdin` and ends it, then
+   * returns the child and its stdout so the caller can pipe/drain it.
+   *
+   * On a nonzero exit (or a spawn error) the stdout stream is DESTROYED with an Error, so a
+   * consumer streaming it (the publish upload) sees the failure and the caller's best-effort
+   * `.catch` fires rather than a truncated pack landing silently.
+   */
+  private spawnGit(
+    cwd: string,
+    args: string[],
+    stdin?: string,
+  ): { child: ChildProcess; stdout: Readable } {
+    const env = gitEnv();
+    this.log.debug("git (spawn)", { cwd, args });
+    const child = spawn("git", withDir(cwd, args), { env });
+    const stderrChunks: Buffer[] = [];
+    child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+    child.on("error", (err) => child.stdout?.destroy(err));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const detail = Buffer.concat(stderrChunks).toString().trim();
+        child.stdout?.destroy(
+          new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`),
+        );
+      }
+    });
+    if (child.stdin) child.stdin.end(stdin ?? "");
+    return { child, stdout: child.stdout as Readable };
   }
 
   /**

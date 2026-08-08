@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 import { GitCache, bareDirName, gitEnv } from "../src/git.js";
@@ -297,6 +298,135 @@ describe("branchTip / trackingTip (PRD #122 M6)", () => {
     const rc = await git.createOrAttachRunnerClone(bare, 8);
     assert.strictEqual(await git.branchTip(rc.path, "agent/issue-does-not-exist"), null);
     assert.strictEqual(await git.trackingTip(bare, "agent/issue-does-not-exist"), null);
+  });
+});
+
+describe("checkpoint reseed candidate (PRD #122 M8)", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+  /** Commit `file` in the runner clone and return the new HEAD sha. */
+  function commit(dir: string, file: string): string {
+    fs.writeFileSync(path.join(dir, file), `${file}\n`);
+    gitIn(dir, ["add", file]);
+    gitIn(dir, [...IDENT, "commit", "-m", `work ${file}`]);
+    return gitIn(dir, ["rev-parse", "HEAD"]);
+  }
+
+  it("(a) seeds off a mirrored checkpoint that strictly descends the floor when no owned tracking ref exists", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Build a checkpoint commit descending the default branch, land its objects in the
+    // bare (as a fetch-back would), and publish it as origin's mirrored checkpoint ref.
+    const seed = await git.createOrAttachRunnerClone(bare, 700, "run-A");
+    const cpSha = commit(seed.path, "CP.txt");
+    await git.fetchAgentBranch(bare, seed.path, "agent/issue-700", "run-A");
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-700", cpSha]);
+    // Simulate a DIFFERENT worker: no local refs/uzi-runner/<branch> here.
+    gitIn(bare, ["update-ref", "-d", "refs/uzi-runner/agent/issue-700"]);
+    await git.removeRunnerClone(seed.path);
+
+    // A fresh cross-worker run (different runId, no origin branch) seeds off the checkpoint.
+    const rc = await git.createOrAttachRunnerClone(bare, 700, "run-B");
+    assert.strictEqual(rc.seededFrom, "checkpoint");
+    assert.strictEqual(rc.baseCommit, cpSha, "baseCommit is the checkpoint tip");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "CP.txt")), true, "checkpointed work checked out");
+    assert.notStrictEqual(rc.checkpointSetAside, true);
+  });
+
+  it("(b) origin wins and the checkpoint is set aside LOUDLY when the checkpoint diverged from origin", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // Cycle 1: push agent/issue-701 to origin at commit A.
+    const first = await git.createOrAttachRunnerClone(bare, 701, "run-1");
+    const shaA = commit(first.path, "A.txt");
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-701", "run-1");
+    await git.pushBranch(bare, "agent/issue-701", "", fx.originPath);
+    await git.removeRunnerClone(first.path);
+    await git.ensureClone(fx.originPath); // refresh origin-tracking so origin/agent/issue-701 exists
+
+    // A DIVERGED checkpoint: a sibling of A off the default branch (neither descends the
+    // other). Built on a throwaway branch so its commit objects reach the bare, then
+    // republished under issue-701's checkpoint ref.
+    const sib = await git.createOrAttachRunnerClone(bare, 7011, "run-sib");
+    const cpxSha = commit(sib.path, "CPX.txt");
+    await git.fetchAgentBranch(bare, sib.path, "agent/issue-7011", "run-sib");
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-701", cpxSha]);
+    await git.removeRunnerClone(sib.path);
+
+    // Reseed issue-701 as a DIFFERENT run: origin exists and the checkpoint diverged from it.
+    const rc = await git.createOrAttachRunnerClone(bare, 701, "run-2");
+    assert.strictEqual(rc.seededFrom, "origin", "origin wins on divergence");
+    assert.strictEqual(rc.baseCommit, shaA);
+    assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is flagged, not dropped silently");
+  });
+
+  it("(c) absent checkpoint ⇒ unchanged behaviour (fresh seed off default, no set-aside)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 702, "run-C");
+    assert.strictEqual(rc.seededFrom, "default");
+    assert.notStrictEqual(rc.checkpointSetAside, true);
+  });
+
+  it("(d) ownedHere local tracking ref still wins over a present checkpoint (same-worker work is not overridden)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc1 = await git.createOrAttachRunnerClone(bare, 800, "run-D");
+    const shaD = commit(rc1.path, "D.txt");
+    await git.fetchAgentBranch(bare, rc1.path, "agent/issue-800", "run-D"); // tracking owned by run-D
+    // A checkpoint that WOULD win the not-ownedHere path (it descends the default floor).
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-800", shaD]);
+    await git.removeRunnerClone(rc1.path);
+
+    // Reseed as the SAME run: the owned tracking ref is consulted, the checkpoint ignored.
+    const rc = await git.createOrAttachRunnerClone(bare, 800, "run-D");
+    assert.strictEqual(rc.seededFrom, "tracking", "the checkpoint must not override same-worker local work");
+    assert.strictEqual(rc.baseCommit, shaD);
+    assert.notStrictEqual(rc.checkpointSetAside, true);
+  });
+
+  it("(e) checkpoint EQUAL to the floor ⇒ falls through to the floor (not 'checkpoint'), no set-aside", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    // A checkpoint ref pointing at EXACTLY the floor (the default branch tip). isAncestor
+    // (merge-base --is-ancestor) is TRUE at equality, so the strict-descendant guard must
+    // keep an equal checkpoint from being seeded as "checkpoint" — nothing was recovered —
+    // and equality is NOT divergence, so it is not "set aside" either.
+    const floorSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/HEAD"]);
+    gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-703", floorSha]);
+
+    const rc = await git.createOrAttachRunnerClone(bare, 703, "run-E");
+    assert.notStrictEqual(rc.seededFrom, "checkpoint", "an equal checkpoint recovers nothing");
+    assert.strictEqual(rc.seededFrom, "default", "falls through to the default floor");
+    assert.strictEqual(rc.baseCommit, floorSha);
+    assert.notStrictEqual(rc.checkpointSetAside, true, "equality is not divergence");
+  });
+});
+
+describe("checkpointPack (PRD #122 M8)", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+  async function drain(r: Readable): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const c of r) chunks.push(c as Buffer);
+    return Buffer.concat(chunks);
+  }
+
+  it("returns null with no tracking ref, and a valid non-empty pack whose tipOid is the tracking tip once one exists", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 900, "run-p");
+
+    // No fetch-back yet ⇒ no tracking ref ⇒ nothing to publish.
+    assert.strictEqual(await git.checkpointPack(bare, "agent/issue-900"), null);
+
+    // Commit + fetch-back so the tracking ref is ahead of the default branch.
+    fs.writeFileSync(path.join(rc.path, "P.txt"), "p\n");
+    gitIn(rc.path, ["add", "P.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "p"]);
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-900", "run-p");
+    const tip = await git.trackingTip(bare, "agent/issue-900");
+
+    const packed = await git.checkpointPack(bare, "agent/issue-900");
+    assert.ok(packed, "a tracking ref ahead of default yields a pack");
+    assert.strictEqual(packed!.tipOid, tip, "tipOid is the tracking-ref tip");
+    const buf = await drain(packed!.pack);
+    assert.ok(buf.length > 0, "the pack is non-empty");
+    assert.strictEqual(buf.subarray(0, 4).toString("ascii"), "PACK", "a real packfile starts with the PACK signature");
   });
 });
 

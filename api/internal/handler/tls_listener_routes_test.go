@@ -47,6 +47,9 @@ func TestTLSListenerServesOnlyTheWorkerAndControllerSurface(t *testing.T) {
 		{http.MethodPost, "/api/worker/register"},
 		{http.MethodPost, "/api/worker/heartbeat"},
 		{http.MethodPost, "/api/worker/runs/claim"},
+		// PRD #122 M8 checkpoint publish. The worker dials the SAME TLS listener, so a
+		// route reachable on the plain listener but not here would 404 in production.
+		{http.MethodPost, "/api/worker/runs/00000000-0000-0000-0000-000000000000/publish"},
 		{http.MethodGet, "/api/controller/poll"},
 		// The controller also POSTs roll health here (PRD #113 M4). It dials the SAME
 		// TLS listener, so a route reachable on the plain listener but not this one
