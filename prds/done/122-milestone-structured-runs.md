@@ -1,7 +1,7 @@
 # PRD #122: Milestone-structured runs — approved milestones, live progress, and mid-run checkpoints
 
 **GitLab Issue**: [#122](https://gitlab.example.com/vtmocanu/uzi/-/issues/122)
-**Status**: Draft (created 2026-07-24; revised same day after a fable adversarial review that opened every cited reference and verified each load-bearing claim against the code — the review found all citations sound but corrected the loss model in Problem §3, exposed an unscoped server-side change in M2, pinned down Decision 9, and added the server-validation decision; see the Decision Log)
+**Status**: COMPLETE (2026-08-08) — all milestones resolved. Phase 1 (M1–M5: milestone data + budget resize, web/Slack/CLI display) and Phase 2–3 (M6 proactive checkpoint, M8 brokered origin publish) landed; M7 delivered by PRD #218. Two live-recovery criteria (M6 SIGKILL same-worker resume, M8 cross-worker recovery) are provable only after the agent/api images ship to dev-cluster — noted inline on M6/M8, not blockers to the code landing. (Created 2026-07-24; revised same day after a fable adversarial review that opened every cited reference and verified each load-bearing claim against the code — the review found all citations sound but corrected the loss model in Problem §3, exposed an unscoped server-side change in M2, pinned down Decision 9, and added the server-validation decision; see the Decision Log.)
 **Priority**: Medium
 **Related**: [#218](https://gitlab.example.com/vtmocanu/uzi/-/issues/218) (**park/requeue work-loss — SHIPPED 0.15.0 + branch `218-m6`, validated live 2026-08-04; it built the durability primitive this PRD's Phase 2 proposed, so Phase 2 is superseded in part — see the banner below and Decisions 7 & 9**), [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; **this PRD reopens the door its analysis closed, by a route that PRD did not consider — see Decision 8**), [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105) (session lost on a different-worker requeue), [#41](https://gitlab.example.com/vtmocanu/uzi/-/issues/41) (plan revision — the gate loop this must not break), [#51](https://gitlab.example.com/vtmocanu/uzi/-/issues/51) (worker uid split), [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58) (single-uid non-root start — the k8s posture that made #110 unsafe). Durability cluster that landed or was filed AFTER this PRD was drafted and that Phase 2 must be reconciled against: [#216](https://gitlab.example.com/vtmocanu/uzi/-/issues/216) (worker load-balancing / `ClaimRun` rewrite + affinity grace), [#217](https://gitlab.example.com/vtmocanu/uzi/-/issues/217) (which credential a resume spends), [#224](https://gitlab.example.com/vtmocanu/uzi/-/issues/224) (requeue work-loss with no usage limit), [#222](https://gitlab.example.com/vtmocanu/uzi/-/issues/222) (steering-channel staleness across a re-clone).
 
@@ -439,7 +439,7 @@ same push-permission check.
       seven-milestone plan no longer trips the cap at turn 5 **and is not swept
       to failed at the global 2h**, a single-milestone plan's budget is unchanged
       from today, and a scaled run does not render as "slow" for its whole life.
-- [ ] **M3 — Web progress UI**: `RunView` renders a milestone checklist (done /
+- [x] **M3 — Web progress UI**: `RunView` renders a milestone checklist (done /
       in progress / left) with copy that does not imply verification (Decision
       6); `Dashboard` shows a compact `M3/7` badge alongside its existing
       iteration badge and `RunsList` gains one (it has none today); the plan gate
@@ -447,7 +447,16 @@ same push-permission check.
       human approves what they are approving. Mocks + tests updated. NULL
       milestones render today's badge. **Verified**: progress updates live over
       the existing run stream with no new endpoint.
-- [ ] **M4 — Slack milestone progress**: a run that is linked to Slack (PRD #25)
+      - *2026-08-08 — landed.* `runBadge.milestoneBadge` (done clamped to frozen
+        membership), the `MilestoneChecklist` ("Milestones (reported complete)",
+        never "verified") and `M{n}/{m}` badge on RunView/Dashboard/RunsList, and
+        the plan-gate "Proposed milestones" candidate list rendered as plain JSX
+        (never `<Markdown>` — untrusted titles). No new endpoint: the frozen list
+        and progress ids were already on the DTO; the one addition was a read-only
+        `milestones_candidate` DTO field decoding the already-stored, already-
+        validated `runs.milestones_candidate` (`apitypes/run.go`, `handler/workers.go`).
+        Full web suite + api tests green; reviewer + auditor + web-ux clean.
+- [x] **M4 — Slack milestone progress**: a run that is linked to Slack (PRD #25)
       shows its milestone progress there, in the surface the owner actually
       watches. In the notifier (`api/internal/slacksvc/notifier.go`, inside the
       existing run-state `handle`, alongside `handleGate`): the root status line
@@ -473,10 +482,29 @@ same push-permission check.
       **Verified**: a linked run reflects each completion in its thread exactly
       once and never re-broadcasts on a repeated `running` report; an unlinked run
       behaves exactly as today.
-- [ ] **M5 — CLI parity**: `uzi` run show/list surface the same milestone
+      - *2026-08-08 — landed.* Migration `00100` adds a nullable
+        `milestones_notified_completed` on `slack_run_messages` with a count-guarded
+        `SetSlackRunMilestoneNotified` setter (distinct from `gate_generation`, per
+        the 00093 reasoning); `GetSlackRunContext` selects the three milestone
+        columns; the notifier renders a `· 3/7` root-line counter and posts ONE
+        `✓ 3/7 · working <title>` thread line on a strict count advance
+        (`handleMilestone`, only on the existing-message branch — never the first
+        post), title through `EscapeMrkdwn` + `ScrubSecrets`, decoded locally (no
+        `workersvc` import). `+2` jumps post one line and aren't lost; a repeated
+        report posts nothing; unlinked/no-milestone runs behave as today. sqlc regen
+        committed; slacksvc tests + reviewer + auditor clean.
+- [x] **M5 — CLI parity**: `uzi` run show/list surface the same milestone
       progress as the web, per the repo's "new functionality ⇒ check the CLI"
       convention. **Verified**: `uzi run show <id> --json` carries the milestone
       fields and the human output shows the same state the web does.
+      - *2026-08-08 — landed.* `--json` was already free (whole-DTO marshal, wire
+        pin already lists the keys). `renderRunDetail` gains a `MILESTONES  N/M
+        reported complete` summary (never "verified"; done clamped to frozen
+        membership) + a per-milestone done/in-progress/left breakdown with each
+        title through `cellText` (untrusted), plus `BUDGET_ITERATIONS`/`BUDGET_WALL`
+        when the effective budget is set; a no-milestone run is byte-for-byte
+        unchanged. Unit + e2e + hostile-title sanitization tests; reviewer +
+        auditor clean.
 
 **Phase 2 — durability (still no credential). RE-SCOPED 2026-08-07 against PRD #218 — read the banner at the top and `prds/done/218-park-resume-work-loss.md` before starting. #218 shipped the tracking-ref + fetch-back + strict-descendant-reseed foundation this phase was originally built around; only the delta below remains, and it is optional (Phase 1 is the feature).**
 
@@ -524,8 +552,8 @@ same push-permission check.
         be confirmed after this agent image ships to dev-cluster. Proven here is the
         unit-level behavior (reap ordering, credential-free fetch call, no-op
         rejection, no-reap fallback), not the live durability outcome.
-- [ ] ~~**M7 — Resume precision**~~ — **DELIVERED by PRD #218 (M2/M3), dropped
-      2026-08-07.** #218 already carries the recovered-commit count into the resume
+- [x] ~~**M7 — Resume precision**~~ — **DELIVERED by PRD #218 (M2/M3), dropped
+      2026-08-07** (ticked as resolved-elsewhere, not built by this PRD). #218 already carries the recovered-commit count into the resume
       (`priorWork` widened) and states it in the feed either way. The only piece
       this PRD adds on top is naming progress by **milestone** rather than by
       commit count, which is a trivial rider on M6 once the completed set rides the

@@ -72,6 +72,9 @@ var runDTOKeys = []string{
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
 	"auto_approve", "milestones",
+	// PRD #122 M3: the PRE-APPROVAL candidate list (nil ⇒ null), always on the wire; the
+	// web renders it only at the plan gate so the human approves the proposed breakdown.
+	"milestones_candidate",
 	// PRD #122 M2: live progress (id arrays, nil ⇒ null) and the effective per-run
 	// budget (nil ⇒ null ⇒ the global default). All four always present; a client
 	// branches per field. budget_* are load-bearing on the state-ack, not just display.

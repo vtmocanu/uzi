@@ -54,6 +54,18 @@ type RunDTO struct {
 	// nil on the create/worker DTO paths. The pre-approval CANDIDATE list is never
 	// exposed here — only the frozen list is served.
 	Milestones []Milestone `json:"milestones"`
+	// MilestonesCandidate is the run's PRE-APPROVAL candidate milestone list (PRD #122 M3),
+	// decoded from runs.milestones_candidate. It is read-only and additive — the same
+	// {id,title} objects as Milestones, but the breakdown the worker PROPOSED, before a
+	// human approved it. A nil slice marshals to JSON null; the web renders it ONLY at the
+	// plan gate (status awaiting_approval), so the human approves the proposed breakdown,
+	// and ignores it everywhere else — a frozen run reads its approved list off Milestones.
+	// The titles are UNTRUSTED display text a consumer writing them to a terminal must
+	// sanitize, the same obligation Milestones and RepoAgent.Description carry. Populated
+	// wherever the store row is decoded through the shared runToDTO — the browser run reads
+	// AND the worker's own awaiting_approval report echo (which serialises the candidate the
+	// worker just submitted back to it); nil on the create DTO path, which has no store row.
+	MilestonesCandidate []Milestone `json:"milestones_candidate"`
 	// MilestonesCompleted and MilestonesInProgress are the run's live progress (PRD #122
 	// M2), decoded from runs.milestones_completed / _in_progress: arrays of frozen
 	// milestone IDS (not {id,title} objects — the titles live on Milestones above; these

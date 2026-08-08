@@ -9,7 +9,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
-import { mrChipState } from "../lib/runBadge";
+import { milestoneBadge, mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
@@ -328,6 +328,8 @@ export function Dashboard() {
           <ul className="mt-2 divide-y divide-edge">
             {recent.map((r) => {
               const mrState = mrChipState(r.mr_state);
+              // PRD #122: compact milestone progress; null for a non-milestone run.
+              const ms = milestoneBadge(r);
               return (
               <li key={r.id}>
                 <Link
@@ -355,6 +357,13 @@ export function Dashboard() {
                   {r.iteration_count > 0 && (
                     <Badge tone="neutral" title="implement ⇄ review iterations">
                       iter {r.iteration_count}
+                    </Badge>
+                  )}
+                  {/* PRD #122: compact milestone progress next to the iter badge; a
+                      non-milestone run keeps only the iter badge. */}
+                  {ms && (
+                    <Badge tone="info" title="Milestones reported complete of the approved plan">
+                      M{ms.done}/{ms.total}
                     </Badge>
                   )}
                   <RunHealthBadge run={r} />

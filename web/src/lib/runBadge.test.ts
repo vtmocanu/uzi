@@ -10,6 +10,7 @@ import {
   isAwaitingInput,
   isHealthFlaggableStatus,
   isStoppedRun,
+  milestoneBadge,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
@@ -443,6 +444,38 @@ describe("isAwaitingApproval (attention strip filter)", () => {
     expect(isAwaitingInput("awaiting_input")).toBe(true);
     expect(isAwaitingInput("awaiting_approval")).toBe(false);
     expect(isAwaitingInput("running")).toBe(false);
+  });
+});
+
+describe("milestoneBadge (M{done}/{total}, PRD #122)", () => {
+  const ms = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
+
+  it("returns null when there is no frozen milestone list (fall back to iteration badge)", () => {
+    expect(milestoneBadge({ milestones: null, milestones_completed: null })).toBeNull();
+    expect(milestoneBadge({ milestones: [], milestones_completed: ["m1"] })).toBeNull();
+    // Missing keys entirely (a pre-#122 api pod omits them) reads as no milestones.
+    expect(milestoneBadge({})).toBeNull();
+  });
+
+  it("a 3-of-7 run → { done: 3, total: 7 }", () => {
+    expect(
+      milestoneBadge({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] }),
+    ).toEqual({ done: 3, total: 7 });
+  });
+
+  it("completed ids not in the frozen list are CLAMPED, so done never exceeds total", () => {
+    // milestones_completed is a monotone union: it can still name an id dropped from
+    // the approved set. Counting it would read M8/7. Only frozen members count.
+    expect(
+      milestoneBadge({
+        milestones: ms(7),
+        milestones_completed: ["m1", "m2", "m3", "dropped-a", "dropped-b"],
+      }),
+    ).toEqual({ done: 3, total: 7 });
+  });
+
+  it("a null milestones_completed counts as zero done", () => {
+    expect(milestoneBadge({ milestones: ms(4), milestones_completed: null })).toEqual({ done: 0, total: 4 });
   });
 });
 

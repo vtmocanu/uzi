@@ -13,6 +13,8 @@ import {
   SeededPlanPanel,
   AgentRosterSummary,
   JudgePanel,
+  MilestoneBadge,
+  MilestoneChecklist,
   RunHeading,
   RunCompletedLine,
   RunFailureReason,
@@ -102,6 +104,14 @@ function run(over: Partial<Run>): Run {
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: a non-milestone run by default, so every existing case exercises the
+    // null-fallback path (no checklist, no M badge, iteration badge unchanged).
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: null,
+    budget_wall_seconds: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
     anthropic_select_reason: null,
@@ -2514,5 +2524,105 @@ describe("the park announcement does not live inside the panel (PRD #88 M2, a11y
   it("QuestionPanel declares no live region of its own", () => {
     expect(questionPanelSource).not.toContain("aria-live");
     expect(questionPanelSource).not.toContain('role="status"');
+  });
+});
+
+// PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
+describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
+  const ms = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
+
+  it("renders M{done}/{total} for a milestone-structured run", () => {
+    render(<MilestoneBadge run={run({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] })} />);
+    expect(screen.getByText("M3/7")).toBeTruthy();
+  });
+
+  it("renders NOTHING for a run with no milestones — the iteration badge stands alone", () => {
+    const { container } = render(<MilestoneBadge run={run({ milestones: null })} />);
+    expect(container.textContent).toBe("");
+  });
+});
+
+describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
+  const milestones = [
+    { id: "a", title: "First milestone" },
+    { id: "b", title: "Second milestone" },
+    { id: "c", title: "Third milestone" },
+  ];
+
+  it("renders every title with a done / in-progress / left indicator", () => {
+    render(
+      <MilestoneChecklist run={run({ milestones, milestones_completed: ["a"], milestones_in_progress: ["b"] })} />,
+    );
+    expect(screen.getByText("First milestone")).toBeTruthy();
+    expect(screen.getByText("Second milestone")).toBeTruthy();
+    expect(screen.getByText("Third milestone")).toBeTruthy();
+    expect(screen.getByLabelText("done")).toBeTruthy();
+    expect(screen.getByLabelText("in progress")).toBeTruthy();
+    expect(screen.getByLabelText("not started")).toBeTruthy();
+  });
+
+  // PRD Decision 6: the worker REPORTS completion; nothing in uzi verified it, so the
+  // copy must not say "verified". This is the header-wording guard.
+  it("says 'reported complete' and NEVER implies verification", () => {
+    const { container } = render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a"] })} />);
+    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    expect(container.textContent?.toLowerCase()).not.toContain("verified");
+  });
+
+  it("shows a done/total count that is clamped to frozen membership", () => {
+    render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a", "b", "gone"] })} />);
+    // "gone" is not a frozen member, so the count clamps to 2/3, never 3/3.
+    expect(screen.getByText("2/3")).toBeTruthy();
+  });
+
+  it("renders NOTHING for a run with no milestones", () => {
+    const { container } = render(<MilestoneChecklist run={run({ milestones: null })} />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("renders an untrusted title as PLAIN text, never a Markdown link", () => {
+    const { container } = render(
+      <MilestoneChecklist
+        run={run({ milestones: [{ id: "x", title: "[pwn](http://evil.test)" }], milestones_completed: [] })}
+      />,
+    );
+    const title = screen.getByText("[pwn](http://evil.test)");
+    expect(title).toBeTruthy();
+    expect(title.closest("a")).toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+  });
+});
+
+describe("PlanPanel proposed milestones (candidate list, PRD #122)", () => {
+  it("renders the candidate titles as plain JSX at the gate, never through Markdown", async () => {
+    render(
+      <PlanPanel
+        run={run({
+          milestones_candidate: [
+            { id: "c1", title: "Ship the thing" },
+            { id: "c2", title: "[pwn](http://evil.test)" },
+          ],
+        })}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByText("Proposed milestones")).toBeTruthy();
+    expect(screen.getByText("Ship the thing")).toBeTruthy();
+    // The untrusted candidate title stays literal text — an approval dialog must never
+    // mint a clickable link from an agent-authored title.
+    const hostile = screen.getByText("[pwn](http://evil.test)");
+    expect(hostile.closest("a")).toBeNull();
+  });
+
+  it("renders no proposed-milestones block when the candidate list is null", async () => {
+    render(
+      <PlanPanel run={run({ milestones_candidate: null })} busy={false} onApprove={() => {}} onReject={() => {}} />,
+    );
+    // Wait for the panel to settle (its best-effort repos fetch resolves), then assert absence.
+    await screen.findByRole("button", { name: /Approve plan/ });
+    expect(screen.queryByText("Proposed milestones")).toBeNull();
   });
 });

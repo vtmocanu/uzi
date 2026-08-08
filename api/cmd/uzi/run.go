@@ -781,6 +781,17 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.StopKind != nil && *r.StopKind != "" {
 		rows = append(rows, []string{"STOP_KIND", sanitizeTTY(*r.StopKind)})
 	}
+	// Milestone progress + effective budget (PRD #122 M5), the CLI twin of the web's
+	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
+	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
+	// same back-compat contract the DTO's nil slices and null budgets carry.
+	rows = append(rows, milestoneRows(r)...)
+	if r.BudgetMaxIterations != nil {
+		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
+	}
+	if r.BudgetWallSeconds != nil {
+		rows = append(rows, []string{"BUDGET_WALL", fmtUntil(time.Duration(*r.BudgetWallSeconds) * time.Second)})
+	}
 	// Which Anthropic credential this run spent (PRD #111 M1). Emitted only when the
 	// server recorded one — a pre-feature or still-queued run has nothing to say and
 	// must not print a blank row.
@@ -850,6 +861,56 @@ func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
 	if r.LimitWaitCount > 0 {
 		rows = append(rows, []string{"LIMIT_WAITS", itoa(int(r.LimitWaitCount)) + " (resumed)"})
 	}
+	return rows
+}
+
+// milestoneRows renders a milestone-structured run's progress block for `uzi run get`
+// (PRD #122 M5): a `{done}/{total} reported complete` summary followed by one indented
+// row per milestone in FROZEN order, marked done / in progress / left. It is the CLI twin
+// of the web's MilestoneChecklist, so both surfaces show the same state off the same fields.
+//
+// Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run is
+// byte-for-byte unchanged — the same back-compat contract the nil Milestones slice carries.
+//
+// The summary says "reported complete", NEVER "verified" (PRD Decision 6): the worker
+// REPORTS a milestone done and nothing in uzi has verified it, so the wording must not
+// imply it has. `done` counts only completed ids that are MEMBERS of the frozen list —
+// milestones_completed is a monotone union that can still name a milestone dropped after
+// it was ticked, and counting those would let the summary read 8/7. Iterating the frozen
+// list (rather than reducing over the completed set) also makes the count immune to a
+// duplicate id, matching the web's milestoneBadge exactly.
+//
+// Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone), so each goes through
+// cellText — the same newline-fold, tab-fold and 200-char cap the ANTHROPIC_TOKEN row
+// relies on, which is what keeps a hostile title from breaking the table rail.
+func milestoneRows(r apitypes.RunDTO) [][]string {
+	if len(r.Milestones) == 0 {
+		return nil
+	}
+	completed := make(map[string]bool, len(r.MilestonesCompleted))
+	for _, id := range r.MilestonesCompleted {
+		completed[id] = true
+	}
+	inProgress := make(map[string]bool, len(r.MilestonesInProgress))
+	for _, id := range r.MilestonesInProgress {
+		inProgress[id] = true
+	}
+	done := 0
+	perMilestone := make([][]string, 0, len(r.Milestones))
+	for _, m := range r.Milestones {
+		state := "left"
+		switch {
+		case completed[m.ID]:
+			state = "done"
+			done++
+		case inProgress[m.ID]:
+			state = "in progress"
+		}
+		perMilestone = append(perMilestone, []string{"  " + state, cellText(m.Title)})
+	}
+	rows := make([][]string, 0, len(r.Milestones)+1)
+	rows = append(rows, []string{"MILESTONES", fmt.Sprintf("%d/%d reported complete", done, len(r.Milestones))})
+	rows = append(rows, perMilestone...)
 	return rows
 }
 

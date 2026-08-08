@@ -36,3 +36,25 @@ func TestRunToDTOMilestones(t *testing.T) {
 		}
 	})
 }
+
+// TestRunToDTOMilestonesCandidate pins how runToDTO surfaces PRD #122 M3's PRE-APPROVAL
+// candidate list: the decoded array when the column holds one, and a nil slice (→ JSON
+// null, the back-compat contract) when it is absent.
+func TestRunToDTOMilestonesCandidate(t *testing.T) {
+	t.Run("candidate list is exposed", func(t *testing.T) {
+		dto := runToDTO(store.Run{
+			ID:                  uuid.New(),
+			MilestonesCandidate: []byte(`[{"id":"m1","title":"First"}]`),
+		})
+		if len(dto.MilestonesCandidate) != 1 || dto.MilestonesCandidate[0].ID != "m1" || dto.MilestonesCandidate[0].Title != "First" {
+			t.Fatalf("dto.MilestonesCandidate = %+v", dto.MilestonesCandidate)
+		}
+	})
+
+	t.Run("no candidate list is nil (null on the wire)", func(t *testing.T) {
+		dto := runToDTO(store.Run{ID: uuid.New()})
+		if dto.MilestonesCandidate != nil {
+			t.Fatalf("a run with no candidate list must expose nil, got %+v", dto.MilestonesCandidate)
+		}
+	})
+}

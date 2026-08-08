@@ -221,6 +221,54 @@ func TestRunGetSurfacesStopKind(t *testing.T) {
 	}
 }
 
+// TestRunGetSurfacesMilestones is the e2e proof (PRD #122 M5) that `uzi run get` renders
+// a milestone-structured run's progress in both output modes: the human table carries the
+// "reported complete" summary and every milestone title, and --json carries the raw
+// milestone fields the whole-DTO marshal already serialises.
+func TestRunGetSurfacesMilestones(t *testing.T) {
+	iters, wall := 18, 5400
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"m": {
+			ID: "m", Status: "running", Kind: "issue", Health: "ok",
+			Milestones: []apitypes.Milestone{
+				{ID: "m1", Title: "Set up the schema"},
+				{ID: "m2", Title: "Wire the API"},
+				{ID: "m3", Title: "Write the docs"},
+			},
+			MilestonesCompleted:  []string{"m1"},
+			MilestonesInProgress: []string{"m2"},
+			BudgetMaxIterations:  &iters,
+			BudgetWallSeconds:    &wall,
+		},
+	}}
+
+	human, _, code := runCLI(t, fakeEnv(fc), "run", "get", "m")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// The wording PRD Decision 6 requires — self-reported, never "verified".
+	if !strings.Contains(human, "reported complete") || strings.Contains(human, "verified") {
+		t.Errorf("human output must say 'reported complete' and never 'verified', got:\n%s", human)
+	}
+	for _, want := range []string{"1/3 reported complete", "Set up the schema", "Wire the API", "Write the docs"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human milestone output missing %q, got:\n%s", want, human)
+		}
+	}
+
+	// --json is a whole-DTO marshal, so the milestone fields ride for free; assert the
+	// keys are actually on the wire so a future omitempty/tag change would redden.
+	jsonOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "m", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("--json exit = %d, want 0", code)
+	}
+	for _, want := range []string{`"milestones"`, `"milestones_completed"`, `"Wire the API"`} {
+		if !strings.Contains(jsonOut, want) {
+			t.Errorf("--json output missing %q, got:\n%s", want, jsonOut)
+		}
+	}
+}
+
 func TestRunGetMissingExit4(t *testing.T) {
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{}}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "get", "nope")

@@ -14,7 +14,7 @@ import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle,
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
-import { isStoppedRun, mrChipState } from "../lib/runBadge";
+import { isStoppedRun, milestoneBadge, mrChipState } from "../lib/runBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -56,6 +56,9 @@ function RunRow({
   // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
   // label and closed is muted + struck. This is a per-run frozen hint.
   const mrState = mrChipState(run.mr_state);
+  // PRD #122: compact milestone progress for the row; null on a non-milestone run,
+  // which then renders no new badge (the row had none before this feature).
+  const ms = milestoneBadge(run);
   return (
     <li>
       <Link
@@ -113,6 +116,12 @@ function RunRow({
             </Badge>
           ) : (
             <>
+              {/* PRD #122: compact milestone progress; a non-milestone run adds nothing. */}
+              {ms && (
+                <Badge tone="info" title="Milestones reported complete of the approved plan">
+                  M{ms.done}/{ms.total}
+                </Badge>
+              )}
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run. */}
               <RunHealthBadge run={run} />
