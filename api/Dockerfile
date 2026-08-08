@@ -30,15 +30,24 @@ ARG UZI_VERSION=dev
 # UZI_COMMIT_COUNT is not computable here at all: the publish build context is api/
 # with no .git in it, and the kaniko image has no git either. CI computes it in
 # publish:assert-changelog and hands it over as a dotenv report (PRD #175 M3).
+#
+# UZI_PRDS_DONE / UZI_PRDS_OPEN are the completed (prds/done/*.md) and active
+# (prds/*.md) PRD counts GET /api/version reports (#245). They are uncomputable here
+# for the same reason as UZI_COMMIT_COUNT and one more: the api/ build context has no
+# prds/ either. CI computes them in publish:assert-changelog on the full checkout and
+# hands them over in the same dotenv report; both default empty and are omitted from a
+# dev build's response.
 ARG UZI_COMMIT=
 ARG UZI_BUILT_AT=
 ARG UZI_COMMIT_COUNT=
+ARG UZI_PRDS_DONE=
+ARG UZI_PRDS_OPEN=
 # Static, VCS-stamp-free build. Migrations are embedded via go:embed, so the
 # runtime image needs nothing but the binary. -buildvcs=false stays: the publish
 # context is api/ with no .git in it (nothing to stamp from), and a VCS-free build
 # is the deliberate reproducibility choice — which is why these coordinates arrive
 # as ldflags rather than from debug.ReadBuildInfo().
-RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT} -X main.builtAt=${UZI_BUILT_AT} -X main.commits=${UZI_COMMIT_COUNT}" -o /out/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT} -X main.builtAt=${UZI_BUILT_AT} -X main.commits=${UZI_COMMIT_COUNT} -X main.prdsDone=${UZI_PRDS_DONE} -X main.prdsOpen=${UZI_PRDS_OPEN}" -o /out/server ./cmd/server
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639

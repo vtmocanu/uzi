@@ -520,16 +520,19 @@ func TestBuildInfoDTOTags(t *testing.T) {
 	assertTags(t, "BuildInfoDTO(unstamped)", BuildInfoDTO{}, "version", "founded")
 
 	commits, uptime := 2060, int64(5400)
+	prdsDone, prdsOpen := 80, 32
 	full := BuildInfoDTO{
 		Version:       "0.11.12",
 		Founded:       "2026-07-03",
 		BuiltAt:       "2026-07-28T09:15:00Z",
 		Commit:        "366a282d52095312f54b99698b241ac872e20284",
 		Commits:       &commits,
+		PrdsDone:      &prdsDone,
+		PrdsOpen:      &prdsOpen,
 		UptimeSeconds: &uptime,
 	}
 	assertTags(t, "BuildInfoDTO(stamped)", full,
-		"version", "founded", "built_at", "commit", "commits", "uptime_seconds")
+		"version", "founded", "built_at", "commit", "commits", "prds_done", "prds_open", "uptime_seconds")
 
 	// uptime_seconds is a pointer so that a genuine 0 (a process in its first second)
 	// stays on the wire. omitempty on a bare int64 would drop it and make it

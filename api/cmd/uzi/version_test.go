@@ -23,6 +23,7 @@ func withVersion(t *testing.T, v string) {
 // fullBuild is a fully-stamped server reply.
 func fullBuild() apitypes.BuildInfoDTO {
 	commits, uptime := 2107, int64(5400)
+	prdsDone, prdsOpen := 80, 32
 	return apitypes.BuildInfoDTO{
 		Version:       "0.11.12",
 		Founded:       "2026-07-03",
@@ -30,6 +31,8 @@ func fullBuild() apitypes.BuildInfoDTO {
 		Commit:        "366a282d52095312f54b99698b241ac872e20284",
 		Commits:       &commits,
 		UptimeSeconds: &uptime,
+		PrdsDone:      &prdsDone,
+		PrdsOpen:      &prdsOpen,
 	}
 }
 
@@ -102,7 +105,8 @@ func TestVersionReportsServerBuildInfo(t *testing.T) {
 		"2026-07-28T09:15:00Z",
 		"2107",
 		"2026-07-03",
-		"1h30m0s", // 5400s
+		"1h30m0s",          // 5400s
+		"80 done, 32 open", // the PRDs row, both counts stamped
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout missing %q:\n%s", want, out)
@@ -188,7 +192,7 @@ func TestVersionJSONPreservesUnknownFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
 		t.Fatalf("decode: %v (out=%s)", err, out)
 	}
-	for _, absent := range []string{"commit", "built_at", "commits", "uptime_seconds"} {
+	for _, absent := range []string{"commit", "built_at", "commits", "uptime_seconds", "prds_done", "prds_open"} {
 		if raw, ok := envelope.Server[absent]; ok {
 			t.Errorf("server.%s present as %s for an unstamped server, want it OMITTED — "+
 				"a CLI-local struct with plain fields would do exactly this", absent, raw)
@@ -198,6 +202,44 @@ func TestVersionJSONPreservesUnknownFields(t *testing.T) {
 		if _, ok := envelope.Server[present]; !ok {
 			t.Errorf("server.%s missing", present)
 		}
+	}
+}
+
+// TestServerRowsPrdsBothOrNeither pins the both-or-neither guard on the PRDs row
+// (#245): the two counts are stamped as a pair in CI and travel together, so a
+// lone field is treated as unknown and the row is skipped — the same rule the web
+// popover obeys. A present pair renders `N done, M open`.
+func TestServerRowsPrdsBothOrNeither(t *testing.T) {
+	rowValue := func(rows [][2]string, label string) (string, bool) {
+		for _, r := range rows {
+			if r[0] == label {
+				return r[1], true
+			}
+		}
+		return "", false
+	}
+
+	// Both present: the row is emitted with both counts.
+	if v, ok := rowValue(serverRows(fullBuild()), "prds"); !ok || v != "80 done, 32 open" {
+		t.Errorf("prds row = %q (present=%v), want %q", v, ok, "80 done, 32 open")
+	}
+
+	// Either field nil: no row.
+	done := 80
+	open := 32
+	for _, tc := range []struct {
+		name string
+		b    apitypes.BuildInfoDTO
+	}{
+		{"only done", apitypes.BuildInfoDTO{Version: "0.1.0", PrdsDone: &done}},
+		{"only open", apitypes.BuildInfoDTO{Version: "0.1.0", PrdsOpen: &open}},
+		{"neither", apitypes.BuildInfoDTO{Version: "0.1.0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if v, ok := rowValue(serverRows(tc.b), "prds"); ok {
+				t.Errorf("prds row present as %q for a half-known count, want it omitted", v)
+			}
+		})
 	}
 }
 

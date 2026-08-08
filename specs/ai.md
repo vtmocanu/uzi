@@ -18810,3 +18810,63 @@ identity + suppress-on-change) is deferred — out of this batch.
   so `body` is always ≤ 2048 (~48ms worst case; ~0.8s at 8192). A comment at the regex
   records that a future cap increase must revisit it — the bound is not in the regex
   itself.
+
+## 493. PRD #245 — the PRD counts are a fourth stamped coordinate on the EXACT `commits` path, both-or-neither, and the panel stays presentational because the container cannot count
+
+`GET /api/version` gains `prds_done`/`prds_open` (`api/internal/apitypes/buildinfo.go`):
+the number of completed (`prds/done/*.md`) and active (top-level `prds/*.md`) PRDs in the
+source tree the image was built from. This is the successor to §450–453's `commits` stamp
+and inherits its whole shape rather than inventing one — the value below is *why* that
+inheritance is forced, not just convenient.
+
+- **A build-time stamp, never a runtime count, and the deployment topology is what forces
+  it.** `prds/` and `.git` are both OUTSIDE the `api/` Docker build context
+  (`docker-compose.yml` `build: ./api`; CI `UZI_BUILD_CONTEXT=$CI_PROJECT_DIR/api`;
+  `.dockerignore`), so neither the image build nor the running container can see the repo
+  root to count. The API therefore makes NO DB query and NO filesystem scan; the popover
+  stays presentational (§451's fold). The counts follow the `commits` path exactly:
+  computed in `publish:assert-changelog` on the full checkout, delivered by the SAME
+  existing `commit_count.env` dotenv (appended `>>`, not a new artifact), injected via the
+  Dockerfile ldflags line (`-X main.prdsDone`, `-X main.prdsOpen`).
+  - **Non-recursive, `.md`-only, and the `-maxdepth 1` is load-bearing, not stylistic.**
+    `find prds -maxdepth 1 -name '*.md'` / `find prds/done -maxdepth 1 …`: `prds/` holds
+    sub-directories (`done/`, `mockups/`, `43-m0-probe/`), and only `done/` holds `.md`
+    today, so a recursive open-count would fold the ~80 `done/` files back in and
+    over-count by exactly the done total. The two counts are computed by disjoint globs,
+    not by subtraction, so neither can go negative off the other.
+- **Omitted on an unstamped (dev) build, like `commit`/`built_at`/`commits`.** A dev
+  build's PRD count is not a release coordinate. "Unknown beats wrong": absent, negative
+  or non-numeric → the field is omitted (`strconv.Atoi(...) == nil && n >= 0` gate in
+  `handler.Version`), never a zero-lie — a real `0` DOES render. The value is gated on
+  BOTH sides: a numeric shape-guard in `publish:assert-changelog` before it becomes a
+  build-arg, and the `Atoi`/`>= 0` gate server-side. This discharged the CI comment's
+  standing "if you add a FIFTH stamp, give it a gate" warning — stamps five and six each
+  carry the gate; the warning now reads "seventh".
+- **Two `*int` fields, both-or-neither; the total is DERIVED in each consumer.** No third
+  `total` stamp — it would introduce a `done + open` invariant across three fields with no
+  upside, since either consumer can add. Mirrors the `Commits *int` convention: two plain
+  decimal ints keep the unquoted kaniko build-arg expansion
+  (`--build-arg UZI_PRDS_DONE=$UZI_PRDS_DONE …`) safe, and each takes its own numeric
+  guard. `TestBuildInfoDTOTags` keeps `version`+`founded` as the only always-present pair;
+  both new fields are `omitempty`.
+- **Public-by-construction, and classified explicitly rather than by silence.** Added to
+  the closed-key-set trust test (`TestVersionEndpointCarriesNothingPrivate`) with a reason:
+  a scalar count over the TRACKED tree is the same disclosure class as the commit count — a
+  build fact about the image — NOT a runtime disclosure like `uptime_seconds`, which is the
+  one field in this struct that needed a deliberate publish decision (§451). The handler
+  doc-comment states this: the PRD counts sit with `commits`/`founded` as build facts, above
+  the `uptime_seconds` boundary.
+- **Both consumers render off the ONE shared DTO under the same both-or-neither guard**
+  (CLAUDE.md CLI-parity check). The web popover renders a `PRDs` row after `Uptime`
+  (`BuildInfoPopover.tsx`, approved Variant A: `N done` in the accent `·` `M open` faint),
+  and `uzi version` prints one `prds` line off the shared `apitypes.BuildInfoDTO`
+  (`api/cmd/uzi/version.go serverRows`). Both drop the row when either field is nil, so a
+  lone field reads as unknown, never half-known. The exact glyphs differ by medium (CLI
+  `"N done, M open"`, panel coloured spans) — the invariant is the guard and the single
+  source, not the punctuation, mirroring §452's "consumers may render differently on
+  purpose". `Row`'s `value` prop widened `string`→`ReactNode` so the panel can compose the
+  two coloured spans; a string is a `ReactNode`, so every existing call site is unchanged.
+- **Not delivered / out of scope:** no signed-out exposure change (the popover audience is
+  unchanged from §453), no `total` field, no per-PRD breakdown, and no e2e/compose coverage
+  of the stamped values — like `commits`, the counts appear only on a tag pipeline, so the
+  §450 post-merge observation point is the only place a stamping regression is visible.

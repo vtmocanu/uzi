@@ -8,6 +8,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **The version popover and `uzi version` now show PRD roadmap progress.** A
+  `PRDs  N done · M open` row (sidebar popover) and matching `prds  N done, M
+  open` line (`uzi version`) count completed PRDs (`prds/done/*.md`) and active
+  ones (`prds/*.md`) in the source tree the running image was built from, so a
+  published instance's roadmap progress is visible without cloning the repo.
+  Both counts are build stamps computed in CI and injected via ldflags, the
+  same way the existing commit count is — the API's Docker build context has
+  neither `.git` nor `prds/` to count from at runtime — so like that field
+  they're simply absent (never shown as zero) on an unstamped dev build. (#245)
+
 - **`save_memory` now steers agents away from saving numbers that will go stale.**
   The lead's prompt and the tool's own description ask agents to record the durable
   fact rather than today's count (test-pass tallies, version numbers, and the

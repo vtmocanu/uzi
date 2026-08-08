@@ -3545,6 +3545,8 @@ export const mockBuildInfo: BuildInfo = {
   commit: "366a282d52095312f54b99698b241ac872e20284",
   commits: 2105,
   uptime_seconds: 3 * 86_400 + 4 * 3_600 + 12 * 60, // 3d 4h 12m
+  prds_done: 80,
+  prds_open: 32,
 };
 
 // THE LAPTOP SHAPE, and the one a developer actually hits: `docker-compose.yml`
