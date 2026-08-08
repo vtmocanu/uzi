@@ -43,4 +43,22 @@ describe("SettingsShell tabs", () => {
     expect(current("Forge")).toBeNull();
     expect(current("Account & token")).toBeNull();
   });
+
+  // Issue #204: at 390px the full tab strip overflows (scrollWidth 401 vs clientWidth 390)
+  // and used to scroll the whole page body sideways. jsdom has no layout engine, so this
+  // asserts the class contract that fixes it rather than a measured width: the tab ROW
+  // scrolls within itself (overflow-x-auto) and the tabs keep their size (shrink-0 /
+  // whitespace-nowrap) so they overflow-and-scroll instead of compressing to fit.
+  it("lets the tab row scroll within itself so the page body never scrolls sideways (#204)", () => {
+    renderAt("/settings/workers");
+    const row = screen.getByRole("link", { name: "Workers" }).parentElement as HTMLElement;
+    expect(row.className).toContain("overflow-x-auto");
+    // The underline still spans the row.
+    expect(row.className).toMatch(/\bborder-b\b/);
+    for (const name of ["Account & token", "Forge", "Workers", "Access", "Memory"]) {
+      const tab = screen.getByRole("link", { name });
+      expect(tab.className).toMatch(/\bshrink-0\b/);
+      expect(tab.className).toContain("whitespace-nowrap");
+    }
+  });
 });

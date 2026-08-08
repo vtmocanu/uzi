@@ -1728,6 +1728,61 @@ func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 	}
 }
 
+// A follow_up posted to the generic /inputs path against a CHAT run is rejected at
+// the service boundary (ErrChatInputNotAllowed) and no row is ever written: chat
+// turns must ride SubmitChatMessage so the CHAT_MAX_TURNS ceiling is enforced.
+// Accepting a follow_up here would burn spend past the cap.
+func TestSubmitInputChatFollowUpRejected(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: RunKindChat}}
+	svc := New(fs, newBox(t), testParams())
+
+	_, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "keep going", nil)
+	if !errors.Is(err, ErrChatInputNotAllowed) {
+		t.Fatalf("err = %v, want ErrChatInputNotAllowed", err)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("no input row must be written for a chat follow_up, got %+v", fs.createdInput)
+	}
+}
+
+// A follow_up on a normal ISSUE run is untouched by the chat guard: it still enqueues
+// a plain input row (regression guard for the guard's kind/Kind condition).
+func TestSubmitInputFollowUpIssueRunEnqueues(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "running", Kind: RunKindIssue}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "use pgx", nil); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if fs.createdInput == nil || fs.createdInput.Kind != "follow_up" {
+		t.Fatalf("follow_up on an issue run must enqueue a plain input: %+v", fs.createdInput)
+	}
+}
+
+// The chat guard is scoped to follow_up only: a cancel on a chat run (the path EndChat
+// rides) must NOT be rejected, so the conversation can still be ended.
+func TestSubmitInputChatCancelAllowed(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued", Kind: RunKindChat}}
+	svc := New(fs, newBox(t), testParams())
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
+	if err != nil {
+		t.Fatalf("cancel on a chat run must not be rejected: %v", err)
+	}
+	if !res.ServerSide {
+		t.Fatal("a cancel on a queued chat run (no poller) is applied server-side")
+	}
+	if fs.cancelled == nil {
+		t.Fatal("CancelRunServerSide not called for a chat cancel")
+	}
+}
+
 func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()

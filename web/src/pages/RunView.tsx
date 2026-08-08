@@ -102,7 +102,9 @@ function LiveElapsed({ since }: { since: string }) {
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
 // only, so health_reason is always present here (no gating needed). It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
-// re-render. Renders nothing for a healthy run or a non-flaggable status.
+// re-render. The VISIBLE pill renders only for a flagged, flaggable run; the sr-only
+// live region beside it is ALWAYS mounted (empty otherwise) — see the note at its
+// render for why the announcement cannot ride the pill itself (#185).
 /**
  * The stuck/health pill. Exported for the same reason RunHeading and RunCompletedLine are:
  * `RunView` needs routing, a live stream and a dozen API mocks to mount, and `health_reason`
@@ -114,30 +116,48 @@ export function HealthFlag({ run }: { run: Run }) {
     const id = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(id);
   }, []);
-  if (!shouldShowHealthFlag(run.health, run.status)) return null;
+  const show = shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
-  const stuck = Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
+  const stuck = show && Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
+  // What the live region announces — the flag's short label, once, when it arrives.
+  // DELIBERATELY NOT the ticking "stuck for Xm": that changes every 30s and would make
+  // the region re-announce on every tick, the same countdown-in-a-live-region hostility
+  // the park panel's role="status" note warns about. The stuck time and reason stay in
+  // the visible pill, which no screen reader is listening to.
+  const announce = show ? (healthFlagLabel(run.health) ?? "") : "";
   return (
-    // role="status" so a screen reader announces the flag when it arrives over WS.
-    // The reason is shown inline below, so no title tooltip (it would be redundant).
-    <span
-      role="status"
-      className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn"
-    >
-      ⚠ {healthFlagLabel(run.health)}
-      {stuck}
-      {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
-          attribute (runBadge's descriptor) and missed it here, where it renders as body
-          text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
-          attribute for 4a739bff. Same field, opposite channel, one commit apart.
-          (This sentence named 4a739bff until D1: that is the commit which fixed the
-          ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
-          mirror. Second time those two were transposed — see the note in
-          WorkerUpgradeBadge.test.tsx — because they are one apart, both about
-          upgrade_detail, and differ only in channel, which is the distinction being
-          taught.) */}
-      {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
-    </span>
+    <>
+      {show && (
+        // A PLAIN (non-live) span: the sr-only region below owns the announcement.
+        // role="status" used to sit HERE, and that was the bug the comment denied — a
+        // live region mounted in the same tick as its first message is silent, because
+        // assistive tech announces CHANGES to a region that already existed (#185;
+        // Board.tsx S5). This pill mounts together with the flag, so it never announced.
+        // The reason is shown inline below, so no title tooltip (it would be redundant).
+        <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
+          ⚠ {healthFlagLabel(run.health)}
+          {stuck}
+          {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
+              attribute (runBadge's descriptor) and missed it here, where it renders as body
+              text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
+              attribute for 4a739bff. Same field, opposite channel, one commit apart.
+              (This sentence named 4a739bff until D1: that is the commit which fixed the
+              ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
+              mirror. Second time those two were transposed — see the note in
+              WorkerUpgradeBadge.test.tsx — because they are one apart, both about
+              upgrade_detail, and differ only in channel, which is the distinction being
+              taught.) */}
+          {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
+        </span>
+      )}
+      {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce
+          region and Board.tsx's S5 pattern. This is what actually announces the flag: a
+          region that already exists narrates its next content change, where one mounted
+          together with its first message stays silent. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {announce}
+      </span>
+    </>
   );
 }
 
@@ -243,11 +263,19 @@ function capitalise(s: string): string {
 export function LimitWaitPanel({
   run,
   busy,
+  canSteer = true,
   onToggle,
   onStop,
 }: {
   run: Run;
   busy: boolean;
+  // False for a NON-OWNER viewer. Mirrors PlanPanel/QuestionPanel (MR !149): POST is
+  // user-scoped, so a non-owner admin — who can legitimately open this owner-or-admin
+  // run view — must not be shown a Stop or a wait-on-limit toggle that 404s. Both
+  // controls are HIDDEN (not greyed) and replaced by inert text, because a disabled
+  // control still invites a click and then refuses it. Defaults true so an owner is
+  // never gated by an absent prop.
+  canSteer?: boolean;
   onToggle: (enabled: boolean) => void;
   // web-ux F1: the panel carries its OWN Stop, rather than pointing at the one in the
   // steer card 596px below it. The old copy's "Stop it if you would rather not wait"
@@ -272,7 +300,10 @@ export function LimitWaitPanel({
   // only invite the question of why it is there.
   if (!canToggleWaitOnLimit(run.status)) return null;
 
-  const toggle = (
+  // Non-owner (#183): the setting is the owner's to change, so render its CURRENT state
+  // as inert text rather than a disabled checkbox — the affordance-that-lies rule the
+  // canSteer prop exists for, mirroring QuestionPanel's inert non-owner options.
+  const toggle = canSteer ? (
     <label className="flex items-center gap-2 text-xs">
       <input
         type="checkbox"
@@ -287,6 +318,12 @@ export function LimitWaitPanel({
         Wait out future Anthropic usage limits on this run
       </span>
     </label>
+  ) : (
+    <span className={cx("text-xs", parked ? "text-fg" : "text-muted")}>
+      {run.wait_on_limit
+        ? "Waiting out future Anthropic usage limits on this run — only its owner can change this."
+        : "Not waiting out future Anthropic usage limits on this run — only its owner can change this."}
+    </span>
   );
 
   if (!parked) return <div className="px-1">{toggle}</div>;
@@ -389,9 +426,15 @@ export function LimitWaitPanel({
             side they wrap as one unit and stay legible from 390px up. */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {toggle}
-          <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
-            Stop run
-          </Button>
+          {/* Non-owner (#183): no live Stop — inert text stating who can, never a greyed
+              button that 404s. Mirrors the PlanPanel/QuestionPanel non-owner branches. */}
+          {canSteer ? (
+            <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
+              Stop run
+            </Button>
+          ) : (
+            <span className="text-xs text-muted">Only the run's owner can stop it.</span>
+          )}
         </div>
       </div>
     </div>
@@ -623,6 +666,7 @@ export function RunView() {
       <LimitWaitPanel
         run={run}
         busy={busy}
+        canSteer={canSteer}
         onStop={() => act(() => submit("cancel"))}
         onToggle={(enabled) =>
           act(async () => {

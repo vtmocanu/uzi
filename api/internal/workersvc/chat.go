@@ -50,6 +50,13 @@ var (
 	// ErrProposalCapReached rejects proposal creation once a run already holds
 	// MaxPendingProposalsPerRun unresolved proposals (anti-spam, Decision 7/8).
 	ErrProposalCapReached = errors.New("too many pending proposals for this chat")
+	// ErrChatInputNotAllowed rejects a follow_up steering input against a chat run:
+	// chat turns MUST go through SubmitChatMessage so the CHAT_MAX_TURNS ceiling is
+	// enforced. Routed to the generic /inputs endpoint a follow_up would bypass the
+	// cap entirely (unbounded spend); the guard sits at the service boundary so it
+	// covers HTTP/CLI/future Slack alike. cancel/reject_plan/approve_plan/answer are
+	// still legal on a chat run (EndChat rides the cancel path).
+	ErrChatInputNotAllowed = errors.New("chat runs accept input only through the chat message endpoint")
 )
 
 // MaxPendingProposalsPerRun caps how many unresolved (pending) proposals a single
