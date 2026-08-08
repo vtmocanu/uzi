@@ -402,6 +402,15 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 	} else {
 		dto.Milestones = milestones
 	}
+	// PRD #122 M3: the PRE-APPROVAL candidate list, read-only for the plan gate. Decoded
+	// like the frozen list above (the column carries the same jsonb_typeof CHECK and every
+	// write is validated) and degrades gracefully on a decode error — logged and left nil
+	// rather than failing the read of an otherwise-fine run.
+	if candidate, err := workersvc.DecodeMilestones(r.MilestonesCandidate); err != nil {
+		slog.Error("decode run milestones candidate", "run_id", r.ID, "error", err)
+	} else {
+		dto.MilestonesCandidate = candidate
+	}
 	// PRD #122 M2: live progress (id arrays) + the effective per-run budget. Progress
 	// degrades to nil on a decode error, same as the frozen list above (the columns
 	// carry a jsonb_typeof CHECK). The budget columns are pgtype.Int4 → *int, null when

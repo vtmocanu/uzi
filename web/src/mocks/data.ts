@@ -17,6 +17,7 @@ import type {
   IssueProposal,
   LatestRun,
   Memory,
+  Milestone,
   MyRateLimits,
   PendingJudge,
   RateLimitSource,
@@ -1817,6 +1818,25 @@ export const mockAllocations: Record<string, { shared: string[]; mine: string[] 
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
+// PRD #122 milestone demo fixtures. The FROZEN list is the denominator; a running run
+// carries some completed + one in-progress so the checklist and the M{done}/{total}
+// badge advance in the live sim (engine.ts patches these alongside iteration_count).
+// Titles are ordinary text here — the untrusted-render path is exercised by the app's
+// stripUnsafeChars, not by hostile fixtures.
+export const HEARTBEAT_MILESTONES: Milestone[] = [
+  { id: "hb-1", title: "Add /metrics endpoint scaffolding" },
+  { id: "hb-2", title: "Expose heartbeat freshness gauge" },
+  { id: "hb-3", title: "Wire the collector to the worker registry" },
+  { id: "hb-4", title: "Add a staleness alert threshold" },
+  { id: "hb-5", title: "Document the metric and add a dashboard panel" },
+];
+// The candidate list at the plan gate (PRE-APPROVAL), shown only on run-awaiting.
+const APPROVAL_NOTIFY_CANDIDATES: Milestone[] = [
+  { id: "an-1", title: "Detect a plan parking at the approval gate" },
+  { id: "an-2", title: "Render the notification email template" },
+  { id: "an-3", title: "Deliver via the existing notifier, respecting mutes" },
+];
+
 export const mockRuns: Run[] = [
   {
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
@@ -1901,6 +1921,14 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: a milestone-structured run mid-flight. The live sim (engine.ts) advances
+    // these alongside iteration_count, so the checklist and the M{done}/{total} badge move.
+    milestones: HEARTBEAT_MILESTONES,
+    milestones_completed: ["hb-1"],
+    milestones_in_progress: ["hb-2"],
+    milestones_candidate: null,
+    budget_max_iterations: 12,
+    budget_wall_seconds: 7200,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     // M5: the headline case, and D20's own example — `console-key — auto, 62% headroom`.
@@ -1962,6 +1990,15 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: at the plan gate the milestones are NOT frozen yet — the candidate list
+    // is what the panel surfaces (PRE-APPROVAL). milestones stays null so the badge and
+    // checklist stay hidden until approval freezes the list.
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: APPROVAL_NOTIFY_CANDIDATES,
+    budget_max_iterations: 8,
+    budget_wall_seconds: 5400,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     // M5: an ordinary default, for contrast with the fallback above.
@@ -2086,6 +2123,18 @@ export const mockRuns: Run[] = [
     agent_source: "own",
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: a milestone-structured run parked on a clarification question, so the
+    // checklist shows mid-flight progress next to the "needs your answer" park.
+    milestones: [
+      { id: "cache-1", title: "Add an in-memory issue cache keyed by repo + poll cursor" },
+      { id: "cache-2", title: "Invalidate on the board webhook" },
+      { id: "cache-3", title: "Expose a cache-hit metric" },
+    ],
+    milestones_completed: ["cache-1"],
+    milestones_in_progress: ["cache-2"],
+    milestones_candidate: null,
+    budget_max_iterations: 6,
+    budget_wall_seconds: null,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     anthropic_select_reason: "default",
@@ -2128,6 +2177,19 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: a COMPLETED milestone run — every milestone reported complete, so the
+    // checklist reads M4/4 and the badge is a full count.
+    milestones: [
+      { id: "fold-1", title: "Group tool_result under its originating tool_use" },
+      { id: "fold-2", title: "Collapse long results behind a disclosure" },
+      { id: "fold-3", title: "Keep the running/live tail expanded" },
+      { id: "fold-4", title: "Add a per-phase token line" },
+    ],
+    milestones_completed: ["fold-1", "fold-2", "fold-3", "fold-4"],
+    milestones_in_progress: [],
+    milestones_candidate: null,
+    budget_max_iterations: 10,
+    budget_wall_seconds: 7200,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
     // M5: D10's best-of-pool. Every pooled token was under the floor and the emptiest was
@@ -2297,6 +2359,19 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // PRD #122: a run that FAILED mid-milestone — two done, one still in progress when
+    // it timed out, so the checklist shows the incomplete state a failure leaves behind.
+    milestones: [
+      { id: "pool-1", title: "Add pool size + timeout config" },
+      { id: "pool-2", title: "Wire pgxpool with the new limits" },
+      { id: "pool-3", title: "Add a saturation metric" },
+      { id: "pool-4", title: "Load-test and tune the defaults" },
+    ],
+    milestones_completed: ["pool-1", "pool-2"],
+    milestones_in_progress: ["pool-3"],
+    milestones_candidate: null,
+    budget_max_iterations: 4,
+    budget_wall_seconds: 7200,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
     // M5: the judge lane's own mode. Rendered `judge binding` and NOT `pinned`, which

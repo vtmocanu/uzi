@@ -6,6 +6,7 @@
 import {
   isTerminalRun,
   type LatestRun,
+  type Milestone,
   type RunHealth,
   type StopKind,
 } from "./api";
@@ -357,6 +358,33 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         pulse: false,
       };
   }
+}
+
+// MilestoneProgress is the compact done/total the milestone badge renders (PRD #122).
+export type MilestoneProgress = { done: number; total: number };
+
+// MilestoneCounted is the minimal run shape milestoneBadge reads: the FROZEN approved
+// list (the denominator) and the ids reported complete. Satisfied by Run / RunListItem.
+export type MilestoneCounted = {
+  milestones?: Milestone[] | null;
+  milestones_completed?: string[] | null;
+};
+
+// milestoneBadge folds a run into its `M{done}/{total}` badge input, or null when the
+// run carries no frozen milestone list — the caller then falls back to the iteration
+// badge, so a pre-#122 (or non-milestone) run renders exactly as before.
+//
+// `done` counts only completed ids that are MEMBERS of the frozen list. milestones_completed
+// is a monotone union and can name an id no longer in the approved set (a milestone dropped
+// after it was ticked); counting those would let the badge read e.g. M8/7. Clamping to
+// frozen membership keeps the badge honest — done never exceeds total.
+export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null {
+  const frozen = run.milestones ?? [];
+  if (frozen.length === 0) return null;
+  const ids = new Set(frozen.map((m) => m.id));
+  const completed = run.milestones_completed ?? [];
+  const done = completed.reduce((n, id) => (ids.has(id) ? n + 1 : n), 0);
+  return { done, total: frozen.length };
 }
 
 // hasActiveRun reports whether a card's latest run is still non-terminal. The

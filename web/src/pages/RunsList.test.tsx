@@ -301,3 +301,50 @@ describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", 
     expect(mockApi.getJudgeStats).not.toHaveBeenCalled();
   });
 })
+
+describe("RunsList milestone badge (PRD #122)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("adds a compact M{done}/{total} badge to a milestone-structured run row", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "m",
+          issue_title: "Milestone run",
+          status: "running",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: ["a", "b"],
+        }),
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("Milestone run")).toBeTruthy());
+    expect(screen.getByText("M2/3")).toBeTruthy();
+  });
+
+  it("adds no milestone badge to a run with no milestones (the row had none before)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "n", issue_title: "Plain run", status: "running", milestones: null })],
+    });
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
+    expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
+  });
+});

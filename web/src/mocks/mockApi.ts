@@ -2208,6 +2208,14 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      // PRD #122: a freshly synthesised run has no milestones yet — all null, so it
+      // renders on the null-fallback path (the iteration badge, no checklist).
+      milestones: null,
+      milestones_completed: null,
+      milestones_in_progress: null,
+      milestones_candidate: null,
+      budget_max_iterations: null,
+      budget_wall_seconds: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_select_reason: null,
@@ -2266,6 +2274,14 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      // PRD #122: a freshly synthesised run has no milestones yet — all null, so it
+      // renders on the null-fallback path (the iteration badge, no checklist).
+      milestones: null,
+      milestones_completed: null,
+      milestones_in_progress: null,
+      milestones_candidate: null,
+      budget_max_iterations: null,
+      budget_wall_seconds: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_select_reason: null,
@@ -2677,6 +2693,14 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      // PRD #122: a freshly synthesised run has no milestones yet — all null, so it
+      // renders on the null-fallback path (the iteration badge, no checklist).
+      milestones: null,
+      milestones_completed: null,
+      milestones_in_progress: null,
+      milestones_candidate: null,
+      budget_max_iterations: null,
+      budget_wall_seconds: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
       anthropic_select_reason: null,

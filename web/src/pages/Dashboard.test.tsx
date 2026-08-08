@@ -395,3 +395,37 @@ describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
     expect(screen.getByText("nothing in flight")).toBeTruthy();
   });
 });
+
+describe("Dashboard milestone badge (PRD #122)", () => {
+  const flush = () => act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+
+  it("shows a compact M{done}/{total} badge on a milestone-structured run", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          issue_title: "Milestone run",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+            { id: "d", title: "D" },
+            { id: "e", title: "E" },
+          ],
+          milestones_completed: ["a", "b"],
+        }),
+      ],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Milestone run")).toBeTruthy();
+    expect(screen.getByText("M2/5")).toBeTruthy();
+  });
+
+  it("adds no milestone badge for a run with no milestones", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "Plain run", milestones: null })] });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("Plain run")).toBeTruthy();
+    expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
+  });
+});

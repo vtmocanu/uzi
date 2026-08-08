@@ -34,6 +34,7 @@ import {
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
+  milestoneBadge,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
@@ -137,6 +138,73 @@ export function HealthFlag({ run }: { run: Run }) {
           taught.) */}
       {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
     </span>
+  );
+}
+
+// MilestoneBadge is the compact `M{done}/{total}` pill (PRD #122), rendered beside the
+// header's iteration badge on a milestone-structured run. It reads milestoneBadge, so it
+// renders NOTHING for a run with no frozen milestone list — a pre-#122 run keeps only its
+// iteration badge. Exported for a direct render test (the page needs a live stream to mount).
+export function MilestoneBadge({ run }: { run: Run }) {
+  const progress = milestoneBadge(run);
+  if (!progress) return null;
+  return (
+    <Badge tone="info" title="Milestones reported complete of the approved plan">
+      M{progress.done}/{progress.total}
+    </Badge>
+  );
+}
+
+// MilestoneMark is the per-row done / in-progress / left indicator. Kept tiny and
+// aria-labelled so the state is legible to assistive tech, not carried by colour alone.
+function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
+  if (state === "done") return <span className="text-ok" aria-label="done">✓</span>;
+  if (state === "in_progress") return <span className="text-info" aria-label="in progress">◐</span>;
+  return <span className="text-faint" aria-label="left">○</span>;
+}
+
+// MilestoneChecklist renders a milestone-structured run's progress (PRD #122): every
+// approved milestone with a done / in-progress / left indicator, driven by the frozen
+// list + the reported-complete and in-progress id sets.
+//
+// 🔴 The header says "reported complete", NEVER "verified" (PRD Decision 6): the worker
+// REPORTS completion and nothing in uzi has verified it, so the copy must not imply it
+// has. Titles are REPO/agent-authored UNTRUSTED text, rendered as PLAIN JSX through
+// stripUnsafeChars — never <Markdown>, the same rule repo_agents follow. Renders nothing
+// for a run with no frozen milestone list. Exported for a direct render test.
+export function MilestoneChecklist({ run }: { run: Run }) {
+  const milestones = run.milestones ?? [];
+  if (milestones.length === 0) return null;
+  const completed = new Set(run.milestones_completed ?? []);
+  const inProgress = new Set(run.milestones_in_progress ?? []);
+  const doneCount = milestones.reduce((n, m) => (completed.has(m.id) ? n + 1 : n), 0);
+  return (
+    <Card className="p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-fg">Milestones (reported complete)</h2>
+        <span className="font-mono text-xs tabular-nums text-faint">
+          {doneCount}/{milestones.length}
+        </span>
+      </div>
+      <ul className="space-y-1.5">
+        {milestones.map((m) => {
+          const state = completed.has(m.id) ? "done" : inProgress.has(m.id) ? "in_progress" : "left";
+          return (
+            <li key={m.id} className="flex items-center gap-2 text-sm">
+              <MilestoneMark state={state} />
+              <span
+                className={cx(
+                  "min-w-0 truncate",
+                  state === "done" ? "text-muted line-through" : state === "in_progress" ? "text-fg" : "text-faint",
+                )}
+              >
+                {stripUnsafeChars(m.title)}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </Card>
   );
 }
 
@@ -517,6 +585,11 @@ export function RunView() {
                   iteration {run.iteration_count}
                 </Badge>
               )}
+              {/* PRD #122: the compact milestone progress pill, shown ALONGSIDE the
+                  iteration badge on a milestone-structured run. milestoneBadge returns
+                  null for a run with no frozen list, so a pre-#122 run shows only the
+                  iteration badge — unchanged. */}
+              <MilestoneBadge run={run} />
               {/* Which Anthropic credential this run spent (PRD #111 M1). Here in
                   the header rather than beside the usage panel because it must show
                   for every claimed run, and the usage panel only appears once a run
@@ -690,6 +763,11 @@ export function RunView() {
       {run.status !== "awaiting_approval" && run.agent_source && (
         <AgentRosterSummary run={run} />
       )}
+
+      {/* PRD #122: the milestone checklist — done / in-progress / left, driven by the
+          frozen list + the reported-complete/in-progress id sets. Renders nothing for a
+          run with no milestones. */}
+      <MilestoneChecklist run={run} />
 
       {(usage.hasLiveTokens || usage.hasConfirmed) && (
         <Card className="p-4">
@@ -987,6 +1065,25 @@ export function PlanPanel({
             read-only card (AgentRosterSummary) once the run is past the gate. */}
         {canSteer && (
           <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+        )}
+
+        {/* PRD #122: the PRE-APPROVAL candidate milestones, shown ONLY at the plan gate,
+            beside the plan body. Rendered as PLAIN JSX (never <Markdown>): a candidate
+            title is agent/repo-authored untrusted text, and this is an approval dialog —
+            the exact place an attacker-authored title must not become a clickable link
+            (same rule as the repo-agent descriptions in the picker above). Nothing renders
+            when the list is null/empty. */}
+        {run.milestones_candidate && run.milestones_candidate.length > 0 && (
+          <div className="rounded-lg border border-edge bg-surface/60 p-3">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Proposed milestones</p>
+            <ol className="list-decimal space-y-1 pl-5 text-sm text-fg">
+              {run.milestones_candidate.map((m) => (
+                <li key={m.id} className="min-w-0">
+                  {stripUnsafeChars(m.title)}
+                </li>
+              ))}
+            </ol>
+          </div>
         )}
 
         {run.plan_md ? (

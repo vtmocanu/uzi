@@ -5,7 +5,7 @@
 // mirroring the real worker protocol's semantics.
 
 import type { IssueProposal, RunInputKind } from "../lib/api";
-import { SAMPLE_PLAN } from "./data";
+import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
 
 type Step = () => void;
@@ -145,7 +145,17 @@ function planningScript(runId: string): Timed[] {
           modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
         });
         appendMessage(runId, "status", null, { text: "plan submitted — awaiting approval" });
-        patchRun(runId, { status: "awaiting_approval", plan_md: SAMPLE_PLAN() });
+        // PRD #122: at the gate the milestones are PRE-APPROVAL candidates, not yet
+        // frozen. Clear any frozen state so the gate shows the candidate list cleanly;
+        // approval (the first iteration bump below) freezes them into `milestones`.
+        patchRun(runId, {
+          status: "awaiting_approval",
+          plan_md: SAMPLE_PLAN(),
+          milestones_candidate: HEARTBEAT_MILESTONES,
+          milestones: null,
+          milestones_completed: null,
+          milestones_in_progress: null,
+        });
       },
     },
   ];
@@ -197,7 +207,18 @@ function implementScript(runId: string): Timed[] {
     ...tool(runId, "coder", "Bash", { command: "cd api && go test ./..." }, "ok  \tuzi/api/internal/handler\t0.31s\nok  \tuzi/api/internal/store\t0.44s", { runFor: 2800, attr: ATTR_B }),
     {
       delay: 900,
-      step: () => patchRun(runId, { iteration_count: 1 }),
+      // PRD #122: the plan is approved and being implemented, so FREEZE the candidate
+      // milestones into the approved list and advance progress — two reported complete,
+      // one in progress — alongside the iteration bump. This is where the checklist and
+      // the M{done}/{total} badge start moving in the live demo.
+      step: () =>
+        patchRun(runId, {
+          iteration_count: 1,
+          milestones: HEARTBEAT_MILESTONES,
+          milestones_candidate: null,
+          milestones_completed: ["hb-1", "hb-2"],
+          milestones_in_progress: ["hb-3"],
+        }),
     },
     ...say(
       runId,
@@ -241,6 +262,11 @@ function implementScript(runId: string): Timed[] {
           mr_iid: 57,
           branch,
           iteration_count: 2,
+          // PRD #122: the run finished — every milestone reported complete, none left in
+          // progress, so the checklist reads a full count on the completed hero.
+          milestones: HEARTBEAT_MILESTONES,
+          milestones_completed: HEARTBEAT_MILESTONES.map((m) => m.id),
+          milestones_in_progress: [],
           finished_at: new Date().toISOString(),
         });
       },
@@ -356,7 +382,15 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
         const plan = `${SAMPLE_PLAN()}\n\n> Revised after rejection: ${reason || "(no reason given)"}`;
         appendMessage(runId, "plan", "lead", { text: plan });
         appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
-        patchRun(runId, { status: "awaiting_approval", plan_md: plan });
+        // PRD #122: the re-gate still shows the milestones as PRE-APPROVAL candidates.
+        patchRun(runId, {
+          status: "awaiting_approval",
+          plan_md: plan,
+          milestones_candidate: HEARTBEAT_MILESTONES,
+          milestones: null,
+          milestones_completed: null,
+          milestones_in_progress: null,
+        });
       },
     },
   ];

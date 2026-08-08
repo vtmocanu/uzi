@@ -882,6 +882,15 @@ export type FixVerdict = "verified" | "fix_failed" | "not_code";
 // convention here, mirroring FixVerdict/AgentSource, which ARE imported elsewhere).
 type PlanSource = "agent" | "seeded";
 
+// Milestone is one item of a milestone-structured run (PRD #122): a stable id and a
+// human title. The title is REPO/agent-authored UNTRUSTED text — safe as JSX (React
+// escapes it) but it must never be rendered through <Markdown> or interpolated into an
+// HTML/URL sink, the same rule RepoAgent descriptions follow.
+export interface Milestone {
+  id: string;
+  title: string;
+}
+
 export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -963,6 +972,29 @@ export interface Run {
    *  this, so an excludable chip always matches what approve accepts and the count is
    *  exact. Populated only on the run-detail read (getRun); null on list rows. */
   own_agents: RepoAgent[] | null;
+  /** PRD #122: milestone-structured run fields. All six land together across an
+   *  api/web deploy boundary — the Go read DTO adds them in parallel — so they are
+   *  OPTIONAL here for the SAME rollout-skew reason plan_source is: a mid-deploy api
+   *  pod that predates the feature omits the keys. A run that was never milestone-
+   *  planned sends them all null. Either way every milestone surface hides and the UI
+   *  falls back to the `iteration N` badge, so a null-milestone run renders EXACTLY as
+   *  it did before this feature.
+   *
+   *  `milestones` is the FROZEN approved list — the denominator N. `milestones_completed`
+   *  is the monotone union of ids reported complete (it can name an id no longer in the
+   *  frozen set, so a badge counts only members — see milestoneBadge). `milestones_in_progress`
+   *  is a snapshot of the ids currently in progress. `milestones_candidate` is the
+   *  PRE-APPROVAL candidate list, shown ONLY at the plan gate.
+   *
+   *  Both milestone lists carry human titles that are REPO/agent-authored UNTRUSTED text:
+   *  render as PLAIN JSX, never <Markdown> (same rule as repo_agents), so an
+   *  attacker-authored title cannot become a link in an approval dialog. */
+  milestones?: Milestone[] | null;
+  milestones_completed?: string[] | null;
+  milestones_in_progress?: string[] | null;
+  milestones_candidate?: Milestone[] | null;
+  budget_max_iterations?: number | null;
+  budget_wall_seconds?: number | null;
   claimed_at: string | null;
   started_at: string | null;
   finished_at: string | null;
