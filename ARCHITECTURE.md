@@ -488,7 +488,7 @@ seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
 repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
 `HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. See
 [docs/scheduling.md](docs/scheduling.md) and
-`prds/241-schedule-runs.md`. Status is a linear state machine:
+`prds/done/241-schedule-runs.md`. Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed

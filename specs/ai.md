@@ -18998,7 +18998,7 @@ today — recorded as the third driver's design, not as a live system.
 
 Adds a **time-driven** run origin alongside manual and autopilot. Full rationale, the
 architect-review corrections, and the two owner-resolved open decisions live in the
-Decision Log at `prds/241-schedule-runs.md`; the sections below record only what shipped.
+Decision Log at `prds/done/241-schedule-runs.md`; the sections below record only what shipped.
 
 ## 496. PRD #241 Decision 1 — a dedicated `run_schedules` table + a single-instance scheduler actor, NOT an overloaded `runs` row
 
