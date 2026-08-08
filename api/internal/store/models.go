@@ -314,6 +314,7 @@ type Run struct {
 	MilestonesInProgress  []byte             `json:"milestones_in_progress"`
 	BudgetMaxIterations   pgtype.Int4        `json:"budget_max_iterations"`
 	BudgetWallSeconds     pgtype.Int4        `json:"budget_wall_seconds"`
+	ScheduleID            pgtype.UUID        `json:"schedule_id"`
 }
 
 type RunMessage struct {
@@ -336,6 +337,28 @@ type RunReview struct {
 	Verdict     string             `json:"verdict"`
 	SummaryMd   string             `json:"summary_md"`
 	JudgeModel  string             `json:"judge_model"`
+	Status      string             `json:"status"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunSchedule struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	RepoID      uuid.UUID          `json:"repo_id"`
+	Target      string             `json:"target"`
+	IssueIid    pgtype.Int8        `json:"issue_iid"`
+	Labels      []byte             `json:"labels"`
+	Prompt      pgtype.Text        `json:"prompt"`
+	Timing      string             `json:"timing"`
+	CronExpr    pgtype.Text        `json:"cron_expr"`
+	RunAt       pgtype.Timestamptz `json:"run_at"`
+	Timezone    string             `json:"timezone"`
+	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
+	LastFiredAt pgtype.Timestamptz `json:"last_fired_at"`
+	AutoApprove bool               `json:"auto_approve"`
+	WaitOnLimit bool               `json:"wait_on_limit"`
+	Enabled     bool               `json:"enabled"`
 	Status      string             `json:"status"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
