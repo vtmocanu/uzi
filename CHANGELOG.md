@@ -4,6 +4,83 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+## [0.20.2] - 2026-08-08
+
+### Fixed
+
+- **The checkpoint push broker no longer OOM-kills the api on a real repository.**
+  M8's broker fetched the run branch's full history into an in-memory git store
+  before pushing; on a real repo that unpacked the entire pack into RAM (~740 MB
+  RSS for uzi's 130 MiB pack) and OOM-killed the 512Mi api pod at every milestone
+  checkpoint. The base fetch is now **shallow (depth 1)** — it pulls only the tip
+  snapshot the delta pack actually references (~190 MB peak, measured against the
+  real forge) — and the api memory limit is raised 512Mi → 1Gi for concurrency
+  headroom. This surfaced on the first real deploy of 0.20.1; the broker's unit
+  tests use a one-commit local fixture where fetch depth is a no-op. (#122 M8)
+
+## [0.20.1] - 2026-08-08
+
+First **published** build of the 0.20.0 changeset. The `v0.20.0` tag was created
+but its publish pipeline was skipped by a stray `[skip ci]` marker on the tagged
+commit (the marker suppresses the tag's own publish pipeline too), so 0.20.0
+produced no images or chart and was never deployed. 0.20.1 is identical in
+shipping code — see the [0.20.0] section below for the actual changes.
+
+## [0.20.0] - 2026-08-08
+
+### Added
+
+- **Runs now checkpoint committed work at milestone boundaries and recover it
+  after a worker crash.** When the lead completes a milestone, the worker durably
+  saves the run's branch to its data volume (surviving a pod kill and a
+  same-worker restart), and — via a new server-side push broker — publishes it to
+  a `refs/uzi-checkpoints/<branch>` ref on the forge, so a *different* worker that
+  re-claims the run recovers the completed milestones instead of redoing them. The
+  forge token is never exposed to a worker git process (the API holds it and
+  performs the push), the push is never forced, and no CI pipeline fires on the
+  checkpoint ref. The plan carries an optional milestone list (`submit_plan`), the
+  run budget scales with it, and progress is reported over the existing run
+  stream; the user-visible progress UI (web, Slack, CLI) is not part of this
+  release. (#122 M1, M2, M6, M8)
+
+- **The run page shows live in-flight token counts.** Usage on the run page
+  updates from the first model call rather than only after the run records
+  usage, so a running agent's token spend is visible as it happens. (#237)
+
+- **The Runs menu item carries an in-progress count badge.** The nav badge shows
+  how many runs are currently in progress at a glance. (#239)
+
+- **The version popover and `uzi version` now show PRD roadmap progress.** A
+  `PRDs  N done · M open` row (sidebar popover) and matching `prds  N done, M
+  open` line (`uzi version`) count completed PRDs (`prds/done/*.md`) and active
+  ones (`prds/*.md`) in the source tree the running image was built from, so a
+  published instance's roadmap progress is visible without cloning the repo.
+  Both counts are build stamps computed in CI and injected via ldflags, the
+  same way the existing commit count is — the API's Docker build context has
+  neither `.git` nor `prds/` to count from at runtime — so like that field
+  they're simply absent (never shown as zero) on an unstamped dev build. (#245)
+
+- **`save_memory` now steers agents away from saving numbers that will go stale.**
+  The lead's prompt and the tool's own description ask agents to record the durable
+  fact rather than today's count (test-pass tallies, version numbers, and the
+  like), and a non-fatal warning fires when a saved memory's body looks like an
+  obvious snapshot shape. (fcaecf57)
+
+### Fixed
+
+- **A subagent addressing "lead", "orchestrator", or "team-lead" no longer fails
+  to send its message.** Those names now get transparently rewritten to `main` by
+  a guardrail hook, defense in depth for repo-sourced and user-authored agent
+  templates (builtins already said `main`). A repo that registers a real subagent
+  literally named `lead` is unaffected: the rewrite only fires when no such
+  subagent is registered. (61795aac)
+
+- **The judge triage meter's "to do" segment is now amber.** It previously read
+  as grey/"dismissed", making outstanding recommendations look already handled;
+  amber distinguishes to-do from dismissed. (#243)
+
 ## [0.19.1] - 2026-08-07
 
 First published cut of the 0.19.0 content: the `v0.19.0` tag was blocked by the release

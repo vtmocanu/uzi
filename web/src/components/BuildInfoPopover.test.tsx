@@ -121,6 +121,14 @@ describe("BuildInfoPopover — fully-stamped build", () => {
     expect(pop.textContent).toContain("3d 4h");
   });
 
+  it("renders the PRDs row as `N done · M open` when both counts are stamped", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const pop = popover();
+    expect(pop.textContent).toContain("PRDs");
+    // Variant A: done in the accent, `· open` faint — asserted on the visible text.
+    expect(pop.textContent).toContain("80 done · 32 open");
+  });
+
   it("carries the FULL 40-char SHA into the DOM while displaying seven", () => {
     // PRD :72 stamps the full SHA "so the stored value stays greppable and
     // linkable", and M1 gates it on len==40 && hex to guarantee it. Before this,
@@ -278,6 +286,45 @@ describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
     expect(text).not.toContain("Uptime");
     expect(text).not.toContain("Commit");
     expect(text).toContain("25 days old");
+  });
+
+  it("omits the PRDs row on a dev build that stamps neither count", () => {
+    // The laptop shape carries no prds_done/prds_open, exactly as it carries no
+    // commit/built_at — the row simply is not there, never "0" or "unknown".
+    render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    expect(popover().textContent).not.toContain("PRDs");
+  });
+
+  it("omits the PRDs row when only one of the pair is present (a half-known count)", () => {
+    // Both-or-neither: the two counts are stamped together in CI, so a lone field
+    // is treated as unknown and renders nothing rather than a misleading half-row.
+    const { rerender } = render(
+      <BuildInfoPopover info={{ ...mockBuildInfoUnstamped, prds_done: 80 }} now={NOW} />,
+    );
+    expect(popover().textContent).not.toContain("PRDs");
+    expect(popover().textContent).not.toContain("80 done");
+
+    rerender(
+      <BuildInfoPopover info={{ ...mockBuildInfoUnstamped, prds_open: 32 }} now={NOW} />,
+    );
+    expect(popover().textContent).not.toContain("PRDs");
+    expect(popover().textContent).not.toContain("32 open");
+  });
+
+  it("degrades a null or NaN PRD count to absent, not to a 'NaN' row", () => {
+    render(
+      <BuildInfoPopover
+        info={{
+          ...mockBuildInfoUnstamped,
+          prds_done: null as unknown as number,
+          prds_open: Number.NaN,
+        }}
+        now={NOW}
+      />,
+    );
+    const text = popover().textContent ?? "";
+    expect(text).not.toContain("PRDs");
+    expect(text).not.toContain("NaN");
   });
 
   it("survives a response missing founded without rendering NaN", () => {

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Version popover — PRD stats mock</title>
+<style>
+  :root{
+    --bg:#0b0d11; --panel:#12151b; --raised:#1a1e26; --edge:#2b313c;
+    --fg:#e6e8ec; --faint:#8b919c; --accent:#5b9bff; --good:#3fb950; --track:#2b313c;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);padding:28px;line-height:1.4}
+  h1{font-size:15px;font-weight:600;margin:0 0 4px}
+  .sub{color:var(--faint);font-size:12px;margin:0 0 24px}
+  .grid{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start}
+  .cell{width:300px}
+  .cap{font-size:12px;color:var(--faint);margin:0 0 10px;font-family:var(--sans)}
+  .cap b{color:var(--fg);font-weight:600}
+  .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:999px;background:var(--raised);border:1px solid var(--edge);color:var(--faint);margin-left:6px;vertical-align:middle}
+  .tag.new{color:var(--good);border-color:#265c31}
+
+  /* --- the popover, matching BuildInfoPopover.tsx --- */
+  .rail{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:0;width:224px}
+  .railtop{height:54px;border-bottom:1px solid var(--edge);display:flex;align-items:center;padding:0 12px;color:var(--faint);font-size:11px;font-family:var(--sans)}
+  .badge{border-top:1px solid var(--edge);padding:6px 12px;font-family:var(--mono);font-size:10px;color:var(--faint)}
+
+  .pop{width:226px;border:1px solid var(--edge);background:var(--raised);border-radius:8px;padding:12px;
+       box-shadow:0 20px 40px rgba(0,0,0,.55);}
+  .pop .title{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--fg)}
+  .pop .subtitle{font-size:11px;color:var(--faint);border-bottom:1px solid var(--edge);padding-bottom:8px;margin-bottom:8px}
+  dl{display:grid;grid-template-columns:auto 1fr;column-gap:12px;row-gap:4px;font-size:11px;margin:0}
+  dt{color:var(--faint)}
+  dd{margin:0;text-align:right;font-family:var(--mono);color:var(--fg)}
+  dd.split .g{color:var(--good)} dd.split .o{color:var(--faint)}
+  .bar{grid-column:1 / -1;height:4px;border-radius:999px;background:var(--track);overflow:hidden;margin-top:2px}
+  .bar > i{display:block;height:100%;width:71%;background:var(--good)}
+  .barrow{display:grid;grid-template-columns:auto 1fr;column-gap:12px;align-items:center}
+  .barrow .mini{height:4px;border-radius:999px;background:var(--track);overflow:hidden}
+  .barrow .mini > i{display:block;height:100%;width:71%;background:var(--good)}
+  .note{color:var(--faint);font-size:11px;max-width:920px;margin:26px 0 0;line-height:1.55}
+  .note code{font-family:var(--mono);color:var(--fg);background:var(--raised);padding:1px 4px;border-radius:4px;font-size:10.5px}
+</style>
+</head>
+<body>
+  <h1>Version popover &mdash; PRD stats mock</h1>
+  <p class="sub">Hover panel on the sidebar version badge (<code style="font-family:var(--mono)">BuildInfoPopover.tsx</code>). New line highlighted <span class="tag new">new</span>. Real numbers, 2026-08-08 snapshot.</p>
+
+  <div class="grid">
+
+    <!-- CURRENT -->
+    <div class="cell">
+      <p class="cap"><b>Current</b> (baseline, no PRD stats)</p>
+      <div class="pop">
+        <div class="title">uzi v0.19.1</div>
+        <div class="subtitle">36 days old &middot; 2,918 commits</div>
+        <dl>
+          <dt>Founded</dt><dd>3 Jul 2026</dd>
+          <dt>Built</dt><dd>8 Aug 2026 14:20 UTC</dd>
+          <dt>Commit</dt><dd>ab2d033</dd>
+          <dt>Uptime</dt><dd>3d 4h</dd>
+        </dl>
+      </div>
+    </div>
+
+    <!-- VARIANT A -->
+    <div class="cell">
+      <p class="cap"><b>Variant A</b> &mdash; one dl row, done &middot; open</p>
+      <div class="pop">
+        <div class="title">uzi v0.19.1</div>
+        <div class="subtitle">36 days old &middot; 2,918 commits</div>
+        <dl>
+          <dt>Founded</dt><dd>3 Jul 2026</dd>
+          <dt>Built</dt><dd>8 Aug 2026 14:20 UTC</dd>
+          <dt>Commit</dt><dd>ab2d033</dd>
+          <dt>Uptime</dt><dd>3d 4h</dd>
+          <dt style="color:var(--good)">PRDs</dt><dd class="split"><span class="g">80 done</span> <span class="o">&middot; 32 open</span></dd>
+        </dl>
+      </div>
+    </div>
+
+    <!-- VARIANT B -->
+    <div class="cell">
+      <p class="cap"><b>Variant B</b> &mdash; row + progress bar</p>
+      <div class="pop">
+        <div class="title">uzi v0.19.1</div>
+        <div class="subtitle">36 days old &middot; 2,918 commits</div>
+        <dl>
+          <dt>Founded</dt><dd>3 Jul 2026</dd>
+          <dt>Built</dt><dd>8 Aug 2026 14:20 UTC</dd>
+          <dt>Commit</dt><dd>ab2d033</dd>
+          <dt>Uptime</dt><dd>3d 4h</dd>
+          <dt style="color:var(--good)">PRDs</dt><dd class="split"><span class="g">80</span><span class="o"> / 112 done</span></dd>
+          <div class="bar"><i></i></div>
+        </dl>
+      </div>
+    </div>
+
+    <!-- VARIANT C -->
+    <div class="cell">
+      <p class="cap"><b>Variant C</b> &mdash; folded into subtitle</p>
+      <div class="pop">
+        <div class="title">uzi v0.19.1</div>
+        <div class="subtitle">36 days old &middot; 2,918 commits &middot; <span style="color:var(--good)">80/112 PRDs</span></div>
+        <dl>
+          <dt>Founded</dt><dd>3 Jul 2026</dd>
+          <dt>Built</dt><dd>8 Aug 2026 14:20 UTC</dd>
+          <dt>Commit</dt><dd>ab2d033</dd>
+          <dt>Uptime</dt><dd>3d 4h</dd>
+        </dl>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="note">
+    <b style="color:var(--fg)">Numbers:</b> <code>prds/done/*.md</code> = 80, <code>prds/*.md</code> = 32, total 112, 71% done &mdash; stamped at build time via ldflags, exactly like <code>commits</code> today (no DB query, panel stays presentational).
+    <br><br>
+    My pick: <b style="color:var(--fg)">Variant A</b> &mdash; consistent with the existing dl rows, no new visual language, and "done / open" answers your exact question at a glance. B adds a progress bar if you want the proportion to pop; C is the lightest touch but buries it in the subtitle. Pick one (or mix) and I'll write the PRD.
+  </p>
+</body>
+</html>

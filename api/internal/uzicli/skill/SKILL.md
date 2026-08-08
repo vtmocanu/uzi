@@ -28,6 +28,15 @@ Two rules cover almost everything:
 2. **Branch on the exit code, not on the text.** The message wording is for
    humans and may change; the exit code is the contract.
 
+Beyond those two, one shape to internalise: the `--json` **envelope is not
+uniform across verbs**, so do not reuse one verb's unwrapping for another.
+
+- `run create` nests the run under a top-level `run` key: `{"run": {…}}`.
+- `run get` returns the run object **at the top level**: `{…}`.
+- `run list` returns a **top-level array**: `[{…}, …]`.
+- `run logs` emits **NDJSON** — one JSON object per line, not a single document —
+  so read it line by line rather than parsing the whole stream as one value.
+
 **`uzi tui` is not for you.** It is a full-screen, keyboard-driven UI for a human
 watching runs, and it refuses to start when stdout is not a terminal (exit 2). There
 is nothing it shows that the `--json` verbs do not: use `uzi run list --json` for the
@@ -149,6 +158,24 @@ uzi version
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
   mode each message is one JSON object per line (NDJSON), so `--follow` streams.
+
+  **The nine `status` values, and what `--follow` actually waits for.** A run's
+  `status` (on `run get` and `run list`) is one of exactly nine values:
+  `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
+  `limit_wait`, `completed`, `failed`, `cancelled`. Only the last three are
+  **terminal**, and `uzi run logs --follow` returns ONLY on those three. The
+  three non-terminal parks it will **not** stop at are `awaiting_approval` (the
+  plan gate), `awaiting_input` (a clarifying question, answered with `run
+  answer`), and `limit_wait` (parked while an Anthropic usage limit resets; the
+  sweep promotes it back to `queued` once past its `retry_not_before`). So to
+  wait for a plan gate or a clarification park, **poll `uzi run get` status** —
+  relying on `--follow` there blocks until the run truly finishes, which may be
+  never if it is waiting on you. (If you ever see a `status` outside this list,
+  the server is newer than this binary — upgrade rather than trusting the value
+  to mean "active". The live `/api/ws` stream and `uzi tui` go further and
+  rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
+  --json` pass it through verbatim, so this nine-value list is what you branch
+  on.)
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
   `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
@@ -223,6 +250,12 @@ yourself, against your own clone, then hand the plan to `run create
 --plan-file` instead of letting the worker derive one from the issue. This
 is the mechanism, in order:
 
+**Vocabulary.** When someone says **seed it to uzi**, **ship it to uzi**, or
+**send it to uzi**, this is exactly what they mean: author the plan locally and
+run `uzi run create --plan-file <path>`. That bypasses uzi's own planning turn
+*and* the approval gate — the worker implements the supplied plan directly, with
+no `submit_plan` and no human sign-off before code lands.
+
 1. **Clone the repo and read the PRD** the issue links (`prds/<n>-slug.md`).
    Plan the change the same way you would for any local task: which files
    change, and how.
@@ -263,6 +296,18 @@ is the mechanism, in order:
 
    `-` instead of a path reads the plan from stdin. An empty plan, or one
    over the 256 KiB cap, is rejected at create time rather than stored.
+
+**Budget tradeoff — a seeded run gets the global default, not a milestone-scaled
+one.** A seeded run never reaches `submit_plan`, so it freezes no milestones, so
+its budget columns stay NULL and it runs on the GLOBAL DEFAULT budget:
+`RUN_MAX_ITERATIONS` iterations and `RUN_TIMEOUT` wall-clock (out of the box 5
+iterations / 2h, but both are configurable server env values, NOT constants). The
+milestone-scaled budget (PRD #122) exists only on the *gated* path, where the
+frozen milestone count is what drives it. So for a large, multi-component change,
+choose deliberately: either split it into per-component seeded runs — each small
+enough to fit the default budget — or use the gated `uzi run create` (no
+`--plan-file`) so the lead proposes milestones and the budget scales to them, at
+the cost of one approval.
 
 **No `prds/*.md` file for this issue yet?** It still works — the plan you
 supply is what the file would have provided. The issue needs **both** the
@@ -414,6 +459,21 @@ as inert data.
   the skill auto-refreshes without waiting for the next `uzi` command. Idempotent;
   backs up `settings.json` first; aborts on malformed JSON rather than clobber it.
 - `uzi skill uninstall-hook` — remove that hook, leaving sibling hooks intact.
+
+**Source of truth — where to change this skill.** These bytes are generated from
+the embedded copy at `api/internal/uzicli/skill/SKILL.md` in the uzi repo and
+reinstalled from the binary on **every** `uzi` command (and by the optional
+SessionStart hook). Editing the installed `~/.claude/skills/uzi-cli/SKILL.md`
+directly is futile: your change is copied to `SKILL.md.bak` and then overwritten
+on the next command. To change the skill for real, edit the embedded source and
+ship it.
+
+**Improving this skill — a nudge, not a gate.** After a session spent driving the
+CLI, if you hit a gap, friction, an inaccuracy, or an undocumented behaviour,
+propose an edit to that embedded source (`api/internal/uzicli/skill/SKILL.md`) —
+the same reflex the `reflect` / `dot-ai-reflect` habit encodes. The skill is only
+ever as good as the last person who fixed it after being surprised; you are that
+person more often than you expect.
 
 ### Version
 

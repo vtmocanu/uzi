@@ -2291,10 +2291,10 @@ export function TriageSummary({
       </div>
       <TriageMeter triage={triage} />
       <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
-        <TriageCount dotClass="bg-edge-strong" n={triage.todo} label="to do" />
+        <TriageCount dotClass="bg-warn" n={triage.todo} label="to do" />
         <TriageCount dotClass="bg-info" n={triage.filed} label="filed" />
         <TriageCount dotClass="bg-ok" n={triage.done} label="done" />
-        <TriageCount dotClass="bg-muted/60" n={triage.dismissed} label="dismissed" />
+        <TriageCount dotClass="bg-muted" n={triage.dismissed} label="dismissed" />
         {triage.dismissed > 0 && (
           <span className="text-faint">
             {triage.false_positives} of {triage.dismissed} dismissed{" "}
@@ -2318,7 +2318,9 @@ function TriageCount({ dotClass, n, label }: { dotClass: string; n: number; labe
 
 // TriageMeter is the segmented bar: one span per non-zero bucket, width proportional
 // to its share of the total, tinted with the same tone tokens as the counts dots. A
-// total of 0 yields an empty track.
+// total of 0 yields an empty track. `todo` takes bg-warn (amber, the "needs attention"
+// token) so the actionable backlog leads the eye, leaving grey (bg-muted) to the single
+// inert bucket, dismissed — the two used to be near-identical slate greys (#243).
 function TriageMeter({ triage }: { triage: TriageCounts }) {
   const total = triage.total;
   const seg = (n: number, cls: string, key: string) =>
@@ -2327,10 +2329,10 @@ function TriageMeter({ triage }: { triage: TriageCounts }) {
     ) : null;
   return (
     <div className="mt-2 flex h-2 overflow-hidden rounded-full bg-raised" aria-hidden="true">
-      {seg(triage.todo, "bg-edge-strong", "todo")}
+      {seg(triage.todo, "bg-warn", "todo")}
       {seg(triage.filed, "bg-info", "filed")}
       {seg(triage.done, "bg-ok", "done")}
-      {seg(triage.dismissed, "bg-muted/60", "dismissed")}
+      {seg(triage.dismissed, "bg-muted", "dismissed")}
     </div>
   );
 }

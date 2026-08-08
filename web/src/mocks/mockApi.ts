@@ -1232,6 +1232,16 @@ export const mockApi = {
     const me = requireSession();
     return delay({ unread: notifications.filter((n) => n.user_id === me.id && !n.read_at).length }, 40);
   },
+  // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
+  // fixtures the same way the real endpoint counts rows: non-terminal runs, excluding
+  // chat/judge kinds (Decision 1 + Decision 4), so the demo build shows a real number
+  // that moves as runs start and finish rather than a hardcoded constant.
+  runsInProgressCount: async () => {
+    const count = [...state.runs.values()].filter(
+      (r) => !isTerminalRun(r.status) && r.kind !== "chat" && r.kind !== "judge",
+    ).length;
+    return delay({ count }, 40);
+  },
   markNotificationRead: async (id: string) => {
     const me = requireSession();
     // Ownership is the (id, user_id) match — a foreign or unknown id is a 404,
@@ -2304,8 +2314,10 @@ export const mockApi = {
   listRuns: async (params?: { repoId?: string; issueIid?: number }) =>
     delay({
       runs: listRunsFor()
-        // Chat conversations ride runs but have their own page (PRD #39).
-        .filter((r) => r.kind !== "chat")
+        // Chat conversations ride runs but have their own page (PRD #39), and judge
+        // is a repo-less meta-run — both are excluded here exactly as the real
+        // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
+        .filter((r) => r.kind !== "chat" && r.kind !== "judge")
         .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
         .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
         .map((r) => runListItem(r)),

@@ -285,6 +285,124 @@ func TestVersionEndpointZeroCommitsPresent(t *testing.T) {
 	}
 }
 
+// TestVersionEndpointStampedPrdCounts is the release-image case for the PRD counts
+// (#245): both prds_done and prds_open present and carried as JSON numbers. Mirrors
+// the commit-count coverage — the counts follow the exact `commits` path (computed in
+// CI, stamped via ldflags), so they render the same way.
+func TestVersionEndpointStampedPrdCounts(t *testing.T) {
+	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+	h.SetBuildInfo(BuildStamp{PrdsDone: "80", PrdsOpen: "32"})
+
+	body := getVersion(t, h)
+	for k, want := range map[string]int{"prds_done": 80, "prds_open": 32} {
+		raw, ok := body[k]
+		if !ok {
+			t.Fatalf("%s missing for a stamped build, want it present (body=%v)", k, body)
+		}
+		var n int
+		if err := json.Unmarshal(raw, &n); err != nil {
+			t.Fatalf("%s is not a JSON number: %v (raw=%s)", k, err, raw)
+		}
+		if n != want {
+			t.Fatalf("%s = %d, want %d", k, n, want)
+		}
+	}
+}
+
+// TestVersionEndpointUnstampedPrdCountsOmitted: on an un-stamped build — every laptop,
+// every compose stack, every MR validation image — both PRD counts are ABSENT, not
+// zero. The same unknown-beats-wrong rule the rest of this endpoint obeys.
+func TestVersionEndpointUnstampedPrdCountsOmitted(t *testing.T) {
+	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+
+	body := getVersion(t, h)
+	if _, ok := body["prds_done"]; ok {
+		t.Errorf("prds_done present on an un-stamped build, want it omitted (raw=%s)", body["prds_done"])
+	}
+	if _, ok := body["prds_open"]; ok {
+		t.Errorf("prds_open present on an un-stamped build, want it omitted (raw=%s)", body["prds_open"])
+	}
+}
+
+// TestVersionEndpointGarbagePrdCountsOmitted: unknown beats wrong for the PRD counts
+// too. An unexpanded CI variable, a non-numeric value or a negative count is dropped
+// rather than served — the same guard `commits` uses (strconv.Atoi, err == nil && n >=
+// 0). The CI numeric shape-guard rejects most of these before the stamp, but the
+// server refuses them regardless.
+func TestVersionEndpointGarbagePrdCountsOmitted(t *testing.T) {
+	for _, tc := range []struct{ name, prdsDone, prdsOpen string }{
+		{"unexpanded ci variables", "$UZI_PRDS_DONE", "$UZI_PRDS_OPEN"},
+		{"non-numeric", "eighty", "thirty-two"},
+		{"negative", "-1", "-5"},
+		{"fractional", "80.0", "32.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+			h.SetBuildInfo(BuildStamp{PrdsDone: tc.prdsDone, PrdsOpen: tc.prdsOpen})
+
+			body := getVersion(t, h)
+			if _, ok := body["prds_done"]; ok {
+				t.Errorf("prds_done present for %q, want it omitted (raw=%s)", tc.prdsDone, body["prds_done"])
+			}
+			if _, ok := body["prds_open"]; ok {
+				t.Errorf("prds_open present for %q, want it omitted (raw=%s)", tc.prdsOpen, body["prds_open"])
+			}
+		})
+	}
+}
+
+// TestVersionEndpointHalfPresentPrdCounts: the two counts parse INDEPENDENTLY on the
+// server — a stamped one renders whether or not its sibling did. The both-or-neither
+// rule the PRD describes is a CONSUMER guarantee (the web row and `uzi version` require
+// both), and it holds because the two are computed in one CI step and travel together;
+// the server itself does not couple them, so this pins the honest per-field behaviour.
+func TestVersionEndpointHalfPresentPrdCounts(t *testing.T) {
+	t.Run("only done stamped", func(t *testing.T) {
+		h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+		h.SetBuildInfo(BuildStamp{PrdsDone: "80"})
+
+		body := getVersion(t, h)
+		if _, ok := body["prds_done"]; !ok {
+			t.Errorf("prds_done omitted when stamped alone, want it present (body=%v)", body)
+		}
+		if _, ok := body["prds_open"]; ok {
+			t.Errorf("prds_open present when only done was stamped (raw=%s)", body["prds_open"])
+		}
+	})
+	t.Run("only open stamped", func(t *testing.T) {
+		h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+		h.SetBuildInfo(BuildStamp{PrdsOpen: "32"})
+
+		body := getVersion(t, h)
+		if _, ok := body["prds_open"]; !ok {
+			t.Errorf("prds_open omitted when stamped alone, want it present (body=%v)", body)
+		}
+		if _, ok := body["prds_done"]; ok {
+			t.Errorf("prds_done present when only open was stamped (raw=%s)", body["prds_done"])
+		}
+	})
+}
+
+// TestVersionEndpointZeroPrdCountsPresent: a real "0" renders as present-not-omitted,
+// exactly like commits and uptime_seconds. A brand-new project with no completed PRDs
+// has a KNOWN done count of 0, which is not the same as "unknown"; the pointer +
+// `n >= 0` guard (not `> 0`) is what keeps that distinction on the wire.
+func TestVersionEndpointZeroPrdCountsPresent(t *testing.T) {
+	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+	h.SetBuildInfo(BuildStamp{PrdsDone: "0", PrdsOpen: "0"})
+
+	body := getVersion(t, h)
+	for _, k := range []string{"prds_done", "prds_open"} {
+		raw, ok := body[k]
+		if !ok {
+			t.Fatalf("%s missing for a stamped \"0\", want it present (body=%v)", k, body)
+		}
+		if string(raw) != "0" {
+			t.Fatalf("%s = %s, want 0", k, raw)
+		}
+	}
+}
+
 // TestVersionEndpointZeroStartedAtOmitsUptime is the hazard PRD #175 M1 calls out and
 // the reason uptime_seconds is a pointer. Many tests in this package construct a
 // Handler as a struct literal rather than through New (see clock()), leaving startedAt
@@ -451,11 +569,13 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 	// One list, and the reason is the value rather than a comment so it cannot drift
 	// away from the key it justifies.
 	public := map[string]string{
-		"version":  "already public: == the image tag, which is in the chart",
-		"founded":  "already public: a const date",
-		"built_at": "already public: when a public image was built",
-		"commit":   "already public: a SHA that is in the repo",
-		"commits":  "already public: a count over that repo",
+		"version":   "already public: == the image tag, which is in the chart",
+		"founded":   "already public: a const date",
+		"built_at":  "already public: when a public image was built",
+		"commit":    "already public: a SHA that is in the repo",
+		"commits":   "already public: a count over that repo",
+		"prds_done": "already public: a count over that repo (completed PRDs)",
+		"prds_open": "already public: a count over that repo (active PRDs)",
 		"uptime_seconds": "DISCLOSURE, not already-public: a runtime fact about this process. " +
 			"See the Version handler for the decision and for what would require re-deciding " +
 			"it (an /about page, a signed-out footer — any new surface widens the audience).",
@@ -494,9 +614,11 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
 	h.SetVersion("0.11.12")
 	h.SetBuildInfo(BuildStamp{
-		Commit:  "366a282d52095312f54b99698b241ac872e20284",
-		BuiltAt: "2026-07-28T09:15:00Z",
-		Commits: "2060",
+		Commit:   "366a282d52095312f54b99698b241ac872e20284",
+		BuiltAt:  "2026-07-28T09:15:00Z",
+		Commits:  "2060",
+		PrdsDone: "80",
+		PrdsOpen: "32",
 	})
 	for k := range getVersion(t, h) {
 		if _, ok := public[k]; !ok {

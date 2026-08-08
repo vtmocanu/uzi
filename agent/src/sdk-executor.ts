@@ -64,7 +64,9 @@ import {
   buildPreToolUseHook,
   buildPathGuardHook,
   buildAgentGuardHook,
+  buildSendMessageAliasHook,
   NESTED_AGENT_TOOL,
+  SEND_MESSAGE_TOOL,
   ASYNC_DEFERRAL_TOOLS,
 } from "./guardrails.js";
 import {
@@ -499,6 +501,10 @@ export class SdkExecutor implements Executor {
       {
         matcher: NESTED_AGENT_TOOL,
         hooks: [buildAgentGuardHook(allowedSubagents, this.log)],
+      },
+      {
+        matcher: SEND_MESSAGE_TOOL,
+        hooks: [buildSendMessageAliasHook(allowedSubagents, this.log)],
       },
     ];
 

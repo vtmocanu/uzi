@@ -368,7 +368,11 @@ var workerDTOKeys = []string{
 	// layer pins it — this tag set is the only wire contract these two fields have.
 	"upgrade_status", "upgrade_detail", "upgrade_target",
 	"upgrade_blocking_container", "upgrade_blocking_reason", "upgrade_last_exit_code",
-	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
+	"last_heartbeat_at",
+	// PRD #251: api-owned anchor of when the worker became online; null when offline or
+	// never online. Uptime is derived client-side as now − online_since; display-only.
+	"online_since",
+	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
@@ -523,16 +527,19 @@ func TestBuildInfoDTOTags(t *testing.T) {
 	assertTags(t, "BuildInfoDTO(unstamped)", BuildInfoDTO{}, "version", "founded")
 
 	commits, uptime := 2060, int64(5400)
+	prdsDone, prdsOpen := 80, 32
 	full := BuildInfoDTO{
 		Version:       "0.11.12",
 		Founded:       "2026-07-03",
 		BuiltAt:       "2026-07-28T09:15:00Z",
 		Commit:        "366a282d52095312f54b99698b241ac872e20284",
 		Commits:       &commits,
+		PrdsDone:      &prdsDone,
+		PrdsOpen:      &prdsOpen,
 		UptimeSeconds: &uptime,
 	}
 	assertTags(t, "BuildInfoDTO(stamped)", full,
-		"version", "founded", "built_at", "commit", "commits", "uptime_seconds")
+		"version", "founded", "built_at", "commit", "commits", "prds_done", "prds_open", "uptime_seconds")
 
 	// uptime_seconds is a pointer so that a genuine 0 (a process in its first second)
 	// stays on the wire. omitempty on a bare int64 would drop it and make it

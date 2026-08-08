@@ -81,7 +81,7 @@ func TestScanPackBudgetRejectsDeltaBomb(t *testing.T) {
 	if len(pack) > 1<<10 {
 		t.Fatalf("bomb pack is %d bytes; expected it to be tiny", len(pack))
 	}
-	if err := scanPackBudget(pack); !errors.Is(err, ErrPackTooLarge) {
+	if err := scanPackBudget(context.Background(), pack); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge", err)
 	}
 }
@@ -98,8 +98,64 @@ func TestScanPackBudgetRejectsDeltaBombCumulative(t *testing.T) {
 		objs = append(objs, refDeltaObject(t, blobOID(baseContent), deltaBody(uint64(len(baseContent)), perDelta)))
 	}
 	pack := assemblePack(t, objs...)
-	if err := scanPackBudget(pack); !errors.Is(err, ErrPackTooLarge) {
+	if err := scanPackBudget(context.Background(), pack); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge (cumulative)", err)
+	}
+}
+
+// TestScanPackBudgetRejectsInstructionStreamBomb is the regression for the DoS this
+// M8 hardening closes — the DUAL of the target-size bomb above. Here every REF_DELTA
+// declares a TARGET size of 0 (so it contributes nothing to the reconstructed-size
+// counter and maxPackTotalBytes NEVER fires) but carries a ~maxPackObjectBytes
+// INSTRUCTION stream. The scanner must zlib-inflate each instruction stream in full to
+// stay aligned; enough of them cross the cumulative inflation-work cap. The
+// pre-hardening budget counted only reconstructed (target) bytes for deltas, so it
+// waved this through — an 897 KiB pack was measured inflating ~900 MiB and being
+// ACCEPTED (err=nil). scanPackBudget must now reject it as ErrPackTooLarge via
+// maxPackInflationWorkBytes.
+//
+// That it is specifically the NEW cap firing (all budget axes share ErrPackTooLarge):
+// every targetSz is 0 so `total` stays 0 (reconstructed cap inert), each h.Length is
+// under maxPackObjectBytes (per-object cap inert), and the object count is a handful
+// << maxPackObjects (count cap inert). Only the inflation-work counter can trip here.
+func TestScanPackBudgetRejectsInstructionStreamBomb(t *testing.T) {
+	baseContent := []byte("base blob\n")
+	const perDeltaInstr = 30 << 20 // under the 32 MiB per-object cap, near it
+	// Enough deltas to push cumulative inflation work past maxPackInflationWorkBytes
+	// (+2 over the integer division for margin), while every other budget axis stays
+	// comfortably inert.
+	nDeltas := maxPackInflationWorkBytes/perDeltaInstr + 2
+	// All deltas are byte-identical: compress the object ONCE and reuse it, so test
+	// construction stays cheap while the scan still inflates each in turn.
+	deltaObj := refDeltaObject(t, blobOID(baseContent), bigInstructionDelta(uint64(len(baseContent)), perDeltaInstr))
+	objs := [][]byte{blobObject(t, baseContent)}
+	for i := 0; i < nDeltas; i++ {
+		objs = append(objs, deltaObj)
+	}
+	pack := assemblePack(t, objs...)
+	// Tiny on the wire (the zero-filled instruction streams zlib-compress away), yet a
+	// pre-hardening scanner would inflate hundreds of MiB and accept it.
+	if len(pack) > 1<<20 {
+		t.Fatalf("instruction-stream bomb pack is %d bytes; expected it to be small on the wire", len(pack))
+	}
+	if err := scanPackBudget(context.Background(), pack); !errors.Is(err, ErrPackTooLarge) {
+		t.Fatalf("err = %v, want ErrPackTooLarge (inflation-work cap)", err)
+	}
+}
+
+// TestScanPackBudgetCancellable proves scanPackBudget honours ctx: an already-cancelled
+// context is returned before the first object is inflated, so the per-publish
+// wall-clock timeout in Publish can actually cut a long inflation short.
+func TestScanPackBudgetCancellable(t *testing.T) {
+	baseContent := []byte("base blob\n")
+	pack := assemblePack(t,
+		blobObject(t, baseContent),
+		refDeltaObject(t, blobOID(baseContent), deltaBody(uint64(len(baseContent)), 4096)),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := scanPackBudget(ctx, pack); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
 
@@ -111,7 +167,7 @@ func TestScanPackBudgetAcceptsNormalDelta(t *testing.T) {
 		blobObject(t, baseContent),
 		refDeltaObject(t, blobOID(baseContent), deltaBody(uint64(len(baseContent)), 4096)),
 	)
-	if err := scanPackBudget(pack); err != nil {
+	if err := scanPackBudget(context.Background(), pack); err != nil {
 		t.Fatalf("scanPackBudget rejected a legit delta: %v", err)
 	}
 }
@@ -120,7 +176,7 @@ func TestScanPackBudgetAcceptsNormalDelta(t *testing.T) {
 // best-effort skip), distinct from ErrPackTooLarge.
 func TestScanPackBudgetMalformed(t *testing.T) {
 	t.Run("bad_signature", func(t *testing.T) {
-		if err := scanPackBudget([]byte("NOPExxxxxxxxxxxxxxxx")); !errors.Is(err, ErrPackInvalid) {
+		if err := scanPackBudget(context.Background(), []byte("NOPExxxxxxxxxxxxxxxx")); !errors.Is(err, ErrPackInvalid) {
 			t.Fatalf("err = %v, want ErrPackInvalid", err)
 		}
 	})
@@ -132,7 +188,7 @@ func TestScanPackBudgetMalformed(t *testing.T) {
 		_ = binary.Write(&buf, binary.BigEndian, uint32(1))
 		sum := sha1.Sum(buf.Bytes())
 		buf.Write(sum[:])
-		if err := scanPackBudget(buf.Bytes()); !errors.Is(err, ErrPackInvalid) {
+		if err := scanPackBudget(context.Background(), buf.Bytes()); !errors.Is(err, ErrPackInvalid) {
 			t.Fatalf("err = %v, want ErrPackInvalid", err)
 		}
 	})
@@ -148,7 +204,7 @@ func TestScanPackBudgetTooManyObjects(t *testing.T) {
 	_ = binary.Write(&buf, binary.BigEndian, uint32(maxPackObjects+1))
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
-	if err := scanPackBudget(buf.Bytes()); !errors.Is(err, ErrPackTooLarge) {
+	if err := scanPackBudget(context.Background(), buf.Bytes()); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge", err)
 	}
 }
@@ -227,6 +283,23 @@ func deltaBody(baseSz, targetSz uint64) []byte {
 	b = append(b, writeDeltaVarint(baseSz)...)
 	b = append(b, writeDeltaVarint(targetSz)...)
 	b = append(b, 0x03, 'a', 'b', 'c') // insert-op: literal 3 bytes
+	return b
+}
+
+// bigInstructionDelta is the DUAL of deltaBody: a delta whose declared TARGET size is
+// 0 (so it contributes nothing to scanPackBudget's reconstructed-size counter) but
+// whose whole body is instrBytes long — the INSTRUCTION stream the scanner must
+// zlib-inflate. The packfile object header (refDeltaObject) declares Length = len of
+// this body, so the returned slice is exactly instrBytes. scanPackBudget reads only
+// the two leading varints and discards the rest, so the zero filler is never executed
+// as delta ops; zeros zlib-compress to almost nothing, which is what makes the bomb
+// tiny on the wire yet huge to inflate.
+func bigInstructionDelta(baseSz uint64, instrBytes int) []byte {
+	b := writeDeltaVarint(baseSz)
+	b = append(b, writeDeltaVarint(0)...) // target size 0
+	if pad := instrBytes - len(b); pad > 0 {
+		b = append(b, make([]byte, pad)...)
+	}
 	return b
 }
 

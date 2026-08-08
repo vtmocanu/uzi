@@ -37,6 +37,10 @@ vi.mock("../lib/api", () => ({
     // workers count would put a second badge in the same nav and any loose
     // getByText(/\d/) here would start matching the wrong one.
     workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
+    // PRD #239: zero for the same reason as workerUpgradeSummary above — a non-zero
+    // Runs badge would put a second count in this nav and the loose digit matchers
+    // here would start measuring the wrong badge.
+    runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
     listNotifications: vi.fn(),

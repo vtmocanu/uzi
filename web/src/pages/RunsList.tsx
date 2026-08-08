@@ -21,6 +21,7 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { stripUnsafeChars } from "../lib/safeText";
+import { formatUptimeSince } from "../lib/formatUptimeSince";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -299,6 +300,9 @@ export function RunsList() {
                         <span className="ml-2 text-xs text-faint">
                           template {w.template_reported ?? `${w.template_declared} (declared)`}
                         </span>
+                      )}
+                      {w.status === "online" && w.online_since && (
+                        <span className="ml-2 text-xs text-faint">up {formatUptimeSince(w.online_since)}</span>
                       )}
                     </div>
                     <div className="flex items-center gap-1.5">

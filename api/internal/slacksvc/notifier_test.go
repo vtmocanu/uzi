@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1054,8 +1055,8 @@ func TestNotifierNoMilestonesBehavesAsToday(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.updates) != 1 || strings.Contains(fp.updates[0].text, "/7") || strings.Contains(fp.updates[0].text, " · 0/") {
-		t.Fatalf("a no-milestone run's root must carry no counter: %+v", fp.updates)
+	if len(fp.updates) != 1 || regexp.MustCompile(`· [0-9]+/[0-9]+`).MatchString(fp.updates[0].text) {
+		t.Fatalf("a no-milestone run's root must carry no milestone counter: %+v", fp.updates)
 	}
 	if len(fp.posts) != 0 {
 		t.Fatalf("a no-milestone run must post no milestone thread line: %+v", fp.posts)

@@ -176,6 +176,13 @@ WITH prev AS (
         version             = @version,
         template_reported   = @template_reported,
         max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+        -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the
+        -- worker is already online with one, else STAMP now() — so a steady stream of
+        -- registers never moves it and the first register after an offline gap (or for a
+        -- brand-new worker) starts a fresh session. Postgres evaluates the SET RHS against
+        -- the OLD row, so workers.status/online_since here read the pre-update tuple (the
+        -- same mechanism SetRunRunning's `health = CASE WHEN status='running'` relies on).
+        online_since        = CASE WHEN workers.status = 'online' AND workers.online_since IS NOT NULL THEN workers.online_since ELSE now() END,
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = @id
@@ -243,6 +250,12 @@ SELECT * FROM upd;
 -- this statement stores them verbatim.
 UPDATE workers SET
     status                = 'online',
+    -- online_since is the api-owned uptime anchor (PRD #251 M1): PRESERVE it if the worker
+    -- is already online with one, else STAMP now() — so repeated heartbeats never move it
+    -- and the first heartbeat after an offline gap starts a fresh session. Postgres
+    -- evaluates the SET RHS against the OLD row, so status/online_since read the pre-update
+    -- tuple (the same mechanism SetRunRunning's `health = CASE WHEN status='running'` uses).
+    online_since          = CASE WHEN workers.status = 'online' AND workers.online_since IS NOT NULL THEN workers.online_since ELSE now() END,
     last_heartbeat_at     = now(),
     stats_cpu_pct         = sqlc.narg('stats_cpu_pct'),
     stats_mem_bytes       = sqlc.narg('stats_mem_bytes'),
@@ -266,9 +279,20 @@ WHERE worker_id = @worker_id
   AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: CountInProgressRunsForUser :one
+-- The Runs nav badge count (PRD #239): the caller's non-terminal runs, scoped to the
+-- same kinds the Runs page (ListRunsForUser) shows — chat and judge excluded, so the
+-- badge is a strict subset of what /runs lists.
+SELECT count(*) FROM runs
+WHERE user_id = @user_id
+  AND kind NOT IN ('chat', 'judge')
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: MarkStaleWorkersOffline :execrows
--- Sweeper: workers past the heartbeat-stale window go offline.
-UPDATE workers SET status = 'offline', updated_at = now()
+-- Sweeper: workers past the heartbeat-stale window go offline. online_since is CLEARED
+-- here (PRD #251 M1): an offline worker carries no uptime, so the next online transition
+-- starts a fresh anchor rather than reporting a session that spanned the outage.
+UPDATE workers SET status = 'offline', online_since = NULL, updated_at = now()
 WHERE status = 'online'
   AND (last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff);
 

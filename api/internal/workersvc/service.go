@@ -2888,7 +2888,15 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
 		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, nil
 	default:
-		return PublishResult{}, fmt.Errorf("publish: %w", err)
+		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
+		// go-git error). This is the ONE forge-touching path whose error does NOT
+		// pass through internal/forge's PAT-scrubbing redactor, and a go-git transport
+		// error can embed the remote URL — which carries the bot PAT in its userinfo —
+		// before it reaches slog.Error in the handler. Restore the stated invariant:
+		// run it through the known-credential scrub. The pushbroker sentinels are all
+		// matched above, so this error is only logged/returned, never errors.Is-checked
+		// downstream — flattening the %w chain to a scrubbed string is safe here.
+		return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
 	}
 }
 

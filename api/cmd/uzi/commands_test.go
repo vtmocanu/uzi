@@ -792,7 +792,7 @@ func TestRunLogsCapsTheActorCell(t *testing.T) {
 // proving the strip is rune-wise, not byte-wise.
 func TestRunReviewSanitizesHumanRender(t *testing.T) {
 	const summary = "\x1b[2J\x1b[31mFAKE ERROR" // CSI screen-clear + red
-	const target = "docs\u0085–end"                  // C1 NEL (U+0085) + en dash (U+2013, 0xE2 0x80 0x93)
+	const target = "docs\u0085–end"             // C1 NEL (U+0085) + en dash (U+2013, 0xE2 0x80 0x93)
 	const rationale = "before\x1b[1mafter"      // SGR bold
 	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
 		"r1": {Verdict: "needs_work", Status: "complete", SummaryMd: summary,
@@ -1194,8 +1194,11 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	// UpgradeStatus (worker.go), which BOTH fixture workers have, so the UPGRADE column
 	// satisfies it whatever VERSION renders. Measured — with the placeholder removed
 	// entirely, so an all-Cf version renders a blank cell, that assertion stayed green.
-	// Columns are ID NAME STATUS VERSION UPGRADE, so a blank VERSION collapses the row to
-	// four fields and the length check is what catches it.
+	// Columns are ID NAME STATUS UPTIME VERSION UPGRADE (TOKEN is empty for both
+	// fixtures, so strings.Fields drops it), so a blank VERSION collapses the row to
+	// five fields and the length check is what catches it. Both workers are online with
+	// a nil OnlineSince, so their UPTIME cell renders "-" (PRD #251) and VERSION sits at
+	// index 4.
 	var betaRow []string
 	for _, line := range strings.Split(out, "\n") {
 		if f := strings.Fields(line); len(f) > 1 && f[1] == "beta" {
@@ -1206,7 +1209,7 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	if betaRow == nil {
 		t.Fatalf("no row for worker beta:\n%s", out)
 	}
-	if len(betaRow) != 5 || betaRow[3] != "-" {
+	if len(betaRow) != 6 || betaRow[4] != "-" {
 		t.Errorf("an all-format-character version must render \"-\" in the VERSION cell, got %q:\n%s", betaRow, out)
 	}
 }
