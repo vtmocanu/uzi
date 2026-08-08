@@ -415,6 +415,43 @@ describe("HealthFlag — the health reason (#124, text channel)", () => {
   });
 });
 
+// Issue #185: the live region must be ALWAYS MOUNTED and the visible pill must NOT be a
+// live region. A region created in the same tick as its first message is silent (assistive
+// tech announces CHANGES to a region that already existed — Board.tsx S5), so role="status"
+// on the pill itself never announced the flag despite the comment claiming it did.
+describe("HealthFlag live region (#185)", () => {
+  it("keeps the sr-only status region mounted and EMPTY for a healthy run", () => {
+    const { container } = render(<HealthFlag run={run({ status: "running", health: "ok" })} />);
+    // No visible pill for a healthy run…
+    const pill = [...container.querySelectorAll("span")].find((s) => (s.textContent ?? "").includes("⚠"));
+    expect(pill).toBeUndefined();
+    // …but the live region exists so a flag arriving later is an announced content change,
+    // not a silent mount-with-first-message.
+    const live = container.querySelector('span.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.getAttribute("aria-live")).toBe("polite");
+    expect(live.textContent).toBe("");
+  });
+
+  it("announces via the sr-only region, and the visible pill is NOT a live region", () => {
+    const { container } = render(
+      <HealthFlag run={run({ status: "running", health: "stalled", health_reason: "no output" })} />,
+    );
+    // The sr-only region carries the flag label — the thing a screen reader hears.
+    const live = container.querySelector('span.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.getAttribute("aria-live")).toBe("polite");
+    expect(live.textContent?.trim()).not.toBe("");
+    // The visible pill exists but carries NO role="status"/aria-live — that was the bug.
+    const pill = [...container.querySelectorAll("span")].find((s) => (s.textContent ?? "").includes("⚠"))!;
+    expect(pill).toBeTruthy();
+    expect(pill.getAttribute("role")).toBeNull();
+    expect(pill.hasAttribute("aria-live")).toBe(false);
+    // Exactly ONE status region on the whole flag — the sr-only one.
+    expect(container.querySelectorAll('[role="status"]').length).toBe(1);
+  });
+});
+
 // Issue #124: `run.branch` is WORKER-supplied and ingest stores it as
 // `stripNULParam(req.Branch)` — NUL only, no Cc/Cf. Extracted to be assertable at all;
 // before that, dropping the strip left the whole file green.
@@ -2413,6 +2450,66 @@ describe("LimitWaitPanel (PRD #35)", () => {
     expect(container.textContent).not.toContain("NaN");
     expect(container.textContent).not.toContain("Invalid");
   });
+
+  // Issue #183: a NON-OWNER (canSteer=false) can open this owner-or-admin run view, but
+  // POST /inputs is user-scoped, so a Stop or a wait-on-limit write would 404. Both
+  // controls are HIDDEN and replaced by inert text — never a greyed button that lies —
+  // mirroring PlanPanel/QuestionPanel's non-owner branches.
+  it("🔴 shows inert text and NO clickable controls for a non-owner on a parked run (#183)", () => {
+    const onStop = vi.fn();
+    const onToggle = vi.fn();
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        canSteer={false}
+        onToggle={onToggle}
+        onStop={onStop}
+      />,
+    );
+    // No live Stop button and no wait-on-limit checkbox.
+    expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
+    expect(container.querySelector("input[type=checkbox]")).toBeNull();
+    // The park still reads for everyone — heading and countdown are unchanged…
+    expect(container.textContent).toContain("Paused on an Anthropic usage limit");
+    expect(container.textContent).toContain("2h 14m");
+    // …and the two controls become inert statements of who can act.
+    expect(container.textContent).toMatch(/only its owner can change this/i);
+    expect(container.textContent).toMatch(/only the run's owner can stop it/i);
+  });
+
+  it("hides the non-owner toggle on a live, never-parked run too (#183)", () => {
+    // The faint-toggle (non-parked) branch is gated by the SAME shared `toggle`, so it
+    // must not leave a clickable checkbox for a non-owner either.
+    const { container } = render(
+      <LimitWaitPanel
+        run={run({ status: "running" })}
+        busy={false}
+        canSteer={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(container.querySelector("input[type=checkbox]")).toBeNull();
+    expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
+    expect(container.textContent).toMatch(/only its owner can change this/i);
+  });
+
+  it("keeps the LIVE toggle and Stop for an owner (canSteer default true)", () => {
+    // The positive control for the two absence checks above: with canSteer defaulting to
+    // true, an owner still gets the real checkbox and Stop button.
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(container.querySelector("input[type=checkbox]")).not.toBeNull();
+    expect(screen.getByRole("button", { name: /stop run/i })).toBeTruthy();
+    expect(container.textContent).not.toMatch(/only the run's owner can stop it/i);
+  });
 });
 
 describe("RunView ↔ LimitWaitPanel wiring (PRD #35)", () => {
@@ -2438,6 +2535,15 @@ describe("RunView ↔ LimitWaitPanel wiring (PRD #35)", () => {
     // refetch the checkbox snaps back to the stale run on the next render, which
     // reads exactly like the write having failed.
     expect(live).toMatch(/setRunWaitOnLimit[\s\S]{0,200}refreshRun\(\)/);
+  });
+
+  it("threads canSteer to the panel, so a non-owner is not offered a Stop that 404s (#183)", () => {
+    // Same pattern as PlanPanel/QuestionPanel (MR !149): canSteer is destructured from
+    // useRunStream at the call site and must reach LimitWaitPanel, or the non-owner
+    // inert-text branch is unreachable from the page.
+    const panel = live.indexOf("<LimitWaitPanel");
+    expect(panel).toBeGreaterThan(-1);
+    expect(live.slice(panel, panel + 400)).toContain("canSteer={canSteer}");
   });
 });
 
