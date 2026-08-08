@@ -28,9 +28,10 @@ import (
 // it wrote. One name makes that class of bug unrepresentable.
 //
 // Pinned to GitLab, and NOT read from config, deliberately (PRD #65 M6a). The
-// migration alongside this widens the forge_type CHECK to admit 'forgejo', but
-// that widening is only safe while nothing can write such a row: handler/forge.go
-// still refuses the type (:158), so the API cannot create one. The seed bypasses
+// migration alongside this widens the forge_type CHECK to admit 'forgejo' (and,
+// since PRD #238 M5, 'github' too), but that widening is only safe while nothing
+// can write such a row: handler/forge.go still refuses those types (:158), so the
+// API cannot create one. The seed bypasses
 // that handler entirely — it calls UpsertForgeConnection directly — so an
 // operator-settable seed type would be a second, ungated door to the exact row
 // the gate exists to prevent, and PRD #65's dark-landing property ("no forgejo row

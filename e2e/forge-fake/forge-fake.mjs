@@ -4,11 +4,13 @@
 // checks, CI) and the uzi worker (merge/pull-request create) actually call, plus
 // an introspection endpoint the harness reads to assert what was recorded.
 //
-// It speaks BOTH forge dialects over ONE shared in-memory state, selected by path
-// prefix: the GitLab v4 API (`/api/v4/*`) and — for PRD #65's Forgejo lane — the
-// Forgejo v1 API (`/api/v1/*`). The driver hits whichever matches the connection's
-// forge_type; the `/_e2e/*` mutators and the git smart-HTTP handler are
-// forge-agnostic and shared. UZI_E2E_FORGE selects the lane in run-e2e.sh.
+// It speaks THREE forge dialects over ONE shared in-memory state, selected by path
+// prefix: the GitLab v4 API (`/api/v4/*`), the Forgejo v1 API (`/api/v1/*`, PRD #65),
+// and the GitHub v3 API (`/api/v3/*`, PRD #238 — go-github mounts an enterprise base
+// under /api/v3). The driver hits whichever matches the connection's forge_type; the
+// `/_e2e/*` mutators and the git smart-HTTP handler are forge-agnostic and shared, so
+// an issue created through one table is visible through the others. UZI_E2E_FORGE
+// selects the lane in run-e2e.sh.
 //
 // It is deliberately NOT a real forge: there is exactly one project, auth is not
 // checked (the harness uses dummy credentials per the testing-credentials
@@ -103,6 +105,14 @@ const state = {
   // ordering the driver's `[0]`-is-newest depends on. The /api/v1 readers return
   // this sorted id DESC; the harness appends via /_e2e/actions-runs.
   forgejoRuns: /** @type {any[]} */ ([]),
+  // GitHub Actions workflow runs (PRD #238 M8). A flat list like forgejoRuns —
+  // github.com returns runs created_at-DESC (newest first) and the driver takes
+  // runs[0], so the /api/v3 reader sorts id DESC. Unlike Forgejo, each run/job
+  // carries TWO fields (status + conclusion, D8): the driver collapses them
+  // (status until completed, then conclusion), so the fixtures must set BOTH — a
+  // failed run is status:"completed" + conclusion:"failure". Appended via
+  // /_e2e/github-actions-runs.
+  githubRuns: /** @type {any[]} */ ([]),
   // Stable label name -> numeric id map for the Forgejo lane. Forgejo's label
   // writes are keyed by id (ReplaceIssueLabels takes []int), so the fake must
   // assign each label name a stable id and map ids back to names on a PUT.
@@ -116,6 +126,8 @@ const state = {
   nextForgejoRunId: 3000,
   nextForgejoJobId: 3500,
   nextForgejoLabelId: 200,
+  nextGitHubRunId: 4000,
+  nextGitHubJobId: 4500,
   // The version /api/v1/version reports. Default is a D4a-passing release; the
   // harness flips it (via /_e2e/forgejo-version) to a < 16.0.0 string for one
   // assertion, to prove the privilege sweep raises the version-downgrade finding.
@@ -136,7 +148,7 @@ function persist() {
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(
-        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines, forgejoRuns: state.forgejoRuns, forgejoLabelIds: state.forgejoLabelIds },
+        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines, forgejoRuns: state.forgejoRuns, githubRuns: state.githubRuns, forgejoLabelIds: state.forgejoLabelIds },
         null,
         2,
       ),
@@ -160,10 +172,13 @@ function load() {
     state.labelEvents = saved.labelEvents && typeof saved.labelEvents === "object" ? saved.labelEvents : {};
     state.pipelines = saved.pipelines && typeof saved.pipelines === "object" ? saved.pipelines : {};
     state.forgejoRuns = Array.isArray(saved.forgejoRuns) ? saved.forgejoRuns : [];
+    state.githubRuns = Array.isArray(saved.githubRuns) ? saved.githubRuns : [];
     state.forgejoLabelIds = saved.forgejoLabelIds && typeof saved.forgejoLabelIds === "object" ? saved.forgejoLabelIds : {};
     state.nextPipelineId = Math.max(899, ...Object.values(state.pipelines).map((p) => p.id)) + 1;
     state.nextForgejoRunId = Math.max(2999, ...state.forgejoRuns.map((r) => r.id)) + 1;
     state.nextForgejoJobId = Math.max(3499, ...state.forgejoRuns.flatMap((r) => (r.jobs || []).map((j) => j.id))) + 1;
+    state.nextGitHubRunId = Math.max(3999, ...state.githubRuns.map((r) => r.id)) + 1;
+    state.nextGitHubJobId = Math.max(4499, ...state.githubRuns.flatMap((r) => (r.jobs || []).map((j) => j.id))) + 1;
     state.nextForgejoLabelId = Math.max(199, ...Object.values(state.forgejoLabelIds)) + 1;
     state.nextIssueIid = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
     state.nextMrIid = Math.max(0, ...state.mrs.map((m) => m.iid)) + 1;
@@ -413,6 +428,126 @@ function forgejoRunSummary({ branch, headSha, limit }) {
   };
 }
 
+// ============================================================================
+// GitHub /api/v3 translation (PRD #238 M8). The GitHub route table below shares
+// the SAME in-memory `state` as the /api/v4 (GitLab) and /api/v1 (Forgejo) tables
+// — the /_e2e mutators and the git smart-HTTP handler are forge-agnostic — but the
+// wire SHAPES differ, so these helpers translate a GitLab-shaped state record into
+// what the go-github driver (api/internal/forge/github.go) actually parses. Every
+// shape here mirrors the driver's own unit-test mocks (github_test.go): an issue's
+// `number` is the iid; a PR is an issue with a NON-NULL pull_request (R4); labels
+// are objects with a `name`; issue events carry event/actor/label; Actions runs
+// return {total_count, workflow_runs} id-DESC with the TWO fields status+conclusion
+// (D8). go-github mounts under /api/v3 via WithEnterpriseURLs, so the route table
+// lives there; the /api/v3 prefix is stripped before dispatch.
+// ============================================================================
+
+// githubWebUrl rewrites a GitLab-style web_url into GitHub's grammar so a card's
+// rendered link is forge-honest (/-/issues/N -> /issues/N, /-/merge_requests/N ->
+// /pull/N). Correctness only; both are same-host https.
+function githubWebUrl(glUrl) {
+  return String(glUrl || "").replace("/-/issues/", "/issues/").replace("/-/merge_requests/", "/pull/");
+}
+// githubIssueState maps the cache's "opened"/"closed" onto GitHub's "open"/"closed"
+// (identical spelling to Forgejo, but kept as its own function so each table owns its
+// vocabulary — see the issue-list-filtering note above).
+function githubIssueState(s) {
+  return s === "closed" ? "closed" : "open";
+}
+// GitHub issue-state vocabulary: open | closed | all (default all). Mirrors the
+// query the driver sends (githubIssueStateParam), which is open/closed/all.
+function issueMatchesGitHubState(issue, stateParam) {
+  if (!stateParam || stateParam === "all") return true;
+  return githubIssueState(issue.state) === stateParam;
+}
+// toGitHubIssue maps a stored GitLab-shaped issue to a GitHub issue: `number` for the
+// index, `body` for the description, label OBJECTS, and — crucially — NO pull_request
+// field, so the driver's R4 filter (PullRequestLinks != nil) keeps it as a card.
+function toGitHubIssue(issue) {
+  return {
+    id: issue.id,
+    number: issue.iid,
+    title: issue.title,
+    body: issue.description ?? "",
+    state: githubIssueState(issue.state),
+    labels: (issue.labels || []).map((n) => ({ id: 1000 + issue.iid, name: n, color: "ededed" })),
+    html_url: githubWebUrl(issue.web_url),
+    user: { id: issue.author?.id ?? 1, login: issue.author?.username || "uzi-bot" },
+    updated_at: issue.updated_at,
+    created_at: issue.created_at,
+  };
+}
+// githubPRState maps a stored MR's GitLab-style state (opened|closed|merged|locked)
+// onto GitHub's {state, merged}: GitHub has state open/closed with a SEPARATE merged
+// bool, so a merged PR is state:"closed" + merged:true (githubMRState folds it back).
+function githubPRState(mrState) {
+  if (mrState === "merged") return { state: "closed", merged: true };
+  if (mrState === "opened") return { state: "open", merged: false };
+  return { state: "closed", merged: false };
+}
+// toGitHubPR maps a stored MR to a GitHub pull request. head.sha is deterministic
+// (mrHeadSha) so LatestMRPipeline can resolve the head then filter runs by it.
+function toGitHubPR(mr) {
+  const s = githubPRState(mr.state);
+  return {
+    id: mr.id,
+    number: mr.iid,
+    title: mr.title,
+    body: mr.description ?? "",
+    state: s.state,
+    merged: s.merged,
+    html_url: githubWebUrl(mr.web_url),
+    head: { ref: mr.source_branch, sha: mr.head_sha || mrHeadSha(mr.source_branch) },
+    base: { ref: mr.target_branch },
+  };
+}
+// mrToGitHubIssue models an MR as an issue with a NON-NULL pull_request — exactly how
+// GitHub returns PRs on the /issues route. The GitHub /issues reader emits these
+// ALONGSIDE real issues so the driver's R4 filter is exercised end-to-end: an MR must
+// NEVER reach the board. The distinct high number (10000+iid) makes a filter FAILURE
+// visible as card #(10000+iid), which no real issue ever has.
+function mrToGitHubIssue(mr) {
+  const s = githubPRState(mr.state);
+  return {
+    id: mr.id,
+    number: 10000 + mr.iid,
+    title: mr.title || `PR ${mr.iid}`,
+    body: mr.description ?? "",
+    state: s.state,
+    labels: [],
+    html_url: githubWebUrl(mr.web_url),
+    user: { id: 1, login: "uzi-bot" },
+    updated_at: new Date().toISOString(),
+    created_at: new Date().toISOString(),
+    pull_request: { merged: s.merged, html_url: githubWebUrl(mr.web_url) },
+  };
+}
+// githubRunSummary is the {total_count, workflow_runs} shape ListRepositoryWorkflowRuns
+// returns, sorted id DESC (newest first) — the ordering the driver's runs[0]-is-newest
+// depends on. Filters by branch and/or head_sha, and honours the driver's per_page.
+// Each run carries BOTH status and conclusion (D8): the driver collapses them.
+function githubRunSummary({ branch, headSha, perPage }) {
+  let runs = state.githubRuns.slice();
+  if (branch) runs = runs.filter((r) => r.head_branch === branch);
+  if (headSha) runs = runs.filter((r) => r.head_sha === headSha);
+  runs.sort((a, b) => b.id - a.id); // id DESC: newest first (github.com returns created_at DESC)
+  const total = runs.length;
+  if (perPage && perPage > 0) runs = runs.slice(0, perPage);
+  return {
+    total_count: total,
+    workflow_runs: runs.map((r) => ({
+      id: r.id,
+      head_branch: r.head_branch,
+      head_sha: r.head_sha,
+      status: r.status,
+      conclusion: r.conclusion,
+      html_url: r.html_url,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    })),
+  };
+}
+
 // Bridge one request to `git http-backend` (CGI). Streams the request body to
 // the backend's stdin and parses its CGI response (headers until a blank line,
 // then a binary body) back onto the HTTP response.
@@ -513,6 +648,7 @@ const server = https.createServer(
         mrs: state.mrs,
         notes: state.notes,
         labelEvents: state.labelEvents,
+        githubRuns: state.githubRuns,  // PRD #238 M8: canned GitHub Actions runs
         project: PROJECT,
         projects: PROJECTS,
         gitStats,  // PRD #97 M1: smart-HTTP push/fetch counters (positive transport control)
@@ -686,6 +822,41 @@ const server = https.createServer(
       persist();
       log("actions run set", run.head_branch || run.head_sha, "->", run.status, "#" + id);
       return send(res, 201, { id, status: run.status });
+    }
+
+    // Append a GitHub Actions workflow run (PRD #238 M8). Like /_e2e/actions-runs
+    // (Forgejo) this APPENDS, so 2+ runs can share a branch/sha — the id-DESC
+    // ordering the driver's runs[0]-is-newest relies on. Body:
+    // {branch?, sha?, status?, conclusion?, id?, jobs?:[{name,status,conclusion,log}]}.
+    // Defaults model a COMPLETED FAILED run (status:"completed", conclusion:"failure")
+    // so the CI-fix loop's IsFailed gate (D8) fires. A later append gets a higher
+    // auto-id (a post-fix run outranks the failure), which the verification guard needs.
+    if (method === "POST" && path === "/_e2e/github-actions-runs") {
+      const body = await readBody(req);
+      const id = Number.isFinite(body.id) ? body.id : state.nextGitHubRunId++;
+      const jobs = (body.jobs || []).map((j) => ({
+        id: state.nextGitHubJobId++,
+        name: j.name || "build",
+        status: j.status || "completed",
+        conclusion: j.conclusion ?? "failure",
+        log: j.log ?? j.trace ?? "",
+        html_url: `${PROJECT.web_url}/actions/runs/${id}`,
+      }));
+      const run = {
+        id,
+        head_branch: String(body.branch || ""),
+        head_sha: String(body.sha || ""),
+        status: String(body.status || "completed"),
+        conclusion: body.conclusion === undefined ? "failure" : body.conclusion,
+        html_url: `${PROJECT.web_url}/actions/runs/${id}`,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        jobs,
+      };
+      state.githubRuns.push(run);
+      persist();
+      log("github actions run set", run.head_branch || run.head_sha, "->", `${run.status}/${run.conclusion}`, "#" + id);
+      return send(res, 201, { id, status: run.status, conclusion: run.conclusion });
     }
 
     // Set the version /api/v1/version reports (PRD #65 M9): the harness flips it
@@ -982,6 +1153,287 @@ const server = https.createServer(
         res.writeHead(200, { "Content-Type": "text/plain" });
         return res.end(job ? job.log : "");
       }
+    }
+
+    // --- GitHub /api/v3 subset (PRD #238 M8) ----------------------------------
+    // Selected by path prefix, over the SAME state as the GitLab/Forgejo tables.
+    // go-github's WithEnterpriseURLs mounts the API under /api/v3 (github.go's
+    // newGitHub), so the whole table lives there; we strip the prefix once and
+    // dispatch on the remainder. The api's github driver hits this when the
+    // connection's forge_type is 'github'; the GitLab lane never reaches it, so
+    // /api/v4 behaviour is byte-identical.
+    if (path === "/api/v3" || path.startsWith("/api/v3/")) {
+      const g = path.replace(/^\/api\/v3/, "") || "/";
+
+      // GetMyUserInfo (VerifyToken) AND TokenInfo (header introspection, D7). The
+      // X-OAuth-Scopes header is ALWAYS set so TokenInfo's hand-rolled parse works;
+      // the compliant seed PAT grants exactly {repo} (least-privilege). A PAT whose
+      // value signals over-privilege ("overpriv"/"workflow") widens the set so a
+      // future connect-gate test can drive a rejection, mirroring /api/v4's pattern.
+      // NO fine-grained (github_pat_) prefix and a real X-OAuth-Scopes header, so the
+      // driver treats the token as an introspectable classic PAT.
+      if (method === "GET" && g === "/user") {
+        const m = /^Bearer\s+(.+)$/i.exec(req.headers["authorization"] || "");
+        const tok = m ? m[1] : "";
+        const scopes = /overpriv|workflow/.test(tok) ? "repo, workflow" : "repo";
+        res.writeHead(200, { "Content-Type": "application/json", "X-OAuth-Scopes": scopes });
+        return res.end(JSON.stringify({ id: 1, login: "uzi-bot", site_admin: false }));
+      }
+      // UserExists (human_username verify). No human accounts are known, so 404 ->
+      // the driver returns (false, nil) -> saved WITH a warning, never a hard reject
+      // (the verified-or-warned path, mirroring the other tables' empty/absent user).
+      const ghUser = g.match(/^\/users\/([^/]+)$/);
+      if (method === "GET" && ghUser) {
+        return send(res, 404, { message: "Not Found" });
+      }
+      // ListProjects. permissions.push=true so the driver's client-side push filter
+      // keeps them (a read-only repo would be dropped).
+      if (method === "GET" && g === "/user/repos") {
+        return send(
+          res,
+          200,
+          PROJECTS.map((p) => ({
+            id: p.id,
+            name: p.path_with_namespace.split("/").slice(1).join("/"),
+            full_name: p.path_with_namespace,
+            html_url: p.web_url,
+            default_branch: p.default_branch,
+            permissions: { admin: false, push: true, pull: true },
+          })),
+        );
+      }
+      // GetByID (repoSlugFor resolves a numeric project id -> owner/repo; ProjectRole
+      // reads permissions COMPUTED FOR THE BOT). push=true, admin=false -> RoleWrite,
+      // member=true (compliant, least-privilege).
+      const ghRepoById = g.match(/^\/repositories\/(\d+)$/);
+      if (method === "GET" && ghRepoById) {
+        const project = resolveProject(ghRepoById[1]);
+        const [owner, ...rest] = project.path_with_namespace.split("/");
+        return send(res, 200, {
+          id: project.id,
+          name: rest.join("/") || project.path_with_namespace,
+          full_name: project.path_with_namespace,
+          owner: { id: 1, login: owner },
+          default_branch: project.default_branch,
+          html_url: project.web_url,
+          permissions: { admin: false, push: true, pull: true },
+        });
+      }
+
+      // Repo-scoped: /repos/{owner}/{repo}/<rest>.
+      const ghRepo = g.match(/^\/repos\/([^/]+)\/([^/]+)(\/.*)?$/);
+      if (ghRepo) {
+        const project = resolveProject(`${ghRepo[1]}/${ghRepo[2]}`);
+        const rest = ghRepo[3] || "";
+
+        // Issues list. Emits real issues AND every MR as a pull_request issue, so the
+        // driver's R4 filter (PullRequestLinks != nil) is exercised: an MR must never
+        // reach the board. Honours `labels` (AND) and `state` in GITHUB's vocabulary
+        // (open/closed/all); the PR half is deliberately unfiltered by state — it
+        // exists to exercise R4, which must drop them whatever the query said.
+        if (method === "GET" && rest === "/issues") {
+          const labelsParam = url.searchParams.get("labels");
+          const stateParam = url.searchParams.get("state");
+          const issues = Object.values(state.issues)
+            .filter((i) => issueMatchesLabels(i, labelsParam) && issueMatchesGitHubState(i, stateParam))
+            .map(toGitHubIssue);
+          const prs = state.mrs.map(mrToGitHubIssue);
+          return send(res, 200, [...issues, ...prs]);
+        }
+        const ghIssueGet = rest.match(/^\/issues\/(\d+)$/);
+        if (method === "GET" && ghIssueGet) {
+          const issue = state.issues[Number(ghIssueGet[1])];
+          return issue ? send(res, 200, toGitHubIssue(issue)) : send(res, 404, { message: "Not Found" });
+        }
+        if (method === "POST" && rest === "/issues") {
+          // CreateIssue: body {title, body, labels:[names]}. GitHub keys labels by
+          // NAME (no id resolution, unlike Forgejo).
+          const body = await readBody(req);
+          const iid = state.nextIssueIid++;
+          const labels = Array.isArray(body.labels) ? body.labels.map(String) : [];
+          const issue = makeIssue({ iid, title: body.title || `issue ${iid}`, description: body.body, labels, project });
+          state.issues[iid] = issue;
+          persist();
+          log("gh issue created", iid, JSON.stringify(issue.title));
+          return send(res, 201, toGitHubIssue(issue));
+        }
+        if (method === "PATCH" && ghIssueGet) {
+          // UpdateIssueDescription (PRD #72 M5). go-github sends body ALONE; apply it.
+          const issue = state.issues[Number(ghIssueGet[1])];
+          if (!issue) return send(res, 404, { message: "Not Found" });
+          const body = await readBody(req);
+          if (typeof body.body === "string") issue.description = body.body;
+          issue.updated_at = new Date().toISOString();
+          persist();
+          log("gh issue", issue.iid, "description updated");
+          return send(res, 200, toGitHubIssue(issue));
+        }
+        // ReplaceLabelsForIssue (UpdateIssueLabels): PUT the full label set by NAME.
+        const ghIssueLabels = rest.match(/^\/issues\/(\d+)\/labels$/);
+        if (method === "PUT" && ghIssueLabels) {
+          const issue = state.issues[Number(ghIssueLabels[1])];
+          if (!issue) return send(res, 404, { message: "Not Found" });
+          const body = await readBody(req);
+          // go-github sends {"labels":[names]} (the SDK wraps the []string).
+          const names = Array.isArray(body.labels) ? body.labels.map(String) : normLabels(body);
+          issue.labels = names;
+          issue.updated_at = new Date().toISOString();
+          persist();
+          log("gh issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
+          return send(res, 200, names.map((n) => ({ id: 1000 + issue.iid, name: n, color: "ededed" })));
+        }
+        // Issue comments (CreateIssueNote). Recorded in the shared notes list so the
+        // harness reads them back via /_e2e/state exactly like the other lanes.
+        const ghComments = rest.match(/^\/issues\/(\d+)\/comments$/);
+        if (method === "POST" && ghComments) {
+          const body = await readBody(req);
+          const iid = Number(ghComments[1]);
+          const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+          state.notes.push(note);
+          persist();
+          log("gh note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));
+          return send(res, 201, { id: note.id, body: note.body });
+        }
+        // Issue events (ListIssueLabelEvents). Translate the shared labelEvents into
+        // GitHub IssueEvent shape: event "labeled"/"unlabeled", actor.login, label.name.
+        const ghEvents = rest.match(/^\/issues\/(\d+)\/events$/);
+        if (method === "GET" && ghEvents) {
+          const evts = state.labelEvents[Number(ghEvents[1])] || [];
+          return send(
+            res,
+            200,
+            evts.map((e) => ({
+              id: e.id,
+              event: e.action === "remove" ? "unlabeled" : "labeled",
+              actor: { id: e.user?.id ?? 2, login: e.user?.username || "" },
+              label: { name: e.label?.name || "" },
+              created_at: e.created_at,
+            })),
+          );
+        }
+        // Repo label catalog (ListLabels / EnsureLabels). GET lists; POST mints one.
+        if (rest === "/labels") {
+          if (method === "GET") {
+            // Defensive: the harness critical path does not depend on a pre-seeded
+            // catalog (CreateIssue auto-creates a referenced label on GitHub).
+            return send(res, 200, []);
+          }
+          if (method === "POST") {
+            const body = await readBody(req);
+            return send(res, 201, { id: 1, name: body.name || "label", color: (body.color || "ededed").replace(/^#/, "") });
+          }
+        }
+        // Branch (DefaultBranchProtection, D6): `protected` is reader-gated and true
+        // for the compliant fixture.
+        const ghBranch = rest.match(/^\/branches\/([^/]+)$/);
+        if (method === "GET" && ghBranch) {
+          return send(res, 200, { name: decodeURIComponent(ghBranch[1]), protected: true });
+        }
+        // Branch rulesets (ListRulesForBranch, reader-gated). A readable, enforced
+        // pull_request rule covers the branch -> the driver reports Can*=false,
+        // ProtectionUnverified=false (authoritatively protected: the bot cannot push
+        // or merge to main). Shape mirrors github_test.go's branchRoutes fixture.
+        const ghRules = rest.match(/^\/rules\/branches\/([^/]+)$/);
+        if (method === "GET" && ghRules) {
+          return send(res, 200, [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }]);
+        }
+        // The admin-gated route the driver must NEVER call (a write bot 403s it). If it
+        // ever does, fail loudly rather than pretending it works.
+        if (rest.match(/^\/branches\/[^/]+\/protection$/)) {
+          return send(res, 403, { message: "Must have admin rights to Branches" });
+        }
+
+        // Pull requests.
+        if (method === "POST" && rest === "/pulls") {
+          // CreatePullRequest (the worker opens the PR — reached via the worker's
+          // api.github.com host mapping once runner.ts wires GitHubClient; also driven
+          // directly by the harness smoke). 422 on an existing OPEN PR for the same
+          // head/base — GitHub's generic-validation status, which the worker's
+          // driver-declared duplicate set {409,422} catches (R6).
+          const body = await readBody(req);
+          const dup = state.mrs.find((m) => m.source_branch === body.head && m.target_branch === body.base && m.state === "opened");
+          if (dup) {
+            log("gh PR create 422 (open PR exists)", dup.iid, body.head);
+            return send(res, 422, { message: `A pull request already exists for ${ghRepo[1]}:${body.head}.` });
+          }
+          const iid = state.nextMrIid++;
+          const mr = {
+            id: 5000 + iid,
+            iid,
+            project_id: project.id,
+            source_branch: body.head,
+            target_branch: body.base,
+            head_sha: mrHeadSha(body.head),
+            title: body.title,
+            description: body.body,
+            state: "opened",
+            web_url: `${project.web_url}/-/merge_requests/${iid}`,
+          };
+          state.mrs.push(mr);
+          persist();
+          log("gh PR created", iid, mr.source_branch, "->", mr.target_branch);
+          return send(res, 201, toGitHubPR(mr));
+        }
+        if (method === "GET" && rest === "/pulls") {
+          // List open PRs filtered by head (`owner:branch`) and base — the worker's
+          // 422-resume fetch (findOpenMr). Returns an array; the worker takes [0].
+          const headParam = url.searchParams.get("head") || "";
+          const baseParam = url.searchParams.get("base") || "";
+          const headBranch = headParam.includes(":") ? headParam.split(":").slice(1).join(":") : headParam;
+          const list = state.mrs.filter(
+            (m) => m.state === "opened" && (headBranch ? m.source_branch === headBranch : true) && (baseParam ? m.target_branch === baseParam : true),
+          );
+          return send(res, 200, list.map(toGitHubPR));
+        }
+        const ghPrGet = rest.match(/^\/pulls\/(\d+)$/);
+        if (method === "GET" && ghPrGet) {
+          // GetMergeRequest / LatestMRPipeline head resolution.
+          const mr = state.mrs.find((m) => m.iid === Number(ghPrGet[1]));
+          return mr ? send(res, 200, toGitHubPR(mr)) : send(res, 404, { message: "Not Found" });
+        }
+
+        // Actions (CI-fix loop + pipeline badge). Runs come back id-DESC with the two
+        // fields status+conclusion (D8). ListRepositoryWorkflowRuns honours branch,
+        // head_sha, and per_page.
+        if (method === "GET" && rest === "/actions/runs") {
+          const perPage = Number(url.searchParams.get("per_page")) || 0;
+          return send(res, 200, githubRunSummary({
+            branch: url.searchParams.get("branch") || "",
+            headSha: url.searchParams.get("head_sha") || "",
+            perPage,
+          }));
+        }
+        const ghRunJobs = rest.match(/^\/actions\/runs\/(\d+)\/jobs$/);
+        if (method === "GET" && ghRunJobs) {
+          const run = state.githubRuns.find((r) => r.id === Number(ghRunJobs[1]));
+          const jobs = run ? run.jobs : [];
+          return send(res, 200, {
+            total_count: jobs.length,
+            jobs: jobs.map((j) => ({ id: j.id, name: j.name, status: j.status, conclusion: j.conclusion, html_url: j.html_url })),
+          });
+        }
+        // Job logs (JobLogTail, D5/H5): a 302 to a text/plain blob the FAKE serves
+        // itself (the ...\/blob path below). The Location host is forge-fake.e2e (same
+        // host) — in-network the api driver's second-hop SSRF guard rejects that
+        // private address, which is CORRECT and unit-tested separately; the snapshot
+        // swallows the miss (ci_fix.go logs a warning, tail=""). The 302→text/plain
+        // SHAPE is what this lane proves, asserted by a direct harness fetch.
+        const ghJobLogs = rest.match(/^\/actions\/jobs\/(\d+)\/logs$/);
+        if (method === "GET" && ghJobLogs) {
+          const loc = `${BASE}/api/v3/repos/${ghRepo[1]}/${ghRepo[2]}/actions/jobs/${ghJobLogs[1]}/logs/blob`;
+          res.writeHead(302, { Location: loc });
+          return res.end();
+        }
+        const ghJobLogBlob = rest.match(/^\/actions\/jobs\/(\d+)\/logs\/blob$/);
+        if (method === "GET" && ghJobLogBlob) {
+          const job = state.githubRuns.flatMap((r) => r.jobs || []).find((j) => j.id === Number(ghJobLogBlob[1]));
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          return res.end(job ? job.log : "");
+        }
+      }
+
+      log("unhandled /api/v3", method, path);
+      return send(res, 404, { message: "Not Found (forge-fake /api/v3)" });
     }
 
     // --- GitLab v4 subset -----------------------------------------------------

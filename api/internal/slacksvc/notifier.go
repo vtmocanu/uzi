@@ -942,19 +942,22 @@ func isHTTPSURL(u string) bool {
 }
 
 // forgeMrAbbrev / forgeMrRef are the Go twins of web/src/lib/forgeNoun.ts (PRD #65
-// D2), kept adjacent-in-review with the SAME mapping so a Forgejo run's DM reads in
-// Forgejo's vocabulary: "PR #N" rather than GitLab's "MR !N". Any unknown/absent
-// forge_type is GitLab's form — the only connection kind that exists until the
-// handler gate flips (M6b).
+// D2, #238 D2), kept adjacent-in-review with the SAME mapping so a Forgejo/GitHub
+// run's DM reads in its own vocabulary: "PR #N" rather than GitLab's "MR !N". Both
+// PR-forges (Forgejo AND GitHub) are named explicitly — a missing github arm would
+// silently render "MR !N" for a GitHub card (the D2 trap). Any unknown/absent
+// forge_type is GitLab's form.
 func forgeMrAbbrev(forgeType string) string {
-	if forgeType == "forgejo" {
+	if forgeType == "forgejo" || forgeType == "github" {
 		return "PR"
 	}
 	return "MR"
 }
 
 func forgeMrRef(forgeType string) string {
-	if forgeType == "forgejo" {
+	// Forgejo "#N" for a pull request; GitHub "#N" (its PRs and issues share one
+	// number namespace, so "#42" is correct). GitLab writes "!N".
+	if forgeType == "forgejo" || forgeType == "github" {
 		return "#"
 	}
 	return "!"

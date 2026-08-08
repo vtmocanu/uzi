@@ -11,6 +11,7 @@ import {
   api,
   client,
   fakeForgejo,
+  fakeGitHub,
   fakeGitlab,
   fx,
   git,
@@ -126,6 +127,63 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(
       call.headers["Authorization"],
       "token fixture-forge-pat-000000",
+    );
+    assert.ok(
+      !call.url.includes("fixture-forge-pat"),
+      "PAT must not be in the URL",
+    );
+    assert.ok(
+      !(call.body ?? "").includes("fixture-forge-pat"),
+      "PAT must not be in the body",
+    );
+    const body = JSON.parse(call.body ?? "{}");
+    assert.strictEqual(body.head, "agent/issue-15");
+    assert.strictEqual(body.base, "main");
+  });
+
+  it("routes a github claim to the GitHub client and persists the PR web url (PRD #238 D9/D8)", async () => {
+    const { github, calls } = fakeGitHub();
+    // A GitHub run: same local clone_url (git is forge-agnostic), a github.com web
+    // url, and forge_type=github on the wire so the worker picks the GitHub client.
+    const claim = gitlabClaim(15, {
+      repo: {
+        id: "r1",
+        url: "https://github.com/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "github",
+      },
+    });
+    const r = new RunRunner(
+      client,
+      git,
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      nullLogger(),
+      20,
+      undefined,
+      {
+        pollMs: 5,
+        planApprovalTimeoutMs: 0,
+        github,
+      },
+    );
+    await r.execute(claim);
+
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.branch, "agent/issue-15");
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(completed.mr_web_url, "https://github.com/org/repo/pull/42");
+
+    // The PR was opened against GitHub's api.github.com pulls endpoint with the
+    // Bearer token header — never the URL/body (primary directive).
+    assert.strictEqual(calls.length, 1);
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "POST");
+    assert.match(call.url, /^https:\/\/api\.github\.com\/repos\/org\/repo\/pulls$/);
+    assert.strictEqual(
+      call.headers["Authorization"],
+      "Bearer fixture-forge-pat-000000",
     );
     assert.ok(
       !call.url.includes("fixture-forge-pat"),

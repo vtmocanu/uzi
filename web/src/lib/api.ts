@@ -389,7 +389,7 @@ export interface Card {
   state: string;
   labels: string[];
   web_url: string;
-  // The card's forge ("gitlab"|"forgejo"), so the UI picks the per-card MR/PR noun
+  // The card's forge ("gitlab"|"forgejo"|"github"), so the UI picks the per-card MR/PR noun
   // (PRD #65 D2). A cross-repo view mixes forges, so it rides each card.
   forge_type: string;
   author: string | null;
@@ -414,7 +414,7 @@ export interface Board {
   repo_id: string;
   path_with_namespace: string;
   web_url: string;
-  // The board's forge ("gitlab"|"forgejo"), so board-level chrome (the "columns are
+  // The board's forge ("gitlab"|"forgejo"|"github"), so board-level chrome (the "columns are
   // <forge> labels" hint, the create-issue "opened on <forge>" note) names the right
   // platform (PRD #65 D2). A board is one repo/connection, so it is a single value.
   forge_type: string;
@@ -441,7 +441,7 @@ export interface IssueDetail {
   closed: boolean;
   conflict: boolean;
   description: string;
-  // The issue's forge ("gitlab"|"forgejo"), so the "Open on <forge>" button names
+  // The issue's forge ("gitlab"|"forgejo"|"github"), so the "Open on <forge>" button names
   // the right platform (PRD #65 D2).
   forge_type: string;
 }
@@ -901,7 +901,7 @@ export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
   repo_id: string | null;
-  /** The run's forge ("gitlab"|"forgejo"), for the per-run MR/PR noun + reference
+  /** The run's forge ("gitlab"|"forgejo"|"github"), for the per-run MR/PR noun + reference
    *  sigil (PRD #65 D2). "" on worker/create DTO paths (no browser MR affordance);
    *  set on the list/detail reads. The web defaults an empty/unknown value to
    *  GitLab's vocabulary. */

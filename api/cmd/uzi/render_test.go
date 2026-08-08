@@ -10,15 +10,16 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// TestMrAbbrev pins the forge-aware merge/pull-request label (PRD #65 D2), the
-// CLI twin of the web's mrAbbrev and slacksvc's forgeMrAbbrev: Forgejo "PR",
-// everything else (GitLab, empty, unknown) "MR".
+// TestMrAbbrev pins the forge-aware merge/pull-request label (PRD #65 D2, #238 D2),
+// the CLI twin of the web's mrAbbrev and slacksvc's forgeMrAbbrev: Forgejo and GitHub
+// "PR", everything else (GitLab, empty, unknown) "MR".
 func TestMrAbbrev(t *testing.T) {
 	for _, tc := range []struct {
 		forge string
 		want  string
 	}{
 		{"forgejo", "PR"},
+		{"github", "PR"},
 		{"gitlab", "MR"},
 		{"", "MR"},
 		{"something_else", "MR"},

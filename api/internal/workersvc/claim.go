@@ -194,8 +194,9 @@ type ClaimRepo struct {
 	URL           string  `json:"url"`
 	CloneURL      string  `json:"clone_url"`
 	DefaultBranch *string `json:"default_branch"`
-	// ForgeType is which forge this repo's connection speaks ("gitlab"|"forgejo",
-	// PRD #65 D9). Additive + optional on the wire (R8): the server always sends it
+	// ForgeType is which forge this repo's connection speaks ("gitlab"|"forgejo"|
+	// "github"; PRD #65 D9, GitHub added by #238). Additive + optional on the wire
+	// (R8): the server always sends it
 	// (forge_connections.forge_type is NOT NULL, default 'gitlab'), and an OLD worker
 	// simply ignores the unknown key, so a GitLab run keeps working. A new worker
 	// reads it to pick its minimal forge client for MR/PR creation.

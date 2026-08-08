@@ -14,7 +14,12 @@ import {
   type ExecutorResult,
 } from "../src/executor.js";
 import { type SdkQueryFn } from "../src/sdk-executor.js";
-import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
+import {
+  GitLabClient,
+  ForgejoClient,
+  GitHubClient,
+  type FetchFn,
+} from "../src/forge.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
@@ -128,6 +133,28 @@ export function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
     };
   };
   return { forgejo: new ForgejoClient({ fetchFn }), calls };
+}
+
+/** A GitHub client whose transport is captured; opens PR #42 with no network. */
+export function fakeGitHub(): { github: GitHubClient; calls: MrCall[] } {
+  const calls: MrCall[] = [];
+  const fetchFn: FetchFn = async (url, init) => {
+    calls.push({
+      url,
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+    });
+    return {
+      status: 201,
+      text: async () =>
+        JSON.stringify({
+          number: 42,
+          html_url: "https://github.com/org/repo/pull/42",
+        }),
+    };
+  };
+  return { github: new GitHubClient({ fetchFn }), calls };
 }
 
 export function runner(

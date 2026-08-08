@@ -37,6 +37,29 @@ describe("pipelineTone", () => {
     expect(pipelineTone("success")).toBe("passed");
     expect(pipelineTone("skipped")).toBe("neutral");
   });
+
+  // PRD #238 D8: GitHub Actions folds a run/job `status` then a `conclusion` into one
+  // stored string. The traps: GitHub says `in_progress`/`queued` (not
+  // `running`/`pending`), so an in-flight GitHub build renders neutral without them.
+  it("folds the GitHub Actions status+conclusion enum without a red build rendering benign", () => {
+    // in-flight (status) — the two naming traps plus `requested`
+    for (const s of ["queued", "in_progress", "requested"]) {
+      expect(pipelineTone(s)).toBe("running");
+    }
+    // terminal failures (conclusion)
+    expect(pipelineTone("timed_out")).toBe("failed");
+    expect(pipelineTone("startup_failure")).toBe("failed");
+    // a human must approve a gate/first-run — attention, not a failure
+    expect(pipelineTone("action_required")).toBe("attention");
+    // neither a failure nor a pass
+    expect(pipelineTone("neutral")).toBe("neutral");
+    expect(pipelineTone("stale")).toBe("neutral");
+    // shared strings (GitHub matches Forgejo, not GitLab): two-L cancelled, `failure`
+    expect(pipelineTone("cancelled")).toBe("neutral");
+    expect(pipelineTone("failure")).toBe("failed");
+    // GitHub's deployment-gate `waiting` is KNOWINGLY shown running, not attention
+    expect(pipelineTone("waiting")).toBe("running");
+  });
 });
 
 describe("pipelineBadge", () => {

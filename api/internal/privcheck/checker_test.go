@@ -359,6 +359,14 @@ func TestScopesPerForge(t *testing.T) {
 		// set, with no attempt to expand it.
 		{"forgejo all literal violates", forge.TypeForgejo, []string{"all"}, true},
 		{"forgejo gitlab-api violates", forge.TypeForgejo, []string{"api"}, true},
+		// GitHub classic PAT: exactly {repo} (PRD #238 D7). The "exactly" set
+		// semantics make {repo, workflow} and {repo, delete_repo} over-privilege
+		// violations for free (D7a); {public_repo} alone is a subset and fails too.
+		{"github exactly repo is clean", forge.TypeGitHub, []string{"repo"}, false},
+		{"github repo+workflow violates", forge.TypeGitHub, []string{"repo", "workflow"}, true},
+		{"github repo+delete_repo violates", forge.TypeGitHub, []string{"repo", "delete_repo"}, true},
+		{"github public_repo alone violates", forge.TypeGitHub, []string{"public_repo"}, true},
+		{"github gitlab-api violates", forge.TypeGitHub, []string{"api"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -369,6 +377,89 @@ func TestScopesPerForge(t *testing.T) {
 					tc.scopes, tc.forgeType, got, tc.wantViolation, tr.Violations)
 			}
 		})
+	}
+}
+
+// TestRequiredScopesGitHub pins PRD #238 D7: the GitHub required set is exactly
+// {repo}, and the unordered set-equality accepts it while rejecting supersets and
+// subsets. GitLab {api} and Forgejo's three-scope set are unchanged (covered by
+// TestScopesPerForge); this asserts the rule primitives directly.
+func TestRequiredScopesGitHub(t *testing.T) {
+	req := requiredScopesFor(forge.TypeGitHub)
+	if len(req) != 1 || req[0] != "repo" {
+		t.Fatalf("requiredScopesFor(github) = %v, want [repo]", req)
+	}
+	if !scopesEqualRequired(forge.TypeGitHub, []string{"repo"}) {
+		t.Errorf("{repo} should equal the github required set")
+	}
+	if scopesEqualRequired(forge.TypeGitHub, []string{"repo", "workflow"}) {
+		t.Errorf("{repo, workflow} is over-privilege, must not equal required")
+	}
+	if scopesEqualRequired(forge.TypeGitHub, []string{"repo", "delete_repo"}) {
+		t.Errorf("{repo, delete_repo} is over-privilege, must not equal required")
+	}
+	if scopesEqualRequired(forge.TypeGitHub, []string{"public_repo"}) {
+		t.Errorf("{public_repo} is a subset, must not equal required")
+	}
+}
+
+// TestIntrospectionUnsupportedMessagePerForge pins PRD #238 S4: the
+// introspection-unsupported warning is per-forge. GitLab keeps its actionable
+// "requires 15.5+" hint; GitHub points the user at a classic PAT rather than
+// flattening to a lossy generic string.
+func TestIntrospectionUnsupportedMessagePerForge(t *testing.T) {
+	c := NewChecker()
+	f := &fakeForge{tokenErr: forge.ErrTokenIntrospectionUnsupported}
+
+	trGitHub := c.CheckToken(context.Background(), f, forge.TypeGitHub, false, now)
+	if len(trGitHub.Violations) != 0 {
+		t.Fatalf("unsupported introspection must not block on github; got %v", trGitHub.Violations)
+	}
+	if !hasFinding(trGitHub.Warnings, "classic PAT") {
+		t.Fatalf("want the github-specific classic-PAT warning, got %v", trGitHub.Warnings)
+	}
+	if hasFinding(trGitHub.Warnings, "15.5+") {
+		t.Fatalf("github must not surface GitLab's version hint, got %v", trGitHub.Warnings)
+	}
+
+	// GitLab's path is unchanged.
+	trGitLab := c.CheckToken(context.Background(), f, forge.TypeGitLab, false, now)
+	if !hasFinding(trGitLab.Warnings, "requires 15.5+") {
+		t.Fatalf("gitlab must keep its version warning, got %v", trGitLab.Warnings)
+	}
+}
+
+// TestEvaluateRepoProtectionUnverified pins PRD #238 D6/H1: a github-shaped
+// protected-but-unverified branch (WriteRoleCanPush/Merge=false, the driver never
+// fabricating a true) yields a WARNING that the rights are undetermined, not a
+// push/merge Violation. When ProtectionUnverified is false, behaviour is the
+// existing one — the push Violation still fires.
+func TestEvaluateRepoProtectionUnverified(t *testing.T) {
+	repo := Repo{ID: "r1", Path: "g/one", ForgeProjectID: 1, DefaultBranch: "main"}
+
+	// Undetermined: protected, but the driver could not read push/merge rights.
+	var unver RepoReport
+	unver.Violations, unver.Warnings = []string{}, []string{}
+	evaluateRepo(&unver, repo, forge.RoleWrite, true, nil, true,
+		forge.BranchProtection{Protected: true, ProtectionUnverified: true, WriteRoleCanPush: false, WriteRoleCanMerge: false}, nil)
+	if len(unver.Violations) != 0 {
+		t.Fatalf("unverified protection must not produce a violation, got %v", unver.Violations)
+	}
+	if !hasFinding(unver.Warnings, "could not fully verify push/merge rights on protected") {
+		t.Fatalf("want the undetermined-rights warning, got %v", unver.Warnings)
+	}
+
+	// Verified (ProtectionUnverified=false) with a real push right: unchanged, the
+	// push Violation still fires and no warning is added.
+	var ver RepoReport
+	ver.Violations, ver.Warnings = []string{}, []string{}
+	evaluateRepo(&ver, repo, forge.RoleWrite, true, nil, true,
+		forge.BranchProtection{Protected: true, ProtectionUnverified: false, WriteRoleCanPush: true}, nil)
+	if !hasFinding(ver.Violations, "the write role may push") {
+		t.Fatalf("verified protection with push right must still violate, got %v", ver.Violations)
+	}
+	if len(ver.Warnings) != 0 {
+		t.Fatalf("verified protection must not add the undetermined warning, got %v", ver.Warnings)
 	}
 }
 

@@ -1065,3 +1065,27 @@ func TestNotifierNoMilestonesBehavesAsToday(t *testing.T) {
 		t.Fatalf("a no-milestone run must record no notified count: %+v", fs.milestoneSet)
 	}
 }
+
+// TestForgeMrVocabulary pins the Go twins of web/src/lib/forgeNoun.ts (PRD #65 D2,
+// #238 D2): a Forgejo or GitHub run's DM reads "PR #N", a GitLab (or unknown/absent)
+// run "MR !N". Both PR-forges must be named explicitly so a missing github arm never
+// silently renders GitLab's form.
+func TestForgeMrVocabulary(t *testing.T) {
+	for _, tc := range []struct {
+		forge        string
+		abbrev, sref string
+	}{
+		{"github", "PR", "#"},
+		{"forgejo", "PR", "#"},
+		{"gitlab", "MR", "!"},
+		{"", "MR", "!"},
+		{"something_else", "MR", "!"},
+	} {
+		if got := forgeMrAbbrev(tc.forge); got != tc.abbrev {
+			t.Errorf("forgeMrAbbrev(%q) = %q, want %q", tc.forge, got, tc.abbrev)
+		}
+		if got := forgeMrRef(tc.forge); got != tc.sref {
+			t.Errorf("forgeMrRef(%q) = %q, want %q", tc.forge, got, tc.sref)
+		}
+	}
+}

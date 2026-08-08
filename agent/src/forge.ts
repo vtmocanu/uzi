@@ -9,9 +9,9 @@
 // and is NEVER merged (humans merge).
 //
 // Only `createMergeRequest` is needed on the worker seam: the worker opens the
-// MR/PR itself and does not need the 19-method Go `Forge` interface (D9). The
+// MR/PR itself and does not need the 20-method Go `Forge` interface (D9). The
 // three transport guards below (non-https refusal, redirect:"error",
-// 409-on-duplicate → fetch existing) are INTERFACE requirements, not per-driver
+// duplicate-status → fetch existing) are INTERFACE requirements, not per-driver
 // details — so they live in the shared base and a fresh driver cannot forget one.
 //
 // `fetchFn` is injectable so the MR/PR path is tested up to — never across — the
@@ -80,11 +80,13 @@ export interface ForgeClientOptions {
  * forgetting) them:
  *   1. `request` refuses a non-https URL before the PAT leaves the process.
  *   2. `request` pins `redirect:"error"` so a 3xx cannot replay the PAT header.
- *   3. `createMergeRequest` treats a 409 as "already exists" and returns the open
- *      MR/PR — tolerating the driver finding none (Forgejo's 409 also covers other
- *      conflicts), so a resumed finish step never dead-ends.
+ *   3. `createMergeRequest` treats a driver-declared `duplicateStatuses()` set as
+ *      "maybe already exists" and returns the open MR/PR — tolerating the driver
+ *      finding none (Forgejo's 409, and GitHub's generic-validation 422, also cover
+ *      non-duplicate causes), so a resumed finish step never dead-ends.
  * A driver supplies only the forge-specific bits: auth header, create URL/body, the
- * find-existing lookup, and the response parse.
+ * find-existing lookup, the response parse, and (when it differs from the {409}
+ * default) which statuses mean "maybe already exists".
  */
 abstract class HttpForgeClient implements ForgeClient {
   protected readonly fetchFn: FetchFn;
@@ -100,16 +102,27 @@ abstract class HttpForgeClient implements ForgeClient {
     if (res.status === 201) return this.parseMr(await res.text());
 
     // An MR/PR for this branch may already exist (a resume, or a prior finish that
-    // pushed + opened before the state report landed) — the forge answers 409. Fetch
-    // and return the existing one so re-running the finish step never dead-ends.
-    // Forgejo's 409 also covers non-duplicate conflicts (a real merge/branch clash),
-    // so findOpenMr may legitimately find none; both drivers tolerate that and fall
-    // through to the error below rather than pretending success.
-    if (res.status === 409) {
+    // pushed + opened before the state report landed). Which status the forge answers
+    // with differs (GitLab/Forgejo 409, GitHub 422), so each driver declares its own
+    // `duplicateStatuses()` set instead of the base hardcoding one — a blanket
+    // 409‖422 would newly route GitLab/Forgejo 422s into find-existing (SC8: no run
+    // changed on existing forges). On a match we fetch and return the existing MR/PR
+    // so re-running the finish step never dead-ends. Those statuses also cover
+    // non-duplicate causes (Forgejo's 409 = other conflicts, GitHub's 422 = any
+    // validation error), so findOpenMr may legitimately find none; every driver
+    // tolerates that and falls through to the error below rather than pretending
+    // success.
+    if (this.duplicateStatuses().includes(res.status)) {
       const existing = await this.findOpenMr(p);
       if (existing) return existing;
     }
     throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+  }
+
+  /** HTTP statuses that mean "an MR/PR may already exist for this head/base → look it
+   *  up". GitLab/Forgejo answer 409; GitHubClient widens this to add 422 (D9/R6). */
+  protected duplicateStatuses(): number[] {
+    return [409];
   }
 
   protected async request(
@@ -233,9 +246,64 @@ export class ForgejoClient extends HttpForgeClient {
   }
 }
 
+/** GitHub REST driver (`api.github.com`, `Authorization: Bearer` header). PRs live at
+ *  `/repos/{owner}/{repo}/pulls`; the create response uses `number` (the iid) +
+ *  `html_url` (the web URL). GitHub answers 422 (not 409) when a PR already exists for
+ *  the same head/base, so it widens `duplicateStatuses()` (D9/R6). */
+export class GitHubClient extends HttpForgeClient {
+  protected authHeaders(pat: string): Record<string, string> {
+    return { Authorization: `Bearer ${pat}` };
+  }
+
+  protected createUrl(repoUrl: string): string {
+    const { apiBase, owner, repo } = githubRepoParts(repoUrl);
+    return `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`;
+  }
+
+  protected createBody(p: CreateMrParams): unknown {
+    // GitHub's create-PR body: head/base branch names, title, body.
+    return { head: p.sourceBranch, base: p.targetBranch, title: p.title, body: p.description };
+  }
+
+  /** GitHub returns 422 (its generic validation status), not 409, when a PR already
+   *  exists for this head/base — add it to the duplicate set (R6). A 422 for some
+   *  OTHER reason still surfaces because findOpenMr finds no open PR and the create
+   *  error falls through, the same tolerance the Forgejo 409 path has. */
+  protected override duplicateStatuses(): number[] {
+    return [409, 422];
+  }
+
+  protected async findOpenMr(p: CreateMrParams): Promise<MergeRequest | undefined> {
+    // List open PRs filtered by head (`owner:branch`, same-repo) and base. A match is
+    // the first array element; anything else (empty list, non-200) means no resume
+    // target and the create error propagates.
+    const { apiBase, owner, repo } = githubRepoParts(p.repoUrl);
+    const head = `${owner}:${p.sourceBranch}`;
+    const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(p.targetBranch)}`;
+    const res = await this.request("GET", url, p.pat);
+    if (res.status !== 200) return undefined;
+    const list = safeJson(await res.text());
+    if (!Array.isArray(list) || list.length === 0) return undefined;
+    const first = list[0];
+    if (!first || typeof first !== "object") return undefined;
+    if ((first as Record<string, unknown>)["state"] !== "open") return undefined;
+    return parseGitHubMr(first);
+  }
+
+  protected parseMr(text: string): MergeRequest {
+    const mr = parseGitHubMr(safeJson(text));
+    if (!mr) throw new ForgeError(201, "pull request response missing number");
+    return mr;
+  }
+}
+
 /** Pick the worker's forge client for a claim's `forge_type` (absent ⇒ gitlab, R8). */
 export function forgeClientFor(forgeType: string | undefined, opts: ForgeClientOptions = {}): ForgeClient {
-  return forgeType === "forgejo" ? new ForgejoClient(opts) : new GitLabClient(opts);
+  return forgeType === "github"
+    ? new GitHubClient(opts)
+    : forgeType === "forgejo"
+      ? new ForgejoClient(opts)
+      : new GitLabClient(opts);
 }
 
 /** Derive the GitLab API base (scheme://host) from a repo web/clone URL. */
@@ -268,6 +336,26 @@ export function forgejoRepoParts(repoUrl: string): { apiBase: string; owner: str
   return { apiBase: `${u.protocol}//${u.host}${subpath}`, owner, repo };
 }
 
+/**
+ * Split a GitHub repo web URL into its API base + owner + repo (D3 host mapping).
+ * Unlike Forgejo, GitHub's API lives on a DIFFERENT SUBDOMAIN, not a path: the web
+ * host `github.com` maps to `api.github.com` (`https://github.com/owner/repo` →
+ * base `https://api.github.com`). The last two path segments are owner/repo (a
+ * trailing `.git` is stripped); there is no ROOT_URL subpath to preserve.
+ * GHES (self-hosted, `api.v3` under a path) is out of scope for v1 (github.com only,
+ * D3); for any non-github.com host we fall back to prefixing `api.`, but the
+ * supported surface is github.com.
+ */
+export function githubRepoParts(repoUrl: string): { apiBase: string; owner: string; repo: string } {
+  const u = new URL(repoUrl);
+  const segs = u.pathname.replace(/^\/+/, "").replace(/\/+$/, "").split("/").filter(Boolean);
+  const repo = (segs.pop() ?? "").replace(/\.git$/, "");
+  const owner = segs.pop() ?? "";
+  if (!owner || !repo) throw new ForgeError(0, "cannot derive owner/repo from GitHub repo URL");
+  const host = u.host === "github.com" ? "api.github.com" : `api.${u.host.replace(/^www\./, "")}`;
+  return { apiBase: `${u.protocol}//${host}`, owner, repo };
+}
+
 function isHttps(url: string): boolean {
   try {
     return new URL(url).protocol === "https:";
@@ -288,6 +376,16 @@ function parseGitlabMr(obj: unknown): MergeRequest | undefined {
 
 /** Parse a Forgejo PR object (`number` = iid, `html_url` = web URL). */
 function parseForgejoMr(obj: unknown): MergeRequest | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const rec = obj as Record<string, unknown>;
+  const iid = rec["number"];
+  if (typeof iid !== "number") return undefined;
+  const webUrl = typeof rec["html_url"] === "string" ? (rec["html_url"] as string) : "";
+  return { iid, webUrl };
+}
+
+/** Parse a GitHub PR object (`number` = iid, `html_url` = web URL). */
+function parseGitHubMr(obj: unknown): MergeRequest | undefined {
   if (!obj || typeof obj !== "object") return undefined;
   const rec = obj as Record<string, unknown>;
   const iid = rec["number"];

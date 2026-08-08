@@ -133,7 +133,7 @@ type issueDetailDTO struct {
 	Closed      bool     `json:"closed"`
 	Conflict    bool     `json:"conflict"`
 	Description string   `json:"description"`
-	// ForgeType is the issue's forge ("gitlab"|"forgejo"), so the issue view's
+	// ForgeType is the issue's forge ("gitlab"|"forgejo"|"github"), so the issue view's
 	// "Open on <forge>" button names the right platform (PRD #65 D2). From
 	// repo.ForgeType (the issue's repo has one connection), not the live forge fetch.
 	ForgeType string `json:"forge_type"`

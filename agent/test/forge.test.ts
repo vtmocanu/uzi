@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import {
   GitLabClient,
   ForgejoClient,
+  GitHubClient,
   ForgeError,
   forgeClientFor,
   gitlabBaseUrl,
   gitlabProjectPath,
   forgejoRepoParts,
+  githubRepoParts,
   type FetchFn,
 } from "../src/forge.js";
 
@@ -83,6 +85,18 @@ describe("GitLabClient.createMergeRequest", () => {
       new GitLabClient({ fetchFn }).createMergeRequest(base),
       (err: unknown) => err instanceof ForgeError && err.status === 403 && !err.message.includes(PAT),
     );
+  });
+
+  it("does NOT route a 422 into find-existing — GitLab's duplicate is 409, so a 422 surfaces the real error (SC8: no run changed on existing forges)", async () => {
+    // Only one response is queued: if the base wrongly treated 422 as a duplicate it
+    // would fire a second (GET) request and the recorder would clamp to the same 422,
+    // but the invariant under test is that the 422 propagates untouched.
+    const { fetchFn, calls } = recorder([{ status: 422, body: { message: "validation failed" } }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).createMergeRequest(base),
+      (err: unknown) => err instanceof ForgeError && err.status === 422,
+    );
+    assert.strictEqual(calls.length, 1, "no find-existing lookup on a GitLab 422");
   });
 
   it("pins redirect:error so a 3xx cannot replay the PAT header cross-origin (N1)", async () => {
@@ -167,6 +181,15 @@ describe("ForgejoClient.createMergeRequest", () => {
     );
   });
 
+  it("does NOT route a 422 into find-existing — Forgejo's duplicate is 409, so a 422 surfaces the real error (SC8: no run changed on existing forges)", async () => {
+    const { fetchFn, calls } = recorder([{ status: 422, body: { message: "validation error" } }]);
+    await assert.rejects(
+      new ForgejoClient({ fetchFn }).createMergeRequest(fjBase),
+      (err: unknown) => err instanceof ForgeError && err.status === 422,
+    );
+    assert.strictEqual(calls.length, 1, "no find-existing lookup on a Forgejo 422");
+  });
+
   it("pins redirect:error so a 3xx cannot replay the token header cross-origin (N1)", async () => {
     const { fetchFn, calls } = recorder([{ status: 201, body: { number: 1, html_url: "https://x/1" } }]);
     await new ForgejoClient({ fetchFn }).createMergeRequest(fjBase);
@@ -190,11 +213,108 @@ describe("ForgejoClient.createMergeRequest", () => {
   });
 });
 
+// GitHub speaks api.github.com (a DIFFERENT subdomain from the github.com web host,
+// D3) with `Authorization: Bearer`, PRs at /pulls, and its create response uses
+// `number` (the iid) + `html_url` (the web URL). Its "PR already exists" status is
+// 422, not 409.
+const ghBase = {
+  repoUrl: "https://github.com/octo/repo",
+  pat: PAT,
+  sourceBranch: "agent/issue-5",
+  targetBranch: "main",
+  title: "Fix login",
+  description: "Closes #5",
+};
+
+describe("GitHubClient.createMergeRequest", () => {
+  it("POSTs to api.github.com/repos/{o}/{r}/pulls with a Bearer header and maps number→iid, html_url→webUrl", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: { number: 42, html_url: "https://github.com/octo/repo/pull/42" } }]);
+    const mr = await new GitHubClient({ fetchFn }).createMergeRequest(ghBase);
+
+    assert.deepStrictEqual(mr, { iid: 42, webUrl: "https://github.com/octo/repo/pull/42" });
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "POST");
+    // API host is api.github.com (subdomain), NOT github.com with an /api path.
+    assert.strictEqual(call.url, "https://api.github.com/repos/octo/repo/pulls");
+    // PAT rides the Authorization: Bearer header only, never URL/body.
+    assert.strictEqual(call.headers["Authorization"], `Bearer ${PAT}`);
+    assert.ok(!call.url.includes(PAT), "PAT not in URL");
+    assert.ok(!(call.body ?? "").includes(PAT), "PAT not in body");
+    // GitHub's create-PR body: head/base/title/body.
+    const body = JSON.parse(call.body ?? "{}");
+    assert.strictEqual(body.head, "agent/issue-5");
+    assert.strictEqual(body.base, "main");
+    assert.strictEqual(body.title, "Fix login");
+    assert.strictEqual(body.body, "Closes #5");
+  });
+
+  it("is idempotent: on 422 (GitHub's duplicate status) it finds and returns the existing open PR", async () => {
+    const { fetchFn, calls } = recorder([
+      { status: 422, body: { message: "A pull request already exists for octo:agent/issue-5." } },
+      { status: 200, body: [{ number: 7, html_url: "https://github.com/octo/repo/pull/7", state: "open" }] },
+    ]);
+    const mr = await new GitHubClient({ fetchFn }).createMergeRequest(ghBase);
+    assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://github.com/octo/repo/pull/7" });
+    // Second call is the GET lookup, head as owner:branch (same-repo), still Bearer only.
+    const lookup = calls[1]!;
+    assert.strictEqual(lookup.method, "GET");
+    assert.strictEqual(lookup.headers["Authorization"], `Bearer ${PAT}`);
+    assert.match(lookup.url, /\/repos\/octo\/repo\/pulls\?state=open&head=octo%3Aagent%2Fissue-5&base=main$/);
+  });
+
+  it("also treats a 409 as duplicate (the shared default stays in the set) and finds the existing PR", async () => {
+    const { fetchFn } = recorder([
+      { status: 409, body: { message: "conflict" } },
+      { status: 200, body: [{ number: 8, html_url: "https://github.com/octo/repo/pull/8", state: "open" }] },
+    ]);
+    const mr = await new GitHubClient({ fetchFn }).createMergeRequest(ghBase);
+    assert.deepStrictEqual(mr, { iid: 8, webUrl: "https://github.com/octo/repo/pull/8" });
+  });
+
+  it("tolerates a 422 for some OTHER reason (find-existing finds none) → the create error surfaces, not swallowed", async () => {
+    const { fetchFn } = recorder([
+      { status: 422, body: { message: "Validation failed: base is invalid" } },
+      { status: 200, body: [] },
+    ]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).createMergeRequest(ghBase),
+      (err: unknown) => err instanceof ForgeError && err.status === 422,
+    );
+  });
+
+  it("does not resume a closed PR match (state !== open) → the create error surfaces", async () => {
+    const { fetchFn } = recorder([
+      { status: 422, body: { message: "already exists" } },
+      { status: 200, body: [{ number: 3, html_url: "https://github.com/octo/repo/pull/3", state: "closed" }] },
+    ]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).createMergeRequest(ghBase),
+      (err: unknown) => err instanceof ForgeError && err.status === 422,
+    );
+  });
+
+  it("pins redirect:error so a 3xx cannot replay the Bearer header cross-origin (N1) — inherited, not re-implemented", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: { number: 1, html_url: "https://x/1" } }]);
+    await new GitHubClient({ fetchFn }).createMergeRequest(ghBase);
+    assert.strictEqual(calls[0]!.redirect, "error");
+  });
+
+  it("refuses a non-https base URL and never sends the PAT (N1) — the guard is inherited", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: {} }]);
+    await assert.rejects(
+      new GitHubClient({ fetchFn }).createMergeRequest({ ...ghBase, repoUrl: "http://github.com/octo/repo" }),
+      (err: unknown) => err instanceof ForgeError && /non-https/.test(err.message),
+    );
+    assert.strictEqual(calls.length, 0, "no request made to a non-https base");
+  });
+});
+
 describe("forgeClientFor", () => {
-  it("selects GitLab for absent/gitlab and Forgejo for forgejo", () => {
+  it("selects GitLab for absent/gitlab, Forgejo for forgejo, GitHub for github", () => {
     assert.ok(forgeClientFor(undefined) instanceof GitLabClient);
     assert.ok(forgeClientFor("gitlab") instanceof GitLabClient);
     assert.ok(forgeClientFor("forgejo") instanceof ForgejoClient);
+    assert.ok(forgeClientFor("github") instanceof GitHubClient);
   });
 });
 
@@ -220,5 +340,22 @@ describe("URL helpers", () => {
 
   it("rejects a Forgejo URL that has no owner/repo", () => {
     assert.throws(() => forgejoRepoParts("https://forgejo.example.com/only-one"), (e: unknown) => e instanceof ForgeError);
+  });
+
+  it("maps a github.com web URL to the api.github.com base (subdomain, not path) + owner/repo", () => {
+    assert.deepStrictEqual(githubRepoParts("https://github.com/octo/repo"), {
+      apiBase: "https://api.github.com",
+      owner: "octo",
+      repo: "repo",
+    });
+    assert.deepStrictEqual(githubRepoParts("https://github.com/octo/repo.git"), {
+      apiBase: "https://api.github.com",
+      owner: "octo",
+      repo: "repo",
+    });
+  });
+
+  it("rejects a GitHub URL that has no owner/repo", () => {
+    assert.throws(() => githubRepoParts("https://github.com/only-one"), (e: unknown) => e instanceof ForgeError);
   });
 });

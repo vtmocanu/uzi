@@ -3,15 +3,20 @@ package pipelinestatus
 import "testing"
 
 func TestIsFailed(t *testing.T) {
-	for _, s := range []string{"failed", "failure", "error"} {
+	// GitLab/Forgejo failures plus GitHub Actions conclusions timed_out/startup_failure
+	// (PRD #238 D8). "failure" is shared with Forgejo.
+	for _, s := range []string{"failed", "failure", "error", "timed_out", "startup_failure"} {
 		if !IsFailed(s) {
 			t.Errorf("IsFailed(%q) = false, want true (a terminal failure on some forge)", s)
 		}
 	}
 	// Not failures: passes, in-flight, and the two cancelled spellings, plus an
 	// unknown status. A false positive here would offer Fix CI on a green/running
-	// build or mis-snapshot a passing job.
-	for _, s := range []string{"success", "running", "pending", "skipped", "canceled", "cancelled", "warning", "manual", "waiting", "blocked", "unknown", "", "Failed", "FAILURE"} {
+	// build or mis-snapshot a passing job. GitHub's action_required/neutral/stale are
+	// DELIBERATELY not failures (D8): a human must approve, or the run is neither a
+	// failure nor a pass — folding them in would launch a fix run at every
+	// approval-pending or cancelled build.
+	for _, s := range []string{"success", "running", "pending", "skipped", "canceled", "cancelled", "warning", "manual", "waiting", "blocked", "unknown", "queued", "in_progress", "requested", "action_required", "neutral", "stale", "", "Failed", "FAILURE"} {
 		if IsFailed(s) {
 			t.Errorf("IsFailed(%q) = true, want false", s)
 		}
@@ -59,6 +64,15 @@ func TestMirrorsWebPipelineBadge(t *testing.T) {
 		// Forgejo CommitStatusState extras
 		"error":   "failed",
 		"warning": "attention",
+		// GitHub Actions run/job status (in-flight) + conclusion (terminal) — #238 D8
+		"queued":          "running",
+		"in_progress":     "running",
+		"requested":       "running",
+		"timed_out":       "failed",
+		"startup_failure": "failed",
+		"action_required": "attention",
+		"neutral":         "neutral",
+		"stale":           "neutral",
 	}
 	for status, tone := range webTones {
 		if got := IsFailed(status); got != (tone == "failed") {
