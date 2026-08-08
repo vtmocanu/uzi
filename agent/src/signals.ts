@@ -28,11 +28,13 @@ export const SUBMIT_PLAN_TOOL = "submit_plan";
 export const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
 export const REPORT_PROGRESS_TOOL = "report_progress";
+export const CHECKPOINT_TOOL = "checkpoint";
 
 const SUBMIT_PLAN_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SUBMIT_PLAN_TOOL}`;
 const SIGNAL_DONE_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SIGNAL_DONE_TOOL}`;
 const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
 const REPORT_PROGRESS_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${REPORT_PROGRESS_TOOL}`;
+const CHECKPOINT_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${CHECKPOINT_TOOL}`;
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
@@ -58,6 +60,12 @@ export interface ScannedSignals {
    *  arrays are defensively parsed — malformed input yields empty arrays, never a throw.
    *  Present whenever a report_progress tool_use was seen on a main-thread frame. */
   progress?: MilestoneProgress;
+  /** PRD #122 M6: true when a `checkpoint` tool_use was seen on a MAIN-THREAD frame.
+   *  MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as `progress`, and for the
+   *  same load-bearing reason: a checkpoint reaps the agent tree and fetches the branch
+   *  back, so a subagent frame — prompt-injected or buggy — must NEVER be able to force
+   *  one. Absent unless the tool fired on the lead's own frame. */
+  checkpoint?: boolean;
 }
 
 /** Options for the signal server's tool schemas. */
@@ -80,6 +88,10 @@ export interface SignalServerOptions {
    *  list to progress against, so the tool is invisible to the model there rather than
    *  present-and-inert. */
   progress?: boolean;
+  /** PRD #122 M6: expose the `checkpoint` tool. Issue runs only (Decision 13), gated on
+   *  the same discriminator as `progress` — a non-issue run has no milestone boundary to
+   *  checkpoint at, so the tool is invisible to the model there rather than present. */
+  checkpoint?: boolean;
 }
 
 /**
@@ -245,6 +257,33 @@ export function buildSignalMcpServer(
             ),
           ]
         : []),
+      // PRD #122 M6. Issue runs only (opts.checkpoint, gated on kind==="issue"). A
+      // TURN-ENDING tool modelled on submit_plan: the worker acts on it BETWEEN turns
+      // (reap + fetch-back the committed work durably), so the lead must stop after
+      // calling it and will be re-prompted for the next milestone. The handler only
+      // acknowledges; the authoritative capture is the worker observing the tool_use in
+      // scanSignals. Decision 6: this is a DURABILITY boundary, NOT a quality gate — the
+      // description must not imply it verifies or tests anything.
+      ...(opts.checkpoint
+        ? [
+            tool(
+              CHECKPOINT_TOOL,
+              "Save the work you have committed for the current milestone durably, so it survives a worker crash. " +
+                "Call this once a milestone's work is committed locally, then STOP and end your turn — you will be " +
+                "re-prompted to continue with the next milestone. This is a durability checkpoint, NOT a quality gate: " +
+                "it does not run tests or verify that review passed.",
+              {},
+              async () => ({
+                content: [
+                  {
+                    type: "text",
+                    text: "Checkpoint saved. Stop now and end your turn.",
+                  },
+                ],
+              }),
+            ),
+          ]
+        : []),
     ],
   });
 }
@@ -265,7 +304,10 @@ export function isSignalToolName(name: unknown): boolean {
     // PRD #122 M2: report_progress is surfaced via the `running` state report, not the
     // feed, so its raw tool_use payload is filtered out of the persisted stream like the
     // other signalling tools — otherwise the model-authored id arrays would persist twice.
-    name === REPORT_PROGRESS_QUALIFIED
+    name === REPORT_PROGRESS_QUALIFIED ||
+    // PRD #122 M6: checkpoint carries no payload and drives the fetch-back out of band,
+    // so its raw tool_use is filtered from the persisted stream like the other signals.
+    name === CHECKPOINT_QUALIFIED
   );
 }
 
@@ -500,6 +542,14 @@ export function scanSignals(message: unknown): ScannedSignals {
         completed: parseProgressIds(input?.["completed"]),
         in_progress: parseProgressIds(input?.["in_progress"]),
       };
+    } else if (name === CHECKPOINT_QUALIFIED) {
+      // PRD #122 M6. Extracted HERE, inside the content loop that isSubagentFrame already
+      // guards (the early return at the top of scanSignals), so it inherits the SAME
+      // main-thread-only guarantee as milestones/progress — the load-bearing property
+      // that a subagent frame can NEVER force a checkpoint (which reaps the agent tree
+      // and fetches the branch back). The tool takes no arguments, so there is nothing to
+      // parse: seeing the tool_use on a main-thread frame IS the signal.
+      out.checkpoint = true;
     }
   }
   return out;

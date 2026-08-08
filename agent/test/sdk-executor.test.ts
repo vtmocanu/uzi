@@ -655,6 +655,81 @@ describe("SdkExecutor budget resize + progress (PRD #122 M2)", () => {
   });
 });
 
+/** A main-thread `checkpoint` tool_use (PRD #122 M6). Turn-ending, no arguments. */
+function checkpointSignal(sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [{ type: "tool_use", id: "tc", name: "mcp__uzi__checkpoint", input: {} }],
+    },
+  } as unknown as SDKMessage;
+}
+
+describe("SdkExecutor milestone checkpoint (PRD #122 M6)", () => {
+  it("a turn that checkpoints (not done) reaps + fetches back and the loop continues", async () => {
+    const calls: Array<{ reap: boolean; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan
+      // iter 1: report progress + checkpoint, but NOT done — the loop must continue.
+      [reportProgress(["m1"], ["m2"]), checkpointSignal(), resultSuccess()],
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2: done
+    ]);
+    const probe = makeCtx({
+      checkpoint: async (opts) => {
+        calls.push(opts);
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // Exactly one checkpoint, the model-cooperative one (reap:true), carrying the progress
+    // the lead reported this turn. No iteration-boundary fallback fired — the `continue`
+    // after the cooperative checkpoint skips it.
+    assert.deepStrictEqual(calls, [
+      { reap: true, progress: { completed: ["m1"], in_progress: ["m2"] } },
+    ]);
+  });
+
+  it("a non-terminal iteration with NO model checkpoint fires the reap:false fallback", async () => {
+    const calls: Array<{ reap: boolean; progress?: MilestoneProgress }> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan
+      [assistantText("still working"), resultSuccess()], // iter 1: no checkpoint, no done
+      [assistantText("done now"), signalDone(), resultSuccess()], // iter 2: done
+    ]);
+    const probe = makeCtx({
+      checkpoint: async (opts) => {
+        calls.push(opts);
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // Iteration 1 did not checkpoint and was not done, so the fallback (NO reap) fired
+    // once. Iteration 2 was done and broke before the fallback, so it never fired again.
+    assert.deepStrictEqual(calls, [{ reap: false, progress: undefined }]);
+  });
+
+  it("a turn that is BOTH done and checkpoint terminates and does NOT reap-checkpoint", async () => {
+    const calls: Array<{ reap: boolean; progress?: MilestoneProgress }> = [];
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // plan
+      // iter 1: checkpoint AND done in the same turn — `done` wins, the loop terminates.
+      [checkpointSignal(), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      checkpoint: async (opts) => {
+        calls.push(opts);
+      },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    // No checkpoint call at all: the cooperative path is guarded by `!turn.done`, and the
+    // `break` exits before the iteration-boundary fallback is reached.
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(turns.length, 2, "one planning turn + one loop turn, then done");
+  });
+});
+
 describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
   const USAGE = { input_tokens: 1200, output_tokens: 800, cache_read_input_tokens: 400, cache_creation_input_tokens: 50 };
 

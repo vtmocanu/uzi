@@ -591,6 +591,25 @@ export class GitCache {
     return dst;
   }
 
+  /** PRD #122 M6: the tip of the worker-side tracking ref `fetchAgentBranch` wrote
+   *  (refs/uzi-runner/<branch>), or null when it does not exist yet. Used by the
+   *  checkpoint no-op check to tell "the branch advanced since the last checkpoint"
+   *  from "nothing new to fetch". Best-effort (tryGitStdout): a broken/absent ref
+   *  answers null rather than throwing. */
+  async trackingTip(barePath: string, branch: string): Promise<string | null> {
+    const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${runnerTrackingRef(branch)}^{commit}`])).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /** PRD #122 M6: the tip of the runner clone's own `refs/heads/<branch>` (the agent's
+   *  committed work), or null when unresolvable. Read as the RUNNER uid — the clone is
+   *  runner-owned, so a worker-uid read would hit the B2 dubious-ownership boundary
+   *  (git.ts B2 invariants). Best-effort. */
+  async branchTip(clonePath: string, branch: string): Promise<string | null> {
+    const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch(() => "")).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
   /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string): Promise<void> {

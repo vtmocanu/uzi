@@ -267,6 +267,39 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
   });
 });
 
+describe("branchTip / trackingTip (PRD #122 M6)", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+  it("branchTip reads the runner clone's own head; trackingTip is null before a fetch-back and the tip after", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 7);
+
+    // The agent commits in the runner clone (the only working tree).
+    fs.writeFileSync(path.join(rc.path, "NEW.txt"), "hi\n");
+    gitIn(rc.path, ["add", "NEW.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "work"]);
+    const agentSha = gitIn(rc.path, ["rev-parse", "HEAD"]);
+
+    // branchTip reads refs/heads/<branch> in the runner-owned clone → the committed tip.
+    assert.strictEqual(await git.branchTip(rc.path, "agent/issue-7"), agentSha);
+
+    // No checkpoint has fetched anything back yet, so the tracking ref does not exist.
+    assert.strictEqual(await git.trackingTip(bare, "agent/issue-7"), null);
+
+    // After a fetch-back the tracking ref exists and its tip equals the clone's tip — this
+    // is exactly the equality the checkpoint no-op check compares.
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
+    assert.strictEqual(await git.trackingTip(bare, "agent/issue-7"), agentSha);
+  });
+
+  it("both answer null for a branch that does not exist rather than throwing", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 8);
+    assert.strictEqual(await git.branchTip(rc.path, "agent/issue-does-not-exist"), null);
+    assert.strictEqual(await git.trackingTip(bare, "agent/issue-does-not-exist"), null);
+  });
+});
+
 /** The constant `core.hooksPath` git.ts pins; baked by both worker templates. */
 const HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 

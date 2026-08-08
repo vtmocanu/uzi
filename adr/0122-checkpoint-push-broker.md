@@ -29,9 +29,12 @@ The checkpoint push is **brokered through the api**, not run on the worker:
    the run's own repo and branch via the worker join token that already scopes
    claims. A worker can never ask the api to push an arbitrary repo or ref.
 3. **The api pushes to origin with the PAT it already decrypts** (`secretbox` lives
-   in the api), targeting `refs/heads/<branch>`, never forced, CI suppressed
-   (`ci.skip`), through a pure-Go smart-HTTP client (go-git), reusing the existing
-   `FORGE_ALLOWED_BASE_URLS` SSRF allowlist.
+   in the api), through a pure-Go smart-HTTP client (go-git), reusing the existing
+   `FORGE_ALLOWED_BASE_URLS` SSRF allowlist. **Target ref: superseded 2026-08-08 by
+   PRD #122 Decision 15** — the push goes to a checkpoint ref no workflow watches
+   (`refs/uzi-checkpoints/<branch>`), never forced, so CI fires on NO forge; the
+   original `refs/heads/<branch>`+`ci.skip` was GitLab-only (see the ci.skip
+   consequence below).
 
 No PAT-bearing git child ever runs under the agent-reachable uid.
 
@@ -81,8 +84,11 @@ therefore strictly stronger.
   secret-sensitive component — but the api already holds every PAT, so this adds no
   new *secret* exposure, only new code to audit (pin + vendor + govulncheck).
 - **The api image stays distroless-static.** A 2026-08-07 source check confirmed
-  go-git's `PushOptions.Options []string` carries git push-options, so `ci.skip` is
-  expressible with no git binary. Adding a git binary was considered and rejected: it
+  go-git's `PushOptions.Options` (a `map[string]string`, not the `[]string` first
+  recorded — corrected 2026-08-08 against v5.19.2, wire-encoded as `[]*Option`)
+  carries git push-options, so `ci.skip` is expressible with no git binary. (Moot
+  under Decision 15, which uses no push-option, but the source claim was wrong.)
+  Adding a git binary was considered and rejected: it
   would fatten the secrets-holder's base image and CVE surface for no capability the
   pure-Go path lacks. (The git-binary cost is image posture, not a new PAT-leak
   vector — the api has no untrusted co-resident, unlike the worker.)
@@ -109,8 +115,15 @@ therefore strictly stronger.
   origin, mirroring the local `refs/uzi-runner/<branch>` tracking ref): workflows
   trigger on `refs/heads/*`/tags/PRs, not arbitrary refs, so CI fires on **no** forge
   and only the end-of-run push to `refs/heads/<branch>` triggers a pipeline — no
-  push-option and no marker needed anywhere. Open question: whether the Developer bot
-  may push a non-`refs/heads/*` ref, per forge. Belongs at the driver/broker layer.
+  push-option and no marker needed anywhere. **CHOSEN 2026-08-08 (PRD #122 Decision
+  15), validated on GitLab by probe:** `gitlab.example.com` accepts a
+  `refs/uzi-checkpoints/*` ref and fires zero pipelines for it (vs one for
+  `refs/heads/main`), and a pure-Go go-git v5.19.2 smart-HTTP send-pack over HTTPS to
+  the same forge round-trips. Residual on the push-permission question: the probe
+  pushed as an OWNER, so a **Developer**-role bot pushing a non-`refs/heads/*` ref is
+  high-confidence (custom refs are not protectable) but proven only at M8 impl on the
+  worker with the bot PAT; Forgejo/GitHub still to check. Belongs at the driver/broker
+  layer.
   **Consequence for M8's own validation plan:** a real send-pack against
   `gitlab.example.com` cannot catch this — GitLab is the one forge where `ci.skip`
   works — so M8 must additionally validate the suppression against a Forgejo (and

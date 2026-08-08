@@ -12,7 +12,7 @@
 // prompt-level layer.
 
 import { randomBytes } from "node:crypto";
-import type { RunKind } from "./protocol.js";
+import type { Milestone, MilestoneProgress, RunKind } from "./protocol.js";
 import { clampToDirCharset } from "./util.js";
 
 const UNTRUSTED_FRAME =
@@ -632,6 +632,17 @@ export interface ImplementPromptInput {
    *  path only), so this is additive rather than a change to the approved-run prompt.
    *  See priorWorkNote. */
   priorWork?: PriorWork;
+  /** PRD #122 M6: the milestone breakdown FROZEN at the gate (the approved list). Named on
+   *  every implement turn so the lead can see where the milestone boundaries are — which is
+   *  what makes the proactive `checkpoint` call at each boundary actionable. Absent/empty ⇒
+   *  no milestone note, so a run with no approved milestones (and every non-issue run) gets
+   *  a byte-identical prompt to before. See milestoneStatusNote. */
+  milestones?: readonly Milestone[];
+  /** PRD #122 M6: the lead's latest reported progress over `milestones`, so the note marks
+   *  each milestone done / in progress / not started. DYNAMIC (unlike deps/baseCommit),
+   *  which is why the milestone note is not first-turn-only: it re-renders the live status
+   *  each turn. Absent ⇒ every milestone renders as not-yet-started. See milestoneStatusNote. */
+  progress?: MilestoneProgress;
 }
 
 /**
@@ -695,6 +706,11 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     ? baseCommitNote(input.baseCommit, input.defaultBranchCommit)
     : "";
   if (baseNote) lines.push("", baseNote);
+  // PRD #122 M6: name the approved milestones and their live status EVERY turn (not
+  // first-turn-only like the facts above — progress is dynamic), so the lead can see the
+  // milestone boundaries and checkpoint at each one. Empty ⇒ nothing added.
+  const milestoneNote = milestoneStatusNote(input.milestones, input.progress);
+  if (milestoneNote) lines.push("", milestoneNote);
   if (input.followUp) {
     lines.push(
       "",
@@ -738,6 +754,39 @@ export function buildRevisePlanPrompt(feedback: string): string {
     "Produce the COMPLETE revised implementation plan (the full plan, not just the",
     "changes), then call the `submit_plan` tool with the plan as Markdown and STOP.",
     "Do NOT implement anything yet — a human must approve the revised plan first.",
+  ].join("\n");
+}
+
+/**
+ * PRD #122 M6: render the approved milestone breakdown with each entry's live status,
+ * plus the checkpoint directive that ties the boundary to the durability mechanism. The
+ * status comes from the lead's own reported `progress` (completed ⇒ done, in_progress ⇒
+ * in progress, else not started); `completed` wins if an id is somehow in both, since a
+ * finished milestone is finished. Returns "" when there are no milestones, so a run with
+ * no approved breakdown adds nothing (the additive-absent property). NOT untrusted-fenced:
+ * these are the human-approved plan's own milestone titles, not attacker-influenceable
+ * forge text — the same trust posture as the approved plan the lead is implementing.
+ */
+function milestoneStatusNote(
+  milestones: readonly Milestone[] | undefined,
+  progress: MilestoneProgress | undefined,
+): string {
+  if (!milestones || milestones.length === 0) return "";
+  const done = new Set(progress?.completed ?? []);
+  const active = new Set(progress?.in_progress ?? []);
+  const rows = milestones.map((m) => {
+    const status = done.has(m.id)
+      ? "done"
+      : active.has(m.id)
+        ? "in progress"
+        : "not started";
+    return `- [${m.id}] ${m.title} — ${status}`;
+  });
+  return [
+    "Your approved plan is broken into these milestones. When a milestone's work is",
+    "committed locally, call the `checkpoint` tool once and end your turn so the work is",
+    "saved durably before you start the next one:",
+    ...rows,
   ].join("\n");
 }
 
