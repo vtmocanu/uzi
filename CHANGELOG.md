@@ -6,6 +6,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-08-08
+
+First **published** build of the 0.20.0 changeset. The `v0.20.0` tag was created
+but its publish pipeline was skipped by a stray `[skip ci]` marker on the tagged
+commit (the marker suppresses the tag's own publish pipeline too), so 0.20.0
+produced no images or chart and was never deployed. 0.20.1 is identical in
+shipping code — see the [0.20.0] section below for the actual changes.
+
 ## [0.20.0] - 2026-08-08
 
 ### Added
