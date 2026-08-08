@@ -23,6 +23,7 @@ import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
 import { RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
+import { Schedules } from "./pages/Schedules";
 import { Judge } from "./pages/Judge";
 import { Notifications } from "./pages/Notifications";
 import { ChatList, ChatConversation } from "./pages/Chat";
@@ -128,6 +129,15 @@ export default function App() {
           element={
             <ProtectedRoute>
               <RunView />
+            </ProtectedRoute>
+          }
+        />
+        {/* PRD #241: scheduled runs (one-time + recurring). */}
+        <Route
+          path="/schedules"
+          element={
+            <ProtectedRoute>
+              <Schedules />
             </ProtectedRoute>
           }
         />

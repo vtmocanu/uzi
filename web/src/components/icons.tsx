@@ -167,6 +167,36 @@ export const XIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// Clock (lucide) — the Schedules nav glyph + issue-view "Schedule…" action
+// (PRD #241): a dial with hands, reading "time-driven".
+export const ClockIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </Icon>
+);
+
+// Play (lucide) — the per-row "Run now" action on the Schedules table (PRD #241).
+export const PlayIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="m6 4 14 8-14 8z" />
+  </Icon>
+);
+
+// Pencil (lucide) — the per-row "Edit" action on the Schedules table (PRD #241).
+export const PencilIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M17 3a2.85 2.85 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5z" />
+  </Icon>
+);
+
+// Trash (lucide) — the delete action in the schedule editor (PRD #241).
+export const TrashIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+  </Icon>
+);
+
 export const CheckIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="M20 6 9 17l-5-5" />

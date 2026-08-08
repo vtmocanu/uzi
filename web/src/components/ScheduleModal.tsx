@@ -1,0 +1,682 @@
+// ScheduleModal — the create/edit modal for scheduled runs (PRD #241 M5, mock §2).
+//
+// One modal serves both timing modes (Once / Recurring) and all three targets
+// (Issue / Label sweep / Prompt); the two segmented pickers swap the fields below
+// them. A live "Next fires" preview calls POST /api/schedules/preview (debounced)
+// so it always matches server truth. The cron STRING is canonical (Decision 6):
+// presets translate to it, editing the raw cron flips the preset to "Custom", and
+// only the cron string is ever sent — never a preset label.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  api,
+  ApiError,
+  type Repo,
+  type Schedule,
+  type ScheduleInput,
+  type ScheduleTarget,
+  type ScheduleTiming,
+} from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
+import {
+  Alert,
+  Button,
+  Field,
+  Input,
+  Select,
+  Textarea,
+  Toggle,
+  cx,
+} from "./ui";
+import { XIcon, TrashIcon } from "./icons";
+import {
+  cronFromPreset,
+  DEFAULT_PRESET_STATE,
+  hhmm,
+  humanizeCron,
+  parseHHMM,
+  presetFromCron,
+  PRESET_OPTIONS,
+  type CronPreset,
+  type PresetState,
+} from "../lib/schedulePresets";
+
+// PinnedIssue locks the modal to one issue (the issue-view "Schedule…" entry,
+// mock §3): the target is forced to "issue" and the repo/issue are not editable.
+export interface PinnedIssue {
+  repoId: string;
+  repoPath: string;
+  issueIid: number;
+}
+
+const TARGET_OPTIONS: { value: ScheduleTarget; title: string; desc: string }[] = [
+  { value: "issue", title: "Issue", desc: "Pin one PRD issue" },
+  { value: "sweep", title: "Label sweep", desc: "Issues matching a label" },
+  { value: "prompt", title: "Prompt", desc: "No issue → opens an MR" },
+];
+
+const TIMING_OPTIONS: { value: ScheduleTiming; title: string; desc: string }[] = [
+  { value: "once", title: "Once", desc: "A single future moment" },
+  { value: "recurring", title: "Recurring", desc: "On a repeating cadence" },
+];
+
+const COMMON_TIMEZONES = ["UTC", "Europe/Bucharest", "America/New_York", "Europe/London"];
+
+function browserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+// toLocalInput / fromLocalInput bridge an ISO instant and a <input type="datetime-local">
+// value (which is a wall-clock string with no zone). We treat the picker as the
+// browser's local zone, which is the least-surprising default for a once schedule.
+function toLocalInput(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number) => n.toString().padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function fromLocalInput(v: string): string | null {
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+// SegmentedControl is the radio-group picker the mock uses for Target and Timing.
+function SegmentedControl<T extends string>({
+  label,
+  value,
+  onChange,
+  options,
+  disabled = false,
+}: {
+  label: string;
+  value: T;
+  onChange: (v: T) => void;
+  options: { value: T; title: string; desc: string }[];
+  disabled?: boolean;
+}) {
+  return (
+    <div className="space-y-2" role="radiogroup" aria-label={label}>
+      <span className="text-xs font-semibold uppercase tracking-wide text-muted">{label}</span>
+      <div className="grid grid-flow-col auto-cols-fr gap-1.5">
+        {options.map((o) => {
+          const on = o.value === value;
+          return (
+            <button
+              key={o.value}
+              type="button"
+              role="radio"
+              aria-checked={on}
+              disabled={disabled}
+              onClick={() => onChange(o.value)}
+              className={cx(
+                "rounded-lg border px-3 py-2.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                on ? "border-brand bg-brand/10" : "border-edge bg-raised hover:border-edge-strong",
+              )}
+            >
+              <span className="flex items-center gap-2 text-[13px] font-semibold text-fg">
+                <span
+                  aria-hidden="true"
+                  className={cx(
+                    "h-3 w-3 shrink-0 rounded-full border-2",
+                    on ? "border-brand bg-brand" : "border-edge-strong",
+                  )}
+                />
+                {o.title}
+              </span>
+              <span className="mt-1 block pl-5 text-[11px] text-faint">{o.desc}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+export function ScheduleModal({
+  pinned,
+  editing,
+  onClose,
+  onSaved,
+}: {
+  // When set, the modal is pre-pinned to this issue (issue-view entry, mock §3).
+  pinned?: PinnedIssue;
+  // When set, the modal edits an existing schedule instead of creating one.
+  editing?: Schedule;
+  onClose: () => void;
+  // Called after a successful create/update/delete so the caller can refresh.
+  onSaved: () => void;
+}) {
+  const { prdLabel } = useAuth();
+  const isEdit = !!editing;
+
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [repoId, setRepoId] = useState<string>(
+    editing?.repo_id ?? pinned?.repoId ?? "",
+  );
+
+  const [target, setTarget] = useState<ScheduleTarget>(
+    editing?.target ?? (pinned ? "issue" : "issue"),
+  );
+  const [issueIid, setIssueIid] = useState<string>(
+    editing?.issue_iid != null
+      ? String(editing.issue_iid)
+      : pinned
+        ? String(pinned.issueIid)
+        : "",
+  );
+  const [labels, setLabels] = useState<string[]>(editing?.labels ?? []);
+  const [labelInput, setLabelInput] = useState("");
+  const [prompt, setPrompt] = useState(editing?.prompt ?? "");
+
+  const [timing, setTiming] = useState<ScheduleTiming>(editing?.timing ?? "recurring");
+
+  // Cadence: the canonical cron string plus the preset sub-state derived from it.
+  const initialCron = editing?.timing === "recurring" ? editing.cron_expr : cronFromPreset(DEFAULT_PRESET_STATE);
+  const [cron, setCron] = useState<string>(initialCron || cronFromPreset(DEFAULT_PRESET_STATE));
+  const [presetState, setPresetState] = useState<PresetState>(
+    presetFromCron(initialCron || cronFromPreset(DEFAULT_PRESET_STATE)),
+  );
+
+  const [runAtLocal, setRunAtLocal] = useState<string>(toLocalInput(editing?.run_at ?? null));
+  const [timezone, setTimezone] = useState<string>(
+    editing?.timezone ?? browserTimezone(),
+  );
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? false);
+  const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+
+  const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
+  const [previewError, setPreviewError] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+
+  // Load repos for the picker (create mode, not pinned). Failure is non-fatal.
+  useEffect(() => {
+    if (isEdit || pinned) return;
+    let alive = true;
+    api
+      .listRepos()
+      .then(({ repos }) => {
+        if (!alive) return;
+        setRepos(repos);
+        setRepoId((cur) => cur || repos[0]?.id || "");
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [isEdit, pinned]);
+
+  // ── Preset ↔ cron keep-in-sync (Decision 6) ────────────────────────────────
+  const applyPreset = useCallback((next: PresetState) => {
+    setPresetState(next);
+    if (next.preset !== "custom") setCron(cronFromPreset(next));
+  }, []);
+
+  const onPresetChange = (preset: CronPreset) => {
+    if (preset === "custom") {
+      setPresetState((s) => ({ ...s, preset }));
+      return;
+    }
+    applyPreset({ ...presetState, preset });
+  };
+  const onTimeChange = (v: string) => {
+    const t = parseHHMM(v);
+    if (!t) return;
+    applyPreset({ ...presetState, ...t });
+  };
+  const onEveryNChange = (v: string) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 1 || n > 23) return;
+    applyPreset({ ...presetState, everyN: n });
+  };
+  const onRawCronChange = (v: string) => {
+    setCron(v);
+    setPresetState(presetFromCron(v, presetState));
+  };
+
+  // ── Live "Next fires" preview (debounced), always from the server ───────────
+  const debounceRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    window.clearTimeout(debounceRef.current);
+    const runAtISO = fromLocalInput(runAtLocal);
+    // Nothing to preview until the timing's key field is present.
+    if (timing === "recurring" && cron.trim() === "") {
+      setFires([]);
+      setPreviewError(false);
+      return;
+    }
+    if (timing === "once" && !runAtISO) {
+      setFires([]);
+      setPreviewError(false);
+      return;
+    }
+    debounceRef.current = window.setTimeout(() => {
+      api
+        .previewSchedule({
+          timing,
+          cron_expr: timing === "recurring" ? cron : undefined,
+          run_at: timing === "once" ? runAtISO : undefined,
+          timezone,
+          n: 3,
+        })
+        .then(({ fires }) => {
+          setFires(fires);
+          setPreviewError(false);
+        })
+        .catch(() => {
+          setFires([]);
+          setPreviewError(true);
+        });
+    }, 400);
+    return () => window.clearTimeout(debounceRef.current);
+  }, [timing, cron, runAtLocal, timezone]);
+
+  const repoPath = useMemo(() => {
+    if (editing) return editing.repo_path;
+    if (pinned) return pinned.repoPath;
+    return repos.find((r) => r.id === repoId)?.path_with_namespace ?? "";
+  }, [editing, pinned, repos, repoId]);
+
+  const addLabel = () => {
+    const t = labelInput.trim();
+    if (t && !labels.includes(t)) setLabels((ls) => [...ls, t]);
+    setLabelInput("");
+  };
+
+  const canSubmit = (): boolean => {
+    if (!repoId) return false;
+    if (target === "issue" && !(Number(issueIid) > 0)) return false;
+    if (target === "prompt" && prompt.trim() === "") return false;
+    if (timing === "recurring" && cron.trim() === "") return false;
+    if (timing === "once" && !fromLocalInput(runAtLocal)) return false;
+    return true;
+  };
+
+  const buildInput = (): ScheduleInput => ({
+    target,
+    issue_iid: target === "issue" ? Number(issueIid) : undefined,
+    labels: target === "sweep" ? labels : undefined,
+    prompt: target === "prompt" ? prompt : undefined,
+    timing,
+    cron_expr: timing === "recurring" ? cron.trim() : undefined,
+    run_at: timing === "once" ? fromLocalInput(runAtLocal) : undefined,
+    timezone,
+    auto_approve: autoApprove,
+    wait_on_limit: waitOnLimit,
+  });
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canSubmit()) return;
+    setError("");
+    setSaving(true);
+    try {
+      if (editing) {
+        await api.updateSchedule(editing.id, buildInput());
+      } else {
+        await api.createSchedule(repoId, buildInput());
+      }
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not save the schedule");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!editing) return;
+    setError("");
+    setDeleting(true);
+    try {
+      await api.deleteSchedule(editing.id);
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not delete the schedule");
+      setDeleting(false);
+    }
+  };
+
+  const footerSummary = [
+    timing === "once" ? "One time" : "Recurring",
+    target === "sweep" ? "sweep" : target === "prompt" ? "prompt" : "issue",
+    autoApprove ? "auto-approve" : "manual approve",
+  ].join(" · ");
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+      role="dialog"
+      aria-modal="true"
+      aria-label={isEdit ? "Edit schedule" : "New schedule"}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <form
+        onSubmit={submit}
+        className="my-8 w-full max-w-xl overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl"
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold">{isEdit ? "Edit schedule" : "New schedule"}</h2>
+            <p className="mt-0.5 text-xs text-muted">
+              {repoPath || "Pick a repo"} · fires as you, on your Anthropic token
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+          >
+            <XIcon />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="max-h-[70vh] space-y-5 overflow-y-auto px-5 py-5">
+          {error && <Alert message={error} />}
+
+          {/* Repo picker (create, non-pinned only) */}
+          {!isEdit && !pinned && (
+            <Field label="Repo" htmlFor="sched-repo">
+              <Select id="sched-repo" value={repoId} onChange={(e) => setRepoId(e.target.value)}>
+                {repos.length === 0 && <option value="">No repos available</option>}
+                {repos.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.path_with_namespace}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          )}
+
+          {/* Target */}
+          <SegmentedControl
+            label="Target"
+            value={target}
+            onChange={setTarget}
+            options={TARGET_OPTIONS}
+            disabled={!!pinned}
+          />
+
+          {target === "issue" && (
+            <Field label="Issue number" htmlFor="sched-issue">
+              <Input
+                id="sched-issue"
+                type="number"
+                min={1}
+                value={issueIid}
+                disabled={!!pinned}
+                onChange={(e) => setIssueIid(e.target.value)}
+                placeholder="e.g. 142"
+              />
+            </Field>
+          )}
+
+          {target === "sweep" && (
+            <div className="space-y-2">
+              <span className="text-sm font-medium text-muted">Labels</span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {labels.map((l) => (
+                  <span
+                    key={l}
+                    className="inline-flex items-center gap-1 rounded-md border border-brand/40 bg-brand/10 px-2 py-0.5 text-[11px] text-brand"
+                  >
+                    {l}
+                    <button
+                      type="button"
+                      aria-label={`Remove ${l}`}
+                      onClick={() => setLabels((ls) => ls.filter((x) => x !== l))}
+                      className="text-brand/70 hover:text-brand"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                ))}
+                <input
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === ",") {
+                      e.preventDefault();
+                      addLabel();
+                    }
+                  }}
+                  onBlur={addLabel}
+                  placeholder="add label…"
+                  className="min-w-[120px] flex-1 rounded-md border border-edge bg-raised px-2 py-1 text-xs text-fg placeholder:text-faint outline-none focus:border-brand/70"
+                />
+              </div>
+              <p className="text-[11px] text-faint">
+                Empty ⇒ the <span className="font-medium text-muted">{prdLabel}</span> label. A selector chooses
+                candidates; the run-creation gate (PRD link, or PRDLESS) chooses what actually fires.
+              </p>
+            </div>
+          )}
+
+          {target === "prompt" && (
+            <Field label="Prompt" htmlFor="sched-prompt">
+              <Textarea
+                id="sched-prompt"
+                rows={3}
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder="hunt for flaky tests and open an MR"
+              />
+            </Field>
+          )}
+          {target === "prompt" && (
+            <p className="-mt-2 text-[11px] text-faint">
+              No forge issue — runs against the repo and opens an MR. Bypasses the PRD-issue gate by design;
+              <code className="mx-1 rounded bg-raised px-1">main</code> stays protected by the unchanged guardrails.
+            </p>
+          )}
+
+          {/* Timing */}
+          <SegmentedControl label="Timing" value={timing} onChange={setTiming} options={TIMING_OPTIONS} />
+
+          {timing === "recurring" ? (
+            <Field label="Cadence" htmlFor="sched-preset">
+              <div className="grid grid-cols-2 gap-2">
+                <Select
+                  id="sched-preset"
+                  value={presetState.preset}
+                  onChange={(e) => onPresetChange(e.target.value as CronPreset)}
+                >
+                  {PRESET_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </Select>
+                {presetState.preset === "everyNHours" ? (
+                  <Input
+                    type="number"
+                    min={1}
+                    max={23}
+                    aria-label="Every N hours"
+                    value={presetState.everyN}
+                    onChange={(e) => onEveryNChange(e.target.value)}
+                  />
+                ) : presetState.preset === "custom" ? (
+                  <div className="flex items-center px-1 text-xs text-faint">Set the cron below</div>
+                ) : (
+                  <Input
+                    type="time"
+                    aria-label="Time of day"
+                    value={hhmm(presetState)}
+                    onChange={(e) => onTimeChange(e.target.value)}
+                  />
+                )}
+              </div>
+            </Field>
+          ) : (
+            <Field label="Fire at" htmlFor="sched-runat">
+              <Input
+                id="sched-runat"
+                type="datetime-local"
+                value={runAtLocal}
+                onChange={(e) => setRunAtLocal(e.target.value)}
+              />
+            </Field>
+          )}
+
+          {/* Advanced: raw cron + timezone */}
+          <details
+            open={advancedOpen}
+            onToggle={(e) => setAdvancedOpen((e.currentTarget as HTMLDetailsElement).open)}
+            className="border-t border-dashed border-edge pt-3"
+          >
+            <summary className="cursor-pointer text-xs font-medium text-brand">
+              Advanced — raw cron &amp; timezone
+            </summary>
+            <div className="mt-3 space-y-3">
+              {timing === "recurring" && (
+                <Field label="Cron expression" htmlFor="sched-cron">
+                  <Input
+                    id="sched-cron"
+                    className="font-mono"
+                    value={cron}
+                    onChange={(e) => onRawCronChange(e.target.value)}
+                    placeholder="0 2 * * 1-5"
+                  />
+                  <p className="mt-1 text-[11px] text-faint">
+                    Standard 5-field cron. The preset stays in sync; edit here to go beyond it
+                    {presetState.preset === "custom" ? " (currently custom)" : ""}.
+                  </p>
+                </Field>
+              )}
+              <Field label="Timezone" htmlFor="sched-tz">
+                <Input
+                  id="sched-tz"
+                  list="sched-tz-list"
+                  value={timezone}
+                  onChange={(e) => setTimezone(e.target.value)}
+                  placeholder="UTC"
+                />
+                <datalist id="sched-tz-list">
+                  {[browserTimezone(), ...COMMON_TIMEZONES].map((tz) => (
+                    <option key={tz} value={tz} />
+                  ))}
+                </datalist>
+              </Field>
+            </div>
+          </details>
+
+          {/* Options */}
+          <div className="space-y-3">
+            <span className="text-xs font-semibold uppercase tracking-wide text-muted">Run options</span>
+            <div className="flex items-start gap-3">
+              <Toggle checked={waitOnLimit} onChange={setWaitOnLimit} label="Wait on usage limit" />
+              <span className="text-[13px] text-fg">
+                Wait on usage limit
+                <span className="block text-[11px] text-faint">
+                  Park the run until the Anthropic window reopens instead of failing it
+                </span>
+              </span>
+            </div>
+            <div className="flex items-start gap-3">
+              <Toggle checked={autoApprove} onChange={setAutoApprove} label="Auto-approve the plan" />
+              <span className="text-[13px] text-fg">
+                Auto-approve the plan
+                <span className="block text-[11px] text-faint">
+                  Skip the approval gate so unattended runs proceed (like autopilot). Off = the run waits at the gate.
+                </span>
+              </span>
+            </div>
+          </div>
+
+          {/* Next fires preview */}
+          <div className="rounded-lg border border-edge bg-bg/50 px-3 py-2.5">
+            <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted">
+              Next fires
+            </p>
+            {previewError ? (
+              <p className="text-xs text-danger">This timing is not valid yet.</p>
+            ) : fires.length === 0 ? (
+              <p className="text-xs text-faint">Nothing to preview yet.</p>
+            ) : (
+              <ul className="space-y-1">
+                {fires.map((f) => (
+                  <li key={f} className="flex gap-2 font-mono text-xs tabular-nums text-fg">
+                    <span>{formatFire(f, timezone)}</span>
+                    <span className="text-faint">{relativeFromNow(f)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {timing === "recurring" && presetState.preset !== "custom" && (
+              <p className="mt-1.5 text-[11px] text-faint">{humanizeCron(cron)} · {timezone}</p>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between gap-3 border-t border-edge bg-bg/40 px-5 py-3.5">
+          <span className="truncate text-[11px] text-faint">{footerSummary}</span>
+          <div className="flex items-center gap-2">
+            {isEdit && (
+              <Button type="button" variant="danger" size="sm" onClick={remove} disabled={deleting || saving}>
+                <TrashIcon /> {deleting ? "Deleting…" : "Delete"}
+              </Button>
+            )}
+            <Button type="button" variant="secondary" onClick={onClose} disabled={saving}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={saving || !canSubmit()}>
+              {saving ? "Saving…" : isEdit ? "Save changes" : "Create schedule"}
+            </Button>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+// formatFire renders one preview instant. The API returns UTC; we render in the
+// schedule's chosen timezone so the preview reads the way the schedule fires.
+function formatFire(iso: string, timezone: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: timezone,
+    }).format(d);
+  } catch {
+    return d.toISOString();
+  }
+}
+
+// relativeFromNow renders a compact "in 6h 12m" / "in 2d 6h" hint.
+export function relativeFromNow(iso: string): string {
+  const d = new Date(iso).getTime();
+  if (Number.isNaN(d)) return "";
+  const ms = d - Date.now();
+  if (ms <= 0) return "now";
+  const mins = Math.round(ms / 60000);
+  const days = Math.floor(mins / 1440);
+  const hours = Math.floor((mins % 1440) / 60);
+  const rem = mins % 60;
+  if (days > 0) return `in ${days}d ${hours}h`;
+  if (hours > 0) return `in ${hours}h ${rem}m`;
+  return `in ${rem}m`;
+}

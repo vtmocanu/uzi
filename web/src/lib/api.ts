@@ -687,6 +687,78 @@ export interface Memory {
   created_at: string;
 }
 
+// ── Scheduled runs (PRD #241) ─────────────────────────────────────────────
+// A time-driven run origin alongside manual and autopilot. A schedule is an
+// owner-scoped intent to create run(s) at future time(s). Mirrors the Go
+// apitypes.ScheduleDTO — snake_case, byte-for-byte.
+
+export type ScheduleTarget = "issue" | "sweep" | "prompt";
+export type ScheduleTiming = "once" | "recurring";
+// active — armed; fired — a `once` schedule that has already fired (terminal);
+// error — parked because its owner/token/repo is gone (surfaced, not dropped).
+export type ScheduleStatus = "active" | "fired" | "error";
+
+export interface Schedule {
+  id: string;
+  repo_id: string;
+  // Best-effort display path ("vtmocanu/uzi"); "" when the repo can no longer be
+  // resolved (disconnected or no longer owned).
+  repo_path: string;
+  target: ScheduleTarget;
+  // Set only for target "issue"; null otherwise.
+  issue_iid: number | null;
+  // Sweep label selector; null (empty) ⇒ the PRD label at fire time (Decision 9).
+  labels: string[] | null;
+  // Stored prompt for target "prompt"; "" otherwise (Decision 10).
+  prompt: string;
+  timing: ScheduleTiming;
+  // 5-field cron for a recurring schedule; "" for a once schedule.
+  cron_expr: string;
+  // The single fire instant (RFC3339) for a once schedule; null for recurring.
+  run_at: string | null;
+  timezone: string;
+  next_fire_at: string | null;
+  last_fired_at: string | null;
+  auto_approve: boolean;
+  wait_on_limit: boolean;
+  enabled: boolean;
+  status: ScheduleStatus;
+  created_at: string;
+  updated_at: string;
+  // The live "next N fires" preview (up to 3), computed server-side from the same
+  // cron logic the modal preview uses so the list and the modal agree.
+  next_fires: string[];
+}
+
+// ScheduleInput is the create/patch body (apitypes.ScheduleRequest). On create,
+// omitted flags take their server defaults (auto_approve=true per Decision 4,
+// wait_on_limit=false, enabled=true). On PATCH a field present is applied and an
+// absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
+export interface ScheduleInput {
+  target?: ScheduleTarget;
+  issue_iid?: number | null;
+  labels?: string[];
+  prompt?: string;
+  timing?: ScheduleTiming;
+  cron_expr?: string;
+  run_at?: string | null;
+  timezone?: string;
+  auto_approve?: boolean;
+  wait_on_limit?: boolean;
+  enabled?: boolean;
+}
+
+// SchedulePreviewInput asks for a live "next fires" preview from a timing spec
+// that need not correspond to a stored schedule (the modal computes it as the user
+// types). n is clamped to [1,10] server-side (default 3).
+export interface SchedulePreviewInput {
+  timing: ScheduleTiming;
+  cron_expr?: string;
+  run_at?: string | null;
+  timezone: string;
+  n?: number;
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -2569,6 +2641,31 @@ const realApi = {
   // owner from the session, so neither call carries a user_id.
   listMemory: () => request<{ memories: Memory[] }>("GET", "/me/memory"),
   deleteMemory: (id: string) => request<null>("DELETE", `/me/memory/${id}`),
+
+  // ── Scheduled runs (PRD #241) — owner-scoped ───────────────────────────────
+  // The list is a BARE JSON array (not an envelope); create/get/patch return a
+  // bare ScheduleDTO. The scheduler fires each schedule through the same shared
+  // seam autopilot uses, so a schedule can do nothing a manual start cannot.
+  listSchedules: () => request<Schedule[]>("GET", "/me/schedules"),
+  createSchedule: (repoId: string, input: ScheduleInput) =>
+    request<Schedule>("POST", `/repos/${repoId}/schedules`, input),
+  getSchedule: (id: string) => request<Schedule>("GET", `/schedules/${id}`),
+  // PATCH merges (field present = apply, absent = keep). The per-row enable toggle
+  // sends just { enabled }, which the server flips without re-validating the config.
+  updateSchedule: (id: string, input: ScheduleInput) =>
+    request<Schedule>("PATCH", `/schedules/${id}`, input),
+  deleteSchedule: (id: string) => request<null>("DELETE", `/schedules/${id}`),
+  // Fire immediately through the seam WITHOUT advancing the recurring cadence
+  // (202). created counts the runs actually started (0 on a benign dedup skip).
+  runScheduleNow: (id: string) =>
+    request<{ created: number; run_ids: string[] }>(
+      "POST",
+      `/schedules/${id}/run-now`,
+    ),
+  // Live "next fires" preview (RFC3339 UTC), computed from the same cron logic the
+  // scheduler fires on, so the modal always matches server truth (Decision 6).
+  previewSchedule: (input: SchedulePreviewInput) =>
+    request<{ fires: string[] }>("POST", "/schedules/preview", input),
 };
 
 // The one client the app talks to. `mockApi` implements the identical surface
