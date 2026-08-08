@@ -910,8 +910,14 @@ function MultiSelectBar({
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [menuOpen]);
 
+  // Issue #204: inset the bar past the sidebar at the desktop breakpoint. `inset-x-0`
+  // spanned full width UNDER the w-60 (240px) z-30 sidebar, clipping the "N groups
+  // selected" label. `lg:left-60` matches the app layout's `lg:pl-60` content inset
+  // (AppShell), so on lg the bar starts at 240px; mobile stays full width. z-20 is left
+  // BELOW the sidebar's z-30 deliberately — the fix is the inset, not stacking over it.
+  // These class strings are literal (not interpolated) for Tailwind JIT.
   return (
-    <div className="fixed inset-x-0 bottom-0 z-20 border-t border-edge bg-surface/95 px-4 py-3 backdrop-blur">
+    <div className="fixed left-0 right-0 bottom-0 z-20 border-t border-edge bg-surface/95 px-4 py-3 backdrop-blur lg:left-60">
       <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center gap-3">
         <span className="text-sm font-medium text-fg">
           {count} {count === 1 ? "group" : "groups"} selected

@@ -20,7 +20,12 @@ export function SettingsShell({ description, children }: { description: string; 
   return (
     <div className="space-y-6">
       <PageHeader title="Settings" description={description} />
-      <div className="flex gap-1 border-b border-edge">
+      {/* Issue #204: the tab row scrolls WITHIN its own container so the page body never
+          scrolls horizontally. At 390px the full tab strip overflows (scrollWidth 401 vs
+          clientWidth 390); `overflow-x-auto` keeps every tab reachable while the border-b
+          underline still spans the row. The tabs are `shrink-0`/`whitespace-nowrap` so they
+          overflow-and-scroll rather than compress to fit (which would defeat overflow-x). */}
+      <div className="flex gap-1 overflow-x-auto border-b border-edge">
         {TABS.map((t) => (
           <NavLink
             key={t.to}
@@ -28,7 +33,7 @@ export function SettingsShell({ description, children }: { description: string; 
             end={t.end}
             className={({ isActive }) =>
               cx(
-                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
                 isActive
                   ? "border-brand text-fg"
                   : "border-transparent text-muted hover:border-edge-strong hover:text-fg",

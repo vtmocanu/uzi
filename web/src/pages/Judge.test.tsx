@@ -779,3 +779,34 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
     expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
   });
 });
+
+// Issue #204: the fixed bulk-action bar used `inset-x-0`, spanning full width UNDER the
+// w-60 (240px) z-30 sidebar and clipping its "N groups selected" label at desktop widths.
+// jsdom has no layout engine, so this asserts the class contract rather than a measured
+// clip: the bar is inset by `lg:left-60` (matching AppShell's `lg:pl-60` content inset) and
+// is NOT raised above the sidebar's z-30 — the fix is the inset, not stacking over it.
+describe("Judge — bulk bar clears the w-60 sidebar at desktop width (#204)", () => {
+  it("insets the fixed bar past the sidebar without stacking over it", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [group()],
+        triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    renderJudge();
+    // Selecting a group reveals the MultiSelectBar.
+    fireEvent.click(await screen.findByLabelText(/^Select /));
+    const bar = screen.getByText(/group selected/).closest("div.fixed") as HTMLElement;
+    expect(bar).toBeTruthy();
+    // Desktop inset matches the app layout's lg:pl-60 content inset…
+    expect(bar.className).toContain("lg:left-60");
+    // …mobile stays full width, and the old full-width span that clipped the label is gone.
+    expect(bar.className).toContain("left-0");
+    expect(bar.className).toContain("right-0");
+    expect(bar.className).not.toContain("inset-x-0");
+    // NOT raised above the z-30 sidebar — the fix is the inset, not the stack order.
+    expect(bar.className).toContain("z-20");
+    expect(bar.className).not.toContain("z-30");
+    expect(bar.className).not.toContain("z-40");
+  });
+});
