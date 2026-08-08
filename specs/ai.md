@@ -18915,3 +18915,81 @@ that has held its slot for days.
   scheduling, or sweeper query reads `online_since`. This is the same contract PRD #49's
   `stats_*` columns hold, and it is enforced by a store guard test that statically scans
   the query set so a future scheduler edit cannot quietly start depending on it.
+
+## 495. PRD #238 — the third forge driver: classic-PAT/github.com-only, `{repo}` exactly, `ProtectionUnverified` for what write role cannot read, and a narrower CI-fix trigger than the raw Actions enum
+
+Serves human Feature #2 ("forge-generic design", now GitLab + Forgejo + GitHub) and
+the primary directive. Full design and rationale: `adr/0238-github-driver.md`. **Ships
+dark**: `handler/forge.go` does not advertise or accept `github` yet (the go-live gate
+flip is this PRD's last milestone), so nothing below is reachable through the product
+today — recorded as the third driver's design, not as a live system.
+
+- **`api/internal/forge/github.go`/`github_pipelines.go`, `github.com/google/go-github/v90`,
+  classic PAT, github.com only.** No `Forge` interface method added (unlike Forgejo's
+  ADR-0065, which added `Role`/`WriteRoleCanMerge`/`BotCanMerge`) — the five test fakes
+  are untouched except for zero-valuing one new struct field (below). `VerifyToken`
+  **refuses a `github_pat_`-prefixed (fine-grained) token up front** rather than saving
+  it on a warning: it cannot be introspected for scopes (no `X-OAuth-Scopes` header,
+  buggy expiry — go-github #3708), so warn-not-reject would silently defeat the
+  over-privilege guard for exactly the token type whose breadth is unknown.
+- **`privcheck.requiredScopesFor(github) = {repo}`, exactly, via the existing set-equality
+  check.** `repo` is GitHub's single coarse scope covering contents write, issues, PRs,
+  and Actions read — there is no way to narrow it further on a classic PAT, an accepted
+  weakening vs. GitLab's `api`/Forgejo's three fine scopes.
+- **The `workflow`-scope boundary (D7a, user-resolved: forbid-and-document).** A push
+  touching `.github/workflows/*` needs the `workflow` scope; requiring it would
+  over-privilege every repo that never touches CI, so uzi instead **refuses a
+  `workflow`-scoped token at connect** (over-privilege, same set-equality path that
+  rejects `{repo, delete_repo}`) and lets an agent's workflow-touching push fail at
+  push time with GitHub's error surfaced PAT-redacted. Deliberate CI-integrity boundary:
+  the token that pushes agent branches cannot also rewrite the CI guarding `main`.
+- **`BranchProtection.ProtectionUnverified bool` — additive, fail-safe branch-protection
+  detection (the D6 crux).** GitHub gives a write-role bot no branch-scoped push/merge
+  flag (the admin-gated `/branches/{b}/protection` 403s it, so the driver never calls
+  it); the only reader-gated signal is the newer **rulesets** endpoint
+  (`ListRulesForBranch`, `Metadata:read`), which is invisible on a repo protected the
+  *classic* way. `DefaultBranchProtection` never fabricates `WriteRoleCanPush/Merge =
+  true` on a branch it knows is protected: unprotected → both `true` (honest worst
+  case); protected + a readable enforced ruleset → both `false`, authoritative;
+  protected + no readable ruleset (legacy protection) → both `false` **and**
+  `ProtectionUnverified = true`, so "undetermined" is never read as a verified "safe".
+  **Whether the rulesets endpoint reflects the calling bot's own bypass ability could
+  not be verified live** (no GitHub credentials in the implementation environment) — the
+  disposition above is fail-safe under either answer, and the open question is recorded,
+  not asserted resolved. The five fakes zero-value the new field to `false` (safe
+  default); `privcheck`'s shared `evaluateRepo` gained one warning branch
+  (`Protected && ProtectionUnverified`) because its existing channels could not express
+  "report Protected:true truthfully AND flag the degradation" otherwise. **PRD #66 must
+  fail-closed on `ProtectionUnverified`**; until it does, a legacy-protected GitHub
+  repo's `main` is held only by guardrail layers 2–4, not by #66's detection.
+- **Actions two-field status fold, narrower than the raw enum (D8).** GitHub reports
+  `status` (in-flight) then `conclusion` (terminal) sequentially, not in parallel; the
+  driver collapses them into uzi's single verbatim status string.
+  `pipelinestatus.IsFailed` (the CI-**fix** trigger) adds `failure`/`timed_out`/
+  `startup_failure` but deliberately excludes `cancelled` (human-cancelled) and
+  `action_required` (a human must approve a gate) — the fix trigger answers "should uzi
+  spend a run fixing this," a narrower question than the badge's "is this red."
+  `pipelineBadge.PIPELINE_TONES` adds the broader set (`queued`/`in_progress`/
+  `requested`→running, `action_required`→its own `attention` tone, `stale`/`neutral`).
+  The one genuine cross-forge string collision — GitHub's run-level `waiting`
+  (deployment-gate approval, i.e. attention) vs. Forgejo's `waiting` (in-flight, i.e.
+  running) — is resolved by keeping the shared map's `waiting → running`: the tone is a
+  nuance either way, so no run is mis-triggered by the collision.
+- **Worker seam: `GitHubClient` in `agent/src/forge.ts`, and a driver-declared duplicate-PR
+  status set (D9).** GitHub signals "PR already exists" with **422**, not GitLab/Forgejo's
+  409, so the shared `HttpForgeClient` base's duplicate-detection widened to a
+  per-driver-declared set (`{409}` for GitLab/Forgejo, `{409, 422}` for GitHub) rather
+  than a blanket widen — a blanket 409‖422 would have wrongly routed an unrelated
+  GitLab/Forgejo 422 into find-existing. The three shared transport guards (non-https
+  refusal, `redirect:"error"`, duplicate→find-existing-with-fallthrough) are unchanged,
+  interface-level invariants a new driver inherits for free.
+- **A new Go-side transport surface neither existing driver has: the Actions job-log
+  redirect.** `Actions.GetWorkflowJobLogs` returns a redirect to a short-lived,
+  unauthenticated blob host on a different domain from `api.github.com`; the driver's
+  own fetch of it attaches no `Authorization` header, refuses to follow any further
+  redirect, and never logs the raw redirect URL (it carries its own short-lived token in
+  the query string) — closing an SSRF + PAT-leak surface a hostile forge could otherwise
+  use.
+- **Still no registry (D12).** Three drivers behind `forge.New`'s hand-written `switch`
+  remains legible; a registry would add indirection for no behavioural gain and would
+  make the "every forge is exactly these N seams" audit harder, not easier.

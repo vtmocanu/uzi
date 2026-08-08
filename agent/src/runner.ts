@@ -35,7 +35,7 @@ import {
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
-import { GitLabClient, ForgejoClient, type ForgeClient } from "./forge.js";
+import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
@@ -164,6 +164,8 @@ export interface RunnerOptions {
   gitlab?: ForgeClient;
   /** Injected for tests; default opens real Forgejo PRs (PRD #65 D9). */
   forgejo?: ForgeClient;
+  /** Injected for tests; default opens real GitHub PRs (PRD #238 D9). */
+  github?: ForgeClient;
   /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
    *  A seam so a test can drive the detection-failure path deterministically. */
   detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
@@ -194,6 +196,7 @@ export class RunRunner {
   private readonly questionTimeoutMs: number;
   private readonly gitlab: ForgeClient;
   private readonly forgejo: ForgeClient;
+  private readonly github: ForgeClient;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -262,6 +265,7 @@ export class RunRunner {
     this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.forgejo = opts.forgejo ?? new ForgejoClient();
+    this.github = opts.github ?? new GitHubClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
   }
@@ -956,14 +960,18 @@ export class RunRunner {
         (await this.git.defaultBranchName(barePath)) ||
         "main";
       // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
-      // the worker opens an MR on GitLab and a PR on Forgejo from the same code path;
-      // each client derives its own API base + project from repo.url (D9). createMergeRequest
-      // is idempotent: for a ci_fix on an existing agent branch it returns the EXISTING
-      // MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N or agent/issue-N
-      // branch it opens one. Reporting its iid keeps the fix branch watched so the
-      // verification sync can stamp the verdict.
+      // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
+      // path; each client derives its own API base + project from repo.url (D9).
+      // createMergeRequest is idempotent: for a ci_fix on an existing agent branch it
+      // returns the EXISTING MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N
+      // or agent/issue-N branch it opens one. Reporting its iid keeps the fix branch
+      // watched so the verification sync can stamp the verdict.
       const forge =
-        claim.repo.forge_type === "forgejo" ? this.forgejo : this.gitlab;
+        claim.repo.forge_type === "forgejo"
+          ? this.forgejo
+          : claim.repo.forge_type === "github"
+            ? this.github
+            : this.gitlab;
       const mr = await forge.createMergeRequest({
         repoUrl: claim.repo.url,
         pat: claim.secrets.forge_pat,

@@ -315,10 +315,11 @@ export interface ClaimRepo {
    *  embedded in the URL (so it can't rest in the bare repo's on-disk config). */
   clone_url: string;
   default_branch?: string | null;
-  /** Which forge this repo's connection speaks (PRD #65 D9). Additive and OPTIONAL:
-   *  absent ⇒ "gitlab", so an old api (which never sends it) still drives a GitLab
-   *  run on a new worker (R8). The worker selects its forge client from this. */
-  forge_type?: "gitlab" | "forgejo";
+  /** Which forge this repo's connection speaks (PRD #65 D9; GitHub added by #238).
+   *  Additive and OPTIONAL: absent ⇒ "gitlab", so an old api (which never sends it)
+   *  still drives a GitLab run on a new worker (R8). The worker selects its forge
+   *  client from this. */
+  forge_type?: "gitlab" | "forgejo" | "github";
   /** Repo owner's opt-in (PRD #16): load skills from the repo's own
    *  .claude/skills at run time. Default false. When true the worker enumerates
    *  repo skills after checkout, applies the caps, and ranks them below every
