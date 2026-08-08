@@ -18870,3 +18870,48 @@ inheritance is forced, not just convenient.
   unchanged from §453), no `total` field, no per-PRD breakdown, and no e2e/compose coverage
   of the stamped values — like `commits`, the counts appear only on a tag pipeline, so the
   §450 post-merge observation point is the only place a stamping regression is visible.
+
+## 494. PRD #251 — worker uptime rides an API-OWNED `online_since` anchor: non-spoofable because the worker never sends it, control-plane-visible session time (not OS uptime), display-only
+
+`workers.online_since timestamptz` (nullable) is the timestamp at which a worker most
+recently *became* online. Uptime is `now − online_since`, derived client-side and shown
+only while the worker is online — literally "how long has the `online` pill been green".
+This serves PRD #251's operator ask: distinguish a worker that just reconnected from one
+that has held its slot for days.
+
+- **API-owned anchor, stamped from the control plane's own clock — the reason it cannot
+  be spoofed.** It is written only by the two liveness writes that already `SET
+  status='online'` (`RegisterWorker`, `HeartbeatWorker`) and never sent by the worker,
+  so unlike self-reported `version`/`template_reported` there is no untrusted input to
+  sanitize or clamp. No new endpoint, no worker-protocol field, no new trust boundary —
+  one column on the existing writes.
+- **Semantics: continuous-online duration as observed by the control plane, via a
+  preserve-or-stamp CASE.** Both liveness writes set `online_since = CASE WHEN
+  workers.status='online' AND workers.online_since IS NOT NULL THEN workers.online_since
+  ELSE now() END` — a steady stream of heartbeats never moves the anchor, while the first
+  register/heartbeat after an offline period (or for a brand-new worker) stamps a fresh
+  `now()`. `MarkStaleWorkersOffline` additionally `SET online_since = NULL` alongside
+  `status='offline'`, so an offline worker carries no uptime and the next online
+  transition starts a fresh session.
+- **Consequence, chosen on purpose: an observed offline gap RESETS uptime.** If the
+  sweeper marks a worker offline during a network blip and a later heartbeat brings it
+  back, uptime restarts from zero — because the control plane observed a gap, and this
+  metric is defined as continuous-online-*as-seen-by-uzi*, which keeps it consistent with
+  the `online` pill (the pill also flipped). This is control-plane-visible session time,
+  NOT OS process uptime (option B — a worker-reported process clock — was rejected as
+  untrusted and able to disagree with the pill). A process that restarts fast enough to
+  re-register while still `online` keeps its anchor; accepted and left un-special-cased
+  rather than chasing process-restart detection (option B's cost, out of scope).
+- **Derived client-side, shown only while online.** No stored duration: web
+  `formatUptimeSince` (an ISO instant + injectable `nowMs` → `2d 4h`/`1h 23m`/`44m`/`<1m`)
+  and the CLI `uptimeCell` (`api/cmd/uzi/worker.go`, its own Go-side formatter since the TS
+  helper does not carry over) both compute `now − online_since` at render time. Gated on
+  `status==='online' && online_since`; an offline or anchorless worker renders no uptime
+  token (web) / `-` (CLI). The existing 10s fleet poll re-renders it, so it advances with
+  no dedicated timer.
+- **Display-only, and pinned as such.** The value is written by the liveness path and read
+  only by the worker DTOs (`OnlineSince *time.Time json:"online_since"` on
+  `apitypes.Worker`, mapped in both DTO builders in `handler/workers.go`) — no claim,
+  scheduling, or sweeper query reads `online_since`. This is the same contract PRD #49's
+  `stats_*` columns hold, and it is enforced by a store guard test that statically scans
+  the query set so a future scheduler edit cannot quietly start depending on it.

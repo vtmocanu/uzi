@@ -54,7 +54,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since
 `
 
 type CreateHostedWorkerParams struct {
@@ -116,6 +116,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
 		&i.AnthropicBindMode,
+		&i.OnlineSince,
 	)
 	return i, err
 }

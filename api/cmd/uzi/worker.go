@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -69,7 +71,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					version = "-"
 				}
 				rows = append(rows, []string{
-					w.ID, cellText(w.Name), w.Status, version, upgradeCell(w), bindModeCell(w),
+					w.ID, cellText(w.Name), w.Status, uptimeCell(w), version, upgradeCell(w), bindModeCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
@@ -83,7 +85,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// gained a WRITE (`worker set-token --auto`) with no human-readable READ, so
 			// the only way to confirm what a worker was set to was `--json`. A three-way
 			// user choice you can set and cannot see is worse than one you cannot set.
-			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE", "TOKEN"}, rows)
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN"}, rows)
 		},
 	}
 
@@ -193,6 +195,47 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(list, rm, setToken)
 	return cmd
+}
+
+// uptimeCell renders a worker's continuous-online duration for `uzi worker list`'s
+// UPTIME column (PRD #251) — "how long has the online pill been green".
+//
+// "-" when the worker is not online or carries no anchor, mirroring upgradeCell's
+// empty→"-" convention: an offline worker is not "up", and a worker whose
+// online_since is nil (never stamped, or cleared by the sweeper) has no session to
+// count from. The value is control-plane-owned (Decision 1), so it needs no scrub —
+// unlike the version/name cells beside it, it is never worker self-reported.
+func uptimeCell(w apitypes.WorkerDTO) string {
+	if w.Status != "online" || w.OnlineSince == nil {
+		return "-"
+	}
+	return formatUptimeDuration(time.Since(*w.OnlineSince))
+}
+
+// formatUptimeDuration renders a duration as "2d 4h" / "1h 23m" / "44m" / "<1m",
+// the same buckets as the web's formatUptimeSince and rateLimits.formatCountdown
+// (Decision 4), so uptime reads in the same vocabulary as the reset countdowns. It
+// is the pure half of uptimeCell, split out so the buckets unit-test without a clock
+// — uptimeCell itself calls it with time.Since. A zero or negative duration (clock
+// skew) floors at "<1m".
+func formatUptimeDuration(d time.Duration) string {
+	total := int(d.Seconds())
+	if total <= 0 {
+		return "<1m"
+	}
+	days := total / 86_400
+	hours := (total % 86_400) / 3_600
+	mins := (total % 3_600) / 60
+	switch {
+	case days >= 1:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case hours >= 1:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	case mins >= 1:
+		return fmt.Sprintf("%dm", mins)
+	default:
+		return "<1m"
+	}
 }
 
 // upgradeCell renders a worker's upgrade status for the table (PRD #113 M5).

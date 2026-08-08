@@ -131,6 +131,46 @@ describe("WorkersSettings — the reported version carries no format characters 
   });
 });
 
+// PRD #251: uptime = now − online_since, rendered as "· up <duration>" ONLY while
+// the worker is online. Paired positive/negative per the copy-change rule in
+// .claude/rules/web.md: the negative ("no token when offline") is only meaningful
+// alongside the positive that proves the token renders at all. The uptime span is
+// the only metadata token that reads "· up …", so /· up / matches it uniquely (the
+// version and last-seen spans read "· v…" / "· last seen …").
+describe("WorkersSettings worker uptime (PRD #251)", () => {
+  it("shows an 'up' uptime token for an ONLINE worker with online_since", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          id: "w-up",
+          name: "uptimer",
+          status: "online",
+          online_since: new Date(Date.now() - 90 * 60 * 1000).toISOString(), // ~1h 30m ago
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("uptimer");
+    expect(screen.getByText(/· up \d/)).toBeTruthy();
+  });
+
+  it("shows NO uptime token for an OFFLINE worker (online_since null)", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          id: "w-down",
+          name: "downed",
+          status: "offline",
+          online_since: null,
+        }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("downed");
+    expect(screen.queryByText(/· up \d/)).toBeNull();
+  });
+});
+
 describe("WorkersSettings resource gauges (PRD #49)", () => {
   it("renders per-worker CPU + memory gauges, a no-limit absolute readout, and the process-source label", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: fleet });

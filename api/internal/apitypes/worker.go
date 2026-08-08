@@ -38,7 +38,10 @@ type WorkerDTO struct {
 	TemplateReported *string    `json:"template_reported"`
 	Version          *string    `json:"version"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
-	CreatedAt        time.Time  `json:"created_at"`
+	// OnlineSince is the api-owned anchor of when the worker became online (PRD #251);
+	// null when offline or never online. Uptime is derived client-side as now − online_since.
+	OnlineSince *time.Time `json:"online_since"`
+	CreatedAt   time.Time  `json:"created_at"`
 	// Derived upgrade health (PRD #113): "up_to_date" | "outdated" | "unknown" |
 	// "upgrading" | "upgrade_failed". Computed at read time from Version against the
 	// control plane's release — never stored, so it cannot go stale against the row

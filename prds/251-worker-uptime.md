@@ -1,7 +1,10 @@
 # PRD #251: Worker uptime — show how long each worker has been online
 
 **GitLab Issue**: [#251](https://gitlab.example.com/vtmocanu/uzi/-/issues/251)
-**Status**: Draft (created 2026-08-08)
+**Status**: Implemented (M1–M3 landed 2026-08-08 on `agent/issue-251`) — two boxes left open:
+M1 `task gate:api` (green except the lint ratchet's pre-existing findings in untouched files,
+an in-worktree stale-`origin/main` artifact that resolves on CI) and M2's manual both-themes
+browser pass. Not moved to `prds/done/` until those close.
 **Priority**: Low
 **Mock**: `prds/mockups/251-worker-uptime-mock.html` (Settings → Workers with the uptime token added; shown to owner 2026-08-08)
 
@@ -139,55 +142,64 @@ no new colour.
 ## Milestones
 
 ### M1 — API: `online_since` column, liveness stamping, DTO (`api`)
-- [ ] Migration: add `online_since timestamptz` (nullable) to `workers`. Number assigned
-  at merge time per the goose convention (next free above the live head). **No backfill
+- [x] Migration: add `online_since timestamptz` (nullable) to `workers`. Landed as
+  `00100_worker_online_since.sql` (next free above head `00099`). **No backfill
   needed**: the `CASE` below stamps any already-online worker with a NULL anchor on its next
   register/heartbeat, so the column self-heals within one heartbeat (≤15s) rather than
   reading blank for the current fleet.
-- [ ] `RegisterWorker` and `HeartbeatWorker` (`api/internal/store/queries/runtime.sql`):
+- [x] `RegisterWorker` and `HeartbeatWorker` (`api/internal/store/queries/runtime.sql`):
   set `online_since` via the preserve-or-stamp `CASE` (Decision 2). `MarkStaleWorkersOffline`:
-  also `SET online_since = NULL`. Regenerate with `sqlc generate` (no-op-clean in CI).
-- [ ] `apitypes.Worker`: add `OnlineSince *time.Time json:"online_since"`. Map it in **both**
-  DTO builders in `handler/workers.go` (~202, ~246) via the existing `timePtr(...)` helper.
-- [ ] **Live-DB test** (`*LiveDB`, run via `./e2e/run-store-it.sh`): a fresh worker gets an
+  also `SET online_since = NULL`. Regenerated with pinned `sqlc v1.30.0` (idempotent — a
+  second `generate` produced no further diff).
+- [x] `apitypes.Worker`: add `OnlineSince *time.Time json:"online_since"`. Mapped in **both**
+  DTO builders in `handler/workers.go` via the existing `timePtr(...)` helper; the
+  `apitypes` wire-contract test (`wire_test.go`) gained the `online_since` tag.
+- [x] **Live-DB test** (`*LiveDB`, run via `./e2e/run-store-it.sh`): a fresh worker gets an
   anchor on first heartbeat; repeated heartbeats **preserve** it; `MarkStaleWorkersOffline`
-  **clears** it; a heartbeat after going offline **re-stamps** a later anchor. This is a new
-  query behaviour, so per `.claude/rules/go.md` it is not verified until a live-DB test has
-  executed it (sqlc-green ≠ runs).
-- [ ] Regression test: no claim/scheduling/sweeper query references `online_since` (mirrors
+  **clears** it; a heartbeat after going offline **re-stamps** a later anchor.
+  `TestWorkerOnlineSinceLifecycleLiveDB` — `--- PASS` (RUN=1, 0 SKIP) against the throwaway
+  Postgres.
+- [x] Regression test: no claim/scheduling/sweeper query references `online_since` (mirrors
   PRD #49's stats_ display-only guard) — the field is liveness-write / DTO-read only.
+  `TestOnlineSinceIsWriteOnlyAndNeverScheduled` (static scan over `queries/*.sql`).
 - [ ] `task gate:api` green (fmt + vet + build + lint + deadcode + test, `-race`).
+  fmt-check / vet / build / deadcode / test(-race) all PASS. The lint slot is red ONLY on
+  23 pre-existing findings in files M1 never touched, exposed because this worktree's
+  `origin/main` mirror sits behind the branch base (`whole-files` then lights up
+  already-merged files); the full unfiltered backlog is 56 and **none** of it is in any file
+  M1 changed. Left unticked until the lint base resolves against a current `origin/main`.
 
 ### M2 — Web: render uptime (`web`)
-- [ ] `Worker` type (`web/src/lib/api.ts`): add `online_since?: string | null`.
-- [ ] New pure helper `formatUptimeSince` in `web/src/lib` (Decision 4 — named to avoid the
+- [x] `Worker` type (`web/src/lib/api.ts`): add `online_since?: string | null`.
+- [x] New pure helper `formatUptimeSince` in `web/src/lib` (Decision 4 — named to avoid the
   `BuildInfoPopover.formatUptime` collision): takes an ISO instant + injectable `nowMs`,
-  renders `2d 4h` / `1h 23m` / `44m` / `<1m`, invalid → `""`. Unit-tested.
-- [ ] `WorkersSettings.tsx`: render `· up {formatUptimeSince(w.online_since)}` in the
+  renders `2d 4h` / `1h 23m` / `44m` / `<1m`, invalid → `""`. Unit-tested (`formatUptimeSince.test.ts`).
+  A future/clock-skewed anchor floors at `<1m` (not `""`) to match the Go twin and avoid a
+  dangling `· up ` label — reviewer/auditor finding; `""` now means only an unparseable instant.
+- [x] `WorkersSettings.tsx`: render `· up {formatUptimeSince(w.online_since)}` in the
   metadata line (between version and "last seen"), gated on `w.status === "online" &&
   w.online_since` (Decision 3/5).
-- [ ] `RunsList.tsx` admin fleet list: the same token on the admin worker rows.
-- [ ] Mock fixtures (`web/src/mocks/data.ts`): add `online_since` to each `mockWorkers` and
-  `mockAdminWorkers` entry — a value for online rows (varied uptimes), `null` for offline —
-  so the demo/mock build shows it.
-- [ ] Tests: `WorkersSettings.test.tsx` asserts the uptime token for an online worker and its
+- [x] `RunsList.tsx` admin fleet list: the same token on the admin worker rows.
+- [x] Mock fixtures (`web/src/mocks/data.ts`): `online_since` on every `mockWorkers` and
+  `mockAdminWorkers` entry — varied ISO values for online rows, `null` for offline.
+- [x] Tests: `WorkersSettings.test.tsx` asserts the uptime token for an online worker and its
   **absence** for an offline one (paired positive/negative per the copy-change rule in
-  `.claude/rules/web.md`). `task gate:web` green.
+  `.claude/rules/web.md`). `task gate:web` green (1711 tests pass).
 - [ ] Manual: `VITE_UZI_MOCK=1 npm run dev` — uptime visible on online rows, hidden on the
-  offline row, in both `ember` and `mission` themes.
+  offline row, in both `ember` and `mission` themes. Not run in this run (no live browser
+  pass); rendering is covered by the vitest online/offline pair + mock fixtures, but the
+  both-themes eyeball check was not performed — left unchecked deliberately.
 
 ### M3 — CLI, specs, docs
-- [ ] `api/cmd/uzi/worker.go`: add a `UPTIME` column to the `uzi workers` table (header +
-  cell), `-` when offline/anchorless (mirror `upgradeCell`'s empty→`-` convention). This
-  needs a **Go-side** duration formatter (`now − online_since` → human string) net-new in
-  `api/cmd/uzi` — the web `formatUptimeSince` is TypeScript and does not carry over. Update
-  `worker_test.go`. **CLI check satisfied**: this IS the CLI change the "new functionality ⇒
-  check `api/cmd/uzi/`" convention requires.
-- [ ] `specs/ai.md`: record `online_since` as an AI design decision (api-owned anchor,
-  continuous-online semantics, display-only).
-- [ ] Docs: update the workers page only if it enumerates the row's fields; `check-docs`
-  stays green. `ARCHITECTURE.md` worker-liveness note if warranted (link this PRD, don't
-  duplicate).
+- [x] `api/cmd/uzi/worker.go`: `UPTIME` column on `uzi worker list` (header + cell), `-` when
+  offline/anchorless. Go-side formatter `formatUptimeDuration(d)` (buckets match the web helper
+  and `formatCountdown`), called by `uptimeCell(w)`; `worker_test.go` covers all buckets plus the
+  `-` cases, and `commands_test.go`'s positional row assertion was updated for the new column.
+- [x] `specs/ai.md`: recorded `online_since` as an AI design decision (§494 — api-owned anchor,
+  continuous-online semantics, observed-gap reset, display-only).
+- [x] Docs: no `docs/` page enumerates the `uzi worker list` column set (only TOKEN/UPGRADE have
+  dedicated subsections), so none needed the column; `check-docs` stays green (part of `gate:web`).
+  No `ARCHITECTURE.md` note warranted — the PRD + `specs/ai.md` §494 carry the design.
 
 ## Success Criteria
 
