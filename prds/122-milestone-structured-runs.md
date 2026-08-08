@@ -431,14 +431,57 @@ hook, so it can never reach a signal tool.
       commit count, which is a trivial rider on M6 once the completed set rides the
       claim (Decision 11) — folded into M6, not a milestone of its own.
 
-**Phase 3 — deferred, gated on evidence.**
+**Phase 3 — brokered origin publish (landed 2026-08-08; live recovery pending deploy).**
 
-- [ ] **M8 — Origin push at checkpoints (DEFERRED)**: push the branch to origin
-      at each checkpoint so work survives a **different** worker re-claiming the
-      run. Blocked on: (a) the `requeue_count` measurement in Risks showing this
-      actually happens, (b) an explicit security review of Decision 8, (c) a
-      decision on CI-trigger suppression (`-o ci.skip`) so N checkpoints do not
-      fire N pipelines. **Not** to be started with M6.
+- [x] **M8 — Origin push at checkpoints (brokered)**: at each reaped
+      model-cooperative checkpoint, publish the run's committed work to origin so
+      it survives a **different** worker re-claiming the run — the gap M6's
+      PVC-local fetch-back cannot close (its tracking ref lives on one worker's
+      PVC). Originally deferred pending (a) a `requeue_count` measurement, (b) a
+      security review of Decision 8, and (c) a CI-trigger-suppression decision;
+      this run built it under an approved plan that settled (b) and (c) by design:
+      the push is **brokered through the api** (the sole PAT holder) so no
+      credential ever reaches an agent-uid git child — the spatial closure that
+      makes Decision 8's mid-turn-push concern moot — and it targets
+      **`refs/uzi-checkpoints/<branch>`**, a custom ref **no workflow watches**, so
+      CI fires on no forge (superseding the `-o ci.skip` idea in (c)). (a) remains
+      a product signal, not a build blocker.
+      - *2026-08-08 — implementation landed.* Agent side (Phase A/C):
+        `checkpointPack` streams a credential-free delta pack
+        (`origin/<branch>..refs/uzi-runner/<branch>`, or `default..` when the
+        branch was never pushed) via a worker-uid `pack-objects` spawn;
+        `client.publishCheckpoint` POSTs it as `application/octet-stream` with an
+        `X-Uzi-Checkpoint-Tip` header; the runner fires it best-effort AFTER the
+        reap + #218 fetch-back and ONLY on the reaped checkpoint (`reap:true`,
+        Decision 10b as amended — never the iteration-boundary fallback), so a
+        publish failure never fails the run. The reseed (`runnerCloneForBranch`)
+        gains `refs/uzi-checkpoints/<branch>` as a THIRD, cross-worker seed
+        candidate (`seededFrom:"checkpoint"`), preferred only when it STRICTLY
+        descends the floor; origin wins loudly on divergence. Api side (Phase B):
+        a new pure-Go `pushbroker` (go-git — the api image stays distroless-static,
+        no git binary) fetches only the needed base refs, applies the received
+        pack, verifies the declared tip STRICTLY descends origin's tip, and pushes
+        `refs/uzi-checkpoints/<branch>` **never forced**. `workersvc.Publish`
+        derives repo/branch/PAT ENTIRELY from `(runID, worker)` — the worker names
+        only the run id + tip + pack; the branch is re-derived server-side as
+        `agent/issue-<iid>` (gated to `kind==="issue"`), not taken from the worker
+        — with the `FORGE_ALLOWED_BASE_URLS` SSRF gate on both the base and the
+        dialed clone host, and a pack-inflation budget (per-object, cumulative, and
+        per-delta reconstructed-target-size caps) that rejects a decompression-bomb
+        pack before it reaches the storer.
+      - *Decision 8's security review (an M8 blocker) is satisfied by the brokered
+        design, not waived:* because the api holds the PAT and the worker ships only
+        credential-free bytes, the "N reap→push windows" exposure the review was to
+        weigh never arises on the worker — no PAT-bearing git child runs under the
+        agent-reachable uid at all.
+      - *Live-verification bound (NOT provable in this run):* the cross-worker
+        recovery outcome (kill a worker mid-run, a DIFFERENT worker re-claims, the
+        checkpointed commits are present) and the go-git fetch-apply-push against a
+        real forge (`gitlab.example.com`) are MANUAL/e2e steps confirmable only
+        after this image ships to dev-cluster. Proven here is the unit + local-bare
+        integration behavior: server-derived authorization, never-forced push,
+        strict-descendant rejection, reap-gated best-effort publish, the
+        decompression-bomb budget guard, and the cross-worker reseed candidate.
 
 ## Success Criteria
 
