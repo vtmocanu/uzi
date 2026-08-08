@@ -26,7 +26,7 @@ type RunDTO struct {
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.
 	RepoID *string `json:"repo_id"`
-	// ForgeType is the run's forge ("gitlab"|"forgejo"), so the web picks the
+	// ForgeType is the run's forge ("gitlab"|"forgejo"|"github"), so the web picks the
 	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
 	// DTO paths, which never render the MR affordance in a browser; set on the
 	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.

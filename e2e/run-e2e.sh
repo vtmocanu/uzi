@@ -1110,25 +1110,26 @@ fi
 # against the same fake's /api/v3 table, run INSTEAD of the GitLab suite. Skipped
 # entirely when FORGE=gitlab, so the GitLab lane below is byte-identical.
 #
-# Connection mechanism (same shape as the Forgejo M9 lane): there is NO shipped
-# path to a github connection before M10 — CreateConnection refuses non-gitlab and
-# the boot seed hardcodes gitlab, both DELIBERATE (dark-landing). So the harness
-# flips the boot-seeded connection's forge_type to 'github' directly in the
-# THROWAWAY test DB: migration 00102's CHECK admits it, the sealed PAT is
-# forge-agnostic (a classic-PAT shape — no github_pat_ prefix), and the base_url is
-# unchanged. go-github mounts an enterprise base under /api/v3, so the driver hits
-# forge-fake's /api/v3 table via the SSRF-allowlisted https://forge-fake.e2e. This
-# is test state only — no api/seed change — so the M10 dark-landing stays intact.
+# Connection mechanism (same shape as the Forgejo lane): the harness flips the
+# boot-seeded connection's forge_type to 'github' directly in the THROWAWAY test DB
+# rather than creating a github connection through the product. This is a NETWORK-
+# ALIASING workaround, not a gate one: post-M10 CreateConnection accepts github, but
+# the driver derives its API host as api.<web-host>, which for the fake would be
+# api.forge-fake.e2e — a name the e2e overlay does not alias — whereas the seeded
+# base_url (https://forge-fake.e2e) plus go-github's /api/v3 enterprise mount lands
+# the driver on the fake's shared table directly. migration 00102's CHECK admits
+# 'github', the sealed PAT is forge-agnostic (a classic-PAT shape — no github_pat_
+# prefix), and the base_url is unchanged. Test state only — no api/seed change.
 #
 # SCOPE (deliberate): this lane exercises the api-side GitHub DRIVER end to end
 # (github.go / github_pipelines.go) — VerifyToken + TokenInfo (X-OAuth-Scopes),
 # ProjectRole + branch-protection rulesets (D6), issue create + R4 PR filter, the
 # Actions two-field status/conclusion collapse (D8), and the CI-fix trigger gate.
-# It does NOT drive a worker run: the worker's GitHubClient (agent/src/forge.ts) is
-# not yet wired into runner.ts (its client select is a forgejo?:gitlab ternary with
-# no github arm) and the worker's api.github.com host derivation has no network
-# alias here — so the worker PR path is validated at the FAKE (direct /api/v3
-# /pulls create+dup smoke) rather than through a live claim. See the run report.
+# It does NOT drive a worker run: the worker's GitHubClient (agent/src/forge.ts) IS
+# wired into runner.ts (the 3-way forge pick), but its api.github.com host derivation
+# has no network alias here — so the worker PR path is validated at the FAKE (direct
+# /api/v3 /pulls create+dup smoke) and by the runner-push-mr unit test, rather than
+# through a live claim in this lane. See the run report.
 # =============================================================================
 if [ "$FORGE" = github ]; then
   say "PRD #238 M8 (GitHub lane): flip the seeded connection to github in the test DB"

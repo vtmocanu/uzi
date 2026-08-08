@@ -47,7 +47,7 @@ type cardDTO struct {
 	State  string   `json:"state"`
 	Labels []string `json:"labels"`
 	WebURL string   `json:"web_url"`
-	// ForgeType is the card's forge ("gitlab"|"forgejo"), so the web picks the
+	// ForgeType is the card's forge ("gitlab"|"forgejo"|"github"), so the web picks the
 	// per-card MR/PR noun (PRD #65 D2). Every card on one board shares the repo's
 	// connection, but a cross-repo view (dashboard) mixes forges, so it rides the
 	// card. Threaded from the repo's connection, not a query change.
@@ -183,7 +183,7 @@ type boardDTO struct {
 	RepoID string `json:"repo_id"`
 	Path   string `json:"path_with_namespace"`
 	WebURL string `json:"web_url"`
-	// ForgeType is the board's forge ("gitlab"|"forgejo"), so board-level chrome
+	// ForgeType is the board's forge ("gitlab"|"forgejo"|"github"), so board-level chrome
 	// (the "columns are <forge> labels" hint, the create-issue "opened on <forge>"
 	// note) names the right platform (PRD #65 D2). A board is one repo/connection, so
 	// this is a single value; per-card forge rides each card. From repo.ForgeType.

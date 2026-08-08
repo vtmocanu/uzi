@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #238, milestones M1–M9 landed; M10 go-live pending)
 **Date**: 2026-08-08
 **Deciders**: Vlad + agent team (architect, coders, review waves — architect, fact-checker, reviewer, auditor)
-**PRD**: [prds/238-github-forge-support.md](../prds/238-github-forge-support.md) (GitLab issue [vtmocanu/uzi#238](https://gitlab.example.com/vtmocanu/uzi/-/issues/238)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale, for a reader rebuilding from specs who should not have to reread it.
+**PRD**: [prds/done/238-github-forge-support.md](../prds/done/238-github-forge-support.md) (GitLab issue [vtmocanu/uzi#238](https://gitlab.example.com/vtmocanu/uzi/-/issues/238)) — the PRD carries the milestones, the full evidence base, and the decision log; this ADR carries the durable design shape and its rationale, for a reader rebuilding from specs who should not have to reread it.
 
 ## Decision (summary)
 
