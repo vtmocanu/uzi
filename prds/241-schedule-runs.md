@@ -1,7 +1,7 @@
 # PRD #241: Scheduled runs (one-time + recurring; pinned issue, label sweep, or ad-hoc prompt) from web + CLI
 
 **GitLab Issue**: [#241](https://gitlab.example.com/vtmocanu/uzi/-/issues/241)
-**Status**: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. **Owner resolved both open decisions 2026-08-08: auto-approve defaults ON (Decision 4); the prompt target is NOT admin-gated (Decision 10).** See the Decision Log.)
+**Status**: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. **Owner resolved both open decisions 2026-08-08: auto-approve defaults ON (Decision 4); the prompt target is NOT admin-gated (Decision 10).** See the Decision Log. **Code citations re-verified against HEAD 2026-08-08**: every symbol, signature and mechanism intact; stale line numbers in `service.go` and `runner.ts` refreshed, the `HasActiveRunForIssue`-is-a-seam-method slip corrected, and the draft migration bumped off the `00100` collision to `00103`.)
 **Priority**: Medium
 **Mock**: `prds/mockups/241-schedule-runs-mock.html` (approved 2026-08-07)
 
@@ -126,22 +126,23 @@ The scheduler loop mirrors `selfimprove.Engine.Run` (`api/internal/selfimprove/e
 a `time.Ticker` wake cadence, and on each tick a claim of rows where
 `enabled AND status='active' AND next_fire_at <= now()`, firing each then advancing
 `next_fire_at`. Like **every** existing background actor here (poller, sweeper, selfimprove,
-privcheck, usage — all wired single-instance in `cmd/server/main.go:465-535`), the scheduler
+privcheck, usage — all wired single-instance in `cmd/server/main.go:~400-545`), the scheduler
 runs **single-instance**, not behind leader election. `FOR UPDATE SKIP LOCKED` on the claim
 is defense-in-depth (and lets AdvanceSchedule be a separate statement with
 retry-without-advance on a transient error, mirroring selfimprove's `skip` path at
 `engine.go:274-297`); it is **not** what makes the design multi-replica-safe. The real
 backstop against a *duplicate run* — should two ticks or two replicas ever race — is the
-seam's **one-active-run-per-issue unique index** (`ErrActiveRunExists`, `service.go:3158`)
-plus `HasActiveRunForIssue`, not the row lock. Genuine multi-replica scheduling would need a
+seam's **one-active-run-per-issue unique index** (`uq_runs_one_active_per_issue`, surfaced as
+`ErrActiveRunExists` at `service.go:3329`) plus the caller-side `HasActiveRunForIssue` pre-check
+(a store query the scheduler runs per issue, not a seam method), not the row lock. Genuine multi-replica scheduling would need a
 lease column (`claimed_by`/`claimed_until`), machinery that exists nowhere else in this
 codebase; out of scope unless the owner requires it.
 
 ### Decision 2 — Fire through the shared run-creation seam, replicating the poller's caller-side scaffolding (recommended)
 
 The scheduler must **not** re-implement run creation. It calls the same
-`*workersvc.Service` methods autopilot calls (`api/internal/workersvc/service.go:2952`,
-`:2975`): `CreateAutopilotRun(ctx, userID, repoID, issueIID, description, allowWithoutPRD)`
+`*workersvc.Service` methods autopilot calls (`api/internal/workersvc/service.go:3145`,
+`:3122`): `CreateAutopilotRun(ctx, userID, repoID, issueIID, description, allowWithoutPRD)`
 when the schedule is auto-approve, and
 `CreateRun(ctx, userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit, nil)`
 when it is not.
@@ -158,14 +159,15 @@ calls the seam (`poller/autopilot.go:198-210`). Per pinned/swept issue the sched
    the selfimprove engine already does (`selfimprove/engine.go:83-85`).
 3. `f.GetIssue(...)` for the fresh title/body/labels.
 4. Compute `allowWithoutPRD` from settings + the fresh labels (PRDLESS bypass, PRD #22
-   Decision 3), as the handler does at `handler/workers.go:756-779`.
+   Decision 3), as the handler does at `handler/workers.go:790`.
 5. Call the seam.
 
 What the seam then **genuinely inherits** (the real reuse): the PRD-label gate (read from
 the *cache*), the PRD-link gate (via the `allowWithoutPRD` bool), the
-**one-active-run-per-issue unique index** and `HasActiveRunForIssue` dedup — so a schedule
+**one-active-run-per-issue unique index** (the seam's own dedup, `ErrActiveRunExists`) — so a schedule
 never double-starts an issue with a live run (critical for sweeps and for a recurring
-schedule whose previous run is still going) — the description cap, the
+schedule whose previous run is still going); note `HasActiveRunForIssue` itself is a caller-side
+pre-check the scheduler runs per issue, not something the seam inherits — the description cap, the
 `auto_approve`/`wait_on_limit` stamping, and the queued→in-progress notify. That is the
 architectural move autopilot's `RunStarter` interface documents: "keeping run creation on the
 workersvc side is what makes an autopilot run and a manual run share one state machine and one
@@ -244,7 +246,7 @@ Two corrections the review forced (the first draft got both wrong):
   path (`poller/autopilot.go:340-352`): it infers consent from the label-adder/author
   matching the repo owner's `human_username`, which is meaningless for a schedule. A
   schedule's consent is direct and already enforced — the owner created it and must own the
-  repo, checked by `GetRepoForUser(repoID, userID)` inside the seam (`service.go:3080`,
+  repo, checked by `GetRepoForUser(repoID, userID)` inside the seam (`service.go:3250`,
   returns `ErrRepoNotFound` otherwise). No attribution inference.
 
 ### Decision 8 — Missed fires: fire once on the next wake, never backfill (recommended)
@@ -258,7 +260,7 @@ during an outage (no thundering backfill); it fires once and computes the next f
 
 For "promptly" to actually hold after a restart, the scheduler must run one **immediate tick
 on boot** — a `Boot()` step wired in `main.go`, exactly as `selfimprove.Engine.Boot` is at
-`engine.go:132-135` (wired `main.go:513`); without it, "promptly" degrades to
+`engine.go:135` (wired `main.go:520`); without it, "promptly" degrades to
 up-to-one-wake-cadence latency after a restart (review N2).
 
 ### Decision 9 — The sweep target carries a label selector; default is the PRD label (recommended)
@@ -312,8 +314,8 @@ precedents:
   must replicate that call or ownership is silently dropped).
 - **Worker side** — model kind handling on **`ci_fix`**, the genuinely issue-less precedent.
   With `issue_iid` NULL the current worker throws (`"issue run claim is missing issue_iid"`,
-  `runner.ts:1360`) and would otherwise emit `Resolve issue #null` / `Closes #null` MR text
-  (`runner.ts:1691,1741`). M8 must add a real `prompt` case to `runnerCloneForClaim`,
+  `runner.ts:1497`) and would otherwise emit `Resolve issue #null` / `Closes #null` MR text
+  (`runner.ts:1827,1879`). M8 must add a real `prompt` case to `runnerCloneForClaim`,
   `mrTitle`, and `mrDescription` — this is "add a kind," **not** "reuse the issue path with a
   synthetic task."
 
@@ -340,7 +342,7 @@ Concretely this needs:
 
 **Guardrail analysis (the reason this is flagged; verified in review).** This target
 **deliberately bypasses the PRD-issue sanction gate** (`isPRDIssue`/`HasPrdLink` inside
-`createRun`, `service.go:3108`/`:3115`). That gate is **not** one of the four main-protection
+`createRun`, `service.go:3278`/`:3285`). That gate is **not** one of the four main-protection
 guardrail layers (Developer-role/protected-branch, worker-holds-PAT, `PreToolUse` deny-hook
 `agent/src/guardrails.ts`, `settingSources:[]`) — all **untouched**, so `main` is still never
 written. `ci_fix` (pipeline failure, no PRD) and `self_improve` (prompt, no PRD) already bypass
@@ -358,8 +360,9 @@ flag for uzi-repo prompt runs remains the one worker-side follow-up (M8).
 ## Milestones
 
 ### M1 — Schema + store queries (`api`)
-- [ ] Migration (draft `00100_run_schedules.sql`; **renamed to the next free number at
-  merge** per the goose convention) creating `run_schedules` with the columns in Decision 1
+- [ ] Migration (draft `00103_run_schedules.sql` — live head is `00102`, and the earlier
+  `00100` draft collided with the existing `00100_worker_online_since.sql`; **renamed to the
+  next free number at merge** per the goose convention) creating `run_schedules` with the columns in Decision 1
   (incl. `labels` jsonb and `prompt` text), an index on `(enabled, status, next_fire_at)` for
   the claim, and a CHECK enforcing the `target`/`timing` field-presence invariants (e.g.
   `issue_iid` non-null iff `target='issue'`; `prompt` non-null iff `target='prompt'`).
@@ -556,7 +559,7 @@ flag for uzi-repo prompt runs remains the one worker-side follow-up (M8).
 
 | Phase | Milestone | Repo/module | Depends on | Files (primary) |
 |---|---|---|---|---|
-| 1 | M1 | api | — | `store/migrations/00100_*` (+ `runs.schedule_id`/kind CHECK), `store/queries/schedules.sql` |
+| 1 | M1 | api | — | `store/migrations/00103_*` (+ `runs.schedule_id`/kind CHECK), `store/queries/schedules.sql` |
 | 1 | M2 | api | — | `internal/schedsvc/*` (+ `go.mod`) |
 | 2 | M3 | api | M1, M2 | `internal/schedsvc` actor (issue/sweep/prompt fire paths), process startup |
 | 2 | M4 | api | M1 | `internal/handler/*`, `handler.go` routes, `apitypes` |
