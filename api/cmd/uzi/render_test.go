@@ -163,6 +163,125 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	}
 }
 
+// ---- PRD #122 M5: milestone progress + effective budget --------------------
+
+// milestoneRun is the fixture the milestone tests start from: a three-milestone frozen
+// list with the first reported complete, the second in progress and the third untouched,
+// plus a scaled effective budget. Built by a helper so a test mutating one field cannot
+// silently change another's input.
+func milestoneRun() apitypes.RunDTO {
+	iters, wall := 18, 5400 // 5400s = 1h30m
+	return apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "running",
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Set up the schema"},
+			{ID: "m2", Title: "Wire the API"},
+			{ID: "m3", Title: "Write the docs"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"},
+		BudgetMaxIterations:  &iters,
+		BudgetWallSeconds:    &wall,
+	}
+}
+
+func renderDetail(t *testing.T, r apitypes.RunDTO) string {
+	t.Helper()
+	var buf bytes.Buffer
+	p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+	if err := renderRunDetail(p, r); err != nil {
+		t.Fatalf("renderRunDetail: %v", err)
+	}
+	return buf.String()
+}
+
+// TestRenderRunDetailMilestones pins `uzi run get`'s milestone block: the
+// "reported complete" summary, the per-milestone state breakdown (done / in progress /
+// left), and the effective-budget rows — plus the back-compat guard that a run with no
+// frozen milestones and a global-default budget renders NONE of it.
+func TestRenderRunDetailMilestones(t *testing.T) {
+	out := renderDetail(t, milestoneRun())
+
+	// The summary counts only frozen members reported complete — 1 of 3 here — and says
+	// "reported complete", the wording PRD Decision 6 requires.
+	if !strings.Contains(out, "MILESTONES") || !strings.Contains(out, "1/3 reported complete") {
+		t.Errorf("a milestone run must summarise its progress as 1/3 reported complete, got:\n%s", out)
+	}
+	// 🔴 NEVER "verified" — a green milestone is self-reported, not verified (Decision 6).
+	if strings.Contains(out, "verified") {
+		t.Errorf("the milestone summary must not claim verification, got:\n%s", out)
+	}
+
+	// The per-milestone breakdown carries the same state the web shows: one row each,
+	// marked done / in progress / left, with the title.
+	for _, want := range []string{"done", "in progress", "left", "Set up the schema", "Wire the API", "Write the docs"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the milestone breakdown is missing %q, got:\n%s", want, out)
+		}
+	}
+
+	// The effective budget, present because this run was scaled off its milestone count.
+	for _, want := range []string{"BUDGET_ITERATIONS", "18", "BUDGET_WALL", "1h30m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a scaled run must render its effective budget, missing %q, got:\n%s", want, out)
+		}
+	}
+
+	// 🔴 A dropped-but-still-completed id must NOT inflate the count past the frozen
+	// total. milestones_completed is a monotone union, so it can name a milestone no
+	// longer in the approved list; the summary clamps to frozen membership.
+	dropped := milestoneRun()
+	dropped.MilestonesCompleted = []string{"m1", "m2", "m3", "ghost"}
+	if out := renderDetail(t, dropped); !strings.Contains(out, "3/3 reported complete") {
+		t.Errorf("a completed id outside the frozen list inflated the count past the total, got:\n%s", out)
+	}
+
+	// The back-compat guard: a run with no frozen milestones and a global-default budget
+	// renders none of these rows — byte-for-byte the pre-#122 output.
+	none := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	nout := renderDetail(t, none)
+	for _, bad := range []string{"MILESTONES", "reported complete", "BUDGET_ITERATIONS", "BUDGET_WALL"} {
+		if strings.Contains(nout, bad) {
+			t.Errorf("a run with no milestones must render no %q row, got:\n%s", bad, nout)
+		}
+	}
+}
+
+// TestRenderRunDetailMilestoneTitleSanitized is the milestone twin of
+// TestRenderRunDetailAnthropicToken: a milestone TITLE is UNTRUSTED repo/agent-authored
+// text (apitypes.Milestone), so it must go through cellText — bidi override and CSI escape
+// stripped, newline folded so the table rail holds, and an oversized title capped.
+//
+// The newline is the discriminating probe (sanitizeTTY spares "\n"; only cellText folds
+// it), the tab the second (sanitizeTTY spares "\t" too), and the length cap the third
+// (sanitizeTTY has no bound at all) — the same three that pin the credential row.
+func TestRenderRunDetailMilestoneTitleSanitized(t *testing.T) {
+	r := milestoneRun()
+	hostile := "safe\u202ednetsop\x1b[31m\nnext-line\tcol" + strings.Repeat("x", 250)
+	r.Milestones = []apitypes.Milestone{{ID: "m1", Title: hostile}}
+	r.MilestonesCompleted = []string{"m1"}
+	r.MilestonesInProgress = nil
+
+	out := renderDetail(t, r)
+	for _, bad := range []string{"\u202e", "\x1b", "\nnext-line", "\t"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("a hostile milestone title reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "safe") || !strings.Contains(out, "next-line") {
+		t.Errorf("sanitizing dropped the printable title text too, got:\n%q", out)
+	}
+	// The cap: the 250-char probe must be truncated and ellipsised, not passed through
+	// whole — an uncapped title blows the table rail.
+	if strings.Contains(out, strings.Repeat("x", 250)) {
+		t.Errorf("a 250-char milestone title reached the terminal uncapped, got:\n%q", out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("an oversized milestone title was neither truncated nor ellipsised, got:\n%q", out)
+	}
+}
+
 // ---- PRD #35: the usage-limit park -----------------------------------------
 
 // parkedRun is the fixture every test below starts from: a run parked on a five-hour
