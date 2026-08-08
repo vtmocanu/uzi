@@ -35,6 +35,13 @@ SELECT * FROM run_schedules WHERE user_id = @user_id ORDER BY created_at DESC;
 -- Owner-scoped edit of the mutable fields. A foreign id matches no row and returns
 -- none, so the handler cannot edit another user's schedule. next_fire_at is recomputed
 -- in Go from the new timing and passed here.
+--
+-- A config edit also REVIVES the schedule to status='active'. Without this, a terminal
+-- 'fired' once-schedule or a 'error'-parked schedule (repo was disconnected) could be
+-- edited to a valid future config that is stored but never claimed — ClaimDueSchedules
+-- gates on status='active' — a silently dead reschedule. Editing the config is the
+-- explicit act of putting a schedule back into service, so it clears the terminal/error
+-- state; enabled (the pause flag) is orthogonal and untouched here.
 UPDATE run_schedules
 SET target        = @target,
     issue_iid     = sqlc.narg('issue_iid'),
@@ -47,6 +54,7 @@ SET target        = @target,
     next_fire_at  = sqlc.narg('next_fire_at'),
     auto_approve  = @auto_approve,
     wait_on_limit = @wait_on_limit,
+    status        = 'active',
     updated_at    = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING *;

@@ -600,6 +600,7 @@ SET target        = $1,
     next_fire_at  = $9,
     auto_approve  = $10,
     wait_on_limit = $11,
+    status        = 'active',
     updated_at    = now()
 WHERE id = $12 AND user_id = $13
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
@@ -624,6 +625,13 @@ type UpdateRunScheduleParams struct {
 // Owner-scoped edit of the mutable fields. A foreign id matches no row and returns
 // none, so the handler cannot edit another user's schedule. next_fire_at is recomputed
 // in Go from the new timing and passed here.
+//
+// A config edit also REVIVES the schedule to status='active'. Without this, a terminal
+// 'fired' once-schedule or a 'error'-parked schedule (repo was disconnected) could be
+// edited to a valid future config that is stored but never claimed — ClaimDueSchedules
+// gates on status='active' — a silently dead reschedule. Editing the config is the
+// explicit act of putting a schedule back into service, so it clears the terminal/error
+// state; enabled (the pause flag) is orthogonal and untouched here.
 func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, updateRunSchedule,
 		arg.Target,
