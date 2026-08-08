@@ -7,7 +7,7 @@ conclusion of PRD #110 for the checkpoint case, by a route #110 did not consider
 **Deciders**: a three-agent, code-grounded security review (researcher + auditor +
 architect) that reached a unanimous recommendation; team lead; Vlad (maintainer),
 who requested per-checkpoint publish "as secure as possible".
-**PRD**: [PRD #122](../prds/122-milestone-structured-runs.md), milestone M8 and
+**PRD**: [PRD #122](../prds/done/122-milestone-structured-runs.md), milestone M8 and
 Decision 14 — this ADR carries only the decision, its security invariant, and the
 alternatives, because each alternative reads as attractive again to anyone who has
 not walked the single-uid k8s attack.
