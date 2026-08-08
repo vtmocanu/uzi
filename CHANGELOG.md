@@ -6,6 +6,35 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-08
+
+### Added
+
+- **Milestone progress across the product (#122).** A run whose lead breaks its plan
+  into milestones now shows what is done, in progress, and left everywhere the run
+  appears: a checklist plus an M/N badge on the run page, and the candidate breakdown
+  at the plan gate (M3); a milestone counter on the Slack root line and a threaded
+  line as each milestone completes (M4); and the same state in `uzi run get` (M5). A
+  run with no milestones is unchanged and keeps its iteration badge.
+- **Per-worker uptime on the fleet UI and CLI (#251).** Each worker shows how long it
+  has been online.
+
+### Fixed
+
+- **A working run no longer reads as stalled or idle (#193).** The wall-clock "slow"
+  health flag was painting the actively-running lane amber as if it had stalled, and
+  lane headers showed when a lane opened instead of its last activity. Both are fixed
+  in the run activity view; the server health detector was already correct.
+- **Version popover ordering (`91584071`).** Reordered so PRDs follow Commit and Uptime
+  is last.
+
+### Changed
+
+- **uzi CLI skill documentation (#255).** Documented the seeded-plan budget tradeoff,
+  the per-verb JSON envelope shapes, the full run-status enum (including `limit_wait`),
+  and that `uzi run logs --follow` returns only on a terminal status; added a
+  post-session "improve this skill" note.
+
 ## [0.20.2] - 2026-08-08
 
 ### Fixed
