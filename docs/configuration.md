@@ -204,7 +204,7 @@ Invalid values for any of the above fall back to their defaults (the same lenien
 ### Milestone-scaled budgets (PRD #122 M2)
 
 On an `issue` run whose plan carries a milestone breakdown approved at the plan
-gate (see [`prds/122-milestone-structured-runs.md`](../prds/122-milestone-structured-runs.md),
+gate (see [`prds/done/122-milestone-structured-runs.md`](../prds/done/122-milestone-structured-runs.md),
 Decisions 5 and 5b), `RUN_MAX_ITERATIONS` and `RUN_TIMEOUT` above are the **base**
 values a per-run budget scales from, not the budget itself. A plan may store up to
 50 milestones, but only the first **12** count toward this scaling — the count used

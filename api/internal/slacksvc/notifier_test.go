@@ -809,14 +809,14 @@ func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 // mechanical rather than editorial: the root line is EDITED, and a Slack edit raises
 // no notification, so without this a user is never told their run paused.
 func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
-	if evt := renderThread(parkedCtx("seven_day", time.Hour, 1), ""); evt == "" {
+	if evt := renderThread(parkedCtx("seven_day", time.Hour, 1)); evt == "" {
 		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
 			"the user would never learn the run paused")
 	}
 	// The promotion back to queued must NOT post — resuming is a return to normal and
 	// the edited root already shows it. A run that parks five times would otherwise
 	// produce ten posts.
-	if evt := renderThread(baseRun("queued"), ""); evt != "" {
+	if evt := renderThread(baseRun("queued")); evt != "" {
 		t.Fatalf("the resume threaded %q; only the park is worth interrupting for", evt)
 	}
 }
@@ -824,7 +824,7 @@ func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
 // Every part is omitted rather than defaulted when unknown, matching the server's own
 // failure-reason composition: the line must never claim a fact uzi does not have.
 func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
-	bare := renderThread(parkedCtx("", 0, 1), "")
+	bare := renderThread(parkedCtx("", 0, 1))
 	if bare != "⏸ paused: usage limit" {
 		t.Fatalf("a park with no window and no stamp rendered %q; it must degrade to the "+
 			"bare statement rather than inventing a window or a time", bare)
@@ -833,7 +833,7 @@ func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
 		t.Fatalf("%q shows a pause counter on the FIRST park, which is noise — the counter "+
 			"is the signal that a run is burning its retry budget", bare)
 	}
-	if repeat := renderThread(parkedCtx("five_hour", time.Hour, 3), ""); !strings.Contains(repeat, "(pause 3)") {
+	if repeat := renderThread(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
 		t.Fatalf("%q — from the second park on, the rising count is the warning that this "+
 			"run may be about to fail for good", repeat)
 	}
@@ -844,7 +844,7 @@ func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
 // refactor. That is exactly the population the CHECK exists for, so the renderer
 // escapes rather than trusting.
 func TestLimitWaitLabelEscapesTheWindowField(t *testing.T) {
-	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1), "")
+	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
 	}

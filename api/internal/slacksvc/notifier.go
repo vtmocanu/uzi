@@ -344,7 +344,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
 			n.logf("update root", uerr)
 		}
-		if evt := renderThread(rc, base); evt != "" {
+		if evt := renderThread(rc); evt != "" {
 			if _, perr := n.poster.Post(ctx, existing.ChannelID, existing.RootTs, ScrubSecrets(evt)); perr != nil {
 				n.logf("post thread event", perr)
 			}
@@ -779,7 +779,7 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 //     resuming is a return to normal and the edited root already shows it. Without
 //     this half, a run that parks five times would produce ten posts and the feature
 //     would read as a notification stream.
-func renderThread(rc store.GetSlackRunContextRow, base string) string {
+func renderThread(rc store.GetSlackRunContextRow) string {
 	switch rc.Status {
 	case "completed":
 		if mr := mrLink(rc); mr != "" {

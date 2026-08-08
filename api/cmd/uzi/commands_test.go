@@ -792,7 +792,7 @@ func TestRunLogsCapsTheActorCell(t *testing.T) {
 // proving the strip is rune-wise, not byte-wise.
 func TestRunReviewSanitizesHumanRender(t *testing.T) {
 	const summary = "\x1b[2J\x1b[31mFAKE ERROR" // CSI screen-clear + red
-	const target = "docs–end"                  // C1 NEL (U+0085) + en dash (U+2013, 0xE2 0x80 0x93)
+	const target = "docs\u0085–end"                  // C1 NEL (U+0085) + en dash (U+2013, 0xE2 0x80 0x93)
 	const rationale = "before\x1b[1mafter"      // SGR bold
 	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
 		"r1": {Verdict: "needs_work", Status: "complete", SummaryMd: summary,
