@@ -5,16 +5,6 @@
 **Priority**: Low
 **Mock**: `prds/mockups/251-worker-uptime-mock.html` (Settings → Workers with the uptime token added; shown to owner 2026-08-08)
 
-> **Working-tree spike (read before starting M2).** An uncommitted `web/` spike already
-> exists in the tree, self-labelled `PROTOTYPE (uptime spike)` — the one that produced the
-> mock. It has already landed, uncommitted: `Worker.online_since` on the type
-> (`web/src/lib/api.ts`), a page-local `formatUptime(sinceIso, nowMs)` + the `· up …` render
-> token (`web/src/pages/WorkersSettings.tsx`), and `online_since` on the four `mockWorkers`
-> fixtures (`web/src/mocks/data.ts`). It is **not** committed by this PRD (only the PRD +
-> mock are), so it is M2's **starting point, not greenfield** — M2 finishes and productionises
-> it (see M2). It does **not** touch the server, `RunsList.tsx`, `mockAdminWorkers`, or any
-> test.
-
 ## Problem
 
 Each worker row on Settings → Workers (`web/src/pages/WorkersSettings.tsx`) and the
@@ -136,8 +126,7 @@ past instant and floors at `<1m`.
 uptime; buckets `3d 4h`/`4h 12m`/`12m`/`48s`/`0s`, unit-tested). The two cannot be merged —
 different input (seconds vs ISO instant) and different floor (`0s` vs `<1m`) — so a second
 exported `formatUptime` would be a knip duplicate-export smell and a reader trap. The new
-helper takes an ISO string + injectable `nowMs` and lives in `web/src/lib` (the working-tree
-spike's page-local `formatUptime` is promoted and renamed as part of M2).
+helper takes an ISO string + injectable `nowMs` and lives in `web/src/lib`.
 
 ### Decision 5 — Placement: in the faint metadata line, between version and "last seen"
 
@@ -169,19 +158,18 @@ no new colour.
   PRD #49's stats_ display-only guard) — the field is liveness-write / DTO-read only.
 - [ ] `task gate:api` green (fmt + vet + build + lint + deadcode + test, `-race`).
 
-### M2 — Web: render uptime (`web`) — *finishes the working-tree spike, not greenfield*
-The spike (see the note at the top) already did: `Worker.online_since` on the type, a
-page-local `formatUptime` + the `· up …` render token in `WorkersSettings.tsx`, and
-`online_since` on the four `mockWorkers` fixtures. M2's remaining deltas:
-- [ ] **Promote + rename the helper**: move the page-local `formatUptime` into `web/src/lib`
-  as `formatUptimeSince` (Decision 4 — avoid the `BuildInfoPopover` collision), add its unit
-  test (`2d 4h` / `1h 23m` / `44m` / `<1m`, invalid → `""`, injectable `nowMs`), and repoint
-  `WorkersSettings.tsx` at the import. Confirm the gate stays `w.status === "online" &&
+### M2 — Web: render uptime (`web`)
+- [ ] `Worker` type (`web/src/lib/api.ts`): add `online_since?: string | null`.
+- [ ] New pure helper `formatUptimeSince` in `web/src/lib` (Decision 4 — named to avoid the
+  `BuildInfoPopover.formatUptime` collision): takes an ISO instant + injectable `nowMs`,
+  renders `2d 4h` / `1h 23m` / `44m` / `<1m`, invalid → `""`. Unit-tested.
+- [ ] `WorkersSettings.tsx`: render `· up {formatUptimeSince(w.online_since)}` in the
+  metadata line (between version and "last seen"), gated on `w.status === "online" &&
   w.online_since` (Decision 3/5).
-- [ ] `RunsList.tsx` admin fleet list: add the same token on the admin worker rows (**not**
-  done by the spike).
-- [ ] Mock fixtures: add `online_since` to each `mockAdminWorkers` entry too (the spike
-  touched only `mockWorkers`) — a value for online rows (varied uptimes), `null` for offline.
+- [ ] `RunsList.tsx` admin fleet list: the same token on the admin worker rows.
+- [ ] Mock fixtures (`web/src/mocks/data.ts`): add `online_since` to each `mockWorkers` and
+  `mockAdminWorkers` entry — a value for online rows (varied uptimes), `null` for offline —
+  so the demo/mock build shows it.
 - [ ] Tests: `WorkersSettings.test.tsx` asserts the uptime token for an online worker and its
   **absence** for an offline one (paired positive/negative per the copy-change rule in
   `.claude/rules/web.md`). `task gate:web` green.
