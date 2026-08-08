@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -34,6 +36,10 @@ type fakeNotifStore struct {
 	question    []byte
 	questionErr error
 	questionSet []store.SetSlackRunQuestionParams
+	// PRD #122 M4: the milestone thread-line dedup writes. Each SetSlackRunMilestoneNotified
+	// call is captured so a test can assert the advanced count was recorded (or that a
+	// deduped/no-milestone report recorded nothing).
+	milestoneSet []store.SetSlackRunMilestoneNotifiedParams
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -72,6 +78,10 @@ func (f *fakeNotifStore) GetLatestRunQuestion(context.Context, uuid.UUID) ([]byt
 func (f *fakeNotifStore) SetSlackRunQuestion(_ context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error) {
 	f.questionSet = append(f.questionSet, arg)
 	return store.SlackRunMessage{RunID: arg.RunID, QuestionID: arg.QuestionID}, nil
+}
+func (f *fakeNotifStore) SetSlackRunMilestoneNotified(_ context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error) {
+	f.milestoneSet = append(f.milestoneSet, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, MilestonesNotifiedCompleted: arg.Count}, nil
 }
 
 type postCall struct{ channel, thread, text string }
@@ -837,5 +847,193 @@ func TestLimitWaitLabelEscapesTheWindowField(t *testing.T) {
 	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1), "")
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
+	}
+}
+
+// --- PRD #122 M4: Slack milestone progress ---------------------------------------
+
+func mjson(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal milestone jsonb: %v", err)
+	}
+	return b
+}
+
+// milestoneRun is a running run with a frozen list of `total` milestones (ids m1..mN,
+// titles "Milestone N"), `done` of them completed (m1..mDone), and an optional
+// in-progress id.
+func milestoneRun(t *testing.T, done, total int, inProgress string) store.GetSlackRunContextRow {
+	t.Helper()
+	rc := baseRun("running")
+	frozen := make([]apitypes.Milestone, total)
+	for i := 0; i < total; i++ {
+		frozen[i] = apitypes.Milestone{ID: fmt.Sprintf("m%d", i+1), Title: fmt.Sprintf("Milestone %d", i+1)}
+	}
+	completed := make([]string, done)
+	for i := 0; i < done; i++ {
+		completed[i] = fmt.Sprintf("m%d", i+1)
+	}
+	rc.MilestonesFrozen = mjson(t, frozen)
+	rc.MilestonesCompleted = mjson(t, completed)
+	if inProgress != "" {
+		rc.MilestonesInProgress = mjson(t, []string{inProgress})
+	}
+	return rc
+}
+
+// The root status line of a milestone-structured run carries the compact `3/7` counter,
+// re-rendered in place on the existing anchor like every other state edit.
+func TestNotifierRootCarriesMilestoneCounter(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "running · 3/7") {
+		t.Fatalf("root must carry the `running · 3/7` milestone counter: %+v", fp.updates)
+	}
+}
+
+// A count-advancing `running` report posts exactly ONE thread line (with the in-progress
+// title) and records the new notified count.
+func TestNotifierPostsMilestoneLineOnAdvance(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "m4")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg: store.SlackRunMessage{
+			RunID: rc.ID, ChannelID: "D1", RootTs: "ts1",
+			MilestonesNotifiedCompleted: pgtype.Int4{Int32: 2, Valid: true}, // last posted 2/7
+		},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
+		t.Fatalf("want exactly one milestone thread line under the root: %+v", fp.posts)
+	}
+	if !strings.Contains(fp.posts[0].text, "✓ 3/7 · working Milestone 4") {
+		t.Fatalf("milestone line = %q, want `✓ 3/7 · working Milestone 4`", fp.posts[0].text)
+	}
+	if len(fs.milestoneSet) != 1 || fs.milestoneSet[0].Count.Int32 != 3 || !fs.milestoneSet[0].Count.Valid {
+		t.Fatalf("advanced notified count not recorded as 3: %+v", fs.milestoneSet)
+	}
+}
+
+// When nothing is in progress, the thread line drops the ` · working …` suffix.
+func TestNotifierMilestoneLineDropsWorkingSuffixWhenIdle(t *testing.T) {
+	rc := milestoneRun(t, 1, 7, "") // no in-progress id
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}, // NULL notified → 0
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 1 || fp.posts[0].text != "✓ 1/7" {
+		t.Fatalf("want a bare `✓ 1/7` line with no working suffix: %+v", fp.posts)
+	}
+}
+
+// A repeated `running` report at the SAME completed count posts NO thread line — dedup is
+// on the new notified-count column, not on status.
+func TestNotifierDoesNotRepostMilestoneOnUnchangedCount(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "m4")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg: store.SlackRunMessage{
+			RunID: rc.ID, ChannelID: "D1", RootTs: "ts1",
+			MilestonesNotifiedCompleted: pgtype.Int4{Int32: 3, Valid: true}, // already posted 3/7
+		},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 0 {
+		t.Fatalf("an unchanged count must not re-post a milestone line: %+v", fp.posts)
+	}
+	if len(fs.milestoneSet) != 0 {
+		t.Fatalf("an unchanged count must not record a new notified count: %+v", fs.milestoneSet)
+	}
+	// The root is still re-edited and keeps the counter.
+	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "3/7") {
+		t.Fatalf("root should still carry the counter on a re-broadcast: %+v", fp.updates)
+	}
+}
+
+// A `+2` jump in one turn (1/7 → 3/7) posts ONE line and does not lose the jump: the
+// count moves straight to 3, not to 2.
+func TestNotifierMilestonePlusTwoPostsOneLine(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "m4")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg: store.SlackRunMessage{
+			RunID: rc.ID, ChannelID: "D1", RootTs: "ts1",
+			MilestonesNotifiedCompleted: pgtype.Int4{Int32: 1, Valid: true}, // last posted 1/7
+		},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "✓ 3/7") {
+		t.Fatalf("a +2 jump must post exactly one line at the new count 3/7: %+v", fp.posts)
+	}
+	if len(fs.milestoneSet) != 1 || fs.milestoneSet[0].Count.Int32 != 3 {
+		t.Fatalf("the jump must record the new count 3, not lose it: %+v", fs.milestoneSet)
+	}
+}
+
+// An unlinked / opted-out run (ErrNoRows on delivery) gets nothing — no milestone line,
+// no notified write — and is otherwise unaffected.
+func TestNotifierMilestoneUnlinkedGetsNothing(t *testing.T) {
+	rc := milestoneRun(t, 3, 7, "m4")
+	fs := &fakeNotifStore{rc: rc, deliveryErr: pgx.ErrNoRows}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 0 || len(fp.updates) != 0 {
+		t.Fatalf("an unlinked owner must receive no Slack call: posts=%+v updates=%+v", fp.posts, fp.updates)
+	}
+	if len(fs.milestoneSet) != 0 {
+		t.Fatalf("an unlinked owner must record no notified count: %+v", fs.milestoneSet)
+	}
+}
+
+// A run with NO milestones behaves exactly as today: no counter on the root line and no
+// milestone thread line.
+func TestNotifierNoMilestonesBehavesAsToday(t *testing.T) {
+	rc := baseRun("running") // no milestone columns set
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.updates) != 1 || strings.Contains(fp.updates[0].text, "/7") || strings.Contains(fp.updates[0].text, " · 0/") {
+		t.Fatalf("a no-milestone run's root must carry no counter: %+v", fp.updates)
+	}
+	if len(fp.posts) != 0 {
+		t.Fatalf("a no-milestone run must post no milestone thread line: %+v", fp.posts)
+	}
+	if len(fs.milestoneSet) != 0 {
+		t.Fatalf("a no-milestone run must record no notified count: %+v", fs.milestoneSet)
 	}
 }

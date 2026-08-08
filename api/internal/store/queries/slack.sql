@@ -120,10 +120,20 @@ RETURNING *;
 -- CHECK is the backstop. The renderer escapes it anyway; that is defence in depth
 -- against a writer that bypassed both, which is precisely the population the CHECK
 -- exists for.
+--
+-- milestones_frozen / milestones_completed / milestones_in_progress (PRD #122 M4) are
+-- the jsonb the notifier renders the `▶ running · 3/7` root counter and the `✓ 3/7 ·
+-- working <title>` thread line from — the frozen {id,title} list (the denominator N),
+-- the monotone completed id set (the numerator), and the in-progress id snapshot. Each
+-- is NULL for a run with no milestone list, which the Go side decodes to empty so a
+-- no-milestone run renders exactly as today. The raw jsonb is decoded in Go (local
+-- helpers over apitypes.Milestone), not projected in SQL, because the title IS what the
+-- thread line delivers — there is nothing to withhold, unlike repo_agent_names above.
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
        r.health, r.plan_md,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count,
+       r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -166,6 +176,23 @@ RETURNING *;
 UPDATE slack_run_messages
 SET gate_ts = @gate_ts, gate_state = @gate_state, gate_generation = @gate_generation, updated_at = now()
 WHERE run_id = @run_id AND (gate_generation IS NULL OR gate_generation < @gate_generation)
+RETURNING *;
+
+-- name: SetSlackRunMilestoneNotified :one
+-- Milestone thread-line dedup counter for the Slack notifier (PRD #122 M4). Records the
+-- last completed-milestone COUNT the notifier posted a `✓ N/M` thread line for. Guarded
+-- like SetSlackRunGateGen but on its OWN column: the update fires ONLY when @count is
+-- strictly greater than what is stored (NULL = nothing posted yet, read as 0), so a
+-- slow/redelivered `running` report carrying an OLD count can never regress the notified
+-- count or re-spam a line the thread already carries. No row returned = the write was
+-- refused (an equal-or-newer count already posted), and the caller has nothing to do.
+--
+-- DISTINCT from gate_generation on purpose: that column is the PLAN gate's own counter
+-- (the count of kind='plan' run_messages), actively read/written by handleGate. A
+-- milestone advance must not touch it, or it would swallow the next plan version's gate.
+UPDATE slack_run_messages
+SET milestones_notified_completed = @count, updated_at = now()
+WHERE run_id = @run_id AND (milestones_notified_completed IS NULL OR milestones_notified_completed < @count)
 RETURNING *;
 
 -- name: SetSlackRunGateIf :one

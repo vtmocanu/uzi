@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -43,6 +45,11 @@ type NotifierStore interface {
 	// SetSlackRunQuestion records which question the run's thread already carries, so a
 	// re-park on the SAME question after a worker death does not post it twice.
 	SetSlackRunQuestion(ctx context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error)
+	// SetSlackRunMilestoneNotified records the last completed-milestone COUNT the notifier
+	// posted a `✓ N/M` thread line for (PRD #122 M4), generation-guarded so a redelivered
+	// `running` report cannot re-post a line the thread already carries. Distinct from
+	// gate_generation (the plan gate's own counter).
+	SetSlackRunMilestoneNotified(ctx context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and
@@ -342,6 +349,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 				n.logf("post thread event", perr)
 			}
 		}
+		n.handleMilestone(ctx, rc, existing)
 	}
 
 	n.handleGate(ctx, rc, anchor, base)
@@ -600,12 +608,147 @@ func (n *Notifier) logf(what string, err error) {
 // they cannot inject a spoofed <url|label> link or a <@Uxxx> mention into the DM;
 // the deep-link markup below stays raw (its base is operator-set, its id a uuid).
 func renderRoot(rc store.GetSlackRunContextRow, base string) string {
-	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s%s",
-		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle), statusLabel(rc), healthSuffix(rc))
+	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s%s%s",
+		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle),
+		statusLabel(rc), milestoneSuffix(rc), healthSuffix(rc))
 	if link := runLink(base, rc.ID); link != "" {
 		head += "\n" + link
 	}
 	return head
+}
+
+// milestoneSuffix is the compact ` · 3/7` counter appended to the root status label of a
+// milestone-structured run (PRD #122 M4) — the same in-place edit renderRoot already
+// re-renders on every state event. Empty for a run with no frozen milestone list, so a
+// no-milestone run's root is byte-for-byte what it was before this feature. The two
+// numbers are server-derived integers (a member count and a list length), so unlike the
+// issue title there is nothing to escape.
+func milestoneSuffix(rc store.GetSlackRunContextRow) string {
+	done, total, ok := milestoneCounts(rc)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(" · %d/%d", done, total)
+}
+
+// decodeMilestones decodes a runs.milestones_frozen jsonb array into a
+// []apitypes.Milestone. A nil/empty/non-array value (a run with no milestones, or a
+// malformed column) degrades to a nil slice — never a panic — so a no-milestone run
+// renders exactly as today. apitypes is a stdlib-only leaf, so importing it here keeps
+// slacksvc off workersvc (which would be an import cycle).
+func decodeMilestones(raw []byte) []apitypes.Milestone {
+	if len(raw) == 0 {
+		return nil
+	}
+	var ms []apitypes.Milestone
+	if err := json.Unmarshal(raw, &ms); err != nil {
+		return nil
+	}
+	return ms
+}
+
+// decodeMilestoneIDs decodes a jsonb array of milestone ids (milestones_completed /
+// milestones_in_progress) into a []string, degrading a nil/empty/non-array value to a
+// nil slice.
+func decodeMilestoneIDs(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil
+	}
+	return ids
+}
+
+// milestoneCounts derives a run's milestone progress from the frozen list and the
+// completed-id set: total is len(frozen); done is the number of completed ids that are
+// MEMBERS of the frozen list (a stale id referencing a milestone no longer frozen, or a
+// duplicate, is not counted, so done can never exceed total). ok is false when the run
+// has no frozen milestones, so every caller appends/posts nothing — the no-milestone run
+// behaves exactly as today.
+func milestoneCounts(rc store.GetSlackRunContextRow) (done, total int, ok bool) {
+	frozen := decodeMilestones(rc.MilestonesFrozen)
+	if len(frozen) == 0 {
+		return 0, 0, false
+	}
+	inFrozen := make(map[string]struct{}, len(frozen))
+	for _, m := range frozen {
+		inFrozen[m.ID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(frozen))
+	for _, id := range decodeMilestoneIDs(rc.MilestonesCompleted) {
+		if _, member := inFrozen[id]; !member {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		done++
+	}
+	return done, len(frozen), true
+}
+
+// handleMilestone posts ONE `✓ N/M` thread line when a milestone-structured run's
+// completed COUNT strictly advances past the count the anchor last recorded (PRD #122
+// M4). It is the milestone counterpart to handleGate/handleQuestion, bound to the
+// existing-message branch of handle: the first post (the ErrNoRows branch) is the run's
+// initial transition, which sets up the root and never a progress line.
+//
+// Dedup is on the COUNT, not on status: PublishState fires on every `running` report, so
+// a redelivered event carries the same count and posts nothing, while a `+2` jump in one
+// turn (1/7 → 3/7) posts ONE line and is not lost. The count-guarded setter refuses a
+// regressing/equal write, so a slow drain can never re-spam.
+//
+// All best-effort: a failure is logged (redacted) and never affects the run.
+func (n *Notifier) handleMilestone(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage) {
+	done, total, ok := milestoneCounts(rc)
+	if !ok {
+		return
+	}
+	notified := 0
+	if anchor.MilestonesNotifiedCompleted.Valid {
+		notified = int(anchor.MilestonesNotifiedCompleted.Int32)
+	}
+	if done <= notified {
+		return // no advance since the last line — a redelivered report, not new progress
+	}
+
+	line := fmt.Sprintf("✓ %d/%d", done, total)
+	if title := inProgressTitle(rc); title != "" {
+		line += " · working " + EscapeMrkdwn(title)
+	}
+	if _, perr := n.poster.Post(ctx, anchor.ChannelID, anchor.RootTs, ScrubSecrets(line)); perr != nil {
+		n.logf("post milestone progress", perr)
+		return // do not advance the notified count; a later event retries
+	}
+	if _, err := n.store.SetSlackRunMilestoneNotified(ctx, store.SetSlackRunMilestoneNotifiedParams{
+		RunID: rc.ID, Count: pgtype.Int4{Int32: int32(done), Valid: true},
+	}); err != nil {
+		n.logf("record milestone notified", err)
+	}
+}
+
+// inProgressTitle returns the human title of the FIRST in-progress milestone (looked up
+// in the frozen list by id), or "" when nothing is in progress or the id is unknown — in
+// which case the thread line drops its ` · working …` suffix. The title is UNTRUSTED
+// display text, so the caller routes it through EscapeMrkdwn like every other field.
+func inProgressTitle(rc store.GetSlackRunContextRow) string {
+	ids := decodeMilestoneIDs(rc.MilestonesInProgress)
+	if len(ids) == 0 {
+		return ""
+	}
+	titles := make(map[string]string)
+	for _, m := range decodeMilestones(rc.MilestonesFrozen) {
+		titles[m.ID] = m.Title
+	}
+	for _, id := range ids {
+		if t := strings.TrimSpace(titles[id]); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // renderThread returns the threaded event for a transition, or "" when the
