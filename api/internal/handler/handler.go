@@ -119,9 +119,11 @@ type Handler struct {
 	// image, since only the tag (publish) build passes them — and an empty or
 	// unparseable value is OMITTED from the response rather than served as a zero.
 	// Set via SetBuildInfo.
-	commit  string
-	builtAt string
-	commits string
+	commit   string
+	builtAt  string
+	commits  string
+	prdsDone string
+	prdsOpen string
 	// now / startedAt serve PRD #113's upgrade classification. startedAt anchors the
 	// no-controller-signal grace for hosted workers: Model B rolls the api in the same
 	// release as the workers, so process start is a free proxy for "a release just
@@ -263,6 +265,12 @@ type BuildStamp struct {
 	BuiltAt string
 	// Commits is the commit count as a decimal string (-X main.commits, PRD #175 M3).
 	Commits string
+	// PrdsDone / PrdsOpen are the completed / active PRD counts as decimal strings
+	// (-X main.prdsDone, -X main.prdsOpen, #245). Computed in CI like Commits — the
+	// api/ build context lacks the repo root the count needs — and omitted together
+	// on any unstamped build.
+	PrdsDone string
+	PrdsOpen string
 }
 
 // SetBuildInfo stamps the non-version build coordinates served at GET /api/version.
@@ -275,6 +283,8 @@ func (h *Handler) SetBuildInfo(s BuildStamp) {
 	h.commit = strings.TrimSpace(s.Commit)
 	h.builtAt = strings.TrimSpace(s.BuiltAt)
 	h.commits = strings.TrimSpace(s.Commits)
+	h.prdsDone = strings.TrimSpace(s.PrdsDone)
+	h.prdsOpen = strings.TrimSpace(s.PrdsOpen)
 }
 
 // SetReconciler wires the poller's force-reconcile signal in after construction,
@@ -366,7 +376,8 @@ func isFullSHA(s string) bool {
 
 // Version reports this instance's build coordinates (PRD #175): the Model-B release
 // version, the project's founding date, this process's uptime, and — on a stamped
-// release image — the source commit, the build time and the commit count.
+// release image — the source commit, the build time, the commit count and the
+// completed / active PRD counts (#245).
 //
 // Unauthenticated and unrate-limited like Health, and that is a deliberate standing
 // property rather than an oversight. It is also where the property is ENFORCED, which
@@ -381,7 +392,9 @@ func isFullSHA(s string) bool {
 //
 // Most of what it carries is public by construction — the version is the chart's
 // image tag, the commit is in the repo, built_at is implied by the
-// release, founded and commits are consts. `uptime_seconds` is NOT in that class and
+// release, founded and commits are consts, and prds_done / prds_open are scalar
+// counts over the tracked tree (build facts, not runtime state). `uptime_seconds` is
+// NOT in that class and
 // is the one field that needs a decision rather than an observation: it is a RUNTIME
 // fact about this process, not a build fact about this image. It is published
 // DELIBERATELY (PRD #175, severity Low) because process age is worth real debugging
@@ -417,6 +430,12 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 	}
 	if n, err := strconv.Atoi(h.commits); err == nil && n >= 0 {
 		info.Commits = &n
+	}
+	if n, err := strconv.Atoi(h.prdsDone); err == nil && n >= 0 {
+		info.PrdsDone = &n
+	}
+	if n, err := strconv.Atoi(h.prdsOpen); err == nil && n >= 0 {
+		info.PrdsOpen = &n
 	}
 	// A zero startedAt is the struct-literal Handler many tests build (see clock()),
 	// not a process that started at the epoch: report unknown rather than ~2 millennia.
@@ -573,6 +592,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/me/workers", func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/upgrade-summary", h.WorkerUpgradeSummary)
+		})
+
+		// Runs-in-progress count for the Runs nav badge (PRD #239). Its own endpoint +
+		// AppShell poll, mirroring /me/workers/upgrade-summary and /me/judge/stats.
+		r.Route("/me/runs", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/in-progress-count", h.RunsInProgressCount)
 		})
 
 		// Global judge-triage strip (PRD #94 Decision 8): the caller's "across all your

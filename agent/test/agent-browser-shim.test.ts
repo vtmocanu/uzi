@@ -69,7 +69,11 @@ function captured(): string[] {
 
 describe("agent-browser crash-close shim (PRD #87 M1)", () => {
   it("exits 0 with the clear message when NO browser resolves", async () => {
-    const res = await runShim(["open", "example.com"], { PATH: emptyBin });
+    // Isolate from a chromium baked into the worker image (PRD #87 M3): point the
+    // executable path at a non-existent file, exactly as the sibling tests at :95
+    // and :105 do, so the degrade path is exercised hermetically in BOTH the laptop
+    // (no baked chromium) and worker (chromium present) environments.
+    const res = await runShim(["open", "example.com"], { PATH: emptyBin, AGENT_BROWSER_EXECUTABLE_PATH: path.join(tmp, "does-not-exist") });
     assert.equal(res.code, 0, "must exit 0 (clean), not the raw Chromium abort");
     assert.match(res.stderr, /no browser in this runtime — skipping browser validation/);
     // It must degrade BEFORE reaching any real CLI — the recorder must not have run.

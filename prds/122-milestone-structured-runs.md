@@ -16,7 +16,9 @@
 > - **M6 shrinks to a delta over #218**, not a foundation. #218 fetches back only on park + graceful SIGTERM, so a hard **SIGKILL** (OOM, node kill with no grace window) still loses everything since the last fetch-back. M6's residual value is the *proactive milestone-boundary checkpoint* (reap + fetch-back while the run is alive), bounding that loss to "since the last milestone", and it must adopt #218's `uzi-trackowner` anchor + `seededFrom` machinery rather than re-deriving Decision 9.
 > - **Phase 2 file:line citations are STALE** — written against a pre-#218 tree that #218 rewrote. Re-derive against HEAD before citing (current symbols: `RUNNER_TRACKING_PREFIX`, `seededFrom`, `fetchBackBestEffort`).
 > - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
-> - **The one open Phase-1 decision the review flagged**: the budget **hard ceiling** (Decision 5, Risks) is still hand-waved as "capped" with no number. Pin a concrete milestone-count cap AND an absolute turn/wall-clock ceiling before M2, and enforce them server-side (Decision 12). This needs a maintainer call, not an invented default.
+> - **The budget hard ceiling is now DECIDED (2026-08-07)**: profile "Generous" — milestone-count cap **12**, total turn ceiling `RUN_MAX_ITERATIONS × min(n, 12)` (≤ 60 turns), absolute wall-clock ceiling **8h**; single-milestone plans stay at today's 5 turns / 2h, and the count cap is enforced server-side (Decision 12). M2 implements it. See the 2026-08-07 Decision Log entry.
+>
+> **Status (2026-08-07): Phase 1 backend DONE — M1 (MR !194) + M2 (MR !195) merged.** M1 = `submit_plan.milestones` + the `00098` two-column store + DTO + Decision-12 validation; M2 = progress reporting (union/overwrite/membership) + the milestone-scaled budget with Decision 5b's per-run sweeper timeout + `00099`. **M3/M4/M5 (web UI, Slack, CLI) are NOT built and were deliberately not seeded.** Active work is **M8 — per-checkpoint origin publish via a server-side push broker** (see the two 2026-08-07 Decision Log entries at the bottom; Decision 8/14 + M8 rewrite pending approval).
 
 ## Problem
 
@@ -259,6 +261,14 @@ where the lead declared a milestone complete and therefore expects a boundary.
 (M8, which does carry a credential, must reap at every checkpoint including the
 fallback — another reason it is a separate decision.)
 
+*(2026-08-07, superseded for the brokered path by Decision 14.) The brokered M8
+push carries no PAT on the worker, so M8 no longer needs to reap at the FALLBACK
+checkpoint: it publishes only at the model-cooperative checkpoint, which M6 already
+reaps, and the iteration-boundary fallback stays M6's credential-free fetch-back
+with no push. The "reap at every checkpoint including the fallback" rule above holds
+only for the rejected worker-side push fallback (Decision 8 / Option A), not for the
+broker.)*
+
 **11. Milestone state rides the claim.** `ClaimResponse` carries the frozen list
 and the completed set, so a requeued run's planning prompt can name what is
 already committed. This is a strict improvement on issue #105's `priorWork`
@@ -290,6 +300,96 @@ the judge are out by construction and need no guard: chat runs a separate
 executor (and `SweepRunningTimeout` already excludes `kind='chat'`,
 `runtime.sql:571`), and the judge denies every tool via a deny-all `PreToolUse`
 hook, so it can never reach a signal tool.
+
+**14. The checkpoint push is BROKERED through the api, not run on the worker
+(supersedes Decision 8's reap-then-push for M8; see `adr/0122`).** M8 publishes each
+checkpoint so work survives a *different* worker re-claiming the run. Doing that
+with the worker's own push (Decision 8) is safe only if the reap is complete — and
+it is not: `killAgentTree` process-group-kills the SDK CLI pid, so a
+`setsid`/new-session child escapes it (demonstrated, 2026-08-07 security review)
+and, on single-uid k8s where agent uid == worker uid == 10001, reads the PAT out of
+the push child's `/proc/<pid>/environ`. M8 would spawn one such push child at each
+of N checkpoints with the agent re-spawned between them, multiplying today's single
+end-of-run window by N. The broker removes that exposure: after M6's reap +
+`fetchAgentBranch` the worker already holds the agent's objects in its bare as
+`refs/uzi-runner/<branch>` with **no credential**; it ships the delta pack
+(`origin/<branch>..refs/uzi-runner/<branch>`) to a new, authorization-scoped
+worker→api endpoint, and **the api pushes to origin with the PAT it already
+decrypts** (`secretbox` lives in the api — the api is the credential's *original*
+holder, the worker a derived copy). The PAT-bearing push therefore runs in the api
+pod, a container/uid the agent cannot reach, and **M8 adds zero new PAT-bearing
+git-child windows under the agent uid over today's baseline.**
+
+The **security invariant** this satisfies, stated exactly: *no forge PAT is present
+in the environment or memory of any process the untrusted agent can read (same uid
++ pid-namespace) while any agent-controlled process is alive.* The broker satisfies
+it by **spatial** closure (the PAT never enters the worker for the push), strictly
+stronger than reap-then-push's **temporal** closure, which depends on
+`killAgentTree` catching a `setsid` escapee at each of N windows.
+
+**Authorization is load-bearing, not optional.** The publish RPC MUST be scoped to
+the calling run's own repo and branch via the worker join token that already scopes
+claims — a worker can never ask the api to push an arbitrary repo or ref; the api
+pushes only `refs/heads/<run-branch>`, never forced, CI suppressed (`ci.skip`).
+
+**Implementation is pure-Go; the api image stays distroless-static.** The api has
+never execed git (it is `distroless/static-debian12`, no git binary; the Forge
+interface is pure REST), so the broker uses a pure-Go smart-HTTP push client
+(go-git). A 2026-08-07 source check said go-git's `PushOptions.Options` carries
+push-options; a 2026-08-08 runtime check corrected the field TYPE — it is
+`map[string]string` in go-git v5.19.2 (wire-encoded as `[]*Option{Key,Value}`), not
+the `[]string` first recorded — so `ci.skip` is expressible without a git binary;
+adding a git binary was considered and rejected because it would fatten the
+secrets-holder's image and CVE surface for no capability the pure-Go path lacks. The
+one residual is forge-specific smart-HTTP behaviour, validated by a real push
+against `gitlab.example.com` when M8 is built. **The concrete instance of that
+residual is now known, and it is worse than "forge-specific": the `ci.skip`
+pipeline-suppression is GitLab-ONLY and inert on BOTH other forges — the
+currently-shipping Forgejo (commit-message-marker skip, verified in Gitea source)
+and the future GitHub (PRD #238 R8). Validating against `gitlab.example.com`
+alone therefore cannot surface it — GitLab is the single forge where it works. See
+the 🔴 note in M8 below.**
+
+This reuses uzi's "api is the sole holder of secrets" boundary rather than adding a
+new one, and reframes PRD #110's "a server-side push duplicates push authority into
+a second component" objection: in uzi the api is the *first* holder, so the broker
+**consolidates** push authority rather than duplicating it. The bot's Developer role
+is unchanged (it can already push non-protected branches — that is how the worker
+pushes today), so this is not a privilege change.
+
+**Considered and rejected:** Infisical agent-vault (a forward-MITM proxy — needs the
+vault on a separate uid/pod single-uid k8s cannot give it, needs a network egress
+lock uzi lacks so the agent can `unset HTTPS_PROXY`, and it moves push capability to
+the agent, weakening the SDK deny-`git push` guardrail); short-lived scoped tokens
+(the Developer bot cannot mint project-access tokens, PAT minimum expiry is 1 day,
+job tokens cannot `git push`); the forge REST Commits API (squashes each checkpoint
+into one synthetic commit, collides non-fast-forward with the end-of-run real push,
+needs a Forge-interface change across both drivers + five fakes). Worker-side
+reap-then-push (Decision 8) remains the **validated fallback** if the real-forge
+go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
+`/proc` and a cgroup-based reap that catches the `setsid` escape.
+
+**15. Checkpoint publishes go to a checkpoint ref no workflow watches, NOT to
+`refs/heads/<branch>`+`ci.skip` (resolves M8's ref-target fork; probe-validated on
+GitLab 2026-08-08).** M8's brokered push (Decision 14) targets a
+`refs/uzi-checkpoints/<branch>` ref on origin, not the branch head. `ci.skip`
+suppresses pipelines on **GitLab only** — it is inert on the shipping Forgejo driver
+and future GitHub (Decision 14's own 🔴) — and the commit-message-marker alternative
+forces either a tip rewrite (→ the forbidden force-push) or a throwaway marker commit.
+A ref no workflow watches sidesteps both: workflows trigger on `refs/heads/*`/tags/PRs,
+so a custom ref fires CI on **no** forge, and only the end-of-run push to
+`refs/heads/<branch>` triggers a pipeline — the intended behaviour everywhere, no
+push-option and no marker. **Validated on GitLab 2026-08-08** (probe P1:
+`gitlab.example.com` accepts `refs/uzi-checkpoints/*` and fires zero pipelines for
+it; probe P2: a pure-Go go-git v5.19.2 smart-HTTP send-pack over HTTPS to the same
+forge round-trips, so the api broker needs no git binary). **Consequence for the
+reseed:** a cross-worker resume must fetch `refs/uzi-checkpoints/<branch>` from origin
+and feed it into Decision 9's `seededFrom` strict-descendant rule as a THIRD input —
+today that rule knows only the local `refs/uzi-runner/<branch>` tracking ref and
+`origin/<branch>`. **Residual:** the probe pushed as an Owner; a Developer-role bot
+pushing a custom ref is high-confidence (custom refs are not protectable in GitLab)
+but proven only at impl on the worker with the bot PAT, and Forgejo/GitHub need the
+same push-permission check.
 
 ## Touchpoints
 
@@ -564,6 +664,17 @@ hook, so it can never reach a signal tool.
   runs interrupted after the plan gate — i.e. those that had reached the
   implement phase and had commits to lose. If *that* is near zero, Phase 1 (the
   progress feature, M1–M5) is the whole feature and Phase 2–3 should be dropped.
+  **Measured 2026-08-08 on dev-cluster (live uzi CNPG DB, read-only aggregate):
+  5 of 80 runs (6.25%) were ever requeued, `max(requeue_count) = 1` — never twice.
+  All 5 were `kind='issue'` with a plan; but `planned_base_commit` is a recent
+  column (filled on only 10/80 runs) so `iteration_count ≥ 2` (implement⇄review
+  turns actually ran) is the better "reached implement" proxy, and by it only 2 of
+  80 (2.5%) were interrupted mid-implement with work plausibly to lose.
+  `requeue_count` cannot split same-worker from different-worker (the #218 R1
+  point), so 2.5% is an UPPER bound on M8's addressable population. This confirms
+  the read above: the durability payoff is small and Phase 1 is the feature. M8
+  still proceeds at the maintainer's direction — the number calibrates it as
+  LOW-urgency, not go/no-go.**
 - **Prompt compliance.** The lead must both emit a sensible milestone list and
   call `checkpoint` at the right time. Mitigation: both degrade to today's
   behavior when absent (Decisions 4 and 10) — the feature fails off, never
@@ -573,9 +684,14 @@ hook, so it can never reach a signal tool.
 
 - None blocking. PRD #41's gate loop must keep working across the freeze point
   (Decision 2); the #105 resume path is improved, not replaced.
-- M8 additionally depends on the Decision 8 security review and, if that review
-  goes the other way, on the k8s two-container uid split that PRD #110 names as
-  its revisit condition.
+- M8 depends on: (a) the Risks `requeue_count` reading (now urgency-calibration, not
+  a hard gate — the maintainer wants the feature); (b) a real-forge go-git send-pack
+  validation deciding broker vs the Option-A worker-push fallback; (c) ADR
+  `adr/0122-checkpoint-push-broker.md` recording Decision 14. It no longer depends on
+  the k8s two-container uid split — the broker (Decision 14) provides spatial closure
+  without it — but the uid split (#51/#58) remains the primitive that would let M8
+  retire the broker and publish with a plain worker `git push`, safe by construction
+  (#110's named revisit condition).
 
 ## Validation
 
@@ -691,3 +807,136 @@ hook, so it can never reach a signal tool.
   re-derivation at implementation time. The open Phase-1 decision remains the
   budget **hard ceiling** — still unnumbered, a maintainer call before M2. This
   is a documentation re-scope only; no code changed.
+- **2026-08-07 — M1 landed (MR !194, merge `3d0720ee`), and the budget hard
+  ceiling was decided.** M1 shipped via a seeded uzi run (`bc631d9c`) as
+  `feat(milestones): M1 …` (`52598983`): `submit_plan.milestones` (schema-gated to
+  issue runs, Decision 13), main-thread-only extraction, the two-column store
+  (`00098_run_milestones.sql`: `milestones_candidate` / `milestones_frozen` jsonb,
+  `NULL ≠ '[]'`), the DTO field, and the Decision 12 server-side validation. Notes
+  for whoever picks up M2, none of which change the design but all of which the M2
+  plan should assume rather than rediscover:
+  - **The milestone type lives in `apitypes` (`Milestone{ID,Title}`) with a
+    `workersvc.Milestone` type ALIAS** (`api/internal/workersvc/milestones.go`),
+    mirroring `RepoAgent`/`AgentSelection`, so `apitypes` stays the stdlib-only
+    leaf the CLI links (PRD #64 M1). M2 reads the frozen list from there.
+  - **The Decision 12 count cap landed at 50** (`maxMilestonesPerRun`), a
+    whole-list reject (not a clamp), with a strict ASCII id-shape regex
+    `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, dup-id reject, and a 200-rune title cap
+    through `hasUnsafeChar` + `stripNUL`. This is the storage/hygiene cap and is
+    **independent of the budget-scaling cap below** — a run may legitimately store
+    up to 50 milestones while M2 scales the budget on only the first N of them.
+  - **The budget hard ceiling (the open Phase-1 decision above) is now set:
+    profile "Generous" — milestone-count cap 12, total turn ceiling
+    `RUN_MAX_ITERATIONS × min(n, 12)` (so ≤ 60 turns), absolute wall-clock ceiling
+    8h.** A single-milestone plan stays exactly at today's 5 turns / 2h; the 10m
+    idle timeout remains the real stall detector. M2 enforces the count cap
+    **server-side** (Decision 12's chokepoint), not worker-side, since a
+    worker-side cap is not a control. Decision 5 (the scaling formula) and Decision
+    5b (the persisted per-run effective timeout that `SweepRunningTimeout` must
+    honour, plus the run-health "slow" clamp) are M2's load-bearing halves — the
+    server change is what makes the wall-clock scale real, since the sweeper, not
+    the worker, is the enforcement.
+- **2026-08-07 — M2 landed (MR !195), Phase 1 backend complete.** M2 shipped via a
+  seeded uzi run (`1de50700`) with migration `00099_run_milestone_progress.sql`.
+  Both halves landed and were verified against the merged diff:
+  - **Budget resize, server-authoritative.** `api/internal/workersvc/budget.go`
+    pins the Generous ceiling — `milestoneBudgetCap = 12`,
+    `budgetWallCeilingSeconds = 8h` — and the freeze SQL derives
+    `budget_max_iterations = run_max_iterations × LEAST(frozen_count, 12)` and
+    `budget_wall_seconds = LEAST(run_timeout × LEAST(frozen_count, 12), 8h)`,
+    written idempotently via `COALESCE` at BOTH the human-approve
+    (`CreateApprovePlanInput`) and autopilot (`SetRunRunning`) freeze paths, and
+    NULL for a 0/1-milestone run so single-milestone budgets are byte-for-byte
+    today's (5 turns / 2h). The cap is applied in the freeze SQL, not worker-side.
+  - **Decision 5b done correctly.** `SweepRunningTimeout` now compares
+    `started_at` against a PER-RUN cutoff
+    (`now - make_interval(secs => COALESCE(budget_wall_seconds, global_timeout))`),
+    and `budget_wall_seconds` rides the running-run health read so the "slow" clamp
+    follows the effective timeout — a scaled run is not swept at 2h and is not
+    flagged slow for its whole life. The 8h ceiling is enforced at the WRITE
+    (freeze) path, with a source comment warning future writers to keep it there.
+  - **Progress: Decision 3.** `milestones_completed` is UNIONED (dedup via
+    `jsonb_agg(DISTINCT …)`), `milestones_in_progress` is OVERWRITTEN, a NULL param
+    leaves the column untouched, and every reported id is membership-checked against
+    the frozen list server-side before the write (Decision 12's M2 half). Live-DB
+    integration test (`run_milestone_progress_integration_test.go`, +337) covers it.
+  - **Still no UI** (M3/M4/M5 unbuilt). The remaining Phase-1 milestones were
+    deliberately NOT seeded — the maintainer redirected to the M8 work below.
+- **2026-08-07 — M8 (per-checkpoint origin publish) reopened and re-designed to a
+  SERVER-SIDE PUSH BROKER (design agreed; PRD Decision 8/14 + M8 rewrite pending).**
+  At the maintainer's direction ("I want per-checkpoint publish, as secure as
+  possible"), a three-agent code-grounded security review (researcher + auditor +
+  architect) reached a unanimous recommendation. The auditor **demonstrated** that
+  reap-then-push does NOT close the vector on single-uid k8s: `killAgentTree`
+  process-group-kills only the SDK CLI pid, so a `setsid`/new-session child escapes
+  the reap and can read the push child's `/proc/environ` (agent uid == worker uid
+  == 10001). Chosen design: the worker ships its credential-free pack
+  (`origin/<b>..refs/uzi-runner/<b>`, already in its bare from #218's
+  `fetchAgentBranch`) to a new authorization-scoped
+  `POST /api/worker/runs/{id}/publish`, and the api pushes with the PAT it already
+  decrypts — no PAT-bearing git child ever runs under the agent-reachable uid
+  (spatial closure, strictly stronger than reap-then-push's temporal closure).
+  Rejected: Infisical agent-vault (needs a separate-pod/egress isolation single-uid
+  k8s can't give, and moves push capability to the agent) and scoped tokens (the
+  Developer bot can't mint them). **go-git spike (2026-08-07): `PushOptions.Options`
+  in the go-git source confirms the client can send `ci.skip`** (the field TYPE was
+  recorded here as `[]string` and is actually `map[string]string` in v5.19.2 —
+  corrected 2026-08-08, see the entry below), so the
+  api push client stays pure-Go and the api image stays distroless-static — no git
+  binary needed. Fallback if a real-forge push proves fragile: Option A (worker
+  reap-then-push hardened with `hidepid=2` + a cgroup reap that catches the setsid
+  escape). ADR `adr/0122-checkpoint-push-broker.md` to be authored on approval of
+  the Decision 8/14 rewrite.
+- **2026-08-08 — local pre-seed validation (P1/P2/P3); M8 ref-target fork resolved
+  (Decision 15); a go-git type claim corrected. No code changed.** Before seeding M6/M8
+  to uzi, three local probes were run so the seeded lead inherits a closed design
+  rather than an open architecture call. All forge probes left `vtmocanu/uzi` clean
+  (throwaway refs created then deleted).
+  - **P1 (forge, GitLab) — custom-ref viability.** A `git push` of
+    `refs/uzi-checkpoints/_probe` to `gitlab.example.com:vtmocanu/uzi` was ACCEPTED
+    and created ZERO pipelines (`pipelines?ref=…` → `[]`), while `refs/heads/main`
+    pushes do create one. → the forge-agnostic ref-target route is real; **Decision
+    15** records it and M8's "Open design question" is closed for GitLab. Pushed as
+    Owner (access_level 50, `uzi-bot-vmocanu` is Developer=30); the Developer-bot
+    residual is noted in Decision 15.
+  - **P2 (go-git) — broker feasibility + a doc correction.** A throwaway pure-Go
+    spike (go-git v5.19.2, no git binary) did a full smart-HTTP send-pack over HTTPS
+    to `gitlab.example.com` (push custom ref → verify → delete). → the api broker
+    (Decision 14) is feasible and the api image stays distroless-static. **It also
+    falsified the "confirmed in source" TYPE claim:** `PushOptions.Options` is
+    `map[string]string`, not `[]string` (wire-encoded as `[]*Option`); corrected in
+    Decision 14 and the 2026-08-07 log entry above. Moot for the shipped design —
+    Decision 15 uses no push-option — but the record was wrong, so it was fixed.
+  - **P3 (live DB, dev-cluster) — requeue urgency.** Read-only aggregate on the uzi
+    CNPG DB: 5 of 80 runs (6.25%) ever requeued, `max(requeue_count)=1`; only 2 of 80
+    (2.5%) reached implement (`iteration_count ≥ 2`) when requeued, and
+    `requeue_count` can't split same- vs different-worker, so 2.5% is an UPPER bound
+    on M8's addressable population. Folded into the M6 Risks bullet. Confirms M8 is
+    LOW-urgency (the maintainer wants it anyway), and Phase 1 is the feature.
+  Next: seed **M6** (checkpoint tool + reap + #218's `fetchAgentBranch`), then **M8**
+  (broker, Decisions 14 + 15). ADR `adr/0122` updated the same day (Decision-15
+  target ref, type correction).
+- **2026-08-08 — M6 landed via a seeded uzi run; M8 seeded and in flight (dogfood).**
+  Executing the maintainer's M6→M8 plan through the factory itself: author a standalone
+  plan against a fresh HEAD code-map, seed it (`uzi run create --plan-file`), watch,
+  review the MR, merge on green.
+  - **M6 shipped — MR !199, seeded run `8593f1ed`, merged to `main` (`13ffc6e3`).** The
+    agent-only delta recorded in the M6 milestone note above. Reviewed clean: the
+    main-thread `scanSignals` guard (a subagent can't force a checkpoint), the
+    reap-before-(credential-free)-fetch ordering, the null-safe no-op tip check, and the
+    issue-only gating are all intact; `git.ts:branchTip` reads the runner-owned clone via
+    `runGitAsRunner` (B2-aware) rather than the worker uid. CI green. One minor,
+    non-blocking deviation from the seed plan: the iteration-boundary fallback checkpoint
+    sits *after* the `maxIterations` throw, so the cap-tripping iteration gets no final
+    fetch-back — a marginal durability edge, not a bug.
+  - **M8 seeded — seeded run `8ab087df`, in progress (NOT merged; M8 checkbox stays
+    `[ ]`).** The plan pins the load-bearing invariants for the cold lead: authorization
+    derived server-side from `(runID, worker)` (never worker-supplied repo/branch), a
+    never-forced push to `refs/uzi-checkpoints/<branch>` (Decision 15), the api's pure-Go
+    go-git fetch-base→apply-delta→push flow (distroless-static preserved), the third
+    reseed input for cross-worker recovery, and best-effort semantics (a publish failure
+    never fails the run). M8's MR will get an extra **auditor** pass — PAT never enters a
+    worker git child; push non-forced; authorization not worker-trusted — before merge.
+  - **Issue lifecycle:** each milestone MR carries `Closes #122`, which re-closes the
+    issue on merge; it is reopened after, since #122 stays open until every milestone
+    (including the M3/M4/M5 UI) lands.

@@ -91,11 +91,64 @@ describe("SteeringChannel", () => {
 // (FIFO) and wakes the gate.
 describe("SteeringChannel — plan revision (PRD #41)", () => {
   /** A client whose input batches are pushed on demand, so a test can interleave epoch
-   *  bumps between what the poll loop consumes. Returns [] until a batch is pushed. */
-  function pushableClient(): { client: WorkerClient; push: (b: UserInput[]) => void } {
+   *  bumps between what the poll loop consumes. Returns [] until a batch is pushed.
+   *
+   *  `consumed()` is the deterministic replacement for a bare `tick()` between a `push`
+   *  and the `bumpEpoch()` that must follow the consumption (issue #242). The poll loop
+   *  routes (and epoch-stamps) a dispensed batch synchronously BEFORE it polls again, so
+   *  any getInputs call after a dispense proves the previously dispensed batch was routed
+   *  at the epoch that was current when it was dispensed. Awaiting `consumed()` therefore
+   *  waits — with no fixed delay, so it holds under any CPU contention — until every batch
+   *  pushed so far has been routed. A bare `tick(10)` only *assumed* that finished in 10ms;
+   *  under load the input could be consumed AFTER the epoch bump and stamped one epoch too
+   *  late, which is the flake this replaces. */
+  function pushableClient(): {
+    client: WorkerClient;
+    push: (b: UserInput[]) => void;
+    consumed: () => Promise<void>;
+  } {
     const queue: UserInput[][] = [];
-    const client = { getInputs: async () => queue.shift() ?? [] } as unknown as WorkerClient;
-    return { client, push: (b) => queue.push(b) };
+    let pushedBatches = 0; // non-empty batches pushed
+    let routedBatches = 0; // non-empty batches the loop has dispensed AND routed
+    let dispensedPending = false;
+    let waiters: { need: number; resolve: () => void }[] = [];
+    const settle = (): void => {
+      waiters = waiters.filter((w) => {
+        if (routedBatches >= w.need) {
+          w.resolve();
+          return false;
+        }
+        return true;
+      });
+    };
+    const client = {
+      getInputs: async () => {
+        // Any poll after a dispense proves the prior dispensed batch was routed.
+        if (dispensedPending) {
+          dispensedPending = false;
+          routedBatches++;
+          settle();
+        }
+        const b = queue.shift();
+        if (b && b.length) {
+          dispensedPending = true;
+          return b;
+        }
+        return [];
+      },
+    } as unknown as WorkerClient;
+    return {
+      client,
+      push: (b) => {
+        if (b.length) pushedBatches++;
+        queue.push(b);
+      },
+      consumed: () =>
+        new Promise<void>((resolve) => {
+          waiters.push({ need: pushedBatches, resolve });
+          settle();
+        }),
+    };
   }
 
   it("routes revise_plan into a FIFO queue, one round per awaitGateEvent", async () => {
@@ -150,12 +203,12 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
 
   it("discards a PRIOR-epoch approve with a feed notice; a current-epoch approve lands", async () => {
     const notices: string[] = [];
-    const { client, push } = pushableClient();
+    const { client, push, consumed } = pushableClient();
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("approve_plan")]); // consumed + buffered at epoch 1
-    await tick();
+    await consumed(); // deterministically wait until it is routed at epoch 1 (issue #242)
     const e2 = ch.bumpEpoch(); // the plan was revised; epoch 1 is now stale
     // The buffered epoch-1 approve is discarded (with a notice) the moment we await epoch 2.
     const p = ch.awaitGateEvent(e2);
@@ -169,12 +222,12 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     // PRD #41 Decision 3: a stale REJECT is discarded exactly like a stale approve (only
     // cancel is epoch-exempt), but the feed wording must read correctly for a rejection.
     const notices: string[] = [];
-    const { client, push } = pushableClient();
+    const { client, push, consumed } = pushableClient();
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("reject_plan", "no thanks")]); // consumed + buffered at epoch 1
-    await tick();
+    await consumed(); // deterministically wait until it is routed at epoch 1 (issue #242)
     const e2 = ch.bumpEpoch(); // the plan was revised; the epoch-1 reject is now stale
     const p = ch.awaitGateEvent(e2);
     push([inp("approve_plan")]); // a fresh approve at epoch 2 resolves the gate
@@ -186,12 +239,12 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
 
   it("discards a stale (prior-epoch) queued revise with a feed notice", async () => {
     const notices: string[] = [];
-    const { client, push } = pushableClient();
+    const { client, push, consumed } = pushableClient();
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
     ch.bumpEpoch(); // epoch 1
     ch.start();
     push([inp("revise_plan", "old feedback")]); // queued at epoch 1
-    await tick();
+    await consumed(); // deterministically wait until it is routed at epoch 1 (issue #242)
     const e2 = ch.bumpEpoch(); // plan moved on; the queued revise is now stale
     const p = ch.awaitGateEvent(e2); // drops the stale revise (with a notice), then parks
     push([inp("approve_plan")]); // fresh approve at epoch 2 resolves the gate

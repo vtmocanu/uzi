@@ -605,6 +605,10 @@ export interface BuildInfo {
   // Commits in the history the image was built from (PRD #175 M3). Independently
   // droppable — every consumer must render correctly without it.
   commits?: number;
+  // Completed / active PRD counts in the source tree the image was built from
+  // (#245). Stamped only on a publish build, like `commits`; absent otherwise.
+  prds_done?: number;
+  prds_open?: number;
   // How long the process has been serving. A pointer server-side because 0 is a
   // legitimate uptime in a process's first second, so absent means UNKNOWN here and
   // must not be rendered as "up 0s".
@@ -2485,6 +2489,11 @@ const realApi = {
   },
   unreadNotificationCount: () =>
     request<{ unread: number }>("GET", "/notifications/unread_count"),
+  // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
+  // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')
+  // — the same scope predicate the /runs page's ListRunsForUser uses (Decision 4).
+  runsInProgressCount: () =>
+    request<{ count: number }>("GET", "/me/runs/in-progress-count"),
   markNotificationRead: (id: string) =>
     request<{ notification: Notification }>(
       "POST",

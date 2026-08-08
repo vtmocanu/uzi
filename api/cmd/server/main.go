@@ -63,31 +63,38 @@ import (
 // as the reason every version this project ships is bare.
 var version = "dev"
 
-// commit, builtAt and commits are the rest of GET /api/version's build info (PRD
-// #175), stamped from the same Dockerfile ldflags line as version:
+// commit, builtAt, commits, prdsDone and prdsOpen are the rest of GET /api/version's
+// build info (PRD #175, #245), stamped from the same Dockerfile ldflags line as
+// version:
 //
 //	-X main.commit=<full 40-char source SHA>
 //	-X main.builtAt=<RFC3339 UTC>
 //	-X main.commits=<decimal commit count>
+//	-X main.prdsDone=<decimal count of prds/done/*.md>
+//	-X main.prdsOpen=<decimal count of prds/*.md>
 //
-// commits is the one that needs history the image build does not have — the publish
-// context is api/ with no .git, and the kaniko image carries no git. CI computes it in
-// publish:assert-changelog and delivers it as a dotenv report (PRD #175 M3), which is
-// why its CI path looks nothing like the other two.
+// commits — and, for the same reason, prdsDone/prdsOpen — need what the image build
+// does not have: commits needs git history, and the PRD counts need the repo root the
+// api/ build context lacks (prds/ is never copied into the api/ image). The publish
+// context is api/ with no .git and no prds/, and the kaniko image carries neither. CI
+// computes all three in publish:assert-changelog and delivers them as a dotenv report
+// (PRD #175 M3, #245), which is why their CI path looks nothing like the other two.
 //
 // They live in THIS package because that is the only place the linker can reach: the
 // values are served from internal/handler, but -X names a package-level string var by
 // its own package path, so -X main.commit targets cmd/server and not handler.
 //
-// Only the tag (publish) build passes them, so all three are empty on a plain
+// Only the tag (publish) build passes them, so all five are empty on a plain
 // `go build`, on `docker compose build`, and on the MR/main validation image. That is
 // deliberate rather than a gap — a `dev` build's commit is not a release coordinate —
 // and an empty value is OMITTED from the response, never served as "" or as a zero
 // timestamp.
 var (
-	commit  = ""
-	builtAt = ""
-	commits = ""
+	commit   = ""
+	builtAt  = ""
+	commits  = ""
+	prdsDone = ""
+	prdsOpen = ""
 )
 
 func main() {
@@ -118,7 +125,7 @@ func healthcheck() int {
 	if err != nil {
 		return 1
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
@@ -567,7 +574,7 @@ func run() error {
 	h.SetVersion(version)
 	// The rest of the build coordinates (PRD #175). Passed raw: the handler decides
 	// what an absent or unparseable stamp means, so there is one such place.
-	h.SetBuildInfo(handler.BuildStamp{Commit: commit, BuiltAt: builtAt, Commits: commits})
+	h.SetBuildInfo(handler.BuildStamp{Commit: commit, BuiltAt: builtAt, Commits: commits, PrdsDone: prdsDone, PrdsOpen: prdsOpen})
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.

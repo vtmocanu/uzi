@@ -1,0 +1,384 @@
+<title>uzi — Runs in progress badge (mock)</title>
+<style>
+  /* Single-theme by design: this reproduces uzi's ember dark chrome
+     (color-scheme: dark in the real app), so every colour is painted
+     explicitly from the app's own tokens and the page holds on any host ground. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --danger: 251 113 133;
+    --ok: 52 211 153;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 620px at 12% -10%, rgb(var(--brand) / 0.06), transparent 60%),
+      rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  .wrap {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 40px 28px 64px;
+  }
+  .pagehead { margin-bottom: 26px; }
+  .eyebrow {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+    color: rgb(var(--faint)); margin: 0 0 8px;
+  }
+  .pagehead h1 {
+    margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  .pagehead p {
+    margin: 8px 0 0; max-width: 62ch; color: rgb(var(--muted)); font-size: 14px;
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 34px;
+    align-items: start;
+  }
+  @media (max-width: 820px) {
+    .stage { grid-template-columns: 1fr; }
+  }
+
+  /* ── The uzi sidebar (faithful) ─────────────────────────────────────────── */
+  .sidebar {
+    width: 240px;
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: 14px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 24px 60px -30px rgb(0 0 0 / 0.8);
+  }
+  .brandrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 16px; border-bottom: 1px solid rgb(var(--edge));
+  }
+  .brandmark {
+    width: 32px; height: 32px; flex: none;
+    display: grid; place-items: center;
+    border-radius: 10px;
+    background: rgb(var(--brand) / 0.15); color: rgb(var(--brand));
+    font-size: 18px;
+  }
+  .brandtext { min-width: 0; line-height: 1.15; }
+  .brandtext .b1 { display:block; font-size: 14px; font-weight: 640; letter-spacing: -0.01em; }
+  .brandtext .b2 { display:block; font-size: 11px; color: rgb(var(--faint)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .demo {
+    margin-left: auto; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+    color: rgb(var(--brand)); background: rgb(var(--brand) / 0.10);
+    border: 1px solid rgb(var(--brand) / 0.40);
+    border-radius: 6px; padding: 2px 6px;
+  }
+
+  nav { padding: 12px 8px 16px; display: flex; flex-direction: column; gap: 4px; }
+  .grouplabel {
+    padding: 16px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: rgb(var(--faint) / 0.8);
+  }
+  .navitem {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 10px; border-radius: 10px;
+    font-size: 14px; color: rgb(var(--muted));
+    text-decoration: none; cursor: default;
+  }
+  .navitem .ico { font-size: 16px; color: rgb(var(--faint)); display: inline-flex; position: relative; }
+  .navitem:hover { background: rgb(var(--raised) / 0.6); color: rgb(var(--fg)); }
+  .navitem.active { background: rgb(var(--raised)); color: rgb(var(--fg)); font-weight: 500; }
+  .navitem.active .ico { color: rgb(var(--brand)); }
+  .navitem.indent { margin-left: 16px; font-size: 13px; }
+  .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .badge {
+    margin-left: auto; min-width: 20px; text-align: center;
+    border-radius: 999px; padding: 2px 6px;
+    font-size: 10px; font-weight: 650; line-height: 1;
+    font-variant-numeric: tabular-nums;
+    background: rgb(var(--brand)); color: rgb(var(--on-brand));
+  }
+  .badge.alert { background: rgb(var(--danger)); color: rgb(var(--on-brand)); }
+
+  /* The new one gets a quiet brand ring so the eye lands on it without a loud marker. */
+  .badge.isnew {
+    box-shadow: 0 0 0 2px rgb(var(--surface)), 0 0 0 4px rgb(var(--brand) / 0.55);
+  }
+  .navitem.newrow { position: relative; }
+  .newtag {
+    position: absolute; right: 8px; top: -9px;
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.08em;
+    color: rgb(var(--brand)); background: rgb(var(--bg));
+    border: 1px solid rgb(var(--brand) / 0.5); border-radius: 999px;
+    padding: 1px 6px;
+  }
+
+  .footer { margin-top: auto; border-top: 1px solid rgb(var(--edge)); padding: 12px; }
+  .userblock { display: flex; align-items: center; gap: 10px; }
+  .avatar {
+    width: 28px; height: 28px; flex: none; border-radius: 999px;
+    display: grid; place-items: center; background: rgb(var(--raised));
+    color: rgb(var(--muted)); font-size: 12px; font-weight: 650;
+  }
+  .userblock .u1 { font-size: 12px; font-weight: 500; color: rgb(var(--fg)); }
+  .userblock .u2 { font-size: 11px; color: rgb(var(--faint)); }
+  .verbadge {
+    margin-top: 12px; display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; color: rgb(var(--faint));
+    border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 3px 8px;
+  }
+  .dot-ok { width: 6px; height: 6px; border-radius: 999px; background: rgb(var(--ok)); }
+
+  svg { width: 1em; height: 1em; display: block; }
+
+  /* ── Explainer column ───────────────────────────────────────────────────── */
+  .aside { display: flex; flex-direction: column; gap: 18px; padding-top: 4px; }
+  .card {
+    background: rgb(var(--surface)); border: 1px solid rgb(var(--edge));
+    border-radius: 14px; padding: 18px 20px;
+  }
+  .card h2 { margin: 0 0 4px; font-size: 15px; font-weight: 620; }
+  .card p { margin: 0; color: rgb(var(--muted)); font-size: 13.5px; }
+  .card p + p { margin-top: 10px; }
+  code.k {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: rgb(var(--brand-hover));
+    background: rgb(var(--raised)); border-radius: 5px; padding: 1px 5px;
+  }
+
+  .legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+  .legend li { display: flex; align-items: center; gap: 12px; }
+  .legend .lbadge {
+    min-width: 20px; text-align: center; border-radius: 999px; padding: 2px 6px;
+    font-size: 10px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums;
+    background: rgb(var(--brand)); color: rgb(var(--on-brand)); flex: none;
+  }
+  .legend .lbadge.alert { background: rgb(var(--danger)); }
+  .legend .ltext { font-size: 13px; }
+  .legend .ltext b { font-weight: 600; color: rgb(var(--fg)); }
+  .legend .ltext span { color: rgb(var(--faint)); }
+  .legend .ltext .newpill {
+    margin-left: 6px; font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
+    color: rgb(var(--brand)); border: 1px solid rgb(var(--brand) / 0.5);
+    border-radius: 999px; padding: 0 5px; vertical-align: 1px;
+  }
+
+  /* Collapsed-rail mini: the badge survives collapse as a brand dot. */
+  .railwrap { display: flex; align-items: flex-start; gap: 16px; }
+  .rail {
+    width: 52px; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge));
+    border-radius: 12px; padding: 10px 0; display: flex; flex-direction: column; gap: 6px; align-items: center;
+  }
+  .railbtn {
+    width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+    color: rgb(var(--faint)); font-size: 16px; position: relative;
+  }
+  .railbtn.active { background: rgb(var(--raised)); color: rgb(var(--brand)); }
+  .raildot {
+    position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 999px;
+    background: rgb(var(--brand)); box-shadow: 0 0 0 2px rgb(var(--surface));
+  }
+  .raildot.alert { background: rgb(var(--danger)); }
+  .railnote { font-size: 12.5px; color: rgb(var(--muted)); max-width: 30ch; }
+  .railnote b { color: rgb(var(--fg)); font-weight: 600; }
+</style>
+
+<div class="wrap">
+  <header class="pagehead">
+    <p class="eyebrow">uzi · sidebar mock</p>
+    <h1>A live count of runs in progress, right on the Runs menu item</h1>
+    <p>
+      Same treatment the sidebar already gives Notifications and Judge: a small brand
+      count pill that trails the label, driven by how many of your runs are currently
+      working (any non-terminal status). Below it collapses to a dot on the icon rail,
+      exactly like the others.
+    </p>
+  </header>
+
+  <div class="stage">
+    <!-- Faithful reproduction of web/src/components/AppShell.tsx sidebar -->
+    <aside class="sidebar" aria-label="uzi navigation (mock)">
+      <div class="brandrow">
+        <span class="brandmark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8l-7 5V8l-7 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2z"/><path d="M17 18h1M12 18h1M7 18h1"/></svg>
+        </span>
+        <span class="brandtext">
+          <span class="b1">uzi</span>
+          <span class="b2">uzinele întunecate</span>
+        </span>
+        <span class="demo" title="This is a static mock — no backend.">demo</span>
+      </div>
+
+      <nav>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg></span>
+          <span class="label">Overview</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg></span>
+          <span class="label">Notifications</span>
+          <span class="badge" aria-label="3 unread">3</span>
+        </a>
+
+        <p class="grouplabel">Work</p>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 7v10M16 7v6"/></svg></span>
+          <span class="label">Boards</span>
+        </a>
+        <a class="navitem indent">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m23.6004 9.5927-.0337-.0862L20.3.9814a.851.851 0 0 0-.3362-.405.8748.8748 0 0 0-.9997.0539.8748.8748 0 0 0-.29.4399l-2.2055 6.748H7.5375l-2.2057-6.748a.8573.8573 0 0 0-.29-.4412.8748.8748 0 0 0-.9997-.0537.8585.8585 0 0 0-.3362.4049L1.4332 9.5065l-.0325.0862-.0038.0089a6.0657 6.0657 0 0 0 2.0121 7.0105l.0111.0087.0294.0213 4.9764 3.7264 2.4624 1.8633 1.4999 1.1321a1.0085 1.0085 0 0 0 1.2192 0l1.4999-1.1321 2.4624-1.8633 5.0058-3.7489.0129-.0102a6.0682 6.0682 0 0 0 2.0119-7.003z"/></svg></span>
+          <span class="label">vtmocanu/uzi</span>
+        </a>
+        <a class="navitem indent">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M23.546 10.93 13.067.452c-.604-.603-1.582-.603-2.188 0L8.708 2.627l2.76 2.76c.645-.215 1.377-.07 1.889.441.516.515.658 1.258.438 1.9l2.658 2.66c.645-.223 1.387-.078 1.9.435.721.72.721 1.884 0 2.604-.719.719-1.881.719-2.6 0-.539-.541-.674-1.337-.404-1.996L12.86 8.955v6.525c.176.086.342.203.488.348.713.721.713 1.883 0 2.6-.719.721-1.889.721-2.609 0-.719-.719-.719-1.879 0-2.598.182-.18.387-.316.605-.406V8.835c-.217-.091-.424-.222-.6-.401-.545-.545-.676-1.342-.396-2.009L7.636 3.7.45 10.881c-.6.605-.6 1.584 0 2.189l10.48 10.477c.604.604 1.582.604 2.186 0l10.43-10.43c.605-.603.605-1.582 0-2.187"/></svg></span>
+          <span class="label">vtmocanu/uzi-web</span>
+        </a>
+        <a class="navitem active newrow" aria-current="page">
+          <span class="newtag">NEW</span>
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+          <span class="label">Runs</span>
+          <span class="badge isnew" aria-label="5 in progress">5</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z"/></svg></span>
+          <span class="label">Chat</span>
+        </a>
+
+        <p class="grouplabel">Factory</p>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="13" r="0.9" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="0.9" fill="currentColor" stroke="none"/><path d="M9 17h6"/></svg></span>
+          <span class="label">Agents</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4M3 5h4M19 17v4M17 19h4"/></svg></span>
+          <span class="label">Skills</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01M6 16.5h.01"/></svg></span>
+          <span class="label">Workers</span>
+          <span class="badge alert" aria-label="2 needing attention">2</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg></span>
+          <span class="label">Judge</span>
+          <span class="badge" aria-label="4 to triage">4</span>
+        </a>
+
+        <p class="grouplabel">Configure</p>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+          <span class="label">Settings</span>
+        </a>
+
+        <p class="grouplabel">Admin</p>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+          <span class="label">Users</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg></span>
+          <span class="label">Rate limits</span>
+        </a>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05M12 22.08V12"/></svg></span>
+          <span class="label">Tool allowlist</span>
+        </a>
+
+        <p class="grouplabel">Help</p>
+        <a class="navitem">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+          <span class="label">Docs</span>
+        </a>
+      </nav>
+
+      <div class="footer">
+        <div class="userblock">
+          <span class="avatar">V</span>
+          <span style="min-width:0;flex:1">
+            <span class="u1" style="display:block">Vlad Mocanu</span>
+            <span class="u2" style="display:block">Administrator</span>
+          </span>
+        </div>
+        <span class="verbadge"><span class="dot-ok"></span>v0.6.0</span>
+      </div>
+    </aside>
+
+    <!-- Explainer -->
+    <div class="aside">
+      <div class="card">
+        <h2>What the number means</h2>
+        <p>
+          The count of your runs that are still working — anything not
+          <code class="k">completed</code>, <code class="k">failed</code>, or
+          <code class="k">cancelled</code>. So <code class="k">queued</code>,
+          <code class="k">running</code>, <code class="k">awaiting_approval</code>,
+          <code class="k">awaiting_input</code> and <code class="k">limit_wait</code> all count.
+        </p>
+        <p>
+          Which of those to include is the one design call worth settling in the PRD —
+          e.g. whether a run parked on your approval should read as "in progress" or be
+          split out. This mock counts every non-terminal run.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>It sits beside the badges you already have</h2>
+        <ul class="legend">
+          <li>
+            <span class="lbadge">3</span>
+            <span class="ltext"><b>Notifications</b> <span>— unread</span></span>
+          </li>
+          <li>
+            <span class="lbadge">5</span>
+            <span class="ltext"><b>Runs</b> <span>— in progress</span><span class="newpill">NEW</span></span>
+          </li>
+          <li>
+            <span class="lbadge">4</span>
+            <span class="ltext"><b>Judge</b> <span>— to triage</span></span>
+          </li>
+          <li>
+            <span class="lbadge alert">2</span>
+            <span class="ltext"><b>Workers</b> <span>— need attention (red = go look now)</span></span>
+          </li>
+        </ul>
+        <p style="margin-top:14px">
+          Runs reuses the brand "count" tone (a queue to get to), not the red "alert"
+          tone the Workers badge uses for something that needs you right now.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Collapse the rail, keep the signal</h2>
+        <div class="railwrap">
+          <div class="rail" aria-label="collapsed rail (mock)">
+            <div class="railbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg><span class="raildot"></span></div>
+            <div class="railbtn active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span class="raildot"></span></div>
+            <div class="railbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01M6 16.5h.01"/></svg><span class="raildot alert"></span></div>
+            <div class="railbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg><span class="raildot"></span></div>
+          </div>
+          <p class="railnote">
+            On the icon rail there is no room for a number, so the badge becomes a
+            <b>brand dot</b> on the icon — the same fallback Notifications, Judge and
+            Workers already use. Screen readers still hear "<b>5 in progress</b>".
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

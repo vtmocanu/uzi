@@ -422,6 +422,23 @@ func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]Cons
 	return items, nil
 }
 
+const countInProgressRunsForUser = `-- name: CountInProgressRunsForUser :one
+SELECT count(*) FROM runs
+WHERE user_id = $1
+  AND kind NOT IN ('chat', 'judge')
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+// The Runs nav badge count (PRD #239): the caller's non-terminal runs, scoped to the
+// same kinds the Runs page (ListRunsForUser) shows — chat and judge excluded, so the
+// badge is a strict subset of what /runs lists.
+func (q *Queries) CountInProgressRunsForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countInProgressRunsForUser, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countOnlineWorkersForUser = `-- name: CountOnlineWorkersForUser :one
 SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 `

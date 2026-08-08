@@ -995,9 +995,22 @@ describe("SdkExecutor guardrail options", () => {
       assert.ok((o.disallowedTools ?? []).includes(t), `${t} must be disallowed`);
     }
 
-    // Three PreToolUse matchers: Bash, the file tools, and the Agent guard.
+    // Four PreToolUse matchers: Bash, the file tools, the Agent guard, and the
+    // SendMessage lead→main alias.
     const matchers = (o.hooks?.PreToolUse ?? []).map((m) => m.matcher);
-    assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent"]);
+    assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent", "SendMessage"]);
+
+    // The SendMessage alias hook is wired and rewrites a lead-alias recipient to main.
+    const sendHook = o.hooks!.PreToolUse![3]!.hooks[0]!;
+    const aliased = await sendHook(
+      { hook_event_name: "PreToolUse", tool_name: "SendMessage", tool_input: { to: "lead", message: "hi" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.strictEqual(
+      (aliased as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput?.to,
+      "main",
+    );
 
     // The Agent guard denies a subagent not in the assembled map (item 7).
     const agentHook = o.hooks!.PreToolUse![2]!.hooks[0]!;

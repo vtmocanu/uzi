@@ -16,6 +16,7 @@
 // data as a prop removes the hazard rather than working around it.
 
 import { useEffect, useId, useState } from "react";
+import type { ReactNode } from "react";
 import type { BuildInfo } from "../lib/api";
 import { cx } from "./ui";
 
@@ -177,7 +178,11 @@ function Row({
   full,
 }: {
   label: string;
-  value: string;
+  // `value` is a ReactNode, not just a string, so a row can compose coloured
+  // spans (the PRDs row renders `N done` in the accent and `· M open` faint).
+  // Backward-compatible: a string IS a ReactNode, so every existing call site is
+  // unchanged.
+  value: ReactNode;
   full?: string;
 }) {
   return (
@@ -253,6 +258,10 @@ export function BuildInfoPopover({
       ? info.uptime_seconds
       : null;
   const commit = typeof info.commit === "string" && info.commit ? info.commit : null;
+  const prdsDone =
+    typeof info.prds_done === "number" && Number.isFinite(info.prds_done) ? info.prds_done : null;
+  const prdsOpen =
+    typeof info.prds_open === "number" && Number.isFinite(info.prds_open) ? info.prds_open : null;
 
   const label = displayVersion(info.version);
   const days = ageInDays(info.founded, now);
@@ -378,6 +387,22 @@ export function BuildInfoPopover({
               and it is what fits. */}
           {commit && <Row label="Commit" value={commit.slice(0, 7)} full={commit} />}
           {uptime && <Row label="Uptime" value={uptime} />}
+          {/* Both-or-neither (#245): the count is stamped as a pair in CI and
+              travels together, so a lone field is treated as unknown and the row
+              is dropped — the same "unknown beats wrong" rule the rest of the
+              panel obeys. `done` reads in the accent, `· open` faint, per the
+              approved Variant A mockup. */}
+          {prdsDone !== null && prdsOpen !== null && (
+            <Row
+              label="PRDs"
+              value={
+                <>
+                  <span className="text-ok">{prdsDone} done</span>{" "}
+                  <span className="text-faint">· {prdsOpen} open</span>
+                </>
+              }
+            />
+          )}
         </dl>
       </div>
     </div>

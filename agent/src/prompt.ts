@@ -55,6 +55,9 @@ export const LEAD_GUARDRAIL_APPEND = [
   "per-run home/memory directory is ephemeral and torn down, and file writes outside",
   "the worktree are denied by design — `save_memory` is the only sanctioned way to",
   "carry a learning forward. Never save secrets, and never save task-specific state.",
+  "Record the DURABLE fact, never a volatile snapshot: prefer a mechanism or a",
+  "command over today's number — a test-pass count, a version tally, a ratio like",
+  "\"1156/1157\" all decay and mislead a later run. Save WHY and HOW, not the tally.",
   "",
   // PRD #88 Decision 7 — the "when to ask" bar, which is what keeps a clarification
   // channel from becoming a nag. The negative half is doing most of the work: the

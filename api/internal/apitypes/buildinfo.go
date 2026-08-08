@@ -54,6 +54,13 @@ type BuildInfoDTO struct {
 	// it is independently droppable: nothing may depend on its presence, and every
 	// consumer must render correctly without it.
 	Commits *int `json:"commits,omitempty"`
+	// PrdsDone / PrdsOpen are the count of completed (prds/done/*.md) and active
+	// (prds/*.md) PRDs in the source tree the image was built from (#245). Like
+	// Commits, they need the repo root the api/ build context lacks, so they are
+	// computed in CI and stamped via ldflags; both are omitted on an unstamped build.
+	// The consumer derives the total (done+open); there is deliberately no total stamp.
+	PrdsDone *int `json:"prds_done,omitempty"`
+	PrdsOpen *int `json:"prds_open,omitempty"`
 	// UptimeSeconds is how long this process has been serving. The only RUNTIME fact
 	// in this struct, and the only field that is a decision rather than an already-
 	// public value — see the Version handler for why it is published and what would

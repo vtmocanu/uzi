@@ -18681,3 +18681,192 @@ unchanged; this only adds a way to narrow which groups come back.
   active bucket filter. `LabelFilter` (`Judge.tsx`) ships chips with no counts; a count is a
   deliberate follow-up that would need its own aggregate, not a tally off what happens to be on
   screen.
+
+## 490. PRD #239 — the Runs nav badge counts the caller's NON-terminal, non-chat/judge runs: a strict SUBSET of the /runs page, its own endpoint, and no CLI subcommand
+
+Serves the live-run-visibility surface of human.md Feature #4 ("which agents are live/idle") as
+ambient navigation, alongside the existing Judge (§482) and Workers (§Feature #113 M6) nav badges.
+Design record: `prds/239-runs-in-progress-badge.md`. Adds an at-a-glance count of the caller's
+in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-scoped count endpoint.
+
+- **"In progress" = every NON-terminal status, not the narrower "actively working" set (Decision 1).**
+  The count is `status NOT IN ('completed','failed','cancelled')` — the six non-terminal statuses
+  the `runs_status_check` constraint enumerates (`queued`, `claimed`, `running`, `awaiting_approval`,
+  `awaiting_input`, `limit_wait`; migration 00092). Chosen over the narrower
+  `IN ('claimed','running','awaiting_approval','awaiting_input')` idiom used by the rate-limit
+  in-flight count (`anthropic_rate_limits.sql`, which excludes `limit_wait` deliberately) and over
+  the favicon "running" set: a queued or limit-parked run is still work the user has in the factory,
+  and the badge answers "how much of mine is not yet done", so the terminal-set complement is the
+  right predicate. This is also the dominant store idiom (`ListRunsForUser`, `ListActiveRunsAll` both
+  key off the same three-value terminal set). Source of truth: `CountInProgressRunsForUser` in
+  `api/internal/store/queries/runtime.sql` — one `count(*)`, no join.
+
+- **Kind scope = the /runs page's own predicate, so the badge is a strict SUBSET of the page (Decision 4).**
+  The query additionally filters `kind NOT IN ('chat','judge')`, the same kind guard `ListRunsForUser`
+  applies (which writes it aliased as `r.kind NOT IN (...)`; semantically identical), so the badge
+  counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat` or `judge` meta-run. The invariant is **same scope predicate (owner + kind-set)**, deliberately NOT
+  numeric equality with what the page renders: the /runs page also lists TERMINAL runs, so the badge
+  is a non-terminal subset of the page's list, never equal to its row count. Framed as a subset
+  because that is the property a reader can check (a badge count can never exceed, or include a kind
+  absent from, the page) — a fragile "equals the page" claim would be false the moment any run
+  completes.
+
+- **Endpoint: `GET /api/me/runs/in-progress-count` → `{ "count": <int> }`, on `RequireUser`.**
+  Handler `RunsInProgressCount` (`api/internal/handler/runs_in_progress_count.go`); mounted under a
+  `/me/runs` route with `RequireUser` (`handler.go`), mirroring `/me/judge/stats` and
+  `/me/workers/upgrade-summary` so a user-scoped CLI token can read it, not only a session cookie.
+  Owner-scoped in the DB by the query's `user_id = @user_id` filter (not a service check). Its OWN
+  lightweight endpoint rather than deriving the badge from the Runs page's data: AppShell owns the
+  poll so the badge stays live wherever the operator navigates, not only while the Runs page is
+  mounted — the same "a page-local poll is stale exactly when the operator is elsewhere" rationale
+  the Workers badge records.
+
+- **Client: AppShell polls on navigation and renders the brand `count` tone, NOT the Workers `alert` red.**
+  `api.runsInProgressCount()` (`web/src/lib/api.ts`) is polled in an AppShell `useEffect` keyed on
+  `[user, location.pathname]` — the same on-navigation cadence as the Judge badge, deliberately
+  without the Workers badge's fixed interval (an in-progress count is not an incident that must
+  surface while the operator sits still). A failed fetch keeps the last known count rather than
+  blanking to zero. The count renders on the Runs `NavItem` via the default `badge`/`count` tone
+  (brand pill = "there is a queue"), explicitly not `badgeTone="alert"` (red = "go look"), which is
+  reserved for the Workers attention badge.
+
+- **CLI: deliberately NO new command (recorded as out-of-scope, not an oversight).** `uzi run list`
+  already prints `ID KIND STATUS TITLE` and supports `--json` (`api/cmd/uzi/run.go`), so an agent or
+  script derives an in-progress tally client-side from `ListRuns`. A dedicated count subcommand would
+  duplicate the badge's purely-ambient-UI purpose with no headless capability the list verb lacks, so
+  none was added.
+
+## 491. Subagent→lead SendMessage recipient alias — a rewrite-only PreToolUse hook, clobber-guarded
+
+Serves human Feature #4 (agent runtime). improve_uzi judge rec, batch 1 bundle #1;
+completes #210 (which fixed only the builtin templates). Not a guardrail — a
+usability router that composes with §50's deny-hooks without weakening them.
+
+- **The problem is SDK-shaped, not uzi's.** A subagent addressing the orchestrator
+  by a colloquial name (`lead`/`orchestrator`/`team-lead`/`team lead`) gets the SDK's
+  "No agent named '<x>' is reachable" error; the one reachable orchestrator recipient
+  is `main`. The error string is SDK-generated, so "make the failure name reachable
+  targets" is not ours to change — the fix is a router alias.
+- **`buildSendMessageAliasHook(allowedSubagents, log)`** (`agent/src/guardrails.ts`)
+  mirrors `buildAgentGuardHook`: a PreToolUse hook wired into the `preToolUse(...)`
+  factory in `sdk-executor.ts` as `{ matcher: "SendMessage", hooks: [...] }`. The
+  factory feeds BOTH the plan and implement turns, so one wiring covers both. It
+  rewrites via `hookSpecificOutput.updatedInput` and NEVER denies.
+- **Alias set = derived floor `{lead, orchestrator, team-lead, team lead}` → `main`.**
+  Derived from `LEAD_NAME_RE` (`/^(lead|orchestrator)$/i`, agents.ts) plus the two
+  measured defect spellings in `recipient_test.go` (`team-lead`, `team lead`). Match
+  is trim + case-insensitive + EXACT on the whole trimmed value — never a substring
+  (which would clobber `team-lead-reviewer`, `co-lead`). The set can never be provably
+  exhaustive (free-text `to`); the floor is the deliberate default, every widening a
+  new clobber surface.
+- **Clobber-guard (best-practice over the naive form).** The rewrite fires ONLY when
+  no registered subagent literally owns the aliased name (case-insensitive). The
+  repo-source path (`subagentsFromTemplates`, agents.ts) can register a REAL invokable
+  subagent named `lead`/`orchestrator`/`team-lead` (`recipient_test.go`); an
+  unconditional rewrite would silently misroute a legitimate call to it.
+  `allowedSubagents` is the registered-name set, threaded in by the executor exactly
+  like `buildAgentGuardHook`'s `allowed`.
+- **Justification is user/repo-authored agents, not builtins.** Post-#210 the builtins
+  already say "SendMessage to `main`" (guarded by `recipient_test.go`), so this is pure
+  defense in depth for those; the real unprotected surface is repo-sourced
+  `.claude/agents/` and user-authored templates, plus future template drift. The chat
+  path (`chat-executor.ts`) does NOT get the hook — single-thread, no subagents.
+- **House idiom + composition.** The matcher is only a pre-filter, so the callback
+  re-checks `hook_event_name === "PreToolUse" && tool_name === "SendMessage"` and
+  returns `{}` otherwise. `SendMessage` is disjoint from the `Bash`/path/`Agent`
+  matchers — no ordering dependency, no conflict with the Agent guard. Distinct from
+  §408/§409's LEAD_NAME_RE routing, which registers a lead TEMPLATE onto the main
+  thread (opposite direction: pickup, not recipient aliasing).
+- **Verification bound.** Unit tests prove uzi EMITS the correct `updatedInput` shape
+  (`sdk-executor.test.ts` the matcher wiring; `guardrails.test.ts` the rewrite). They
+  do NOT prove the native `claude` binary APPLIES `updatedInput` for SendMessage's
+  `to` — that runtime is not JS-inspectable; a live worker-run trace is the only
+  definitive proof (nice-to-have, not a blocker). The two gating SDK claims — a
+  top-level hook fires on a subagent's call, and the SDK honours `updatedInput` for
+  `to` — were confirmed in the design wave.
+
+## 492. Memory-write guidance — steer against volatile snapshots; a warn-only save-time lint
+
+Serves human Feature #4; refines PRD #90's write policy (§321). improve_uzi judge
+rec, batch 1 bundle #3. The expensive half (stamping memories with image/toolchain
+identity + suppress-on-change) is deferred — out of this batch.
+
+- **Two prose surfaces steer the lead away from fast-decaying numeric snapshots.**
+  `LEAD_GUARDRAIL_APPEND` (`agent/src/prompt.ts`) and the `save_memory` tool
+  description + body `.describe()` (`agent/src/memory-tools.ts`) both say: record the
+  DURABLE fact — the mechanism or command, not today's number (a test-pass count, a
+  version tally, an "N of M" ratio all decay and mislead a later run).
+- **A save-time lint that WARNS, never rejects.** `makeMemoryToolHandlers.saveMemory`
+  tests the body against `VOLATILE_SNAPSHOT_RE`
+  (`/\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i`) and, on a match, appends a
+  NON-FATAL advisory nudge to the ALREADY-SUCCESSFUL save text; the entry is stored
+  either way (`isError` stays false). Warn-only is deliberate: a legitimate numeric
+  fact wears the same shape (idle timeout `120000`, CIDR `10.0.0.0/24`, date
+  `2026/08`), so the heuristic must never gate — the prose carries the rest. Do not
+  narrow the regex to chase those false positives.
+- **The lint's cost is bounded ONLY by `MEMORY_BODY_MAX_BYTES` (§321), by coupling.**
+  The alternation backtracks superlinearly on an adversarial digit run; the
+  `bytes > MEMORY_BODY_MAX_BYTES` early-return in `saveMemory` runs BEFORE the regex,
+  so `body` is always ≤ 2048 (~48ms worst case; ~0.8s at 8192). A comment at the regex
+  records that a future cap increase must revisit it — the bound is not in the regex
+  itself.
+
+## 493. PRD #245 — the PRD counts are a fourth stamped coordinate on the EXACT `commits` path, both-or-neither, and the panel stays presentational because the container cannot count
+
+`GET /api/version` gains `prds_done`/`prds_open` (`api/internal/apitypes/buildinfo.go`):
+the number of completed (`prds/done/*.md`) and active (top-level `prds/*.md`) PRDs in the
+source tree the image was built from. This is the successor to §450–453's `commits` stamp
+and inherits its whole shape rather than inventing one — the value below is *why* that
+inheritance is forced, not just convenient.
+
+- **A build-time stamp, never a runtime count, and the deployment topology is what forces
+  it.** `prds/` and `.git` are both OUTSIDE the `api/` Docker build context
+  (`docker-compose.yml` `build: ./api`; CI `UZI_BUILD_CONTEXT=$CI_PROJECT_DIR/api`;
+  `.dockerignore`), so neither the image build nor the running container can see the repo
+  root to count. The API therefore makes NO DB query and NO filesystem scan; the popover
+  stays presentational (§451's fold). The counts follow the `commits` path exactly:
+  computed in `publish:assert-changelog` on the full checkout, delivered by the SAME
+  existing `commit_count.env` dotenv (appended `>>`, not a new artifact), injected via the
+  Dockerfile ldflags line (`-X main.prdsDone`, `-X main.prdsOpen`).
+  - **Non-recursive, `.md`-only, and the `-maxdepth 1` is load-bearing, not stylistic.**
+    `find prds -maxdepth 1 -name '*.md'` / `find prds/done -maxdepth 1 …`: `prds/` holds
+    sub-directories (`done/`, `mockups/`, `43-m0-probe/`), and only `done/` holds `.md`
+    today, so a recursive open-count would fold the ~80 `done/` files back in and
+    over-count by exactly the done total. The two counts are computed by disjoint globs,
+    not by subtraction, so neither can go negative off the other.
+- **Omitted on an unstamped (dev) build, like `commit`/`built_at`/`commits`.** A dev
+  build's PRD count is not a release coordinate. "Unknown beats wrong": absent, negative
+  or non-numeric → the field is omitted (`strconv.Atoi(...) == nil && n >= 0` gate in
+  `handler.Version`), never a zero-lie — a real `0` DOES render. The value is gated on
+  BOTH sides: a numeric shape-guard in `publish:assert-changelog` before it becomes a
+  build-arg, and the `Atoi`/`>= 0` gate server-side. This discharged the CI comment's
+  standing "if you add a FIFTH stamp, give it a gate" warning — stamps five and six each
+  carry the gate; the warning now reads "seventh".
+- **Two `*int` fields, both-or-neither; the total is DERIVED in each consumer.** No third
+  `total` stamp — it would introduce a `done + open` invariant across three fields with no
+  upside, since either consumer can add. Mirrors the `Commits *int` convention: two plain
+  decimal ints keep the unquoted kaniko build-arg expansion
+  (`--build-arg UZI_PRDS_DONE=$UZI_PRDS_DONE …`) safe, and each takes its own numeric
+  guard. `TestBuildInfoDTOTags` keeps `version`+`founded` as the only always-present pair;
+  both new fields are `omitempty`.
+- **Public-by-construction, and classified explicitly rather than by silence.** Added to
+  the closed-key-set trust test (`TestVersionEndpointCarriesNothingPrivate`) with a reason:
+  a scalar count over the TRACKED tree is the same disclosure class as the commit count — a
+  build fact about the image — NOT a runtime disclosure like `uptime_seconds`, which is the
+  one field in this struct that needed a deliberate publish decision (§451). The handler
+  doc-comment states this: the PRD counts sit with `commits`/`founded` as build facts, above
+  the `uptime_seconds` boundary.
+- **Both consumers render off the ONE shared DTO under the same both-or-neither guard**
+  (CLAUDE.md CLI-parity check). The web popover renders a `PRDs` row after `Uptime`
+  (`BuildInfoPopover.tsx`, approved Variant A: `N done` in the accent `·` `M open` faint),
+  and `uzi version` prints one `prds` line off the shared `apitypes.BuildInfoDTO`
+  (`api/cmd/uzi/version.go serverRows`). Both drop the row when either field is nil, so a
+  lone field reads as unknown, never half-known. The exact glyphs differ by medium (CLI
+  `"N done, M open"`, panel coloured spans) — the invariant is the guard and the single
+  source, not the punctuation, mirroring §452's "consumers may render differently on
+  purpose". `Row`'s `value` prop widened `string`→`ReactNode` so the panel can compose the
+  two coloured spans; a string is a `ReactNode`, so every existing call site is unchanged.
+- **Not delivered / out of scope:** no signed-out exposure change (the popover audience is
+  unchanged from §453), no `total` field, no per-PRD breakdown, and no e2e/compose coverage
+  of the stamped values — like `commits`, the counts appear only on a tag pipeline, so the
+  §450 post-merge observation point is the only place a stamping regression is visible.
