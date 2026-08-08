@@ -44,6 +44,15 @@ export const SAVE_MEMORY_TOOL = "save_memory";
 export const MEMORY_TITLE_MAX_BYTES = 200;
 export const MEMORY_BODY_MAX_BYTES = 2048;
 
+/**
+ * Obvious "volatile snapshot" shapes a durable memory should NOT be built around:
+ * a test-pass/fail count ("1156 pass"), a ratio ("1156/1157"), or an "N of M"
+ * tally. A match appends a NON-FATAL nudge to the (already-successful) save — it
+ * NEVER rejects, because a legitimate numeric fact can wear the same shape; the
+ * memory is stored either way. Complements the tool-description/prompt guidance.
+ */
+const VOLATILE_SNAPSHOT_RE = /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i;
+
 /** The qualified tool name to allow/deny by (extraTools / subagent deny). */
 export function memoryToolNames(): string[] {
   return [`mcp__${MEMORY_SERVER_NAME}__${SAVE_MEMORY_TOOL}`];
@@ -123,8 +132,13 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
       }
       try {
         const entry = await client.saveMemory(runId, { title, body });
+        // The memory IS saved (isError stays false); this only appends an advisory
+        // nudge when the body looks like a fast-decaying tally, never a rejection.
+        const snapshotNudge = VOLATILE_SNAPSHOT_RE.test(body)
+          ? " Note: this reads like a volatile snapshot figure (a count, ratio, or \"N of M\" tally). It is saved, but prefer recording the durable fact — the mechanism or command, not today's number, which decays and misleads a later run."
+          : "";
         return asText(
-          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.`,
+          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}`,
         );
       } catch (err) {
         log.warn("save_memory tool failed", { run_id: runId, error: errMessage(err) });
@@ -159,7 +173,9 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
           "It is persisted server-side; you cannot read it back this run. Do NOT save secrets",
           "or anything sensitive. The per-run home/memory directory is ephemeral and file",
           "writes outside the worktree are denied — this tool is the ONLY sanctioned way to",
-          "persist a note. Keep the title short and the body a couple of sentences.",
+          "persist a note. Record the DURABLE fact, not a volatile snapshot: prefer a mechanism",
+          "or command over today's number (a test-pass count, a version tally, an \"N of M\" ratio",
+          "all decay and mislead a later run). Keep the title short and the body a couple of sentences.",
         ].join(" "),
         {
           title: z
@@ -175,7 +191,7 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
             .refine((s) => Buffer.byteLength(s, "utf8") <= MEMORY_BODY_MAX_BYTES, {
               message: `body must be at most ${MEMORY_BODY_MAX_BYTES} bytes`,
             })
-            .describe(`The durable fact to remember (≤${MEMORY_BODY_MAX_BYTES} bytes).`),
+            .describe(`The durable fact to remember, not a volatile snapshot like a test-pass count or version tally (≤${MEMORY_BODY_MAX_BYTES} bytes).`),
         },
         (args) => h.saveMemory(args),
       ),

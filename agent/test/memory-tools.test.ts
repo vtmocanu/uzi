@@ -62,6 +62,26 @@ describe("save_memory handler (PRD #90 M2)", () => {
     assert.match(bodyText(res), /advisory/i);
   });
 
+  it("appends a NON-FATAL nudge when the body reads like a volatile snapshot (still saves)", async () => {
+    for (const body of ["1156 pass, 0 fail", "1156/1157 green", "1 of 227 suites failed", "3 fail after the fix"]) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "t", body });
+      assert.strictEqual(calls.saveMemory.length, 1, `${body} must still be POSTed`);
+      assert.notStrictEqual(res.isError, true, `${body} must NOT be rejected`);
+      assert.match(bodyText(res), /Saved cross-run memory/);
+      assert.match(bodyText(res), /volatile snapshot/i, `${body} should trigger the nudge`);
+    }
+  });
+
+  it("does NOT nudge a legitimate durable fact that carries no snapshot shape", async () => {
+    for (const body of ["gcc is baked in; no build-essential needed", "set GOFLAGS=-buildvcs=false in linked worktrees"]) {
+      const { client } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "t", body });
+      assert.notStrictEqual(res.isError, true);
+      assert.doesNotMatch(bodyText(res), /volatile snapshot/i, `${body} must not trigger the nudge`);
+    }
+  });
+
   it("rejects an empty title/body client-side with a tool error and NO network call", async () => {
     const { client, calls } = fakeClient();
     const noTitle = await handlers(client).saveMemory({ title: "   ", body: "x" });
