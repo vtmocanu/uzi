@@ -1,0 +1,340 @@
+<title>Run duration on the Runs page — mock</title>
+<style>
+  /* Faithful to uzi's default "ember" dark theme (web/src/index.css + the committed
+     251-worker-uptime mock). Single-theme on purpose: this mocks a dark product UI,
+     so it paints its own ground + every color explicitly and holds on any host bg. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    padding: 2rem 1.25rem 3rem;
+  }
+  .page { max-width: 56rem; margin: 0 auto; }
+
+  /* ── Page header (matches PageHeader) ─────────────────────────────────────── */
+  h1.title { margin: 0 0 0.3rem; font-size: 1.5rem; font-weight: 650; letter-spacing: -0.01em; }
+  .subtitle { margin: 0 0 1.5rem; font-size: 0.9rem; color: rgb(var(--muted)); }
+
+  /* ── Annotation strip (frames the mock; not part of the app) ─────────────── */
+  .note {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem;
+    margin-bottom: 1.75rem; padding: 0.85rem 1rem;
+    border: 1px solid rgb(var(--brand) / 0.35);
+    background: rgb(var(--brand) / 0.07);
+    border-radius: var(--radius);
+    font-size: 0.8125rem; color: rgb(var(--muted));
+  }
+  .note strong { color: rgb(var(--fg)); font-weight: 600; }
+  .note .mono { font-family: var(--mono); }
+  .note .spacer { flex: 1; }
+  .toggle {
+    appearance: none; cursor: pointer; font: inherit; font-size: 0.75rem;
+    color: rgb(var(--fg)); background: rgb(var(--raised));
+    border: 1px solid rgb(var(--edge-strong)); border-radius: 0.5rem;
+    padding: 0.4rem 0.75rem; white-space: nowrap;
+  }
+  .toggle:hover { border-color: rgb(var(--brand) / 0.6); }
+  .toggle:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+
+  /* ── Section title (matches SectionTitle) ─────────────────────────────────── */
+  .section-title {
+    margin: 1.5rem 0 0.6rem; font-size: 0.6875rem; font-weight: 600;
+    letter-spacing: 0.09em; text-transform: uppercase; color: rgb(var(--muted));
+  }
+  .section-title:first-of-type { margin-top: 0; }
+
+  /* ── Run row (matches RunRow: Link -> flex justify-between) ────────────────── */
+  ul.runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .row {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem;
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / 0.4);
+    border-radius: var(--radius); padding: 0.65rem 0.75rem;
+    text-decoration: none; color: inherit; cursor: pointer;
+    transition: border-color 0.15s, background-color 0.15s;
+  }
+  .row:hover { border-color: rgb(var(--edge-strong)); background: rgb(var(--raised) / 0.7); }
+  .row-main { min-width: 0; flex: 1; }
+  .row-title {
+    font-size: 0.875rem; font-weight: 500; color: rgb(var(--fg));
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40rem;
+  }
+  .meta {
+    margin-top: 0.15rem; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 0.1rem 0.5rem; font-size: 0.75rem; color: rgb(var(--faint));
+  }
+  .meta .mono { font-family: var(--mono); }
+  .meta .cost { color: rgb(var(--brand) / 0.9); font-family: var(--mono); }
+
+  /* The prototype token — the run's duration, on every row */
+  .dur {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    transition: outline-color 0.2s, background-color 0.2s, color 0.2s;
+    border-radius: 3px; padding: 0 2px;
+  }
+  body.highlight .dur {
+    outline: 1px solid rgb(var(--brand) / 0.9);
+    background: rgb(var(--brand) / 0.14);
+    color: rgb(var(--fg));
+  }
+
+  .row-side { display: flex; align-items: center; gap: 0.4rem; }
+
+  /* ── Status pill (matches StatusPill tones) ───────────────────────────────── */
+  .pill {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-size: 0.72rem; font-weight: 500; line-height: 1;
+    padding: 0.3rem 0.55rem; border-radius: 0.4rem; border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .p-ok      { color: rgb(var(--ok));     border-color: rgb(var(--ok) / 0.4);     background: rgb(var(--ok) / 0.1); }
+  .p-info    { color: rgb(var(--info));   border-color: rgb(var(--info) / 0.4);   background: rgb(var(--info) / 0.1); }
+  .p-warn    { color: rgb(var(--warn));   border-color: rgb(var(--warn) / 0.4);   background: rgb(var(--warn) / 0.1); }
+  .p-danger  { color: rgb(var(--danger)); border-color: rgb(var(--danger) / 0.4); background: rgb(var(--danger) / 0.1); }
+  .p-queue   { color: rgb(var(--faint));  border-color: rgb(var(--edge-strong));  background: rgb(var(--raised)); }
+  .p-neutral { color: rgb(var(--muted));  border-color: rgb(var(--edge));         background: rgb(var(--raised)); }
+  @media (prefers-reduced-motion: no-preference) { .pulse { animation: pulse 1.8s ease-in-out infinite; } }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+  /* Past-runs disclosure (matches the "Show past runs (N)" button) */
+  .disclosure {
+    appearance: none; cursor: pointer; font: inherit;
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase;
+    color: rgb(var(--faint)); background: none; border: none; padding: 0; margin: 1.25rem 0 0.6rem;
+  }
+  .disclosure:hover { color: rgb(var(--muted)); }
+  .disclosure svg { width: 12px; height: 12px; }
+  .past.collapsed { display: none; }
+
+  /* ── Decisions footer ─────────────────────────────────────────────────────── */
+  .decisions {
+    margin-top: 2rem; border: 1px solid rgb(var(--edge));
+    background: rgb(var(--raised) / 0.4); border-radius: var(--radius);
+    padding: 1.1rem 1.25rem;
+  }
+  .decisions h2 { margin: 0 0 0.75rem; font-size: 0.95rem; font-weight: 600; }
+  .decisions dl { margin: 0; display: grid; grid-template-columns: minmax(9rem, 13rem) 1fr; gap: 0.5rem 1.25rem; }
+  .decisions dt { font-size: 0.8rem; font-weight: 600; color: rgb(var(--fg)); }
+  .decisions dd { margin: 0; font-size: 0.8rem; color: rgb(var(--muted)); }
+  .decisions dd .mono, .decisions dt .mono { font-family: var(--mono); color: rgb(var(--fg)); }
+  .bugnote {
+    margin-top: 1rem; padding: 0.75rem 0.9rem; font-size: 0.8rem;
+    border: 1px solid rgb(var(--danger) / 0.35); background: rgb(var(--danger) / 0.07);
+    border-radius: 0.5rem; color: rgb(var(--muted));
+  }
+  .bugnote strong { color: rgb(var(--danger)); }
+  .bugnote .mono { font-family: var(--mono); color: rgb(var(--fg)); }
+</style>
+
+<div class="page">
+  <h1 class="title">Runs</h1>
+  <p class="subtitle">Your agent runs. Open one to watch it live.</p>
+
+  <div class="note">
+    <span><strong>The new bit:</strong> a <span class="mono">running 1h 30m</span> / <span class="mono">waiting 34m</span> /
+      <span class="mono">queued 4m</span> / <span class="mono">ran 42m</span> token on each row's meta line, so you see how long
+      a run has been going without opening it. Web-only — the row already receives <span class="mono">started_at</span> /
+      <span class="mono">finished_at</span>. Ticks live for active runs (this mock is ticking now).</span>
+    <span class="spacer"></span>
+    <button class="toggle" id="hl" aria-pressed="false">Highlight the new bit</button>
+  </div>
+
+  <h2 class="section-title">Active</h2>
+  <ul class="runs">
+    <!-- The run from the screenshot (#193), now carrying its duration -->
+    <li>
+      <a class="row" href="#">
+        <div class="row-main">
+          <div class="row-title">A working run reads as stalled and idle: run health 'slow' paints the active lane amber, and lane headers show open time instead of last activity</div>
+          <div class="meta">
+            <span class="mono">vtmocanu/uzi #193</span>
+            <span>· <span class="mono">base.l-da4a</span></span>
+            <span>· 08/08/2026, 17:39:36</span>
+            <span>· <span class="dur" data-since="5400" data-verb="running">running 1h 30m</span></span>
+            <span class="mono">· 1.33M tok so far</span>
+            <span class="cost">· $4.10</span>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="pill p-info pulse"><span class="dot"></span>running</span>
+        </div>
+      </a>
+    </li>
+
+    <!-- awaiting approval — the duration that matters most: it's parked on YOU -->
+    <li>
+      <a class="row" href="#">
+        <div class="row-main">
+          <div class="row-title">Forgejo driver: sync MR labels on state change</div>
+          <div class="meta">
+            <span class="mono">vtmocanu/uzi #408</span>
+            <span>· <span class="mono">laptop</span></span>
+            <span>· 08/08/2026, 18:35:12</span>
+            <span>· <span class="dur" data-since="2040" data-verb="waiting">waiting 34m</span></span>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="pill p-warn">awaiting approval</span>
+        </div>
+      </a>
+    </li>
+
+    <!-- queued, unclaimed -->
+    <li>
+      <a class="row" href="#">
+        <div class="row-main">
+          <div class="row-title">Rate-limit the worker heartbeat endpoint</div>
+          <div class="meta">
+            <span class="mono">vtmocanu/uzi #415</span>
+            <span>· unclaimed</span>
+            <span>· 08/08/2026, 19:05:41</span>
+            <span>· <span class="dur" data-since="240" data-verb="queued">queued 4m</span></span>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="pill p-queue">queued</span>
+        </div>
+      </a>
+    </li>
+  </ul>
+
+  <button class="disclosure" id="pastBtn" aria-expanded="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" id="chev"><path d="M6 9l6 6 6-6"/></svg>
+    <span id="pastLabel">Past runs</span>
+  </button>
+  <ul class="runs past" id="past">
+    <li>
+      <a class="row" href="#">
+        <div class="row-main">
+          <div class="row-title">Version popover: PRD counts</div>
+          <div class="meta">
+            <span class="mono">vtmocanu/uzi #245</span>
+            <span>· <span class="mono">laptop</span></span>
+            <span>· 08/08/2026, 15:58:02</span>
+            <span>· <span class="dur">ran 42m</span></span>
+            <span class="mono">· 812K tok</span>
+            <span class="cost">· $2.35</span>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="pill p-ok"><span class="dot"></span>completed</span>
+        </div>
+      </a>
+    </li>
+    <li>
+      <a class="row" href="#">
+        <div class="row-main">
+          <div class="row-title">Runs-in-progress badge</div>
+          <div class="meta">
+            <span class="mono">vtmocanu/uzi #238</span>
+            <span>· <span class="mono">nas-runner</span></span>
+            <span>· 08/08/2026, 14:11:20</span>
+            <span>· <span class="dur">ran 12m</span></span>
+          </div>
+        </div>
+        <div class="row-side">
+          <span class="pill p-danger"><span class="dot"></span>failed</span>
+        </div>
+      </a>
+    </li>
+  </ul>
+
+  <!-- ── Design decisions to review ───────────────────────────────────────────── -->
+  <div class="decisions">
+    <h2>What to decide (review mock — nothing built yet)</h2>
+    <dl>
+      <dt>What each duration means</dt>
+      <dd><span class="mono">queued</span> = since created · <span class="mono">running</span> = since started · <span class="mono">waiting</span> = time parked in the current state (awaiting approval / your answer / a usage limit) · <span class="mono">ran</span> = total started→finished (static).</dd>
+
+      <dt>Keep the timestamp?</dt>
+      <dd>Shown here <em>alongside</em> the existing <span class="mono">08/08/2026, 17:39:36</span>. Option: replace it — for an active run "how long" is more useful than a wall-clock "last updated". Your call.</dd>
+
+      <dt>Live vs static</dt>
+      <dd>Active rows tick (the list already reloads; a light client timer keeps seconds honest between reloads). Past rows show a fixed total.</dd>
+
+      <dt>Format</dt>
+      <dd>Rolls over to hours: <span class="mono">44s → 8m → 1h 30m → 2d 4h</span>. Never bare <span class="mono">90m</span>.</dd>
+
+      <dt>Scope</dt>
+      <dd>Web-only. All needed timestamps are already on the row DTO (<span class="mono">RunListItemDTO → RunDTO</span>). Same treatment fits the admin "Active runs · all users" list on this page.</dd>
+    </dl>
+
+    <div class="bugnote">
+      <strong>Confirmed bug, fixing separately:</strong> the <span class="mono">90m</span> you saw is real, but it's <em>inside</em> a run, not on this list.
+      <span class="mono">formatDuration</span> (RunEvent.tsx) is the one duration helper that never rolls to hours — it powers the run header,
+      the Duration stat, and the run-history rows, so a 90-min run shows <span class="mono">90m 00s</span> and a 2-hour run <span class="mono">120m 00s</span>.
+      Fix = add an hour tier (<span class="mono">1h 30m 00s</span>). This list will use the rolling format from the start.
+    </div>
+  </div>
+</div>
+
+<script>
+  const btn = document.getElementById("hl");
+  btn.addEventListener("click", () => {
+    const on = document.body.classList.toggle("highlight");
+    btn.setAttribute("aria-pressed", String(on));
+    btn.textContent = on ? "Show it integrated" : "Highlight the new bit";
+  });
+
+  // Past-runs disclosure
+  const pastBtn = document.getElementById("pastBtn");
+  const past = document.getElementById("past");
+  const chev = document.getElementById("chev");
+  const pastLabel = document.getElementById("pastLabel");
+  pastBtn.addEventListener("click", () => {
+    const open = past.classList.toggle("collapsed") === false;
+    pastBtn.setAttribute("aria-expanded", String(open));
+    chev.innerHTML = open ? '<path d="M6 9l6 6 6-6"/>' : '<path d="M9 6l6 6-6 6"/>';
+    pastLabel.textContent = open ? "Past runs" : "Show past runs (2)";
+  });
+
+  // Duration format — identical rules to the app's formatElapsed (rolls to hours),
+  // extended with a day tier like formatUptimeSince.
+  function fmt(totalSec) {
+    const s = Math.max(0, Math.floor(totalSec));
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + "h " + (m % 60) + "m";
+    const d = Math.floor(h / 24);
+    return d + "d " + (h % 24) + "h";
+  }
+
+  // Live-tick the active rows so the durations advance in the browser.
+  const live = [...document.querySelectorAll(".dur[data-since]")].map((el) => ({
+    el, verb: el.getAttribute("data-verb"),
+    base: parseInt(el.getAttribute("data-since"), 10), t0: Date.now(),
+  }));
+  function render() {
+    const now = Date.now();
+    for (const c of live) c.el.textContent = c.verb + " " + fmt(c.base + (now - c.t0) / 1000);
+  }
+  render();
+  setInterval(render, 1000);
+</script>
