@@ -4090,22 +4090,35 @@ UPDATE runs SET
     repo_agents      = COALESCE($3::jsonb, repo_agents),
     agent_source     = COALESCE($4, agent_source),
     agent_exclusions = COALESCE($5::jsonb, agent_exclusions),
-    -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself.
-    -- Written IMMUTABLY — COALESCE keeps the EXISTING value, so a later ` + "`" + `running` + "`" + `
-    -- report can never overwrite a frozen list. Only the first report that carries
-    -- one wins; the common heartbeat omits it and passes NULL, leaving it untouched
-    -- (a human-gated run freezes through CreateApprovePlanInput instead).
-    milestones_frozen = COALESCE(milestones_frozen, $6::jsonb),
+    -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
+    -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
+    -- IMMUTABLY — COALESCE keeps the EXISTING value, so a later ` + "`" + `running` + "`" + ` report can
+    -- never overwrite a frozen list. Three sources, in priority order:
+    --   1. milestones_frozen — an already-frozen list is never disturbed (immutability).
+    --   2. narg('milestones_frozen') — the AUTOPILOT path: the worker sends its resolved
+    --      list on the (self-contained) running report, since an autopilot run never
+    --      reports awaiting_approval and so has no candidate column set.
+    --   3. milestones_candidate — the HUMAN-GATED safety net. CreateApprovePlanInput is
+    --      the primary freeze for that path (candidate→frozen at approve), but issue #259
+    --      observed that freeze reading a NOT-YET-VISIBLE candidate and freezing NULL,
+    --      leaving an approved milestone run with candidate set and frozen NULL — so the
+    --      progress UI never lit up. This clause makes the FIRST post-approval running
+    --      report re-freeze from the candidate column, closing that gap idempotently. It
+    --      cannot fire prematurely: the WHERE guard below only admits awaiting_approval →
+    --      running once an approve_plan input was consumed, and during planning the
+    --      candidate column is still NULL. The common heartbeat leaves an already-frozen
+    --      value untouched via clause 1.
+    milestones_frozen = COALESCE(milestones_frozen, $6::jsonb, milestones_candidate),
     -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
     -- budget is byte-for-byte the global default. Count capped at milestone_budget_cap,
     -- wall capped at budget_wall_ceiling_seconds. Frozen source = same COALESCE as above.
     budget_max_iterations = COALESCE(budget_max_iterations,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb)), 0) <= 1 THEN NULL
-             ELSE $7::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb)), $8::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+             ELSE $7::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), $8::int) END),
     budget_wall_seconds = COALESCE(budget_wall_seconds,
-        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb)), 0) <= 1 THEN NULL
-             ELSE LEAST($9::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb)), $8::int), $10::int) END),
+        CASE WHEN COALESCE(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), 0) <= 1 THEN NULL
+             ELSE LEAST($9::int * LEAST(jsonb_array_length(COALESCE(milestones_frozen, $6::jsonb, milestones_candidate)), $8::int), $10::int) END),
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
     -- Ids are validated + membership-checked server-side (progressParams) before here.

@@ -134,6 +134,75 @@ func TestRunMilestonesLifecycleLiveDB(t *testing.T) {
 		}
 	})
 
+	// ── Issue #259: the human-gated approve-time freeze can read a candidate that is
+	//    not yet visible to it and freeze NULL, leaving an APPROVED run with candidate
+	//    set and frozen NULL — so the progress UI never lights up. The first
+	//    post-approval `running` report must re-freeze from the candidate column (the
+	//    SetRunRunning safety net) and derive the budget at the same freeze. ──
+	t.Run("running report freezes candidate when approve missed it (issue #259)", func(t *testing.T) {
+		gateRun := uuid.New()
+		// The exact #259 row state: approved (an approve_plan input was consumed, which
+		// the awaiting_approval → running guard requires) but frozen still NULL.
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, kind, milestones_candidate)
+			 VALUES ($1, $2, $3, 9, 't', 'd', 'awaiting_approval', $4, 'issue', $5)`,
+			gateRun, userID, repoID, wkr.ID, candidateJSON)
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at)
+			 VALUES ($1, 'approve_plan', '{}', now())`, gateRun)
+		if got := milestones(gateRun, "milestones_frozen"); got != nil {
+			t.Fatalf("precondition: frozen must be NULL before the running report, got %s", got)
+		}
+
+		// The first post-approval running report re-freezes candidate → frozen.
+		rows, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: gateRun, WorkerID: workerID, IterationCount: 1,
+			RunMaxIterations: 5, RunTimeoutSeconds: 7200,
+			MilestoneBudgetCap: 12, BudgetWallCeilingSeconds: 28800,
+		})
+		if err != nil || rows != 1 {
+			t.Fatalf("SetRunRunning: rows=%d err=%v", rows, err)
+		}
+		if got := milestones(gateRun, "milestones_frozen"); string(got) != string(candidateJSON) {
+			t.Fatalf("frozen after running report = %s, want the candidate list frozen", got)
+		}
+		// The budget is derived at the same freeze from the now-frozen count (2 milestones):
+		// run_max_iterations(5) * LEAST(2, cap 12) = 10.
+		var maxIters pgtype.Int4
+		if err := pool.QueryRow(ctx, `SELECT budget_max_iterations FROM runs WHERE id = $1`, gateRun).Scan(&maxIters); err != nil {
+			t.Fatalf("read budget_max_iterations: %v", err)
+		}
+		if !maxIters.Valid || maxIters.Int32 != 10 {
+			t.Fatalf("budget_max_iterations = %v, want 10 (run_max_iterations * milestone count)", maxIters)
+		}
+	})
+
+	// ── Issue #259 guard: the safety net must NOT freeze before approval. A run still
+	//    at the gate with a candidate but NO consumed approve_plan cannot transition to
+	//    running (the guard blocks it), so the report is a no-op and nothing freezes. ──
+	t.Run("running report does not freeze before approval (issue #259)", func(t *testing.T) {
+		gateRun := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, kind, milestones_candidate)
+			 VALUES ($1, $2, $3, 10, 't', 'd', 'awaiting_approval', $4, 'issue', $5)`,
+			gateRun, userID, repoID, wkr.ID, candidateJSON)
+
+		rows, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: gateRun, WorkerID: workerID, IterationCount: 1,
+			RunMaxIterations: 5, RunTimeoutSeconds: 7200,
+			MilestoneBudgetCap: 12, BudgetWallCeilingSeconds: 28800,
+		})
+		if err != nil {
+			t.Fatalf("SetRunRunning: %v", err)
+		}
+		if rows != 0 {
+			t.Fatalf("SetRunRunning applied (rows=%d) on an un-approved gate — the guard must block it", rows)
+		}
+		if got := milestones(gateRun, "milestones_frozen"); got != nil {
+			t.Fatalf("frozen = %s, want NULL — nothing may freeze before approval", got)
+		}
+	})
+
 	// ── The autopilot freeze: SetRunRunning writes frozen via COALESCE, so the first
 	//    report wins and a later one with a different list cannot overwrite it. ──
 	t.Run("autopilot frozen is immutable", func(t *testing.T) {
