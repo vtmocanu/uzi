@@ -18,7 +18,7 @@
 > - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
 > - **The budget hard ceiling is now DECIDED (2026-08-07)**: profile "Generous" — milestone-count cap **12**, total turn ceiling `RUN_MAX_ITERATIONS × min(n, 12)` (≤ 60 turns), absolute wall-clock ceiling **8h**; single-milestone plans stay at today's 5 turns / 2h, and the count cap is enforced server-side (Decision 12). M2 implements it. See the 2026-08-07 Decision Log entry.
 >
-> **Status (2026-08-07): Phase 1 backend DONE — M1 (MR !194) + M2 (MR !195) merged.** M1 = `submit_plan.milestones` + the `00098` two-column store + DTO + Decision-12 validation; M2 = progress reporting (union/overwrite/membership) + the milestone-scaled budget with Decision 5b's per-run sweeper timeout + `00099`. **M3/M4/M5 (web UI, Slack, CLI) are NOT built and were deliberately not seeded.** Active work is **M8 — per-checkpoint origin publish via a server-side push broker** (see the two 2026-08-07 Decision Log entries at the bottom; Decision 8/14 + M8 rewrite pending approval).
+> **Status (2026-08-08): Phase 1 backend + ALL durability DONE and SHIPPED in release v0.20.0.** Merged: M1 (MR !194), M2 (MR !195), M6 (MR !199), M8 (MR !203, plus a security-hardening follow-up in the same MR). M1 = `submit_plan.milestones` + `00098` store + Decision-12 validation; M2 = progress reporting + the milestone-scaled budget + Decision 5b per-run sweeper timeout (`00099`); M6 = the `checkpoint` signal tool → reap → credential-free PVC fetch-back (bounds SIGKILL/same-worker loss to "since the last milestone"); M8 = brokered origin publish to `refs/uzi-checkpoints/<branch>` via a pure-Go api push broker (cross-worker recovery; no PAT ever on a worker git child; server-derived authorization; never-forced; a pack-inflation-bomb guard). **M7 was dropped** (delivered by #218). **⏭️ REMAINING WORK — a fresh session should pick up here, in order: M3 → M4 → M5, the user-visible progress surfaces, NONE built yet.** **Next = M3 (Web progress UI):** `RunView` milestone checklist, a compact `M3/7` badge on Dashboard + RunsList, and the plan-gate CANDIDATE list; NULL milestones must still render today's `iteration N` badge (see the M3 milestone entry + Decision 6 for copy that must not imply verification). Then M4 (Slack) and M5 (CLI). **Also open (not milestones):** (a) LIVE validation of M6/M8 on dev-cluster after the v0.20.0 deploy — kill a worker mid-run and confirm same-worker (M6) and different-worker (M8) recovery, the Verified criteria neither seeded run could prove; (b) a deferred `/publish` rate-limiter (`TODO(PRD#122 M8)` in `api/internal/handler/handler.go` — the DoS amplification is already closed at source, this is defense-in-depth).
 
 ## Problem
 
@@ -940,3 +940,26 @@ same push-permission check.
   - **Issue lifecycle:** each milestone MR carries `Closes #122`, which re-closes the
     issue on merge; it is reopened after, since #122 stays open until every milestone
     (including the M3/M4/M5 UI) lands.
+- **2026-08-08 — M8 landed (MR !203) after an auditor-found DoS was fixed; released as
+  v0.20.0.** The seeded M8 run (`8ab087df`) shipped the brokered publish: `pushbroker`
+  (go-git, api stays distroless-static), `POST /api/worker/runs/{id}/publish`,
+  `workersvc.Publish` with server-derived authz, the cross-worker reseed candidate
+  (`seededFrom:"checkpoint"`, strict-descendant), all faithful to Decisions 14/15. An
+  independent **auditor** pass verified every confidentiality/integrity invariant clean
+  (PAT isolation, server-derived authorization, never-forced, dual-host SSRF gate,
+  distroless, `govulncheck` clean) but **found one MEDIUM availability DoS**: the
+  pack-inflation budget counted only *reconstructed* size, so a delta with a large
+  inflated instruction stream but `targetSz=0` slipped the cap (PoC: 897 KiB → 900 MiB /
+  1027× inflation, ACCEPTED), and `/publish` had no rate limit/timeout — an authenticated
+  worker could saturate api cores. **Fixed before merge** (`8c91c68c`): `scanPackBudget`
+  now bounds cumulative *inflation work* (`maxPackInflationWorkBytes = 256 MiB`) and takes
+  a `ctx` (cancellable), a 60s publish wall-clock ceiling was added, the go-git error is
+  scrubbed before logging, and a regression test covers the instruction-stream-bomb
+  variant. The `/publish` rate limiter was left as an explicit `TODO(PRD#122 M8)` in
+  `handler.go` — defense-in-depth; the amplification is closed at source. `task gate:api`
+  green on the merged tip. **Then cut release v0.20.0** (chart `version`/`appVersion` →
+  `0.20.0`, tag `v0.20.0`, CHANGELOG folded) and bumped argo-apps
+  `apps/uzi/app.uzi.yaml` `targetRevision` → `0.20.0` to deploy M6/M8 to dev-cluster —
+  where the live SIGKILL/cross-worker recovery checks (M6 and M8's own Verified criteria,
+  unprovable in a seeded run) can finally be run. **Remaining after this: M3/M4/M5 (the
+  progress UI). A new session picks up at M3** — see the Status banner at the top.

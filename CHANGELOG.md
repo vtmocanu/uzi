@@ -6,7 +6,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-08
+
 ### Added
+
+- **Runs now checkpoint committed work at milestone boundaries and recover it
+  after a worker crash.** When the lead completes a milestone, the worker durably
+  saves the run's branch to its data volume (surviving a pod kill and a
+  same-worker restart), and — via a new server-side push broker — publishes it to
+  a `refs/uzi-checkpoints/<branch>` ref on the forge, so a *different* worker that
+  re-claims the run recovers the completed milestones instead of redoing them. The
+  forge token is never exposed to a worker git process (the API holds it and
+  performs the push), the push is never forced, and no CI pipeline fires on the
+  checkpoint ref. The plan carries an optional milestone list (`submit_plan`), the
+  run budget scales with it, and progress is reported over the existing run
+  stream; the user-visible progress UI (web, Slack, CLI) is not part of this
+  release. (#122 M1, M2, M6, M8)
 
 - **The version popover and `uzi version` now show PRD roadmap progress.** A
   `PRDs  N done · M open` row (sidebar popover) and matching `prds  N done, M
