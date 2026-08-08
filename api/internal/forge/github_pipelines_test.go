@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -230,6 +231,38 @@ func TestGitHubJobLogTailRejectsPrivateHost(t *testing.T) {
 	// The error must never carry the raw pre-signed URL (its query holds a secret).
 	if strings.Contains(err.Error(), "presigned") {
 		t.Fatalf("error leaked the pre-signed URL query: %q", err.Error())
+	}
+}
+
+// TestIsDisallowedLogIP pins the second-hop SSRF host allowlist (R5), including
+// RFC 6598 CGNAT (100.64.0.0/10), which net.IP.IsPrivate does NOT cover but which
+// fronts internal services in some cloud/k8s fabrics.
+func TestIsDisallowedLogIP(t *testing.T) {
+	for _, tc := range []struct {
+		ip         string
+		disallowed bool
+	}{
+		{"127.0.0.1", true},         // loopback
+		{"::1", true},               // loopback v6
+		{"169.254.169.254", true},   // link-local (cloud metadata)
+		{"10.0.0.1", true},          // RFC 1918
+		{"192.168.1.1", true},       // RFC 1918
+		{"100.64.1.1", true},        // CGNAT (RFC 6598)
+		{"100.127.255.254", true},   // CGNAT upper edge
+		{"::ffff:100.64.1.1", true}, // IPv4-mapped CGNAT
+		{"0.0.0.0", true},           // unspecified
+		{"224.0.0.1", true},         // multicast
+		{"140.82.112.3", false},     // a real public GitHub-range address
+		{"100.63.255.255", false},   // just below CGNAT
+		{"100.128.0.0", false},      // just above CGNAT
+	} {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("bad test IP %q", tc.ip)
+		}
+		if got := isDisallowedLogIP(ip); got != tc.disallowed {
+			t.Errorf("isDisallowedLogIP(%s) = %v, want %v", tc.ip, got, tc.disallowed)
+		}
 	}
 }
 

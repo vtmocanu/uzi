@@ -226,16 +226,26 @@ func rejectPrivateLogHost(ctx context.Context, host string) error {
 
 // isDisallowedLogIP reports whether ip is one a job log must never be fetched from:
 // loopback (127.0.0.1/::1), link-local (169.254.0.0/16, incl. the cloud metadata
-// address, and fe80::/10), private (RFC 1918 / ULA), unspecified (0.0.0.0/::), or
-// multicast.
+// address, and fe80::/10), private (RFC 1918 / ULA), CGNAT (RFC 6598 100.64.0.0/10,
+// used as internal/link addressing in some cloud and k8s CNI fabrics — net.IP.IsPrivate
+// does NOT cover it), unspecified (0.0.0.0/::), or multicast.
 func isDisallowedLogIP(ip net.IP) bool {
 	return ip.IsLoopback() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsPrivate() ||
+		cgnatRange.Contains(ip) ||
 		ip.IsUnspecified() ||
 		ip.IsMulticast()
 }
+
+// cgnatRange is RFC 6598 carrier-grade-NAT space (100.64.0.0/10). It is not
+// RFC 1918 private, so net.IP.IsPrivate misses it, yet it fronts internal services
+// in some cloud/k8s fabrics — a defense-in-depth addition to the second-hop guard.
+var cgnatRange = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
 
 // githubActionsStatus is the D8 two-field collapse: while status != "completed"
 // the neutral status IS the run/job status; once completed it is the conclusion

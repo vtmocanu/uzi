@@ -667,7 +667,7 @@ func (g *github) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	if resp == nil || resp.Response == nil {
 		return TokenInfo{}, errors.New("github: token info: response carried no headers")
 	}
-	h := resp.Response.Header
+	h := resp.Header
 	if _, present := h[textproto.CanonicalMIMEHeaderKey("X-OAuth-Scopes")]; !present {
 		// No scopes header at all → a fine-grained / un-introspectable token. VerifyToken
 		// already rejects github_pat_, so this is a defensive fallback: surface the
