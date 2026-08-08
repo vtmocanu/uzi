@@ -189,8 +189,11 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 
 	// Step 2: fetch ONLY the base refs this publish needs into the storer — the
 	// branch itself, the repo default branch (the delta pack's exclude-boundary base
-	// for the never-pushed-branch case), and the branch's checkpoint ref. We do NOT
-	// fetch every head / the full history (Rule: bounded fetch): only these three.
+	// for the never-pushed-branch case), and the branch's checkpoint ref. Only these
+	// three refs, and each SHALLOW (depth 1, set in fetchBaseRefs) — so this pulls only
+	// the tip SNAPSHOT of each, never its history. That bound is load-bearing, not
+	// cosmetic: a full (deep) fetch unpacks the ref's entire history into the in-memory
+	// storer and OOM-killed the api on the first real repo (see fetchBaseRefs).
 	//
 	// A specific refspec for a ref origin does not advertise fails the WHOLE fetch
 	// ("couldn't find remote ref"), and the PRIMARY M8 case is a branch never pushed
@@ -475,6 +478,17 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 		RefSpecs:   specs,
 		Auth:       auth,
 		Tags:       git.NoTags,
+		// SHALLOW (depth 1) — bounds memory to ONE snapshot, not the branch's whole
+		// history. A full fetch of a real repo unpacks its entire pack into the
+		// in-memory storer: measured 787 MiB heap / 742 MB RSS for uzi's 131 MiB pack,
+		// which OOM-killed the 512Mi api pod at every checkpoint (PRD #122 M8, found in
+		// the first real-forge deploy — the unit tests use a 1-commit local fixture,
+		// where depth is a no-op, so they never caught it). Depth 1 fetches only each
+		// wanted ref's TIP snapshot — exactly the base objects the worker's thin delta
+		// pack references and the ancestry checks need (they only ever walk DOWN to the
+		// fetched tip, never below it). Measured with depth 1: 47 MiB heap / 194 MB RSS
+		// including the push. Validated against gitlab.example.com before shipping.
+		Depth: 1,
 	})
 	if fetchErr != nil &&
 		!errors.Is(fetchErr, git.NoErrAlreadyUpToDate) &&
