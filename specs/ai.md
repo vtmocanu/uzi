@@ -18735,3 +18735,78 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
   script derives an in-progress tally client-side from `ListRuns`. A dedicated count subcommand would
   duplicate the badge's purely-ambient-UI purpose with no headless capability the list verb lacks, so
   none was added.
+
+## 491. Subagent→lead SendMessage recipient alias — a rewrite-only PreToolUse hook, clobber-guarded
+
+Serves human Feature #4 (agent runtime). improve_uzi judge rec, batch 1 bundle #1;
+completes #210 (which fixed only the builtin templates). Not a guardrail — a
+usability router that composes with §50's deny-hooks without weakening them.
+
+- **The problem is SDK-shaped, not uzi's.** A subagent addressing the orchestrator
+  by a colloquial name (`lead`/`orchestrator`/`team-lead`/`team lead`) gets the SDK's
+  "No agent named '<x>' is reachable" error; the one reachable orchestrator recipient
+  is `main`. The error string is SDK-generated, so "make the failure name reachable
+  targets" is not ours to change — the fix is a router alias.
+- **`buildSendMessageAliasHook(allowedSubagents, log)`** (`agent/src/guardrails.ts`)
+  mirrors `buildAgentGuardHook`: a PreToolUse hook wired into the `preToolUse(...)`
+  factory in `sdk-executor.ts` as `{ matcher: "SendMessage", hooks: [...] }`. The
+  factory feeds BOTH the plan and implement turns, so one wiring covers both. It
+  rewrites via `hookSpecificOutput.updatedInput` and NEVER denies.
+- **Alias set = derived floor `{lead, orchestrator, team-lead, team lead}` → `main`.**
+  Derived from `LEAD_NAME_RE` (`/^(lead|orchestrator)$/i`, agents.ts) plus the two
+  measured defect spellings in `recipient_test.go` (`team-lead`, `team lead`). Match
+  is trim + case-insensitive + EXACT on the whole trimmed value — never a substring
+  (which would clobber `team-lead-reviewer`, `co-lead`). The set can never be provably
+  exhaustive (free-text `to`); the floor is the deliberate default, every widening a
+  new clobber surface.
+- **Clobber-guard (best-practice over the naive form).** The rewrite fires ONLY when
+  no registered subagent literally owns the aliased name (case-insensitive). The
+  repo-source path (`subagentsFromTemplates`, agents.ts) can register a REAL invokable
+  subagent named `lead`/`orchestrator`/`team-lead` (`recipient_test.go`); an
+  unconditional rewrite would silently misroute a legitimate call to it.
+  `allowedSubagents` is the registered-name set, threaded in by the executor exactly
+  like `buildAgentGuardHook`'s `allowed`.
+- **Justification is user/repo-authored agents, not builtins.** Post-#210 the builtins
+  already say "SendMessage to `main`" (guarded by `recipient_test.go`), so this is pure
+  defense in depth for those; the real unprotected surface is repo-sourced
+  `.claude/agents/` and user-authored templates, plus future template drift. The chat
+  path (`chat-executor.ts`) does NOT get the hook — single-thread, no subagents.
+- **House idiom + composition.** The matcher is only a pre-filter, so the callback
+  re-checks `hook_event_name === "PreToolUse" && tool_name === "SendMessage"` and
+  returns `{}` otherwise. `SendMessage` is disjoint from the `Bash`/path/`Agent`
+  matchers — no ordering dependency, no conflict with the Agent guard. Distinct from
+  §408/§409's LEAD_NAME_RE routing, which registers a lead TEMPLATE onto the main
+  thread (opposite direction: pickup, not recipient aliasing).
+- **Verification bound.** Unit tests prove uzi EMITS the correct `updatedInput` shape
+  (`sdk-executor.test.ts` the matcher wiring; `guardrails.test.ts` the rewrite). They
+  do NOT prove the native `claude` binary APPLIES `updatedInput` for SendMessage's
+  `to` — that runtime is not JS-inspectable; a live worker-run trace is the only
+  definitive proof (nice-to-have, not a blocker). The two gating SDK claims — a
+  top-level hook fires on a subagent's call, and the SDK honours `updatedInput` for
+  `to` — were confirmed in the design wave.
+
+## 492. Memory-write guidance — steer against volatile snapshots; a warn-only save-time lint
+
+Serves human Feature #4; refines PRD #90's write policy (§321). improve_uzi judge
+rec, batch 1 bundle #3. The expensive half (stamping memories with image/toolchain
+identity + suppress-on-change) is deferred — out of this batch.
+
+- **Two prose surfaces steer the lead away from fast-decaying numeric snapshots.**
+  `LEAD_GUARDRAIL_APPEND` (`agent/src/prompt.ts`) and the `save_memory` tool
+  description + body `.describe()` (`agent/src/memory-tools.ts`) both say: record the
+  DURABLE fact — the mechanism or command, not today's number (a test-pass count, a
+  version tally, an "N of M" ratio all decay and mislead a later run).
+- **A save-time lint that WARNS, never rejects.** `makeMemoryToolHandlers.saveMemory`
+  tests the body against `VOLATILE_SNAPSHOT_RE`
+  (`/\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i`) and, on a match, appends a
+  NON-FATAL advisory nudge to the ALREADY-SUCCESSFUL save text; the entry is stored
+  either way (`isError` stays false). Warn-only is deliberate: a legitimate numeric
+  fact wears the same shape (idle timeout `120000`, CIDR `10.0.0.0/24`, date
+  `2026/08`), so the heuristic must never gate — the prose carries the rest. Do not
+  narrow the regex to chase those false positives.
+- **The lint's cost is bounded ONLY by `MEMORY_BODY_MAX_BYTES` (§321), by coupling.**
+  The alternation backtracks superlinearly on an adversarial digit run; the
+  `bytes > MEMORY_BODY_MAX_BYTES` early-return in `saveMemory` runs BEFORE the regex,
+  so `body` is always ≤ 2048 (~48ms worst case; ~0.8s at 8192). A comment at the regex
+  records that a future cap increase must revisit it — the bound is not in the regex
+  itself.
