@@ -216,9 +216,14 @@ type CrewState = "working" | "stalled" | "waiting" | "idle" | "done";
 // run.health, not this timer.
 const STALE_MS = 45_000;
 
-// looping/slow/stalled are PRD #47 WARN flags → amber `stalled`, never green `working`
-// (a looping agent is spinning without progress; it must not read as healthy).
-const STALLED_HEALTH = new Set<string>(["stalled", "slow", "looping"]);
+// `stalled`/`looping` are PRD #47 no-progress WARN flags → amber `stalled`, never green
+// `working` (a looping agent is spinning without progress; it must not read as healthy).
+// `slow` is DELIBERATELY EXCLUDED: it is a pure wall-clock signal the server raises at
+// ~45 min (health_slow_seconds) regardless of activity or in-flight state, so a run can
+// be `slow` while it is actively emitting messages. The actively-speaking lane on a
+// `slow` run is genuinely working, so it must keep its green pulsing `working` dot — the
+// run-level `slow` badge (RunHealthBadge) already carries the wall-clock warning.
+const STALLED_HEALTH = new Set<string>(["stalled", "looping"]);
 
 // crewStateFor is the Decision-2 ladder. Precedence: terminal → gate/worker-wait →
 // active-speaker (health, NOT recency) → non-active recency split.
@@ -891,7 +896,9 @@ export function ActivityFeed({
                   agent={l.role}
                   label={laneLabelText(l.label)}
                   messages={l.messages}
-                  startedAt={l.startedAt}
+                  lastActivity={
+                    laneAgg.get(l.key)?.latest?.created_at ?? l.startedAt
+                  }
                   state={crewStateFor(
                     run,
                     l.key,
@@ -927,7 +934,10 @@ export function ActivityFeed({
                     bodyId={`agent-body-${firstSeq}`}
                     agent={g.agent}
                     messages={g.messages}
-                    startedAt={g.startedAt}
+                    lastActivity={
+                      g.messages[g.messages.length - 1]?.created_at ??
+                      g.startedAt
+                    }
                     live={g.agent === activeAgent}
                     expanded={isExpanded(g.agent)}
                     followLive={followLive}
@@ -953,7 +963,7 @@ function AgentBlock({
   agent,
   label,
   messages,
-  startedAt,
+  lastActivity,
   state,
   live,
   expanded,
@@ -973,7 +983,10 @@ function AgentBlock({
   // rendered plain, never through <Markdown> (Decision 7). Empty ⇒ no `· task` suffix.
   label?: string;
   messages: RunMessage[];
-  startedAt: string;
+  // The lane's LAST-activity instant (its most recent message's created_at), NOT its
+  // open time — the header timestamp reads "when did this actor last do something", so a
+  // lane active a while ago but quiet now ages, while one still emitting reads fresh.
+  lastActivity: string;
   // Per-lane state dot + word (Decision 3/4), so a COLLAPSED lane still shows whether
   // that actor is live. Absent in Timeline view, where the roster strip carries the dots
   // exactly as it did before this PRD.
@@ -1180,9 +1193,9 @@ function AgentBlock({
         )}
         <span
           className="ml-auto shrink-0 text-[11px] tabular-nums text-faint"
-          title={startedAt}
+          title={lastActivity}
         >
-          {relativeTime(startedAt, now)}
+          {relativeTime(lastActivity, now)}
         </span>
       </div>
       <div
