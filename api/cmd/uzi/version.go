@@ -170,5 +170,11 @@ func serverRows(b apitypes.BuildInfoDTO) [][2]string {
 	if b.UptimeSeconds != nil {
 		rows = append(rows, [2]string{"uptime", (time.Duration(*b.UptimeSeconds) * time.Second).String()})
 	}
+	// Both-or-neither, mirroring the web popover (#245): the counts are stamped as
+	// a pair in CI and travel together, so a lone field is treated as unknown and
+	// the row is skipped rather than rendered half-known.
+	if b.PrdsDone != nil && b.PrdsOpen != nil {
+		rows = append(rows, [2]string{"prds", fmt.Sprintf("%d done, %d open", *b.PrdsDone, *b.PrdsOpen)})
+	}
 	return rows
 }
