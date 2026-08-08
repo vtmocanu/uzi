@@ -381,9 +381,13 @@ export type MilestoneCounted = {
 export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null {
   const frozen = run.milestones ?? [];
   if (frozen.length === 0) return null;
-  const ids = new Set(frozen.map((m) => m.id));
-  const completed = run.milestones_completed ?? [];
-  const done = completed.reduce((n, id) => (ids.has(id) ? n + 1 : n), 0);
+  // Count by iterating the FROZEN list and testing membership in the completed set,
+  // NOT by reducing over milestones_completed. Both clamp to frozen membership, but
+  // iterating frozen also makes `done` immune to a duplicate id in the completed set
+  // (which would otherwise let the badge read M8/7): each frozen id is counted at most
+  // once by construction, matching MilestoneChecklist's counter (its single source).
+  const completed = new Set(run.milestones_completed ?? []);
+  const done = frozen.reduce((n, m) => (completed.has(m.id) ? n + 1 : n), 0);
   return { done, total: frozen.length };
 }
 

@@ -160,7 +160,7 @@ export function MilestoneBadge({ run }: { run: Run }) {
 function MilestoneMark({ state }: { state: "done" | "in_progress" | "left" }) {
   if (state === "done") return <span className="text-ok" aria-label="done">✓</span>;
   if (state === "in_progress") return <span className="text-info" aria-label="in progress">◐</span>;
-  return <span className="text-faint" aria-label="left">○</span>;
+  return <span className="text-faint" aria-label="not started">○</span>;
 }
 
 // MilestoneChecklist renders a milestone-structured run's progress (PRD #122): every
@@ -177,7 +177,10 @@ export function MilestoneChecklist({ run }: { run: Run }) {
   if (milestones.length === 0) return null;
   const completed = new Set(run.milestones_completed ?? []);
   const inProgress = new Set(run.milestones_in_progress ?? []);
-  const doneCount = milestones.reduce((n, m) => (completed.has(m.id) ? n + 1 : n), 0);
+  // Single source of truth for the done count — milestoneBadge counts frozen members
+  // present in the completed set (immune to duplicate ids), the same rule this list
+  // renders from. Non-null here since the frozen list is non-empty (checked above).
+  const doneCount = milestoneBadge(run)?.done ?? 0;
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
@@ -193,6 +196,7 @@ export function MilestoneChecklist({ run }: { run: Run }) {
             <li key={m.id} className="flex items-center gap-2 text-sm">
               <MilestoneMark state={state} />
               <span
+                title={stripUnsafeChars(m.title)}
                 className={cx(
                   "min-w-0 truncate",
                   state === "done" ? "text-muted line-through" : state === "in_progress" ? "text-fg" : "text-faint",

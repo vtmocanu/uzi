@@ -62,7 +62,9 @@ type RunDTO struct {
 	// and ignores it everywhere else — a frozen run reads its approved list off Milestones.
 	// The titles are UNTRUSTED display text a consumer writing them to a terminal must
 	// sanitize, the same obligation Milestones and RepoAgent.Description carry. Populated
-	// only on the run reads (where the store is in reach); nil on the create/worker DTO paths.
+	// wherever the store row is decoded through the shared runToDTO — the browser run reads
+	// AND the worker's own awaiting_approval report echo (which serialises the candidate the
+	// worker just submitted back to it); nil on the create DTO path, which has no store row.
 	MilestonesCandidate []Milestone `json:"milestones_candidate"`
 	// MilestonesCompleted and MilestonesInProgress are the run's live progress (PRD #122
 	// M2), decoded from runs.milestones_completed / _in_progress: arrays of frozen

@@ -2559,7 +2559,7 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
     expect(screen.getByText("Third milestone")).toBeTruthy();
     expect(screen.getByLabelText("done")).toBeTruthy();
     expect(screen.getByLabelText("in progress")).toBeTruthy();
-    expect(screen.getByLabelText("left")).toBeTruthy();
+    expect(screen.getByLabelText("not started")).toBeTruthy();
   });
 
   // PRD Decision 6: the worker REPORTS completion; nothing in uzi verified it, so the
