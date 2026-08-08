@@ -17,6 +17,7 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { stripUnsafeChars } from "../lib/safeText";
+import { formatUptimeSince } from "../lib/formatUptimeSince";
 
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
@@ -454,6 +455,9 @@ export function WorkersSettings() {
                       )}
                       {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
                       {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
+                      {w.status === "online" && w.online_since && (
+                        <span>· up {formatUptimeSince(w.online_since)}</span>
+                      )}
                       {w.last_heartbeat_at && (
                         <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                       )}

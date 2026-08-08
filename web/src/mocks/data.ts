@@ -1326,6 +1326,7 @@ export const mockWorkers: Worker[] = [
     upgrade_blocking_reason: null,
     upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.2),
+    online_since: minsAgo(192), // online ~3h 12m
     created_at: daysAgo(14),
     // cgroup sample with a limit → CPU bar + "used / limit · %" memory bar (ok tone).
     stats_cpu_pct: 34.2,
@@ -1356,6 +1357,7 @@ export const mockWorkers: Worker[] = [
     upgrade_blocking_reason: null,
     upgrade_last_exit_code: null,
     last_heartbeat_at: daysAgo(2),
+    online_since: null, // offline → no uptime anchor
     created_at: daysAgo(21),
     // Offline → its last-known cgroup sample renders dimmed, never live-looking.
     stats_cpu_pct: 12,
@@ -1403,6 +1405,7 @@ export const mockWorkers: Worker[] = [
     // failure from the volume filling up rather than naming both.
     upgrade_last_exit_code: 2,
     last_heartbeat_at: minsAgo(14),
+    online_since: null, // offline → no uptime anchor
     created_at: daysAgo(11),
     stats_cpu_pct: null,
     stats_mem_bytes: null,
@@ -1433,6 +1436,7 @@ export const mockWorkers: Worker[] = [
     upgrade_blocking_reason: null,
     upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.4),
+    online_since: daysAgo(1), // online ~1d
     created_at: daysAgo(6),
     stats_cpu_pct: 8.3,
     stats_mem_bytes: 503316480, // 480 MiB
@@ -1467,6 +1471,7 @@ export const mockWorkers: Worker[] = [
     upgrade_blocking_reason: null,
     upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.3),
+    online_since: minsAgo(27), // online ~27m
     created_at: daysAgo(3),
     stats_cpu_pct: 21.5,
     stats_mem_bytes: 1181116006, // 1.1 GiB
@@ -1504,6 +1509,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     upgrade_blocking_reason: null,
     upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.5),
+    online_since: daysAgo(2), // online ~2d
     created_at: daysAgo(9),
     stats_cpu_pct: 96.4,
     stats_mem_bytes: 8160437862, // 7.6 GiB

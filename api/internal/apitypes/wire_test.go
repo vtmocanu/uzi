@@ -365,7 +365,11 @@ var workerDTOKeys = []string{
 	// layer pins it — this tag set is the only wire contract these two fields have.
 	"upgrade_status", "upgrade_detail", "upgrade_target",
 	"upgrade_blocking_container", "upgrade_blocking_reason", "upgrade_last_exit_code",
-	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
+	"last_heartbeat_at",
+	// PRD #251: api-owned anchor of when the worker became online; null when offline or
+	// never online. Uptime is derived client-side as now − online_since; display-only.
+	"online_since",
+	"created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —

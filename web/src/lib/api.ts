@@ -764,6 +764,8 @@ export interface Worker {
   // and from that volume filling up.
   upgrade_last_exit_code: number | null;
   last_heartbeat_at: string | null;
+  // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
+  online_since?: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
   // one (and re-nulled if it stops). stats_cpu_pct is a percentage of the worker's

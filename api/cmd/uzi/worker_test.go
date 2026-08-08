@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
@@ -214,6 +215,101 @@ func TestWorkerListShowsBindMode(t *testing.T) {
 	}
 }
 
+// TestFormatUptimeDuration covers each bucket of the pure formatter (PRD #251). It
+// is split from uptimeCell precisely so the bucket boundaries test without the wall
+// clock; the buckets must match the web's formatUptimeSince / rateLimits.formatCountdown
+// so uptime reads in the same vocabulary as the reset countdowns (Decision 4).
+func TestFormatUptimeDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"days rounds to Nd Nh", 2*24*time.Hour + 4*time.Hour + 30*time.Minute, "2d 4h"},
+		{"hours to Nh Nm", 1*time.Hour + 23*time.Minute, "1h 23m"},
+		{"minutes to Nm", 44 * time.Minute, "44m"},
+		{"sub-minute floors", 42 * time.Second, "<1m"},
+		{"zero floors", 0, "<1m"},
+		{"negative (clock skew) floors", -5 * time.Minute, "<1m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatUptimeDuration(tc.d); got != tc.want {
+				t.Errorf("formatUptimeDuration(%v) = %q, want %q", tc.d, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUptimeCell covers the "-" gates (which need no clock) and that an online
+// worker with a recent anchor renders a real duration rather than "-" (PRD #251).
+// Offline or anchorless → "-", mirroring upgradeCell's empty→"-" convention: an
+// offline worker is not "up", and a nil OnlineSince has no session to count from.
+func TestUptimeCell(t *testing.T) {
+	recent := time.Now().Add(-90 * time.Minute)
+	for _, tc := range []struct {
+		name string
+		w    apitypes.WorkerDTO
+		want string
+	}{
+		{"offline worker", apitypes.WorkerDTO{Status: "offline", OnlineSince: &recent}, "-"},
+		{"online but nil anchor", apitypes.WorkerDTO{Status: "online"}, "-"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := uptimeCell(tc.w); got != tc.want {
+				t.Errorf("uptimeCell(%+v) = %q, want %q", tc.w, got, tc.want)
+			}
+		})
+	}
+	// An online worker with a recent anchor renders a duration, not "-".
+	if got := uptimeCell(apitypes.WorkerDTO{Status: "online", OnlineSince: &recent}); got == "-" || got == "" {
+		t.Errorf("online worker with a recent anchor = %q, want a duration", got)
+	}
+}
+
+// TestWorkerListShowsUptime asserts the UPTIME column is present and renders a
+// worker's continuous-online duration, with "-" for an offline worker (PRD #251).
+//
+// The fixture stages an online worker with a fixed-hours anchor and an offline one,
+// so the failure that matters — a renderer that prints the same thing for both, or
+// drops the column — is caught. The online anchor is set well inside the hours
+// bucket so the assertion does not race the wall clock across a bucket boundary.
+func TestWorkerListShowsUptime(t *testing.T) {
+	up := time.Now().Add(-3*time.Hour - 12*time.Minute)
+	down := time.Now().Add(-2 * time.Hour)
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", AnthropicBindMode: "default", OnlineSince: &up},
+		{ID: "w2", Name: "bravo", Status: "offline", AnthropicBindMode: "default", OnlineSince: &down},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "UPTIME") {
+		t.Fatalf("worker list is missing the UPTIME column: %q", out)
+	}
+	uptimeOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				// UPTIME is the 4th column: ID NAME STATUS UPTIME VERSION UPGRADE TOKEN.
+				f := strings.Fields(line)
+				if len(f) < 4 {
+					t.Fatalf("row for %s has too few fields: %q", name, line)
+				}
+				return f[3]
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	if got := uptimeOf("alpha"); got != "3h" {
+		t.Errorf("online worker's UPTIME first field = %q, want the hours bucket (3h ...)", got)
+	}
+	if got := uptimeOf("bravo"); got != "-" {
+		t.Errorf("offline worker's UPTIME = %q, want - (an offline worker is not up)", got)
+	}
+}
+
 // TestBindModeCellUnknownPassesThrough: the CLI ships separately from the API, so a
 // newer server can send a fourth mode. Printing it as itself is honest; mapping it to
 // "default" would state something false about where a worker's money goes.
@@ -252,7 +348,7 @@ func TestBindModeCellPinnedWithNoLabel(t *testing.T) {
 //
 // MUTATION THIS CATCHES: reverting either cell to the raw `w.Name`. Measured on both.
 func TestWorkerNamesAreSanitizedForTheTerminal(t *testing.T) {
-	hostile := "safe‮dnetsop\x1b[31m\nforged\trow"
+	hostile := "safe\u202ednetsop\x1b[31m\nforged\trow"
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -285,7 +381,7 @@ func TestWorkerNamesAreSanitizedForTheTerminal(t *testing.T) {
 			// The first two are the shared floor; the last two are what tell cellText
 			// and sanitizeTTY apart — only cellText folds a newline and a tab, and a
 			// newline in a table cell is what forges a row.
-			for _, bad := range []string{"‮", "\x1b", "\nforged", "\trow"} {
+			for _, bad := range []string{"\u202e", "\x1b", "\nforged", "\trow"} {
 				if strings.Contains(out, bad) {
 					t.Errorf("a hostile worker name reached the terminal carrying %q: %q", bad, out)
 				}
