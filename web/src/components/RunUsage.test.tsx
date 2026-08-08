@@ -251,6 +251,13 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     // the agent row and the "Attributed total" row must BOTH hold exactly the dash.
     expect(columnTexts(table, 0)).toEqual(["lead", "Attributed total"]);
     expect(columnTexts(table, 1)).toEqual(["—", "—"]);
+    // Issue #163 (a11y): the tabIndex/aria-label pairing is EARNED only by a
+    // truncatable string id. A non-string Model cell (`—` here, `N models` on a
+    // mixed total) is neither clipped nor a machine id, so it must NOT become a
+    // bare keyboard tab stop with no accessible name — assert the span is inert.
+    const dashSpan = table.tBodies[0].rows[0].cells[1].querySelector("span");
+    expect(dashSpan?.hasAttribute("tabindex")).toBe(false);
+    expect(dashSpan?.hasAttribute("aria-label")).toBe(false);
   });
 });
 

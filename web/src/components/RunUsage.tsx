@@ -78,10 +78,13 @@ function Td({ children, left, total, mono }: { children: ReactNode; left?: boole
       {mono ? (
         // Issue #163 (a11y): the id is visually clipped at 220px, so a keyboard/AT
         // user needs it both reachable (tabIndex) and announced in full (aria-label) —
-        // `title` alone is mouse-hover only. Both reuse the same full-id value.
+        // `title` alone is mouse-hover only. All three are gated on the SAME string
+        // condition: non-string cells (`—`, `N models`) are neither clipped nor
+        // machine ids, so a bare focus stop with no accessible name would just be
+        // keyboard/SR noise — only the truncatable id earns the tab stop + label.
         <span
           className="block max-w-[220px] truncate"
-          tabIndex={0}
+          tabIndex={typeof children === "string" ? 0 : undefined}
           title={typeof children === "string" ? children : undefined}
           aria-label={typeof children === "string" ? children : undefined}
         >

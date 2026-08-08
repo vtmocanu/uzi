@@ -916,6 +916,10 @@ function MultiSelectBar({
   // (AppShell), so on lg the bar starts at 240px; mobile stays full width. z-20 is left
   // BELOW the sidebar's z-30 deliberately — the fix is the inset, not stacking over it.
   // These class strings are literal (not interpolated) for Tailwind JIT.
+  // The inset tracks the DEFAULT (expanded) sidebar; when a user collapses it to w-14
+  // the bar over-insets by ~184px (cosmetic gap, never a clip). Tracking the collapse
+  // state would need a shared signal plumbed out of AppShell's local state — out of
+  // scope here; the label-clip bug this fixes is gone in both states.
   return (
     <div className="fixed left-0 right-0 bottom-0 z-20 border-t border-edge bg-surface/95 px-4 py-3 backdrop-blur lg:left-60">
       <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center gap-3">
