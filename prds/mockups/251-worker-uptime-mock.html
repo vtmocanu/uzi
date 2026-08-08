@@ -1,0 +1,321 @@
+<title>Worker uptime — mock</title>
+<style>
+  /* Faithful to the uzi app's default "ember" dark theme (web/src/index.css).
+     Committed single-theme on purpose: this is a mock of a dark product UI, so it
+     paints its own ground + colors explicitly and holds on any host background. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+
+  .page { max-width: 60rem; margin: 0 auto; }
+
+  /* ── Annotation strip (not part of the app; frames the mock) ─────────────── */
+  .note {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1rem;
+    margin-bottom: 1.75rem; padding: 0.85rem 1rem;
+    border: 1px solid rgb(var(--brand) / 0.35);
+    background: rgb(var(--brand) / 0.07);
+    border-radius: var(--radius);
+    font-size: 0.8125rem; color: rgb(var(--muted));
+  }
+  .note strong { color: rgb(var(--fg)); font-weight: 600; }
+  .note .spacer { flex: 1; }
+  .toggle {
+    appearance: none; cursor: pointer; font: inherit; font-size: 0.75rem;
+    color: rgb(var(--fg)); background: rgb(var(--raised));
+    border: 1px solid rgb(var(--edge-strong)); border-radius: 0.5rem;
+    padding: 0.35rem 0.7rem; white-space: nowrap;
+  }
+  .toggle:hover { border-color: rgb(var(--brand) / 0.6); }
+  .toggle:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; }
+
+  /* ── Card ─────────────────────────────────────────────────────────────── */
+  .card {
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    display: flex; flex-direction: column; gap: 0.75rem;
+  }
+  .section-title {
+    margin: 0; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.09em;
+    text-transform: uppercase; color: rgb(var(--muted));
+  }
+
+  /* Fleet upgrade panel */
+  .fleet {
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--raised) / 0.4);
+    border-radius: var(--radius);
+    padding: 0.9rem 1rem; display: flex; flex-direction: column; gap: 0.55rem;
+  }
+  .fleet-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .fleet-head h3 { margin: 0; font-size: 1.05rem; font-weight: 600; color: rgb(var(--fg)); }
+  .fleet-head .target { font-size: 0.8125rem; color: rgb(var(--faint)); }
+  .fleet-bar { height: 6px; border-radius: 999px; background: rgb(var(--edge)); overflow: hidden; }
+  .fleet-bar > i { display: block; height: 100%; background: rgb(var(--ok)); border-radius: 999px; }
+  .fleet-sub { font-size: 0.8125rem; color: rgb(var(--muted)); }
+
+  ul.workers { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  li.worker {
+    display: flex; flex-direction: column; gap: 0.5rem;
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--raised) / 0.4);
+    border-radius: var(--radius);
+    padding: 0.65rem 0.75rem;
+    font-size: 0.875rem;
+  }
+
+  .worker-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; }
+
+  .name { font-weight: 500; color: rgb(var(--fg)); }
+
+  .meta {
+    margin-top: 0.15rem; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 0.15rem 0.5rem; font-size: 0.75rem; color: rgb(var(--faint));
+  }
+  .meta .mono { font-family: var(--mono); }
+
+  /* The prototype token */
+  .uptime { transition: outline-color 0.2s, background-color 0.2s; border-radius: 3px; padding: 0 2px; }
+  body.highlight .uptime {
+    outline: 1px solid rgb(var(--brand) / 0.9);
+    background: rgb(var(--brand) / 0.14);
+    color: rgb(var(--fg));
+  }
+
+  .token-line { margin-top: 0.25rem; font-size: 0.75rem; color: rgb(var(--muted)); }
+  .token-line a { color: inherit; text-decoration: underline; }
+
+  .controls { display: flex; align-items: center; gap: 0.375rem; flex-wrap: wrap; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    font-size: 0.6875rem; font-weight: 500; line-height: 1;
+    padding: 0.28rem 0.5rem; border-radius: 0.4rem; border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .b-ok      { color: rgb(var(--ok));     border-color: rgb(var(--ok) / 0.4);     background: rgb(var(--ok) / 0.1); }
+  .b-info    { color: rgb(var(--info));   border-color: rgb(var(--info) / 0.4);   background: rgb(var(--info) / 0.1); }
+  .b-neutral { color: rgb(var(--muted));  border-color: rgb(var(--edge));         background: rgb(var(--raised)); }
+
+  select.picker {
+    appearance: none; font: inherit; font-size: 0.75rem; height: 2rem;
+    color: rgb(var(--fg)); background: rgb(var(--raised));
+    border: 1px solid rgb(var(--edge-strong)); border-radius: 0.5rem;
+    padding: 0 1.7rem 0 0.6rem; max-width: 11rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23949eb0' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 0.55rem center;
+  }
+  button.del {
+    appearance: none; cursor: pointer; font: inherit; font-size: 0.75rem; font-weight: 500;
+    height: 2rem; padding: 0 0.7rem; border-radius: 0.5rem;
+    color: rgb(var(--danger)); border: 1px solid rgb(var(--danger) / 0.35);
+    background: rgb(var(--danger) / 0.14);
+  }
+  button.del:hover { background: rgb(var(--danger) / 0.22); }
+
+  /* Gauges */
+  .gauges { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.15rem; }
+  .gauges.dim { opacity: 0.55; }
+  .gauge-row { display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; color: rgb(var(--muted)); }
+  .gauge-row .val { font-variant-numeric: tabular-nums; }
+  .track { height: 6px; border-radius: 999px; background: rgb(var(--edge)); overflow: hidden; margin-top: 0.25rem; }
+  .track > i { display: block; height: 100%; border-radius: 999px; background: rgb(var(--ok)); }
+  .track > i.warn { background: rgb(var(--warn)); }
+  .gauge-note { font-size: 0.6875rem; color: rgb(var(--faint)); }
+  .offline-note { font-size: 0.6875rem; color: rgb(var(--faint)); font-style: italic; }
+</style>
+
+<div class="page">
+  <div class="note">
+    <span><strong>Mock:</strong> Settings → Workers, with a per-worker <strong>uptime</strong> added to the metadata line (<span class="mono" style="font-family:var(--mono)">· up&nbsp;3h&nbsp;12m</span>). It sits between the version and “last seen”, shows only for <strong>online</strong> workers, and is hidden when the worker is down.</span>
+    <span class="spacer"></span>
+    <button class="toggle" id="hl" aria-pressed="false">Highlight the new bit</button>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">Your workers</h2>
+
+    <div class="fleet">
+      <div class="fleet-head">
+        <h3>Fleet upgrade</h3>
+        <span class="target">target release v0.20.2</span>
+      </div>
+      <div class="fleet-bar"><i style="width:100%"></i></div>
+      <div class="fleet-sub">4 up to date</div>
+    </div>
+
+    <ul class="workers">
+      <!-- laptop — online, external -->
+      <li class="worker">
+        <div class="worker-top">
+          <div>
+            <span class="name">laptop</span>
+            <span class="badge b-ok" style="margin-left:0.5rem;vertical-align:middle">up to date</span>
+            <div class="meta">
+              <span>template base</span>
+              <span>· <span class="mono">v0.20.2</span></span>
+              <span>· up <span class="uptime">3h 12m</span></span>
+              <span>· last seen 08/08/2026, 14:52:03</span>
+            </div>
+            <div class="token-line">spends your default token</div>
+          </div>
+          <div class="controls">
+            <span class="badge b-ok"><span class="dot"></span>online</span>
+            <span class="badge b-neutral">1/1 runs</span>
+            <button class="del">Delete</button>
+          </div>
+        </div>
+        <div class="gauges">
+          <div>
+            <div class="gauge-row"><span>CPU</span><span class="val">34%</span></div>
+            <div class="track"><i style="width:34%"></i></div>
+          </div>
+          <div>
+            <div class="gauge-row"><span>Memory</span><span class="val">2.1/4 GiB · 52%</span></div>
+            <div class="track"><i style="width:52%"></i></div>
+          </div>
+        </div>
+      </li>
+
+      <!-- base.l-da4a — online, hosted + docker -->
+      <li class="worker">
+        <div class="worker-top">
+          <div>
+            <span class="name">base.l-da4a</span>
+            <span class="badge b-ok" style="margin-left:0.5rem;vertical-align:middle">up to date</span>
+            <div class="meta">
+              <span>template base</span>
+              <span>· <span class="mono">v0.20.2+gadf13b84</span></span>
+              <span>· up <span class="uptime">1d 7h</span></span>
+              <span>· last seen 08/08/2026, 14:52:15</span>
+            </div>
+            <div class="token-line">auto-selects from your <a href="#">token pool</a></div>
+          </div>
+          <div class="controls">
+            <span class="badge b-info">hosted</span>
+            <span class="badge b-neutral">docker</span>
+            <span class="badge b-ok"><span class="dot"></span>online</span>
+            <span class="badge b-neutral">0/2 runs</span>
+            <select class="picker" aria-label="Anthropic token for base.l-da4a">
+              <option>Auto-select from the pool</option>
+              <option>Use my default token</option>
+            </select>
+            <button class="del">Delete</button>
+          </div>
+        </div>
+        <div class="gauges">
+          <div>
+            <div class="gauge-row"><span>CPU</span><span class="val">0%</span></div>
+            <div class="track"><i style="width:0%"></i></div>
+          </div>
+          <div>
+            <div class="gauge-row"><span>Memory</span><span class="val">0.2/8 GiB · 2%</span></div>
+            <div class="track"><i style="width:2%"></i></div>
+          </div>
+        </div>
+      </li>
+
+      <!-- nas-runner — online, short uptime, process-source mem (no bar) -->
+      <li class="worker">
+        <div class="worker-top">
+          <div>
+            <span class="name">nas-runner</span>
+            <span class="badge b-ok" style="margin-left:0.5rem;vertical-align:middle">up to date</span>
+            <div class="meta">
+              <span>template base</span>
+              <span>· <span class="mono">v0.20.2</span></span>
+              <span>· up <span class="uptime">27m</span></span>
+              <span>· last seen 08/08/2026, 14:54:41</span>
+            </div>
+            <div class="token-line">spends your default token</div>
+          </div>
+          <div class="controls">
+            <span class="badge b-ok"><span class="dot"></span>online</span>
+            <span class="badge b-neutral">0/1 runs</span>
+            <button class="del">Delete</button>
+          </div>
+        </div>
+        <div class="gauges">
+          <div>
+            <div class="gauge-row"><span>CPU</span><span class="val">8%</span></div>
+            <div class="track"><i style="width:8%"></i></div>
+          </div>
+          <div>
+            <div class="gauge-row"><span>Memory</span><span class="val">480 MiB</span></div>
+            <div class="gauge-note">worker process only</div>
+          </div>
+        </div>
+      </li>
+
+      <!-- ci-runner-1 — OFFLINE: no uptime token, drift badge, dimmed last-known stats -->
+      <li class="worker">
+        <div class="worker-top">
+          <div>
+            <span class="name">ci-runner-1</span>
+            <div class="meta">
+              <span>template base</span>
+              <span>· <span class="mono">v0.20.1</span></span>
+              <span>· last seen 08/06/2026, 09:12:30</span>
+            </div>
+            <div class="token-line">spends your default token</div>
+          </div>
+          <div class="controls">
+            <span class="badge b-neutral">template drift</span>
+            <span class="badge b-neutral"><span class="dot"></span>offline</span>
+            <button class="del">Delete</button>
+          </div>
+        </div>
+        <div class="offline-note">No uptime while offline — “last seen” carries its story.</div>
+        <div class="gauges dim">
+          <div>
+            <div class="gauge-row"><span>CPU</span><span class="val">12%</span></div>
+            <div class="track"><i style="width:12%"></i></div>
+          </div>
+          <div>
+            <div class="gauge-row"><span>Memory</span><span class="val">1.5/2 GiB · 75%</span></div>
+            <div class="track"><i style="width:75%"></i></div>
+          </div>
+        </div>
+      </li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  const btn = document.getElementById("hl");
+  btn.addEventListener("click", () => {
+    const on = document.body.classList.toggle("highlight");
+    btn.setAttribute("aria-pressed", String(on));
+    btn.textContent = on ? "Show it integrated" : "Highlight the new bit";
+  });
+</script>
