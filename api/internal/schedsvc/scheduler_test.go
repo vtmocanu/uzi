@@ -315,6 +315,24 @@ func TestTickPermanentErrorParks(t *testing.T) {
 	}
 }
 
+func TestTickMalformedConfigParks(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule()
+	s.Target = "sweep"
+	s.IssueIid = pgtype.Int8{} // sweep carries no issue
+	s.Labels = []byte(`{"not":"an array"}`) // valid jsonb, invalid selector shape
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("malformed config must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 1 || h.st.statusCalls[0].Status != "error" {
+		t.Fatalf("malformed config must PARK at status='error' (not retry forever): status calls = %+v", h.st.statusCalls)
+	}
+}
+
 func TestTickPromptScheduleCreatesPromptRun(t *testing.T) {
 	h := newHarness()
 	s := h.issueSchedule()

@@ -64,9 +64,12 @@ DELETE FROM run_schedules WHERE id = @id AND user_id = @user_id;
 
 -- name: ClaimDueSchedules :many
 -- The due-gate poll. Returns every enabled, active schedule whose next_fire_at has
--- passed, locked FOR UPDATE SKIP LOCKED so concurrent claimers partition the due set
--- rather than contending (Decision 1, defense-in-depth alongside the per-run
--- uniqueness backstops). The caller advances each row it claims within the same tx.
+-- passed, locked FOR UPDATE SKIP LOCKED as defense-in-depth (Decision 1) so that IF a
+-- second instance ever ran, concurrent claimers would partition the due set rather
+-- than contend. The scheduler is wired single-instance and does NOT hold a surrounding
+-- transaction across the fire+advance (it must not keep a tx open across the forge
+-- GetIssue HTTP call), so the row locks release when this SELECT auto-commits; the real
+-- backstop against a duplicate run is the per-run one-active unique index, not the lock.
 SELECT * FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()

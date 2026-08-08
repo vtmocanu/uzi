@@ -44,6 +44,15 @@ const promptTitleCap = 60
 // only backpressure on it, so keep it.
 const sweepPacing = 50 * time.Millisecond
 
+// errBadConfig marks a fire failure caused by a schedule's own stored config being
+// malformed (e.g. a labels selector that is valid jsonb but not a string array). Such
+// a row can NEVER succeed, so advance() treats it as PERMANENT and parks the schedule
+// at status='error' rather than re-failing it every tick forever (a self-inflicted
+// log-storm on the owner's schedule). It is distinct from a transient forge/DB error,
+// which must keep retrying. The create/edit handler (M4) validates config up front, so
+// this is defense-in-depth for a row that somehow bypassed that validation.
+var errBadConfig = errors.New("schedule config is malformed")
+
 // Store is the DB surface the scheduler reads and writes. *store.Queries satisfies it.
 type Store interface {
 	ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error)
@@ -356,6 +365,10 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			e.park(ctx, sched, "the schedule's repo is disconnected or no longer owned by you")
 			return
 		}
+		if errors.Is(fireErr, errBadConfig) {
+			e.park(ctx, sched, "the schedule's configuration is invalid and cannot fire")
+			return
+		}
 		// Transient: leave next_fire_at in the past so the next tick retries.
 		e.logger.Warn("scheduler: transient fire error, will retry", "schedule", sched.ID.String(), "error", fireErr)
 		return
@@ -390,7 +403,11 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			e.logger.Error("scheduler: advance once", "schedule", sched.ID.String(), "error", err)
 		}
 	default:
+		// A timing the DB CHECK should have rejected. Park it rather than leave
+		// next_fire_at in the past to re-claim every tick (symmetry with fireOne's
+		// unknown-target default).
 		e.logger.Error("scheduler: unknown timing", "schedule", sched.ID.String(), "timing", sched.Timing)
+		e.park(ctx, sched, "the schedule has an unrecognized timing mode")
 	}
 }
 
@@ -440,7 +457,9 @@ func (e *Scheduler) resolveSweepLabels(ctx context.Context, stored []byte) ([]by
 	var sel []string
 	if len(stored) > 0 {
 		if err := json.Unmarshal(stored, &sel); err != nil {
-			return nil, fmt.Errorf("parse sweep labels: %w", err)
+			// Permanent: a stored labels value that is not a string array will never
+			// parse. Park the schedule instead of retrying it every tick forever.
+			return nil, fmt.Errorf("parse sweep labels: %w: %w", errBadConfig, err)
 		}
 	}
 	// Drop blanks so a stored `[""]` does not defeat the non-empty invariant.
