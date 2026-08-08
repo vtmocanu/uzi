@@ -179,15 +179,30 @@ describe("ActivityFeed crew roster", () => {
     expect(container.querySelector(".animate-pulse")).toBeNull();
   });
 
-  it("`slow` and `stalled` health also read stalled", () => {
-    for (const health of ["slow", "stalled"] as RunHealth[]) {
-      const { getByTitle, unmount } = renderFeed([m(1, "text", { text: "hi" }, "lead")], {
-        status: "running",
-        health,
-      });
-      expect(getByTitle("lead: stalled")).toBeTruthy();
-      unmount();
-    }
+  it("a `stalled` active speaker reads amber `stalled`", () => {
+    const { getByTitle, queryByTitle, container } = renderFeed([m(1, "text", { text: "hi" }, "lead")], {
+      status: "running",
+      health: "stalled",
+    });
+    expect(getByTitle("lead: stalled")).toBeTruthy();
+    expect(queryByTitle("lead: working")).toBeNull();
+    // stalled is not working → no pulse.
+    expect(container.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  it("a `slow` run's active speaker still reads `working` — slow is wall-clock, not no-progress", () => {
+    // `slow` is a pure wall-clock signal: the server raises it at ~45 min
+    // (health_slow_seconds) regardless of activity, so a run can be `slow` while it is
+    // actively emitting. The currently-speaking lane is genuinely working and must keep
+    // its green pulsing dot — only `stalled`/`looping` (real no-progress) read amber.
+    const { getByTitle, queryByTitle, container } = renderFeed([m(1, "text", { text: "hi" }, "lead")], {
+      status: "running",
+      health: "slow",
+    });
+    expect(getByTitle("lead: working")).toBeTruthy();
+    expect(queryByTitle("lead: stalled")).toBeNull();
+    // The working dot pulses.
+    expect(container.querySelector(".animate-pulse")).not.toBeNull();
   });
 
   it("every agent reads `waiting` at a plan gate", () => {
@@ -536,6 +551,25 @@ describe("ActivityFeed header + timestamps (preserved)", () => {
     const iso = new Date().toISOString();
     const { getByTitle } = renderFeed([m(1, "text", { text: "hi" }, "lead", iso)], { status: "running" });
     expect(getByTitle(iso).textContent).toBe("just now");
+  });
+
+  it("shows a lane's LAST activity in the header, not when the lane opened", () => {
+    // Regression (#193): the header rendered `startedAt` (the lane's FIRST message), so a
+    // lane active a while but still emitting read e.g. "7m ago" instead of "just now".
+    // Build ONE lane (same agent + agent_instance so the two frames coalesce) with an
+    // old opener and a fresh newest message; the header must reflect the newest.
+    const oldIso = new Date(Date.now() - 7 * 60_000).toISOString();
+    const freshIso = new Date(Date.now() - 500).toISOString();
+    const { getByTitle, queryByTitle } = renderFeed(
+      [
+        mi(1, "coder", "toolu_A", "lane work", { created_at: oldIso }),
+        mi(2, "coder", "toolu_A", "lane work", { created_at: freshIso }),
+      ],
+      { status: "running", health: "ok" },
+    );
+    // Header timestamp reflects the LAST message ("just now"), not the first ("7m ago").
+    expect(getByTitle(freshIso).textContent).toBe("just now");
+    expect(queryByTitle(oldIso)).toBeNull();
   });
 
   it("renders status messages as hairline meta divider lines", () => {
