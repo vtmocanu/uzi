@@ -159,6 +159,24 @@ type FakeClient struct {
 	StreamErr       error
 	LastStreamRunID string
 
+	// Run schedules (PRD #241 M6). Schedules drives ListSchedules; ScheduleByID backs
+	// GetSchedule (a key absent → ExitNotFound, mirroring the server's owner-scoped
+	// 404). The write verbs capture their args so a test can assert the exact wire
+	// mapping the command assembled: CreateSchedule records the repo id and the whole
+	// ScheduleRequest, SetScheduleEnabled the id + bool (pause vs resume), and the
+	// delete/run-now verbs their id.
+	Schedules           []apitypes.ScheduleDTO
+	ScheduleByID        map[string]apitypes.ScheduleDTO
+	CreatedSchedule     apitypes.ScheduleDTO
+	LastCreateSchedRepo string
+	LastCreateSchedReq  apitypes.ScheduleRequest
+	EnabledSchedule     apitypes.ScheduleDTO
+	LastSchedEnabledID  string
+	LastSchedEnabledVal bool
+	LastDeletedSchedID  string
+	RunNowResult        apitypes.RunNowResponse
+	LastRunNowSchedID   string
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -463,6 +481,56 @@ func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string,
 //
 // The events go through NormalizeRunEvent, like the live decode boundary, so a
 // fake cannot deliver a frame shape the real client would have made inert.
+func (f *FakeClient) ListSchedules(context.Context) ([]apitypes.ScheduleDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.Schedules, nil
+}
+
+func (f *FakeClient) CreateSchedule(_ context.Context, repoID string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error) {
+	f.LastCreateSchedRepo = repoID
+	f.LastCreateSchedReq = req
+	if f.Err != nil {
+		return apitypes.ScheduleDTO{}, f.Err
+	}
+	return f.CreatedSchedule, nil
+}
+
+// GetSchedule mirrors the owner-scoped endpoint: a key present in ScheduleByID is the
+// caller's own schedule; a key absent is a foreign/unknown id → ExitNotFound (exit 4).
+func (f *FakeClient) GetSchedule(_ context.Context, id string) (apitypes.ScheduleDTO, error) {
+	if f.Err != nil {
+		return apitypes.ScheduleDTO{}, f.Err
+	}
+	if s, ok := f.ScheduleByID[id]; ok {
+		return s, nil
+	}
+	return apitypes.ScheduleDTO{}, Exitf(ExitNotFound, "schedule %s not found", id)
+}
+
+func (f *FakeClient) SetScheduleEnabled(_ context.Context, id string, enabled bool) (apitypes.ScheduleDTO, error) {
+	f.LastSchedEnabledID = id
+	f.LastSchedEnabledVal = enabled
+	if f.Err != nil {
+		return apitypes.ScheduleDTO{}, f.Err
+	}
+	return f.EnabledSchedule, nil
+}
+
+func (f *FakeClient) DeleteSchedule(_ context.Context, id string) error {
+	f.LastDeletedSchedID = id
+	return f.Err
+}
+
+func (f *FakeClient) RunScheduleNow(_ context.Context, id string) (apitypes.RunNowResponse, error) {
+	f.LastRunNowSchedID = id
+	if f.Err != nil {
+		return apitypes.RunNowResponse{}, f.Err
+	}
+	return f.RunNowResult, nil
+}
+
 func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, error) {
 	f.LastStreamRunID = runID
 	if f.StreamErr != nil {

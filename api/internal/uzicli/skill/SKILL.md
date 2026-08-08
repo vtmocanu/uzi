@@ -105,6 +105,13 @@ uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
+uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--auto-approve[=false]] [--wait-on-limit]
+uzi schedule list
+uzi schedule get <schedule-id>
+uzi schedule pause <schedule-id>
+uzi schedule resume <schedule-id>
+uzi schedule run-now <schedule-id>
+uzi schedule delete <schedule-id>
 uzi tui [run-id]
 uzi review show <run-id>
 uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>]
@@ -241,6 +248,37 @@ uzi version
   consumed_at}` list (derive the state yourself: `consumed_at` null = queued,
   set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
   chat turn as a follow-up, so its queue lists them all (issue runs start empty).
+
+### Schedules — time-driven runs
+
+A **schedule** starts run(s) at future time(s) — the clock-driven origin alongside a
+manual `run create` and label-driven autopilot. It fires through the **same** shared
+run-creation seam a manual start uses, so PRDLESS gating, the fresh forge issue fetch,
+active-run dedup and the usage-limit park all behave identically; a schedule can do
+nothing a manual start cannot.
+
+- `uzi schedule create --repo <repo-id> …` — create a schedule. Get the repo id from
+  `uzi repo list`. You pick exactly one **target** and exactly one **timing**, or it is
+  a usage error (exit 2) before any request:
+  - **target** — one of `--issue <iid>` (a pinned issue), `--sweep` (every eligible open
+    issue matching the `--label` selector; `--label` is repeatable and defaults to the
+    PRD label when omitted), or `--prompt <text>` (an issue-less repo→MR run that
+    bypasses the PRD-issue gate). `--label` is valid only with `--sweep`.
+  - **timing** — one of `--at <rfc3339>` (fires once, then goes terminal) or
+    `--cron <expr>` (a recurring 5-field cron). `--tz <iana>` sets the timezone the cron
+    is read in (default `UTC`).
+  - `--auto-approve` defaults **on** (the run proceeds past the plan gate unattended, the
+    point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
+    `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
+    of failing it.
+- `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
+  `NEXT`, `ON`); `--json` dumps the raw array.
+- `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
+- `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
+  restart firing without deleting (a `PATCH` of just `enabled`).
+- `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence;
+  prints the created run id(s), or reports nothing started when a dedup skip fired none.
+- `uzi schedule delete <schedule-id>` — delete a schedule. Run history is preserved.
 
 ### Authoring a seeded plan
 

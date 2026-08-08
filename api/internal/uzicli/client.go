@@ -231,6 +231,34 @@ type Client interface {
 	// rule. A caller learning "0 written" learns only that none of THEIR rows matched, and
 	// must render that as "nothing was written" rather than as success.
 	BulkSetDispositions(ctx context.Context, items []apitypes.JudgeDispositionCoordDTO, status, reason string) (apitypes.JudgeDispositionResultDTO, error)
+
+	// ListSchedules returns the caller's run schedules, newest first (PRD #241 M6):
+	// GET /api/me/schedules. Owner-scoped on RequireUser, so a CLI token works. The
+	// reply is a BARE top-level array of ScheduleDTO (no envelope), unlike the run
+	// verbs above.
+	ListSchedules(ctx context.Context) ([]apitypes.ScheduleDTO, error)
+	// CreateSchedule creates a schedule on a repo the caller owns: POST
+	// /api/repos/{id}/schedules (201 ScheduleDTO). repoID is passed straight through
+	// as the path id, exactly as CreateRun does with --repo. The per-target/timing
+	// field invariants are validated SERVER-side (400/422); the CLI validates only the
+	// one-of constraints client-side so a bad invocation fails before any request.
+	CreateSchedule(ctx context.Context, repoID string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error)
+	// GetSchedule returns one owner-scoped schedule: GET /api/schedules/{id}. A
+	// foreign/absent id is a 404 → *ExitError{ExitNotFound}.
+	GetSchedule(ctx context.Context, id string) (apitypes.ScheduleDTO, error)
+	// SetScheduleEnabled pauses (false) or resumes (true) a schedule: PATCH
+	// /api/schedules/{id} with the minimal body {enabled}. Sending ONLY `enabled` hits
+	// the handler's pause/resume path (onlyEnabled), which flips the flag without
+	// re-validating or recomputing the schedule's config.
+	SetScheduleEnabled(ctx context.Context, id string, enabled bool) (apitypes.ScheduleDTO, error)
+	// DeleteSchedule removes an owner-scoped schedule: DELETE /api/schedules/{id} (204).
+	// A foreign/absent id is a 404 (exit 4). Run history is preserved server-side (the
+	// runs.schedule_id FK is ON DELETE SET NULL), so this deletes the schedule only.
+	DeleteSchedule(ctx context.Context, id string) error
+	// RunScheduleNow fires a schedule immediately through the shared run-creation seam,
+	// WITHOUT advancing its cadence: POST /api/schedules/{id}/run-now (202
+	// RunNowResponse). A benign dedup skip fires nothing and reports Created:0.
+	RunScheduleNow(ctx context.Context, id string) (apitypes.RunNowResponse, error)
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -985,6 +1013,60 @@ func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body strin
 	var out apitypes.RunInputResponse
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", reqBody, &out); err != nil {
 		return apitypes.RunInputResponse{}, err
+	}
+	return out, nil
+}
+
+// The schedule endpoints (PRD #241 M6) return their DTOs BARE — the handler writes
+// the value directly (httpx.JSON), not under a `{"schedule": …}` key — so these
+// decode into the DTO itself rather than an envelope struct.
+
+func (c *HTTPClient) ListSchedules(ctx context.Context) ([]apitypes.ScheduleDTO, error) {
+	var out []apitypes.ScheduleDTO
+	if err := c.get(ctx, "/api/me/schedules", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) CreateSchedule(ctx context.Context, repoID string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error) {
+	var out apitypes.ScheduleDTO
+	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/schedules", req, &out); err != nil {
+		return apitypes.ScheduleDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetSchedule(ctx context.Context, id string) (apitypes.ScheduleDTO, error) {
+	var out apitypes.ScheduleDTO
+	if err := c.get(ctx, "/api/schedules/"+url.PathEscape(id), &out); err != nil {
+		return apitypes.ScheduleDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) SetScheduleEnabled(ctx context.Context, id string, enabled bool) (apitypes.ScheduleDTO, error) {
+	// A struct carrying ONLY `enabled`, so the handler's onlyEnabled() pause/resume path
+	// fires: the config is left untouched and just the flag flips. A full ScheduleRequest
+	// here would re-submit empty target/timing fields and be rejected on re-validation.
+	reqBody := struct {
+		Enabled bool `json:"enabled"`
+	}{Enabled: enabled}
+	var out apitypes.ScheduleDTO
+	if err := c.patch(ctx, "/api/schedules/"+url.PathEscape(id), reqBody, &out); err != nil {
+		return apitypes.ScheduleDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) DeleteSchedule(ctx context.Context, id string) error {
+	return c.del(ctx, "/api/schedules/"+url.PathEscape(id))
+}
+
+func (c *HTTPClient) RunScheduleNow(ctx context.Context, id string) (apitypes.RunNowResponse, error) {
+	var out apitypes.RunNowResponse
+	if err := c.postJSON(ctx, "/api/schedules/"+url.PathEscape(id)+"/run-now", nil, &out); err != nil {
+		return apitypes.RunNowResponse{}, err
 	}
 	return out, nil
 }
