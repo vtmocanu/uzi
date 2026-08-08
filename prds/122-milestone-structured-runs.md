@@ -531,85 +531,57 @@ same push-permission check.
       commit count, which is a trivial rider on M6 once the completed set rides the
       claim (Decision 11) — folded into M6, not a milestone of its own.
 
-**Phase 3 — deferred, gated on evidence.**
+**Phase 3 — brokered origin publish (landed 2026-08-08; live recovery pending deploy).**
 
-- [ ] **M8 — Brokered origin publish at checkpoints (DEFERRED, gated on evidence)**:
-      publish the branch to origin at each model-cooperative checkpoint so work
-      survives a **different** worker re-claiming the run — via the **api push
-      broker** (Decision 14, `adr/0122`), NOT the worker's own push. Mechanism:
-      after M6's reap + `fetchAgentBranch`, the worker ships the delta pack
-      (`origin/<branch>..refs/uzi-runner/<branch>`, already in its bare, no
-      credential) to a new authorization-scoped `POST /api/worker/runs/{id}/publish`;
-      the api pushes to origin with the stored PAT via a pure-Go smart-HTTP client
-      (go-git — the api image is distroless-static, no git binary), targeting
-      `refs/heads/<branch>`, never forced, CI suppressed (`ci.skip`, confirmed
-      expressible via go-git `PushOptions.Options`). The api's outbound push reuses
-      the existing `FORGE_ALLOWED_BASE_URLS` SSRF allowlist. Publish fires **only at
-      the reaped model-cooperative checkpoint** (Decision 10b as amended), never at
-      the fallback.
-
-      **🔴 `ci.skip` IS THE "forge-specific smart-HTTP behaviour" residual, and it
-      is GitLab-ONLY among all three forges — so the "N checkpoints fire zero extra
-      pipelines" guarantee below is ALREADY BROKEN for the currently-shipping FORGEJO
-      driver, not just a future-GitHub concern.** The `ci.skip` push-option is a
-      GitLab feature. Verified from source 2026-08-07: **Forgejo Actions (= Gitea
-      Actions) skips only via a commit-message marker** read from `commit.MessageRaw`
-      against `setting.Actions.SkipWorkflowStrings` (default `[skip ci]`/`[ci skip]`/
-      `[no ci]`/`[skip actions]`/`[actions skip]`) — `services/actions/notifier_helper.go`,
-      **no push-option handling at all**; and **GitHub Actions likewise has no
-      push-option skip** (docs.github.com — commit-message marker only, PRD #238 R8).
-      So on **any Forgejo repo today** (uzi's CI-fix loop is wired for Forgejo
-      Actions, PRD #65) and on **any GitHub repo once PRD #238 lands**, every brokered
-      checkpoint push fires a fresh Actions run, and those in-flight checkpoint
-      pipelines feed uzi's own CI-fix watcher a spurious mid-implementation "red
-      build". "The push-options half is confirmed in source" means **go-git carries
-      the option**, NOT that the option skips anything off GitLab — and validating M8
-      against `gitlab.example.com` alone can never surface this, because GitLab is
-      the one forge where it works. **This is an M8 design correction, not a
-      cross-PRD footnote, and the obvious fix does not work cleanly:** the only skip
-      lever Forgejo/GitHub expose is a **commit-message marker** — but the broker
-      pushes the agent's *real* commits to `refs/heads/<branch>`, and putting a
-      `[skip ci]` marker on the pushed head means either rewriting the tip (new SHA →
-      the next checkpoint / end-of-run push is non-fast-forward → **the forbidden
-      force-push**) or stacking a throwaway marker commit that must be stripped later
-      (same divergence). Both fight M8's own "never forced, fast-forward-compatible"
-      invariant, which is exactly why GitLab's content-free push-option was clean.
-      **The forge-agnostic fix that avoids the marker entirely: publish checkpoints
-      to a ref no workflow watches** — a `refs/uzi-checkpoints/<branch>`-style ref on
-      origin (the same shape as the existing local `refs/uzi-runner/<branch>` tracking
-      ref), which a reclaiming worker fetches, and which fires CI on **no** forge
-      because workflows trigger on `refs/heads/*`/tags/PRs, not arbitrary refs. Only
-      the end-of-run push to `refs/heads/<branch>` then triggers a pipeline — the
-      intended behaviour on every forge, `ci.skip` or not. **RESOLVED 2026-08-08 →
-      this ref-target route IS chosen (Decision 15); GitLab validated by probe** — a
-      custom `refs/uzi-checkpoints/*` ref is accepted by `gitlab.example.com` and
-      fires ZERO pipelines (`pipelines?ref=…` → `[]`), vs one for `refs/heads/main`;
-      see the 2026-08-08 Decision Log entry. Residual per-forge push-permission check:
-      the probe pushed as an OWNER, so a **Developer**-role bot pushing a
-      non-`refs/heads/*` ref is high-confidence (custom refs are not protectable in
-      GitLab) but proven only at M8 impl on the worker with the bot PAT; Forgejo/GitHub
-      still to check. If M8 instead keeps pushing to
-      `refs/heads/<branch>`, the marker path is best-effort on Forgejo anyway
-      (`SkipWorkflowStrings` is admin-configurable). Do not treat the
-      zero-extra-pipelines criterion as forge-portable, and do not treat "add a
-      `[skip ci]` marker" as a drop-in.
-
-      **Blocked on, in order:** (a) the `requeue_count` measurement in Risks — now
-      calibrating URGENCY, not go/no-go (the maintainer wants the feature): it sizes
-      how often cross-worker reclaim happens, which M6 structurally cannot cover (its
-      tracking ref lives on one worker's PVC, #218 R1); (b) a real-forge go-git
-      send-pack validation against `gitlab.example.com` (the push-options half is
-      already confirmed in source) — if fragile, fall back to **Option A** (worker
-      reap-then-push hardened with `hidepid=2` + a cgroup reap that catches the
-      `setsid` escape, per Decision 14); (c) ADR `adr/0122-checkpoint-push-broker.md`.
-
-      **Not** to be started with M6. **Verified**: a run publishing at a checkpoint,
-      then killed and re-claimed by a **different** worker on a **different** PVC,
-      resumes with the checkpointed milestones' commits present (the pre-M8 baseline
-      loses them — R1); the forge PAT never enters a worker git child on the publish
-      path (verified by test — no PAT-bearing spawn under the agent uid); N
-      checkpoints fire **zero** extra pipelines (`ci.skip`); the end-of-run push + MR
-      path is byte-for-byte unchanged.
+- [x] **M8 — Origin push at checkpoints (brokered)**: at each reaped
+      model-cooperative checkpoint, publish the run's committed work to origin so
+      it survives a **different** worker re-claiming the run — the gap M6's
+      PVC-local fetch-back cannot close (its tracking ref lives on one worker's
+      PVC). Originally deferred pending (a) a `requeue_count` measurement, (b) a
+      security review of Decision 8, and (c) a CI-trigger-suppression decision;
+      this run built it under an approved plan that settled (b) and (c) by design:
+      the push is **brokered through the api** (the sole PAT holder) so no
+      credential ever reaches an agent-uid git child — the spatial closure that
+      makes Decision 8's mid-turn-push concern moot — and it targets
+      **`refs/uzi-checkpoints/<branch>`**, a custom ref **no workflow watches**, so
+      CI fires on no forge (superseding the `-o ci.skip` idea in (c)). (a) remains
+      a product signal, not a build blocker.
+      - *2026-08-08 — implementation landed.* Agent side (Phase A/C):
+        `checkpointPack` streams a credential-free delta pack
+        (`origin/<branch>..refs/uzi-runner/<branch>`, or `default..` when the
+        branch was never pushed) via a worker-uid `pack-objects` spawn;
+        `client.publishCheckpoint` POSTs it as `application/octet-stream` with an
+        `X-Uzi-Checkpoint-Tip` header; the runner fires it best-effort AFTER the
+        reap + #218 fetch-back and ONLY on the reaped checkpoint (`reap:true`,
+        Decision 10b as amended — never the iteration-boundary fallback), so a
+        publish failure never fails the run. The reseed (`runnerCloneForBranch`)
+        gains `refs/uzi-checkpoints/<branch>` as a THIRD, cross-worker seed
+        candidate (`seededFrom:"checkpoint"`), preferred only when it STRICTLY
+        descends the floor; origin wins loudly on divergence. Api side (Phase B):
+        a new pure-Go `pushbroker` (go-git — the api image stays distroless-static,
+        no git binary) fetches only the needed base refs, applies the received
+        pack, verifies the declared tip STRICTLY descends origin's tip, and pushes
+        `refs/uzi-checkpoints/<branch>` **never forced**. `workersvc.Publish`
+        derives repo/branch/PAT ENTIRELY from `(runID, worker)` — the worker names
+        only the run id + tip + pack; the branch is re-derived server-side as
+        `agent/issue-<iid>` (gated to `kind==="issue"`), not taken from the worker
+        — with the `FORGE_ALLOWED_BASE_URLS` SSRF gate on both the base and the
+        dialed clone host, and a pack-inflation budget (per-object, cumulative, and
+        per-delta reconstructed-target-size caps) that rejects a decompression-bomb
+        pack before it reaches the storer.
+      - *Decision 8's security review (an M8 blocker) is satisfied by the brokered
+        design, not waived:* because the api holds the PAT and the worker ships only
+        credential-free bytes, the "N reap→push windows" exposure the review was to
+        weigh never arises on the worker — no PAT-bearing git child runs under the
+        agent-reachable uid at all.
+      - *Live-verification bound (NOT provable in this run):* the cross-worker
+        recovery outcome (kill a worker mid-run, a DIFFERENT worker re-claims, the
+        checkpointed commits are present) and the go-git fetch-apply-push against a
+        real forge (`gitlab.example.com`) are MANUAL/e2e steps confirmable only
+        after this image ships to dev-cluster. Proven here is the unit + local-bare
+        integration behavior: server-derived authorization, never-forced push,
+        strict-descendant rejection, reap-gated best-effort publish, the
+        decompression-bomb budget guard, and the cross-worker reseed candidate.
 
 ## Success Criteria
 

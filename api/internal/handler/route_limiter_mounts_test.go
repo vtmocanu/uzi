@@ -63,11 +63,13 @@ var limiterNames = [...]string{
 	limBoardOrder,
 }
 
-// The limiter names, as constants so a typo in the 142-row table below is a compile
+// The limiter names, as constants so a typo in the 143-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 142 as of this commit; it was 141 until `c309e8a0` added GET /api/admin/cli-tokens.
+// 143 as of this commit; it was 142 until PRD #122 M8 added POST
+// /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
+// /api/admin/cli-tokens.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -118,7 +120,7 @@ type routeMount struct {
 // the `lim*` constants above were rotted by a single commit — `c309e8a0`, which added
 // GET /api/admin/cli-tokens as the FOURTH auth per-user mount and the 142nd table row:
 //
-//	any new ROUTE                  -> the "142-row table" sentence at the lim* constants
+//	any new ROUTE                  -> the "143-row table" sentence at the lim* constants
 //	a new AUTH per-user mount      -> this paragraph: the four-route list AND the "25"
 //
 // Both figures are this commit's inventory. THE TABLE BELOW IS THE MECHANISM THAT FAILS
@@ -291,6 +293,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
+	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	{"POST", "/api/workers/", noLimiter},

@@ -175,6 +175,18 @@ func canonicalizeTarget(s string, max int) string {
 	return s
 }
 
+// maxPackBytes caps a checkpoint publish's raw packfile body (PRD #122 M8). Sized
+// generously — a milestone delta is a handful of commits, but a checkpoint after a
+// long turn can be larger — while bounding an abusive/garbled worker. The api reads
+// the whole body into memory before handing it to the go-git broker, so this is
+// also the memory ceiling per in-flight publish.
+const maxPackBytes = 64 << 20 // 64 MiB
+
+// checkpointTipRe matches exactly a 40-char lowercase-hex SHA-1 — the only shape a
+// git object id takes on the wire. It is validated at the handler so a malformed
+// tip is a 400 (a worker bug) and never reaches the broker as a would-be object id.
+var checkpointTipRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
 // restarting). Accepts an optional {version} body.
 func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
@@ -715,4 +727,59 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, workerMemoryToDTO(m))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"memories": out})
+}
+
+// WorkerRunPublish is the api side of the M8 brokered checkpoint publish (PRD
+// #122): the worker POSTs a raw delta PACKFILE (octet-stream body) plus the tip OID
+// it claims (header X-Uzi-Checkpoint-Tip), naming ONLY the run id in the path. The
+// api derives the repo/branch/PAT entirely from the run row and pushes the pack
+// NON-FORCED to refs/uzi-checkpoints/<branch> — the worker can never name the
+// repo/ref/credential.
+//
+// This is a best-effort durability path: a 500 is ignored by the worker, and the
+// benign "origin moved / unsupported" outcomes are 200 skips, not errors.
+func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	tip := r.Header.Get("X-Uzi-Checkpoint-Tip")
+	if !checkpointTipRe.MatchString(tip) {
+		httpx.Error(w, http.StatusBadRequest, "invalid checkpoint tip")
+		return
+	}
+	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
+	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
+	// not a silently truncated — and thus malformed — pack.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
+			return
+		}
+		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
+		return
+	}
+	res, err := h.wsvc.Publish(r.Context(), wkr, runID, tip, body)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run publish", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := map[string]any{"published": res.Published, "ref": res.Ref}
+	if res.Skipped != "" {
+		out["skipped"] = res.Skipped
+	}
+	httpx.JSON(w, http.StatusOK, out)
 }

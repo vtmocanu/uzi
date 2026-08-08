@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import {
   api,
+  client,
   fakeGitlab,
   git,
   gitlabClaim,
@@ -43,6 +45,24 @@ function spyFetch(events: string[]): () => void {
   };
   return () => {
     (git as unknown as { fetchAgentBranch: unknown }).fetchAgentBranch = orig;
+  };
+}
+
+/** Spy on client.publishCheckpoint (PRD #122 M8), recording a "publish" event. Drains the
+ *  real pack stream so pack-objects can exit, and optionally throws to prove a publish
+ *  failure never fails the run. Returns a restore fn (call it in a finally). */
+function spyPublish(events: string[], opts: { throws?: boolean } = {}): () => void {
+  const orig = client.publishCheckpoint.bind(client);
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+    ...args: unknown[]
+  ) => {
+    events.push("publish");
+    (args[2] as Readable | undefined)?.resume(); // drain the pack so the git child can exit
+    if (opts.throws) throw new Error("boom publish");
+    return { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" };
+  };
+  return () => {
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
   };
 }
 
@@ -150,5 +170,85 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
       !("iteration_count" in report!),
       "the checkpoint report omits iteration_count so it cannot regress the GREATEST-merged counter",
     );
+  });
+
+  it("reap:true brokers the checkpoint pack to origin, strictly AFTER the reap and fetch-back (PRD #122 M8)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(64);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    // Reap, then fetch-back, then the brokered publish — publish is credentialed-class and
+    // must stay after the reap and the tracking-ref update the fetch-back writes.
+    assert.deepStrictEqual(afterCheckpoint, ["kill", "fetch", "publish"]);
+  });
+
+  it("reap:false does NOT publish (the iteration-boundary fallback fetches only)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(65);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: false, progress: { completed: ["m1"], in_progress: [] } });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.deepStrictEqual(afterCheckpoint, ["fetch"]);
+  });
+
+  it("a thrown publish error is swallowed — the run still completes and reports state (best-effort)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(66);
+    const events: string[] = [];
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events, { throws: true });
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      // Must NOT reject even though publishCheckpoint throws.
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.ok(events.includes("publish"), "the publish was attempted");
+    const completed = api.states.some(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    );
+    assert.ok(completed, "the run completed despite the publish failure");
   });
 });

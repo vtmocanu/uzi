@@ -230,6 +230,14 @@ type Reconciler interface {
 
 // New constructs a Handler.
 func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub, set *settings.Cache) *Handler {
+	// Wire the M8 checkpoint-publish SSRF gate into workersvc here (PROD wiring, not
+	// just tests): the broker refuses to fetch/push against a forge base URL that is
+	// not on the configured allowlist. workersvc defaults publishFn to
+	// pushbroker.Publish, so only the gate needs injecting. Nil-guarded because some
+	// handler tests construct a Handler with no workersvc.
+	if wsvc != nil {
+		wsvc.SetForgeBaseURLAllowed(cfg.ForgeBaseURLAllowed)
+	}
 	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
@@ -1144,6 +1152,22 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+		// Checkpoint publish (PRD #122 M8): the worker POSTs a raw delta packfile +
+		// tip OID; the api derives repo/branch/PAT from the run row and pushes it
+		// NON-FORCED to refs/uzi-checkpoints/<branch>. Inherits RequireWorker; feeds
+		// BOTH the plain and TLS listeners from this one mount.
+		//
+		// TODO(PRD#122 M8): rate-limit /publish. Deliberately unlimited today: the
+		// primary DoS (a pack forcing ~GiBs of uncancellable inflation) is closed at the
+		// source by pushbroker's cumulative inflation-work cap + per-publish wall-clock
+		// timeout, so each request is now cheap and bounded and the amplification is
+		// gone. A per-worker limiter would be pure defense-in-depth but is invasive here
+		// — it means a new *mw.Limiter threaded through Routes/WorkerRoutes/
+		// mountWorkerRoutes, new config knobs, and updating the pinned route-table +
+		// limiter-argument-order tests — so it is left as a follow-up rather than folded
+		// into this hardening pass.
+		r.Post("/runs/{id}/publish", h.WorkerRunPublish)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences
