@@ -44,14 +44,22 @@ const promptTitleCap = 60
 // only backpressure on it, so keep it.
 const sweepPacing = 50 * time.Millisecond
 
-// errBadConfig marks a fire failure caused by a schedule's own stored config being
+// ErrBadConfig marks a fire failure caused by a schedule's own stored config being
 // malformed (e.g. a labels selector that is valid jsonb but not a string array). Such
 // a row can NEVER succeed, so advance() treats it as PERMANENT and parks the schedule
 // at status='error' rather than re-failing it every tick forever (a self-inflicted
 // log-storm on the owner's schedule). It is distinct from a transient forge/DB error,
 // which must keep retrying. The create/edit handler (M4) validates config up front, so
 // this is defense-in-depth for a row that somehow bypassed that validation.
-var errBadConfig = errors.New("schedule config is malformed")
+//
+// Exported so the M4 run-now handler can classify a malformed-config fire as a 400
+// (a bad request against the schedule's own config), distinct from a repo-gone 404 or
+// a transient 502. errBadConfig is the unexported alias the rest of this package uses.
+var ErrBadConfig = errors.New("schedule config is malformed")
+
+// errBadConfig is the package-internal name for ErrBadConfig; it is the SAME sentinel,
+// so errors.Is(err, errBadConfig) and errors.Is(err, ErrBadConfig) are equivalent.
+var errBadConfig = ErrBadConfig
 
 // Store is the DB surface the scheduler reads and writes. *store.Queries satisfies it.
 type Store interface {
@@ -163,15 +171,31 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule) {
 			e.logger.Error("scheduler: panic firing schedule", "schedule", sched.ID.String(), "panic", r)
 		}
 	}()
-	fireErr := e.fireOne(ctx, sched)
+	// The tick path ignores the created run ids; only RunNow surfaces them.
+	_, fireErr := e.fireOne(ctx, sched)
 	e.advance(ctx, sched, fireErr)
 }
 
-// fireOne dispatches on the schedule target and returns:
+// RunNow fires a schedule ONCE, manually, and returns the ids of the runs it created
+// (issue→0/1, sweep→N, prompt→0/1; a benign dedup skip → empty). It is the seam behind
+// POST /api/schedules/{id}/run-now.
+//
+// Unlike the tick path it does NOT advance or park the schedule: a manual extra fire
+// must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor
+// terminate a once schedule. Errors ride up UNCHANGED — workersvc.ErrRepoNotFound (repo
+// gone / not owned), ErrBadConfig (malformed stored config), or a transient forge/DB
+// error — so the handler can map each to the right HTTP code.
+func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+	return e.fireOne(ctx, sched)
+}
+
+// fireOne dispatches on the schedule target and returns the ids of the runs it created
+// this fire, plus:
 //   - nil                        → success or a benign per-fire skip (advance the schedule)
 //   - workersvc.ErrRepoNotFound  → permanent (park the schedule at status='error')
+//   - ErrBadConfig               → permanent (malformed stored config)
 //   - any other error            → transient (do NOT advance; retry next tick)
-func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) error {
+func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	switch sched.Target {
 	case "issue":
 		return e.fireIssue(ctx, sched)
@@ -182,17 +206,17 @@ func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) error 
 	default:
 		// A target the DB CHECK should have rejected. Park it rather than retry forever.
 		e.logger.Error("scheduler: unknown target", "schedule", sched.ID.String(), "target", sched.Target)
-		return workersvc.ErrRepoNotFound
+		return nil, workersvc.ErrRepoNotFound
 	}
 }
 
 // fireIssue fires a single-issue schedule through the same seam a manual/autopilot
 // start uses, computing the PRDLESS bypass from a fresh GetIssue snapshot exactly
 // like the poller/handler.
-func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) error {
+func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	iid := sched.IssueIid.Int64
 
@@ -202,16 +226,16 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) erro
 		RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 	})
 	if err != nil {
-		return err // transient DB error: retry next tick
+		return nil, err // transient DB error: retry next tick
 	}
 	if active {
 		e.logger.Info("scheduler: issue has active run, skipping fire", "schedule", sched.ID.String(), "issue", iid)
-		return nil
+		return nil, nil
 	}
 
 	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
 	if err != nil {
-		return fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
+		return nil, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
 	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Description, issue.Labels)
 }
@@ -222,23 +246,24 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) erro
 // through the same per-issue flow as fireIssue. Per-issue failures are logged and
 // skipped so one bad issue does not abort the fan-out; only a failure to resolve the
 // repo/forge or to LIST is treated as transient for the whole schedule.
-func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) error {
+func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	labelsJSON, err := e.resolveSweepLabels(ctx, sched.Labels)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
 		RepoID: repo.ID, Labels: labelsJSON,
 	})
 	if err != nil {
-		return err // transient DB error
+		return nil, err // transient DB error
 	}
 	e.logger.Info("scheduler: sweep fan-out (not behind the per-user run limiter, review N1)",
 		"schedule", sched.ID.String(), "candidates", len(candidates))
+	var created []uuid.UUID
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		active, err := e.store.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
@@ -256,43 +281,45 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) erro
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
 			continue
 		}
-		if err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Description, issue.Labels); err != nil {
+		ids, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Description, issue.Labels)
+		if err != nil {
 			// A permanent repo error mid-sweep is unexpected (the repo just resolved);
 			// log and keep going rather than aborting the whole fan-out.
 			e.logger.Warn("scheduler: sweep create run", "schedule", sched.ID.String(), "issue", iid, "error", err)
 		}
+		created = append(created, ids...)
 		// Light pacing between seam calls (review N1: no per-user limiter guards this).
 		e.sleep(sweepPacing)
 	}
-	return nil
+	return created, nil
 }
 
 // firePrompt fires a free-form prompt schedule: a repo-ful, issue-less prompt run
 // keyed to the schedule. HasActiveRunForSchedule is the benign dedup pre-check
 // alongside the uq_runs_one_active_prompt_per_schedule structural backstop.
-func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) error {
+func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	active, err := e.store.HasActiveRunForSchedule(ctx, pgUUID(sched.ID))
 	if err != nil {
-		return err // transient DB error
+		return nil, err // transient DB error
 	}
 	if active {
 		e.logger.Info("scheduler: prompt schedule has active run, skipping fire", "schedule", sched.ID.String())
-		return nil
+		return nil, nil
 	}
 	prompt := sched.Prompt.String
 	title := promptTitle(prompt)
-	_, err = e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, prompt, sched.AutoApprove, sched.WaitOnLimit)
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, prompt, sched.AutoApprove, sched.WaitOnLimit)
 	switch {
 	case err == nil:
-		return nil
+		return []uuid.UUID{run.ID}, nil
 	case errors.Is(err, workersvc.ErrActivePromptExists):
 		// Raced the pre-check; the unique index did its job. Benign — advance.
 		e.logger.Info("scheduler: prompt run already active (race)", "schedule", sched.ID.String())
-		return nil
+		return nil, nil
 	case errors.Is(err, workersvc.ErrRepoNotFound):
-		return workersvc.ErrRepoNotFound // permanent
+		return nil, workersvc.ErrRepoNotFound // permanent
 	default:
-		return err // transient
+		return nil, err // transient
 	}
 }
 
@@ -306,31 +333,32 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) err
 // auto-approve run has no human in the loop), so the schedule's wait_on_limit is
 // threaded ONLY on the non-auto-approve CreateRun path. This is intentional — do not
 // change the seam to thread it through the autopilot path.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) error {
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
+	var run store.Run
 	var err error
 	if sched.AutoApprove {
-		_, err = e.runs.CreateAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD)
+		run, err = e.runs.CreateAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD)
 	} else {
 		waitOnLimit := sched.WaitOnLimit
-		_, err = e.runs.CreateRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
+		run, err = e.runs.CreateRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
 	}
 
 	switch {
 	case err == nil:
-		return nil
+		return []uuid.UUID{run.ID}, nil
 	case errors.Is(err, workersvc.ErrActiveRunExists),
 		errors.Is(err, workersvc.ErrNotPRDIssue),
 		errors.Is(err, workersvc.ErrNoPRDLink),
 		errors.Is(err, workersvc.ErrDescriptionTooLarge):
 		// Benign per-fire skip: the schedule still advances (no tick-storm).
 		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
-		return nil
+		return nil, nil
 	case errors.Is(err, workersvc.ErrRepoNotFound):
-		return workersvc.ErrRepoNotFound // permanent
+		return nil, workersvc.ErrRepoNotFound // permanent
 	default:
-		return err // transient
+		return nil, err // transient
 	}
 }
 
