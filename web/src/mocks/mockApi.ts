@@ -830,6 +830,18 @@ let schedules: Schedule[] = [
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
     updated_at: daysFromNow(-3, 18), next_fires: [],
   },
+  {
+    // A parked schedule (status='error'): the last fire failed and the scheduler
+    // stopped advancing it, so the list shows the red "parked" badge and an "error"
+    // Next-run pill. Demoing this state is the whole reason it's a seed row.
+    id: "sch-er0r", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 173, labels: null, prompt: "",
+    timing: "recurring", cron_expr: "30 1 * * *", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
+    enabled: true, status: "error", created_at: daysFromNow(-12, 15),
+    updated_at: daysFromNow(-1, 1, 30), next_fires: [],
+  },
 ];
 
 let skills: Skill[] = mockSkills.map((s) => ({ ...s }));

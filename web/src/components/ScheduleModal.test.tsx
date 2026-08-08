@@ -98,6 +98,19 @@ describe("editing a raw cron flips the preset to Custom", () => {
   });
 });
 
+describe("keyboard: Escape closes the dialog", () => {
+  it("calls the close handler (same as the × button) on Escape", () => {
+    const onClose = vi.fn();
+    render(
+      <MemoryRouter>
+        <ScheduleModal pinned={undefined} onClose={onClose} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("the Next fires preview renders from the mocked endpoint", () => {
   it("shows the server-computed fires, not a client guess", async () => {
     const future = new Date(Date.now() + 2 * 86_400_000 + 3 * 3_600_000).toISOString();

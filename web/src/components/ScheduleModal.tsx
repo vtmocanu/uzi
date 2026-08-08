@@ -200,6 +200,54 @@ export function ScheduleModal({
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
 
+  // Focus management (a11y): on open we move focus into the dialog container
+  // (tabIndex={-1} makes it programmatically focusable) so Tab starts inside and
+  // a screen reader lands on the dialog. On close we restore focus to whatever
+  // was focused when the dialog opened — captured here without threading a ref
+  // from every caller, mirroring how CliTokens focuses a container ref on mount.
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<Element | null>(null);
+  useEffect(() => {
+    restoreFocusRef.current = document.activeElement;
+    dialogRef.current?.focus();
+    return () => {
+      const prev = restoreFocusRef.current;
+      if (prev instanceof HTMLElement) prev.focus();
+    };
+  }, []);
+
+  // Escape closes (same handler as the × button) and Tab is trapped so focus
+  // cycles within the dialog instead of reaching the list behind it. The trap is
+  // a boundary wrap at the first/last focusable element — no new dependency.
+  const onDialogKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      onClose();
+      return;
+    }
+    if (e.key !== "Tab") return;
+    const root = dialogRef.current;
+    if (!root) return;
+    const focusable = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      if (active === first || active === root) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
   // Load repos for the picker (create mode, not pinned). Failure is non-fatal.
   useEffect(() => {
     if (isEdit || pinned) return;
@@ -356,10 +404,13 @@ export function ScheduleModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+      ref={dialogRef}
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 outline-none sm:items-center"
       role="dialog"
       aria-modal="true"
       aria-label={isEdit ? "Edit schedule" : "New schedule"}
+      onKeyDown={onDialogKeyDown}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -626,9 +677,9 @@ export function ScheduleModal({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between gap-3 border-t border-edge bg-bg/40 px-5 py-3.5">
-          <span className="truncate text-[11px] text-faint">{footerSummary}</span>
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-edge bg-bg/40 px-5 py-3.5">
+          <span className="hidden truncate text-[11px] text-faint sm:inline">{footerSummary}</span>
+          <div className="flex flex-1 items-center justify-end gap-2">
             {isEdit && (
               <Button type="button" variant="danger" size="sm" onClick={remove} disabled={deleting || saving}>
                 <TrashIcon /> {deleting ? "Deleting…" : "Delete"}

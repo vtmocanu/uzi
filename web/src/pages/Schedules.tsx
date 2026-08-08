@@ -131,7 +131,7 @@ export function Schedules() {
           </div>
         </div>
       ) : (
-        <div className="overflow-hidden rounded-xl border border-edge bg-surface">
+        <div className="overflow-x-auto rounded-xl border border-edge bg-surface">
           <table className="w-full text-left text-sm">
             <thead>
               <tr className="border-b border-edge text-[12.5px] text-muted">
