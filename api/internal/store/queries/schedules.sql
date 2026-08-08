@@ -116,3 +116,18 @@ FROM runs
 WHERE schedule_id = @schedule_id
   AND kind = 'prompt'
   AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: CreatePromptRun :one
+-- The scheduler's dedicated insert for a kind='prompt' run (PRD #241): repo-ful,
+-- issue-less, always stamped with the originating schedule_id so
+-- uq_runs_one_active_prompt_per_schedule dedups concurrent live runs. Modeled on
+-- CreateSelfImproveRun (selfimprove.sql): a direct INSERT, not createRun, because a
+-- prompt run has no forge issue and no PRD link. auto_approve and wait_on_limit come
+-- straight from the schedule (the owner set them there), so unlike the engine runs
+-- this path does not fall back to the owner's default.
+INSERT INTO runs (
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit
+) VALUES (
+    @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit
+)
+RETURNING *;

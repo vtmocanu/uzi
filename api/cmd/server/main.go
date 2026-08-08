@@ -34,6 +34,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/schedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
@@ -522,6 +523,27 @@ func run() error {
 		}()
 	} else {
 		slog.Info("self-improvement engine disabled (UZI_SELFIMPROVE_CHECK_INTERVAL=0)")
+	}
+
+	// Run scheduler (PRD #241): a time-driven run origin alongside autopilot. Each
+	// tick it claims due run_schedules and fires each through the SAME shared
+	// run-creation seam autopilot uses (workersvc), so every gate — PRDLESS, fresh
+	// forge fetch, active-run dedup, usage-limit park — is inherited. It shares the
+	// same collaborators: workersvc creates the run, forgesvc builds the driver from
+	// the stored connection, settingsCache resolves PRDLESS/PRD labels, notifysvc
+	// delivers error notifications. 0 disables it; the Boot pass runs inside the
+	// goroutine (poller precedent) so a slow forge can't delay serve, and it makes a
+	// schedule that came due while the api was down fire promptly after a restart.
+	if cfg.SchedulerCheckInterval > 0 {
+		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, cfg.SchedulerCheckInterval, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			scheduler.Boot(ctx)
+			scheduler.Run(ctx)
+		}()
+	} else {
+		slog.Info("run scheduler disabled (UZI_SCHEDULER_CHECK_INTERVAL=0)")
 	}
 
 	// Per-user Claude rate-limit poller (PRD #53): each tick it polls every
