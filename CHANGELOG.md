@@ -6,6 +6,26 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-08
+
+### Added
+
+- **GitHub forge support (#238).** A third forge driver (github.com, classic PAT)
+  behind the forge-generic interface, at full parity with GitLab and Forgejo: board
+  sync, runs, pull-request creation and watching, privilege guardrails, and the
+  GitHub Actions CI-fix loop. Connect a GitHub bot PAT and your PRD-labeled issues
+  populate the board; cards read "Pull Request"/"PR"/"#N". Ships dark behind the
+  connect-form forge picker.
+
+### Fixed
+
+- **Milestone progress UI stayed blank on human-gated runs (#259).** Milestones are
+  now frozen on the first running report (`milestones_frozen` is set), so the PRD #122
+  progress UI populates on runs that pass through a plan gate.
+- **Bug bundle: controller vulnerabilities, web papercuts, and a chat-cap bypass
+  (#258).** A batch fix that landed alongside #238, also closing #221, #152, #163,
+  #183, #185, #204, and #192.
+
 ## [0.21.0] - 2026-08-08
 
 ### Added
