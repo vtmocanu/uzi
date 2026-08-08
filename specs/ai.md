@@ -11846,7 +11846,7 @@ Recorded as a decision rather than left to read as an omission, following §364'
   to carry (§393). Recorded here rather than only fixed in the page, because both read as *diagnostics
   guidance*, and guidance naming a discriminator the system cannot provide is worse than none.
 
-See [prds/113-worker-upgrade-status.md](../prds/113-worker-upgrade-status.md) for the Decision Log and
+See [prds/done/113-worker-upgrade-status.md](../prds/done/113-worker-upgrade-status.md) for the Decision Log and
 the amendments each of these sections distils, and [docs/worker-upgrades.md](../docs/worker-upgrades.md)
 for the operator-facing meaning of each state.
 
@@ -17871,7 +17871,7 @@ later reader has no other way to learn that they were known.
 
 Serves human Feature #58 (hosted k8s workers) and Feature #83 (docker-capable worker), under the
 user's #224 decisions: ship a conservative chart-tunable default now and measure on the fleet after;
-ship it and accept one loss event. PRD `prds/224-worker-ephemeral-storage.md` is the rationale
+ship it and accept one loss event. PRD `prds/done/224-worker-ephemeral-storage.md` is the rationale
 record; the amendments are the Decision Log.
 
 **🔴 READ THIS BEFORE ANY OTHER LINE, BECAUSE THE OBVIOUS SUMMARY IS WRONG.** A worker pod evicted

@@ -1128,7 +1128,7 @@ moving its version. Roll-health rows are reachable only by joining through `work
 which is what makes the per-user scoping unavoidable.
 
 Rationale, the decision log, and the alternatives that were rejected are in
-`prds/113-worker-upgrade-status.md`. The user-facing behaviour is
+`prds/done/113-worker-upgrade-status.md`. The user-facing behaviour is
 [docs/worker-upgrades.md](docs/worker-upgrades.md).
 
 ## Not yet in scope
