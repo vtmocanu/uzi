@@ -18,7 +18,7 @@
 > - **Phase 1 (M1–M5) is UNAFFECTED and still unbuilt** — the progress UI + budget resize remains the real motivation. One Phase-1 citation also drifted: the iteration badge is now `web/src/pages/RunView.tsx:515-517`, not `:270-272`. Re-verify Phase-1 line refs at implementation time too.
 > - **The budget hard ceiling is now DECIDED (2026-08-07)**: profile "Generous" — milestone-count cap **12**, total turn ceiling `RUN_MAX_ITERATIONS × min(n, 12)` (≤ 60 turns), absolute wall-clock ceiling **8h**; single-milestone plans stay at today's 5 turns / 2h, and the count cap is enforced server-side (Decision 12). M2 implements it. See the 2026-08-07 Decision Log entry.
 >
-> **Status (2026-08-08): Phase 1 backend + ALL durability DONE and SHIPPED in release v0.20.0.** Merged: M1 (MR !194), M2 (MR !195), M6 (MR !199), M8 (MR !203, plus a security-hardening follow-up in the same MR). M1 = `submit_plan.milestones` + `00098` store + Decision-12 validation; M2 = progress reporting + the milestone-scaled budget + Decision 5b per-run sweeper timeout (`00099`); M6 = the `checkpoint` signal tool → reap → credential-free PVC fetch-back (bounds SIGKILL/same-worker loss to "since the last milestone"); M8 = brokered origin publish to `refs/uzi-checkpoints/<branch>` via a pure-Go api push broker (cross-worker recovery; no PAT ever on a worker git child; server-derived authorization; never-forced; a pack-inflation-bomb guard). **M7 was dropped** (delivered by #218). **⏭️ REMAINING WORK — a fresh session should pick up here, in order: M3 → M4 → M5, the user-visible progress surfaces, NONE built yet.** **Next = M3 (Web progress UI):** `RunView` milestone checklist, a compact `M3/7` badge on Dashboard + RunsList, and the plan-gate CANDIDATE list; NULL milestones must still render today's `iteration N` badge (see the M3 milestone entry + Decision 6 for copy that must not imply verification). Then M4 (Slack) and M5 (CLI). **Also open (not milestones):** (a) LIVE validation of M6/M8 on dev-cluster after the v0.20.0 deploy — kill a worker mid-run and confirm same-worker (M6) and different-worker (M8) recovery, the Verified criteria neither seeded run could prove; (b) a deferred `/publish` rate-limiter (`TODO(PRD#122 M8)` in `api/internal/handler/handler.go` — the DoS amplification is already closed at source, this is defense-in-depth).
+> **Status (2026-08-08): Phase 1 backend + ALL durability DONE, SHIPPED in release `v0.20.2`, DEPLOYED to dev-cluster, and LIVE-VALIDATED.** ⚠️ **`v0.20.0` and `v0.20.1` are DEAD tags — never running anywhere; `v0.20.2` is the live release** (0.20.0's publish pipeline was skipped by a stray `[skip ci]` on the tagged commit; 0.20.1 OOM-killed the api at every checkpoint; both superseded by 0.20.2's shallow-fetch fix — full story in the 2026-08-08 OOM Decision Log entry). Merged: M1 (MR !194), M2 (MR !195), M6 (MR !199), M8 (MR !203) + the OOM hotfix (MR !205). M1 = `submit_plan.milestones` + `00098` store + Decision-12 validation; M2 = progress reporting + the milestone-scaled budget + Decision 5b per-run sweeper timeout (`00099`); M6 = the `checkpoint` signal tool → reap → credential-free PVC fetch-back (bounds SIGKILL/same-worker loss to "since the last milestone"); M8 = brokered origin publish to `refs/uzi-checkpoints/<branch>` via a pure-Go api push broker (cross-worker recovery; no PAT ever on a worker git child; server-derived authorization; never-forced; a pack-inflation-bomb guard). **M7 was dropped** (delivered by #218). **⏭️ REMAINING WORK — a fresh session should pick up here, in order: M3 → M4 → M5, the user-visible progress surfaces, NONE built yet.** **Next = M3 (Web progress UI):** `RunView` milestone checklist, a compact `M3/7` badge on Dashboard + RunsList, and the plan-gate CANDIDATE list; NULL milestones must still render today's `iteration N` badge (see the M3 milestone entry + Decision 6 for copy that must not imply verification). Then M4 (Slack) and M5 (CLI). **Also open (not milestones):** (a) ✅ **DONE — LIVE validation of M6/M8 on dev-cluster (0.20.2, 2026-08-08):** M6 same-worker recovery (SIGKILL → PVC reseed), M8 cross-worker recovery (worker scaled to 0 mid-run → a **different-PVC** worker recovered the committed milestones from the origin checkpoint ref), M8 publish to real GitLab, and 0 api OOMs throughout — all four Verified criteria confirmed (method + evidence in the Decision Log); (b) **STILL OPEN — a deferred `/publish` rate-limiter** (`TODO(PRD#122 M8)` in `api/internal/handler/handler.go` — the DoS amplification is already closed at source by the shallow fetch, so this is defense-in-depth, not urgent).
 
 ## Problem
 
@@ -963,3 +963,63 @@ same push-permission check.
   where the live SIGKILL/cross-worker recovery checks (M6 and M8's own Verified criteria,
   unprovable in a seeded run) can finally be run. **Remaining after this: M3/M4/M5 (the
   progress UI). A new session picks up at M3** — see the Status banner at the top.
+- **2026-08-08 — M8 OOM bug found on first real deploy, fixed in v0.20.2; M6+M8
+  LIVE-VALIDATED on dev-cluster. Version reality: `v0.20.2` is the ONLY live release.**
+  This entry is the handoff record; read it before touching M8 or the release tags.
+  - **THE RELEASE TAGS (do not be confused by three of them):** `v0.20.0` was tagged but
+    its publish pipeline was **skipped** — the release commit carried `[skip ci]` in its
+    message, which GitLab honours on the tag pipeline too, so **no images/chart were ever
+    built**. `v0.20.1` was cut to re-publish, deployed, and then **OOM-killed the api at
+    every checkpoint** (below), so it was superseded. **`v0.20.2` is the live, validated
+    release.** 0.20.0 and 0.20.1 are dead tags pointing at commits that never ran anywhere
+    — do NOT try to "fix" or deploy them. (Release lesson captured in
+    `.claude/agents/release.md`: never `[skip ci]` a commit you tag — not even the literal
+    string in the body prose; recover a skipped tag with `glab ci run --branch <tag>`.)
+  - **THE OOM BUG (the reason 0.20.1 died).** M8's `pushbroker.Publish` fetched the run
+    branch's **full history into an in-memory go-git store** (`memory.NewStorage`) before
+    pushing. On a real repo (uzi's pack is ~131 MiB / 36k objects) go-git unpacked the
+    whole thing into RAM — **measured 787 MiB heap / 742 MB RSS** — and OOM-killed the
+    **512Mi** api pod once per checkpoint. Symptom on the box: the per-user vault re-locks
+    (api restart drops the in-memory key) and `kubectl` shows `lastState: OOMKilled`
+    (exit 137). The broker's unit tests use a **one-commit local `file://` fixture** where
+    fetch depth is a no-op, so they never caught it — and the ADR had explicitly flagged
+    "the real-forge go-git round-trip is a manual/e2e validation step" that was skipped at
+    release. **THE FIX (MR !205, v0.20.2):** `fetchBaseRefs` now fetches **shallow
+    (`Depth: 1`)** — only the tip SNAPSHOT the thin delta pack references, not the history
+    — dropping peak to **47 MiB heap / 194 MB RSS** (validated against `gitlab.example.com`
+    before shipping); the api memory limit was raised **512Mi → 1Gi** for concurrency
+    headroom (`deploy/chart/values.yaml`). A regression sits in the pushbroker comment at
+    the `Depth: 1` line. **Follow-up still open:** a `/publish` rate-limiter / publish
+    concurrency semaphore (`TODO(PRD#122 M8)` in `api/internal/handler/handler.go`) — the
+    amplification is closed at source, so this is defense-in-depth, low priority.
+  - **LIVE VALIDATION — all four Verified criteria confirmed on dev-cluster @ 0.20.2, and
+    HOW to reproduce.** Method: create a throwaway issue (labels `PRD`+`PRDLESS`), seed a
+    trivial multi-milestone plan with `uzi run create --plan-file` (each step = create one
+    file, commit, call `checkpoint`; `checkpoint` ends the turn so the run pauses between
+    steps), then watch `git ls-remote origin 'refs/uzi-checkpoints/agent/issue-<n>'` for a
+    checkpoint to publish. Results: **(1) OOM fix** — 0 api restarts across all checkpoint
+    publishes + both recoveries; **(2) M8 publish** — the checkpoint ref lands on real
+    GitLab and fires NO CI (Decision 15 confirmed); **(3) M6 same-worker recovery** —
+    `kubectl delete pod <worker> --force` mid-run, same worker re-claims from its PVC, the
+    pre-kill checkpoint SHA is an ancestor of the final branch (recovered, not redone);
+    **(4) M8 cross-worker recovery (the hard one)** — needs a genuinely different PVC:
+    provision a 2nd hosted worker (web-only action), then when the run is mid-flight scale
+    the *claiming* worker's Deployment to 0 (`kubectl -n uzi-workers-docker scale deploy
+    uzi-hw-<worker_id> --replicas=0`) — `uzi worker rm` is BLOCKED while a run is active, and
+    a plain pod-kill just reschedules the same PVC, so **scale-to-0 is the lever**; the run
+    requeues (`requeue_count=1`), the *other* worker (different node + PVC, no local
+    `refs/uzi-runner`) re-claims after the affinity grace and recovers the committed
+    milestones from `refs/uzi-checkpoints/<branch>` on **origin** — proven unambiguously
+    because the recovering worker had no local ref to fall back on. Gotchas for whoever
+    re-runs this: the run is fast (~30-40s/milestone) so act on checkpoint 1, not later;
+    `uzi run get --json` has raw control chars that break `jq` — extract fields with a
+    space-tolerant `grep -oE`; a freshly-created issue needs ~30s for the poller to sync
+    its labels before `run create` accepts it; hosted worker nix-seed needs a node with
+    free **imageFs** (one dev-cluster node had a small/full 19 GiB image disk and failed
+    the seed — cordon it or grow it). Filed **flake #248** (a `web/src/pages/IssueView.test.tsx`
+    bidi/zero-width test intermittently fails in CI; unrelated to this PRD).
+  - **WHERE TO PICK UP: M3 (Web progress UI), then M4 (Slack), then M5 (CLI).** These are
+    the user-visible surfaces and none are built. All the backend data they render is live
+    and validated; see the M3/M4/M5 milestone entries + the Touchpoints section. The
+    coordination note under Touchpoints (PRD #237 touched `RunView.tsx`) still applies —
+    re-verify Phase-1 web line refs at implementation time.
