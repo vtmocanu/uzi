@@ -470,7 +470,25 @@ the account it billed afterwards. That record is the attribution join
 
 One `runs` row is the unit of work; an issue can accumulate several over its
 life (a DB partial unique index enforces at most one non-terminal run per
-issue). Status is a linear state machine:
+issue). A row enters `queued` from one of three origins: the manual **Start
+run** button (`IssueView.tsx` → `POST /api/repos/{id}/runs`); **autopilot**
+(PRD #19), event-driven off a forge label; and, since PRD #241, the
+**scheduler** — time-driven. `api/internal/schedsvc`'s engine is a
+single-instance background actor modeled on the selfimprove engine (a wake
+ticker over the durable `run_schedules.next_fire_at` due-gate, `FOR UPDATE
+SKIP LOCKED` claim, a `Boot()` immediate tick so a fire missed across a
+restart happens promptly on the next wake rather than waiting a full
+cadence — never a backfill of the cadences it missed). A due schedule fires
+through the exact `workersvc.CreateRun`/`CreateAutopilotRun` seam autopilot
+uses, so PRDLESS gating, the fresh-label forge fetch, active-run dedup, and
+the usage-limit park all apply exactly as for a manual start; the exception
+is its **ad-hoc prompt** target, which — like `ci_fix` — has no issue to
+seam through, so it lands via a dedicated INSERT as a new `prompt` run kind
+(`runs.kind`, beside `chat`/`ci_fix`/`self_improve`/`judge`/`issue`):
+repo-ful, issue-less, `schedule_id`-keyed for dedup (no issue to key
+`HasActiveRunForIssue` on), and MR-opening on the `ci_fix` shape. See
+[docs/scheduling.md](docs/scheduling.md) and
+`prds/241-schedule-runs.md`. Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed

@@ -18993,3 +18993,181 @@ today — recorded as the third driver's design, not as a live system.
 - **Still no registry (D12).** Three drivers behind `forge.New`'s hand-written `switch`
   remains legible; a registry would add indirection for no behavioural gain and would
   make the "every forge is exactly these N seams" audit harder, not easier.
+
+# PRD #241 — Scheduled runs (one-time + recurring; pinned issue, label sweep, or ad-hoc prompt)
+
+Adds a **time-driven** run origin alongside manual and autopilot. Full rationale, the
+architect-review corrections, and the two owner-resolved open decisions live in the
+Decision Log at `prds/241-schedule-runs.md`; the sections below record only what shipped.
+
+## 496. PRD #241 Decision 1 — a dedicated `run_schedules` table + a single-instance scheduler actor, NOT an overloaded `runs` row
+
+A **schedule** and a **run** are different lifecycles (a schedule recurs and outlives the
+runs it spawns), so scheduling state lives in its own table, not a `scheduled_for` column
+on `runs`. `run_schedules` (`00103_run_schedules.sql`): `user_id`/`repo_id` (both FK **`ON
+DELETE CASCADE`** — deleting the owner or repo takes its schedules), `target ∈
+{issue,sweep,prompt}`, the per-target payload columns (`issue_iid` / `labels` jsonb /
+`prompt` text), `timing ∈ {once,recurring}` with `cron_expr` (recurring) or `run_at`
+(once), an IANA `timezone` (default `UTC`), `auto_approve` (default **true**, Decision 4),
+`wait_on_limit`, `enabled`, `status ∈ {active,fired,error}`, and the two audit columns.
+Two CHECKs pin the invariants: `run_schedules_target_shape` (issue⇒`issue_iid` set &
+`prompt` null; sweep⇒both null; prompt⇒`issue_iid` null & `prompt` set) and
+`run_schedules_timing_shape` (once⇒`run_at` set & `cron_expr` null; recurring⇒`cron_expr`
+set).
+
+- **`next_fire_at timestamptz` is the durable due-gate — the real runner.** Both once and
+  recurring feed this one column so the claimer never parses cron; a partial index
+  `idx_run_schedules_due ON (next_fire_at) WHERE enabled AND status='active'` drives the
+  claim. A `once` schedule that fires sets `next_fire_at = NULL, status='fired'` (Decision
+  5); a recurring one recomputes it.
+- **`api/internal/schedsvc.Scheduler` is a single-instance background actor** modeled on
+  `selfimprove.Engine` (`Boot()` immediate tick + a `time.Ticker` wake loop), wired in
+  `cmd/server/main.go` behind `cfg.SchedulerCheckInterval > 0` beside the poller / sweeper
+  / selfimprove — same single-instance posture as every other actor here, **no leader
+  election**. `ClaimDueSchedules` uses `FOR UPDATE SKIP LOCKED` as defense-in-depth, NOT as
+  the multi-replica-safety mechanism; the real duplicate-run backstop is the seam's
+  one-active-run-per-issue unique index (issue/sweep) and
+  `uq_runs_one_active_prompt_per_schedule` (prompt). Genuine multi-replica scheduling would
+  need a lease column that exists nowhere in this codebase; out of scope.
+- **Endpoints (M4), owner-scoped, all under `RequireUser`** (so a CLI token works): `POST
+  /api/repos/{id}/schedules` (create, repo ownership via `repoForRequest`), `GET
+  /api/me/schedules` (list), `GET/PATCH/DELETE /api/schedules/{id}`, `POST
+  /api/schedules/{id}/run-now`, and `POST /api/schedules/preview` (next-N-fires for an
+  unsaved config; static path matched ahead of `/{id}`). Only `run-now` reads the forge, so
+  only it carries the per-user forge limiter — matching `CreateRun`'s posture; the rest are
+  unlimited. `PATCH` with only `enabled` set is a pure pause/resume that does not re-run
+  config validation.
+
+## 497. PRD #241 Decision 2 — fire through the SHARED `workersvc` seam, replicating the poller's caller-side scaffolding (not re-implementing run creation)
+
+Issue and sweep targets call the exact `*workersvc.Service` methods autopilot/manual use —
+`CreateAutopilotRun` when the schedule is auto-approve, `CreateRun` (threading
+`wait_on_limit`) when it is not — so a scheduled run and a manual run share one state
+machine and every gate. The seam does **not** fetch from the forge or compute PRDLESS;
+those are caller-side, so `Scheduler` replicates the poller's autopilot steps per issue
+(`poller/autopilot.go` template): `GetRepoForUser` (which also enforces owner-owns-repo,
+Decision 7) → `ForgeForConnection` (via an injected `ForgeBuilder`, like selfimprove) →
+`f.GetIssue` for fresh labels/body → compute `allowWithoutPRD` from settings + fresh
+PRDLESS label → call the seam.
+
+- **What the seam genuinely inherits** (the reuse): the PRD-label gate (read from *cache*,
+  so a just-added PRD label lags one refresh — same as the manual button), the PRD-link
+  gate (via `allowWithoutPRD`), the one-active-run-per-issue unique index, the description
+  cap, the `auto_approve`/`wait_on_limit` stamping, and the queued notify.
+  `HasActiveRunForIssue` is a **caller-side** pre-check the scheduler runs per issue, not a
+  seam method.
+- **wait_on_limit threading is asymmetric on purpose.** An auto-approve fire goes through
+  `CreateAutopilotRun`, which uses the owner's own wait-on-limit default (no human in the
+  loop); the schedule's `wait_on_limit` is threaded only on the non-auto-approve `CreateRun`
+  path. Do not "fix" the seam to thread it through the autopilot path.
+
+## 498. PRD #241 Decisions 3/6/8 — `robfig/cron/v3` as parser-only, presets as a translation layer over raw cron, and missed-fire = fire-once-on-next-wake
+
+The one new Go dependency is `github.com/robfig/cron/v3 v3.0.1`, used for **only** its
+parser/schedule types (`cron.ParseStandard`, `Schedule.Next`) — never its in-process
+`cron.Cron` runner, because the durable `next_fire_at` column is the runner (Decision 1).
+`api/internal/schedsvc` is a pure, DB-free engine: `ValidateCron`, `NextFire(expr, tz,
+after)`, once-`run_at` normalization, and next-N-fires rendering.
+
+- **5-field only.** `parseStandard` rejects anything that is not exactly 5
+  whitespace-separated fields up front, so robfig's `@every`/`@daily` descriptors and
+  6-field seconds forms are refused; the stored form is always plain 5-field cron so the
+  presets round-trip it.
+- **DST via location probe, persist UTC (Decision 3, review N3).** `NextFire` builds the
+  probe instant in the schedule's IANA location (`time.LoadLocation` + `.In`) before calling
+  `Schedule.Next`, then returns UTC. `CRON_TZ=` prefixing is deliberately NOT used, to keep
+  the stored cron string clean for preset/CLI round-trips. Guarded by a Europe/Bucharest
+  spring-forward test asserting consecutive daily 02:30 fires are 23h apart across the gap.
+- **Presets are a translation layer; raw cron is the source of truth (Decision 6).**
+  `presets.go` maps friendly presets ↔ a canonical cron string, shared by web/CLI/api so all
+  three agree byte-for-byte. Storage is always cron + tz, never a preset label.
+- **Missed fires: fire once, never backfill (Decision 8).** After an outage `next_fire_at`
+  is already past, so the next wake fires the schedule once and computes the next *future*
+  `next_fire_at` — no thundering backfill of skipped cadences. `Boot()` runs one immediate
+  tick at API start so "promptly" holds across a restart rather than degrading to one
+  wake-cadence of latency.
+- **Skip-vs-advance (all targets, sharpest for prompt).** A fire skipped for a benign
+  reason (a prior run still live, or a per-fire seam rejection — not-a-PRD-issue, no PRD
+  link, description too large, active-run) STILL advances the schedule, so there is neither a
+  tick-storm nor a queued double-fire. Only a **transient** forge/DB error leaves
+  `next_fire_at` in the past to retry next tick; a **permanent** error parks the schedule at
+  `status='error'` (repo/owner gone → `ErrRepoNotFound`; malformed stored config →
+  `ErrBadConfig`, e.g. a `labels` value that is valid jsonb but not a string array; a cron
+  with no next fire). A park notifies the owner via `notifysvc` so it is not silent.
+
+## 499. PRD #241 Decisions 4/5 — auto-approve per-schedule defaulting ON, and one-time schedules go terminal (not deleted)
+
+- **Auto-approve defaults ON (owner decision 2026-08-08).** The point of a schedule is
+  unattended off-hours work, so a per-schedule `auto_approve` toggle defaults **true** (DB
+  default) — reusing the exact semantics autopilot already runs under, not a new privilege.
+  A user who wants a review gate flips it off per schedule; auto-approve skips only the
+  *plan* gate, never a guardrail — `main` is still never written and delivery is still an MR
+  a human merges.
+- **One-time schedules go terminal, not hard-deleted (Decision 5).** After a `once`
+  schedule fires it moves to `status='fired'` and drops out of the active claim set; the row
+  is kept for provenance (`runs.schedule_id`, `last_fired_at`) and a future "past/fired"
+  filter. `run-now` deliberately does **neither** advance nor terminate — a manual extra
+  fire must not disturb a recurring cadence nor terminate a once schedule.
+
+## 500. PRD #241 Decisions 7/9 — sweep eligibility is a PRD-label sibling query, consent is repo ownership, and the selector defaults to the PRD label (never an empty array)
+
+A sweep fires, at fire time, on every open issue on the repo matching a label selector that
+*also* passes the run-creation gate. Two corrections the review forced, both shipped:
+
+- **The query is a PRD-label-only sibling of the autopilot candidate query**
+  (`ListSweepCandidateIssues`, `open ∧ has(selected labels)`), NOT
+  `ListAutopilotCandidateIssues` (which also requires the autopilot label and would make a
+  sweep near-redundant with autopilot). Per-issue `HasActiveRunForIssue` dedup follows. No
+  GIN index on `issues.labels` — a sweep is a bounded seq-scan over one repo's cached issues.
+- **Consent is direct repo ownership** via `GetRepoForUser(repoID, userID)` inside the fire
+  path — NOT autopilot's `eligible()`/attribution inference (label-adder matching
+  `human_username`), which is meaningless for a schedule the owner created.
+- **The selector defaults to the PRD label — resolved in Go, never an empty jsonb array
+  (Decision 9).** `run_schedules.labels` holds zero-or-more label names; an empty/NULL/`[]`
+  or all-blank selector resolves in `resolveSweepLabels` to the single-element `[PRD label]`.
+  This is load-bearing: an empty `[]` passed to the containment predicate would match *every*
+  open issue. The per-issue run-creation gate is unchanged, so a `bug` sweep over non-PRD
+  issues fires only when PRDLESS is enabled and those issues carry the PRDLESS label —
+  "selector picks candidates, gate picks what runs."
+
+## 501. PRD #241 Decision 10 — the `prompt` run kind (repo-ful, issue-less, `ci_fix` shape), and the FK/CHECK correction that makes schedule-keyed dedup work
+
+The ad-hoc prompt target is a new `runs.kind='prompt'` (`workersvc.RunKindPrompt`): `repo_id`
+set, `issue_iid` NULL, the schedule's prompt snapshotted as `issue_description`, created by a
+**dedicated INSERT** (`CreatePromptRun`), NOT `createRun`. It is repo-ful *and issue-less* —
+the **`ci_fix` shape, not `self_improve`** (which carries a real tracking issue). It
+deliberately bypasses the PRD-issue **sanction** gate (`isPRDIssue`/`HasPrdLink`), which is
+NOT one of the four main-protection guardrail layers (Developer-role/protected-branch,
+worker-holds-PAT, `PreToolUse` deny-hook, `settingSources:[]`) — all untouched, so `main`
+stays protected. Consent is repo ownership (`GetRepoForUser`), replicated in the Go wrapper
+because the prompt path bypasses `createRun` where that check normally sits. **Owner decided
+it is NOT admin-gated** — a normal user capability gated only by repo ownership.
+
+- **Both `runs` kind constraints edited (`00104`).** `runs_kind_check` adds `'prompt'` to the
+  domain, and `runs_kind_shape` adds `(kind='prompt' AND repo_id IS NOT NULL AND issue_iid IS
+  NULL)`. Editing only one fails the other on first insert. `RunKind` in
+  `agent/src/protocol.ts` gains `"prompt"` too.
+- **The FK/CHECK correction worth capturing for a rebuild.** `runs.schedule_id` is a nullable
+  FK **`ON DELETE SET NULL`** (never CASCADE — deleting a schedule must not delete its run
+  history). The prompt shape CHECK therefore **must NOT require `schedule_id IS NOT NULL`**:
+  the two are jointly unsatisfiable — `ON DELETE SET NULL` runs `UPDATE runs SET schedule_id =
+  NULL` on schedule delete, which such a CHECK would reject, aborting the delete (and any
+  user/repo cascade) as soon as one prompt run exists. Dedup does not rest on the CHECK: the
+  **only** inserter of a prompt run is the scheduler, which always stamps `schedule_id`, so the
+  partial unique index `uq_runs_one_active_prompt_per_schedule ON runs(schedule_id) WHERE
+  kind='prompt' AND status NOT IN (completed,failed,cancelled)` catches concurrent live runs at
+  enqueue (surfaced as `ErrActivePromptExists`). `schedule_id` is NULL only after the schedule
+  is gone, by which point one-active dedup is moot.
+- **Dedup is schedule-keyed.** `HasActiveRunForSchedule` is the benign pre-check;
+  `ErrActivePromptExists` (the index) is the race backstop — either advances the schedule
+  without a second fire.
+- **Worker side modeled on `ci_fix`, not `self_improve` (M8, the only `agent`-module work).**
+  `runner.ts` adds a real `prompt` case to `runnerCloneForClaim` (branch `uzi/prompt-{runId}`),
+  `mrTitle`, and `mrDescription` — otherwise the issue defaults render `#null` MR text. Board
+  move is null-safe for free (`runlifecycle` skips the card move + terminal comment when
+  `issue_iid` is NULL). `issue_title` is set to a capped first-line of the prompt (`promptTitle`,
+  60 runes) so the run-view header is never blank.
+- **Guard-critical-path flag SHIPPED (the one M8 follow-up the PRD flagged as open).** A
+  `prompt` run that actually touches uzi's own guard surface gets the guard-critical MR section
+  (`guardCriticalMrSection`, `runner.ts`), closing the gap that `self_improve` got this flag for
+  free (it targets uzi's repo) but a repo-agnostic prompt run would not.

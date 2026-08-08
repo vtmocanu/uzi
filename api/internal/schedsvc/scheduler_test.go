@@ -319,7 +319,7 @@ func TestTickMalformedConfigParks(t *testing.T) {
 	h := newHarness()
 	s := h.issueSchedule()
 	s.Target = "sweep"
-	s.IssueIid = pgtype.Int8{} // sweep carries no issue
+	s.IssueIid = pgtype.Int8{}              // sweep carries no issue
 	s.Labels = []byte(`{"not":"an array"}`) // valid jsonb, invalid selector shape
 	h.st.due = []store.RunSchedule{s}
 
