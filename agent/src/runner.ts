@@ -718,6 +718,66 @@ export class RunRunner {
             return undefined;
           }
         },
+        // PRD #122 M6: durably checkpoint the run's committed milestone work MID-RUN
+        // (Decisions 6, 7, 10, 10b). It is the SAME credential-free fetch-back the done and
+        // park paths use (#218's fetchAgentBranch), fired at a milestone boundary so a hard
+        // crash loses at most "since the last milestone" rather than the whole run.
+        //
+        // REAP-BEFORE-GIT is the load-bearing invariant (B1/M4 audit): when reaping, the
+        // agent tree is killed BEFORE any git runs, so a survivor cannot read a credential
+        // out of a git child's /proc/environ — the exact order the done path uses
+        // (killAgentTree at :731 before fetchAgentBranch at :760). Best-effort throughout:
+        // a checkpoint must NEVER fail the run.
+        checkpoint: async (opts) => {
+          // `barePath` is the outer `let` (string | undefined); it is set before the run
+          // reaches the executor, but narrow it so the closure is honest rather than `!`.
+          if (!barePath) return;
+          // Decision 6 no-op rejection (tip-movement check): if the runner clone's branch
+          // tip has not moved since the last checkpoint wrote the tracking ref, there is
+          // nothing new to fetch — skip it (do NOT fail the run, do NOT fetch). A null
+          // trackTip (never checkpointed) or a null cloneTip (unresolvable) is NOT a match,
+          // so it falls through to a real fetch.
+          const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+          const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
+          if (trackTip !== null && cloneTip !== null && trackTip === cloneTip) {
+            runLog.info("checkpoint skipped: branch tip unmoved since last checkpoint", {
+              run_id: runId,
+              branch: runnerClone.branch,
+            });
+            return;
+          }
+          // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
+          // any git — exactly as the done path orders killAgentTree before fetchAgentBranch.
+          // The fallback (reap:false) must NOT reap: a backgrounded dev server the lead
+          // means to reuse next iteration must survive.
+          if (opts.reap) executor.killAgentTree?.();
+          // Fetch back, credential-free (#218's helper): brings the committed work into
+          // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
+          await this.fetchBackBestEffort(
+            barePath,
+            runnerClone.path,
+            runnerClone.branch,
+            runId,
+            runLog,
+          );
+          // Report the checkpointed milestone as a `running` report — additive-optional
+          // (milestone fields omitted when no progress) and wrapped so it never throws. NO
+          // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
+          // out keeps it from regressing the server's GREATEST-merged iteration counter.
+          await reportState({
+            status: "running",
+            ...(opts.progress
+              ? {
+                  milestones_completed: opts.progress.completed,
+                  milestones_in_progress: opts.progress.in_progress,
+                }
+              : {}),
+          }).catch((e) =>
+            runLog.warn("could not report checkpoint progress", {
+              error: errMessage(e),
+            }),
+          );
+        },
       };
 
       const result = await executor.run(ctx);

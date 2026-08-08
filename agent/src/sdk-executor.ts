@@ -201,6 +201,10 @@ interface TurnResult {
    *  during this turn (last-wins within the turn). The loop carries it into the NEXT
    *  iteration's `running` report. */
   progress?: MilestoneProgress;
+  /** PRD #122 M6: true when the lead called the turn-ending `checkpoint` tool this turn.
+   *  Latched (last-wins/latch within the turn, like `done`): once seen it stays set, and
+   *  the loop reaps + fetches the committed milestone work back durably before continuing. */
+  checkpoint?: boolean;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -414,6 +418,12 @@ export class SdkExecutor implements Executor {
     // PRD #122 M2: the newest progress snapshot the lead has reported, carried into the
     // next iteration's `running` report so the server sees it. Updated after each turn.
     let latestProgress: MilestoneProgress | undefined;
+    // PRD #122 M6: the milestone list FROZEN at the gate, hoisted out of the block-scoped
+    // `candidateMilestones` inside the plan-and-gate block so the implement loop can name
+    // the milestones in its prompt. Assigned once the gate resolves `approve`; it stays
+    // undefined on the pre-approved resume path (no plan-and-gate block runs there) —
+    // acceptable for M6, which introduces no claim change to carry it across a resume.
+    let frozenMilestones: Milestone[] | undefined;
     const maxRevisions = planMaxRevisionsOf(ctx.config);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -513,6 +523,9 @@ export class SdkExecutor implements Executor {
         // PRD #122 M2: report_progress, gated identically — a non-issue run has no
         // milestone list to progress against.
         progress: isIssueRun,
+        // PRD #122 M6: the checkpoint tool, gated on the same isIssueRun discriminator —
+        // a non-issue run has no milestone boundary to checkpoint at.
+        checkpoint: isIssueRun,
       }),
     };
     if (this.client) {
@@ -923,6 +936,11 @@ export class SdkExecutor implements Executor {
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
         approvedSelection = verdict.selection;
+        // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
+        // `candidateMilestones` is block-scoped and REPLACED across revision rounds
+        // (Decision 2), so this captures the final approved list — the one the loop names
+        // in its prompt and the checkpoint reports progress against.
+        frozenMilestones = candidateMilestones;
       } // end of the plan-and-gate block skipped by a pre-approved resume
 
       // A ci_fix run whose approved plan is a not_code verdict is done: no code to
@@ -1106,6 +1124,12 @@ export class SdkExecutor implements Executor {
             // pre-approved path ONLY, so an ordinary gated run's implement prompt is
             // byte-identical to before (it never carried this). First turn only.
             priorWork: preApproved ? ctx.priorWork : undefined,
+            // PRD #122 M6: name the frozen milestones and their live status so the lead
+            // can see the boundaries and checkpoint at each one. Both undefined on the
+            // pre-approved resume path (frozenMilestones is never assigned there) and on
+            // any run with no approved breakdown, which makes the note additive-absent.
+            milestones: frozenMilestones,
+            progress: latestProgress,
           }),
           state,
           idleMs,
@@ -1116,8 +1140,23 @@ export class SdkExecutor implements Executor {
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
         if (turn.progress) latestProgress = turn.progress;
+        // PRD #122 M6 (Decision 10): the lead cooperatively checkpointed a completed
+        // milestone. Reap + fetch-back durably, then continue — it ended its turn and will
+        // be re-prompted for the next milestone. A turn that is BOTH done and checkpoint
+        // still terminates: the `if (turn.done) break;` below wins because we skip the
+        // continue when done.
+        if (turn.checkpoint && !turn.done) {
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          continue;
+        }
         if (turn.done) break;
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
+
+        // PRD #122 M6 (Decision 10b): iteration-boundary fallback checkpoint. Only reached
+        // when the model did NOT cooperatively checkpoint this iteration (that path
+        // `continue`d above). Fetch-back WITHOUT reaping — a backgrounded dev server the
+        // lead means to reuse next iteration must survive (Decision 10b). Best-effort.
+        await ctx.checkpoint?.({ reap: false, progress: latestProgress });
 
         // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
         // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
@@ -1563,6 +1602,7 @@ export class SdkExecutor implements Executor {
         if (sig.milestones) result.milestones = sig.milestones; // last-wins, alongside plan (PRD #122 M1)
         if (sig.progress) result.progress = sig.progress; // last-wins (PRD #122 M2)
         if (sig.done) result.done = true;
+        if (sig.checkpoint) result.checkpoint = true; // latch, like `done` (PRD #122 M6)
         // Last-wins within the turn, mirroring `plan` rather than `done`'s latch:
         // if the lead somehow signals twice, the LAST declaration is the one that
         // describes the tree the worker is about to push (PRD #72 M4).
