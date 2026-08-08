@@ -203,6 +203,30 @@ func TestRunMilestonesLifecycleLiveDB(t *testing.T) {
 		}
 	})
 
+	// ── Issue #259: the candidate fallback (clause 3) must be as immutable as the
+	//    narg path — a later running report carrying a DIFFERENT candidate cannot
+	//    overwrite an already-frozen list, because milestones_frozen is first in the
+	//    COALESCE. Guards a reorder of the three sources. ──
+	t.Run("candidate fallback cannot overwrite an already-frozen list (issue #259)", func(t *testing.T) {
+		frozenRun := uuid.New()
+		frozenList := []byte(`[{"id": "x", "title": "Frozen"}]`)
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, kind, milestones_frozen, milestones_candidate)
+			 VALUES ($1, $2, $3, 11, 't', 'd', 'running', $4, 'issue', $5, $6)`,
+			frozenRun, userID, repoID, wkr.ID, frozenList, candidateJSON)
+		// A running heartbeat while a different candidate sits on the row.
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: frozenRun, WorkerID: workerID, IterationCount: 2,
+			RunMaxIterations: 5, RunTimeoutSeconds: 7200,
+			MilestoneBudgetCap: 12, BudgetWallCeilingSeconds: 28800,
+		}); err != nil {
+			t.Fatalf("SetRunRunning: %v", err)
+		}
+		if got := milestones(frozenRun, "milestones_frozen"); string(got) != string(frozenList) {
+			t.Fatalf("frozen overwritten by the candidate fallback: got %s, want the original frozen list", got)
+		}
+	})
+
 	// ── The autopilot freeze: SetRunRunning writes frozen via COALESCE, so the first
 	//    report wins and a later one with a different list cannot overwrite it. ──
 	t.Run("autopilot frozen is immutable", func(t *testing.T) {

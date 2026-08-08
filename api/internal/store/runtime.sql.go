@@ -4103,11 +4103,16 @@ UPDATE runs SET
     --      observed that freeze reading a NOT-YET-VISIBLE candidate and freezing NULL,
     --      leaving an approved milestone run with candidate set and frozen NULL — so the
     --      progress UI never lit up. This clause makes the FIRST post-approval running
-    --      report re-freeze from the candidate column, closing that gap idempotently. It
-    --      cannot fire prematurely: the WHERE guard below only admits awaiting_approval →
-    --      running once an approve_plan input was consumed, and during planning the
-    --      candidate column is still NULL. The common heartbeat leaves an already-frozen
-    --      value untouched via clause 1.
+    --      report re-freeze from the candidate column, closing that gap idempotently. On
+    --      the normal path it never freezes a not-yet-approved list: during planning the
+    --      candidate column is still NULL, and the WHERE guard below admits
+    --      awaiting_approval → running only once an approve_plan input was consumed. In the
+    --      one residual that guard DOES admit — a stale round-2 pre-gate report riding a
+    --      consumed round-1 approve_plan (see the accepted-residual note on this query's
+    --      guard) — it is clause 1, NOT the guard, that keeps the freeze correct: the
+    --      round-1 resume already froze round-1's candidate, so the already-frozen list
+    --      wins and the stale round-2 candidate cannot overwrite it. The common heartbeat
+    --      is likewise a no-op via clause 1.
     milestones_frozen = COALESCE(milestones_frozen, $6::jsonb, milestones_candidate),
     -- PRD #122 M2 (Decision 5/5b): per-run budget derived SERVER-SIDE from the frozen
     -- milestone count at freeze, written IMMUTABLY. NULL for a 0/1-milestone run so its
