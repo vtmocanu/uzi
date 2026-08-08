@@ -480,7 +480,7 @@ same push-permission check.
 
 **Phase 2 — durability (still no credential). RE-SCOPED 2026-08-07 against PRD #218 — read the banner at the top and `prds/done/218-park-resume-work-loss.md` before starting. #218 shipped the tracking-ref + fetch-back + strict-descendant-reseed foundation this phase was originally built around; only the delta below remains, and it is optional (Phase 1 is the feature).**
 
-- [ ] **M6 — Proactive milestone-boundary checkpoint (delta over #218)**: new
+- [x] **M6 — Proactive milestone-boundary checkpoint (delta over #218)**: new
       `checkpoint` signal tool; on it the executor ends the turn, the runner calls
       `killAgentTree()`, the worker rejects a no-op checkpoint (tip unmoved / tree
       dirty, Decision 6) and otherwise runs #218's existing `fetchAgentBranch`
@@ -502,6 +502,28 @@ same push-permission check.
       for 14 minutes) can lose the affinity and a different worker takes the run
       onto a different PVC where the checkpoint is invisible. Cross-worker recovery
       is M8 (origin push), still deferred.
+      - *2026-08-08 — implementation landed (agent-only delta).* Shipped: the
+        turn-ending `checkpoint` signal tool gated to `kind === "issue"`
+        (`agent/src/signals.ts`, main-thread-only extraction in `scanSignals`); the
+        executor's model-cooperative (reap, Decision 10) and iteration-boundary
+        fallback (no-reap, Decision 10b) checkpoints (`agent/src/sdk-executor.ts`);
+        the runner callback that runs the no-op check → reap-if-cooperative → #218's
+        credential-free `fetchAgentBranch` fetch-back → running report
+        (`agent/src/runner.ts`); the `branchTip`/`trackingTip` helpers
+        (`agent/src/git.ts`); and the implement-prompt milestone note
+        (`agent/src/prompt.ts`). Unit coverage: signals, sdk-executor,
+        runner-checkpoint (reap-before-git ordering, no-op skip, milestone report),
+        git helpers, and the prompt note; `task gate:agent` green.
+      - *Divergence from the text above:* the no-op rejection is **tip-movement
+        only**, NOT "tree dirty". A worker-uid `git status` in the runner clone
+        would read a runner-owned config source and violate B2 (Decision 6, `git.ts`
+        invariants), so the tree-dirty half was deliberately not built — the plan
+        scoped it out.
+      - *Live-verification bound (NOT provable in this run):* M6's **Verified**
+        criterion is a live SIGKILL-recovery test on a deployed worker; it can only
+        be confirmed after this agent image ships to dev-cluster. Proven here is the
+        unit-level behavior (reap ordering, credential-free fetch call, no-op
+        rejection, no-reap fallback), not the live durability outcome.
 - [ ] ~~**M7 — Resume precision**~~ — **DELIVERED by PRD #218 (M2/M3), dropped
       2026-08-07.** #218 already carries the recovered-commit count into the resume
       (`priorWork` widened) and states it in the feed either way. The only piece

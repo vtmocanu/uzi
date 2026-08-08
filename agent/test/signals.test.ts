@@ -399,12 +399,68 @@ describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () =>
   });
 });
 
+describe("scanSignals checkpoint (PRD #122 M6)", () => {
+  const CHECKPOINT = "mcp__uzi__checkpoint";
+
+  it("extracts checkpoint:true from a main-thread checkpoint tool_use", () => {
+    assert.deepStrictEqual(scanSignals(toolUse(CHECKPOINT, {})), { checkpoint: true });
+  });
+
+  it("does NOT latch checkpoint from a subagent frame (the main-thread guard holds)", () => {
+    // A subagent must never be able to force a checkpoint (which reaps the agent tree +
+    // fetches the branch back). Both markers together, and each independently, are dropped.
+    assert.strictEqual(scanSignals(subagentToolUse(CHECKPOINT, {})).checkpoint, undefined);
+    assert.strictEqual(
+      scanSignals(subagentToolUse(CHECKPOINT, {}, { subagent_type: "coder" })).checkpoint,
+      undefined,
+    );
+    assert.strictEqual(
+      scanSignals(subagentToolUse(CHECKPOINT, {}, { parent_tool_use_id: "toolu_x" })).checkpoint,
+      undefined,
+    );
+  });
+
+  it("still honors checkpoint on a main-thread frame (parent_tool_use_id: null)", () => {
+    const r = scanSignals(subagentToolUse(CHECKPOINT, {}, { parent_tool_use_id: null }));
+    assert.deepStrictEqual(r, { checkpoint: true });
+  });
+});
+
+describe("buildSignalMcpServer checkpoint schema gate (PRD #122 M6)", () => {
+  // Mirrors the report_progress schema-gate test: the tool is registered only for issue
+  // runs (Decision 13), so the model never sees it on a non-issue run.
+  const registeredTools = (server: unknown): Record<string, unknown> => {
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, unknown> } | undefined)?._registeredTools;
+    assert.ok(tools, "expected the sdk server to expose its registered tools");
+    return tools!;
+  };
+
+  it("does NOT register checkpoint by default (ci_fix / self_improve)", () => {
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({}), buildSignalMcpServer({ checkpoint: false })]) {
+      const tools = registeredTools(server);
+      assert.ok(!("checkpoint" in tools), `checkpoint must be absent; got ${Object.keys(tools).join(", ")}`);
+    }
+  });
+
+  it("registers a no-argument checkpoint tool when enabled", () => {
+    const tools = registeredTools(buildSignalMcpServer({ checkpoint: true }));
+    const checkpoint = tools["checkpoint"] as { inputSchema?: { shape?: Record<string, unknown> } } | undefined;
+    assert.ok(checkpoint, `expected a checkpoint tool; got ${Object.keys(tools).join(", ")}`);
+    // It takes no arguments — an empty zod object shape.
+    const shape = checkpoint!.inputSchema?.shape ?? {};
+    assert.deepStrictEqual(Object.keys(shape), [], "checkpoint takes no arguments");
+  });
+});
+
 describe("isSignalToolName", () => {
   it("matches the qualified signal tools only", () => {
     assert.strictEqual(isSignalToolName("mcp__uzi__submit_plan"), true);
     assert.strictEqual(isSignalToolName("mcp__uzi__signal_done"), true);
     // PRD #122 M2: report_progress is filtered from the persisted stream too.
     assert.strictEqual(isSignalToolName("mcp__uzi__report_progress"), true);
+    // PRD #122 M6: checkpoint is filtered from the persisted stream too.
+    assert.strictEqual(isSignalToolName("mcp__uzi__checkpoint"), true);
     assert.strictEqual(isSignalToolName("submit_plan"), false);
     assert.strictEqual(isSignalToolName("Bash"), false);
     assert.strictEqual(isSignalToolName(undefined), false);

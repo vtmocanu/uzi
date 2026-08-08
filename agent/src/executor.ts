@@ -196,6 +196,21 @@ export interface RunContext {
     iteration: number,
     progress?: MilestoneProgress,
   ): Promise<IterationBudget | undefined> | void;
+  /**
+   * PRD #122 M6: durably checkpoint the run's committed work at a milestone boundary.
+   * The executor calls it from the implement loop when a milestone completes.
+   *
+   * `reap:true` is the MODEL-COOPERATIVE checkpoint (Decision 10): the lead called the
+   * `checkpoint` tool, so reap the agent tree THEN fetch the branch back — reap-before-git
+   * is the same B1 ordering the done path uses. `reap:false` is the ITERATION-BOUNDARY
+   * FALLBACK (Decision 10b): fetch back WITHOUT reaping, so a backgrounded dev server the
+   * lead means to reuse next iteration survives. `progress` carries the latest reported
+   * milestone progress so the running report names the checkpointed milestone.
+   *
+   * Fire-and-forget in spirit: BEST-EFFORT, and the runner's implementation swallows any
+   * failure so a checkpoint can never fail the run. Absent on the stub/test executors.
+   */
+  checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
 }
 
 export interface ExecutorResult {
