@@ -308,6 +308,50 @@ export function missingDeclaredDeps(cwd: string): string[] {
   return declared.filter((name) => !existsSync(`${cwd}/node_modules/${name}`));
 }
 
+// guardCriticalWarningLines is the guard-critical flag as MR-description lines,
+// keyed on flagGuardPaths' output. guardHits is null when the changed-file diff
+// could NOT be computed — that surfaces loudly (fail-closed) so a diff failure never
+// silently suppresses the flag on a guard-touching MR (M5 audit). Empty [] ⇒ no
+// guard path touched ⇒ no lines. Factored out so the self_improve section and the
+// PRD #241 prompt-run section share ONE copy of this warning text (a duplicated
+// safety warning is the copy-drift this repo guards against).
+function guardCriticalWarningLines(guardHits: string[] | null): string[] {
+  if (guardHits === null) {
+    return [
+      "> ⚠️ **Guard-path check: UNAVAILABLE (diff failed).** The worker could not compute the",
+      "> changed-file list, so it could not check for guard-critical paths. Review this change",
+      "> for any touch of guardrails, auth, secret/vault, worker token assembly, or compose",
+      "> secret wiring MANUALLY before merging.",
+    ];
+  }
+  if (guardHits.length > 0) {
+    return [
+      "> ⚠️ **Guard-critical paths touched — review with extra care.** This change modifies",
+      "> files on uzi's security-critical surface (guardrails, auth, secret/vault, worker",
+      "> token assembly, or compose secret wiring). Verify it does not weaken any guardrail",
+      "> before merging:",
+      ...guardHits.map((f) => `> - \`${f}\``),
+    ];
+  }
+  return [];
+}
+
+// guardCriticalMrSection composes a standalone MR-description section carrying ONLY
+// the guard-critical flag (PRD #241 Decision 10, worker-side follow-up). Used by an
+// ad-hoc prompt run, which — unlike a self_improve run — carries no test-suite
+// evidence: it runs against an arbitrary repo, so uzi's own SELF_IMPROVE_CHECKS
+// gate suite is meaningless there and is not run. The flag itself IS still safe on
+// any repo because GUARD_CRITICAL_PATTERNS match uzi's own source paths only, so it
+// fires exactly when a prompt run actually touches uzi's guard surface (i.e. targets
+// the uzi repo) and is an empty no-op otherwise. Returns "" when nothing is flagged
+// (guardHits is [] — a computed diff that touched no guard path) so a clean prompt
+// MR carries no self-improvement-style boilerplate.
+export function guardCriticalMrSection(guardHits: string[] | null): string {
+  const warning = guardCriticalWarningLines(guardHits);
+  if (warning.length === 0) return "";
+  return ["", "---", "### Guard-critical paths", "", ...warning].join("\n");
+}
+
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:
 // the guard-critical flag (when any path was touched) and the test-suite evidence.
 // guardHits is null when the changed-file diff could NOT be computed — that surfaces
@@ -317,24 +361,8 @@ export function missingDeclaredDeps(cwd: string): string[] {
 export function selfImproveMrSection(guardHits: string[] | null, checks: CheckResult[]): string {
   const lines: string[] = ["", "---", "### Self-improvement run"];
 
-  if (guardHits === null) {
-    lines.push(
-      "",
-      "> ⚠️ **Guard-path check: UNAVAILABLE (diff failed).** The worker could not compute the",
-      "> changed-file list, so it could not check for guard-critical paths. Review this change",
-      "> for any touch of guardrails, auth, secret/vault, worker token assembly, or compose",
-      "> secret wiring MANUALLY before merging.",
-    );
-  } else if (guardHits.length > 0) {
-    lines.push(
-      "",
-      "> ⚠️ **Guard-critical paths touched — review with extra care.** This change modifies",
-      "> files on uzi's security-critical surface (guardrails, auth, secret/vault, worker",
-      "> token assembly, or compose secret wiring). Verify it does not weaken any guardrail",
-      "> before merging:",
-      ...guardHits.map((f) => `> - \`${f}\``),
-    );
-  }
+  const guardWarning = guardCriticalWarningLines(guardHits);
+  if (guardWarning.length > 0) lines.push("", ...guardWarning);
 
   if (checks.length > 0) {
     lines.push("", "**Test evidence** (run by the worker — this repo has no CI):", "");
