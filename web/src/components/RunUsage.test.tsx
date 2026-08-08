@@ -233,6 +233,10 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     // single-model total row) and on hover.
     expect(getAllByText(long).length).toBe(2);
     expect(span?.getAttribute("title")).toBe(long);
+    // Issue #163 (a11y): the clipped id must still be reachable and announced in full —
+    // aria-label carries the whole id (the same value as title) and the span is a tab stop.
+    expect(span?.getAttribute("aria-label")).toBe(long);
+    expect(span?.getAttribute("tabindex")).toBe("0");
   });
 
   it("renders '—' in the Model column for a pre-feature run (usage, no models)", () => {
