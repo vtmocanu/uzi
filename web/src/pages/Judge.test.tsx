@@ -697,7 +697,10 @@ describe("Judge — the ?run= deep-link anchor (PRD #98 Decision 4)", () => {
 // what these tests are about. A group's category Badge renders the label too but is a <span>,
 // so `role: "button"` still addresses the chip unambiguously.
 describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", () => {
-  const chip = (name: string) => screen.getByRole("button", { name: new RegExp(`^${name},`) });
+  // Escape regex metachars in the label so a future category label containing one
+  // (e.g. parentheses) still matches literally rather than as a pattern.
+  const chip = (name: string) =>
+    screen.getByRole("button", { name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},`) });
 
   it("clicking a chip writes ?category= and re-fetches the backlog narrowed to that label", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());

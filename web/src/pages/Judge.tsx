@@ -635,12 +635,23 @@ function LabelFilter({
                   : "border-edge bg-raised text-muted hover:border-edge-strong hover:text-fg",
                 // A true-zero whole-backlog chip is dimmed — "none of this kind" — but kept
                 // visible and clickable (open question 3). Dim only, no `disabled`: a chip
-                // selected via ?category= whose count is 0 must still be un-pressable.
+                // already selected via ?category= whose count is 0 must stay pressable so the
+                // user can still toggle it off to clear the filter.
                 empty && "opacity-50",
               )}
             >
               <span>{label}</span>
-              <span aria-hidden="true" className="tabular-nums text-xs opacity-80">
+              {/* The count pill mirrors the #235 mockup's `.chip .n` badge (a rounded
+                  well, tabular digits). text-faint is the deliberately AA-compliant
+                  token (index.css) — no opacity dimming, so the digit clears WCAG AA;
+                  the pressed chip recolors the badge like the mockup. */}
+              <span
+                aria-hidden="true"
+                className={cx(
+                  "rounded-full px-1.5 py-px text-[0.68rem] tabular-nums",
+                  on ? "bg-brand/[0.12] text-brand-hover" : "bg-ink/60 text-faint",
+                )}
+              >
                 {count}
               </span>
             </button>
