@@ -114,4 +114,5 @@ ORDER BY forge_issue_iid ASC;
 SELECT count(*) > 0 AS active
 FROM runs
 WHERE schedule_id = @schedule_id
+  AND kind = 'prompt'
   AND status NOT IN ('completed', 'failed', 'cancelled');
