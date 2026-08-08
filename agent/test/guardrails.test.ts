@@ -9,11 +9,13 @@ import {
   screenToolPath,
   buildPathGuardHook,
   buildAgentGuardHook,
+  buildSendMessageAliasHook,
   NESTED_AGENT_TOOL,
+  SEND_MESSAGE_TOOL,
   ASYNC_DEFERRAL_TOOLS,
 } from "../src/guardrails.js";
 import { nullLogger } from "./helpers.js";
-import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 
 // The milestone's acceptance: scripted hostile prompts attempting a protected
 // push, force-push, and repo-settings mutation MUST be denied at the hook layer
@@ -502,6 +504,55 @@ describe("buildAgentGuardHook (item 7)", () => {
   it("ignores non-Agent tools", async () => {
     const out = await hook({ ...baseInput(), hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_use_id: "tu" } as HookInput);
     assert.deepStrictEqual(out, {});
+  });
+});
+
+describe("buildSendMessageAliasHook (lead→main routing)", () => {
+  const hook = buildSendMessageAliasHook(["coder", "reviewer", "tester"], nullLogger());
+  const sendInput = (to: unknown, extra: Record<string, unknown> = {}): HookInput =>
+    ({ ...baseInput(), hook_event_name: "PreToolUse", tool_name: SEND_MESSAGE_TOOL, tool_input: { to, ...extra }, tool_use_id: "tu" } as HookInput);
+  const rewrittenTo = (out: HookJSONOutput): unknown =>
+    (out as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput?.to;
+
+  it("rewrites each lead alias to `main`, case-insensitively and trimmed", async () => {
+    for (const alias of ["lead", "orchestrator", "team-lead", "team lead", "LEAD", " Team-Lead "]) {
+      const out = await hook(sendInput(alias));
+      assert.strictEqual(rewrittenTo(out), "main", `expected ${JSON.stringify(alias)} → main`);
+    }
+  });
+
+  it("preserves the rest of the message input while rewriting only `to`", async () => {
+    const out = await hook(sendInput("lead", { message: "hi", summary: "s" }));
+    assert.deepStrictEqual((out as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput, {
+      to: "main",
+      message: "hi",
+      summary: "s",
+    });
+  });
+
+  it("CLOBBER-GUARD: does NOT rewrite an alias a registered subagent literally owns", async () => {
+    // A repo-sourced/user-authored subagent named `lead` is a real invokable
+    // recipient; rerouting it to `main` would silently misroute a legitimate call.
+    const guarded = buildSendMessageAliasHook(["lead", "coder"], nullLogger());
+    assert.deepStrictEqual(await guarded(sendInput("lead")), {});
+    assert.deepStrictEqual(await guarded(sendInput("LEAD")), {}, "match is case-insensitive on both sides");
+    // A non-owned alias still routes.
+    assert.strictEqual(rewrittenTo(await guarded(sendInput("orchestrator"))), "main");
+  });
+
+  it("leaves non-alias recipients untouched (EXACT match, never substring)", async () => {
+    for (const to of ["coder", "team-lead-reviewer", "co-lead", "main", "leadership"]) {
+      assert.deepStrictEqual(await hook(sendInput(to)), {}, `expected no rewrite for ${JSON.stringify(to)}`);
+    }
+  });
+
+  it("returns no decision on a missing recipient or a non-SendMessage tool", async () => {
+    assert.deepStrictEqual(await hook(sendInput(undefined)), {});
+    assert.deepStrictEqual(await hook(sendInput("")), {});
+    assert.deepStrictEqual(
+      await hook({ ...baseInput(), hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_use_id: "tu" } as HookInput),
+      {},
+    );
   });
 });
 

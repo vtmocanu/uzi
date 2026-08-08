@@ -71,6 +71,28 @@ import type { Logger } from "./log.js";
 export const NESTED_AGENT_TOOL = "Agent";
 
 /**
+ * The teammate-messaging tool. A subagent that addresses the orchestrator by one
+ * of the lead's colloquial names (`lead`/`orchestrator`/`team-lead`) gets the
+ * SDK's "No agent named '<x>' is reachable" error — the reachable recipient is
+ * `main`. buildSendMessageAliasHook rewrites those aliases to `main` (defense in
+ * depth for repo-sourced + user-authored agents and future template drift; #210
+ * fixed the builtin templates).
+ */
+export const SEND_MESSAGE_TOOL = "SendMessage";
+
+/**
+ * Recipient names that all denote the orchestrator/main thread. Derived floor:
+ * LEAD_NAME_RE's spellings in agents.ts (`lead`/`orchestrator`) plus the two
+ * measured defect spellings from api/internal/agenttmpl/recipient_test.go
+ * (`team-lead`, `team lead`). Matched trim + case-insensitive + EXACT on the whole
+ * trimmed value — NEVER a substring, which would clobber legitimate recipients
+ * like `team-lead-reviewer` or `co-lead`.
+ */
+const SEND_MESSAGE_LEAD_ALIASES = new Set(["lead", "orchestrator", "team-lead", "team lead"]);
+/** The one reachable orchestrator recipient the aliases above route to. */
+const SEND_MESSAGE_MAIN = "main";
+
+/**
  * Tools that let an agent DEFER work to a future turn (schedule a wakeup / a
  * session-scoped cron). Disallowed for a uzi run (wired in sdk-executor): a run
  * is a bounded task and the executor tears the agent tree down at every turn
@@ -641,6 +663,59 @@ export function buildAgentGuardHook(
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         updatedInput: { ...original, run_in_background: false },
+      },
+    };
+  };
+}
+
+/** The recipient (`to`) an SDK SendMessage tool_use targets, if present. */
+function messageRecipientOf(toolInput: unknown): string | undefined {
+  if (toolInput && typeof toolInput === "object" && "to" in toolInput) {
+    const t = (toolInput as { to?: unknown }).to;
+    if (typeof t === "string" && t.length > 0) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Build the PreToolUse hook that aliases a SendMessage addressed to the lead's
+ * colloquial names (`lead`/`orchestrator`/`team-lead`/`team lead`) onto the one
+ * reachable orchestrator recipient, `main`. Repo-sourced and user-authored agents
+ * are the unprotected surface this covers — the builtin templates already say
+ * "SendMessage to `main`" (#210, guarded by recipient_test.go), so this is pure
+ * defense in depth for those.
+ *
+ * CLOBBER-GUARD: the rewrite fires ONLY when no registered subagent literally owns
+ * the aliased name (case-insensitive). The repo-source path (subagentsFromTemplates,
+ * agents.ts) can register a REAL invokable subagent named `lead`/`orchestrator`/
+ * `team-lead` (recipient_test.go); an unconditional rewrite would silently misroute
+ * a legitimate call to it. `allowedSubagents` is the registered-name set, threaded
+ * in by the executor exactly like buildAgentGuardHook's `allowed`.
+ *
+ * Like every hook here the matcher is only a pre-filter, so the callback re-checks
+ * the event + tool name and returns `{}` (no decision) for anything else. It only
+ * ever rewrites the `to` field; it never denies.
+ */
+export function buildSendMessageAliasHook(
+  allowedSubagents: Iterable<string>,
+  log: Logger,
+): (input: HookInput) => Promise<HookJSONOutput> {
+  const registered = new Set([...allowedSubagents].map((n) => n.trim().toLowerCase()));
+  return async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== SEND_MESSAGE_TOOL) return {};
+    const to = messageRecipientOf(input.tool_input);
+    if (to === undefined) return {};
+    const norm = to.trim().toLowerCase();
+    // Only a lead alias, and only when no registered subagent owns that exact name.
+    if (!SEND_MESSAGE_LEAD_ALIASES.has(norm) || registered.has(norm)) return {};
+    const original = input.tool_input && typeof input.tool_input === "object"
+      ? (input.tool_input as Record<string, unknown>)
+      : {};
+    log.debug("guardrail aliased a SendMessage recipient to main", { alias: norm });
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        updatedInput: { ...original, to: SEND_MESSAGE_MAIN },
       },
     };
   };

@@ -4,6 +4,25 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+### Added
+
+- **`save_memory` now steers agents away from saving numbers that will go stale.**
+  The lead's prompt and the tool's own description ask agents to record the durable
+  fact rather than today's count (test-pass tallies, version numbers, and the
+  like), and a non-fatal warning fires when a saved memory's body looks like an
+  obvious snapshot shape. (fcaecf57)
+
+### Fixed
+
+- **A subagent addressing "lead", "orchestrator", or "team-lead" no longer fails
+  to send its message.** Those names now get transparently rewritten to `main` by
+  a guardrail hook, defense in depth for repo-sourced and user-authored agent
+  templates (builtins already said `main`). A repo that registers a real subagent
+  literally named `lead` is unaffected: the rewrite only fires when no such
+  subagent is registered. (61795aac)
+
 ## [0.19.1] - 2026-08-07
 
 First published cut of the 0.19.0 content: the `v0.19.0` tag was blocked by the release
