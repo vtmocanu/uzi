@@ -269,6 +269,9 @@ type Store interface {
 	DeleteRecommendationDisposition(ctx context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error)
 	ListDispositionsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.RecommendationDisposition, error)
 	ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error)
+	// Judge filter-chip counts (PRD #244): the per-category GROUP count over the whole
+	// backlog, uncapped, so a chip is exact even when the backlog list truncates.
+	CountJudgeGroupsByCategoryForUser(ctx context.Context, userID uuid.UUID) ([]store.CountJudgeGroupsByCategoryForUserRow, error)
 	// Judge menu grouped read (PRD #98 M1): the wider per-recommendation join the
 	// (category, target) dedup groups. Same spine as the triage row above, plus the
 	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor

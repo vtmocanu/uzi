@@ -21,6 +21,7 @@ import {
   ApiError,
   type JudgeBacklog,
   type JudgeBacklogBucket,
+  type JudgeCategoryStats,
   type JudgeDispositionCoord,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
@@ -115,6 +116,11 @@ export function Judge() {
   }, [categoryParam]);
 
   const [backlog, setBacklog] = useState<JudgeBacklog | null>(null);
+  // Per-category chip counts (PRD #244), the canonical /me/judge/category-stats aggregate.
+  // Whole-backlog, uncapped, triage-invariant — so it is fetched ONCE on mount (below), not
+  // through `load` (which re-fires on every bucket/category/run change). Defaults to {} so a
+  // slow or failed fetch renders 0-count chips rather than crashing.
+  const [categoryCounts, setCategoryCounts] = useState<JudgeCategoryStats["counts"]>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionErr, setActionErr] = useState("");
@@ -152,6 +158,26 @@ export function Judge() {
     setSelected(new Set());
     load();
   }, [load]);
+
+  // The per-category chip counts (PRD #244) are fetched ONCE on mount, NOT via `load`. The
+  // count is a whole-backlog, uncapped, triage-invariant aggregate (a group stays a group once
+  // triaged), so it is identical across every bucket, category filter, run anchor, and after
+  // any disposition — refetching it on those changes would spend a round-trip to learn the
+  // same number. Empty deps is the fetch-once contract; a failure leaves the chips at 0.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const stats = await api.getJudgeCategoryStats();
+        if (alive) setCategoryCounts(stats.counts);
+      } catch {
+        /* chips render with 0 counts — a progressive enhancement, never a blocker */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // The file-issue picker lists every connected repo (#68). Best-effort: a failure just
   // leaves the picker empty and the draft still opens.
@@ -399,11 +425,19 @@ export function Judge() {
       )}
 
       {/* Recommendation-label filter (PRD #235): multi-select chips ABOVE the bucket tabs.
-          The filter narrows the GROUP LIST only — the tabs and nav badge stay whole-backlog
-          (they read the canonical triage aggregate), so there are deliberately NO per-chip
-          counts (Decision 6: no canonical per-category aggregate, and tallying off the
-          truncated/bucket-filtered groups is the anti-pattern the codebase forbids). */}
-      <LabelFilter selected={categories} onToggle={toggleCategory} onClear={clearCategories} />
+          The filter narrows the GROUP LIST only — the tabs and nav badge stay whole-backlog.
+          Each chip now carries a per-category GROUP count (PRD #244), sourced from the
+          canonical /me/judge/category-stats aggregate fetched once on mount (categoryCounts) —
+          the aggregate Decision 6 required. That count is a real server COUNT(DISTINCT target)
+          over the whole backlog, NOT a tally of the groups on screen: the on-screen groups are
+          capped-before-grouping and bucket-filtered, so tallying them stays the anti-pattern the
+          codebase forbids — a chip can honestly read 6 while a truncated list shows 4 cards. */}
+      <LabelFilter
+        selected={categories}
+        counts={categoryCounts}
+        onToggle={toggleCategory}
+        onClear={clearCategories}
+      />
 
       {/* Bucket tabs — counts straight from the canonical triage aggregate, never tallied
           off the (possibly filtered/truncated) groups on screen. */}
@@ -539,16 +573,27 @@ function isBucket(v: string | null): v is JudgeBacklogBucket {
 
 // LabelFilter is the recommendation-label chip row (PRD #235 M2): one toggle chip per
 // JUDGE_CATEGORIES key, multi-select (OR semantics — a group has one category, so AND is
-// meaningless), driving the ?category= URL param. It carries NO per-chip counts by design
-// (Decision 6). The Clear control appears only when something is selected and removes the
-// param entirely. Chips are aria-pressed toggle buttons labelled by recommendationLabel, so
-// their accessible name matches the badge each group already renders.
+// meaningless), driving the ?category= URL param. The Clear control appears only when
+// something is selected and removes the param entirely.
+//
+// Each chip carries a per-category GROUP count (PRD #244) from `counts` — the canonical
+// /me/judge/category-stats aggregate the page fetched once on mount, NOT a tally of the
+// on-screen groups (which are capped/bucket-filtered; tallying them is the banned
+// anti-pattern). `counts[cat] ?? 0` per chip, so a category the aggregate never returned
+// reads 0. A true-zero chip is DIMMED — "none of this kind" — rather than hidden, so the six
+// chips stay a stable, learnable set (open question 3).
+//
+// The numeric badge is aria-hidden and the chip's accessible name is set explicitly via
+// aria-label ("Improve uzi, 6 groups") so the count is announced honestly WITHOUT the raw
+// digit polluting the name the way rendering it as plain button text would.
 function LabelFilter({
   selected,
+  counts,
   onToggle,
   onClear,
 }: {
   selected: RecommendationCategory[];
+  counts: Record<string, number>;
   onToggle: (cat: RecommendationCategory) => void;
   onClear: () => void;
 }) {
@@ -573,20 +618,31 @@ function LabelFilter({
       <div role="group" aria-label="Recommendation labels" className="flex flex-wrap gap-2">
         {JUDGE_CATEGORIES.map((cat) => {
           const on = active.has(cat);
+          const count = counts[cat] ?? 0;
+          const label = recommendationLabel(cat);
+          const empty = count === 0;
           return (
             <button
               key={cat}
               type="button"
               aria-pressed={on}
+              aria-label={`${label}, ${count} ${count === 1 ? "group" : "groups"}`}
               onClick={() => onToggle(cat)}
               className={cx(
-                "inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium transition-colors",
+                "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
                 on
                   ? "border-brand/60 bg-brand/[0.13] text-brand"
                   : "border-edge bg-raised text-muted hover:border-edge-strong hover:text-fg",
+                // A true-zero whole-backlog chip is dimmed — "none of this kind" — but kept
+                // visible and clickable (open question 3). Dim only, no `disabled`: a chip
+                // selected via ?category= whose count is 0 must still be un-pressable.
+                empty && "opacity-50",
               )}
             >
-              {recommendationLabel(cat)}
+              <span>{label}</span>
+              <span aria-hidden="true" className="tabular-nums text-xs opacity-80">
+                {count}
+              </span>
             </button>
           );
         })}

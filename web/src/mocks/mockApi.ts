@@ -25,6 +25,7 @@ import {
   type IssueDraft,
   type JudgeBacklog,
   type JudgeBacklogBucket,
+  type JudgeCategoryStats,
   type JudgeDispositionCoord,
   type JudgeDispositionResult,
   type JudgeSettledMember,
@@ -312,6 +313,38 @@ function computeTriage(): TriageCounts {
     total.false_positives += t.false_positives;
   }
   return total;
+}
+
+// computeCategoryStats recomputes the per-category GROUP count the server's
+// CountJudgeGroupsByCategoryForUser aggregate serves (PRD #244): the number of DISTINCT
+// (category, target) coordinates in each category across EVERY review the caller owns.
+//
+// It recomputes from the fixtures INDEPENDENTLY of groupJudgeRecommendations — exactly as
+// computeTriage recomputes triage rather than reusing the grouper. Sharing the grouper would
+// be wrong twice over: the grouper is fed capBacklogRows' output (the cap applies BEFORE
+// grouping), so its group set understates under truncation — the very failure #244's uncapped
+// aggregate exists to avoid — and it also carries the ?bucket=/?run= filters, which this count
+// must ignore. So this walks the raw, uncapped reviews.
+//
+// DISTINCT COORDINATES, never rows: a coordinate recurring across several reviews counts ONCE
+// (a Set of targets per category). Keying per category means the same `target` string filed
+// under two categories is counted once in each — the GROUP BY category the SQL does. All
+// triage states are counted: a group stays a group once triaged, so this reads no disposition.
+function computeCategoryStats(): JudgeCategoryStats {
+  const targetsByCategory = new Map<string, Set<string>>();
+  for (const review of reviews) {
+    for (const rec of review.recommendations) {
+      let targets = targetsByCategory.get(rec.category);
+      if (!targets) {
+        targets = new Set<string>();
+        targetsByCategory.set(rec.category, targets);
+      }
+      targets.add(rec.target);
+    }
+  }
+  const counts: Record<string, number> = {};
+  for (const [category, targets] of targetsByCategory) counts[category] = targets.size;
+  return { counts };
 }
 
 // RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280), and the count
@@ -2463,6 +2496,12 @@ export const mockApi = {
     // Canonical aggregate over every review the caller owns (the same tally the Judge
     // page's tabs and the nav badge read — see computeTriage).
     return delay(computeTriage(), 60);
+  },
+  getJudgeCategoryStats: async () => {
+    requireSession();
+    // Canonical per-category GROUP count over every review the caller owns — distinct
+    // (category, target) coordinates, uncapped and triage-invariant (see computeCategoryStats).
+    return delay(computeCategoryStats(), 60);
   },
 
   // ── Judge menu — cross-run backlog + bulk disposition (PRD #98 M3) ───────────

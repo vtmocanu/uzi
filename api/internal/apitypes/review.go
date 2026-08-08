@@ -75,6 +75,22 @@ type TriageDTO struct {
 	FalsePositives int `json:"false_positives"`
 }
 
+// JudgeCategoryStatsDTO is GET /me/judge/category-stats (PRD #244): the caller's
+// per-category GROUP count — distinct (category, target) coordinates across their whole
+// backlog — for the Judge filter-chip counts. Counts is keyed by the raw rr.category
+// column, one entry per category with at least one group. It is a MAP, not a fixed-field
+// struct, so the taxonomy can grow without a wire break (Decision 7): a client reads
+// counts[cat] ?? 0 per chip and an unknown category simply has no chip to render on.
+//
+// It is a NEW DTO rather than a widening of TriageDTO (Decision 4): the count is a GROUP
+// count (a card per group), not the ROW count TriageDTO carries, and keeping it on its own
+// endpoint keeps the category dimension out of the polled nav-badge payload, which reads
+// only TriageCounts.todo. The count is uncapped and whole-backlog — exact even when the
+// backlog list truncates, and byte-stable across bucket switches and triage actions.
+type JudgeCategoryStatsDTO struct {
+	Counts map[string]int `json:"counts"`
+}
+
 // JudgeFiledIssueRefDTO is the forge issue a single occurrence was filed as (PRD #98 M1).
 // It is the lean, coordinate-free cousin of FiledIssueDTO: inside an occurrence the
 // (category, target) coordinate is the enclosing group's, so only the issue itself is

@@ -29,6 +29,10 @@ vi.mock("../lib/api", () => ({
     bulkSetJudgeDisposition: vi.fn(),
     deleteDisposition: vi.fn(),
     listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+    // PRD #244 chip counts — the Judge page fetches this once on mount. It must NOT be able
+    // to move the nav badge (a separate endpoint with no `todo` field), which the isolation
+    // test below asserts. Defaulted here so the page renders; overridden where it matters.
+    getJudgeCategoryStats: vi.fn().mockResolvedValue({ counts: {} }),
     // AppShell chrome
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
     unreadNotificationCount: vi.fn().mockResolvedValue({ count: 0 }),
@@ -91,6 +95,7 @@ const group = () => ({
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user } as unknown as ReturnType<typeof useAuth>);
   mockApi.getJudgeStats.mockResolvedValue(triage(3));
+  mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
   mockApi.getJudgeBacklog.mockResolvedValue({
     bucket: "todo",
     run: "",
@@ -233,6 +238,28 @@ describe("Judge nav badge vs the To-triage tab (PRD #98 review BLK-BADGE)", () =
 
     await waitFor(() => expect(tabText()).toContain("1"));
     await waitFor(() => expect(navBadgeText()).toContain("1"));
+  });
+
+  // PRD #244 — the per-category chip counts must not be able to drive the nav badge. The
+  // badge reads TriageCounts.todo from /me/judge/stats (via the page's publish of the same
+  // canonical number); the category aggregate is a SEPARATE endpoint with no `todo` field.
+  // Here the category counts are large and total far more than triage.todo (3), yet the badge
+  // stays 3 — proof the two payloads are structurally unrelated. An implementation that folded
+  // category data into the badge would read the wrong number and this fails.
+  it("the nav badge is unaffected by the per-category chip counts (#244 isolation)", async () => {
+    mockApi.getJudgeCategoryStats.mockResolvedValue({
+      counts: { improve_uzi: 99, install_worker_tool: 42, enable_tool: 7 },
+    });
+
+    renderJudgeInShell();
+
+    await waitFor(() => expect(navBadgeText()).toContain("3"));
+    // The badge is the to-triage count (3), never a category total (99/42/7) or their sum.
+    expect(navBadgeText()).not.toContain("99");
+    expect(navBadgeText()).not.toContain("42");
+    expect(tabText()).toContain("3");
+    // The badge's own source was polled once; the category endpoint never feeds it.
+    expect(mockApi.getJudgeStats).toHaveBeenCalledTimes(1);
   });
 
   // Control: what the page publishes is the SERVER's canonical count, never a tally of the
