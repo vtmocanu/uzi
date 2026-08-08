@@ -50,6 +50,14 @@ export const MEMORY_BODY_MAX_BYTES = 2048;
  * tally. A match appends a NON-FATAL nudge to the (already-successful) save — it
  * NEVER rejects, because a legitimate numeric fact can wear the same shape; the
  * memory is stored either way. Complements the tool-description/prompt guidance.
+ *
+ * COST COUPLING: this alternation backtracks superlinearly on an adversarial digit
+ * run, so its cost is bounded ONLY by the input length. The `bytes >
+ * MEMORY_BODY_MAX_BYTES` early-return in saveMemory runs BEFORE this regex is ever
+ * tested, so `body` here is always ≤ MEMORY_BODY_MAX_BYTES (2048) — that cap is the
+ * bound (auditor measured ~48ms worst case at 2048 bytes, ~0.8s at 8192). Raising
+ * MEMORY_BODY_MAX_BYTES therefore raises this per-call worst case: revisit this
+ * regex (anchor it, or drop the superlinear `\d+\s*` prefixes) if the cap grows.
  */
 const VOLATILE_SNAPSHOT_RE = /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i;
 

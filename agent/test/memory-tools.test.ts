@@ -73,12 +73,26 @@ describe("save_memory handler (PRD #90 M2)", () => {
     }
   });
 
-  it("does NOT nudge a legitimate durable fact that carries no snapshot shape", async () => {
+  it("does NOT nudge a DIGIT-FREE durable fact (nothing that looks like a snapshot)", async () => {
     for (const body of ["gcc is baked in; no build-essential needed", "set GOFLAGS=-buildvcs=false in linked worktrees"]) {
       const { client } = fakeClient();
       const res = await handlers(client).saveMemory({ title: "t", body });
       assert.notStrictEqual(res.isError, true);
       assert.doesNotMatch(bodyText(res), /volatile snapshot/i, `${body} must not trigger the nudge`);
+    }
+  });
+
+  it("nudges an ACCEPTED false positive: a legit numeric durable fact still gets warned (never rejected)", async () => {
+    // The heuristic is warn-only by design (memory-tools.ts): it fires on any body
+    // wearing a snapshot shape, INCLUDING durable numeric facts — an "of <N>" phrase,
+    // a CIDR, a date. Documenting that here keeps the test honest: the nudge is
+    // over-broad on purpose, and the memory is still saved regardless.
+    for (const body of ["worker idle timeout of 120000 ms is the wedged-daemon ceiling", "the pod network is 10.0.0.0/24", "chromium pinned since 2026/08"]) {
+      const { client, calls } = fakeClient();
+      const res = await handlers(client).saveMemory({ title: "t", body });
+      assert.strictEqual(calls.saveMemory.length, 1, `${body} must still be POSTed`);
+      assert.notStrictEqual(res.isError, true, `${body} must NOT be rejected — warn-only`);
+      assert.match(bodyText(res), /volatile snapshot/i, `${body} is an accepted false positive and should still nudge`);
     }
   });
 
