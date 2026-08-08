@@ -335,8 +335,10 @@ pushes only `refs/heads/<run-branch>`, never forced, CI suppressed (`ci.skip`).
 **Implementation is pure-Go; the api image stays distroless-static.** The api has
 never execed git (it is `distroless/static-debian12`, no git binary; the Forge
 interface is pure REST), so the broker uses a pure-Go smart-HTTP push client
-(go-git). A 2026-08-07 source check confirmed go-git's `PushOptions.Options
-[]string` carries push-options, so `ci.skip` is expressible without a git binary;
+(go-git). A 2026-08-07 source check said go-git's `PushOptions.Options` carries
+push-options; a 2026-08-08 runtime check corrected the field TYPE — it is
+`map[string]string` in go-git v5.19.2 (wire-encoded as `[]*Option{Key,Value}`), not
+the `[]string` first recorded — so `ci.skip` is expressible without a git binary;
 adding a git binary was considered and rejected because it would fatten the
 secrets-holder's image and CVE surface for no capability the pure-Go path lacks. The
 one residual is forge-specific smart-HTTP behaviour, validated by a real push
@@ -366,6 +368,28 @@ needs a Forge-interface change across both drivers + five fakes). Worker-side
 reap-then-push (Decision 8) remains the **validated fallback** if the real-forge
 go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
 `/proc` and a cgroup-based reap that catches the `setsid` escape.
+
+**15. Checkpoint publishes go to a checkpoint ref no workflow watches, NOT to
+`refs/heads/<branch>`+`ci.skip` (resolves M8's ref-target fork; probe-validated on
+GitLab 2026-08-08).** M8's brokered push (Decision 14) targets a
+`refs/uzi-checkpoints/<branch>` ref on origin, not the branch head. `ci.skip`
+suppresses pipelines on **GitLab only** — it is inert on the shipping Forgejo driver
+and future GitHub (Decision 14's own 🔴) — and the commit-message-marker alternative
+forces either a tip rewrite (→ the forbidden force-push) or a throwaway marker commit.
+A ref no workflow watches sidesteps both: workflows trigger on `refs/heads/*`/tags/PRs,
+so a custom ref fires CI on **no** forge, and only the end-of-run push to
+`refs/heads/<branch>` triggers a pipeline — the intended behaviour everywhere, no
+push-option and no marker. **Validated on GitLab 2026-08-08** (probe P1:
+`gitlab.example.com` accepts `refs/uzi-checkpoints/*` and fires zero pipelines for
+it; probe P2: a pure-Go go-git v5.19.2 smart-HTTP send-pack over HTTPS to the same
+forge round-trips, so the api broker needs no git binary). **Consequence for the
+reseed:** a cross-worker resume must fetch `refs/uzi-checkpoints/<branch>` from origin
+and feed it into Decision 9's `seededFrom` strict-descendant rule as a THIRD input —
+today that rule knows only the local `refs/uzi-runner/<branch>` tracking ref and
+`origin/<branch>`. **Residual:** the probe pushed as an Owner; a Developer-role bot
+pushing a custom ref is high-confidence (custom refs are not protectable in GitLab)
+but proven only at impl on the worker with the bot PAT, and Forgejo/GitHub need the
+same push-permission check.
 
 ## Touchpoints
 
@@ -534,9 +558,15 @@ go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
       ref), which a reclaiming worker fetches, and which fires CI on **no** forge
       because workflows trigger on `refs/heads/*`/tags/PRs, not arbitrary refs. Only
       the end-of-run push to `refs/heads/<branch>` then triggers a pipeline — the
-      intended behaviour on every forge, `ci.skip` or not. **Open M8 design question**
-      (needs a per-forge push-permission check: can the Developer bot push a
-      non-`refs/heads/*` ref on each forge?). If M8 instead keeps pushing to
+      intended behaviour on every forge, `ci.skip` or not. **RESOLVED 2026-08-08 →
+      this ref-target route IS chosen (Decision 15); GitLab validated by probe** — a
+      custom `refs/uzi-checkpoints/*` ref is accepted by `gitlab.example.com` and
+      fires ZERO pipelines (`pipelines?ref=…` → `[]`), vs one for `refs/heads/main`;
+      see the 2026-08-08 Decision Log entry. Residual per-forge push-permission check:
+      the probe pushed as an OWNER, so a **Developer**-role bot pushing a
+      non-`refs/heads/*` ref is high-confidence (custom refs are not protectable in
+      GitLab) but proven only at M8 impl on the worker with the bot PAT; Forgejo/GitHub
+      still to check. If M8 instead keeps pushing to
       `refs/heads/<branch>`, the marker path is best-effort on Forgejo anyway
       (`SkipWorkflowStrings` is admin-configurable). Do not treat the
       zero-extra-pipelines criterion as forge-portable, and do not treat "add a
@@ -640,6 +670,17 @@ go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
   runs interrupted after the plan gate — i.e. those that had reached the
   implement phase and had commits to lose. If *that* is near zero, Phase 1 (the
   progress feature, M1–M5) is the whole feature and Phase 2–3 should be dropped.
+  **Measured 2026-08-08 on dev-cluster (live uzi CNPG DB, read-only aggregate):
+  5 of 80 runs (6.25%) were ever requeued, `max(requeue_count) = 1` — never twice.
+  All 5 were `kind='issue'` with a plan; but `planned_base_commit` is a recent
+  column (filled on only 10/80 runs) so `iteration_count ≥ 2` (implement⇄review
+  turns actually ran) is the better "reached implement" proxy, and by it only 2 of
+  80 (2.5%) were interrupted mid-implement with work plausibly to lose.
+  `requeue_count` cannot split same-worker from different-worker (the #218 R1
+  point), so 2.5% is an UPPER bound on M8's addressable population. This confirms
+  the read above: the durability payoff is small and Phase 1 is the feature. M8
+  still proceeds at the maintainer's direction — the number calibrates it as
+  LOW-urgency, not go/no-go.**
 - **Prompt compliance.** The lead must both emit a sensible milestone list and
   call `checkpoint` at the right time. Mitigation: both degrade to today's
   behavior when absent (Decisions 4 and 10) — the feature fails off, never
@@ -843,10 +884,41 @@ go-git push proves fragile, but only hardened with `hidepid=2` on the worker's
   (spatial closure, strictly stronger than reap-then-push's temporal closure).
   Rejected: Infisical agent-vault (needs a separate-pod/egress isolation single-uid
   k8s can't give, and moves push capability to the agent) and scoped tokens (the
-  Developer bot can't mint them). **go-git spike (2026-08-07): `PushOptions.Options
-  []string` in the go-git source confirms the client can send `ci.skip`**, so the
+  Developer bot can't mint them). **go-git spike (2026-08-07): `PushOptions.Options`
+  in the go-git source confirms the client can send `ci.skip`** (the field TYPE was
+  recorded here as `[]string` and is actually `map[string]string` in v5.19.2 —
+  corrected 2026-08-08, see the entry below), so the
   api push client stays pure-Go and the api image stays distroless-static — no git
   binary needed. Fallback if a real-forge push proves fragile: Option A (worker
   reap-then-push hardened with `hidepid=2` + a cgroup reap that catches the setsid
   escape). ADR `adr/0122-checkpoint-push-broker.md` to be authored on approval of
   the Decision 8/14 rewrite.
+- **2026-08-08 — local pre-seed validation (P1/P2/P3); M8 ref-target fork resolved
+  (Decision 15); a go-git type claim corrected. No code changed.** Before seeding M6/M8
+  to uzi, three local probes were run so the seeded lead inherits a closed design
+  rather than an open architecture call. All forge probes left `vtmocanu/uzi` clean
+  (throwaway refs created then deleted).
+  - **P1 (forge, GitLab) — custom-ref viability.** A `git push` of
+    `refs/uzi-checkpoints/_probe` to `gitlab.example.com:vtmocanu/uzi` was ACCEPTED
+    and created ZERO pipelines (`pipelines?ref=…` → `[]`), while `refs/heads/main`
+    pushes do create one. → the forge-agnostic ref-target route is real; **Decision
+    15** records it and M8's "Open design question" is closed for GitLab. Pushed as
+    Owner (access_level 50, `uzi-bot-vmocanu` is Developer=30); the Developer-bot
+    residual is noted in Decision 15.
+  - **P2 (go-git) — broker feasibility + a doc correction.** A throwaway pure-Go
+    spike (go-git v5.19.2, no git binary) did a full smart-HTTP send-pack over HTTPS
+    to `gitlab.example.com` (push custom ref → verify → delete). → the api broker
+    (Decision 14) is feasible and the api image stays distroless-static. **It also
+    falsified the "confirmed in source" TYPE claim:** `PushOptions.Options` is
+    `map[string]string`, not `[]string` (wire-encoded as `[]*Option`); corrected in
+    Decision 14 and the 2026-08-07 log entry above. Moot for the shipped design —
+    Decision 15 uses no push-option — but the record was wrong, so it was fixed.
+  - **P3 (live DB, dev-cluster) — requeue urgency.** Read-only aggregate on the uzi
+    CNPG DB: 5 of 80 runs (6.25%) ever requeued, `max(requeue_count)=1`; only 2 of 80
+    (2.5%) reached implement (`iteration_count ≥ 2`) when requeued, and
+    `requeue_count` can't split same- vs different-worker, so 2.5% is an UPPER bound
+    on M8's addressable population. Folded into the M6 Risks bullet. Confirms M8 is
+    LOW-urgency (the maintainer wants it anyway), and Phase 1 is the feature.
+  Next: seed **M6** (checkpoint tool + reap + #218's `fetchAgentBranch`), then **M8**
+  (broker, Decisions 14 + 15). ADR `adr/0122` updated the same day (Decision-15
+  target ref, type correction).
