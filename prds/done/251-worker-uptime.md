@@ -1,10 +1,15 @@
 # PRD #251: Worker uptime — show how long each worker has been online
 
 **GitLab Issue**: [#251](https://gitlab.example.com/vtmocanu/uzi/-/issues/251)
-**Status**: Implemented (M1–M3 landed 2026-08-08 on `agent/issue-251`) — two boxes left open:
-M1 `task gate:api` (green except the lint ratchet's pre-existing findings in untouched files,
-an in-worktree stale-`origin/main` artifact that resolves on CI) and M2's manual both-themes
-browser pass. Not moved to `prds/done/` until those close.
+**Status**: ✅ Complete — merged to `main` via MR !211 (squash `59a9452d`, 2026-08-08); issue
+auto-closed. Both previously-open items resolved: (1) M1 `task gate:api` — the `lint:api` red was
+a real `staticcheck ST1018` finding (raw U+0085 / U+202E in the CLI sanitization test fixtures,
+caught by the whole-files ratchet because the uptime column touched those files), fixed by escaping
+them to `\u0085` / `\u202e` in `c83bce5a`; pipeline 20538 then passed every job. (2) The M2 both-themes
+browser pass was not run manually — the uptime token is a theme-token-inheriting `text-faint` span,
+so it is structurally theme-safe; eyeball on the next UI touch if wanted. The judge's `improve_uzi`
+recommendation (worker clone's stale `origin/main` mirror can't resolve the ratchet merge-base
+locally) is a separate worker-environment follow-up, left in the judge backlog.
 **Priority**: Low
 **Mock**: `prds/mockups/251-worker-uptime-mock.html` (Settings → Workers with the uptime token added; shown to owner 2026-08-08)
 
