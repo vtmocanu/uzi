@@ -5,7 +5,7 @@
 **Area**: a fourth stamped coordinate pair on `GET /api/version` — `api/internal/apitypes/buildinfo.go` (two new DTO fields) + `api/internal/apitypes/wire_test.go` (its tag test), `api/internal/handler/handler.go` (`BuildStamp`, `SetBuildInfo`, `Version`, the handler fields) + `api/internal/handler/version_test.go` (parse/omit + the closed-key-set trust test), `api/cmd/server/main.go` (two ldflags vars + wiring), `api/Dockerfile` (two ARGs + the ldflags line), `.gitlab-ci.yml` (`publish:assert-changelog` computes the counts, delivers them by dotenv, `publish:api` passes them as build-args) · `web/src/lib/api.ts` (`BuildInfo` type), `web/src/components/BuildInfoPopover.tsx` (the new row), `web/src/mocks/data.ts` (fixture parity) · `api/cmd/uzi/` (the `uzi version` consumer of the same DTO).
 **Mockup**: [`prds/mockups/245-version-prd-counts-mock.html`](mockups/245-version-prd-counts-mock.html) — approved **Variant A** (a `PRDs` row reading `N done · M open`).
 **Line references** are against `ab2d033`.
-**Status**: draft — awaiting review.
+**Status**: complete — shipped 2026-08-08 (M1–M3 all landed on branch `agent/issue-245`).
 
 ## Problem
 
@@ -340,18 +340,18 @@ user approval.
 
 ## Milestones
 
-- [ ] **M1 — Server + build/CI stamp plumbing, end to end.** The two DTO fields +
+- [x] **M1 — Server + build/CI stamp plumbing, end to end.** The two DTO fields +
       `wire_test` tag test; `BuildStamp` / `SetBuildInfo` / `Version` parse-and-omit +
       handler fields; the `main.go` ldflags vars + wiring; the `api/Dockerfile` ARGs +
       ldflags line; the `.gitlab-ci.yml` compute-guard-dotenv-buildarg change with the
       fifth-stamp comment widened; the closed-key-set trust test updated. Exercised by
       Go tests and by `curl` against a locally-stamped binary (build with the `-X`
       flags set by hand to prove the parse/omit paths). No web change yet.
-- [ ] **M2 — Consumers: the popover row + `uzi version` line.** `BuildInfo` TS
+- [x] **M2 — Consumers: the popover row + `uzi version` line.** `BuildInfo` TS
       fields; the type-guarded `PRDs` row (Variant A) with the optional `Row` ReactNode
       widening; `mockApi`/fixture parity; the `uzi version` line. Unit tests: row
       renders the pair, absent on a missing field, `null`/`NaN` degrade to absent.
-- [ ] **M3 — Docs, changelog, specs, verification.** `CHANGELOG.md`, the `specs/ai.md`
+- [x] **M3 — Docs, changelog, specs, verification.** `CHANGELOG.md`, the `specs/ai.md`
       note, and a browser check in mock mode (`VITE_UZI_MOCK=1`, never a live-proxying
       `vite dev`/`preview` per `.claude/rules/web.md`) that the shipped row matches the
       mockup, plus a note that the real stamp appears only on a tag/publish build.
