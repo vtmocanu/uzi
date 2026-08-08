@@ -68,4 +68,10 @@ same claim was in `.claude/agents/documenter.md`.)* Re-verify `main`
 mergeability IMMEDIATELY before tagging (bots + sibling PRD merges drift it); reconcile with
 a plain `git merge origin/main` (never force-push), renumber any append-numbered artifacts
 (goose migrations, `specs/ai.md` sections) above the merged head, re-run the gate on the
-merged tip, then tag. Confirm with the lead before pushing any tag.
+merged tip, then tag. Confirm with the lead before pushing any tag. **Never
+`[skip ci]` the commit you tag** — the marker skips the tag's *publish* pipeline
+too (push-triggered, same as the branch pipeline), so `git push origin vX.Y.Z`
+reports `* [new tag]` and publishes NOTHING; recovery is `glab ci run --branch
+vX.Y.Z` (a manually-created pipeline ignores the marker), tag left in place. The
+full trap + recovery is in `deploy/README.md`'s release procedure — read it before
+tagging, not after (this bit me on 0.20.0).
