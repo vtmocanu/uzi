@@ -690,7 +690,7 @@ func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		defer tx.Rollback(r.Context())
+		defer tx.Rollback(r.Context()) //nolint:errcheck // no-op after a successful Commit
 		qtx := h.q.WithTx(tx)
 
 		if err := qtx.SetBoardOrderPositions(r.Context(), store.SetBoardOrderPositionsParams{
