@@ -510,7 +510,7 @@ Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/102-board-v2.md`.
 
 ## Feature #113 — Worker upgrade & version health
 
-Tracked as GitLab issue vtmocanu/uzi#113; PRD at `prds/113-worker-upgrade-status.md`.
+Tracked as GitLab issue vtmocanu/uzi#113; PRD at `prds/done/113-worker-upgrade-status.md`.
 Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 
 - A worker's reported version must be the release it is actually running — no more a frozen informational string. [user, accepted from the mock 2026-07-22]
@@ -629,7 +629,7 @@ Every other decision on this feature is the team's and lives in `specs/ai.md`
 
 ## Feature #224 — Worker pods declare no ephemeral-storage request
 
-Tracked as GitLab issue vtmocanu/uzi#224; PRD at `prds/224-worker-ephemeral-storage.md`.
+Tracked as GitLab issue vtmocanu/uzi#224; PRD at `prds/done/224-worker-ephemeral-storage.md`.
 
 - Fix the defect: a worker pod evicted for node ephemeral-storage pressure
   destroys every in-flight run's work, silently. [user, the originating ask]
