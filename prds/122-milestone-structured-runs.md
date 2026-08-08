@@ -944,3 +944,27 @@ same push-permission check.
   Next: seed **M6** (checkpoint tool + reap + #218's `fetchAgentBranch`), then **M8**
   (broker, Decisions 14 + 15). ADR `adr/0122` updated the same day (Decision-15
   target ref, type correction).
+- **2026-08-08 — M6 landed via a seeded uzi run; M8 seeded and in flight (dogfood).**
+  Executing the maintainer's M6→M8 plan through the factory itself: author a standalone
+  plan against a fresh HEAD code-map, seed it (`uzi run create --plan-file`), watch,
+  review the MR, merge on green.
+  - **M6 shipped — MR !199, seeded run `8593f1ed`, merged to `main` (`13ffc6e3`).** The
+    agent-only delta recorded in the M6 milestone note above. Reviewed clean: the
+    main-thread `scanSignals` guard (a subagent can't force a checkpoint), the
+    reap-before-(credential-free)-fetch ordering, the null-safe no-op tip check, and the
+    issue-only gating are all intact; `git.ts:branchTip` reads the runner-owned clone via
+    `runGitAsRunner` (B2-aware) rather than the worker uid. CI green. One minor,
+    non-blocking deviation from the seed plan: the iteration-boundary fallback checkpoint
+    sits *after* the `maxIterations` throw, so the cap-tripping iteration gets no final
+    fetch-back — a marginal durability edge, not a bug.
+  - **M8 seeded — seeded run `8ab087df`, in progress (NOT merged; M8 checkbox stays
+    `[ ]`).** The plan pins the load-bearing invariants for the cold lead: authorization
+    derived server-side from `(runID, worker)` (never worker-supplied repo/branch), a
+    never-forced push to `refs/uzi-checkpoints/<branch>` (Decision 15), the api's pure-Go
+    go-git fetch-base→apply-delta→push flow (distroless-static preserved), the third
+    reseed input for cross-worker recovery, and best-effort semantics (a publish failure
+    never fails the run). M8's MR will get an extra **auditor** pass — PAT never enters a
+    worker git child; push non-forced; authorization not worker-trusted — before merge.
+  - **Issue lifecycle:** each milestone MR carries `Closes #122`, which re-closes the
+    issue on merge; it is reopened after, since #122 stays open until every milestone
+    (including the M3/M4/M5 UI) lands.
