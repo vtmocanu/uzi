@@ -44,11 +44,28 @@ func (c *Checker) CheckToken(ctx context.Context, f forge.Forge, forgeType forge
 	if err != nil {
 		warn := "could not verify token scopes against the forge; scope/expiry checks were skipped"
 		if errors.Is(err, forge.ErrTokenIntrospectionUnsupported) {
-			warn = "cannot verify token scopes on this GitLab version (requires 15.5+)"
+			warn = introspectionUnsupportedWarn(forgeType)
 		}
 		return evaluateToken(forgeType, forge.TokenInfo{}, isAdmin, now, c.warnWindow, warn)
 	}
 	return evaluateToken(forgeType, info, isAdmin, now, c.warnWindow, "")
+}
+
+// introspectionUnsupportedWarn is the per-forge message used when a token cannot
+// be introspected for scopes/expiry (PRD #238 S4). It is kept per-forge on
+// purpose: GitLab's version-gate is fixable by upgrading, so its hint names the
+// version; GitHub's is a token-type problem — a fine-grained token exposes no
+// scopes header — so it points the user at a classic PAT instead. Flattening
+// either into a lossy generic string would drop an actionable hint. Forgejo (and
+// any other forge) never reaches this arm in practice, but a generic default
+// keeps the switch total.
+func introspectionUnsupportedWarn(forgeType forge.Type) string {
+	switch forgeType {
+	case forge.TypeGitHub:
+		return "cannot verify token scopes: fine-grained tokens can't be introspected; use a classic PAT"
+	default:
+		return "cannot verify token scopes on this GitLab version (requires 15.5+)"
+	}
 }
 
 // Check runs the full report: the token-level checks plus every enabled repo's
@@ -183,6 +200,19 @@ func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleE
 		rr.Violations = append(rr.Violations, fmt.Sprintf("default branch %q is not protected", repo.DefaultBranch))
 		return
 	}
+	// ProtectionUnverified (PRD #238 D6/H1): the branch IS protected, but the
+	// driver could not authoritatively read who may push/merge — the GitHub
+	// legacy-branch-protection case, where /protection 403s a write bot and no
+	// ruleset illuminates it. The driver reports WriteRoleCanPush/Merge=false
+	// (never a fabricated true), so the Violation branches below correctly do not
+	// fire; without this Warning the "undetermined" state would read as clean.
+	// This surfaces it as a Warning, not a Violation — the Can* fields being false
+	// here means "could not tell", not "safe" (see forge.BranchProtection). On
+	// GitLab/Forgejo, and GitHub with a readable ruleset, the flag is false and
+	// behaviour is unchanged.
+	if bp.ProtectionUnverified {
+		rr.Warnings = append(rr.Warnings, fmt.Sprintf("could not fully verify push/merge rights on protected %q", repo.DefaultBranch))
+	}
 	// Push findings are violations — pre-existing PRD #5 behaviour, unchanged.
 	if bp.WriteRoleCanPush {
 		rr.Violations = append(rr.Violations, fmt.Sprintf("the write role may push to protected %q", repo.DefaultBranch))
@@ -260,10 +290,18 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 // the worker's branch push), write:issue (the board), read:user (token/identity
 // introspection). Verified minimal and sufficient in D6b.
 func requiredScopesFor(t forge.Type) []string {
-	if t == forge.TypeForgejo {
+	switch t {
+	case forge.TypeForgejo:
 		return []string{"read:user", "write:issue", "write:repository"}
+	case forge.TypeGitHub:
+		// GitHub classic PAT: the single coarse `repo` scope, exactly (PRD #238
+		// D7). The set-equality semantics below make {repo, workflow} and
+		// {repo, delete_repo} save-blocking over-privilege violations for free
+		// (D7a) — deliberately no allowed-extra set.
+		return []string{"repo"}
+	default:
+		return []string{"api"}
 	}
-	return []string{"api"}
 }
 
 // scopesEqualRequired reports whether scopes is exactly the forge's required set,
