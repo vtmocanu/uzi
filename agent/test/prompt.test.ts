@@ -250,6 +250,67 @@ describe("buildImplementPrompt", () => {
   });
 });
 
+describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
+  const milestones = [
+    { id: "m1", title: "wire the schema" },
+    { id: "m2", title: "render the badge" },
+    { id: "m3", title: "cli parity" },
+  ];
+
+  it("names the approved milestones and the checkpoint directive", () => {
+    const p = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: true,
+      iteration: 1,
+      milestones,
+    });
+    assert.match(p, /\[m1\] wire the schema/);
+    assert.match(p, /\[m2\] render the badge/);
+    assert.match(p, /`checkpoint`/, "the note points at the checkpoint tool");
+  });
+
+  it("renders live status: completed ⇒ done, in_progress ⇒ in progress, else not started", () => {
+    const p = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder"],
+      first: false,
+      iteration: 3,
+      milestones,
+      progress: { completed: ["m1"], in_progress: ["m2"] },
+    });
+    assert.match(p, /\[m1\] wire the schema — done/);
+    assert.match(p, /\[m2\] render the badge — in progress/);
+    assert.match(p, /\[m3\] cli parity — not started/);
+  });
+
+  it("completed wins over in_progress when an id is somehow in both", () => {
+    const p = buildImplementPrompt({
+      branch: "b",
+      subagentNames: [],
+      first: false,
+      iteration: 2,
+      milestones,
+      progress: { completed: ["m1"], in_progress: ["m1"] },
+    });
+    assert.match(p, /\[m1\] wire the schema — done/);
+    assert.ok(!/\[m1\][^\n]*in progress/.test(p), "a finished milestone is not also in progress");
+  });
+
+  it("is additive-absent: no milestones ⇒ byte-identical to the pre-M6 prompt", () => {
+    // Success-criterion posture (Decision 4/10): a run with no approved breakdown — and
+    // every non-issue run, and the pre-approved resume where frozenMilestones is undefined
+    // — gets the exact prompt it got before M6. Both the absent field and an empty list.
+    const base = { branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1 };
+    const before = buildImplementPrompt({ ...base });
+    const emptyList = buildImplementPrompt({ ...base, milestones: [] });
+    const withProgressButNoList = buildImplementPrompt({ ...base, progress: { completed: ["m1"], in_progress: [] } });
+    assert.equal(emptyList, before, "an empty milestone list adds nothing");
+    assert.equal(withProgressButNoList, before, "progress with no milestone list adds nothing");
+    assert.ok(!/checkpoint/i.test(before), "no milestone note ⇒ no checkpoint mention");
+  });
+});
+
 describe("buildRevisePlanPrompt (PRD #41)", () => {
   const feedback = "Split the migration into two steps and cover the rollback path.";
   const p = buildRevisePlanPrompt(feedback);

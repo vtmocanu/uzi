@@ -724,10 +724,13 @@ export class RunRunner {
         // crash loses at most "since the last milestone" rather than the whole run.
         //
         // REAP-BEFORE-GIT is the load-bearing invariant (B1/M4 audit): when reaping, the
-        // agent tree is killed BEFORE any git runs, so a survivor cannot read a credential
-        // out of a git child's /proc/environ — the exact order the done path uses
-        // (killAgentTree at :731 before fetchAgentBranch at :760). Best-effort throughout:
-        // a checkpoint must NEVER fail the run.
+        // agent tree is killed BEFORE any CREDENTIALED git runs, so a survivor cannot read a
+        // credential out of a git child's /proc/environ — the same ordering the done path
+        // uses (killAgentTree before fetchBackBestEffort). The pre-reap tip reads below
+        // (branchTip/trackingTip) are credential-free local rev-parse, and the only
+        // credential-bearing-CLASS op here is the fetch-back, itself credential-free
+        // (file://, no PAT) — so a future credentialed git op MUST stay after the reap.
+        // Best-effort throughout: a checkpoint must NEVER fail the run.
         checkpoint: async (opts) => {
           // `barePath` is the outer `let` (string | undefined); it is set before the run
           // reaches the executor, but narrow it so the closure is honest rather than `!`.
@@ -747,7 +750,7 @@ export class RunRunner {
             return;
           }
           // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
-          // any git — exactly as the done path orders killAgentTree before fetchAgentBranch.
+          // any CREDENTIALED git — the done path likewise reaps before its fetch-back.
           // The fallback (reap:false) must NOT reap: a backgrounded dev server the lead
           // means to reuse next iteration must survive.
           if (opts.reap) executor.killAgentTree?.();
