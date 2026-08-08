@@ -115,7 +115,7 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 func (h *Handler) ForgeConfig(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"allowed_base_urls": h.cfg.ForgeAllowedBaseURLs,
-		"forge_types":       []string{string(forge.TypeGitLab), string(forge.TypeForgejo)},
+		"forge_types":       []string{string(forge.TypeGitLab), string(forge.TypeForgejo), string(forge.TypeGitHub)},
 	})
 }
 
@@ -148,7 +148,7 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	if forgeType == "" {
 		forgeType = string(forge.TypeGitLab)
 	}
-	if forgeType != string(forge.TypeGitLab) && forgeType != string(forge.TypeForgejo) {
+	if forgeType != string(forge.TypeGitLab) && forgeType != string(forge.TypeForgejo) && forgeType != string(forge.TypeGitHub) {
 		httpx.Error(w, http.StatusBadRequest, "unsupported forge type")
 		return
 	}
