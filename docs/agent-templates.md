@@ -86,7 +86,8 @@ starting the next:
   the lead diffs the working tree against the last commit to confirm only the
   declared scopes changed, commits each landed unit, then runs the quality gate
   over that commit — overlapped with the read-only validator wave rather than
-  serialized ahead of it, but still blocking: a red gate blocks the commit.
+  serialized ahead of it, but still blocking: a red gate holds that unit, it is
+  not advanced or built on until the gate is green.
 - **A unit others depend on can publish its seam early.** When the plan declares
   that one unit's output (a schema change, a shared type, an interface or route
   shape) another builds on, the lead can land and commit that seam first so the
@@ -168,9 +169,9 @@ no badge.) Open the template before resetting: the editor shows exactly what's
 different, so you're not resetting blind.
 
 Drift and reset live in the web UI and the REST API — the badge, the
-shipped-vs-stored diff, and the reset action. There is no `uzi` CLI command for
-them by design: the CLI's admin surface is read-only, and reset produces nothing
-a script would capture. Builtin **skills** follow the same edit-preserving rule
+shipped-vs-stored diff, and the reset action. There is no `uzi` command for
+template or skill drift or reset, by design: the CLI's admin surface is
+read-only, and reset produces nothing a script would capture. Builtin **skills** follow the same edit-preserving rule
 with one difference worth knowing: a shipped change to a builtin skill is **not**
 re-applied on boot and carries no drift badge, so a builtin skill an admin has
 customized only picks up a newer shipped body when it is explicitly reset.
