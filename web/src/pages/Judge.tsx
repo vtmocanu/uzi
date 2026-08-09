@@ -460,7 +460,7 @@ export function Judge() {
           <button
             type="button"
             onClick={clearRunAnchor}
-            className="inline-flex items-center gap-1 font-medium text-brand underline underline-offset-2 hover:text-brand-hover"
+            className="inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg"
           >
             <XIcon /> Clear filter
           </button>
@@ -623,8 +623,9 @@ function isBucket(v: string | null): v is JudgeBacklogBucket {
 
 // LabelFilter is the recommendation-label chip row (PRD #235 M2): one toggle chip per
 // JUDGE_CATEGORIES key, multi-select (OR semantics — a group has one category, so AND is
-// meaningless), driving the ?category= URL param. The Clear control appears only when
-// something is selected and removes the param entirely.
+// meaningless), driving the ?category= URL param. The Clear control is always mounted
+// (kept invisible and non-focusable when nothing is selected, so the panel height does not
+// shift) and removes the param entirely.
 //
 // Each chip carries a per-category GROUP count from `counts` — the canonical
 // /me/judge/category-stats matrix indexed by the active tab (PRD #270; the page derives this
@@ -656,15 +657,17 @@ function LabelFilter({
     >
       <div className="mb-2 flex flex-wrap items-center gap-2">
         <span className="text-xs font-semibold uppercase tracking-wide text-muted">Filter by label</span>
-        {active.size > 0 && (
-          <button
-            type="button"
-            onClick={onClear}
-            className="ml-auto inline-flex items-center gap-1 text-sm font-medium text-brand underline underline-offset-2 hover:text-brand-hover"
-          >
-            <XIcon /> Clear
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={onClear}
+          aria-hidden={active.size === 0}
+          tabIndex={active.size === 0 ? -1 : 0}
+          className={`ml-auto inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
+            active.size === 0 ? " invisible pointer-events-none" : ""
+          }`}
+        >
+          <XIcon /> Clear
+        </button>
       </div>
       <div role="group" aria-label="Recommendation labels" className="flex flex-wrap gap-2">
         {JUDGE_CATEGORIES.map((cat) => {
@@ -1117,7 +1120,7 @@ function UndoToast({ toast, onUndo, onDismiss }: { toast: Toast; onUndo: () => v
           <button
             type="button"
             onClick={onUndo}
-            className="font-medium text-brand underline underline-offset-2 hover:text-brand-hover"
+            className="inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg"
           >
             Undo
           </button>
