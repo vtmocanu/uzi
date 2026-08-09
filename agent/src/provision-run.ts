@@ -13,7 +13,9 @@ import { provisionTools } from "./provision.js";
 import { extractRepoDevboxPackages, mergeToolPackages } from "./repo-tools.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
-/** Reason prefix for a provisioning failure (the run fails, never degrades). */
+/** Reason prefix for a FATAL provisioning failure. Tier-1 (uzi-stored) failure
+ *  fails the run with this reason; a tier-2 (repo opt-in extra) failure does NOT —
+ *  it degrades to a run-feed warning and a retry with tier-1 only. */
 export const REASON_PROVISION_FAILED = "tool provisioning failed before the agent could start";
 
 // ctx.runId becomes a path segment under provisionRoot; RUN_ID_RE (util.ts) rejects
@@ -41,24 +43,35 @@ export interface ProvisionRunResult {
 /**
  * Resolve the run's tier-1 (∪ opted-in tier-2) package set and provision it,
  * emitting the same run-stream status messages regardless of executor. No
- * packages ⇒ a no-op returning an empty env. A provision failure throws
- * (REASON_PROVISION_FAILED) so the run fails cleanly rather than degrading.
+ * packages ⇒ a no-op returning an empty env.
+ *
+ * Failure handling is split by tier (PRD #278 M2, option b):
+ *   - Tier-1 (uzi-stored) provisioning failure is FATAL — it throws
+ *     REASON_PROVISION_FAILED so the run fails cleanly.
+ *   - A tier-2 (repo opt-in extra) failure DEGRADES: the merged install is
+ *     best-effort. If it fails and repo extras were in the set, emit a run-feed
+ *     warning naming the dropped extras and retry with tier-1 only (skip the repo
+ *     extras). The retry keeps tier-1 fatal.
  */
 export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps): Promise<ProvisionRunResult> {
   const provision = deps.provision ?? provisionTools;
 
-  let toolPackages = ctx.config?.tool_packages ?? [];
+  const tier1 = ctx.config?.tool_packages ?? [];
+  let toolPackages = tier1;
+  let tier2Added = 0;
   // Tier-2 (PRD #18 M5): when the repo owner opted in, union the repo's own
   // devbox.json packages (packages-only, shape-validated, hooks/scripts/flakes
-  // ignored) with tier-1 — tier-1 wins version conflicts. Pure JSON extraction.
+  // ignored) with tier-1 — tier-1 wins version conflicts. Extraction is a
+  // comment-tolerant (JSONC) parse; nothing in the manifest is executed.
   if (ctx.config?.repo_devbox_opt_in) {
     const repoPackages = await extractRepoDevboxPackages(ctx.worktreePath);
     if (repoPackages.length > 0) {
-      const before = toolPackages.length;
-      toolPackages = mergeToolPackages(toolPackages, repoPackages);
-      const added = toolPackages.length - before;
-      if (added > 0) {
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: `merged ${added} package(s) from this repo's devbox.json` } });
+      toolPackages = mergeToolPackages(tier1, repoPackages);
+      // mergeToolPackages preserves tier-1 order then appends surviving tier-2
+      // entries, so anything beyond tier1.length is a tier-2-only add.
+      tier2Added = toolPackages.length - tier1.length;
+      if (tier2Added > 0) {
+        ctx.emit({ kind: "status", agent: "worker", payload: { text: `merged ${tier2Added} package(s) from this repo's devbox.json` } });
       }
     }
   }
@@ -67,13 +80,42 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   if (!RUN_ID_RE.test(ctx.runId)) throw new Error(`${REASON_PROVISION_FAILED}: invalid run id`);
 
   const provisionDir = path.join(deps.provisionRoot, ctx.runId);
-  ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${toolPackages.length} tool(s): ${toolPackages.join(", ")}` } });
-  try {
-    const res = await provision({ packages: toolPackages, runDir: provisionDir, homeDir: deps.homeDir }, { log: deps.log });
+
+  // Provision `packages` against provisionDir, emitting the run-feed status
+  // messages. provisionTools writes a fresh packages-only manifest on every call,
+  // so re-running against the same dir is self-contained (we clear it first so no
+  // stale devbox.json/lock from a failed attempt lingers).
+  const install = async (packages: string[]): Promise<ProvisionRunResult> => {
+    ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${packages.length} tool(s): ${packages.join(", ")}` } });
+    const res = await provision({ packages, runDir: provisionDir, homeDir: deps.homeDir }, { log: deps.log });
     ctx.emit({ kind: "status", agent: "worker", payload: { text: "tools provisioned" } });
     return { toolEnv: res.toolEnv, provisionDir };
+  };
+
+  try {
+    return await install(toolPackages);
   } catch (err) {
     await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+    if (tier2Added > 0) {
+      // The failed set carried repo extras — DEGRADE rather than fail the run.
+      const tier2Only = toolPackages.slice(tier1.length);
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `repo devbox.json tool provisioning failed; skipping this repo's extra tool(s) (${tier2Only.join(", ")}): ${errMessage(err)}`,
+        },
+      });
+      if (tier1.length === 0) return { toolEnv: {} };
+      // Retry with tier-1 only — tier-1 stays fatal.
+      try {
+        return await install(tier1);
+      } catch (retryErr) {
+        await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+        throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(retryErr)}`);
+      }
+    }
+    // Pure tier-1 (or opt-in off) — fatal, exactly as before.
     throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(err)}`);
   }
 }
