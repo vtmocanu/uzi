@@ -26,5 +26,5 @@ dependencies:
     # rendered `postgresql.cnpg.io/v1 Cluster` uses only fields present in the CRD the
     # dev-cluster operator (1.23.5) ships. Bump together with the fleet.
     version: "0.6.1"
-    repository: "https://cloudnative-pg.github.io/charts"
+    repository: "oci://ghcr.io/cloudnative-pg/charts"
     condition: postgres.enabled

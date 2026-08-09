@@ -773,37 +773,27 @@ workers:
       # learning from CI's helm_chart job minutes later. This IS the "expand from a REAL
       # provisioning failure" the note above asks for: the measured failure is `helm
       # template` refusing with "found in Chart.yaml, but missing in charts/ directory:
-      # cluster" on a worker (2026-07-27).
+      # cluster" on a worker (2026-07-27). The subchart is now fetched from the OCI
+      # registry oci://ghcr.io/cloudnative-pg/charts (pinned in Chart.yaml + Chart.lock).
       #
-      # FOUR hosts, not one — the full redirect chain, traced 2026-07-27:
-      #   cloudnative-pg.github.io              -> 301
-      #   cloudnative-pg.io                     -> 200, serves charts/index.yaml
-      #   github.com                            -> 302 on the release asset
-      #   release-assets.githubusercontent.com  -> 200, the 63 KB cluster-0.6.1.tgz
+      # TWO hosts, not one — the OCI pull splits across a registry and a blob CDN, proven
+      # by a live pull (issue #285):
+      #   ghcr.io                              -> manifest + anonymous pull token
+      #   pkg-containers.githubusercontent.com -> 307 target for the blob layers
+      #                                           (config + the cluster-0.6.1.tgz)
+      # BOTH are needed — a manifest-only reachability check against ghcr.io alone passes
+      # while the actual layer pull still fails at the blob host.
       #
-      # These are the WIDEST entries in this list by a distance: github.com and the
-      # release-assets host are general-purpose (any repo, any release asset), unlike
-      # every single-purpose name above them, on a fence whose stated job is the
-      # repo-exfil residual. Owner-accepted 2026-07-27 with that understood.
-      #
-      # Also FRAGILE: GitHub has rotated this asset hostname before
-      # (objects.githubusercontent.com -> release-assets.githubusercontent.com). If the
-      # fetch starts failing, re-trace the redirects before assuming the ANNP broke.
-      # A narrower future option exists and was verified reachable the same day: the
-      # same chart is an OCI artifact at ghcr.io/cloudnative-pg/charts/cluster (manifest
-      # for 0.6.1 -> HTTP 200), which would swap these three GitHub-ish names for
-      # ghcr.io — a registry only, with no arbitrary repo or code access.
-      - name: allow-cnpg-charts-pages
-        fqdn: "cloudnative-pg.github.io"
+      # This REPLACED the previous four GitHub-ish hosts (cloudnative-pg.github.io,
+      # cloudnative-pg.io, github.com, release-assets.githubusercontent.com). Notably
+      # github.com — the general-purpose "any repo, any release asset" host, the widest
+      # entry this list ever carried — is gone, swapped for a registry + blob-CDN pair
+      # with no arbitrary repo or code access.
+      - name: allow-cnpg-oci-registry
+        fqdn: "ghcr.io"
         ports: [443]
-      - name: allow-cnpg-charts-index
-        fqdn: "cloudnative-pg.io"
-        ports: [443]
-      - name: allow-github-release-redirect
-        fqdn: "github.com"
-        ports: [443]
-      - name: allow-github-release-assets
-        fqdn: "release-assets.githubusercontent.com"
+      - name: allow-cnpg-oci-blobs
+        fqdn: "pkg-containers.githubusercontent.com"
         ports: [443]
 
 # --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
