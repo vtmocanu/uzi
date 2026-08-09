@@ -44,8 +44,10 @@ export function formatTokens(n: number): string {
 // formatCost renders a USD cost the way the mock does: "$1.87". A zero cost with
 // nonzero tokens is a subscription-auth run the SDK prices at $0 (Decision 8) —
 // callers render "—" for that rather than a misleading "$0.00", so this only ever
-// formats a genuinely present cost.
+// formats a genuinely present cost. Costs of $1000 or more drop the cents and
+// render as a whole dollar amount ("$1119") — the cents are noise at that scale —
+// while anything below keeps the two-decimal form. No thousands separator either way.
 export function formatCost(usd: number): string {
   if (!Number.isFinite(usd) || usd < 0) usd = 0;
-  return `$${usd.toFixed(2)}`;
+  return usd >= 1000 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`;
 }
