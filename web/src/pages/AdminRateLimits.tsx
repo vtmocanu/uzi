@@ -192,6 +192,18 @@ export function AdminRateLimits() {
                               <Badge tone={badge.tone} dot={badge.dot}>
                                 {badge.label}
                               </Badge>
+                              {/* PRD #217 D6: a limit_report reading is a park-time
+                                  inference, not a poll — an operator must be able to
+                                  tell it from a usage_endpoint/header_probe row. An
+                                  inline badge (no new column: the table is pinned to
+                                  four) sits above the "updated" line it qualifies,
+                                  because that 100% was recorded AFTER that timestamp
+                                  (D3). Other sources render no badge, exactly as today. */}
+                              {t.limits.status === "ok" && t.limits.source === "limit_report" && (
+                                <div className="mt-1.5">
+                                  <Badge tone="neutral">Recorded at usage limit</Badge>
+                                </div>
+                              )}
                               {/* "Updated" folds under the Status pill (PRD #240 Decision 2):
                                   the relocated Updated column, NOT a new element, so it keeps
                                   text-muted — it must clear WCAG AA at 12px (web-ux finding). */}

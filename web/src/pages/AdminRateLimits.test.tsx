@@ -99,6 +99,26 @@ describe("AdminRateLimits", () => {
     expect(within(sorin).queryByText(/nearly out/)).toBeNull();
   });
 
+  it("badges a limit_report row as recorded at the usage limit, not other rows (PRD #217)", async () => {
+    // nadia's five-hour window was recorded 100% at a usage-limit park (source
+    // limit_report), synced_at deliberately older than the reading; vlad is an
+    // ordinary poll. The park-time badge must sit on nadia's row only.
+    mockApi.getAdminRateLimits.mockResolvedValue({
+      users: [
+        row("nadia", ok(100, 40, { source: "limit_report", synced_at: new Date(Date.now() - 14 * 60_000).toISOString() })),
+        row("vlad", ok(8, 27)),
+      ],
+    });
+    render(<AdminRateLimits />);
+    const nadia = (await screen.findByText("nadia")).closest("tr")!;
+    expect(within(nadia).getByText("Recorded at usage limit")).toBeTruthy();
+    // The updated line still renders alongside the disclosure.
+    expect(within(nadia).getByText(/updated/)).toBeTruthy();
+
+    const vlad = screen.getByText("vlad").closest("tr")!;
+    expect(within(vlad).queryByText("Recorded at usage limit")).toBeNull();
+  });
+
   it("renders a faint 'no name' placeholder for a user with an empty name (PRD #54)", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("", ok(8, 27))] });
     render(<AdminRateLimits />);

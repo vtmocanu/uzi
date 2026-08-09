@@ -231,6 +231,21 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     auto_status: "below_threshold" as const,
     limits: okReading(93, 40 * MIN, 88, 1 * D, 3),
   },
+  {
+    // PRD #217 M3: a `limit_report` reading — the only fixture that makes the
+    // park-time source disclosure (D6) visible under VITE_UZI_MOCK=1. This token
+    // just hit its five-hour wall, so the park wrote that window 100% consumed with
+    // source `limit_report` and DID NOT bump synced_at (D3): the reading is 100%
+    // but the "updated 14m ago" line beside it is OLDER, which is exactly the state
+    // the "Recorded at usage limit" badge exists to explain. Kept NON-pooled so it
+    // stays outside pooledFixtureStatus while still agreeing with mockSecrets.
+    secret_id: "sec-parked",
+    label: "parked-key",
+    is_default: false,
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
+    limits: okReading(100, 35 * MIN, 40, 2 * D + 5 * H, 14, "limit_report"),
+  },
 ];
 
 // tokenised wraps a single reading as a one-token list, for the personas whose
@@ -715,6 +730,18 @@ export const mockSecrets: SecretMeta[] = [
     auto_eligible: true,
     created_at: daysAgo(12),
     updated_at: daysAgo(1),
+  },
+  // PRD #217 M3: the token whose reading carries source `limit_report` (see
+  // mockMyTokenRateLimits). Its auto_eligible MUST match its meter fixture
+  // token-for-token (data.test.ts) — both false, so it stays out of the pool.
+  {
+    id: "sec-parked",
+    kind: "anthropic_token",
+    label: "parked-key",
+    is_default: false,
+    auto_eligible: false,
+    created_at: daysAgo(6),
+    updated_at: minsAgo(14),
   },
 ];
 

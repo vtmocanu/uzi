@@ -1280,9 +1280,17 @@ export interface RateLimitWindow {
   resets_at: number | null;
 }
 
-// Which source produced the reading: the free usage endpoint, or the ~1-token
-// header probe fallback (Decision 2).
-export type RateLimitSource = "usage_endpoint" | "header_probe";
+// Which source produced the reading:
+//  - "usage_endpoint": the free usage endpoint (Decision 2).
+//  - "header_probe": the ~1-token header probe fallback (Decision 2).
+//  - "limit_report": a reading recorded at usage-limit park time from the
+//    worker's limit report (PRD #217 M1). It is a 100%-consumed INFERENCE for the
+//    window that just refused the run, NOT a live measurement — the park writes
+//    the pct and nothing else. Because the park deliberately does not bump
+//    `synced_at` (D3), this reading is NEWER than the `synced_at` shown beside it,
+//    so a surface rendering "updated Xm ago" against a 100% bar must disclose that
+//    the 100% was recorded at the park, after that timestamp.
+export type RateLimitSource = "usage_endpoint" | "header_probe" | "limit_report";
 
 // MyRateLimits is the per-user reading, discriminated on status:
 //  - "ok": a real reading (possibly stale — vault-locked users age silently, D3).
