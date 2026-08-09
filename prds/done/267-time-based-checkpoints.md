@@ -1,7 +1,7 @@
 # PRD #267: Time-based checkpoints — bound data-loss exposure between milestone boundaries
 
 **GitLab Issue**: [vtmocanu/uzi#267](https://gitlab.example.com/vtmocanu/uzi/-/issues/267)
-**Status**: Draft — architect-reviewed 2026-08-09 (citations verified; crux CONFIRMED GO via PRD #122 Decisions 10b/14; applied the tip-skip-decoupling fix, the config-idiom fix, and the pinned seams).
+**Status**: Complete — implemented and reviewed 2026-08-09 (all milestones M1–M4 shipped on `agent/issue-267`; auditor CONFIRMED the credential-safety invariant on the new `reap:false` publish path; the shipped env is `CHECKPOINT_INTERVAL`, a Go-style duration string). Originally architect-reviewed 2026-08-09 (crux CONFIRMED GO via PRD #122 Decisions 10b/14).
 **Priority**: High (top priority)
 **Created**: 2026-08-09
 **Related**: PRD #122 (milestone-structured runs — M6 milestone checkpoint, M8 brokered origin publish, Decisions 10/10b), PRD #218 (`fetchAgentBranch` credential-free fetch-back), `agent/src/runner.ts`, `agent/src/sdk-executor.ts`, `agent/src/git.ts`
@@ -137,7 +137,7 @@ loss becomes **~one interval** of committed work regardless of milestone length.
 **Phase graph:** M1 (safe decoupling) gates everything. M2 (time-gate + config) needs M1.
 M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
 
-- [ ] **M1 — Safe origin-publish on the non-reap path.** The rationale is already settled
+- [x] **M1 — Safe origin-publish on the non-reap path.** The rationale is already settled
       (Decision 2): PRD #122 Decision 14 dissolved the reap/publish coupling for the broker,
       so this is a scope/cost choice, not a correctness invariant. Refactor the `checkpoint`
       callback so a `reap:false` checkpoint **can** publish to `refs/uzi-checkpoints/<branch>`
@@ -153,7 +153,7 @@ M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
       byte-identical — Decision 9 restructures the shared skip logic and may legitimately
       skip a redundant re-publish of an already-published milestone tip).
 
-- [ ] **M2 — Time-gated trigger + config.** Track `lastPublish` time and `lastPublishedTip`
+- [x] **M2 — Time-gated trigger + config.** Track `lastPublish` time and `lastPublishedTip`
       (Decision 9); on the `reap:false` path publish only when
       `now - lastPublish >= CHECKPOINT_INTERVAL` **and** `cloneTip !== lastPublishedTip`
       (new committed work not yet on origin) — do **not** gate this on the `:776` fetch-skip.
@@ -167,7 +167,7 @@ M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
       milestone publish resets the gate so the next time publish is a full interval later;
       **at most one origin publish per interval per run** (no per-iteration spam).
 
-- [ ] **M3 — Visibility + commit cadence.** Emit a log line / subtle running-report signal
+- [x] **M3 — Visibility + commit cadence.** Emit a log line / subtle running-report signal
       when a time checkpoint publishes, so the "work is now safe on origin" moment is
       observable (mirroring the milestone checkpoint's running report). Add a one-line note
       to the builtin `lead` template to **commit local work frequently so checkpoints
@@ -175,8 +175,8 @@ M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
       worker env and not in its prompt). **Verified**: a time checkpoint emits the signal;
       the builtin-template parse test passes and the note is present.
 
-- [ ] **M4 — Docs.** Document the two-tier checkpoint model (milestone-cooperative +
-      time-gated iteration-boundary) and `CHECKPOINT_INTERVAL_SECONDS`. **Verified**:
+- [x] **M4 — Docs.** Document the two-tier checkpoint model (milestone-cooperative +
+      time-gated iteration-boundary) and `CHECKPOINT_INTERVAL`. **Verified**:
       `node web/scripts/check-docs.mjs` passes.
 
 ## Success Criteria
@@ -184,13 +184,13 @@ M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
 - A run inside a long milestone has its committed work on origin within **~one interval
   plus at most one turn** (the publish fires at the next iteration boundary, and a turn is
   atomic), not only at milestone completion.
-- Worst-case data loss from a worker-disk loss is bounded to **~`CHECKPOINT_INTERVAL_SECONDS`**
+- Worst-case data loss from a worker-disk loss is bounded to **~`CHECKPOINT_INTERVAL`**
   of committed work (plus any uncommitted work, which is out of scope).
 - Cross-worker recovery from a time checkpoint works **identically** to a milestone
   checkpoint (same `refs/uzi-checkpoints/<branch>` mirror + `git.ts` seed path).
 - The milestone (`reap:true`) path is unchanged, and the worker still never `git push`es
   (publish stays broker-mediated).
-- `CHECKPOINT_INTERVAL_SECONDS=0` fully restores milestone-only behaviour.
+- `CHECKPOINT_INTERVAL=0` fully restores milestone-only behaviour.
 - At most **one origin publish per interval per run** — no per-iteration broker spam.
 
 ## Out of Scope (deliberate)
@@ -245,8 +245,10 @@ M3 (visibility + nudge) and M4 (docs) follow M2 and are mutually independent.
   before the interval would never publish (Decision 9). (b) The interval is
   `CHECKPOINT_INTERVAL` read via `duration(...)` default `20m`, not `…_SECONDS` (a bare
   `_SECONDS` number reads as milliseconds and `positiveInt` won't let `0` disable).
-- **2026-08-09 — Config.** Worker env `CHECKPOINT_INTERVAL_SECONDS`, default `1200` (20m),
-  `0` disables; server-served central config deferred.
+- **2026-08-09 — Config (SUPERSEDED by the ↳review correction above).** The original draft
+  proposed worker env `CHECKPOINT_INTERVAL_SECONDS`, default `1200` (20m). As shipped this is
+  `CHECKPOINT_INTERVAL` (a Go-style duration string via `duration(...)`, default `20m`), `0`
+  disables; server-served central config deferred.
 - **2026-08-09 — Evidence.** Checkpoint model verified at `cd746a0e`
   (`sdk-executor.ts:1154-1165`, `runner.ts:765-810`, `executor.ts:203-213`,
   `client.ts:222`, `git.ts:222-232`); live gap measured on run #191 (no
