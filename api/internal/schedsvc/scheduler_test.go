@@ -73,6 +73,12 @@ type runCall struct {
 	issueIID        int64
 	allowWithoutPRD bool
 	waitOnLimit     *bool
+	// scheduled discriminates which seam the scheduler routed to: false = CreateRun
+	// (the interactive human seam, which carries PRD #196's PRD-link waiver), true =
+	// CreateScheduledRun (the non-interactive scheduled seam, no waiver). This pins the
+	// non-auto issue path to the waiver-free method — routing it through CreateRun
+	// instead would silently reopen the M4-review HIGH.
+	scheduled bool
 }
 
 type promptCall struct {
@@ -92,17 +98,18 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, false})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
 	// The non-auto-approve scheduled path (PRD #196): recorded in the same `runs`
-	// bucket as CreateRun so the existing wait-on-limit / path-selection assertions
-	// still observe it — the scheduler routes here instead of CreateRun now.
+	// bucket as CreateRun so the existing wait-on-limit / path-selection count
+	// assertions still observe it, but tagged scheduled=true so a test can prove the
+	// scheduler routed here (waiver-free) rather than through CreateRun.
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
@@ -238,6 +245,31 @@ func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	}
 	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
 		t.Fatalf("recurring next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+}
+
+// TestTickNonAutoIssueScheduleUsesTheScheduledSeam pins the M4-review fix: a
+// non-auto-approve issue schedule must fire through CreateScheduledRun (the waiver-free
+// seam), NOT CreateRun (the interactive seam that carries PRD #196's PRD-link waiver).
+// Routing a timer-fired sweep through CreateRun would let it start link-less
+// non-primary-eligible runs unattended — the exact HIGH the fix closes. Reverting
+// scheduler.go's non-auto branch to CreateRun makes this test fail (scheduled=false).
+func TestTickNonAutoIssueScheduleUsesTheScheduledSeam(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule()
+	s.AutoApprove = false // the human-approves-the-plan path, but still no per-run click
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 0 {
+		t.Fatalf("non-auto issue must NOT use the autopilot seam, got %d", len(h.runs.autopilot))
+	}
+	if len(h.runs.runs) != 1 {
+		t.Fatalf("non-auto issue: run-seam calls = %d, want 1", len(h.runs.runs))
+	}
+	if !h.runs.runs[0].scheduled {
+		t.Fatalf("non-auto issue must fire through CreateScheduledRun (waiver-free), not CreateRun (interactive, waiver-carrying)")
 	}
 }
 
