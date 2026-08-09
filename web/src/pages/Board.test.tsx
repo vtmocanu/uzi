@@ -1029,6 +1029,29 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
   });
 
+  it("suppresses an ordinary label that adds zero cards, but keeps a selected one (PRD #196 M6)", async () => {
+    // `enhancement` lives only on a PRD card, so it adds nothing to the board — the
+    // PRD's "nothing offered that matches zero cards" rule, so it must not appear as a
+    // confusing plain 0 row. `bug` (a bug-only card) adds one, so it is offered. A
+    // previously-saved extra whose cards have all left the payload (`ghost`) is kept so
+    // it stays untickable in place rather than only clearable via Reset.
+    mockApi.getBoard.mockResolvedValue({
+      board: aBoard({
+        cards: [
+          aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD", "enhancement"] }),
+          aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
+        ],
+      }),
+    });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: ["ghost"], show_all: false });
+    renderBoard();
+    await screen.findByText("Backlog");
+    openIssues();
+    expect(screen.queryByLabelText(/^bug/)).toBeTruthy();
+    expect(screen.queryByLabelText(/^enhancement/)).toBeNull();
+    expect(screen.queryByLabelText(/^ghost/)).toBeTruthy();
+  });
+
   it("unticking the default extra narrows the board and PUTs the absolute empty set (PRD #196 M3)", async () => {
     renderBoard();
     await screen.findByText("Backlog");

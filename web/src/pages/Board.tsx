@@ -173,15 +173,23 @@ export function Board() {
     };
   }, [repoId]);
 
-  // The "Issues" popover's open state, and its container ref for outside-click.
+  // The "Issues" popover's open state, its container ref for outside-click, and the
+  // trigger button ref so Escape returns focus to it (a keyboard user dismissing the
+  // popover must land back on the control, not fall to <body>).
   const [issuesOpen, setIssuesOpen] = useState(false);
   const issuesPopRef = useRef<HTMLDivElement>(null);
+  const issuesTriggerRef = useRef<HTMLButtonElement>(null);
   // Dismiss on Escape or an outside click, the BuildInfoPopover pattern. Listeners
   // are attached only while open, so a closed popover costs nothing.
   useEffect(() => {
     if (!issuesOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setIssuesOpen(false);
+      if (e.key === "Escape") {
+        setIssuesOpen(false);
+        // Return focus to the trigger (WCAG 2.4.3): an outside click leaves focus
+        // where the pointer landed, but a keyboard Escape must restore it.
+        issuesTriggerRef.current?.focus();
+      }
     };
     const onDown = (e: MouseEvent) => {
       if (issuesPopRef.current && !issuesPopRef.current.contains(e.target as Node)) {
@@ -684,9 +692,17 @@ export function Board() {
 
   // Candidate extra labels for the picker: the distinct CONTENT labels present on the
   // payload — the same `seen`-Set accumulation ColumnSettings' suggester uses —
-  // excluding the primary, the configured columns and the workflow labels. A
-  // configured-default extra is unioned in even with zero matching cards, so an inert
-  // default stays visible (open question 8).
+  // excluding the primary, the configured columns and the workflow labels.
+  //
+  // An ordinary payload label is offered ONLY when it would ADD at least one card
+  // (a card carrying it that is not already shown via the primary). The PRD's design
+  // note is "nothing offered that matches zero cards", and a label that lives only on
+  // PRD cards (e.g. an `enhancement` that is always PRD+enhancement) adds nothing, so
+  // it would otherwise render a confusing plain `0` row. Two labels are kept even at a
+  // zero add-count: a configured-default extra (shown greyed, so an inert default is
+  // visible — open question 8) and a label the user has already selected (so it stays
+  // untickable in place rather than only clearable via Reset once its last card leaves
+  // the payload).
   const candidateExtras = useMemo<string[]>(() => {
     const excluded = new Set<string>([
       prdLabel,
@@ -695,17 +711,25 @@ export function Board() {
       SELF_IMPROVE_LABEL,
       ...(board?.columns ?? []).map((c) => c.label_name),
     ]);
+    const addCount = new Map<string, number>();
+    for (const c of payloadCards) {
+      if (isPRDCard(c, prdLabel)) continue;
+      for (const l of c.labels) addCount.set(l, (addCount.get(l) ?? 0) + 1);
+    }
+    const kept = (l: string) =>
+      l !== "" &&
+      !excluded.has(l) &&
+      ((addCount.get(l) ?? 0) > 0 || serverDefaultExtras.includes(l) || resolvedExtras.includes(l));
     const seen = new Set<string>();
     for (const c of payloadCards) for (const l of c.labels) seen.add(l);
-    const labels = [...seen].filter((l) => l !== "" && !excluded.has(l));
-    // A configured-default extra (the admin default from the payload) is unioned in
-    // even with zero matching cards, so an inert default stays visible in the picker
-    // as a greyed 0 row (open question 8).
-    for (const d of serverDefaultExtras) {
+    const labels = [...seen].filter(kept);
+    // Union in configured defaults and selected extras that carry zero payload cards,
+    // so neither drops out of the picker (open question 8 / the untickable-selected fix).
+    for (const d of [...serverDefaultExtras, ...resolvedExtras]) {
       if (!excluded.has(d) && d !== "" && !labels.includes(d)) labels.push(d);
     }
     return labels.sort();
-  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel, serverDefaultExtras]);
+  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel, serverDefaultExtras, resolvedExtras]);
 
   // Per-label count = cards carrying L that do NOT carry the primary — "how much
   // bigger does the board get" (mock §3: bug 6, not 7). A label with no such card
@@ -944,6 +968,7 @@ export function Board() {
               open={issuesOpen}
               onToggleOpen={() => setIssuesOpen((o) => !o)}
               popRef={issuesPopRef}
+              triggerRef={issuesTriggerRef}
               prdLabel={prdLabel}
               membershipLabels={membershipLabels}
               defaultExtras={serverDefaultExtras}
@@ -1818,6 +1843,7 @@ function IssuesFilter({
   open,
   onToggleOpen,
   popRef,
+  triggerRef,
   prdLabel,
   membershipLabels,
   defaultExtras,
@@ -1833,6 +1859,7 @@ function IssuesFilter({
   open: boolean;
   onToggleOpen: () => void;
   popRef: React.RefObject<HTMLDivElement>;
+  triggerRef: React.RefObject<HTMLButtonElement>;
   prdLabel: string;
   membershipLabels: string[];
   defaultExtras: string[];
@@ -1852,6 +1879,7 @@ function IssuesFilter({
   return (
     <div className="relative" ref={popRef}>
       <button
+        ref={triggerRef}
         type="button"
         onClick={onToggleOpen}
         aria-haspopup="true"
