@@ -175,29 +175,32 @@ export function Judge() {
   // acted-on card stays visible at its new rollup (dispose re-renders it, never filters it
   // out) while a refetched `todo` chip has already decremented — a brief, deliberate mismatch
   // that reconciles on the next navigation/load.
+  //
+  // Every fetch stamps a monotonic generation and only applies its result if it is still the
+  // latest issued (categoryStatsGen). Without this, a back-to-back mutation (e.g. mark-done
+  // then undo within one response window) resolves last-in-by-ARRIVAL, so a stale post-action
+  // matrix could stick on the chips until the next navigation. The guard also invalidates any
+  // in-flight fetch on unmount / run-anchor change (the effect cleanup bumps the generation),
+  // so no response lands on an unmounted page — the discipline the old `alive` flag had.
+  const categoryStatsGen = useRef(0);
   const loadCategoryStats = useCallback(async () => {
+    const gen = ++categoryStatsGen.current;
     try {
       const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
-      setCategoryStats(stats.counts_by_bucket);
+      if (gen === categoryStatsGen.current) setCategoryStats(stats.counts_by_bucket);
     } catch {
       /* chips render with 0 counts — a progressive enhancement, never a blocker */
     }
   }, [runAnchor]);
 
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
-        if (alive) setCategoryStats(stats.counts_by_bucket);
-      } catch {
-        /* chips render with 0 counts — a progressive enhancement, never a blocker */
-      }
-    })();
+    loadCategoryStats();
+    // Invalidate any in-flight fetch so a late response never overwrites a fresher one (or
+    // lands after unmount): the next issued fetch — or this cleanup — advances the generation.
     return () => {
-      alive = false;
+      categoryStatsGen.current++;
     };
-  }, [runAnchor]);
+  }, [loadCategoryStats]);
 
   // The chip row is per-tab: index the whole matrix by the resolved bucket (todo/filed/done/
   // dismissed/all — `all` is a real key, so indexing is uniform). A bucket with no groups is

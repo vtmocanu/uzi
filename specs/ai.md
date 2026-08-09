@@ -19360,7 +19360,7 @@ user-stated requirement changed; this rides those existing constraints. Full rat
 ## 506. PRD #270 — Judge chip counts scope to the SELECTED bucket tab: a bucket-keyed MATRIX, rolled up (not `GROUP BY`d) over an UNCAPPED load, now triage-VARIANT
 
 Serves human.md Feature #46 (the judge inbox/worklist). Design record:
-`prds/done/270-judge-chip-counts-tab-scope.md`. Reverses two head properties of §502
+`prds/done/270-judge-chip-tab-scoped-counts.md`. Reverses two head properties of §502
 (PRD #244): the counts were a whole-backlog, triage-INVARIANT per-category number fetched
 once on mount; they now scope to the currently selected bucket tab (To triage / Filed /
 Done / Dismissed / All) and refetch as the user works the list. The uncapped guarantee
