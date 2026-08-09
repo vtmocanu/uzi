@@ -271,6 +271,9 @@ type Store interface {
 	DeleteRecommendationDisposition(ctx context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error)
 	ListDispositionsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.RecommendationDisposition, error)
 	ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error)
+	// Judge filter-chip counts (PRD #244): the per-category GROUP count over the whole
+	// backlog, uncapped, so a chip is exact even when the backlog list truncates.
+	CountJudgeGroupsByCategoryForUser(ctx context.Context, userID uuid.UUID) ([]store.CountJudgeGroupsByCategoryForUserRow, error)
 	// Judge menu grouped read (PRD #98 M1): the wider per-recommendation join the
 	// (category, target) dedup groups. Same spine as the triage row above, plus the
 	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor
@@ -2364,11 +2367,15 @@ type StateRequest struct {
 	// MilestonesCompleted and MilestonesInProgress are the run's live PROGRESS report
 	// (PRD #122 M2), each a POINTER to a slice of frozen milestone IDS for the same
 	// tri-state as RepoAgents/Milestones: absent (nil) = this call reports nothing about
-	// that set; `[]` = an explicitly empty set; non-empty = the ids. They ride `running`
-	// reports only. completed is UNIONED server-side (monotone, dedup); in_progress is
-	// OVERWRITTEN wholesale (Decision 3). Every id is membership-checked against the run's
-	// FROZEN list and kind-gated here (progressParams, Decision 12/13); a rejected set is
-	// DROPPED, never persisted, and never fails the report.
+	// that set; `[]` = an explicitly empty set; non-empty = the ids. MilestonesInProgress
+	// rides `running` reports only. MilestonesCompleted rides `running` reports AND — since
+	// PRD #265 M1 — the terminal `completed` report, where the lead's signal_done
+	// declaration of what it finished is unioned in (the completion path reconciles a run
+	// that never emitted a mid-run report). completed is UNIONED server-side (monotone,
+	// dedup); in_progress is OVERWRITTEN wholesale (Decision 3) and cleared on every
+	// terminal transition. Every id is membership-checked against the run's FROZEN list and
+	// kind-gated here (progressParams, Decision 12/13); a rejected set is DROPPED, never
+	// persisted, and never fails the report.
 	MilestonesCompleted  *[]string `json:"milestones_completed"`
 	MilestonesInProgress *[]string `json:"milestones_in_progress"`
 	// AgentSelection is the default an AUTOPILOT run resolved for itself (Decision 6).
@@ -2468,11 +2475,21 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
+		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
+		// declaration. progressParams subset-validates the declared ids against the run's
+		// FROZEN list (Decision 12/13) exactly as the `running` path does — a non-issue
+		// run, an empty/absent declaration, or any non-member id yields nil, which the
+		// query's CASE leaves the column untouched for (additive-absent: byte-identical to
+		// before). The in_progress side is not declared on completion (the SQL clears it
+		// unconditionally on every terminal transition, D4), so only the completed side is
+		// passed here.
+		completedIDs, _ := progressParams(owned.Kind, owned.MilestonesFrozen, req.MilestonesCompleted, nil)
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
-			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
-			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
-			ID:          runID, WorkerID: pgUUID(wkr.ID),
+			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
+			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
+			MilestonesCompleted: completedIDs,
+			ID:                  runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)

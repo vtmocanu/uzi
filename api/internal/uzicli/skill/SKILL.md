@@ -28,6 +28,15 @@ Two rules cover almost everything:
 2. **Branch on the exit code, not on the text.** The message wording is for
    humans and may change; the exit code is the contract.
 
+**Do not pipe `--json` through a shell `echo`.** The CLI's `--json` is valid — it
+`\uXXXX`-escapes control bytes (agent output can contain raw control characters).
+But **zsh's `echo` interprets `\uXXXX` escapes**, so `echo "$json" | jq` turns
+those escapes back into raw bytes and produces invalid JSON that `jq` rejects —
+silently returning nothing. If you must round-trip the document through the shell,
+use `printf '%s' "$json"` (never `echo`), or write it to a file. Better: to read a
+scalar you do not need JSON at all — `uzi run get <id> --field status` prints the
+raw value with nothing to mangle (see `run get` below).
+
 Beyond those two, one shape to internalise: the `--json` **envelope is not
 uniform across verbs**, so do not reuse one verb's unwrapping for another.
 
@@ -55,6 +64,7 @@ it.
 | 4 | not found | the run/worker/repo id does not exist or is not visible to you |
 | 5 | conflict (e.g. the run already finished) | re-read state with `uzi run get`; the action no longer applies |
 | 6 | server unreachable / 5xx | transient; back off and retry |
+| 7 | a wait deadline elapsed (`run wait --timeout`) before any target state | the run is still working; re-`wait` or raise `--timeout` |
 
 ### Configuration and credentials
 
@@ -95,8 +105,9 @@ uzi auth status
 uzi whoami
 
 uzi run list
-uzi run get <run-id>
+uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>]
+uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>]
 uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
@@ -114,7 +125,7 @@ uzi schedule run-now <schedule-id>
 uzi schedule delete <schedule-id>
 uzi tui [run-id]
 uzi review show <run-id>
-uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>]
+uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>] [--category <label,label>]
 uzi review resolve <run-id> <rec-id> | --category <c> --target <t>
 uzi review dismiss <run-id> <rec-id> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <run-id> <rec-id>
@@ -161,6 +172,16 @@ uzi version
 - `uzi run list` — your runs.
 - `uzi run get <run-id>` — one run's status and details. Surfaces a health
   reason (e.g. a run parked behind a locked vault) without a web round-trip.
+  `--field <name>` (repeatable) prints only the named top-level **scalar**
+  field(s), raw and unquoted, one per line — so a poller reads `.status` or
+  `.mr_web_url` with **no JSON parse at all**: `uzi run get <id> --field status`.
+  This is the robust way to read a scalar (see the `--json`/shell-`echo` note
+  below): there is no JSON to mangle. A `null`/absent field prints an empty line
+  (so a nil array field is an empty line, not an error); an unknown field or a
+  **non-scalar** one that is actually populated — any array or object field, e.g.
+  `milestones`, `own_agents`, `agent_exclusions`, `usage` (read those with
+  `--json`) — is a usage error (exit 2); `--field` and `--json` are mutually
+  exclusive.
 - `uzi run logs <run-id>` — the run's message history. `--follow` polls until the
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
@@ -175,14 +196,34 @@ uzi version
   plan gate), `awaiting_input` (a clarifying question, answered with `run
   answer`), and `limit_wait` (parked while an Anthropic usage limit resets; the
   sweep promotes it back to `queued` once past its `retry_not_before`). So to
-  wait for a plan gate or a clarification park, **poll `uzi run get` status** —
-  relying on `--follow` there blocks until the run truly finishes, which may be
-  never if it is waiting on you. (If you ever see a `status` outside this list,
+  wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
+  below) — relying on `--follow` there blocks until the run truly finishes, which
+  may be never if it is waiting on you. (If you ever see a `status` outside this list,
   the server is newer than this binary — upgrade rather than trusting the value
   to mean "active". The live `/api/ws` stream and `uzi tui` go further and
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
   --json` pass it through verbatim, so this nine-value list is what you branch
   on.)
+- `uzi run wait <run-id>` — block until the run reaches a state you can act on,
+  the primitive for driving a gated run headless. With no `--until` it stops on
+  any **actionable or terminal** state — `awaiting_approval` (the plan gate),
+  `awaiting_input` (a clarification park), `completed`, `failed`, `cancelled` —
+  and keeps waiting through `queued`/`claimed`/`running`/`limit_wait`. So a bare
+  `uzi run wait <id>` is "wait for the plan gate OR the end". It **exits 0** the
+  moment a target state is reached (including if the run is already in one),
+  polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
+  prints each transition to **stderr**; `--json` prints the final run object (the
+  same shape as `run get --json`) to **stdout**. `--timeout <dur>` is opt-in and
+  gives **exit 7** if it elapses first (there is no default timeout — a healthy
+  gated run stops at its gate, so a bare wait cannot hang). A single transient
+  `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
+  set (validated against the nine statuses).
+
+  **Narrow the wait after you approve.** A run lingers at `awaiting_approval` for
+  a beat after a successful `run approve` (the async flip to `running`), so the
+  *second* wait in a gated loop must exclude the gate it just cleared:
+  `uzi run wait <id> --until completed,failed,cancelled`. A bare `run wait` there
+  would return immediately at the gate it just approved.
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
   `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
@@ -223,6 +264,21 @@ uzi version
   Do not read "the run's default" as the source named `own` — they are opposite
   on every repo that ships agents, and this line said the former while reading as
   the latter until 2026-08-03.
+
+  Three things a first-time caller misreads as failures, none of which are:
+  - **`--json` returns the envelope `{"server_side": false}`**, not the run
+    object. For an approve `server_side` is **always** `false` — the approval is
+    always handed to the live worker to apply, never applied server-side — so
+    `false` here is success, not a failure signal.
+  - **The status stays `awaiting_approval` for a beat after a successful
+    approve**, then flips to `running` asynchronously. So a `run wait <id>`
+    *after* approving must narrow to the terminals
+    (`--until completed,failed,cancelled`) — a bare wait would return at once on
+    the gate you just cleared. Read the flip with `run get --field status` or the
+    narrowed `run wait`.
+  - **A second approve of an already-approved run is a benign no-op — exit 0**,
+    not the exit-5 conflict the table might suggest. Re-approving to be sure is
+    safe.
 - `uzi run reject <run-id> [--message <text>]` — reject the plan gate, optionally
   with a reason for the agent.
 - `uzi run cancel <run-id>` — cancel a run.
@@ -389,6 +445,14 @@ signal is the point. `--bucket` filters by the group's rollup and defaults to
 occur in that run — and it is the **only** filter applied BEFORE the server's row cap, so it
 is the only thing that can answer a `truncated` response. `--bucket` filters the rows the cap
 already cut, so no bucket value changes what is missing.
+
+`--category <label,label>` narrows to one or more recommendation **labels**
+(`improve_uzi`, `install_worker_tool`, …) — multi-value, comma-separated — so an
+agent triaging one category asks the server for just that category instead of
+pulling the whole backlog and filtering locally. An unknown label is a usage
+error (exit 2), never a silently empty list, exactly like an unknown `--bucket`;
+an omitted `--category` means all labels. This is a **distinct** flag from the
+single-coordinate `--category` on `review resolve`/`review dismiss`.
 
 Triage a whole group in one call with the coordinate `backlog` prints:
 

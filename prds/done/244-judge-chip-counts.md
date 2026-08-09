@@ -5,7 +5,7 @@
 **Area**: a new `/me/judge/category-stats` aggregate — `api/internal/store/queries/dispositions.sql` (a sibling of `ListJudgeTriageRowsForUser`), `api/internal/workersvc/judge_disposition.go` (a `JudgeCategoryStats` method beside `JudgeTriageStats`), `api/internal/handler/judge_stats.go` (a sibling handler) + route (`handler.go` `/me/judge` group), `api/internal/apitypes/review.go` (a new DTO) + `api/internal/apitypes/wire_test.go` (its pinned tag test) · `web/src/lib/api.ts` (`getJudgeCategoryStats` + TS type), `web/src/pages/Judge.tsx` (render the count on each chip), `web/src/mocks/mockApi.ts` (parity).
 **Mockup**: [`prds/mockups/235-judge-label-filter-mock.html`](mockups/235-judge-label-filter-mock.html) — the parent's mockup already draws the count badge (`.chip .n`, `countFor(cat)` at `:275`). This PRD ships what that badge illustrated.
 **Line references** are against `f9306c8e`.
-**Status**: draft — reviewed 2026-08-08 (see [Review findings](#review-findings)); verdict sound-with-fixes, fixes folded in.
+**Status**: done — implemented 2026-08-08 (#244, all milestones M1–M3 complete). Design reviewed 2026-08-08 (see [Review findings](#review-findings)); verdict sound-with-fixes, fixes folded in.
 
 ## Problem
 
@@ -333,16 +333,16 @@ aggregate and the whole-backlog / group-count / separate-endpoint decisions. No
 
 ## Milestones
 
-- [ ] **M1 — Server: the per-category count aggregate end to end.** The new SQL
+- [x] **M1 — Server: the per-category count aggregate end to end.** The new SQL
       `COUNT(DISTINCT)` query (regenerated, const confirmed moved),
       `JudgeCategoryStats`, the `JudgeCategoryStatsDTO` + `wire_test` tag test, the
       handler and route. Ships with the **live-DB uncapped-and-deduped proof** and the
       handler owner-scoping test. No web change yet; exercised by tests and `curl`.
-- [ ] **M2 — Web: render the count on each chip.** `getJudgeCategoryStats` + the TS
+- [x] **M2 — Web: render the count on each chip.** `getJudgeCategoryStats` + the TS
       type, fetch-once-on-mount, the chip count badge, the dim-on-zero treatment,
       `mockApi` parity, and the updated Decision-6 comment. Unit tests: count render,
       no-refetch-on-toggle, dim-on-zero, nav-badge isolation.
-- [ ] **M3 — Docs, changelog, specs, parity check.** The user doc line, the changelog
+- [x] **M3 — Docs, changelog, specs, parity check.** The user doc line, the changelog
       entry, the `specs/ai.md` note, and a browser check that the shipped chip counts
       match the mockup against a mock-mode build (`VITE_UZI_MOCK=1`, never a
       live-proxying `vite dev`/`preview`, per `.claude/rules/web.md`).

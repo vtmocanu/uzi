@@ -14,7 +14,7 @@ import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle,
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
-import { isStoppedRun, milestoneBadge, mrChipState } from "../lib/runBadge";
+import { isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
@@ -59,6 +59,7 @@ function RunRow({
   // PRD #122: compact milestone progress for the row; null on a non-milestone run,
   // which then renders no new badge (the row had none before this feature).
   const ms = milestoneBadge(run);
+  const msBadge = ms ? milestoneBadgeText(ms) : null;
   return (
     <li>
       <Link
@@ -116,10 +117,11 @@ function RunRow({
             </Badge>
           ) : (
             <>
-              {/* PRD #122: compact milestone progress; a non-milestone run adds nothing. */}
-              {ms && (
-                <Badge tone="info" title="Milestones reported complete of the approved plan">
-                  M{ms.done}/{ms.total}
+              {/* PRD #122: compact milestone progress; a non-milestone run adds nothing.
+                  PRD #265 M2: "not reported" (M–/N) reads distinct from a genuine 0/N. */}
+              {msBadge && (
+                <Badge tone="info" title={msBadge.title}>
+                  {msBadge.label}
                 </Badge>
               )}
               {/* The health flag (PRD #47) sits beside the status pill; hidden here

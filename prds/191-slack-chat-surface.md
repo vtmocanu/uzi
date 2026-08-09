@@ -10,6 +10,15 @@ true-but-imprecise claims (marked ↳fact-check), of which 4 targeted text the a
 pass had already deleted. Two findings outlived their own review: the "outbound-only"
 heading must NOT be rewritten, and a pre-existing chat-injection hole over HTTP is
 recorded in Decision 5 as **out of scope** rather than absorbed.
+**Refreshed 2026-08-09** (tree at `32e91f99`, v0.22.0). Every file:line citation below
+was **re-derived to `32e91f99`** in this pass; the drafting-era `f25eff39` offsets
+survive only in the historical block. Every load-bearing premise was re-verified and
+all still hold — the mechanisms survived nine releases, only the line numbers drifted.
+Material shifts folded in: #192 (the Decision 5 chat-injection hole) landed and is now
+CLOSED; a sixth run kind `prompt` (PRD #241) corrected the kind enumerations; PRD #122
+(v0.21.0) added a THIRD read-on-DB content path to Slack — milestone titles — which
+bears on Problem, Decision 4, M2b, M3 and M7 (noted inline). Re-derive before acting all
+the same: a number without a SHA is not a citation.
 **Priority**: Medium
 **Created**: 2026-07-29
 **Depends on**: PRD #25 (Slack integration, done), PRD #39 (chat agent, done), PRD #41 (plan revision gate, done — the plan-in-thread precedent), PRD #88 (clarification questions, done — the threaded-answer precedent)
@@ -20,9 +29,11 @@ recorded in Decision 5 as **out of scope** rather than absorbed.
 > landed on `main` while this was being written. That last pass was not ceremonial:
 > the release inserted 5 lines at `workersvc/service.go:269`, shifting **six** of this
 > document's citations into that file — `SubmitInput` 3111→3116, `GetRun` 2975→2980,
-> `PublishMessage` 478→483, `SettingsReader` 543→548, and two more. Every number below
-> is at `f25eff39`. Re-derive before acting on one: a line number without a SHA is not
-> a citation, and this document proved it on itself inside one hour.
+> `PublishMessage` 478→483, `SettingsReader` 543→548, and two more. Those offsets were
+> at `f25eff39`; the body below was **re-derived to `32e91f99`** on 2026-08-09, so its
+> numbers are at that SHA, not this one. Re-derive before acting on one: a line number
+> without a SHA is not a citation, and this document proved it on itself inside one hour
+> — and again across the nine releases to `32e91f99`.
 
 ## Problem
 
@@ -30,28 +41,32 @@ Slack today is a **notification bridge with in-thread verbs on an existing run**
 cannot hold a conversation, and the gap is structural rather than a missing flag:
 
 - **A top-level DM to the bot is silently dropped.** `routeMessage`
-  (`api/internal/slacksvc/socket.go:227-232`) returns early when `thread_ts` is
+  (`api/internal/slacksvc/socket.go:230-232`) returns early when `thread_ts` is
   empty, so a user who types "what's running?" into the uzi DM gets **no reply at
   all** — not an error, not a hint. The manifest already subscribes `message.im`
   (`docs/slack.md:36-49`), so the event arrives and is discarded.
-- **A thread reply is routed by the anchored run's status** (`replier.go:161-245`),
-  and by the anchor's gate state where the two `awaiting_approval` arms are compound
-  (`:161-162`, `:200`). Six outcomes: revise feedback, reject reason, question answer,
-  `follow_up` steer, an open-gate nudge, or "that run has already finished"
-  (`:222-223`). There is no free-text path.
+- **A thread reply is routed by the anchored run's status** (`replier.go:162-245`, in
+  `HandleMessage` `:111`), and by the anchor's gate state where the two
+  `awaiting_approval` arms are compound (`:162`, `:200`). Six outcomes: revise feedback,
+  reject reason, question answer, `follow_up` steer, an open-gate nudge, or "that run
+  has already finished" (`:222-223`). There is no free-text path.
 - **Message content structurally cannot reach Slack.** `Notifier.PublishMessage` is
   a deliberate no-op — *"run message CONTENT never goes to Slack (content
-  minimization — only status/title/links do)"* (`notifier.go:170-173`). The two
-  exceptions, plan bodies and question text, are **not** streamed: they are read from
-  the database on a state transition (`notifier.go:470` reads `rc.PlanMd`,
-  `notifier.go:369` reads `GetLatestRunQuestion`; `gate.go:266` and `question.go` only
-  render what those reads returned).
+  minimization — only status/title/links do)"* (`notifier.go:177-180`). The
+  exceptions are read from the database on a state transition, not streamed: plan
+  bodies (`notifier.go:478` reads `rc.PlanMd`) and question text (`notifier.go:377`
+  reads `GetLatestRunQuestion`; `gate.go:266` and `question.go` only render what those
+  reads returned) — and, ↳update 2026-08-09 via PRD #122 (v0.21.0), **milestone
+  titles** (`handleMilestone`, `notifier.go:705`, posts `✓ N/M · working <title>`). So
+  it is **three** read-on-DB exceptions at HEAD, not the two the first draft saw; M7
+  and Decision 4 inherit this.
 
 Meanwhile the Chat page (PRD #39) does exactly what users want from Slack, and is
 **web-only**. The CLI hit the same wall and chose to refuse rather than half-build
-it: `api/cmd/uzi/tui_steer.go:85-90` marks chat runs watch-only because
-`SubmitRunInput` does not gate `kind=chat`, so a raw follow-up would inject into a
-chat outside the guarded `/chats` path.
+it: `api/cmd/uzi/tui_steer.go:85-90` marks chat runs watch-only. (↳update 2026-08-09:
+the CLI is still watch-only at `:88`, but that file's comment claiming a raw follow-up
+"would inject" is stale post-#192 — `SubmitInput` now *rejects* it. The point holds;
+the comment is a separate code fix, not this PRD's.)
 
 The practical failure is not "a feature is missing" but **"uzi ignored me"**.
 
@@ -61,15 +76,16 @@ The first draft missed this and built a milestone on top of the gap. **No chat s
 event can reach Slack today**, by three independent constructions:
 
 1. `GetSlackRunContext` — the notifier's one context query — **INNER JOINs `repos`**
-   (`api/internal/store/queries/slack.sql:135`, `JOIN repos rp ON rp.id = r.repo_id`).
-   A chat run has `repo_id NULL` (`00053_chat_runs.sql:32`, `runs_kind_shape`), so the
-   query returns no rows and `Notifier.handle` (`notifier.go:272-283`) returns
-   silently.
-2. `CreateChatRun` (`workersvc/chat.go:237-250`) publishes nothing; run creation never
+   (`api/internal/store/queries/slack.sql:145`, `JOIN repos rp ON rp.id = r.repo_id`;
+   PRD #65 D2 added a `JOIN forge_connections` on top and PRD #122 added three
+   `milestones_*` selects — neither reachable by a repo-less chat run). A chat run has
+   `repo_id NULL` (`00053_chat_runs.sql:32`, `runs_kind_shape`), so the query returns no
+   rows and `Notifier.handle` (`notifier.go:279`) returns silently.
+2. `CreateChatRun` (`workersvc/chat.go:244`) publishes nothing; run creation never
    calls `PublishState` anywhere.
 3. Chat is excluded from the health lane by design — `ListActiveRunsForHealth` ends
-   `AND kind <> 'chat'` (`queries/runtime.sql:1698`), one of **eight** `kind <> 'chat'`
-   guards across `runtime.sql`.
+   `AND kind <> 'chat'` (`queries/runtime.sql:1841`, guard @`:1860`), one of **eight**
+   `kind <> 'chat'` guards across `runtime.sql`.
 
 (1) is the load-bearing one: terminal transitions — idle-complete, turn-cap complete,
 failed — *do* publish state, and every one is dropped there. So "this conversation
@@ -78,7 +94,7 @@ milestone that promises a chat status message needs this fixed **first**, which 
 why M2b exists.
 
 **↳fact-check — this is a DECISION in the code, not an oversight, and the PRD should
-inherit its reasoning rather than overturn it blindly.** `notifier.go:275-278` names
+inherit its reasoning rather than overturn it blindly.** `notifier.go:282-289` names
 the exact mechanism and rules on it: *"No row for a chat run (PRD #39):
 GetSlackRunContext INNER-JOINs repos … Chat transitions have no repo-scoped DM to send
 — skip silently."* That was correct while chat had no Slack presence at all. M2b's
@@ -94,13 +110,13 @@ A chat created from the web, with no anchor, must keep skipping exactly as today
    `gatekeeper.go:109`. Deactivation falls out for free.
 2. **Chat verbs are service-level.** `CreateChatRun`, `ListChatRuns`,
    `SubmitChatMessage`, `EndChat`, `ContinueChat` are at
-   `workersvc/chat.go:237,254,281,312,325`; `handler/chat.go` is a thin HTTP shell.
+   `workersvc/chat.go:244,261,288,319,332`; `handler/chat.go` is a thin HTTP shell.
 3. **The untrusted-text rendering pipeline is built and documented.**
    `planThreadBlocks` (`gate.go:266-277`) is ScrubSecrets → whole-blob `EscapeMrkdwn`
    → `truncateForSlackSection` (2900 runes) → deep link in a **separate** block, with
    a doc comment arguing why whole-blob escaping is correct for model-authored text.
 4. **Riding `kind='chat'` genuinely works** (↳review, verified): `ClaimChat` /
-   `assembleChatClaim` (`workersvc/chat.go:140-228`) join no repo and no forge
+   `assembleChatClaim` (`workersvc/chat.go:147`/`:173`) join no repo and no forge
    connection, `ChatClaimPayload` has no PAT field by construction, and
    `resume_of_run_id`, the turn cap, the idle backstop and `WORKER_CHAT_SESSIONS` are
    all origin-agnostic. Nothing kind-scoped breaks on a Slack-originated conversation.
@@ -112,9 +128,9 @@ A chat created from the web, with no anchor, must keep skipping exactly as today
 3. An **inbound entry point** that is not thread-anchored.
 4. **Three composite operations that live in HANDLERS, not services**, and therefore
    cannot be called from Slack: proposal confirm (`handler/chat.go:194-255`), run
-   creation (`handler/workers.go:671-762`), and the per-user chat **spend limiter**,
-   which is route-mounted (`handler.go:1044,1046,1051`) so any non-HTTP caller
-   silently bypasses it.
+   creation (`handler/workers.go:725`), and the per-user chat **spend limiter**, which
+   is route-mounted (`handler.go:1127,1129,1134`, the three
+   `chatLimiter.PerUserMiddleware` mounts) so any non-HTTP caller silently bypasses it.
 
 That fourth group is the real work. uzi's service layer is clean everywhere the web
 was the only consumer of a *simple* verb, and leaks into handlers exactly where the
@@ -133,11 +149,13 @@ with real Create / Dismiss buttons.
   `chat:write` / `im:write` / `reactions:write` are granted (`docs/slack.md:36-49`).
   Every workspace that has uzi's Slack app gets this on upgrade with no admin action.
 - **Content minimization is relaxed for `kind='chat'` ONLY.** ↳fact-check: there are
-  **five** run kinds, not two — `issue`, `ci_fix`, `chat`, `judge` and `self_improve`
-  (`workersvc/ci_fix.go:18-19`, `chat.go:21`, `judge.go:23,27`). The other four keep
-  today's posture byte-for-byte; `judge` and `self_improve` are additionally already
-  suppressed from the run-state DM path at `notifier.go:289`, so naming only two lanes
-  left two unaccounted for.
+  **six** run kinds, not two — `issue`, `ci_fix`, `chat`, `judge`, `self_improve` and
+  `prompt` (`workersvc/ci_fix.go:18-19`, `chat.go:21`, `judge.go:23,27,31`). The other
+  five keep today's posture byte-for-byte; `judge` and `self_improve` are additionally
+  already suppressed from the run-state DM path (`notifier.go:296`), while `prompt` is
+  repo-ful and NOT suppressed, so it rides the same run-state DM lane as
+  `issue`/`ci_fix`. (↳update 2026-08-09: was "five … the other four" before `prompt`,
+  PRD #241, landed as a run kind.)
 - **The chat agent still holds no credential.** `start_run` and `propose_issue` are
   *requests to the api*, which performs the forge call with the user's own connection.
 
@@ -152,7 +170,7 @@ with real Create / Dismiss buttons.
    `GetSlackRunMessageByRoot(channel_id, root_ts)` resolves only if `root_ts` is that
    user message. But every existing consumer treats `root_ts` as the **bot's
    editable** root: `00044_slack.sql:26-28` (*"status edits target it"*), and both
-   `notifier.go:337` and `notifier.go:586` call
+   `notifier.go:344` and `notifier.go:594` call
    `poster.Update(ctx, existing.ChannelID, existing.RootTs, root)`. A bot cannot edit
    another user's message, and every failure on that path is best-effort-logged, so
    this would have been silent.
@@ -183,8 +201,9 @@ with real Create / Dismiss buttons.
    NULL gate/question columns breaks none of them; and a forged chat run id on a gate
    button hits `!anchor.GateTs.Valid` at `gatekeeper.go:147-151` and gets the
    "superseded" ephemeral. Inert. Every column added since `00044` is nullable
-   (`00074:12`, `00093:24,43`), so the NULL-column claim holds against the current
-   shape and not merely the original one.
+   (`00074:12`, `00093:24,43`, and — ↳update 2026-08-09, PRD #122 — `00101:15`
+   `milestones_notified_completed int`), so the NULL-column claim holds against the
+   current shape and not merely the original one.
    **↳fact-check — one stated premise expires, and M2 must re-establish it.** There is
    **no UNIQUE index** on `(channel_id, root_ts)`; `replier.go:136-138` argues the
    `:one` lookup is safe because the pair is *effectively* unique — *"each run posts
@@ -198,37 +217,48 @@ with real Create / Dismiss buttons.
 5. **The replier branches on `run.Kind == "chat"` BEFORE its status switch.** A chat
    run's status is `queued`/`claimed`/`running`, which lands in the `default:` arm and
    would submit a raw `follow_up` — the injection the CLI refuses at
-   `tui_steer.go:85-90`. ↳review verified the premise: `workersvc.GetRun`
-   (`service.go:2980`) is kind-agnostic and returns `store.Run` with `.Kind`, and
-   `SubmitInput` (`service.go:3116`) does not gate chat. Turns route through
-   `SubmitChatMessage` instead, which enforces the turn cap and the terminal 409.
-   This requires extending `PlanGateSubmitter` (`gatekeeper.go:48-69`) and its
-   `gateSubmitter` impl in `api/cmd/server/main.go` — both now in Touchpoints.
-   **↳fact-check — the same hole is already OPEN over HTTP, and it is not this PRD's
-   to fix.** Verified at HEAD: `SubmitInput` (`service.go:3116-3144`) checks ownership
-   and terminal status and **never** `run.Kind`, and `CreateRunInput`
-   (`handler/workers.go:868-889`) validates only the *input* kind against
-   `runInputKinds`. So `POST /api/runs/{id}/inputs {"kind":"follow_up"}` on a chat run
-   the caller owns is **accepted today**, bypassing `SubmitChatMessage`'s turn cap —
-   the CLI refuses to *offer* the affordance (`tui_steer.go:85-90`) but the API accepts
-   the call. That is a pre-existing defect with its own blast radius (spend cap
-   bypass), it predates this PRD, and it was filed separately rather than smuggled into
-   a Slack milestone: **[vtmocanu/uzi#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192)**.
-   Decision 5 keeps Slack out of the hole; it does not close it.
+   `tui_steer.go:85-90`. ↳review verified the premise: `workersvc.GetRunByIDForUser`
+   (`service.go:3399`; was `GetRun` `:2980` at `f25eff39`) is kind-agnostic and returns
+   `store.Run` with `.Kind`. Turns route through `SubmitChatMessage` instead, which
+   enforces the turn cap and the terminal 409. This requires extending `PlanGateSubmitter`
+   (`gatekeeper.go:48-69`) and its `gateSubmitter` impl in `api/cmd/server/main.go` —
+   both now in Touchpoints.
+   **↳update 2026-08-09 — the SAFETY half of this premise expired: `SubmitInput` now
+   DOES gate chat.** PRD #258/#192 landed `if run.Kind == RunKindChat && kind ==
+   "follow_up"` at the service boundary (`service.go:3549`), returning
+   `ErrChatInputNotAllowed` before any write. So the replier branch no longer prevents
+   an *injection* — a raw `follow_up` is refused by the service, not accepted. It is
+   still required, but for CORRECTNESS not safety: without it a Slack thread reply lands
+   in the `default:` arm, submits `follow_up`, and now *errors* instead of continuing
+   the chat. Route through `SubmitChatMessage` so the reply becomes a turn, not a 409.
+   **↳fact-check (2026-07-29) — the same hole was OPEN over HTTP, and it was not this
+   PRD's to fix.** As verified at `f25eff39`: `SubmitInput` checked ownership and
+   terminal status and **never** `run.Kind`, and `CreateRunInput` (`handler/workers.go`)
+   validated only the *input* kind against `runInputKinds`. So `POST
+   /api/runs/{id}/inputs {"kind":"follow_up"}` on a chat run the caller owned was
+   **accepted**, bypassing `SubmitChatMessage`'s turn cap — the CLI refused to *offer*
+   the affordance (`tui_steer.go:85-90`) but the API accepted the call. A pre-existing
+   spend-cap-bypass defect, filed separately rather than smuggled into a Slack
+   milestone: **[vtmocanu/uzi#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192)**.
+   **↳update 2026-08-09 — #192 is now CLOSED** (`fix(258): reject follow_up on chat
+   runs at the SubmitInput boundary`, `32e91f99`): the guard sits at the service
+   boundary and covers HTTP, CLI and future Slack. Decision 5 no longer *keeps Slack out
+   of* an open hole — the hole is shut for every caller; the replier branch is now the
+   correctness half described in the update above.
 
 6. **↳review — post one Slack message per assistant TURN, and enumerate every way a
    turn can end.** Turn boundaries *are* observable at the `PublishMessage` seam:
    turn start is `kind:"user_message"` (`agent/src/chat-runner.ts:260`), happy-path
    end is the SDK result frame arriving as `kind:"status"` with
-   `payload.event=="result"` (`chat-executor.ts:461-468`), and re-deliveries are
-   excluded because only `inserted` is broadcast (`service.go:1977-1979`), so no
-   double-post. But **three turn-end paths emit no result frame**, all in
-   `chat-executor.ts`: a cancelled turn (`:474`, emits nothing), a wall-clock timeout
-   (`:476-479`, emits a prose `status`), and the catch-all error (`:481`, emits
-   `kind:"error"`). A consumer waiting only on `event=="result"` strands the "uzi is
-   thinking…" placeholder forever on exactly the turns a user most needs explained.
-   The consumer therefore treats **all four** as turn-end.
-   Two further rulings: **`thinking` frames are never posted** (`sdk-messages.ts:120-124`
+   `payload.event=="result"` (`chat-executor.ts:462-471`), and re-deliveries are
+   excluded because only `inserted`/new messages are broadcast (`service.go:2100,2161`),
+   so no double-post. But **three turn-end paths emit no result frame**, all in
+   `chat-executor.ts`: a cancelled turn (`:476`, dup `:485`, emits nothing), a wall-clock
+   timeout (`:477-479`, dup `:486-488`, emits a prose `status`), and the catch-all error
+   (`:481`, emits `kind:"error"`). A consumer waiting only on `event=="result"` strands
+   the "uzi is thinking…" placeholder forever on exactly the turns a user most needs
+   explained. The consumer therefore treats **all four** as turn-end.
+   Two further rulings: **`thinking` frames are never posted** (`sdk-messages.ts:120-122`
    emits them; streaming model reasoning to Slack is a wider widening than Decision 10
    describes and nobody asked for it) — only `text` frames compose the turn body. And
    the per-turn buffer is in-memory, so an api restart mid-turn orphans a placeholder;
@@ -260,9 +290,9 @@ with real Create / Dismiss buttons.
      `selfimprove`, `privcheck` and `runlifecycle` already use, plus wiring in
      `main.go`.
    - `StartRunForUser` needs `PrdlessEnabled`/`PrdlessLabel`
-     (`handler/workers.go:718-721`); `workersvc.SettingsReader`
-     (`service.go:548-561`) carries only `JudgeEnabled`, `JudgeModel`, `PRDLabel`.
-   Also: `handler/workers.go:730-762` is the sentinel→HTTP-status switch and **stays
+     (`handler/workers.go:788-790`); `workersvc.SettingsReader`
+     (`service.go:608-621`) carries only `JudgeEnabled`, `JudgeModel`, `PRDLabel`.
+   Also: `handler/workers.go:839-877` is the sentinel→HTTP-status switch and **stays
    in the handler**. The lift ends at the service boundary, not at the response.
 
 9. **↳review — do NOT move the spend limiter off the routes; export an `Allow` seam
@@ -270,10 +300,11 @@ with real Create / Dismiss buttons.
    `mw.Limiter.PerUserMiddleware` (`middleware/ratelimit.go:101-120`) keys on
    `RoutePattern() + "|" + userID` and calls the unexported `l.allow`, and
    `workersvc` importing `internal/middleware` is the wrong dependency direction.
-   Worse, `handler/route_limiter_mounts_test.go` is an exhaustive 142-row
-   route→limiter table that exists *because* deleting all 24 `.With(…PerUserMiddleware)`
-   mounts once left `go vet` clean and the suite at zero failures — moving the chat
-   limiter off the routes retires the only mechanism that can catch a dropped mount.
+   Worse, `handler/route_limiter_mounts_test.go` is an exhaustive 159-row
+   route→limiter table (↳update 2026-08-09: was 142) that exists *because* deleting all
+   28 `.With(…PerUserMiddleware)` mounts (was 24) once left `go vet` clean and the suite
+   at zero failures — moving the chat limiter off the routes retires the only mechanism
+   that can catch a dropped mount.
    So: export `Allow(key string) bool` on `mw.Limiter`, keep every route mount and its
    guard intact, and have the Slack path call `Allow` directly. This also removes the
    first draft's contradiction, where a milestone titled "no behaviour change" would
@@ -289,8 +320,8 @@ with real Create / Dismiss buttons.
     documented in `docs/slack.md`, scrubbed of known credential *patterns*, DM-only.
     **↳review — record the second-order consequence the first draft missed.** The
     chat agent's read tools are user-scoped but **not kind-scoped**:
-    `ListRunsForWorker` (`workersvc/chat.go:494-502`) says *"both kinds — the chat
-    agent investigates issue runs too"*, and `ListRunMessagesForWorker` (`:520-532`)
+    `ListRunsForWorker` (`workersvc/chat.go:504`) says *"both kinds — the chat
+    agent investigates issue runs too"*, and `ListRunMessagesForWorker` (`:527`)
     authorizes on ownership alone. So a Slack chat can be asked to quote an **`issue`
     run's** message content — plan bodies, diffs, tool output — into Slack. The
     notification lanes stay byte-identical and the *exposure* does not: run content
@@ -355,15 +386,26 @@ calls "worse than no guard, because the surface *looks* protected".
       (Decision 8); `SettingsReader` gains the prdless accessors; `mw.Limiter` exports
       `Allow(key)` (Decision 9) with routes untouched. **↳review — verification is
       tests to WRITE, not tests to inherit.** There are no handler tests for either
-      operation today: `rg -l "ConfirmProposal|CreateRun\("` across
-      `api/internal/handler/*_test.go` returns nothing, and
-      `workersvc/chat_test.go:207-237` tests the service primitives the lift does not
-      move. Inheriting that net would have been a control that cannot discriminate.
-      **Verified**: a new composition test per post-claim failure point
-      (`handler/chat.go:210,219,231,241`) asserts the proposal returns to `pending`;
+      operation today. ↳update 2026-08-09: at `f25eff39`,
+      `rg -l "ConfirmProposal|CreateRun\("` across `api/internal/handler/*_test.go`
+      returned nothing; at `32e91f99` it returns `seeded_plan_livedb_test.go` (a service
+      `CreateRun(...)` setup call, not a handler composite test) and `handler/chat_test.go`
+      now exists with 7 tests — but still **none** is a ConfirmProposal composition/revert
+      test, so the "no net to inherit" spirit survives while the literal output changed.
+      `workersvc/chat_test.go:192-237` tests the service primitives the lift does not move.
+      Inheriting that net would have been a control that cannot discriminate.
+      **↳update 2026-08-09 — the claim-first path the lift wants to mutation-test already
+      SHIPS in the handler**: `handler/chat.go` `ConfirmProposal` (`:194-255`) already does
+      `ClaimProposalForConfirm` + revert-on-failure at **three** post-claim points
+      (`:212,:224,:239`, not the four the draft listed), calling
+      `forgesvc.ForgeForConnection` (`forgesvc/service.go:168`). The lift is still unbuilt
+      (`ConfirmProposalForUser`/`StartRunForUser` absent from `workersvc`), but M1's tests
+      describe behaviour that already exists.
+      **Verified**: a composition test per post-claim failure point
+      (`handler/chat.go:212,224,239`) asserts the proposal returns to `pending`;
       a concurrent-confirm test creates exactly **one** forge issue, and a mutation
       that removes claim-first ordering reddens it; the route→limiter table
-      (`route_limiter_mounts_test.go`) is unchanged, all 142 rows.
+      (`route_limiter_mounts_test.go`) is unchanged, all 159 rows.
 
 - [ ] **M2 — Inbound: a top-level DM opens a chat.** `routeMessage` accepts
       `thread_ts == ""` in a DM; the path creates a chat run via `CreateChatRun`
@@ -383,9 +425,9 @@ calls "worse than no guard, because the surface *looks* protected".
 - [ ] **M2b — ↳review NEW: chat runs can reach the notifier at all.** A repo-less
       `GetSlackChatContext` (no `repos`/`forge_connections` join) plus a chat branch in
       `Notifier.handle`, so a chat's terminal transitions stop being dropped at
-      `queries/slack.sql:135`. Status edits target `status_ts`, never `root_ts`.
+      `queries/slack.sql:145`. Status edits target `status_ts`, never `root_ts`.
       Nothing is added to the health lane — chat's exclusion there
-      (`queries/runtime.sql:1698`) is correct and stays. **Verified**: a chat run
+      (`queries/runtime.sql:1841`) is correct and stays. **Verified**: a chat run
       reaching `completed`/`failed` posts exactly one Slack status update against
       `status_ts`; the same event on an `issue` run renders byte-identically to today;
       a chat run's transition performs **zero** `Update` calls against `root_ts`.
@@ -396,7 +438,7 @@ calls "worse than no guard, because the surface *looks* protected".
       (Decision 6), rendered through the scrub/escape/truncate pipeline. Every other
       kind keeps the no-op path. Two ↳fact-check constraints on the implementation:
       **(a) `PublishMessage` carries no run kind** — its `kind` parameter
-      (`service.go:483`) is the *message* kind (`text`/`tool_use`/`proposal`), so the
+      (`service.go:543`) is the *message* kind (`text`/`tool_use`/`proposal`), so the
       consumer must resolve `runs.kind` per message via a lookup or a cache, on the hot
       path for every frame; decide which in M3, not at review time. **(b) This is a
       PARALLEL path, not a branch in the existing renderer** — everything downstream of
@@ -447,12 +489,15 @@ calls "worse than no guard, because the surface *looks* protected".
       question privacy notes, **and states the second-order exposure**: an `issue`
       run's content can be quoted into Slack through chat's kind-agnostic read tools.
       `docs/chat.md` stops implying the Chat page is the only way in (`docs/chat.md:8-9`).
-      **↳fact-check — `ARCHITECTURE.md`'s "outbound-only" heading (`:800`) STAYS
+      **↳fact-check — `ARCHITECTURE.md`'s "outbound-only" heading (`:839`) STAYS
       CORRECT and must not be rewritten.** It describes the *transport*: Socket Mode
       out, no public URL, no inbound port — none of which M2 changes, and the section
       already documents inbound actions (buttons, reply-steering). What actually goes
       stale is narrower and easy to miss: the *"content minimization — with two
-      deliberate exceptions"* bullet becomes three, and the section's opening
+      deliberate exceptions"* bullet (still says "two" at `:846`) — ↳update 2026-08-09,
+      PRD #122 already made milestone titles a third read-on-DB path, so the bullet is
+      arguably understated **before** chat and chat makes it four; M7 must reconcile the
+      count, not just append. And the section's opening
       enumeration ("per-user run DMs, plan-approval buttons, and reply-from-Slack
       steering") needs a fourth item. The first draft's stated reason would have sent
       someone to rewrite a heading that is true.
@@ -468,16 +513,17 @@ calls "worse than no guard, because the surface *looks* protected".
 - A run can be started from Slack in two steps (ask, confirm) and never in one.
 - An issue can be drafted and filed from Slack, the forge write still gated on a click.
 - Existing workspaces need **no** app re-install and **no** admin action.
-- The **notification lanes for all four non-chat kinds** (`issue`, `ci_fix`, `judge`,
-  `self_improve`) are byte-identical to today. Stated as the lane, not the system —
-  Decision 10 records that run content gains a route to Slack through chat's read
-  tools.
+- The **notification lanes for all five non-chat kinds** (`issue`, `ci_fix`, `judge`,
+  `self_improve`, `prompt`) are byte-identical to today. Stated as the lane, not the
+  system — Decision 10 records that run content gains a route to Slack through chat's
+  read tools. (↳update 2026-08-09: `prompt`, PRD #241, is the fifth; it was not a run
+  kind when this was written.)
 
 ## Out of Scope (deliberate)
 
 - Slash commands, `app_mention`, channel or group conversations (Decision 14).
 - Multi-user or shared conversations.
-- Chat runs in the health lane (`queries/runtime.sql:1698` excludes them correctly).
+- Chat runs in the health lane (`queries/runtime.sql:1841` excludes them correctly).
 - Voice, file upload, image input.
 - Making the CLI a chat consumer — the obvious next beneficiary of M1's seams, and a
   separate PRD.
@@ -539,7 +585,7 @@ calls "worse than no guard, because the surface *looks* protected".
   its own comment saying *"Slack has no animated 'typing' reaction like Feishu's, so we
   use the universal 👀"* (`typing_indicator.go:20-26`). uzi already grants
   `reactions:write` (`docs/slack.md:43`) and already calls `AddReaction`
-  (`poster.go:117`, `replier.go:62`), so "if Slack supports it here" was a question
+  (`poster.go:117`, `replier.go:398`), so "if Slack supports it here" was a question
   with an answer already in the tree. It is also not a substitute for a placeholder — a
   reaction cannot carry answer text. The real trade M3 should weigh is
   **react-then-post-once** (1 post, 0 edits) against **placeholder-then-edit** (1 post,
@@ -565,7 +611,7 @@ calls "worse than no guard, because the surface *looks* protected".
   again by the CLI.
 - **2026-07-29 (↳review) — the first draft's outbound half was built on an assumption
   nobody had checked**: that a chat run's state events reach the notifier. They do not
-  (`queries/slack.sql:135`). M2b exists because of it, M6 was unbuildable without it,
+  (`queries/slack.sql:145`). M2b exists because of it, M6 was unbuildable without it,
   and the general lesson is the one CLAUDE.md keeps making: the draft cited the
   notifier's *message* no-op as the only outbound gap and never asked what happened to
   *state*. Two adjacent negatives, one checked.
@@ -578,13 +624,16 @@ calls "worse than no guard, because the surface *looks* protected".
   false implication** (`chat.update` "is rate-limited too" — Tier 3 at 50+/min against
   postMessage's ~1/sec, so the parity it implies does not exist and the rejection it
   supported never needed it); and a **citation one layer off the fact** (`gate.go:266`
-  renders the plan, `notifier.go:470` reads it). None would have failed a build; each
+  renders the plan, `notifier.go:478` reads it). None would have failed a build; each
   would have sent an implementer somewhere real and wrong.
 - **2026-07-29 — a defect found by review is filed, not absorbed.** The HTTP
-  chat-injection hole (Decision 5) is real, verified at HEAD, and predates this work.
-  Folding it into a Slack milestone would hide a spend-cap bypass inside a feature MR
-  and leave it unfixed for as long as this PRD takes. Filed as
-  [#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192).
+  chat-injection hole (Decision 5) was real, verified at `f25eff39`, and predated this
+  work. Folding it into a Slack milestone would have hidden a spend-cap bypass inside a
+  feature MR and left it unfixed for as long as this PRD takes. Filed as
+  [#192](https://gitlab.example.com/vtmocanu/uzi/-/issues/192). **↳update 2026-08-09 —
+  #192 landed independently** (`fix(258)`, `32e91f99`), which is the outcome
+  filing-not-absorbing exists to enable: the fix shipped on its own timeline instead of
+  waiting on this PRD. Decision 5 updated to match.
 - **2026-07-29 — the tree moved under this document while it was being written**, and
   the citation block records it. `chore(release): 0.13.0` shifted six `service.go`
   citations by +5 in the ~90 minutes between drafting and committing. Nothing here was

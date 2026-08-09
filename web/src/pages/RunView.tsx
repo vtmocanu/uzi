@@ -35,6 +35,7 @@ import {
   healthFlagLabel,
   isStoppedRun,
   milestoneBadge,
+  milestoneBadgeText,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
@@ -168,9 +169,12 @@ export function HealthFlag({ run }: { run: Run }) {
 export function MilestoneBadge({ run }: { run: Run }) {
   const progress = milestoneBadge(run);
   if (!progress) return null;
+  // PRD #265 M2: render "not reported" (M–/N) apart from a genuine 0/N via the shared
+  // helper, so the header pill matches the board and a done run never reads as failed.
+  const badge = milestoneBadgeText(progress);
   return (
-    <Badge tone="info" title="Milestones reported complete of the approved plan">
-      M{progress.done}/{progress.total}
+    <Badge tone="info" title={badge.title}>
+      {badge.label}
     </Badge>
   );
 }
@@ -200,13 +204,21 @@ export function MilestoneChecklist({ run }: { run: Run }) {
   // Single source of truth for the done count — milestoneBadge counts frozen members
   // present in the completed set (immune to duplicate ids), the same rule this list
   // renders from. Non-null here since the frozen list is non-empty (checked above).
-  const doneCount = milestoneBadge(run)?.done ?? 0;
+  const progress = milestoneBadge(run);
+  const doneCount = progress?.done ?? 0;
+  // PRD #265 M2: a run that reported nothing shows "not reported" (–/N) instead of a
+  // 0/N that reads as failure. The rows below already render every milestone as ○
+  // (not-started) in that case, which is honest; only the header count changes.
+  const reported = progress?.reported ?? false;
   return (
     <Card className="p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
         <h2 className="text-sm font-semibold text-fg">Milestones (reported complete)</h2>
-        <span className="font-mono text-xs tabular-nums text-faint">
-          {doneCount}/{milestones.length}
+        <span
+          className="font-mono text-xs tabular-nums text-faint"
+          title={reported ? undefined : "No milestone completion reported for this run"}
+        >
+          {reported ? `${doneCount}/${milestones.length}` : `–/${milestones.length}`}
         </span>
       </div>
       <ul className="space-y-1.5">

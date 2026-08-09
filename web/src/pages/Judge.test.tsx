@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       getJudgeBacklog: vi.fn(),
+      getJudgeCategoryStats: vi.fn(),
       bulkSetJudgeDisposition: vi.fn(),
       deleteDisposition: vi.fn(),
       listRepos: vi.fn().mockResolvedValue({ repos: [] }),
@@ -73,6 +74,10 @@ function backlog(over: Partial<JudgeBacklog> = {}): JudgeBacklog {
 
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user: { judge_enabled: true } } as unknown as ReturnType<typeof useAuth>);
+  // Default the PRD #244 chip-count fetch to empty so every existing suite renders; the
+  // count-specific suites override it. vi.clearAllMocks() (afterEach) clears calls but not
+  // implementations, so re-setting here each test also prevents an override leaking forward.
+  mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
 });
 afterEach(() => {
   cleanup();
@@ -685,11 +690,17 @@ describe("Judge — the ?run= deep-link anchor (PRD #98 Decision 4)", () => {
   });
 });
 
-// PRD #235 M2 — the recommendation-label filter. The chips are aria-pressed toggle buttons
-// whose accessible name is recommendationLabel(cat); a group's category Badge renders the
-// same text but is a <span>, so a `role: "button"` query addresses the chip unambiguously.
+// PRD #235 M2 — the recommendation-label filter. The chips are aria-pressed toggle buttons.
+// Since PRD #244 their accessible name is `${recommendationLabel(cat)}, N groups` (the count
+// rides the aria-label; the visible digit is aria-hidden), so the lookup matches the LABEL
+// PREFIX with a regex rather than the whole name — the count varies per fixture and is not
+// what these tests are about. A group's category Badge renders the label too but is a <span>,
+// so `role: "button"` still addresses the chip unambiguously.
 describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", () => {
-  const chip = (name: string) => screen.getByRole("button", { name });
+  // Escape regex metachars in the label so a future category label containing one
+  // (e.g. parentheses) still matches literally rather than as a pattern.
+  const chip = (name: string) =>
+    screen.getByRole("button", { name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},`) });
 
   it("clicking a chip writes ?category= and re-fetches the backlog narrowed to that label", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());
@@ -777,6 +788,84 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
 
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, []));
     expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
+  });
+});
+
+// PRD #244 — the per-category GROUP count on each filter chip. The count is the canonical
+// /me/judge/category-stats aggregate, fetched ONCE on mount, rendered as a badge inside the
+// chip; a 0-count chip is dimmed. The chip's accessible name is `${label}, N groups` so the
+// count is announced without the raw digit polluting the name.
+describe("Judge — per-category chip counts (PRD #244)", () => {
+  // Whole-backlog group counts per category. improve_uzi has 6, install_worker_tool 3,
+  // enable_tool is a deliberate ZERO to exercise the dimmed state.
+  const counts = {
+    improve_uzi: 6,
+    install_worker_tool: 3,
+    add_agent: 1,
+    adjust_template: 2,
+    improve_agent: 4,
+    enable_tool: 0,
+  };
+
+  it("renders each chip's count from getJudgeCategoryStats, and dims a 0-count chip", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts });
+    renderJudge();
+
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+
+    // The accessible name carries the count honestly, singular "group" at 1.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Improve uzi, 6 groups" })).toBeTruthy());
+    const uzi = screen.getByRole("button", { name: "Improve uzi, 6 groups" });
+    const worker = screen.getByRole("button", { name: "Install a worker tool, 3 groups" });
+    const single = screen.getByRole("button", { name: "Add a missing agent, 1 group" });
+    const zero = screen.getByRole("button", { name: "Enable a tool or skill, 0 groups" });
+
+    // The visible (aria-hidden) badge shows the digit inside the chip.
+    expect(within(uzi).getByText("6")).toBeTruthy();
+    expect(within(worker).getByText("3")).toBeTruthy();
+    expect(within(single).getByText("1")).toBeTruthy();
+
+    // The 0-count chip is dimmed; a non-zero one is not.
+    expect(zero.className).toContain("opacity-50");
+    expect(uzi.className).not.toContain("opacity-50");
+    // Dimmed, but NOT disabled — a chip must stay togglable even at 0 (so a ?category= that
+    // selected it can be un-pressed).
+    expect(zero.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("fetches the counts ONCE on mount, never on a bucket or category toggle", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts });
+    renderJudge();
+
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    // The one mount fetch.
+    await waitFor(() => expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(1));
+    // Baseline: the backlog was read once on mount too.
+    expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(1);
+
+    // A category toggle re-fetches the backlog (the list narrows)…
+    fireEvent.click(screen.getByRole("button", { name: /^Install a worker tool,/ }));
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(2));
+
+    // A bucket switch re-fetches the backlog again…
+    fireEvent.click(screen.getByRole("tab", { name: /All/ }));
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(3));
+
+    // …but the counts are invariant to both, so the aggregate is NEVER re-fetched.
+    expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a 0 on every chip when the aggregate is absent, without crashing", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
+    renderJudge();
+
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    // Every chip reads `counts[cat] ?? 0` → "0 groups", and every chip is dimmed.
+    const chip = screen.getByRole("button", { name: "Improve uzi, 0 groups" });
+    expect(chip.className).toContain("opacity-50");
   });
 });
 

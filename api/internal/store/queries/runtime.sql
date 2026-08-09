@@ -740,6 +740,9 @@ UPDATE runs SET
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
     -- Ids are validated + membership-checked server-side (progressParams) before here.
+    -- PRD #265 M1: SetRunCompleted copies this exact milestones_completed union onto the
+    -- completion path (signal_done reconciliation). The two sites MUST keep identical
+    -- dedup semantics — if you change one, change both.
     milestones_completed = CASE
         WHEN sqlc.narg('milestones_completed')::jsonb IS NULL THEN milestones_completed
         ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
@@ -1070,6 +1073,31 @@ UPDATE runs SET
     -- reported by one worker in one payload, so they must not persist under
     -- different conventions.
     prd_done_path      = @prd_done_path,
+    -- PRD #265 M1: reconcile the milestone tracker at completion. The lead declares on
+    -- signal_done which frozen milestones it finished; the server UNIONs them here so a
+    -- run that never emitted a mid-run `report_progress` still lands a truthful tracker.
+    -- This CASE is copied VERBATIM from SetRunRunning's milestones_completed union
+    -- (see this file's `SetRunRunning`, milestones_completed) and MUST stay a UNION, not
+    -- the plain assignment mr_iid/prd_done_path use above: a run that already reported
+    -- {m1,m2} via checkpoint and then declares {m3} on signal_done must end at
+    -- {m1,m2,m3}, never be overwritten to {m3}. Keep the two union sites' dedup
+    -- semantics identical — if you change one, change both. NULL param (nothing declared,
+    -- or a non-issue/invalid set dropped by progressParams) leaves the column untouched,
+    -- so a no-declaration completion is byte-identical to before.
+    milestones_completed = CASE
+        WHEN sqlc.narg('milestones_completed')::jsonb IS NULL THEN milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || sqlc.narg('milestones_completed')::jsonb) AS e), '[]'::jsonb)
+    END,
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run, so the snapshot is
+    -- cleared on every terminal transition a milestone-bearing (issue) run can reach (an
+    -- explicit clear — progressParams' nil-input convention leaves columns untouched, so it
+    -- will not happen for free). Same clear appears on SetRunFailed / MarkRunFailedByID /
+    -- CancelRunServerSide / FailRunAutoStop / RejectRunServerSide / SweepRunningTimeout and
+    -- the stale-worker failers below. (SweepIdleChatRuns also completes runs but is kind=
+    -- 'chat'-only, and progressParams gates milestone writes to issue runs, so its snapshot
+    -- is always NULL — the clear there would be a no-op and is deliberately omitted.)
+    milestones_in_progress = NULL,
     -- Arm the M5 patch marker. Explicit rather than left to the column default,
     -- because SetRunCompleted can in principle run on a row that already carries a
     -- stamp from an earlier terminal transition.
@@ -1091,6 +1119,8 @@ UPDATE runs SET
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1106,6 +1136,8 @@ UPDATE runs SET
     failure_reason     = @failure_reason,
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1119,6 +1151,8 @@ WHERE id = @id
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1159,6 +1193,8 @@ UPDATE runs SET status = 'failed',
     stop_kind          = 'auto_stopped',
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1194,6 +1230,8 @@ WHERE id = @id
 -- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 -- regardless of the failure_reason text.
 UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1265,6 +1303,8 @@ WHERE id = @id AND status = 'claimed';
 -- server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
 -- would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1279,6 +1319,8 @@ RETURNING id, user_id, status;
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1314,6 +1356,8 @@ RETURNING id, user_id, status;
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
 -- as the sweeper's FailRunsOfStaleWorkersOverCap does.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,6 +72,45 @@ var terminalRunStatuses = map[string]bool{
 	"cancelled": true,
 }
 
+// allRunStatuses is the nine-value status enum the skill documents and migration
+// 00092 constrains (runs_status_check). It is the source of truth `run wait`
+// validates `--until` against, so a typo'd target is a clean usage error rather than
+// a silent forever-wait. A status the SERVER reports that is NOT in this set is a
+// newer server than this binary (surfaced, treated non-terminal — never a target,
+// since `--until` can only name a member here).
+var allRunStatuses = map[string]bool{
+	"queued":            true,
+	"claimed":           true,
+	"running":           true,
+	"awaiting_approval": true,
+	"awaiting_input":    true,
+	statusLimitWait:     true,
+	"completed":         true,
+	"failed":            true,
+	"cancelled":         true,
+}
+
+// defaultWaitStates is `run wait`'s `--until` default (PRD #264 D2): the "actionable"
+// set — every state that needs the caller or ends the run. It deliberately OMITS
+// queued/claimed/running (still working) and limit_wait (auto-resumes; parking on it
+// is legitimate), so a bare `uzi run wait <id>` returns at the plan gate, a
+// clarification park, or a terminal — the common "wait for the gate OR the end" case.
+var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "completed", "failed", "cancelled"}
+
+// run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,
+// not consts, only so tests shrink the waits; nothing at runtime reassigns them.
+//
+//   - runWaitPollInterval — the default `--interval` between polls of GET /api/runs/:id.
+//   - runWaitBackoff — the pause after a mid-wait ExitUnreachable before retrying.
+//   - runWaitMaxUnreachable — how many CONSECUTIVE unreachable polls end the wait with
+//     exit 6. A single 5xx/network blip (the skill calls it "transient; back off and
+//     retry") must not kill a multi-hour gate-wait, so the default is small but > 1.
+var (
+	runWaitPollInterval   = 3 * time.Second
+	runWaitBackoff        = 2 * time.Second
+	runWaitMaxUnreachable = 5
+)
+
 // newRunCmd — `uzi run` and its verbs. Every verb is wired to the Client: the reads
 // (list/get/logs/review/inputs) and the writes (create/approve/reject/cancel/
 // follow-up/answer).
@@ -114,17 +154,29 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			fields, _ := cmd.Flags().GetStringSlice("field")
+			fields = nonEmpty(fields)
+			p := env.printer(gf)
+			// --field and --json are two output modes; refusing the combination up front
+			// keeps each single-purpose (a scalar-per-line stream vs a JSON document).
+			if len(fields) > 0 && p.Format == uzicli.FormatJSON {
+				return uzicli.Exitf(uzicli.ExitUsage, "--field cannot be combined with --json")
+			}
 			run, err := c.GetRun(cmd.Context(), args[0])
 			if err != nil {
 				return err
 			}
-			p := env.printer(gf)
+			if len(fields) > 0 {
+				return printRunFields(env, run, fields)
+			}
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
 			return renderRunDetail(p, run)
 		},
 	}
+	get.Flags().StringSlice("field", nil,
+		"print only these top-level scalar field(s), raw and one per line (repeatable; mutually exclusive with --json)")
 
 	logs := &cobra.Command{
 		Use:   "logs <run-id>",
@@ -196,7 +248,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					// cellText, NOT sanitizeTTY, and the difference is the whole point:
 					// sanitizeTTY spares "\n", so a status carrying one would inject a
 					// line onto stderr. Unreachable today because runs_status_check
-					// constrains status to eight values — which is precisely the argument
+					// constrains status to nine values (migration 00092) — which is precisely the argument
 					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
 					// controlled today" is exactly the assumption that rots). Holding one
 					// line of this file to a weaker standard than the line beside it, on a
@@ -213,6 +265,39 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	logs.Flags().Bool("follow", false, "keep polling for new messages")
 	logs.Flags().Int32("after", 0, "only show messages after this sequence number")
+
+	wait := &cobra.Command{
+		Use:   "wait <run-id>",
+		Short: "Block until a run reaches a chosen state",
+		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
+			"With no `--until`, it stops on any state that needs you or ends the run: " +
+			"awaiting_approval, awaiting_input, completed, failed, cancelled. It does NOT stop " +
+			"on queued/claimed/running (still working) or limit_wait (auto-resumes), so a bare " +
+			"`uzi run wait <id>` waits for the plan gate OR the end.\n\n" +
+			"Transitions print to stderr; `--json` prints the final run object (same shape as " +
+			"`run get --json`) to stdout. Exit codes: 0 a target state was reached (including if " +
+			"the run was already in one); 4 not found; 6 server unreachable after repeated " +
+			"failures; 7 `--timeout` elapsed before any target state.\n\n" +
+			"After approving a plan, NARROW the second wait — `run wait <id> --until " +
+			"completed,failed,cancelled` — because a run lingers at awaiting_approval for a beat " +
+			"after a successful approve, so a bare `run wait` would return immediately at the " +
+			"gate it just cleared.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			until, _ := cmd.Flags().GetStringSlice("until")
+			interval, _ := cmd.Flags().GetDuration("interval")
+			timeout, _ := cmd.Flags().GetDuration("timeout")
+			return runWait(env, gf, c, cmd, args[0], until, interval, timeout)
+		},
+	}
+	wait.Flags().StringSlice("until", nil,
+		"comma-separated run statuses to wait for (default: awaiting_approval,awaiting_input,completed,failed,cancelled)")
+	wait.Flags().Duration("interval", runWaitPollInterval, "how often to poll the run's status")
+	wait.Flags().Duration("timeout", 0, "give up with exit 7 after this long (default: no timeout)")
 
 	// review is now a HIDDEN, DEPRECATED alias of `uzi review show` (PRD #94
 	// Decision 10). It shares runReviewShow so the two stay byte-identical.
@@ -464,8 +549,137 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp, answer, inputs)
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, cancel, followUp, answer, inputs)
 	return cmd
+}
+
+// runWait blocks until the run enters one of `until` (default defaultWaitStates),
+// polling GET /api/runs/:id every `interval` (PRD #264 D1, client-side — no server
+// long-poll). It returns nil (exit 0) the instant the run is in a target state,
+// including on the first poll; it never waits on a state it cannot leave toward a
+// target, and `timeout` (opt-in, D6) bounds even an unrecognized status.
+//
+// Exit codes (D3): 0 target reached; 4 not found (immediate, never retried); 6 server
+// unreachable after runWaitMaxUnreachable CONSECUTIVE failures (D9 — a single blip is
+// ridden out); 7 timeout. Transitions go to STDERR (D4) so `--json`'s final run object
+// on stdout stays a clean single document.
+func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID string, until []string, interval, timeout time.Duration) error {
+	targets, err := waitTargets(until)
+	if err != nil {
+		return err
+	}
+	if interval <= 0 {
+		interval = runWaitPollInterval
+	}
+
+	// One timer for the whole wait so the deadline fires during a poll interval AND
+	// during a post-blip backoff. Nil channel (timeout <= 0) blocks forever in the
+	// select, which is exactly "no timeout".
+	var deadline <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		deadline = t.C
+	}
+
+	consecutiveUnreachable := 0
+	lastStatus := ""
+	sawStatus := false
+	warnedUnknown := map[string]bool{}
+	ctx := cmd.Context()
+
+	for {
+		run, err := c.GetRun(ctx, runID)
+		if err != nil {
+			var ee *uzicli.ExitError
+			// Only an unreachable server (5xx/network) is transient; a 4/other is a fact
+			// about the request and is returned at once.
+			if errors.As(err, &ee) && ee.Code == uzicli.ExitUnreachable {
+				consecutiveUnreachable++
+				if consecutiveUnreachable >= runWaitMaxUnreachable {
+					return err
+				}
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s (retry %d/%d)\n",
+					runID, cellText(err.Error()), consecutiveUnreachable, runWaitMaxUnreachable)
+				if done, werr := waitOrDeadline(ctx, runID, runWaitBackoff, deadline); done {
+					return werr
+				}
+				continue
+			}
+			return err
+		}
+		consecutiveUnreachable = 0
+
+		// A transition line on every status change, including the first observation, so a
+		// human watching stderr sees the run move. cellText folds a newline a rotted
+		// "server-controlled" status could carry, keeping one status per line.
+		if run.Status != lastStatus {
+			if sawStatus {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s → %s\n", runID, cellText(lastStatus), cellText(run.Status))
+			} else {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, cellText(run.Status))
+			}
+			lastStatus = run.Status
+			sawStatus = true
+		}
+		// A status outside the nine-value enum means the server is newer than this
+		// binary. Surface it once and keep waiting (it can never be a target — `--until`
+		// only names known statuses), so it is never a silent forever-wait; `--timeout`
+		// still bounds it (R1).
+		if !allRunStatuses[run.Status] && !warnedUnknown[run.Status] {
+			warnedUnknown[run.Status] = true
+			_, _ = fmt.Fprintf(env.Stderr,
+				"run %s: unrecognized status %q — treating as non-terminal; this CLI may be older than the server\n",
+				runID, cellText(run.Status))
+		}
+
+		if targets[run.Status] {
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(run)
+			}
+			return nil
+		}
+
+		if done, werr := waitOrDeadline(ctx, runID, interval, deadline); done {
+			return werr
+		}
+	}
+}
+
+// waitTargets resolves `run wait`'s target set from the `--until` flag, defaulting to
+// defaultWaitStates. Every named status is validated against allRunStatuses so a typo
+// is a clean usage error (exit 2) rather than a wait that can never end.
+func waitTargets(until []string) (map[string]bool, error) {
+	until = nonEmpty(until)
+	if len(until) == 0 {
+		until = defaultWaitStates
+	}
+	targets := make(map[string]bool, len(until))
+	for _, s := range until {
+		s = strings.TrimSpace(s)
+		if !allRunStatuses[s] {
+			return nil, uzicli.Exitf(uzicli.ExitUsage,
+				"--until: %q is not a run status (valid: queued, claimed, running, awaiting_approval, awaiting_input, limit_wait, completed, failed, cancelled)", s)
+		}
+		targets[s] = true
+	}
+	return targets, nil
+}
+
+// waitOrDeadline sleeps for d, returning (true, exit-7 error) if the wait deadline
+// fires first and (true, nil) if the context is cancelled — mirroring `run logs
+// --follow`, which treats a cancelled context as a clean stop. (false, nil) means the
+// pause elapsed and the caller should poll again.
+func waitOrDeadline(ctx context.Context, runID string, d time.Duration, deadline <-chan time.Time) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return true, nil
+	case <-deadline:
+		return true, uzicli.Exitf(uzicli.ExitTimeout, "run %s did not reach a target state before the timeout", runID)
+	case <-time.After(d):
+		return false, nil
+	}
 }
 
 // approveSelection maps the plan-gate flags to the wire AgentSelection
@@ -739,6 +953,83 @@ func nonEmpty(in []string) []string {
 		}
 	}
 	return out
+}
+
+// printRunFields projects a run to its named top-level scalar field(s), printing each
+// value raw and unquoted on its own line, in the order the caller named them (PRD #264
+// D5). It is the cheap read a poller wants: no whole-object JSON parse, so the exact
+// class of footgun that produced the zsh-`echo` blindness — piping `--json` through a
+// shell that reinterprets the CLI's valid \uXXXX escapes — never arises for the common
+// status/mr case.
+//
+// The field enum is DERIVED, not restated: marshaling the concrete RunDTO to
+// map[string]json.RawMessage makes its key set the source of truth (self-maintaining as
+// the DTO grows), gives `null → empty line` for free, and makes the non-scalar case a
+// one-byte test — a RawMessage whose first non-space byte is `[` or `{` (the four array
+// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress)
+// has no meaningful one-line raw form and is a usage error. An unknown field is likewise
+// a usage error (exit 2), never a silent blank.
+//
+// Written to Stdout, NOT through the Printer, because on a PIPE this is a machine
+// channel whose contract is byte-fidelity — a poller reads `.status`/`.mr_web_url`
+// verbatim, so a non-TTY destination gets the raw decoded bytes. On a TTY, though, a
+// field can be forge-authored free text (`issue_title`, `title`, `issue_description`)
+// carrying raw control/ANSI bytes, and unlike `--json` there is no encoder here to
+// escape them — so the value is run through SanitizeTTY when stdout is a terminal.
+// That closes the same terminal-injection vector the rest of the CLI's human output
+// guards (Risk 13) while leaving the agent/pipe contract exactly raw.
+func printRunFields(env Env, run apitypes.RunDTO, fields []string) error {
+	b, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	// Validate every field FIRST, so a bad name in a multi-field call fails cleanly
+	// (exit 2) rather than printing some lines and then erroring mid-stream.
+	lines := make([]string, 0, len(fields))
+	for _, f := range fields {
+		raw, ok := m[f]
+		if !ok {
+			return uzicli.Exitf(uzicli.ExitUsage, "unknown field %q", f)
+		}
+		v, err := scalarField(f, raw)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, v)
+	}
+	for _, l := range lines {
+		if env.StdoutTTY {
+			l = uzicli.SanitizeTTY(l)
+		}
+		_, _ = fmt.Fprintln(env.Stdout, l)
+	}
+	return nil
+}
+
+// scalarField renders one RunDTO field's RawMessage as a raw one-line value, or a usage
+// error if it is non-scalar (an array/object). `null` renders as the empty string (an
+// empty line); a JSON string is unquoted to its raw content; a number or bool prints its
+// literal bytes.
+func scalarField(name string, raw json.RawMessage) (string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "null" {
+		return "", nil
+	}
+	if len(trimmed) > 0 && (trimmed[0] == '[' || trimmed[0] == '{') {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "field %q is not a scalar (it is an array or object); use --json to read it", name)
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	return trimmed, nil
 }
 
 // renderRunDetail prints a run as an aligned key/value block. Health + the health

@@ -2647,6 +2647,17 @@ describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
     const { container } = render(<MilestoneBadge run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
   });
+
+  it("renders M–/N (not a 0/N) when the tracker was never reported (PRD #265 M2)", () => {
+    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
+    expect(screen.getByText("M–/4")).toBeTruthy();
+    expect(screen.queryByText("M0/4")).toBeNull();
+  });
+
+  it("still renders M0/N when an empty completion set WAS reported (genuine zero)", () => {
+    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    expect(screen.getByText("M0/4")).toBeTruthy();
+  });
 });
 
 describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
@@ -2685,6 +2696,19 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
   it("renders NOTHING for a run with no milestones", () => {
     const { container } = render(<MilestoneChecklist run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
+  });
+
+  it("shows '–/N' (not '0/N') in the header when completion was never reported (PRD #265 M2)", () => {
+    render(<MilestoneChecklist run={run({ milestones, milestones_completed: null })} />);
+    expect(screen.getByText("–/3")).toBeTruthy();
+    expect(screen.queryByText("0/3")).toBeNull();
+    // Every milestone still renders as not-started — honest, just no longer a failure-look.
+    expect(screen.getAllByLabelText("not started")).toHaveLength(3);
+  });
+
+  it("shows a genuine '0/3' when an empty completion set WAS reported", () => {
+    render(<MilestoneChecklist run={run({ milestones, milestones_completed: [] })} />);
+    expect(screen.getByText("0/3")).toBeTruthy();
   });
 
   it("renders an untrusted title as PLAIN text, never a Markdown link", () => {

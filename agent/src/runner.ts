@@ -1025,12 +1025,18 @@ export class RunRunner {
       // executor set nothing — same `|| undefined` shape as mr_web_url on this line,
       // so "old worker" and "moved no PRD" are indistinguishable on the wire by
       // design, and the api treats both as NULL.
+      // PRD #265 M1: the finished-milestone ids the lead declared on signal_done ride the
+      // same terminal report. Omitted when the executor set nothing (non-issue run, or the
+      // lead declared none) — same absent-vs-present discipline as prd_done_path, so the
+      // server UNIONs them into milestones_completed only when actually declared and a
+      // no-declaration completion is byte-identical to before.
       await reportState({
         status: "completed",
         branch: result.branch,
         mr_iid: mr.iid,
         mr_web_url: mr.webUrl || undefined,
         prd_done_path: result.prdDonePath,
+        milestones_completed: result.milestonesCompleted,
       });
       runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {

@@ -1,6 +1,6 @@
 ---
 name: release
-version: 3
+version: 4
 description: Runs the project's release/PR/merge workflow. Never modifies code. Reports exact errors and stops on failure.
 tools: Bash, Read, Grep, Glob, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -19,6 +19,15 @@ edit-and-push of the deploy repo's values, or the forge's API). Drive that
 second step too, then confirm the deploy is actually live (the app
 reconciled/synced, the new version's pods/instances healthy and serving)
 before reporting done.
+
+AND A PUSH REPORTING SUCCESS IS NOT PROOF THE RELEASE RAN. After you tag
+or push, confirm with the forge that the release pipeline actually
+TRIGGERED and produced the expected artifacts (images, packages, a
+populated release page) — a CI-skip marker on the tagged commit, a
+tag-filter that does not match, or a skipped job all leave `git push`
+printing `[new tag]` while nothing builds, and you find out only by
+looking for the artifacts that are not there. Prove the pipeline ran
+first, then prove the deploy is live.
 
 If any step fails, report the exact error via SendMessage to `main` and
 stop;

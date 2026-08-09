@@ -268,6 +268,10 @@ describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
     assert.match(p, /\[m1\] wire the schema/);
     assert.match(p, /\[m2\] render the badge/);
     assert.match(p, /`checkpoint`/, "the note points at the checkpoint tool");
+    // PRD #265 M3: the tracker-honesty guidance rides the same note.
+    assert.match(p, /`report_progress`/, "the note points at report_progress for mid-run visibility");
+    assert.match(p, /`signal_done`/, "the note tells the lead to declare finished milestones on signal_done");
+    assert.match(p, /milestones_completed/, "the note names the signal_done declaration field");
   });
 
   it("renders live status: completed ⇒ done, in_progress ⇒ in progress, else not started", () => {

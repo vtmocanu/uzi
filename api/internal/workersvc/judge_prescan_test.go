@@ -644,3 +644,70 @@ func TestScanSuppressesDenylistedCLIsInPathForm(t *testing.T) {
 		t.Errorf("the non-denied path-form miss must be reported basenamed as \"jq\", got %v", cmds)
 	}
 }
+
+// TestPrescanDropsGenericNotFoundWordNeverInvoked pins the fix (issue #263): a generic
+// English word in tool output that matches the low-confidence `X: not found`
+// (dash/busybox) form but was never invoked as a command is NOT a missing worker tool
+// and must produce no ToolMiss. Without corroboration these each became a false
+// `install_worker_tool` recommendation downstream.
+func TestPrescanDropsGenericNotFoundWordNeverInvoked(t *testing.T) {
+	// A lone generic line, no tool_use anywhere: the token was never invoked.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "sh: 1: key: not found", true),
+	}, []string{})
+
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "foo: not found", true),
+	}, []string{})
+
+	// Two generic words in one trace, neither invoked: both dropped.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceResult(10, "u1", "X: not found", true),
+		traceResult(20, "u2", "sh: 1: key: not found", true),
+	}, []string{})
+}
+
+// TestPrescanMentionDoesNotCorroborate: corroboration reuses tool_use command text as
+// an allow-signal via executablesIn, which parses EXECUTABLE POSITION — not
+// strings.Contains. A token that appears only as an ARGUMENT (`grep key package.json`
+// mentions key) was never invoked as a command, so the low-confidence `key: not found`
+// line stays dropped.
+func TestPrescanMentionDoesNotCorroborate(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "grep key package.json"),
+		traceResult(10, "u1", "sh: 1: key: not found", true),
+	}
+	assertReported(t, rows, []string{})
+}
+
+// TestPrescanHighConfidenceFormsSurviveWithoutInvocation: corroboration applies to the
+// low-confidence reShNotFound form ONLY. The three explicit forms (`command not found`
+// bash/zsh, exec: executable-file-not-found) are high-confidence and must report even
+// with NO tool_use in the trace to corroborate against.
+func TestPrescanHighConfidenceFormsSurviveWithoutInvocation(t *testing.T) {
+	for _, tc := range []struct{ name, content string }{
+		{"bash", "foo: command not found"},
+		{"zsh", "command not found: foo"},
+		// Watch the quote escaping, as case-8's terraform fixture does: the jsonb
+		// payload carries \" and payloadText unescapes it before reExecNotFound runs.
+		{"exec", "exec: \"foo\": executable file not found in $PATH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertReported(t, []store.ListToolTraceForRunRow{
+				traceResult(10, "u1", tc.content, true),
+			}, []string{"foo"})
+		})
+	}
+}
+
+// TestPrescanGenuineBusyboxMissPreserved is the corroboration positive path: a real
+// dash/busybox miss whose tool WAS invoked directly (`foo --version` puts foo in
+// executable position) is corroborated and still reported. The fix must not swallow
+// genuine low-confidence misses.
+func TestPrescanGenuineBusyboxMissPreserved(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "foo --version"),
+		traceResult(10, "u1", "sh: 1: foo: not found", true),
+	}
+	assertReported(t, rows, []string{"foo"})
+}

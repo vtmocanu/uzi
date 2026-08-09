@@ -26,3 +26,24 @@ func (h *Handler) JudgeStats(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, http.StatusOK, stats)
 }
+
+// JudgeCategoryStats serves the caller's per-category GROUP counts — the Judge filter-chip
+// counts (PRD #244). A SEPARATE endpoint from JudgeStats so the nav badge (which reads only
+// TriageCounts.todo from /me/judge/stats) is structurally unreachable from category data.
+// Owner-scoped (the query filters run_reviews.user_id = caller) and mounted on RequireUser
+// like /me/judge/stats. The count is whole-backlog, uncapped and triage-invariant, so the
+// Judge page fetches it once on mount.
+func (h *Handler) JudgeCategoryStats(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	stats, err := h.wsvc.JudgeCategoryStats(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("judge category stats", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, stats)
+}

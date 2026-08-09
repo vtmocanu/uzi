@@ -179,6 +179,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
 	{"GET", "/api/health", noLimiter},
 	{"GET", "/api/me/cli-tokens/", noLimiter},
+	{"GET", "/api/me/judge/category-stats", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
 	{"GET", "/api/me/judge/stats", noLimiter},
 	// noLimiter, same reasoning as /me/judge/stats beside it: an authenticated read that

@@ -42,6 +42,12 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   [docs/board.md](docs/board.md#which-issues-show-up) and
   [docs/admin-settings.md](docs/admin-settings.md#run-eligibility-and-board-membership).
 
+- **Per-label counts on the Judge filter chips (#244).** Each chip now shows how
+  many recommendation groups are in that category across your whole backlog, every
+  bucket and triage state — sourced from a new server aggregate, never tallied off
+  the on-screen list, so a chip reads correctly even when the truncation banner is
+  showing. A zero-count chip stays visible, just dimmed.
+
 ## [0.22.0] - 2026-08-08
 
 ### Added

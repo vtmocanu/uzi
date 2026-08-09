@@ -239,6 +239,14 @@ export interface ExecutorResult {
    *  not hold, without ever failing the terminal report. Absent when the run moved
    *  no PRD, which is the common case. StubExecutor never sets it. */
   prdDonePath?: string;
+  /** PRD #265 M1: the frozen-milestone ids the lead declared it FINISHED, from
+   *  `signal_done`. ISSUE RUNS ONLY and forwarded VERBATIM — the worker parsed them for
+   *  transport hygiene (parseProgressIds), and the api re-validates membership against
+   *  the run's frozen list before UNIONing them into `milestones_completed` on the
+   *  completion path, so a completed run's tracker reflects what actually shipped even
+   *  when no mid-run progress was reported. Absent when the lead declared nothing, which
+   *  is the common case. StubExecutor never sets it. */
+  milestonesCompleted?: string[];
 }
 
 /**

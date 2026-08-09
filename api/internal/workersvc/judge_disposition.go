@@ -121,3 +121,21 @@ func (s *Service) JudgeTriageStats(ctx context.Context, ownerUserID uuid.UUID) (
 	}
 	return BucketTriage(tr), nil
 }
+
+// JudgeCategoryStats is the Judge filter-chip counts (PRD #244): the caller's per-category
+// GROUP count — distinct (category, target) coordinates — across their whole backlog. The
+// COUNT(DISTINCT) is done in SQL (no Go grouping, no bucket ladder), so this method just
+// folds the rows into the map DTO. Owner-scoped by the query's user_id filter. Uncapped
+// and whole-backlog: a chip reads the TRUE count even when the backlog list truncates, and
+// the count is triage-invariant (a coordinate stays a coordinate once triaged).
+func (s *Service) JudgeCategoryStats(ctx context.Context, ownerUserID uuid.UUID) (apitypes.JudgeCategoryStatsDTO, error) {
+	rows, err := s.q.CountJudgeGroupsByCategoryForUser(ctx, ownerUserID)
+	if err != nil {
+		return apitypes.JudgeCategoryStatsDTO{}, err
+	}
+	m := make(map[string]int, len(rows))
+	for _, r := range rows {
+		m[r.Category] = int(r.GroupCount) // int64 from the bigint cast → int, explicit narrowing
+	}
+	return apitypes.JudgeCategoryStatsDTO{Counts: m}, nil
+}
