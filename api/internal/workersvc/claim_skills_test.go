@@ -137,7 +137,8 @@ func TestClaimDeliversSkills(t *testing.T) {
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
 			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
-			RepoSkillsEnabled: true,
+			RepoSkillsEnabled:   true,
+			RepoClaudemdEnabled: true,
 		},
 		anthropic: sealedTok,
 		templates: []store.AgentTemplate{
@@ -161,6 +162,9 @@ func TestClaimDeliversSkills(t *testing.T) {
 	}
 	if !payload.Repo.SkillsEnabled {
 		t.Error("repo.skills_enabled should ride the claim when the repo opted in")
+	}
+	if !payload.Repo.ClaudemdEnabled {
+		t.Error("repo.claudemd_enabled should ride the claim when the repo opted in (PRD #246)")
 	}
 	if payload.Config.SkillMaxBytes != 65536 || payload.Config.SkillsMaxPerRun != 32 {
 		t.Errorf("config skill caps wrong: %+v", payload.Config)

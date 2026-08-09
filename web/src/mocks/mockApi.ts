@@ -2093,6 +2093,24 @@ export const mockApi = {
     r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
   },
+  setRepoClaudemdEnabled: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_claudemd_enabled = enabled;
+    return delay({ repo: { ...r } });
+  },
+  // Trusted-repo master control (PRD #246): sets whichever of the two trust flags
+  // are present in one call, mirroring the server's atomic both-flags path.
+  setRepoTrustFlags: async (
+    id: string,
+    flags: { repo_skills_enabled?: boolean; repo_claudemd_enabled?: boolean },
+  ) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    if (flags.repo_skills_enabled !== undefined) r.repo_skills_enabled = flags.repo_skills_enabled;
+    if (flags.repo_claudemd_enabled !== undefined) r.repo_claudemd_enabled = flags.repo_claudemd_enabled;
+    return delay({ repo: { ...r } });
+  },
   setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");

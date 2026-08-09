@@ -45,12 +45,32 @@ func TestHealthNudgeHeadLeavesTheToolRepetitionWordingExactlyAsItWas(t *testing.
 	// PRD #108 ADDED an arm; it did not reword an existing one. This pins the old
 	// sentence verbatim so the additive change stays additive — no shipped nudge's
 	// wording moves.
-	const before = "⚠ This run looks like it's repeating the same step."
+	// PRD #268 M3 swapped the leading glyph to 🔁; the sentence after it is unchanged.
+	const before = "🔁 This run looks like it's repeating the same step."
 	if got := healthNudgeHead(healthLooping, reasonLooping()); got != before {
 		t.Fatalf("nudge head for the tool-repetition cause = %q, want the unchanged %q", got, before)
 	}
 	if got := healthNudgeHead(healthLooping, ""); got != before {
 		t.Fatalf("nudge head with NO reason = %q, want the unchanged %q — an empty reason must fall back to the original wording, which is also what a mirror drift degrades to", got, before)
+	}
+}
+
+// TestHealthNudgeHeadStalledLeadsWithTheSleepGlyph pins the PRD #268 M3 glyph swap
+// (⚠️→💤) on the stalled "gone quiet" head. Mirrors the tool-repetition pin above:
+// the exact sentence, glyph included, so a future reword or a glyph regression reddens.
+func TestHealthNudgeHeadStalledLeadsWithTheSleepGlyph(t *testing.T) {
+	const want = "💤 This run has gone quiet and may be stuck."
+	if got := healthNudgeHead(healthStalled, ""); got != want {
+		t.Fatalf("stalled nudge head = %q, want %q — the M3 💤 swap must hold and the sentence stay as written", got, want)
+	}
+}
+
+// TestHealthNudgeHeadSlowLeadsWithTheTurtleGlyph pins the PRD #268 M3 glyph swap
+// (⚠️→🐢) on the slow "taking longer than usual" head.
+func TestHealthNudgeHeadSlowLeadsWithTheTurtleGlyph(t *testing.T) {
+	const want = "🐢 This run is taking longer than usual."
+	if got := healthNudgeHead(healthSlow, ""); got != want {
+		t.Fatalf("slow nudge head = %q, want %q — the M3 🐢 swap must hold and the sentence stay as written", got, want)
 	}
 }
 
@@ -60,15 +80,16 @@ func TestHealthNudgeHeadLeavesTheToolRepetitionWordingExactlyAsItWas(t *testing.
 // take the same branch, which is what the empty-reason case above also proves.
 func reasonLooping() string { return "the agent keeps repeating the same action" }
 
-func TestHealthNudgeTextThreadsTheReasonThrough(t *testing.T) {
-	// The head is chosen by the reason and the body then appends it, so the two must
+func TestHealthNudgeBlocksThreadTheReasonThrough(t *testing.T) {
+	// The head is chosen by the reason and the section then appends it, so the two must
 	// not contradict each other in the same message.
-	body := healthNudgeText(healthLooping, reasonPersistFailing, "https://uzi.example", uuid.New())
+	blocks, _ := healthNudgeBlocks(healthLooping, reasonPersistFailing, "https://uzi.example", uuid.New())
+	_, body := blockSummary(blocks)
 	if strings.Contains(body, "repeating the same step") {
-		t.Fatalf("nudge body = %q: the head still carries the tool-repetition framing", body)
+		t.Fatalf("nudge section = %q: the head still carries the tool-repetition framing", body)
 	}
 	if !strings.Contains(body, reasonPersistFailing) {
-		t.Fatalf("nudge body = %q, want it to carry the detector's reason verbatim", body)
+		t.Fatalf("nudge section = %q, want it to carry the detector's reason verbatim", body)
 	}
 }
 
@@ -153,12 +174,13 @@ func reasonNoWorker() string      { return "no worker is online to pick up this 
 // precisely what shipped before this fix:
 //
 //	⏳ This run is still waiting for a worker to pick it up. the worker hasn't picked up your response yet.
-func TestHealthNudgeTextUndeliveredVerdictDoesNotContradictItself(t *testing.T) {
-	body := healthNudgeText(healthWaitingWorker, reasonVerdictUndelivered, "https://uzi.example", uuid.New())
+func TestHealthNudgeBlocksUndeliveredVerdictDoNotContradictThemselves(t *testing.T) {
+	blocks, _ := healthNudgeBlocks(healthWaitingWorker, reasonVerdictUndelivered, "https://uzi.example", uuid.New())
+	_, body := blockSummary(blocks)
 	if strings.Contains(body, "waiting for a worker to pick it up") {
-		t.Fatalf("nudge body = %q: the head still carries the unclaimed-run framing while the reason says a worker is holding it", body)
+		t.Fatalf("nudge section = %q: the head still carries the unclaimed-run framing while the reason says a worker is holding it", body)
 	}
 	if !strings.Contains(body, reasonVerdictUndelivered) {
-		t.Fatalf("nudge body = %q, want it to carry the detector's reason verbatim", body)
+		t.Fatalf("nudge section = %q, want it to carry the detector's reason verbatim", body)
 	}
 }

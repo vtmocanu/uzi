@@ -809,6 +809,9 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
+    // A deliberate mix: repo skills on, repo instructions off — so the Trusted-repo
+    // panel's sub-toggle independence is exercisable under VITE_UZI_MOCK=1.
+    repo_claudemd_enabled: false,
     repo_devbox_opt_in: true,
     pipeline: {
       status: "failed",
@@ -827,6 +830,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: {
       status: "success",
@@ -845,6 +849,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
   },

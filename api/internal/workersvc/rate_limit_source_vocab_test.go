@@ -11,20 +11,20 @@ import (
 )
 
 // TestRateLimitSourceVocabularyMatchesCheck keeps anthropic.AllSources() and
-// migration 00108's widened CHECK in step, mirroring
+// migration 00109's widened CHECK in step, mirroring
 // TestSelectReasonVocabularyMatchesCheck (00089) and
 // TestRateLimitTypeVocabularyMatchesCheck (00091). PRD #217 M1 adds a fourth home for
 // this vocabulary (the migration, the Go constants, the TS union and the mock
 // bundle); four homes and no drift test is the shape D21 exists to prevent.
 //
-// A value Go writes and 00108's CHECK rejects is a constraint violation at PARK time
+// A value Go writes and 00109's CHECK rejects is a constraint violation at PARK time
 // — a failed run instead of a parked one — and nothing else reads `source`, so
 // nothing else would notice.
 //
-// MUTATION THIS CATCHES: adding a member to AllSources without widening 00108 (and
+// MUTATION THIS CATCHES: adding a member to AllSources without widening 00109 (and
 // the reverse).
 func TestRateLimitSourceVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00108_rate_limit_source_limit_report.sql"
+	const path = "../store/migrations/00109_rate_limit_source_limit_report.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -75,7 +75,7 @@ func TestRateLimitSourceVocabularyMatchesCheck(t *testing.T) {
 	sort.Strings(fromGo)
 	if strings.Join(fromSQL, ",") != strings.Join(fromGo, ",") {
 		t.Fatalf("the source vocabulary has drifted.\n  Go:  %v\n  SQL: %v\nA value Go writes and "+
-			"00108's CHECK rejects is a constraint violation at park time — a failed run instead of a "+
+			"00109's CHECK rejects is a constraint violation at park time — a failed run instead of a "+
 			"parked one — and nothing else reads this column, so nothing else would notice.", fromGo, fromSQL)
 	}
 }

@@ -36,7 +36,8 @@
     "clone_url": "https://gitlab.example.com/g/p.git",
     "default_branch": "main",
     "forge_type": "gitlab",
-    "skills_enabled": false
+    "skills_enabled": false,
+    "claudemd_enabled": false
   },
   "secrets": {
     "forge_username": "uzi-bot",

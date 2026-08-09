@@ -34,7 +34,8 @@ func feed(n *Notifier, runID uuid.UUID, frames ...chatMsgEvent) {
 }
 
 // A turn emitting N text frames produces exactly ONE placeholder post and ONE edit,
-// regardless of N, and the edit carries the joined body.
+// regardless of N (PRD #268 M4: both are Block Kit). The edit's section carries the
+// joined body and the deep link rides its OWN context block, not the section text.
 func TestChatTurnCoalescesToOnePostOneEdit(t *testing.T) {
 	runID := uuid.New()
 	fp := &fakePoster{}
@@ -48,28 +49,33 @@ func TestChatTurnCoalescesToOnePostOneEdit(t *testing.T) {
 		frame("status", `{"event":"result"}`),
 	)
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want exactly one placeholder post, got %d: %+v", len(fp.posts), fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want exactly one placeholder Block Kit post, got %d: %+v", len(fp.blocks), fp.blocks)
 	}
-	if fp.posts[0].thread != "user1" {
-		t.Errorf("placeholder must thread on root_ts, got %q", fp.posts[0].thread)
+	if fp.blocks[0].thread != "user1" {
+		t.Errorf("placeholder must thread on root_ts, got %q", fp.blocks[0].thread)
 	}
-	if len(fp.updates) != 1 {
-		t.Fatalf("want exactly one edit regardless of frame count, got %d: %+v", len(fp.updates), fp.updates)
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want exactly one Block Kit edit regardless of frame count, got %d: %+v", len(fp.updateBlocks), fp.updateBlocks)
 	}
-	if fp.updates[0].ts != "ts1" { // the placeholder's ts
-		t.Errorf("edit must target the placeholder, got %q", fp.updates[0].ts)
+	edit := fp.updateBlocks[0]
+	if edit.ts != "ts1" { // the placeholder's ts
+		t.Errorf("edit must target the placeholder, got %q", edit.ts)
 	}
-	body := fp.updates[0].text
-	if !strings.Contains(body, "The plan gate pauses the run for approval.") {
-		t.Errorf("edit must carry the joined text-frame body: %q", body)
+	if !strings.Contains(edit.sectionText, "The plan gate pauses the run for approval.") {
+		t.Errorf("edit section must carry the joined text-frame body: %q", edit.sectionText)
 	}
-	if !strings.Contains(body, "Open in uzi") {
-		t.Errorf("resolved turn should keep the deep link: %q", body)
+	// The deep link lives in the context block, NOT inside the section text.
+	if strings.Contains(edit.sectionText, "Open in uzi") {
+		t.Errorf("deep link must be moved OUT of the section body: %q", edit.sectionText)
+	}
+	if !strings.Contains(edit.contextText, "Open in uzi") {
+		t.Errorf("resolved turn should keep the deep link in its own context block: %q", edit.contextText)
 	}
 }
 
-// The placeholder carries the deep link so an orphan (api restart mid-turn) is useful.
+// The placeholder is a context block that carries the deep link so an orphan (api
+// restart mid-turn) is useful (PRD #268 M4).
 func TestChatPlaceholderCarriesDeepLink(t *testing.T) {
 	runID := uuid.New()
 	fp := &fakePoster{}
@@ -77,8 +83,22 @@ func TestChatPlaceholderCarriesDeepLink(t *testing.T) {
 
 	feed(n, runID, frame("user_message", `{"text":"hi"}`))
 
-	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "Open in uzi") {
-		t.Fatalf("placeholder must carry the deep link: %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want exactly one placeholder Block Kit post, got %+v", fp.blocks)
+	}
+	// The placeholder is a context block (no section), carrying the thinking glyph and
+	// the deep link.
+	if fp.blocks[0].sectionText != "" {
+		t.Errorf("placeholder must be a context block, not a section: %q", fp.blocks[0].sectionText)
+	}
+	if !strings.Contains(fp.blocks[0].contextText, "uzi is thinking") {
+		t.Errorf("placeholder must carry the thinking text: %q", fp.blocks[0].contextText)
+	}
+	if !strings.Contains(fp.blocks[0].contextText, "Open in uzi") {
+		t.Errorf("placeholder must carry the deep link: %q", fp.blocks[0].contextText)
+	}
+	if fp.blocks[0].fallback != "uzi is thinking…" {
+		t.Errorf("placeholder fallback = %q, want the fixed thinking text", fp.blocks[0].fallback)
 	}
 }
 
@@ -111,16 +131,83 @@ func TestChatNonResultTurnEndsResolvePlaceholder(t *testing.T) {
 				tc.end,
 			)
 
-			if len(fp.posts) != 1 {
-				t.Fatalf("want one placeholder, got %+v", fp.posts)
+			if len(fp.blocks) != 1 {
+				t.Fatalf("want one placeholder, got %+v", fp.blocks)
 			}
-			if len(fp.updates) != 1 {
-				t.Fatalf("%s must resolve the placeholder with exactly one edit, got %+v", tc.name, fp.updates)
+			if len(fp.updateBlocks) != 1 {
+				t.Fatalf("%s must resolve the placeholder with exactly one edit, got %+v", tc.name, fp.updateBlocks)
 			}
-			if !strings.Contains(fp.updates[0].text, tc.wantText) {
-				t.Errorf("%s edit missing %q: %q", tc.name, tc.wantText, fp.updates[0].text)
+			if !strings.Contains(fp.updateBlocks[0].sectionText, tc.wantText) {
+				t.Errorf("%s edit section missing %q: %q", tc.name, tc.wantText, fp.updateBlocks[0].sectionText)
 			}
 		})
+	}
+}
+
+// A text-less status{event:"init"} heartbeat (the real Claude Agent SDK emits one at
+// the start of every query) must NOT flush the open turn before its answer buffers —
+// reproduces the PRD #268 init-heartbeat drop, where the answer was replaced by
+// chatNoAnswerText in Slack.
+func TestChatInitStatusDoesNotDropAnswer(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID,
+		frame("user_message", `{"text":"what runs do we have now?"}`),
+		frame("status", `{"event":"init","model":"claude-opus-4-8"}`),
+		frame("text", `{"text":"the real answer"}`),
+		frame("status", `{"event":"result"}`),
+	)
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want exactly one placeholder post, got %d: %+v", len(fp.blocks), fp.blocks)
+	}
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want exactly one edit resolving the turn, got %d: %+v", len(fp.updateBlocks), fp.updateBlocks)
+	}
+	edit := fp.updateBlocks[0]
+	// The answer must reach the edit — in the section and the fallback — never replaced
+	// by the no-answer degrade (the M1 init-heartbeat regression).
+	if !strings.Contains(edit.sectionText, "the real answer") {
+		t.Errorf("edit section must carry the answer, not drop it: %q", edit.sectionText)
+	}
+	if !strings.Contains(edit.fallback, "the real answer") {
+		t.Errorf("edit fallback must carry the answer: %q", edit.fallback)
+	}
+	if strings.Contains(edit.sectionText, chatNoAnswerText) || strings.Contains(edit.contextText, chatNoAnswerText) {
+		t.Errorf("init heartbeat must not flush the turn to the no-answer placeholder: section=%q context=%q", edit.sectionText, edit.contextText)
+	}
+}
+
+// A tool-only turn (a user_message and a result with no text frames) degrades to a
+// de-emphasized context block carrying chatNoAnswerText — NOT a section — plus the deep
+// link, and never strands the placeholder (PRD #268 M4).
+func TestChatEmptyTurnDegradesToContextBlock(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID,
+		frame("user_message", `{"text":"just run a tool"}`),
+		frame("status", `{"event":"result"}`),
+	)
+
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want exactly one edit resolving the empty turn, got %+v", fp.updateBlocks)
+	}
+	edit := fp.updateBlocks[0]
+	if edit.sectionText != "" {
+		t.Errorf("empty-turn degrade must be a context block, not a section: %q", edit.sectionText)
+	}
+	if !strings.Contains(edit.contextText, chatNoAnswerText) {
+		t.Errorf("empty-turn degrade must carry the no-answer text in a context block: %q", edit.contextText)
+	}
+	if !strings.Contains(edit.contextText, "Open in uzi") {
+		t.Errorf("empty-turn degrade must still carry the deep link: %q", edit.contextText)
+	}
+	if edit.fallback != chatNoAnswerText {
+		t.Errorf("empty-turn fallback = %q, want the no-answer text", edit.fallback)
 	}
 }
 
@@ -136,8 +223,8 @@ func TestChatThinkingAndToolFramesNeverPost(t *testing.T) {
 	fp := &fakePoster{}
 	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
 	feed(n, runID, frame("text", `{"text":"orphan text"}`))
-	if len(fp.posts) != 0 || len(fp.updates) != 0 {
-		t.Fatalf("a text frame with no open turn must not post: posts=%v updates=%v", fp.posts, fp.updates)
+	if len(fp.blocks) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("a text frame with no open turn must not post: posts=%v updates=%v", fp.blocks, fp.updateBlocks)
 	}
 }
 
@@ -154,18 +241,23 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 		frame("status", `{"event":"result"}`),
 	)
 
-	if len(fp.updates) != 1 {
-		t.Fatalf("want one resolved turn, got %+v", fp.updates)
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want one resolved turn, got %+v", fp.updateBlocks)
 	}
-	body := fp.updates[0].text
+	// The untrusted answer sits inside the section block, whole-blob escaped/scrubbed.
+	body := fp.updateBlocks[0].sectionText
 	if strings.Contains(body, "<@U123>") {
-		t.Errorf("a raw Slack mention must be neutralized: %q", body)
+		t.Errorf("a raw Slack mention must be neutralized in the section: %q", body)
 	}
 	if strings.Contains(body, "<https://evil|Open>") {
-		t.Errorf("a masquerading link must be neutralized: %q", body)
+		t.Errorf("a masquerading link must be neutralized in the section: %q", body)
 	}
 	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped string was scrubbed, never a real secret
 		t.Errorf("a credential-shaped string must be scrubbed: %q", body)
+	}
+	// The fallback is built from the same escaped body, so it is inert there too.
+	if strings.Contains(fp.updateBlocks[0].fallback, "<@U123>") {
+		t.Errorf("the fallback must carry the escaped (inert) body: %q", fp.updateBlocks[0].fallback)
 	}
 }
 
@@ -209,8 +301,8 @@ func TestChatFrameAfterTerminalDoesNotStream(t *testing.T) {
 		frame("status", `{"event":"result"}`),
 	)
 
-	if len(fp.posts) != 0 || len(fp.updates) != 0 {
-		t.Fatalf("frames for an already-terminal chat must not stream: posts=%v updates=%v", fp.posts, fp.updates)
+	if len(fp.blocks) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("frames for an already-terminal chat must not stream: posts=%v updates=%v", fp.blocks, fp.updateBlocks)
 	}
 }
 
@@ -229,8 +321,8 @@ func TestChatMsgIssueRunProducesNoChatPosts(t *testing.T) {
 		frame("status", `{"event":"result"}`),
 	)
 
-	if len(fp.posts) != 0 || len(fp.updates) != 0 {
-		t.Fatalf("an issue run must produce no chat posts: posts=%v updates=%v", fp.posts, fp.updates)
+	if len(fp.blocks) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("an issue run must produce no chat posts: posts=%v updates=%v", fp.blocks, fp.updateBlocks)
 	}
 	if v, ok := n.chatDecided.Load(runID); !ok || v.(bool) {
 		t.Errorf("the run must be classified non-chat (decided=false), got ok=%v v=%v", ok, v)

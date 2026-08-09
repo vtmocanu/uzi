@@ -1428,6 +1428,7 @@ SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
        rp.repo_skills_enabled,
+       rp.repo_claudemd_enabled,
        rp.repo_devbox_opt_in,
        c.forge_type,
        c.base_url,
@@ -1444,16 +1445,17 @@ WHERE r.id = $1
 `
 
 type GetRunClaimContextRow struct {
-	RepoWebUrl        string      `json:"repo_web_url"`
-	RepoPath          string      `json:"repo_path"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
-	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
-	ForgeType         string      `json:"forge_type"`
-	BaseUrl           string      `json:"base_url"`
-	BotUsername       string      `json:"bot_username"`
-	TokenCiphertext   []byte      `json:"token_ciphertext"`
-	HumanPlanApproved bool        `json:"human_plan_approved"`
+	RepoWebUrl          string      `json:"repo_web_url"`
+	RepoPath            string      `json:"repo_path"`
+	DefaultBranch       pgtype.Text `json:"default_branch"`
+	RepoSkillsEnabled   bool        `json:"repo_skills_enabled"`
+	RepoClaudemdEnabled bool        `json:"repo_claudemd_enabled"`
+	RepoDevboxOptIn     bool        `json:"repo_devbox_opt_in"`
+	ForgeType           string      `json:"forge_type"`
+	BaseUrl             string      `json:"base_url"`
+	BotUsername         string      `json:"bot_username"`
+	TokenCiphertext     []byte      `json:"token_ciphertext"`
+	HumanPlanApproved   bool        `json:"human_plan_approved"`
 }
 
 // The repo + connection facts the claim payload needs, alongside the run. The
@@ -1513,6 +1515,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoPath,
 		&i.DefaultBranch,
 		&i.RepoSkillsEnabled,
+		&i.RepoClaudemdEnabled,
 		&i.RepoDevboxOptIn,
 		&i.ForgeType,
 		&i.BaseUrl,

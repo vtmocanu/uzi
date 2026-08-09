@@ -465,7 +465,7 @@ func (e *Scheduler) park(ctx context.Context, sched store.RunSchedule, reason st
 			UserID:  sched.UserID,
 			Kind:    "schedule_error",
 			Payload: map[string]any{"title": "Scheduled run paused", "body": body, "schedule_id": sched.ID.String()},
-			Slack:   &notifysvc.SlackRender{Title: "Scheduled run paused", Body: body},
+			Slack:   &notifysvc.SlackRender{Emoji: "⏸️", Title: "Scheduled run paused", Body: body},
 		}); err != nil {
 			e.logger.Warn("scheduler: notify schedule error", "schedule", sched.ID.String(), "error", err)
 		}

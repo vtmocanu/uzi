@@ -61,10 +61,12 @@ import {
   buildImplementPrompt,
   buildLeadSystemPrompt,
   buildPlanPrompt,
+  buildRepoInstructionsContext,
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
 } from "./prompt.js";
+import { readRepoInstructions } from "./repo-instructions.js";
 import {
   buildPreToolUseHook,
   buildPathGuardHook,
@@ -449,6 +451,38 @@ export class SdkExecutor implements Executor {
     const skillsPluginPath = prepared.pluginPath;
     this.emitSkillDrops(ctx, prepared.drops);
 
+    // Repo instructions (PRD #246 M2). When the repo owner opted in, read + sanitize
+    // the clone's ROOT CLAUDE.md and frame it ONCE as a nonce-fenced UNTRUSTED/ADVISORY
+    // block — read once (one file read), framed once (one nonce), threaded to BOTH
+    // buildLeadSystemPrompt sites below. `settingSources: []` is untouched: this is our
+    // own read+inject channel, never the SDK's project loader. Lead-only. The outcome
+    // (injected byte count, or the drop reason) is trace-logged like emitSkillDrops.
+    let repoInstructionsBlock: string | undefined;
+    if (ctx.repoClaudemdEnabled) {
+      const result = await readRepoInstructions(ctx.worktreePath);
+      if ("text" in result) {
+        repoInstructionsBlock = buildRepoInstructionsContext(result.text);
+        // Only claim "injected" when the FRAMED block is non-empty. A present but
+        // whitespace-only CLAUDE.md frames to "" (buildLeadSystemPrompt then injects
+        // nothing), so emitting "injected … (N bytes)" here would be a false status.
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: repoInstructionsBlock
+              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+              : `repo instructions: not injected (empty)`,
+          },
+        });
+      } else {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `repo instructions: not injected (${result.dropped})` },
+        });
+      }
+    }
+
     // Subagents: each def.skills is its allocated delivered skills (re-filtered to
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
@@ -576,6 +610,7 @@ export class SdkExecutor implements Executor {
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
+        repoInstructions: repoInstructionsBlock,
       }),
       // PLAN-TURN roster: every subagent minus the file-write tools (#203).
       // `baseOptions` drives both planning turns (first plan at the
@@ -1053,6 +1088,7 @@ export class SdkExecutor implements Executor {
         systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
           repoSourced: selection.source === "repo",
           kind: ctx.kind,
+          repoInstructions: repoInstructionsBlock,
         }),
         hooks: { PreToolUse: preToolUse(selectedNames) },
       };

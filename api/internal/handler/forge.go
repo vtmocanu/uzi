@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
@@ -92,14 +93,15 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 // repoToDTO stays here as the store→DTO mapper.
 func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	dto := apitypes.RepoDTO{
-		ID:                r.ID.String(),
-		ConnectionID:      r.ConnectionID.String(),
-		ForgeProjectID:    r.ForgeProjectID,
-		PathWithNamespace: r.PathWithNamespace,
-		WebURL:            r.WebUrl,
-		Enabled:           r.Enabled,
-		RepoSkillsEnabled: r.RepoSkillsEnabled,
-		RepoDevboxOptIn:   r.RepoDevboxOptIn,
+		ID:                  r.ID.String(),
+		ConnectionID:        r.ConnectionID.String(),
+		ForgeProjectID:      r.ForgeProjectID,
+		PathWithNamespace:   r.PathWithNamespace,
+		WebURL:              r.WebUrl,
+		Enabled:             r.Enabled,
+		RepoSkillsEnabled:   r.RepoSkillsEnabled,
+		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
+		RepoDevboxOptIn:     r.RepoDevboxOptIn,
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -576,16 +578,34 @@ type patchRepoRequest struct {
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a
 	// no-op rather than a silent disable.
 	RepoSkillsEnabled *bool `json:"repo_skills_enabled"`
+	// RepoClaudemdEnabled is the trusted-repo instructions opt-in (PRD #246): let the
+	// lead read the clone's root CLAUDE.md as advisory context. Pointer so an omitted
+	// field is a no-op. A sibling trust flag of RepoSkillsEnabled — the two may be set
+	// together or individually in one request (the "Trusted repo" master).
+	RepoClaudemdEnabled *bool `json:"repo_claudemd_enabled"`
 	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): union the repo's own
 	// devbox.json packages (packages-only) into provisioning. Pointer = omitted is a
-	// no-op. Exactly one field is patched per request.
+	// no-op. Its own exclusive path — cannot be combined with the trust flags.
 	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
 }
 
-// PatchRepo updates one of a repo's mutable opt-in settings (repo_skills_enabled
-// OR repo_devbox_opt_in). Authorization: the repo owner (via the owning
-// connection) or an admin. A non-owned, unknown id returns 404 for a non-admin; an
-// admin may target any repo. Exactly one field must be present.
+// optBoolToPgtype maps an optional request bool to a pgtype.Bool: a nil pointer is
+// an absent value (Valid:false), which the COALESCE in SetRepoTrustFlags reads as
+// "leave this column unchanged"; a non-nil pointer is the value to set.
+func optBoolToPgtype(v *bool) pgtype.Bool {
+	if v == nil {
+		return pgtype.Bool{Valid: false}
+	}
+	return pgtype.Bool{Bool: *v, Valid: true}
+}
+
+// PatchRepo updates a repo's mutable opt-in settings. Two disjoint paths: the
+// trust flags (repo_skills_enabled and/or repo_claudemd_enabled, PRD #16/#246) —
+// which may be set together or individually in one atomic round-trip
+// (SetRepoTrustFlags) — and repo_devbox_opt_in (PRD #18), which is its own exclusive
+// path. The two paths cannot be combined in one request. At least one field must be
+// present. Authorization: the repo owner (via the owning connection) or an admin. A
+// non-owned, unknown id returns 404 for a non-admin; an admin may target any repo.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -602,20 +622,31 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if (req.RepoSkillsEnabled == nil) == (req.RepoDevboxOptIn == nil) {
-		httpx.Error(w, http.StatusBadRequest, "provide exactly one of repo_skills_enabled or repo_devbox_opt_in")
+	devboxSet := req.RepoDevboxOptIn != nil
+	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
+	if devboxSet && trustSet {
+		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in cannot be combined with repo_skills_enabled or repo_claudemd_enabled")
+		return
+	}
+	if !devboxSet && !trustSet {
+		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, or at least one of repo_skills_enabled or repo_claudemd_enabled")
 		return
 	}
 
 	var repo store.Repo
 	switch {
-	case req.RepoSkillsEnabled != nil:
+	case trustSet:
+		// One atomic round-trip sets both trust columns; a nil field is left unchanged
+		// by the query's COALESCE, so the master toggle and each sub-toggle share this
+		// path with no partial-failure window.
+		skills := optBoolToPgtype(req.RepoSkillsEnabled)
+		claudemd := optBoolToPgtype(req.RepoClaudemdEnabled)
 		if user.IsAdmin {
-			repo, err = h.q.SetRepoSkillsEnabled(r.Context(), store.SetRepoSkillsEnabledParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled})
+			repo, err = h.q.SetRepoTrustFlags(r.Context(), store.SetRepoTrustFlagsParams{ID: id, Skills: skills, Claudemd: claudemd})
 		} else {
-			repo, err = h.q.SetRepoSkillsEnabledForUser(r.Context(), store.SetRepoSkillsEnabledForUserParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled, UserID: user.ID})
+			repo, err = h.q.SetRepoTrustFlagsForUser(r.Context(), store.SetRepoTrustFlagsForUserParams{ID: id, Skills: skills, Claudemd: claudemd, UserID: user.ID})
 		}
-	case req.RepoDevboxOptIn != nil:
+	case devboxSet:
 		if user.IsAdmin {
 			repo, err = h.q.SetRepoDevboxOptIn(r.Context(), store.SetRepoDevboxOptInParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn})
 		} else {

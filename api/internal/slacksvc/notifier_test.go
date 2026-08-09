@@ -105,11 +105,13 @@ type updateCall struct{ channel, ts, text string }
 type blockCall struct {
 	channel, thread, fallback string
 	sectionText               string
+	contextText               string
 	actionIDs                 []string
 }
 type updateBlockCall struct {
 	channel, ts, fallback string
 	sectionText           string
+	contextText           string
 	actionIDs             []string
 }
 type ephemeralCall struct{ channel, user, text string }
@@ -156,6 +158,19 @@ func blockSummary(blks []slack.Block) ([]string, string) {
 	return ids, section
 }
 
+// findUpdateBlock returns the first UpdateBlocks call recorded at ts. Since PRD #268
+// M2 the run-status root is edited via UpdateBlocks, so the root edit shares
+// fp.updateBlocks with the gate edits — a test that wants a specific edit locates it
+// by ts rather than by position.
+func findUpdateBlock(calls []updateBlockCall, ts string) (updateBlockCall, bool) {
+	for _, c := range calls {
+		if c.ts == ts {
+			return c, true
+		}
+	}
+	return updateBlockCall{}, false
+}
+
 func (p *fakePoster) OpenDM(context.Context, string) (string, error) {
 	if p.dmChannel == "" {
 		p.dmChannel = "D1"
@@ -173,13 +188,13 @@ func (p *fakePoster) Update(_ context.Context, ch, ts, text string) error {
 }
 func (p *fakePoster) PostBlocks(_ context.Context, ch, thread, fallback string, blks []slack.Block) (string, error) {
 	ids, sectionText := blockSummary(blks)
-	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, sectionText: sectionText, actionIDs: ids})
+	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, sectionText: sectionText, contextText: contextText(blks), actionIDs: ids})
 	p.tsSeq++
 	return fmt.Sprintf("ts%d", p.tsSeq), p.postErr
 }
 func (p *fakePoster) UpdateBlocks(_ context.Context, ch, ts, fallback string, blks []slack.Block) error {
 	ids, sectionText := blockSummary(blks)
-	p.updateBlocks = append(p.updateBlocks, updateBlockCall{channel: ch, ts: ts, fallback: fallback, sectionText: sectionText, actionIDs: ids})
+	p.updateBlocks = append(p.updateBlocks, updateBlockCall{channel: ch, ts: ts, fallback: fallback, sectionText: sectionText, contextText: contextText(blks), actionIDs: ids})
 	return p.postErr
 }
 func (p *fakePoster) PostEphemeral(_ context.Context, ch, user, text string) error {
@@ -219,14 +234,24 @@ func TestNotifierFirstTransitionPostsRoot(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: fs.rc.ID, status: "running"})
 
-	if len(fp.posts) != 1 || fp.posts[0].thread != "" {
-		t.Fatalf("want 1 top-level post, got %+v", fp.posts)
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "" {
+		t.Fatalf("want 1 top-level Block Kit post, got %+v", fp.blocks)
 	}
-	body := fp.posts[0].text
-	for _, want := range []string{"grp/repo#42", "Add the feature", "running", "/runs/" + fs.rc.ID.String(), "Open in uzi"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("root missing %q in %q", want, body)
+	root := fp.blocks[0]
+	// The section carries the glyph label + repo#iid + title; the deep link rides the
+	// context block, not a trailing text line.
+	for _, want := range []string{"Running", "grp/repo#42", "Add the feature"} {
+		if !strings.Contains(root.sectionText, want) {
+			t.Errorf("root section missing %q in %q", want, root.sectionText)
 		}
+	}
+	for _, want := range []string{"/runs/" + fs.rc.ID.String(), "Open in uzi"} {
+		if !strings.Contains(root.contextText, want) {
+			t.Errorf("root context missing %q in %q", want, root.contextText)
+		}
+	}
+	if want := "Running · grp/repo#42 — Add the feature"; root.fallback != want {
+		t.Errorf("root fallback = %q, want %q", root.fallback, want)
 	}
 	if len(fs.upserted) != 1 || fs.upserted[0].ChannelID != "D1" || fs.upserted[0].RootTs != "ts1" {
 		t.Errorf("anchor not recorded: %+v", fs.upserted)
@@ -245,14 +270,22 @@ func TestNotifierEditsRootAndThreadsCompleted(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
 
-	if len(fp.updates) != 1 || fp.updates[0].ts != "ts1" || !strings.Contains(fp.updates[0].text, "MR !7") {
-		t.Fatalf("root not edited to completed: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || !strings.Contains(root.sectionText, "Completed") {
+		t.Fatalf("root not edited to Completed: %+v", fp.updateBlocks)
 	}
-	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
-		t.Fatalf("want 1 threaded event under ts1, got %+v", fp.posts)
+	if !strings.Contains(root.contextText, "MR !7") {
+		t.Fatalf("root context missing the MR link: %q", root.contextText)
 	}
-	if !strings.Contains(fp.posts[0].text, "/-/merge_requests/7") {
-		t.Errorf("thread event missing MR link: %q", fp.posts[0].text)
+	// PRD #268 M3: the terminal thread event is now a Block Kit post (family B).
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+		t.Fatalf("want 1 threaded Block Kit event under ts1, got %+v", fp.blocks)
+	}
+	if !strings.Contains(fp.blocks[0].sectionText, "Completed") {
+		t.Errorf("thread event section not Completed: %q", fp.blocks[0].sectionText)
+	}
+	if !strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/7") {
+		t.Errorf("thread event missing MR link: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -273,17 +306,18 @@ func TestNotifierForgejoRunSaysPullRequestAndUsesPersistedURL(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
 
-	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "PR #7") {
-		t.Fatalf("root not edited to Forgejo completed: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || !strings.Contains(root.contextText, "PR #7") {
+		t.Fatalf("root not edited to Forgejo completed: %+v", fp.updateBlocks)
 	}
-	if strings.Contains(fp.updates[0].text, "MR !7") {
-		t.Errorf("Forgejo DM must not use GitLab's MR !N form: %q", fp.updates[0].text)
+	if strings.Contains(root.contextText, "MR !7") {
+		t.Errorf("Forgejo DM must not use GitLab's MR !N form: %q", root.contextText)
 	}
-	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "/pulls/7") {
-		t.Fatalf("thread event must link the persisted mr_web_url: %+v", fp.posts)
+	if len(fp.blocks) != 1 || !strings.Contains(fp.blocks[0].contextText, "/pulls/7") {
+		t.Fatalf("thread event must link the persisted mr_web_url: %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "/-/merge_requests/") {
-		t.Errorf("Forgejo DM must not reconstruct a GitLab MR URL: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/") {
+		t.Errorf("Forgejo DM must not reconstruct a GitLab MR URL: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -303,15 +337,15 @@ func TestNotifierRejectsNonHTTPSMrWebURL(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want 1 threaded event, got %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want 1 threaded event, got %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "javascript:") {
-		t.Errorf("a non-https mr_web_url must not be rendered: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].contextText, "javascript:") {
+		t.Errorf("a non-https mr_web_url must not be rendered: %q", fp.blocks[0].contextText)
 	}
 	// It falls back to the GitLab reconstruction (this row's forge is gitlab).
-	if !strings.Contains(fp.posts[0].text, "/-/merge_requests/7") {
-		t.Errorf("want the GitLab reconstruction fallback: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/7") {
+		t.Errorf("want the GitLab reconstruction fallback: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -371,11 +405,11 @@ func TestNotifierEscapesHostileTitleAndPath(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want a post, got %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want a Block Kit post, got %+v", fp.blocks)
 	}
-	body := fp.posts[0].text
-	// The hostile markup must appear only in escaped form.
+	// The hostile forge/model fields live in the section; they must appear only escaped.
+	body := fp.blocks[0].sectionText
 	if strings.Contains(body, "<https://phishing.example|Open in uzi>") {
 		t.Errorf("raw spoofed link survived into the DM: %q", body)
 	}
@@ -385,9 +419,13 @@ func TestNotifierEscapesHostileTitleAndPath(t *testing.T) {
 	if !strings.Contains(body, "&lt;https://phishing.example|Open in uzi&gt;") || !strings.Contains(body, "&lt;@U123&gt;") {
 		t.Errorf("hostile fields were not mrkdwn-escaped: %q", body)
 	}
-	// The genuine deep link (trusted base + uuid) must stay raw and clickable.
-	if !strings.Contains(body, "<https://uzi.example/runs/"+rc.ID.String()+"|Open in uzi>") {
-		t.Errorf("legit deep link was broken by over-escaping: %q", body)
+	// The genuine deep link (trusted base + uuid) must stay raw and clickable in context.
+	if !strings.Contains(fp.blocks[0].contextText, "<https://uzi.example/runs/"+rc.ID.String()+"|Open in uzi>") {
+		t.Errorf("legit deep link was broken by over-escaping: %q", fp.blocks[0].contextText)
+	}
+	// The fallback must never carry a raw hostile field either (it is parsed for mrkdwn).
+	if strings.Contains(fp.blocks[0].fallback, "<@U123>") || strings.Contains(fp.blocks[0].fallback, "<https://phishing.example|Open in uzi>") {
+		t.Errorf("fallback carried a raw hostile field: %q", fp.blocks[0].fallback)
 	}
 }
 
@@ -405,10 +443,14 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "failed"})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want one threaded failure event, got %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one threaded failure event, got %+v", fp.blocks)
 	}
-	evt := fp.posts[0].text
+	// The reason rides its own FULL section (never a context element).
+	evt := fp.blocks[0].sectionText
+	if !strings.Contains(evt, "Failed") {
+		t.Errorf("failure event missing the Failed head: %q", evt)
+	}
 	if strings.Contains(evt, "<@U9>") {
 		t.Errorf("raw mention survived in the failure event: %q", evt)
 	}
@@ -417,6 +459,10 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 	}
 	if !strings.Contains(evt, "…") || strings.Contains(evt, strings.Repeat("x", 501)) {
 		t.Errorf("failure reason was not length-bounded: %q", evt)
+	}
+	// The fallback also carries the escaped, bounded reason — never a raw model field.
+	if strings.Contains(fp.blocks[0].fallback, "<@U9>") {
+		t.Errorf("fallback carried a raw mention: %q", fp.blocks[0].fallback)
 	}
 }
 
@@ -603,9 +649,11 @@ func TestNotifierRepostsGateOnNewPlanGeneration(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
 
-	// The prior gate (gate-v1) is edited button-free to a superseded state.
-	if len(fp.updateBlocks) != 1 || fp.updateBlocks[0].ts != "gate-v1" || len(fp.updateBlocks[0].actionIDs) != 0 ||
-		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "superseded") {
+	// The prior gate (gate-v1) is edited button-free to a superseded state. (The root
+	// itself is also edited via UpdateBlocks now, so locate the gate edit by ts.)
+	superseded, ok := findUpdateBlock(fp.updateBlocks, "gate-v1")
+	if !ok || len(superseded.actionIDs) != 0 ||
+		!strings.Contains(strings.ToLower(superseded.sectionText), "superseded") {
 		t.Fatalf("prior gate must be edited button-free to 'superseded': %+v", fp.updateBlocks)
 	}
 	// A fresh plan-in-thread + a fresh gate are posted.
@@ -632,7 +680,9 @@ func TestNotifierClosesGateWhenResolvedElsewhere(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.updateBlocks) != 1 || fp.updateBlocks[0].ts != "gate-ts" || len(fp.updateBlocks[0].actionIDs) != 0 {
+	// The root is edited via UpdateBlocks too now, so locate the gate close by ts.
+	closed, ok := findUpdateBlock(fp.updateBlocks, "gate-ts")
+	if !ok || len(closed.actionIDs) != 0 {
 		t.Fatalf("gate message must be edited button-free at its gate_ts: %+v", fp.updateBlocks)
 	}
 	if len(fs.gateSet) != 1 || fs.gateSet[0].GateTs.Valid || fs.gateSet[0].GateState.Valid {
@@ -647,11 +697,14 @@ func TestNotifierScrubsSecretsOutbound(t *testing.T) {
 	fp := &fakePoster{}
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
-	if len(fp.posts) != 1 {
-		t.Fatalf("want a post")
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want a Block Kit post")
 	}
-	if strings.Contains(fp.posts[0].text, "xoxb-leak-token") {
-		t.Errorf("outbound text leaked a token: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].sectionText, "xoxb-leak-token") {
+		t.Errorf("outbound section leaked a token: %q", fp.blocks[0].sectionText)
+	}
+	if strings.Contains(fp.blocks[0].fallback, "xoxb-leak-token") {
+		t.Errorf("fallback leaked a token: %q", fp.blocks[0].fallback)
 	}
 }
 
@@ -671,8 +724,9 @@ func TestNotifierHealthFlipsRootNoNudge(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "the agent stopped sending updates", nudge: false})
 
-	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "⚠ stalled") {
-		t.Fatalf("root not flipped to ⚠ stalled: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || !strings.Contains(root.contextText, "⚠️ stalled") {
+		t.Fatalf("root not flipped to ⚠️ stalled context flag: %+v", fp.updateBlocks)
 	}
 	if len(fp.posts) != 0 {
 		t.Fatalf("a non-nudge event must not thread a DM: %+v", fp.posts)
@@ -686,8 +740,9 @@ func TestNotifierHealthClearEditsRootBack(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "ok", reason: "", nudge: false})
 
-	if len(fp.updates) != 1 || strings.Contains(fp.updates[0].text, "⚠") {
-		t.Fatalf("root should be edited back without ⚠: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || strings.Contains(root.contextText, "⚠️") || strings.Contains(root.sectionText, "⚠️") {
+		t.Fatalf("root should be edited back without ⚠️: %+v", fp.updateBlocks)
 	}
 	if len(fp.posts) != 0 {
 		t.Fatalf("a clear must not thread a DM: %+v", fp.posts)
@@ -701,14 +756,15 @@ func TestNotifierHealthNudgeThreadsUnderRoot(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "the agent stopped sending updates", nudge: true})
 
-	if len(fp.updates) != 1 {
-		t.Fatalf("root should also be re-rendered: %+v", fp.updates)
+	if _, ok := findUpdateBlock(fp.updateBlocks, "ts1"); !ok {
+		t.Fatalf("root should also be re-rendered: %+v", fp.updateBlocks)
 	}
-	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
-		t.Fatalf("nudge not threaded under the root ts1: %+v", fp.posts)
+	// PRD #268 M3: the nudge is now a Block Kit post (family E) threaded under the root.
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+		t.Fatalf("nudge not threaded under the root ts1: %+v", fp.blocks)
 	}
-	if !strings.Contains(fp.posts[0].text, "quiet") {
-		t.Errorf("nudge missing its enum-keyed framing: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].sectionText, "quiet") {
+		t.Errorf("nudge missing its enum-keyed framing: %q", fp.blocks[0].sectionText)
 	}
 }
 
@@ -723,8 +779,8 @@ func TestNotifierHealthApprovalIdleThreadsUnderGate(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "approval_idle", reason: "waiting for the plan to be approved", nudge: true})
 
-	if len(fp.posts) != 1 || fp.posts[0].thread != "gate1" {
-		t.Fatalf("approval_idle nudge should thread under the gate ts: %+v", fp.posts)
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "gate1" {
+		t.Fatalf("approval_idle nudge should thread under the gate ts: %+v", fp.blocks)
 	}
 }
 
@@ -747,15 +803,18 @@ func TestNotifierHealthCreatesRootWhenAbsent(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "waiting_worker", reason: "no worker is online to pick up this run", nudge: true})
 
-	// Post 1 is the new top-level root (carrying the flag); post 2 is the nudge under it.
-	if len(fp.posts) != 2 {
-		t.Fatalf("want a root post + a threaded nudge, got %+v", fp.posts)
+	// PRD #268 M3: both the new top-level root AND the threaded nudge are Block Kit posts
+	// now, so fp.blocks carries two — the root (thread "") first, then the nudge under it.
+	if len(fp.blocks) != 2 {
+		t.Fatalf("want the root + the nudge as two Block Kit posts: %+v", fp.blocks)
 	}
-	if fp.posts[0].thread != "" || !strings.Contains(fp.posts[0].text, "⚠ waiting for a worker") {
-		t.Fatalf("root not created with the flag: %+v", fp.posts[0])
+	root := fp.blocks[0]
+	if root.thread != "" || !strings.Contains(root.contextText, "⚠️ waiting for a worker") {
+		t.Fatalf("root not created with the flag: %+v", root)
 	}
-	if fp.posts[1].thread != "ts1" {
-		t.Fatalf("nudge not threaded under the new root: %+v", fp.posts[1])
+	nudge := fp.blocks[1]
+	if nudge.thread != "ts1" {
+		t.Fatalf("nudge not threaded under the new root: %+v", nudge)
 	}
 	if len(fs.upserted) != 1 {
 		t.Fatalf("anchor not recorded for the new root: %+v", fs.upserted)
@@ -770,14 +829,14 @@ func TestNotifierHealthNudgeScrubsSecrets(t *testing.T) {
 	// A hostile reason carrying a token must never reach Slack.
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "leaked xoxb-abc123DEF token", nudge: true})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want a nudge post: %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want a nudge post: %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "xoxb-abc123DEF") {
-		t.Errorf("nudge leaked a token: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].sectionText, "xoxb-abc123DEF") {
+		t.Errorf("nudge leaked a token: %q", fp.blocks[0].sectionText)
 	}
-	if !strings.Contains(fp.posts[0].text, "[redacted]") {
-		t.Errorf("token not scrubbed in nudge: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].sectionText, "[redacted]") {
+		t.Errorf("token not scrubbed in nudge: %q", fp.blocks[0].sectionText)
 	}
 }
 
@@ -804,20 +863,23 @@ func parkedCtx(rateLimitType string, resumesIn time.Duration, count int32) store
 	return rc
 }
 
-// TestParkedRunRendersAsPausedNotAsARawStatus is the gap this milestone closes: the
-// notifier has NO status filter, so before this a parked run reached statusLabel's
-// default arm and the user's DM read the literal database string "limit_wait".
+// TestParkedRunRendersAsPausedNotAsARawStatus is the gap PRD #35 closed and PRD #268
+// M2 preserves under Block Kit: the notifier has NO status filter, so a parked run must
+// not reach the default arm and leak the literal database string "limit_wait" into a
+// user's DM. The root section reads "⏸️ Paused · usage limit"; the window/resume detail
+// now rides the terminal thread event's context (limitWaitDetail), asserted below.
 func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
-	got := renderRoot(parkedCtx("five_hour", 4*time.Hour, 1), "https://uzi.example")
-	if strings.Contains(got, "limit_wait") {
-		t.Fatalf("root = %q — the raw status string leaked to a user's DM", got)
+	blocks, fallback := rootBlocks(parkedCtx("five_hour", 4*time.Hour, 1), "https://uzi.example")
+	_, section := blockSummary(blocks)
+	all := section + contextText(blocks) + fallback
+	if strings.Contains(all, "limit_wait") {
+		t.Fatalf("root = %q — the raw status string leaked to a user's DM", all)
 	}
-	if !strings.Contains(got, "paused: usage limit") || !strings.Contains(got, "(five_hour)") {
-		t.Fatalf("root = %q, want it to name the pause and the window", got)
+	if !strings.Contains(section, "Paused · usage limit") {
+		t.Fatalf("root section = %q, want it to name the pause", section)
 	}
-	if !strings.Contains(got, "<!date^") {
-		t.Fatalf("root = %q, want Slack's date markup so the time renders in the READER's "+
-			"timezone rather than the server's", got)
+	if !strings.Contains(fallback, "Paused · usage limit") {
+		t.Fatalf("root fallback = %q, want it to name the pause", fallback)
 	}
 }
 
@@ -825,33 +887,46 @@ func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 // mechanical rather than editorial: the root line is EDITED, and a Slack edit raises
 // no notification, so without this a user is never told their run paused.
 func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
-	if evt := renderThread(parkedCtx("seven_day", time.Hour, 1)); evt == "" {
+	if _, _, ok := renderThreadBlocks(parkedCtx("seven_day", time.Hour, 1), "https://uzi.example"); !ok {
 		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
 			"the user would never learn the run paused")
 	}
 	// The promotion back to queued must NOT post — resuming is a return to normal and
 	// the edited root already shows it. A run that parks five times would otherwise
 	// produce ten posts.
-	if evt := renderThread(baseRun("queued")); evt != "" {
-		t.Fatalf("the resume threaded %q; only the park is worth interrupting for", evt)
+	if _, _, ok := renderThreadBlocks(baseRun("queued"), "https://uzi.example"); ok {
+		t.Fatal("the resume threaded an event; only the park is worth interrupting for")
 	}
 }
 
 // Every part is omitted rather than defaulted when unknown, matching the server's own
-// failure-reason composition: the line must never claim a fact uzi does not have.
-func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
-	bare := renderThread(parkedCtx("", 0, 1))
-	if bare != "⏸ paused: usage limit" {
-		t.Fatalf("a park with no window and no stamp rendered %q; it must degrade to the "+
-			"bare statement rather than inventing a window or a time", bare)
+// failure-reason composition: the detail must never claim a fact uzi does not have. The
+// park head is the section (⏸️ Paused · usage limit); the detail suffix is the context.
+func TestLimitWaitDetailOmitsWhatItDoesNotKnow(t *testing.T) {
+	// A park with no window and no stamp on the first pause has no detail at all: the
+	// section carries the head, and the context is just the deep link.
+	if bare := limitWaitDetail(parkedCtx("", 0, 1)); bare != "" {
+		t.Fatalf("a park with no window and no stamp had detail %q; it must be empty rather "+
+			"than inventing a window or a time", bare)
 	}
-	if strings.Contains(bare, "(pause") {
-		t.Fatalf("%q shows a pause counter on the FIRST park, which is noise — the counter "+
-			"is the signal that a run is burning its retry budget", bare)
+	blocks, _, ok := renderThreadBlocks(parkedCtx("", 0, 1), "https://uzi.example")
+	if !ok {
+		t.Fatal("a bare park must still thread the head + link")
 	}
-	if repeat := renderThread(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
+	_, section := blockSummary(blocks)
+	if !strings.Contains(section, "Paused · usage limit") {
+		t.Fatalf("park section = %q, want the pause head", section)
+	}
+	if strings.Contains(limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)), "(pause") {
+		t.Fatal("a pause counter on the FIRST park is noise — the counter is the signal that a run is burning its retry budget")
+	}
+	if repeat := limitWaitDetail(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
 		t.Fatalf("%q — from the second park on, the rising count is the warning that this "+
 			"run may be about to fail for good", repeat)
+	}
+	// The reader-local resume token is preserved verbatim.
+	if d := limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)); !strings.Contains(d, "resumes <!date^") {
+		t.Fatalf("detail = %q, want the <!date^…> reader-local resume token preserved", d)
 	}
 }
 
@@ -859,10 +934,100 @@ func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
 // only fire for a writer that bypassed both — a backfill, an admin tool, a later
 // refactor. That is exactly the population the CHECK exists for, so the renderer
 // escapes rather than trusting.
-func TestLimitWaitLabelEscapesTheWindowField(t *testing.T) {
-	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
+func TestLimitWaitDetailEscapesTheWindowField(t *testing.T) {
+	got := limitWaitDetail(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
+	}
+}
+
+// --- PRD #268 M3: the Block Kit terminal thread events (family B) -----------------
+
+// Each terminal transition renders its canonical glyph + label section, the deep link,
+// and a fallback built from fixed labels + the escaped repo#iid — never a raw field.
+func TestRenderThreadBlocksShapesPerEvent(t *testing.T) {
+	failedCancelled := baseRun("failed")
+	failedCancelled.FailureReason = txt("run cancelled")
+
+	failedReason := baseRun("failed")
+	failedReason.FailureReason = txt("the agent crashed")
+
+	completedMR := baseRun("completed")
+	completedMR.MrIid = text8(7)
+
+	for _, tc := range []struct {
+		name         string
+		rc           store.GetSlackRunContextRow
+		wantSection  string
+		wantFallback string
+	}{
+		{"completed", completedMR, "✅ *Completed*", "Completed · grp/repo#42"},
+		{"failed", failedReason, "❌ *Failed*", "Failed · grp/repo#42 — the agent crashed"},
+		{"failed-run-cancelled", failedCancelled, "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
+		{"cancelled", baseRun("cancelled"), "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
+		{"limit_wait", parkedCtx("five_hour", time.Hour, 1), "⏸️ *Paused · usage limit*", "Paused · usage limit · grp/repo#42"},
+	} {
+		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example")
+		if !ok {
+			t.Errorf("%s: ok=false, want a threaded event", tc.name)
+			continue
+		}
+		_, section := blockSummary(blocks)
+		if !strings.Contains(section, tc.wantSection) {
+			t.Errorf("%s: section = %q, want it to contain %q", tc.name, section, tc.wantSection)
+		}
+		if fallback != tc.wantFallback {
+			t.Errorf("%s: fallback = %q, want %q", tc.name, fallback, tc.wantFallback)
+		}
+		// Every event carries the run deep link in a context element.
+		if !strings.Contains(contextText(blocks), "Open in uzi") {
+			t.Errorf("%s: context missing the deep link: %q", tc.name, contextText(blocks))
+		}
+	}
+}
+
+// A non-terminal, non-park transition threads nothing (ok=false).
+func TestRenderThreadBlocksSkipsRunningAndQueued(t *testing.T) {
+	for _, status := range []string{"queued", "running", "claimed", "awaiting_approval"} {
+		if _, _, ok := renderThreadBlocks(baseRun(status), "https://uzi.example"); ok {
+			t.Errorf("%s must not thread a terminal event", status)
+		}
+	}
+}
+
+// The failed reason is untrusted free text: it rides its OWN section (never a context
+// element), scrubbed and escaped, and the fallback carries the escaped reason too.
+func TestRenderThreadBlocksFailedReasonIsAnEscapedSection(t *testing.T) {
+	rc := baseRun("failed")
+	rc.FailureReason = txt("boom <@U9> leaked sk-ant-abc123DEF")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	if !ok {
+		t.Fatal("failed must thread an event")
+	}
+	_, section := blockSummary(blocks)
+	if strings.Contains(section, "<@U9>") || !strings.Contains(section, "&lt;@U9&gt;") {
+		t.Errorf("reason not escaped in its section: %q", section)
+	}
+	if strings.Contains(section, "sk-ant-abc123DEF") || strings.Contains(fallback, "sk-ant-abc123DEF") {
+		t.Errorf("reason not scrubbed: section=%q fallback=%q", section, fallback)
+	}
+}
+
+// Emoji-presentation across the thread events, same guard as the root.
+func TestRenderThreadBlocksUseEmojiPresentation(t *testing.T) {
+	completedMR := baseRun("completed")
+	completedMR.MrIid = text8(7)
+	for _, rc := range []store.GetSlackRunContextRow{
+		completedMR,
+		baseRun("cancelled"),
+		parkedCtx("five_hour", time.Hour, 2),
+	} {
+		blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+		if !ok {
+			t.Fatalf("%s: want a threaded event", rc.Status)
+		}
+		_, section := blockSummary(blocks)
+		assertEmojiPresentation(t, section+contextText(blocks)+fallback)
 	}
 }
 
@@ -912,8 +1077,9 @@ func TestNotifierRootCarriesMilestoneCounter(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "running · 3/7") {
-		t.Fatalf("root must carry the `running · 3/7` milestone counter: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || !strings.Contains(root.sectionText, "Running") || !strings.Contains(root.contextText, "🧩 3/7 milestones") {
+		t.Fatalf("root must carry Running + the `🧩 3/7 milestones` context counter: %+v", fp.updateBlocks)
 	}
 }
 
@@ -936,8 +1102,8 @@ func TestNotifierPostsMilestoneLineOnAdvance(t *testing.T) {
 	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
 		t.Fatalf("want exactly one milestone thread line under the root: %+v", fp.posts)
 	}
-	if !strings.Contains(fp.posts[0].text, "✓ 3/7 · working Milestone 4") {
-		t.Fatalf("milestone line = %q, want `✓ 3/7 · working Milestone 4`", fp.posts[0].text)
+	if !strings.Contains(fp.posts[0].text, "🧩 3/7 · working Milestone 4") {
+		t.Fatalf("milestone line = %q, want `🧩 3/7 · working Milestone 4`", fp.posts[0].text)
 	}
 	if len(fs.milestoneSet) != 1 || fs.milestoneSet[0].Count.Int32 != 3 || !fs.milestoneSet[0].Count.Valid {
 		t.Fatalf("advanced notified count not recorded as 3: %+v", fs.milestoneSet)
@@ -956,18 +1122,18 @@ func TestNotifierFirstPostCarriesNoMilestoneLine(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.posts) != 1 || fp.posts[0].thread != "" {
-		t.Fatalf("want exactly one top-level root post, no threaded line: %+v", fp.posts)
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "" {
+		t.Fatalf("want exactly one top-level root block, no threaded line: %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "✓") {
-		t.Fatalf("first post must not carry a milestone advance line: %q", fp.posts[0].text)
+	if len(fp.posts) != 0 {
+		t.Fatalf("first post must not carry a milestone advance thread line: %+v", fp.posts)
 	}
 	if len(fs.milestoneSet) != 0 {
 		t.Fatalf("first post must not record a notified count: %+v", fs.milestoneSet)
 	}
-	// The root itself still shows the compact counter — that is the root suffix, not a line.
-	if !strings.Contains(fp.posts[0].text, "3/7") {
-		t.Fatalf("root should still carry the `3/7` counter suffix: %q", fp.posts[0].text)
+	// The root itself still shows the compact counter — that is the context counter, not a line.
+	if !strings.Contains(fp.blocks[0].contextText, "3/7") {
+		t.Fatalf("root should still carry the `3/7` context counter: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -983,8 +1149,8 @@ func TestNotifierMilestoneLineDropsWorkingSuffixWhenIdle(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.posts) != 1 || fp.posts[0].text != "✓ 1/7" {
-		t.Fatalf("want a bare `✓ 1/7` line with no working suffix: %+v", fp.posts)
+	if len(fp.posts) != 1 || fp.posts[0].text != "🧩 1/7" {
+		t.Fatalf("want a bare `🧩 1/7` line with no working suffix: %+v", fp.posts)
 	}
 }
 
@@ -1011,8 +1177,9 @@ func TestNotifierDoesNotRepostMilestoneOnUnchangedCount(t *testing.T) {
 		t.Fatalf("an unchanged count must not record a new notified count: %+v", fs.milestoneSet)
 	}
 	// The root is still re-edited and keeps the counter.
-	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "3/7") {
-		t.Fatalf("root should still carry the counter on a re-broadcast: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || !strings.Contains(root.contextText, "3/7") {
+		t.Fatalf("root should still carry the counter on a re-broadcast: %+v", fp.updateBlocks)
 	}
 }
 
@@ -1032,7 +1199,7 @@ func TestNotifierMilestonePlusTwoPostsOneLine(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "✓ 3/7") {
+	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "🧩 3/7") {
 		t.Fatalf("a +2 jump must post exactly one line at the new count 3/7: %+v", fp.posts)
 	}
 	if len(fs.milestoneSet) != 1 || fs.milestoneSet[0].Count.Int32 != 3 {
@@ -1070,8 +1237,9 @@ func TestNotifierNoMilestonesBehavesAsToday(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
 
-	if len(fp.updates) != 1 || regexp.MustCompile(`· [0-9]+/[0-9]+`).MatchString(fp.updates[0].text) {
-		t.Fatalf("a no-milestone run's root must carry no milestone counter: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "ts1")
+	if !ok || regexp.MustCompile(`[0-9]+/[0-9]+`).MatchString(root.contextText) {
+		t.Fatalf("a no-milestone run's root must carry no milestone counter: %+v", fp.updateBlocks)
 	}
 	if len(fp.posts) != 0 {
 		t.Fatalf("a no-milestone run must post no milestone thread line: %+v", fp.posts)
@@ -1102,5 +1270,90 @@ func TestForgeMrVocabulary(t *testing.T) {
 		if got := forgeMrRef(tc.forge); got != tc.sref {
 			t.Errorf("forgeMrRef(%q) = %q, want %q", tc.forge, got, tc.sref)
 		}
+	}
+}
+
+// --- PRD #268 M2: the Block Kit root glyphs -------------------------------------
+
+// statusGlyph is the canonical (emoji, label) per status on the root line. This pins
+// the exact pair for every arm, including the `failed`+"run cancelled" sentinel that
+// reads as Cancelled, so a later edit that swaps a glyph or reword is caught.
+func TestStatusGlyph(t *testing.T) {
+	failedCancelled := baseRun("failed")
+	failedCancelled.FailureReason = txt("run cancelled")
+
+	for _, tc := range []struct {
+		name         string
+		rc           store.GetSlackRunContextRow
+		emoji, label string
+	}{
+		{"queued", baseRun("queued"), "⏳", "Queued"},
+		{"claimed", baseRun("claimed"), "▶️", "Running"},
+		{"running", baseRun("running"), "▶️", "Running"},
+		{"awaiting_approval", baseRun("awaiting_approval"), "⏸️", "Needs your approval"},
+		{"awaiting_input", baseRun("awaiting_input"), "❓", "Needs your answer"},
+		{"limit_wait", baseRun("limit_wait"), "⏸️", "Paused · usage limit"},
+		{"completed", baseRun("completed"), "✅", "Completed"},
+		{"failed", baseRun("failed"), "❌", "Failed"},
+		{"cancelled", baseRun("cancelled"), "🚫", "Cancelled"},
+		{"failed-run-cancelled", failedCancelled, "🚫", "Cancelled"},
+	} {
+		emoji, label := statusGlyph(tc.rc)
+		if emoji != tc.emoji || label != tc.label {
+			t.Errorf("statusGlyph(%s) = (%q, %q), want (%q, %q)", tc.name, emoji, label, tc.emoji, tc.label)
+		}
+	}
+}
+
+// A run with no context elements (no milestones, no MR, non-flagged health, no deep
+// link because base is empty) omits the context block entirely — Slack rejects an
+// empty one — so rootBlocks returns exactly the single section block.
+func TestRootBlocksOmitsEmptyContext(t *testing.T) {
+	blocks, _ := rootBlocks(baseRun("running"), "")
+	if len(blocks) != 1 {
+		t.Fatalf("want exactly one block (context omitted when empty), got %d: %+v", len(blocks), blocks)
+	}
+	if _, ok := blocks[0].(*slack.SectionBlock); !ok {
+		t.Fatalf("the single block must be a *slack.SectionBlock, got %T", blocks[0])
+	}
+}
+
+// assertEmojiPresentation fails if s carries a bare monochrome glyph: the retired
+// ✓ (U+2713, now fully replaced by 🧩), or a ▶ / ⏸ / ⚠ rune not immediately followed
+// by the emoji-presentation variation selector U+FE0F. A strings.Contains check
+// cannot express this — emoji presentation is a base rune + U+FE0F, so the scan must
+// look at the NEXT rune, not the substring.
+func assertEmojiPresentation(t *testing.T, s string) {
+	t.Helper()
+	runes := []rune(s)
+	for i, r := range runes {
+		if r == '✓' {
+			t.Errorf("found bare U+2713 ✓ (should be fully replaced by 🧩): %q", s)
+			continue
+		}
+		if r == '▶' || r == '⏸' || r == '⚠' {
+			if i+1 >= len(runes) || runes[i+1] != '️' {
+				t.Errorf("found monochrome %q not followed by U+FE0F variation selector: %q", string(r), s)
+			}
+		}
+	}
+}
+
+// Every glyph the root emits is emoji-presentation (base rune + U+FE0F), never a bare
+// monochrome codepoint, so the DM reads consistently beside the full-color ✅ ❌ 🚫.
+// Exercises a running run (▶️), a completed run WITH an MR (✅ + 🔀), and a
+// health-flagged run (⚠️) across the section, context and fallback strings.
+func TestRootBlocksUseEmojiPresentation(t *testing.T) {
+	completedMR := baseRun("completed")
+	completedMR.MrIid = text8(7)
+
+	for _, rc := range []store.GetSlackRunContextRow{
+		baseRun("running"),
+		completedMR,
+		healthRun("running", "stalled"),
+	} {
+		blocks, fallback := rootBlocks(rc, "https://uzi.example")
+		_, section := blockSummary(blocks)
+		assertEmojiPresentation(t, section+contextText(blocks)+fallback)
 	}
 }

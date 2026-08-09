@@ -75,12 +75,13 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		// an empty exclusions list here would agree with a producer that dropped them.
 		AgentSelection: &AgentSelection{Source: "repo", Exclusions: []string{"reviewer"}}, // PRD #35 Decision 6b: lets a resume skip the plan gate
 		Repo: ClaimRepo{
-			ID:            "22222222-2222-2222-2222-222222222222",
-			URL:           "https://gitlab.example.com/g/p",
-			CloneURL:      "https://gitlab.example.com/g/p.git",
-			DefaultBranch: strptr("main"),
-			SkillsEnabled: true,
-			ForgeType:     "gitlab", // PRD #65 R8: emitted on every claim, "gitlab" for a GitLab connection
+			ID:              "22222222-2222-2222-2222-222222222222",
+			URL:             "https://gitlab.example.com/g/p",
+			CloneURL:        "https://gitlab.example.com/g/p.git",
+			DefaultBranch:   strptr("main"),
+			SkillsEnabled:   true,
+			ClaudemdEnabled: true,     // PRD #246: repo owner opted into advisory CLAUDE.md; rides the claim byte-for-byte (no omitempty)
+			ForgeType:       "gitlab", // PRD #65 R8: emitted on every claim, "gitlab" for a GitLab connection
 		},
 		Secrets: ClaimSecrets{
 			ForgeUsername:       "uzi-bot",

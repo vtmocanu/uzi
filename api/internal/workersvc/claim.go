@@ -207,6 +207,12 @@ type ClaimRepo struct {
 	// below every delivered skill (M6). Skills only — the repo's hooks/settings/
 	// commands are never loaded, flag or no flag.
 	SkillsEnabled bool `json:"skills_enabled"`
+	// ClaudemdEnabled is the repo owner's opt-in (PRD #246) for the lead to read the
+	// clone's root CLAUDE.md as nonce-fenced UNTRUSTED/ADVISORY context. Default false.
+	// A sibling trust flag of SkillsEnabled; the worker reads and injects it through
+	// its own channel (settingSources stays []). Additive on the wire — an old worker
+	// ignores the unknown key.
+	ClaudemdEnabled bool `json:"claudemd_enabled"`
 }
 
 // ClaimSecrets are the decrypted secrets for this run only. The worker holds the

@@ -1692,12 +1692,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// milestone-less run's claim byte-identical to today's.
 		Milestones: milestones,
 		Repo: ClaimRepo{
-			ID:            uuid.UUID(run.RepoID.Bytes).String(),
-			URL:           rc.RepoWebUrl,
-			CloneURL:      rc.RepoWebUrl + ".git",
-			DefaultBranch: textPtr(rc.DefaultBranch),
-			SkillsEnabled: rc.RepoSkillsEnabled,
-			ForgeType:     rc.ForgeType,
+			ID:              uuid.UUID(run.RepoID.Bytes).String(),
+			URL:             rc.RepoWebUrl,
+			CloneURL:        rc.RepoWebUrl + ".git",
+			DefaultBranch:   textPtr(rc.DefaultBranch),
+			SkillsEnabled:   rc.RepoSkillsEnabled,
+			ClaudemdEnabled: rc.RepoClaudemdEnabled,
+			ForgeType:       rc.ForgeType,
 		},
 		Secrets: ClaimSecrets{
 			ForgeUsername:       rc.BotUsername,

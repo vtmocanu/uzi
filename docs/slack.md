@@ -115,6 +115,23 @@ Open **Settings → Notifications**:
 
 ## Using it
 
+**Message format**: every DM is Block Kit, not plain text — a status line leads
+with a rendered emoji + word (never emoji alone), secondary detail (progress,
+health, links) rides in a `context` block underneath, and the deep link is
+always a rendered "Open in uzi" affordance (a link or a button), never a bare
+URL. No DM carries the `[uzi]` prefix or a raw `:shortcode:` — it's a 1:1 DM
+with the bot, so the sender is already `uzi`. Glyph legend:
+
+| | | |
+|---|---|---|
+| ⏳ Queued | ▶️ Running | ⏸️ Needs your approval |
+| ❓ Needs your answer | ⏸️ Paused · usage limit | ✅ Completed |
+| ❌ Failed | 🚫 Cancelled | 🔀 View MR/PR |
+| 🧩 N/M milestones | 🔗 Open in uzi | 💬 Chat |
+| 🔎 Judge review (verdict ✅ ideal/ok · ⚠️ issues) | 🔧 Self-improvement | 📝 Issue proposal |
+| 💤 Stalled | 🔁 Looping | 🐢 Slow |
+| ⏳ Waiting for a worker | ⏸️ Awaiting approval | |
+
 - **Plan gate**: the `awaiting_approval` DM carries **Approve** /
   **Request changes** / **Reject** / **Open in uzi**, and the plan body
   itself is posted into the run thread so you can read it without leaving
@@ -184,8 +201,11 @@ Open **Settings → Notifications**:
 - Approving or rejecting from the web UI updates the Slack message too (and
   vice versa), so a stale button press just gets a quiet "already handled".
 - **Run judge and self-improvement**: if you've opted into the [run
-  judge](./judge.md), a finished review's verdict and summary arrive as a DM,
-  same content as the inbox row. If your admin has enabled
+  judge](./judge.md), a finished review arrives as a DM leading with 🔎 *Run
+  review ready*, a fact row (verdict glyph + word, recommendation count, and a
+  `code` chip per category), and the summary as a blockquoted excerpt with an
+  Open-in-uzi link — richer formatting than the inbox row, same underlying
+  content. If your admin has enabled
   [self-improvement](./self-improvement.md), you get a DM when a cycle starts
   and when one is skipped (vault locked, repo disconnected, a cycle already
   running). A judge or self-improvement run's *own* state changes (queued,
@@ -194,13 +214,15 @@ Open **Settings → Notifications**:
   "judge run completed" for a run you never see on the board.
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   slow, waiting for a worker, or stuck too long awaiting approval — see
-  [Run health](./run-health.md)), its root status label picks up a `· ⚠
-  <flag>` suffix, and you get one threaded nudge — at most once per cooldown
-  window (30 minutes by default, admin-tunable) even if the run flaps
-  between flags in that time. An approval-idle nudge threads under the
+  [Run health](./run-health.md)), the root DM's `context` block picks up a
+  `⚠️ <flag>` element (the status label itself doesn't change), and you get
+  one threaded nudge — leading with a per-state glyph (💤 stalled, 🔁 looping,
+  🐢 slow, ⏳ waiting for a worker, ⏸️ awaiting approval) — at most once per
+  cooldown window (30 minutes by default, admin-tunable) even if the run
+  flaps between flags in that time. An approval-idle nudge threads under the
   existing plan-gate message, right next to its action buttons.
-  When the run recovers, the root label reverts on its own and nudging
-  stops — no action needed.
+  When the run recovers, the `⚠️ <flag>` context element drops off on its own
+  and nudging stops — no action needed.
 
 ## Chatting from Slack
 

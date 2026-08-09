@@ -668,6 +668,7 @@ export class RunRunner {
         skills: claim.skills,
         skillsDropped: claim.skills_dropped,
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
+        repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
         memory,
         config: claim.config,
         // Preflighted above: the claim's id, or undefined when its transcript is not

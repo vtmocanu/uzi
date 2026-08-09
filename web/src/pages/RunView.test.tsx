@@ -1233,6 +1233,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
       default_branch: "main",
       enabled: true,
       repo_skills_enabled: false,
+      repo_claudemd_enabled: false,
       repo_devbox_opt_in: false,
       pipeline: null,
     };

@@ -78,7 +78,7 @@ const (
 )
 
 // AllSources is the whole `source` vocabulary in a form a guard can enumerate, the
-// source-of-truth a drift test compares against migration 00108's CHECK (M4), the
+// source-of-truth a drift test compares against migration 00109's CHECK (M4), the
 // same shape autoselect.AllReasons() uses for its own CHECK.
 //
 // Returns a fresh slice: a package-level var would let one caller's append corrupt
