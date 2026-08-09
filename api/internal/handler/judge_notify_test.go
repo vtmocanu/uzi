@@ -55,6 +55,26 @@ func TestBuildReviewNotificationSummaryAndScrub(t *testing.T) {
 	if n.Slack == nil || n.Slack.Link != wantLink {
 		t.Errorf("slack link = %v, want %q", n.Slack, wantLink)
 	}
+	// PRD #268 M3: the Slack render carries the emoji + trusted facts, and the Body is the
+	// scrubbed summary preview alone (not the verdict/count one-liner — those are facts now).
+	if n.Slack.Emoji != "🔎" {
+		t.Errorf("slack emoji = %q, want 🔎", n.Slack.Emoji)
+	}
+	if n.Slack.Body != n.Payload.(map[string]any)["summary"] {
+		t.Errorf("slack body = %q, want the scrubbed summary preview", n.Slack.Body)
+	}
+	if strings.Contains(n.Slack.Body, secret) {
+		t.Errorf("slack body leaked a secret: %q", n.Slack.Body)
+	}
+	wantFacts := []string{"Verdict ⚠️ *issues*", "2 recommendations", "`install_worker_tool`", "`improve_uzi`"}
+	if len(n.Slack.Facts) != len(wantFacts) {
+		t.Fatalf("slack facts = %v, want %v", n.Slack.Facts, wantFacts)
+	}
+	for i, w := range wantFacts {
+		if n.Slack.Facts[i] != w {
+			t.Errorf("slack fact[%d] = %q, want %q", i, n.Slack.Facts[i], w)
+		}
+	}
 
 	blob, err := json.Marshal(n)
 	if err != nil {
@@ -109,5 +129,65 @@ func TestBuildReviewNotificationNoBaseURL(t *testing.T) {
 	single := reviewNotificationBody("ok", 1, "")
 	if !strings.Contains(single, "1 recommendation") || strings.Contains(single, "recommendations") {
 		t.Errorf("singular body = %q, want '1 recommendation'", single)
+	}
+}
+
+// verdictGlyph maps every live verdict (ideal|ok|issues) plus the PRD #268 M3
+// forward-compat keys; an unknown value degrades to "" (no glyph).
+func TestVerdictGlyph(t *testing.T) {
+	for verdict, want := range map[string]string{
+		"ideal":         "✅",
+		"ok":            "✅",
+		"issues":        "⚠️",
+		"needs_changes": "⚠️",
+		"needs-changes": "⚠️",
+		"bad":           "❌",
+		"":              "",
+		"who_knows":     "",
+	} {
+		if got := verdictGlyph(verdict); got != want {
+			t.Errorf("verdictGlyph(%q) = %q, want %q", verdict, got, want)
+		}
+	}
+}
+
+// recommendationCategoryChips dedupes categories in first-seen order and wraps each in
+// a `code` chip; with in-enum data, dedup (not the maxChips backstop) is what bounds the
+// result to the distinct categories present. recCountFact does singular/plural.
+func TestReviewSlackFactsChipsAndCount(t *testing.T) {
+	if got := recCountFact(1); got != "1 recommendation" {
+		t.Errorf("recCountFact(1) = %q, want '1 recommendation'", got)
+	}
+	if got := recCountFact(3); got != "3 recommendations" {
+		t.Errorf("recCountFact(3) = %q, want '3 recommendations'", got)
+	}
+	// Duplicate categories collapse to one chip, in first-seen order.
+	recs := []workersvc.ReviewRecommendation{
+		{Category: "improve_agent"}, {Category: "improve_uzi"}, {Category: "improve_agent"},
+	}
+	chips := recommendationCategoryChips(recs)
+	if len(chips) != 2 || chips[0] != "`improve_agent`" || chips[1] != "`improve_uzi`" {
+		t.Errorf("chips = %v, want the two distinct categories as `code` chips in first-seen order", chips)
+	}
+	// Many recommendations drawn from the closed enum collapse to exactly the DISTINCT
+	// categories present — dedup, not the cap, is what bounds the chips for in-enum data
+	// (the enum has 6 members, so a review can never carry more than 6 distinct ones).
+	// A submission that repeats every category many times must yield one chip per
+	// distinct category, in first-seen order.
+	distinct := []string{"enable_tool", "install_worker_tool", "adjust_template", "improve_agent", "add_agent", "improve_uzi"}
+	many := make([]workersvc.ReviewRecommendation, 0, len(distinct)*4)
+	for i := 0; i < 4; i++ {
+		for _, cat := range distinct {
+			many = append(many, workersvc.ReviewRecommendation{Category: cat})
+		}
+	}
+	chipsMany := recommendationCategoryChips(many)
+	if len(chipsMany) != len(distinct) {
+		t.Fatalf("chip count = %d, want %d distinct categories deduped to one chip each", len(chipsMany), len(distinct))
+	}
+	for i, cat := range distinct {
+		if chipsMany[i] != "`"+cat+"`" {
+			t.Errorf("chip[%d] = %q, want %q (dedup preserves first-seen order)", i, chipsMany[i], "`"+cat+"`")
+		}
 	}
 }

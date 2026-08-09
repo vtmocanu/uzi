@@ -1,7 +1,7 @@
 # PRD #268: Slack DM UX — deliver chat answers to the thread, and give every DM real Slack formatting
 
 **GitLab Issue**: [vtmocanu/uzi#268](https://gitlab.example.com/vtmocanu/uzi/-/issues/268)
-**Status**: Draft
+**Status**: Done (2026-08-09)
 **Priority**: High
 **Created**: 2026-08-09
 **Depends on**: PRD #191 (Slack as a conversational surface — done; this fixes and polishes what it shipped)
@@ -157,11 +157,11 @@ Message families to convert (grouped by the Slack UX inventory, letters A–L in
 
 ## Milestones
 
-- [ ] **M1 — Chat turn no longer dropped by the init heartbeat.** `applyChatFrame` guards the status flush on resolving content; a **slacksvc notifier regression test** (Go, not the agent stub) emits the real `user_message → status:init → text → status:result` order and asserts the thread carries the answer. `task gate:api` green.
-- [ ] **M2 — Status root (A), glyph canonicalization, `[uzi]` deletions.** `renderRoot`→`PostBlocks`/`UpdateBlocks`; progress/health moved to a `context` block; one emoji-presentation glyph set across `statusLabel`/`limitWaitLabel`/`healthNudgeHead`/milestone; `[uzi]` removed from `notifier.go:302`, `notifier.go:745`, `linker.go:221`; test DM (K2) restyled. Every new `PostBlocks` carries a fixed/escaped `fallbackText`. Tests updated.
-- [ ] **M3 — Generic notification (D) + terminal thread events (B) + health (E).** `renderNotification`→`PostBlocks`; widen `Slacker.PublishNotification` to carry a struct (Emoji/Facts) + update its two test fakes; judge DM = headline + verdict glyph + blockquote excerpt (preview 280→~600) + Open-in-uzi; self-improve/scheduled restyled; `renderThread` completed/failed/cancelled/limit_wait restyled (failure reason full `section`); health nudge restyled. Tests updated.
-- [ ] **M4 — Chat surface (F).** Per-turn answer as `section` + `context` deep link (link out of the body); placeholder + empty-turn degrade as `context`; chat-status/proposal/run-request copy + emoji polish. Depends on M1. Tests updated.
-- [ ] **M5 — Docs.** `docs/slack.md` updated to describe the new message shapes and glyph set; examples refreshed. `web/scripts/check-docs.mjs` green.
+- [x] **M1 — Chat turn no longer dropped by the init heartbeat.** `applyChatFrame` guards the status flush on resolving content; a **slacksvc notifier regression test** (Go, not the agent stub) emits the real `user_message → status:init → text → status:result` order and asserts the thread carries the answer. `task gate:api` green.
+- [x] **M2 — Status root (A), glyph canonicalization, `[uzi]` deletions.** `renderRoot`→`PostBlocks`/`UpdateBlocks`; progress/health moved to a `context` block; one emoji-presentation glyph set across `statusLabel`/`limitWaitLabel`/`healthNudgeHead`/milestone; `[uzi]` removed from `notifier.go:302`, `notifier.go:745`, `linker.go:221`; test DM (K2) restyled. Every new `PostBlocks` carries a fixed/escaped `fallbackText`. Tests updated.
+- [x] **M3 — Generic notification (D) + terminal thread events (B) + health (E).** `renderNotification`→`PostBlocks`; widen `Slacker.PublishNotification` to carry a struct (Emoji/Facts) + update its two test fakes; judge DM = headline + verdict glyph + blockquote excerpt (preview 280→~600) + Open-in-uzi; self-improve/scheduled restyled; `renderThread` completed/failed/cancelled/limit_wait restyled (failure reason full `section`); health nudge restyled. Tests updated.
+- [x] **M4 — Chat surface (F).** Per-turn answer as `section` + `context` deep link (link out of the body); placeholder + empty-turn degrade as `context`; chat-status/proposal/run-request copy + emoji polish. Depends on M1. Tests updated.
+- [x] **M5 — Docs.** `docs/slack.md` updated to describe the new message shapes and glyph set; examples refreshed. `web/scripts/check-docs.mjs` green.
 
 ## Success criteria
 

@@ -263,7 +263,7 @@ func (e *Engine) runCycle(ctx context.Context, now time.Time, userID uuid.UUID, 
 			Kind:    "selfimprove_started",
 			RunID:   &runID,
 			Payload: map[string]any{"title": "Self-improvement run started", "body": body},
-			Slack:   &notifysvc.SlackRender{Title: "Self-improvement run started", Body: body},
+			Slack:   &notifysvc.SlackRender{Emoji: "🔧", Title: "Self-improvement run started", Body: body},
 		}); err != nil {
 			e.logger.Warn("selfimprove: notify started", "error", err)
 		}
@@ -290,7 +290,7 @@ func (e *Engine) skip(ctx context.Context, userID uuid.UUID, interval time.Durat
 		UserID:  userID,
 		Kind:    "selfimprove_skipped",
 		Payload: map[string]any{"title": "Self-improvement cycle skipped", "body": body},
-		Slack:   &notifysvc.SlackRender{Title: "Self-improvement cycle skipped", Body: body},
+		Slack:   &notifysvc.SlackRender{Emoji: "🔧", Title: "Self-improvement cycle skipped", Body: body},
 	}); err != nil {
 		e.logger.Warn("selfimprove: notify skip", "error", err)
 	}

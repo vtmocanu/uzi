@@ -82,11 +82,12 @@ func TestNotifierAwaitingInputPostsQuestionInThread(t *testing.T) {
 	if fs.questionSet[0].QuestionTs.String != "ts1" {
 		t.Fatalf("the card's own ts must be recorded so replies can be ordered against it: %+v", fs.questionSet[0])
 	}
-	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "needs your answer") {
-		t.Fatalf("root label must read the parked state, not the raw enum: %+v", fp.updates)
+	root, ok := findUpdateBlock(fp.updateBlocks, "root1")
+	if !ok || !strings.Contains(root.sectionText, "Needs your answer") {
+		t.Fatalf("root label must read the parked state, not the raw enum: %+v", fp.updateBlocks)
 	}
-	if strings.Contains(fp.updates[0].text, "awaiting_input") {
-		t.Fatalf("root line leaked the raw status enum: %q", fp.updates[0].text)
+	if strings.Contains(root.sectionText, "awaiting_input") {
+		t.Fatalf("root line leaked the raw status enum: %q", root.sectionText)
 	}
 }
 

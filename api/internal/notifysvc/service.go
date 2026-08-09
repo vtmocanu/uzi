@@ -40,10 +40,15 @@ type Store interface {
 // Slacker is the best-effort Slack delivery seam. The slacksvc Notifier satisfies
 // it via PublishNotification, which enqueues onto the notifier's own goroutine and
 // returns immediately — so a Slack call never blocks or fails Notify. Optional:
-// nil (Slack off, or a test) simply skips delivery. Primitives only, so notifysvc
-// and slacksvc share no types and there is no import cycle.
+// nil (Slack off, or a test) simply skips delivery.
+//
+// The method takes the SlackRender struct by value (PRD #268 M3), so slacksvc imports
+// notifysvc for the param type. That import is LEAF-WARD and one-directional: notifysvc
+// depends on store only and never imports slacksvc, so there is no cycle (go build is
+// the check). The struct replaces the earlier primitives-only signature because the
+// Block Kit renderer needs the emoji + structured facts, not just title/body/link.
 type Slacker interface {
-	PublishNotification(userID uuid.UUID, title, body, link string)
+	PublishNotification(userID uuid.UUID, r SlackRender)
 }
 
 // Service is the notify seam. slack and its render inputs are optional; only q is
@@ -71,12 +76,18 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 // SlackRender is the optional Slack DM rendering for a notification. Title is a
 // caller-set fixed label (e.g. "judge review ready"); Body is the dynamic,
 // potentially untrusted free text (a verdict summary, a repo/agent name) and Link
-// is an in-app deep-link URL. The notifier escapes + scrubs these before they
-// leave the box; the inbox row is the durable copy regardless.
+// is an in-app deep-link URL. Emoji is a caller-set leading glyph for the section
+// head (empty ⇒ none). Facts are caller-built TRUSTED short strings that may carry
+// intentional mrkdwn markup (`*bold*`, “ `code` “ chips, verdict emoji) built from
+// CLOSED enums/ints — the notifier scrubs them but does NOT mrkdwn-escape them (that
+// would break the intended markup). The notifier escapes + scrubs the untrusted
+// fields before they leave the box; the inbox row is the durable copy regardless.
 type SlackRender struct {
 	Title string
 	Body  string
 	Link  string
+	Emoji string
+	Facts []string
 }
 
 // Notification is the input to Notify: a user to notify, a kind + jsonb payload
@@ -131,7 +142,7 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	// Slack delivery, best-effort. Enqueues and returns; a Slack failure is handled
 	// entirely inside the notifier and never surfaces here.
 	if s.slack != nil && n.Slack != nil {
-		s.slack.PublishNotification(n.UserID, n.Slack.Title, n.Slack.Body, n.Slack.Link)
+		s.slack.PublishNotification(n.UserID, *n.Slack)
 	}
 
 	return row, nil
