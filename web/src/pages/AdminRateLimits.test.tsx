@@ -118,9 +118,27 @@ describe("AdminRateLimits", () => {
     expect(within(mihai).getByText("31%")).toBeTruthy(); // pct still shown, just dimmed
 
     const irina = screen.getByText("irina").closest("tr")!;
-    // no_token → em-dashes in the token cell, both window cells, and Updated.
-    // (Four since PRD #104 added the Token column; the badge keeps its own cell so
-    // the row stays aligned with the live ones.)
-    expect(within(irina).getAllByText("—").length).toBe(4);
+    // no_token → em-dashes in the token cell and the single Utilization cell.
+    // (Two since PRD #240 collapsed the two window columns into one and folded the
+    // Updated column under the Status pill — a no_token row shows no "updated" line,
+    // so its Updated dash is gone too. The badge keeps its own cell so the row stays
+    // aligned with the live ones.)
+    expect(within(irina).getAllByText("—").length).toBe(2);
+  });
+
+  it("renders the four-column header and no Updated/window columns (PRD #240 regression)", async () => {
+    // Pin the fix's intent: the table is User · Token · Utilization · Status. If a
+    // future change re-splits Utilization back into two window columns (or re-adds a
+    // standalone Updated column), the horizontal-scroll bug this PRD fixed returns —
+    // so this asserts the collapsed shape, not just that the headers render.
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
+    render(<AdminRateLimits />);
+    await screen.findByText("ana");
+
+    const headers = screen.getAllByRole("columnheader").map((h) => h.textContent);
+    expect(headers).toEqual(["User", "Token", "Utilization", "Status"]);
+    expect(screen.queryByRole("columnheader", { name: "Updated" })).toBeNull();
+    expect(screen.queryByRole("columnheader", { name: "5-hour window" })).toBeNull();
+    expect(screen.queryByRole("columnheader", { name: "7-day window" })).toBeNull();
   });
 });
