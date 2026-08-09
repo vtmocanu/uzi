@@ -25,6 +25,7 @@ import {
   BookIcon,
   BotIcon,
   ChatIcon,
+  ClockIcon,
   ChevronRightIcon,
   FactoryIcon,
   GaugeIcon,
@@ -336,6 +337,7 @@ function SidebarContent({
   unread = 0,
   judgeTodo = 0,
   runsInProgress = 0,
+  schedulesEnabled = 0,
   workersAttention = 0,
 }: {
   onNavigate?: () => void;
@@ -352,6 +354,10 @@ function SidebarContent({
   // (kind NOT IN chat/judge, Decision 4). Brand "count" tone, NOT the Workers `alert` red:
   // in-progress runs are healthy activity / a queue to get to, not "go look now".
   runsInProgress?: number;
+  // Enabled-schedule count for the Schedules nav badge (PRD #241 M5). The caller's
+  // enabled schedules (paused ones don't nag), brand "count" tone like Runs. 0 renders
+  // nothing.
+  schedulesEnabled?: number;
   // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
   // badge showing zero, which would be a permanent ornament that means nothing.
   workersAttention?: number;
@@ -478,6 +484,17 @@ function SidebarContent({
             // "in progress", not the count tone's default "unread": a run is never unread,
             // and the mock spec'd this noun. Brand tone (Decision 2), not the Workers alert red.
             badgeLabel="in progress"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
+          {/* Schedules (PRD #241): the time-driven run origin. Badge is the caller's
+              enabled-schedule count — brand "count" tone, paused ones excluded. */}
+          <NavItem
+            to="/schedules"
+            icon={<ClockIcon />}
+            label="Schedules"
+            badge={schedulesEnabled}
+            badgeLabel="enabled"
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
@@ -692,6 +709,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // In-progress runs badge (PRD #239). Owned here alongside `judgeTodo`, from
   // /me/runs/in-progress-count — the caller's non-terminal, non-chat/judge run count.
   const [runsInProgress, setRunsInProgress] = useState(0);
+  // Enabled-schedule badge (PRD #241 M5). Owned here alongside runsInProgress; the
+  // caller's enabled schedules, from the owner-scoped listSchedules.
+  const [schedulesEnabled, setSchedulesEnabled] = useState(0);
   // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
@@ -767,6 +787,26 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
   }, [user, location.pathname]);
 
+  // Enabled-schedule poll (PRD #241 M5): the same on-navigation cadence as the Runs
+  // poll above, reading the owner-scoped listSchedules and counting enabled rows. A
+  // failed fetch keeps the last known count rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setSchedulesEnabled(0);
+      return;
+    }
+    let alive = true;
+    api
+      .listSchedules()
+      .then((rows) => {
+        if (alive) setSchedulesEnabled(rows.filter((s) => s.enabled).length);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [user, location.pathname]);
+
   // Workers-attention poll (PRD #113 M6). On navigation AND on a fixed interval, which
   // is deliberately more than the Judge badge does: a worker's roll fails while the
   // operator is doing something else entirely, and a badge that only refreshes on
@@ -834,6 +874,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           unread={unread}
           judgeTodo={judgeTodo}
           runsInProgress={runsInProgress}
+          schedulesEnabled={schedulesEnabled}
           workersAttention={workersAttention}
         />
       </aside>
@@ -866,7 +907,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} workersAttention={workersAttention} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} />
           </div>
         </div>
       )}

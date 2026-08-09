@@ -12,6 +12,8 @@ import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
+import { ClockIcon } from "../components/icons";
+import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 
@@ -47,6 +49,8 @@ export function IssueView() {
   const [starting, setStarting] = useState(false);
   const [prdlessBusy, setPrdlessBusy] = useState(false);
   const [promoting, setPromoting] = useState(false);
+  // PRD #241: the "Schedule…" entry point, pre-pinned to this issue.
+  const [scheduling, setScheduling] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -305,6 +309,14 @@ export function IssueView() {
                   {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
                 </Button>
               )}
+              {/* Schedule… (PRD #241 M5, mock §3): opens the schedule modal
+                  pre-pinned to this issue (target=issue, locked). Available
+                  regardless of the immediate-run gate — you can schedule ahead. */}
+              {!issue.closed && (
+                <Button variant="secondary" onClick={() => setScheduling(true)} title="Schedule a run for this issue">
+                  <ClockIcon /> Schedule…
+                </Button>
+              )}
               {isHttpsUrl(issue.web_url) && (
                 <a href={issue.web_url} target="_blank" rel="noreferrer">
                   <Button variant="ghost">Open on {forgePlatform(issue.forge_type)}</Button>
@@ -369,8 +381,31 @@ export function IssueView() {
           </Card>
         </>
       )}
+
+      {scheduling && issue && (
+        <ScheduleModal
+          pinned={{ repoId, repoPath: repoPathFromWebUrl(issue.web_url), issueIid: issue.iid }}
+          onClose={() => setScheduling(false)}
+          onSaved={() => setScheduling(false)}
+        />
+      )}
     </div>
   );
+}
+
+// repoPathFromWebUrl derives a "namespace/repo" display path from an issue's forge
+// web URL, tolerating both GitLab (/-/issues/) and GitHub/Forgejo (/issues/) grammars.
+// Best-effort — an unparseable URL yields "", which the modal renders gracefully.
+function repoPathFromWebUrl(webUrl: string): string {
+  try {
+    const p = new URL(webUrl).pathname;
+    return p
+      .replace(/\/-\/issues\/.*/, "")
+      .replace(/\/issues\/.*/, "")
+      .replace(/^\/+/, "");
+  } catch {
+    return "";
+  }
 }
 
 function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl: string }) {

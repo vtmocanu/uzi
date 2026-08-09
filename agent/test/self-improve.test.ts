@@ -9,6 +9,7 @@ import {
   buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
+  guardCriticalMrSection,
   missingDeclaredDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
@@ -107,6 +108,41 @@ describe("selfImproveMrSection", () => {
     assert.ok(md.includes("MANUALLY"));
     // Test evidence still renders.
     assert.ok(md.includes("Test evidence"));
+  });
+});
+
+describe("guardCriticalMrSection (PRD #241 prompt-run flag)", () => {
+  it("is empty for an all-clear change (no guard path, no boilerplate)", () => {
+    // A prompt run carries no test evidence, so with nothing flagged the section
+    // must be "" — a clean prompt MR gets no self-improvement-style block.
+    assert.equal(guardCriticalMrSection([]), "");
+  });
+
+  it("raises the same guard-critical flag self_improve uses, listing the paths", () => {
+    const md = guardCriticalMrSection([
+      "agent/src/guardrails.ts",
+      "api/internal/vault/vault.go",
+    ]);
+    assert.ok(md.includes("Guard-critical paths"));
+    assert.ok(md.includes("Guard-critical paths touched"));
+    assert.ok(md.includes("`agent/src/guardrails.ts`"));
+    assert.ok(md.includes("`api/internal/vault/vault.go`"));
+  });
+
+  it("fails CLOSED when the diff is unavailable (null)", () => {
+    const md = guardCriticalMrSection(null);
+    assert.ok(md.includes("Guard-path check: UNAVAILABLE"));
+    assert.ok(md.includes("MANUALLY"));
+  });
+
+  it("shares one warning text with selfImproveMrSection (no copy drift)", () => {
+    // The guard warning wording must be identical in both surfaces — it is factored
+    // through guardCriticalWarningLines, and this pins that they don't drift apart.
+    const hits = ["agent/src/git.ts"];
+    const promptMd = guardCriticalMrSection(hits);
+    const selfMd = selfImproveMrSection(hits, []);
+    assert.ok(promptMd.includes("Guard-critical paths touched — review with extra care."));
+    assert.ok(selfMd.includes("Guard-critical paths touched — review with extra care."));
   });
 });
 

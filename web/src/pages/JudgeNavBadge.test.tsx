@@ -41,6 +41,7 @@ vi.mock("../lib/api", () => ({
     // Runs badge would put a second count in this nav and the loose digit matchers
     // here would start measuring the wrong badge.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
+    listSchedules: vi.fn().mockResolvedValue([]),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
     listNotifications: vi.fn(),

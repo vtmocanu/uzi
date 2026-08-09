@@ -79,6 +79,10 @@ uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
+uzi schedule create --repo <id> (--issue <iid> | --sweep [--label <l> ...] | --prompt <text>)
+                    (--at <rfc3339> | --cron <expr>) [--tz <iana>]
+                    [--auto-approve[=false]] [--wait-on-limit]
+uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--category label,label]
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
@@ -149,6 +153,21 @@ A few worth knowing:
   target, submits, and gets back a 409: the question it read was already
   answered. Re-run `run get` if that happens; it isn't a sign anything went
   wrong with your first answer.
+- **`schedule` runs work on a clock.** A schedule starts run(s) at future
+  time(s) through the *same* shared seam a manual `run create` uses, so PRDLESS
+  gating, the forge issue fetch, active-run dedup and the usage-limit park all
+  behave identically — a schedule can do nothing a manual start can't. `schedule
+  create` takes exactly one **target** (`--issue <iid>` a pinned issue; `--sweep`
+  every eligible issue matching the repeatable `--label` selector, defaulting to
+  the PRD label; or `--prompt <text>` an issue-less repo→MR run) and exactly one
+  **timing** (`--at <rfc3339>` fires once, or `--cron <expr>` recurring in
+  `--tz`); either constraint violated is a usage error before any request.
+  `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
+  gate); pass `--auto-approve=false` to keep the gate, and `--wait-on-limit` to
+  park a fired run on a usage limit rather than fail it. `schedule list`/`get`
+  read them, `pause`/`resume` flip firing without deleting, `run-now` fires one
+  immediately without disturbing its cadence, and `delete` removes it (run
+  history is preserved).
 - **`review show <id>`** (formerly `run review <id>`, still around as a
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see

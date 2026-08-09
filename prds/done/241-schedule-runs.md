@@ -1,9 +1,41 @@
 # PRD #241: Scheduled runs (one-time + recurring; pinned issue, label sweep, or ad-hoc prompt) from web + CLI
 
 **GitLab Issue**: [#241](https://gitlab.example.com/vtmocanu/uzi/-/issues/241)
-**Status**: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. **Owner resolved both open decisions 2026-08-08: auto-approve defaults ON (Decision 4); the prompt target is NOT admin-gated (Decision 10).** See the Decision Log. **Code citations re-verified against HEAD 2026-08-08**: every symbol, signature and mechanism intact; stale line numbers in `service.go` and `runner.ts` refreshed, the `HasActiveRunForIssue`-is-a-seam-method slip corrected, and the draft migration bumped off the `00100` collision to `00103`.)
+**Status**: **Complete (2026-08-08)** — all milestones M1–M8 shipped, reviewed, and gated green on branch `agent/issue-241`. See "As-built corrections" immediately below for the few places the shipped design diverged from this draft. Original history: Draft (created 2026-08-07; mock approved by owner same day; reviewed same day by an architect agent — concurrency/replica claim corrected to single-instance, the "inherited for free" seam boundary narrowed, sweep eligibility/consent fixed. **Expanded same day at owner's direction**: the sweep target generalized to a label selector (Decision 9), and a third target added — an issue-less repo→MR **ad-hoc prompt**, a new run kind (Decision 10). Re-reviewed by an architect agent, which corrected the prompt kind from the `self_improve` shape to the **`ci_fix` shape** — repo-ful + issue-less — and caught both kind CHECKs, the schedule-keyed dedup NULL gap, the FK delete semantics, and the `#null` MR hazard. **Owner resolved both open decisions 2026-08-08: auto-approve defaults ON (Decision 4); the prompt target is NOT admin-gated (Decision 10).** See the Decision Log. **Code citations re-verified against HEAD 2026-08-08**: every symbol, signature and mechanism intact; stale line numbers in `service.go` and `runner.ts` refreshed, the `HasActiveRunForIssue`-is-a-seam-method slip corrected, and the draft migration bumped off the `00100` collision to `00103`.)
 **Priority**: Medium
 **Mock**: `prds/mockups/241-schedule-runs-mock.html` (approved 2026-08-07)
+
+## As-built corrections (2026-08-08)
+
+The implementation follows this PRD; these are the points where the shipped code
+diverges from the draft prose, recorded so a future reader trusts the code, not the draft:
+
+1. **The `prompt` kind is the `ci_fix` shape end-to-end.** One stale phrase in the Solution
+   Overview ("a new run kind on the `self_improve` shape") is a leftover; Decision 10 and the
+   shipped code are `ci_fix`-shaped (repo-ful, issue-less). Corrected inline below.
+2. **`runs.schedule_id` FK is `ON DELETE SET NULL` and the prompt shape CHECK does NOT require
+   `schedule_id IS NOT NULL`.** Decision 10 point 3 called for both, but they are jointly
+   unsatisfiable — `ON DELETE SET NULL` issues `UPDATE runs SET schedule_id = NULL`, which a
+   `schedule_id IS NOT NULL` CHECK rejects, so deleting a schedule (or cascade-deleting the
+   owning user/repo) would abort once any prompt run existed. The NOT-NULL clause was dropped;
+   dedup is guaranteed instead because the ONLY inserter of a prompt run — the scheduler's
+   dedicated INSERT — always stamps `schedule_id`, where `uq_runs_one_active_prompt_per_schedule`
+   catches concurrent live runs. `schedule_id` goes NULL only after the schedule is gone, when
+   dedup is moot. (Migration `00104`.)
+3. **The DST example was factually off.** In `Europe/Bucharest` on the 2026 spring-forward day
+   the gap is 03:00→04:00, so a `30 2 * * *` daily cron's 02:30 wall time still exists. The M2
+   DST test therefore asserts (a) `30 2` compresses to a 23h inter-fire gap across the transition,
+   and (b) a cron actually IN the gap (`30 3 * * *`) is skipped to the next valid instant — the
+   real load-bearing behavior. Decision 3 / M2 / Risks text that implies 02:30 is in the gap is
+   superseded by this.
+4. **The guard-critical-path flag for uzi-repo prompt runs SHIPPED in M8** (not left as a
+   follow-up): `guardCriticalMrSection` in `agent/src/runner.ts` flags a prompt-run MR that
+   touches uzi's guard surface (keyed on `GUARD_CRITICAL_PATTERNS`, fail-closed), since the
+   claim carries no repo-identity field.
+5. **Schema shipped as two migrations** (`00103_run_schedules.sql` table, `00104_…` provenance +
+   prompt kind), and an extra owner-scoped endpoint `POST /api/schedules/preview` backs the
+   modal's live next-fires preview. The scheduler also parks a malformed-config schedule
+   (`ErrBadConfig`) instead of retrying it forever, and a config edit revives `status='active'`.
 
 ## Problem
 
@@ -35,7 +67,7 @@ persisted, owner-scoped intent to create run(s) at future time(s):
   - a **label sweep** — at fire time, every open issue on the repo matching a label selector
     that *also* passes the run-creation gate; the selector defaults to the PRD label (Decision 9);
   - an **ad-hoc prompt** — a stored prompt run against the repo with **no issue**, opening an
-    MR; a new run kind on the `self_improve` shape (Decision 10).
+    MR; a new run kind on the `ci_fix` shape (repo-ful + issue-less; Decision 10).
 
 Schedules are managed from a new web **Schedules** surface (list page + create/edit modal
 + an issue-view "Schedule…" entry point) and a `uzi schedule …` CLI, each a peer consumer
@@ -360,18 +392,18 @@ flag for uzi-repo prompt runs remains the one worker-side follow-up (M8).
 ## Milestones
 
 ### M1 — Schema + store queries (`api`)
-- [ ] Migration (draft `00103_run_schedules.sql` — live head is `00102`, and the earlier
+- [x] Migration (draft `00103_run_schedules.sql` — live head is `00102`, and the earlier
   `00100` draft collided with the existing `00100_worker_online_since.sql`; **renamed to the
   next free number at merge** per the goose convention) creating `run_schedules` with the columns in Decision 1
   (incl. `labels` jsonb and `prompt` text), an index on `(enabled, status, next_fire_at)` for
   the claim, and a CHECK enforcing the `target`/`timing` field-presence invariants (e.g.
   `issue_iid` non-null iff `target='issue'`; `prompt` non-null iff `target='prompt'`).
-- [ ] Migration adding nullable **`runs.schedule_id`** FK (**`ON DELETE SET NULL`**) and
+- [x] Migration adding nullable **`runs.schedule_id`** FK (**`ON DELETE SET NULL`**) and
   editing **both** kind constraints in `00058` — `runs_kind_check` (`kind IN …`) **and**
   `runs_kind_shape` — for the new `prompt` kind (repo-ful, issue-less, `schedule_id` non-null,
   `issue_title` set). Also the `RunKind` type (`agent/src/protocol.ts`) and an API kind constant
   (`workersvc/judge.go` neighborhood) — Decision 10.
-- [ ] sqlc queries in a new `queries/schedules.sql`: create, get, list-for-user,
+- [x] sqlc queries in a new `queries/schedules.sql`: create, get, list-for-user,
   update (edit + pause/resume), delete, **ClaimDueSchedules** (`FOR UPDATE SKIP LOCKED`,
   single-instance defense-in-depth per Decision 1), and **AdvanceSchedule** (a *separate*
   statement — set `last_fired_at`, recompute or terminate — with retry-without-advance on a
@@ -380,97 +412,101 @@ flag for uzi-repo prompt runs remains the one worker-side follow-up (M8).
   selector labels (default = PRD label), and a **`HasActiveRunForSchedule`** dedup query for the
   prompt target (Decision 10). `sqlc generate` (verify the generated const moved, per
   `.claude/rules/go.md`).
-- [ ] Live-DB test (`*LiveDB`) for the claim/advance round-trip across `once` and
+- [x] Live-DB test (`*LiveDB`) for the claim/advance round-trip across `once` and
   `recurring`, proving the query runs against real Postgres.
 
 ### M2 — Cron / next-fire engine (`api`, pure)
-- [ ] New `api/internal/schedsvc` (name TBD): add `robfig/cron/v3` (Decision 3); functions
+- [x] New `api/internal/schedsvc` (name TBD): add `robfig/cron/v3` (Decision 3); functions
   to validate a cron string, compute `next_fire_at` for `(cron, tz)` and for a `once`
   `run_at`, and render the next N fires.
-- [ ] Preset↔cron translation helpers (Decision 6), shared so web/CLI/api agree.
-- [ ] Unit tests including a **DST boundary** case (a 02:30 daily cron across a spring-forward
+- [x] Preset↔cron translation helpers (Decision 6), shared so web/CLI/api agree.
+- [x] Unit tests including a **DST boundary** case (a 02:30 daily cron across a spring-forward
   day in `Europe/Bucharest`) and an invalid-cron rejection. No DB, fast.
 
 ### M3 — Scheduler goroutine (`api`)
-- [ ] A **single-instance** background actor modeled on `selfimprove.Engine` (ticker +
+- [x] A **single-instance** background actor modeled on `selfimprove.Engine` (ticker +
   durable gate + a `Boot()` immediate tick, Decision 8), taking a `ForgeBuilder` dependency
   like the selfimprove engine: claim due schedules, fire each, then AdvanceSchedule.
-- [ ] Per-issue firing replicates the poller's caller-side steps (Decision 2): `GetRepoForUser`
+- [x] Per-issue firing replicates the poller's caller-side steps (Decision 2): `GetRepoForUser`
   (also enforces owner-owns-repo, Decision 7) → `ForgeForConnection` → `f.GetIssue` for fresh
   labels/body → compute `allowWithoutPRD` → call the seam. Cite `poller/autopilot.go:198-210`
   as the template.
-- [ ] Sweep path: the **label-parameterized** candidate query (Decisions 7, 9) +
+- [x] Sweep path: the **label-parameterized** candidate query (Decisions 7, 9) +
   `HasActiveRunForIssue` dedup; pinned path: single issue with the same dedup. Do **not** wire
   autopilot's `eligible()` consent gate.
-- [ ] Prompt path (Decision 10): a dedicated INSERT **+ `GetRepoForUser` consent wrapper**
+- [x] Prompt path (Decision 10): a dedicated INSERT **+ `GetRepoForUser` consent wrapper**
   modeled on `self_improve.go` (`kind='prompt'`, repo-ful, prompt-as-description, `schedule_id`
   set, `issue_title` derived), dedup via `HasActiveRunForSchedule`. Does **not** touch the issue
   seam or the forge issue APIs.
-- [ ] **Skip-vs-advance rule** (review): when a fire is skipped because the prior run is still
+- [x] **Skip-vs-advance rule** (review): when a fire is skipped because the prior run is still
   live, `AdvanceSchedule` still advances `next_fire_at` to the next cadence and drops this fire
   (per Decision 8) — do **not** hold a past `next_fire_at` (tick-storm) nor queue a second run
   (double-fire). Applies to all targets; sharpest for prompt (schedule-keyed dedup).
-- [ ] Error handling: a schedule whose owner/token/repo is gone goes `status='error'`
+- [x] Error handling: a schedule whose owner/token/repo is gone goes `status='error'`
   (surfaced, not silently dropped); a transient forge/DB error is logged and retried next
   tick without advancing.
-- [ ] Wire the actor into `cmd/server/main.go` beside the poller/sweeper/selfimprove
+- [x] Wire the actor into `cmd/server/main.go` beside the poller/sweeper/selfimprove
   (single-instance, matching them).
-- [ ] Live-DB test: seed a due schedule, run one tick, assert a run was created via the seam
-  and `next_fire_at` advanced (recurring) / `status='fired'` (once).
+- [x] Live-DB test: seed a due schedule, run one tick, assert a run was created via the seam
+  and `next_fire_at` advanced (recurring) / `status='fired'` (once). *(As-built: the one-tick
+  assertions — run created via the seam, recurring advance, once→`fired`, dedup-skip-still-advances,
+  transient-no-advance, permanent-parks — shipped as a fakes-based tick test in
+  `schedsvc/scheduler_test.go`, which isolates the tick logic; the claim/advance round-trip against
+  real Postgres is the `*LiveDB` test in M1.)*
 
 ### M4 — API endpoints + DTOs (`api`)
-- [ ] `GET /api/me/schedules` (list, owner-scoped), `POST /api/repos/{id}/schedules`
+- [x] `GET /api/me/schedules` (list, owner-scoped), `POST /api/repos/{id}/schedules`
   (create), `GET/PATCH/DELETE /api/schedules/{id}`, and `POST /api/schedules/{id}/run-now`
   (fire immediately through the seam). Mounted on `RequireUser` (so a CLI token works),
   owner-scoped; create validates cron/tz and the per-target fields (issue_iid / labels /
   prompt) via M2 + Decisions 9-10.
-- [ ] DTOs in `apitypes` (schedule row + next-fires preview), and a `runsForLimiter`-style
+- [x] DTOs in `apitypes` (schedule row + next-fires preview), and a `runsForLimiter`-style
   decision on whether create should sit behind the forge per-user limiter (it does a forge
   read on `run-now`/pinned validation) — match `CreateRun`'s limiter posture.
-- [ ] Handler tests: auth (owner-only), validation (bad cron → 400), shape.
+- [x] Handler tests: auth (owner-only), validation (bad cron → 400), shape.
 
 ### M5 — Web: Schedules surface (`web`)
-- [ ] `/schedules` page (list table per the mock §1) + a `NavItem` in the **Work** group
+- [x] `/schedules` page (list table per the mock §1) + a `NavItem` in the **Work** group
   with an optional enabled-count badge (mock §4), reusing the existing `NavItem`/badge
   mechanism.
-- [ ] Create/edit modal (mock §2): Target (issue / label sweep / prompt) + Timing segmented
+- [x] Create/edit modal (mock §2): Target (issue / label sweep / prompt) + Timing segmented
   pickers — the label sweep reveals a **label multiselect** (Decision 9), the prompt target a
   **prompt textarea** (Decision 10); preset dropdown + time, Advanced (raw cron + tz), options
   (wait-on-limit, auto-approve), and a **live "Next fires" preview** computed from M2's logic.
-- [ ] Issue-view **"Schedule…"** action beside "Start run" (mock §3), opening the modal
+- [x] Issue-view **"Schedule…"** action beside "Start run" (mock §3), opening the modal
   pre-pinned to that issue.
-- [ ] `api.*` methods in `web/src/lib/api.ts` + matching `web/src/mocks/mockApi.ts` (mock
+- [x] `api.*` methods in `web/src/lib/api.ts` + matching `web/src/mocks/mockApi.ts` (mock
   parity, typechecked against `realApi`), so `VITE_UZI_MOCK=1` demos the surface from
   fixtures. Vitest coverage for the modal's mode/target switching and the preview.
 
 ### M6 — CLI parity (`api/cmd/uzi`)
-- [ ] `uzi schedule` command group: `create` (`--repo`, one of `--issue`|`--sweep`|`--prompt`,
+- [x] `uzi schedule` command group: `create` (`--repo`, one of `--issue`|`--sweep`|`--prompt`,
   `--label` (repeatable, with `--sweep`), `--at`|`--cron` `--tz`, `--auto-approve`,
   `--wait-on-limit`), `list`, `get`, `pause`, `resume`, `run-now`, `delete` — with `--json` and
   documented exit codes, matching the existing `uzi run` command's conventions. (Mandatory per
   the "new functionality ⇒ check `api/cmd/uzi/`" convention.)
-- [ ] Command tests mirroring `run.go`'s (`commands_test.go` style).
+- [x] Command tests mirroring `run.go`'s (`commands_test.go` style).
 
 ### M7 — Docs, specs, gates
-- [ ] `docs/` page (audience: user) for scheduling, and a `docs/cli.md` update for the
+- [x] `docs/` page (audience: user) for scheduling, and a `docs/cli.md` update for the
   `uzi schedule` group; `web/scripts/check-docs.mjs` stays green.
-- [ ] `specs/ai.md` records Decisions 1–10; `specs/human.md` only with owner approval.
-- [ ] ARCHITECTURE.md: add the scheduler as the time-driven run origin (a peer of autopilot
+- [x] `specs/ai.md` records Decisions 1–10; `specs/human.md` only with owner approval.
+- [x] ARCHITECTURE.md: add the scheduler as the time-driven run origin (a peer of autopilot
   in "Agent runtime") and the `prompt` run kind beside `chat`/`ci_fix`/`self_improve`.
   **Consider an ADR** (`adr/0241-…`) only if the scheduler seam or the prompt-kind gate-bypass
   proves to be a durable invariant other code must respect — the ADR set is deliberately small;
   default to the PRD Decision Log otherwise. (The Decision 10 gate-bypass is a plausible ADR
   candidate.)
-- [ ] All gates green: `task gate:api` (incl. `-race`, ratcheted lint, deadcode-at-zero),
+- [x] All gates green: `task gate:api` (incl. `-race`, ratcheted lint, deadcode-at-zero),
   `task gate:web`, `task gate:agent` (M8 touches it), `task gate:repo`.
 
 ### M8 — Worker support for the ad-hoc prompt kind (`agent`)
-- [ ] The worker claims and executes `kind='prompt'` runs (Decision 10): task = the run's
+- [x] The worker claims and executes `kind='prompt'` runs (Decision 10): task = the run's
   `issue_description`, no issue reference. **Model on the issue-less `ci_fix` path, not
   `self_improve`** (which carries a tracking issue). Add a real `prompt` case to
   `runnerCloneForClaim` (branch derivation), `mrTitle`, and `mrDescription` (`runner.ts`) — the
   issue defaults produce `#null` MR text otherwise — and add `prompt` to the `RunKind` type.
-- [ ] Guardrails unchanged: the `PreToolUse` deny-hook and PAT/branch protections apply
+- [x] Guardrails unchanged: the `PreToolUse` deny-hook and PAT/branch protections apply
   identically — this kind adds a *trigger*, not a new capability. Consider the guard-critical-
   path flag (`GUARD_CRITICAL_PATTERNS`) if a prompt run targets the uzi repo. `task gate:agent`
   green.

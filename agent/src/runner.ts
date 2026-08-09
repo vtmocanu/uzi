@@ -43,6 +43,7 @@ import {
   buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
+  guardCriticalMrSection,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -939,6 +940,29 @@ export class RunRunner {
         );
       }
 
+      // Guard-critical flag for an ad-hoc scheduled prompt run (PRD #241 Decision 10,
+      // the one worker-side follow-up). self_improve gets this flag by KIND — it is
+      // hardcoded API-side to uzi's own repo, a decision the worker CANNOT reproduce:
+      // the claim carries no repo-identity field, so there is no clean worker-side
+      // "is this the uzi repo" signal to gate on (flagged for the owner in the M8
+      // report — a repo-identity flag on the claim would be the API-side alternative).
+      // Instead we key the flag on the CHANGED PATHS: GUARD_CRITICAL_PATTERNS match
+      // uzi's own security-critical source paths only, so flagGuardPaths fires exactly
+      // when a prompt run actually touches uzi's guard surface (i.e. it targets the
+      // uzi repo) and is an empty no-op on any other repo. We do NOT run
+      // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
+      // against an arbitrary repo. Best-effort, gathered before the push like the
+      // self_improve evidence above.
+      let promptGuardSection: string | undefined;
+      if (claim.kind === "prompt") {
+        // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
+        // note, exactly as the self_improve path does above (M5 audit).
+        const changed = await this.git.changedFiles(barePath, trackingRef);
+        promptGuardSection = guardCriticalMrSection(
+          changed === null ? null : flagGuardPaths(changed),
+        );
+      }
+
       // The agent signalled done. The WORKER now performs the authenticated push
       // + MR with the PAT — the agent never had a credential.
       batcher.emit({
@@ -983,6 +1007,7 @@ export class RunRunner {
           result.branch,
           result.agentSelection,
           selfImproveSection,
+          promptGuardSection,
         ),
       });
       batcher.emit({
@@ -1493,6 +1518,23 @@ export class RunRunner {
         runId,
       );
     }
+    if (claim.kind === "prompt") {
+      // An ad-hoc SCHEDULED prompt run (PRD #241 Decision 10) is repo-ful and
+      // ISSUE-LESS — the ci_fix shape, not self_improve (which carries a tracking
+      // issue and reuses a FIXED branch across cycles). With no issue_iid there is
+      // no agent/issue-{iid} branch to key on, so derive a stable branch from the
+      // run id. Each fired prompt run is a distinct run, so `uzi/prompt-{runId}` is
+      // unique and collision-free — the worker's idempotent createMergeRequest opens
+      // exactly one MR for it (no fixed-branch reuse, unlike self_improve). The
+      // run_id also seeds the tracking-ref ownership anchor above.
+      const promptBranch = `uzi/prompt-${runId}`;
+      return this.git.runnerCloneForBranch(
+        barePath,
+        promptBranch,
+        promptBranch.replace(/\//g, "-"),
+        runId,
+      );
+    }
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId);
@@ -1824,6 +1866,11 @@ function mrTitle(claim: ClaimResponse): string {
   if (t) return t;
   if (claim.kind === "ci_fix" && claim.pipeline)
     return `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`;
+  // An ad-hoc scheduled prompt run (PRD #241) has no issue, so it must never render
+  // `Resolve issue #null`. The scheduler sets issue_title from a derived title so
+  // the trimmed-title branch above almost always wins; this is the empty-title
+  // fallback.
+  if (claim.kind === "prompt") return "Scheduled prompt run";
   return `Resolve issue #${claim.issue_iid}`;
 }
 
@@ -1837,6 +1884,7 @@ function mrDescription(
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
   selfImproveSection?: string,
+  promptGuardSection?: string,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -1868,6 +1916,24 @@ function mrDescription(
       "",
       `Failing pipeline: ${claim.pipeline.web_url}`,
       ...repoMarker,
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
+  if (claim.kind === "prompt") {
+    // An ad-hoc scheduled prompt run (PRD #241 Decision 10) is ISSUE-LESS: it is
+    // created from a schedule's stored prompt against this repo, with no issue to
+    // reference or close. Modeled on the self_improve branch above (references the
+    // task, does NOT `Closes #…`), never the issue fallback below whose
+    // `Implements/Closes #${issue_iid}` would render `#null`. When the change touched
+    // a guard-critical path, promptGuardSection carries the flag (empty otherwise).
+    return [
+      "Ad-hoc scheduled prompt run (PRD #241 Decision 10). This run was created from a",
+      "schedule's stored prompt against this repository — there is no tracking issue, so",
+      "this MR references the task but closes nothing.",
+      ...repoMarker,
+      promptGuardSection ?? "",
       "",
       "---",
       footer,
