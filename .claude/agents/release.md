@@ -84,7 +84,14 @@ which if unspecified; default to direct-to-`main`. Re-verify `main`
 mergeability IMMEDIATELY before tagging (bots + sibling PRD merges drift it); reconcile with
 a plain `git merge origin/main` (never force-push), renumber any append-numbered artifacts
 (goose migrations, `specs/ai.md` sections) above the merged head, re-run the gate on the
-merged tip, then tag. Confirm with the lead before pushing any tag. **Never
+merged tip, then tag **directly — do NOT wait for the release commit's `main`-branch CI
+pipeline to go green first.** The tag pipeline re-runs the full gate AND publishes (a strict
+superset, verified live: it carries every `test`/`lint`/`validate`/`build`/`e2e` stage plus
+the `publish:*` jobs), so tagging concurrently loses no gate coverage and saves a whole serial
+CI cycle. Cancel the now-redundant `main` pipeline
+(`glab api --method POST projects/vtmocanu%2Fuzi/pipelines/<id>/cancel`) to free runners for
+the tag pipeline; a cold Harbor cache just means a slower publish (never a failure), and a
+flaky tag pipeline re-runs with `glab ci run --branch v<X.Y.Z>`, tag left in place. Confirm with the lead before pushing any tag. **Never
 `[skip ci]` the commit you tag** — the marker skips the tag's *publish* pipeline
 too (push-triggered, same as the branch pipeline), so `git push origin vX.Y.Z`
 reports `* [new tag]` and publishes NOTHING; recovery is `glab ci run --branch

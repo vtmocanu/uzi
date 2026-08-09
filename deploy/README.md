@@ -64,10 +64,23 @@ tag's re-gate), and it runs the slow suite one fewer time — which matters beca
 run is an independent roll against flaky tests. The trade is that the release commit gets no
 independent pre-land review gate; that is low risk here because it only bumps `Chart.yaml` +
 CHANGELOG on code every feature MR already gated, and **the tag pipeline re-runs the whole
-gate as the safety net** (step 2). Note the Harbor layer cache is warmed by the `main`-branch
-build (MR builds are cache-less by design, Decision 2), so with either method you want the
-`main` pipeline on the release commit to have run before you tag — that is a publish-speed
-point (warm vs cold cache), not a correctness one, and it is the same for both.
+gate as the safety net** (step 2).
+
+**Tag directly — do NOT serialize behind the `main` pipeline.** The tag pipeline re-runs the
+**entire** gate (test, lint, validate, build, e2e) **and** publishes — verified against a live
+tag pipeline, it carries every gate stage the `main` build does plus the `publish:*` jobs, so
+it is a strict **superset** and tagging before the `main` build finishes loses **no** gate
+coverage. So push the release commit and tag it right away (step 2); the tag pipeline and the
+`main` pipeline then run **concurrently**, and you wait for **one** long CI (the tag's) instead
+of two in series. Cancel the now-redundant `main` pipeline
+(`glab api --method POST projects/vtmocanu%2Fuzi/pipelines/<id>/cancel`) to give the runners to
+the tag pipeline. The only cost is a **cold** Harbor layer cache (the `main` build is what
+warms it, MR builds are cache-less by design, Decision 2), which makes the tag's image builds
+a full rebuild — **slower, never a failure**; a flaky tag pipeline re-runs with
+`glab ci run --branch v<X.Y.Z>`, tag left in place. This assumes the usual mechanical release
+commit (CHANGELOG + `Chart.yaml` version only, on already-gated code); if you tagged a commit
+that changed real code and are unsure it is green, wait for the `main` gate first to avoid a
+bad tag.
 
 1. **Bump the chart version and write the CHANGELOG on the release commit.**
    Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z` (they must be
@@ -75,8 +88,10 @@ point (warm vs cold cache), not a correctness one, and it is the same for both.
    date — in the **same** commit. Then land it one of two ways:
 
    - **Direct to `main` (default).** `git checkout main && git pull --rebase`, commit the
-     bump, `git push origin main`. Let the `main`-branch pipeline run (it warms the cache
-     and is the gate); tag once it is green.
+     bump, `git push origin main`, then **tag right away** (step 2) — do not wait for the
+     `main` pipeline to go green; the tag pipeline re-gates and publishes (see "Tag directly"
+     above), so tagging concurrently saves a full serial CI cycle. Cancel the redundant `main`
+     pipeline to free runners.
    - **Via an MR (when you want it reviewed).** Open an MR, let CI go green, merge to `main`.
 
    **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
