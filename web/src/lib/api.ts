@@ -772,6 +772,13 @@ export interface Schedule {
   last_fired_at: string | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
+  // Per-sweep upper bound on issues fanned out per fire, oldest-first; null =
+  // unlimited. Sweep target only (null for issue/prompt).
+  max_issues: number | null;
+  // Optional owner guidance steering HOW a run approaches the task (the issue body
+  // stays the task); null = none. Issue and sweep targets only (null for prompt,
+  // which already carries its own prompt text). Capped at 8192 bytes server-side.
+  guidance: string | null;
   enabled: boolean;
   status: ScheduleStatus;
   created_at: string;
@@ -796,6 +803,11 @@ export interface ScheduleInput {
   timezone?: string;
   auto_approve?: boolean;
   wait_on_limit?: boolean;
+  // Sweep cap (oldest-first); explicit null clears to unlimited. Sweep target only.
+  max_issues?: number | null;
+  // Owner guidance for issue/sweep targets; explicit null/"" clears to none.
+  // Omitted on the prompt target so the server never rejects it.
+  guidance?: string | null;
   enabled?: boolean;
 }
 

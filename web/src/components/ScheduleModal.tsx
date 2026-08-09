@@ -191,8 +191,14 @@ export function ScheduleModal({
   );
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? false);
+  const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+  // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
+  // (agreeing with the server), an edit reflects the stored value (null included).
+  const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
+  // Optional owner guidance for issue/sweep targets; a string in state ("" = none).
+  // Steers HOW a run approaches the task — the issue body stays the task.
+  const [guidance, setGuidance] = useState<string>(editing?.guidance ?? "");
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
   const [previewError, setPreviewError] = useState(false);
@@ -346,6 +352,10 @@ export function ScheduleModal({
     if (!repoId) return false;
     if (target === "issue" && !(Number(issueIid) > 0)) return false;
     if (target === "prompt" && prompt.trim() === "") return false;
+    // Blank max_issues (null) = unlimited and is valid; a set value must be a
+    // positive integer. The server validates too.
+    if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0))
+      return false;
     if (timing === "recurring" && cron.trim() === "") return false;
     if (timing === "once" && !fromLocalInput(runAtLocal)) return false;
     return true;
@@ -355,6 +365,17 @@ export function ScheduleModal({
     target,
     issue_iid: target === "issue" ? Number(issueIid) : undefined,
     labels: target === "sweep" ? labels : undefined,
+    // Sweep-only cap; send explicit null (not undefined) so clearing the field
+    // clears the stored value to unlimited. Omitted on non-sweep targets.
+    max_issues: target === "sweep" ? maxIssues : undefined,
+    // Owner guidance on issue/sweep only; a blank/cleared textarea sends explicit
+    // null (clear to none). Omitted (undefined) on prompt so the server never rejects it.
+    guidance:
+      target === "issue" || target === "sweep"
+        ? guidance.trim() === ""
+          ? null
+          : guidance
+        : undefined,
     prompt: target === "prompt" ? prompt : undefined,
     timing,
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
@@ -395,6 +416,26 @@ export function ScheduleModal({
       setDeleting(false);
     }
   };
+
+  // Optional guidance textarea, rendered only for the issue and sweep targets
+  // (never prompt, which carries its own prompt text). Mirrors the prompt
+  // textarea's markup.
+  const guidanceField = (
+    <Field label="Guidance (optional)" htmlFor="sched-guidance">
+      <Textarea
+        id="sched-guidance"
+        rows={3}
+        maxLength={8192}
+        value={guidance}
+        onChange={(e) => setGuidance(e.target.value)}
+        placeholder="always add a failing test first"
+      />
+      <p className="mt-1 text-[11px] text-faint">
+        Steers how the run approaches the task, e.g. “always add a failing test first”. Applied to
+        every issue this schedule runs; the issue itself stays the task.
+      </p>
+    </Field>
+  );
 
   const footerSummary = [
     timing === "once" ? "One time" : "Recurring",
@@ -465,17 +506,20 @@ export function ScheduleModal({
           />
 
           {target === "issue" && (
-            <Field label="Issue number" htmlFor="sched-issue">
-              <Input
-                id="sched-issue"
-                type="number"
-                min={1}
-                value={issueIid}
-                disabled={!!pinned}
-                onChange={(e) => setIssueIid(e.target.value)}
-                placeholder="e.g. 142"
-              />
-            </Field>
+            <>
+              <Field label="Issue number" htmlFor="sched-issue">
+                <Input
+                  id="sched-issue"
+                  type="number"
+                  min={1}
+                  value={issueIid}
+                  disabled={!!pinned}
+                  onChange={(e) => setIssueIid(e.target.value)}
+                  placeholder="e.g. 142"
+                />
+              </Field>
+              {guidanceField}
+            </>
           )}
 
           {target === "sweep" && (
@@ -516,6 +560,23 @@ export function ScheduleModal({
                 Empty ⇒ the <span className="font-medium text-muted">{prdLabel}</span> label. A selector chooses
                 candidates; the run-creation gate (PRD link, or PRDLESS) chooses what actually fires.
               </p>
+              <Field label="Max issues per run" htmlFor="sched-max-issues">
+                <Input
+                  id="sched-max-issues"
+                  type="number"
+                  min={1}
+                  value={maxIssues ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value.trim();
+                    setMaxIssues(v === "" ? null : Number(v));
+                  }}
+                  placeholder="unlimited"
+                />
+                <p className="mt-1 text-[11px] text-faint">
+                  Oldest issues first. Leave blank for unlimited.
+                </p>
+              </Field>
+              {guidanceField}
             </div>
           )}
 

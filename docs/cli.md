@@ -82,7 +82,8 @@ uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
 uzi schedule create --repo <id> (--issue <iid> | --sweep [--label <l> ...] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
-                    [--auto-approve[=false]] [--wait-on-limit]
+                    [--auto-approve[=false]] [--wait-on-limit[=false]]
+                    [--max-issues <n>] [--guidance <text>]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--category label,label]
 uzi review resolve <id> <rec> | --category <c> --target <t>
@@ -164,11 +165,27 @@ A few worth knowing:
   **timing** (`--at <rfc3339>` fires once, or `--cron <expr>` recurring in
   `--tz`); either constraint violated is a usage error before any request.
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
-  gate); pass `--auto-approve=false` to keep the gate, and `--wait-on-limit` to
-  park a fired run on a usage limit rather than fail it. `schedule list`/`get`
-  read them, `pause`/`resume` flip firing without deleting, `run-now` fires one
-  immediately without disturbing its cadence, and `delete` removes it (run
-  history is preserved).
+  gate); pass `--auto-approve=false` to keep the gate. `--wait-on-limit` also
+  defaults **on** for a new schedule — a fired run parks until the Anthropic
+  usage window reopens instead of failing — and this now takes effect even on
+  the common auto-approve path (a schedule's own setting used to be silently
+  ignored there); pass `--wait-on-limit=false` to fail on limit instead. A
+  `--sweep` target defaults `--max-issues 10`, the cap on issues started per
+  fire, oldest issue first (must be positive; `0` or negative is rejected);
+  raise it with `--max-issues <n>`. The CLI has no `schedule update`, so a
+  sweep created from it always carries a cap — an unlimited sweep is reachable
+  only by blanking the field in the web modal. `--guidance <text>` attaches
+  optional owner steering ("always add a failing test first") to an `--issue`
+  or `--sweep` target only (a `--prompt` target rejects it, since a prompt
+  already carries its own text), injected into the run instruction as a
+  section separate from the issue body; it does not change which issues are
+  eligible to run, is capped at 8 KiB, and is truncated — never dropped — if a
+  large issue body plus guidance would otherwise push the composed instruction
+  over its size limit. Both `--max-issues` and `--wait-on-limit`'s new default
+  apply at create time only — existing schedules keep their stored values.
+  `schedule list`/`get` read them, `pause`/`resume` flip firing without
+  deleting, `run-now` fires one immediately without disturbing its cadence,
+  and `delete` removes it (run history is preserved).
 - **`review show <id>`** (formerly `run review <id>`, still around as a
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see

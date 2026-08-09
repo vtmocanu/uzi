@@ -376,6 +376,8 @@ type RunSchedule struct {
 	Status      string             `json:"status"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	MaxIssues   pgtype.Int4        `json:"max_issues"`
+	Guidance    pgtype.Text        `json:"guidance"`
 }
 
 type RunUsage struct {

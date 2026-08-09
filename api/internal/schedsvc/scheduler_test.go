@@ -2,8 +2,10 @@ package schedsvc
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,11 +28,12 @@ type fakeStore struct {
 	repoErr error
 	repoRow store.GetRepoForUserRow
 
-	activeIssue     bool
-	activeIssueErr  error
-	activeSchedule  bool
-	sweepRows       []store.ListSweepCandidateIssuesRow
-	sweepLabelParam []byte
+	activeIssue         bool
+	activeIssueErr      error
+	activeSchedule      bool
+	sweepRows           []store.ListSweepCandidateIssuesRow
+	sweepLabelParam     []byte
+	sweepMaxIssuesParam pgtype.Int4
 }
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {
@@ -46,6 +49,7 @@ func (f *fakeStore) SetRunScheduleStatus(_ context.Context, arg store.SetRunSche
 }
 func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error) {
 	f.sweepLabelParam = arg.Labels
+	f.sweepMaxIssuesParam = arg.MaxIssues
 	return f.sweepRows, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
@@ -66,6 +70,11 @@ type autopilotCall struct {
 	issueIID        int64
 	description     string
 	allowWithoutPRD bool
+	// waitOnLimit is nil for the poller-shaped CreateAutopilotRun (which drops the
+	// per-run choice and takes the owner default) and carries the schedule's captured
+	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
+	// auto-approve scheduled path threads the schedule's wait_on_limit by reading it.
+	waitOnLimit *bool
 }
 
 type runCall struct {
@@ -116,7 +125,20 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD})
+	// nil waitOnLimit: the poller seam has no per-run choice (owner default). Kept so the
+	// interface stays satisfied even though the scheduler no longer calls it.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil})
+	return store.Run{ID: uuid.New()}, nil
+}
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
+	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
+	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) so a test
+	// can prove the schedule's persisted wait_on_limit is threaded through.
+	if f.err != nil {
+		return store.Run{}, f.err
+	}
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error) {
@@ -227,10 +249,10 @@ func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	h.sched.Boot(context.Background())
 
 	if len(h.runs.autopilot) != 1 {
-		t.Fatalf("auto-approve issue: CreateAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
 	}
 	if len(h.runs.runs) != 0 {
-		t.Fatalf("auto-approve issue must NOT use the wait-on-limit CreateRun path, got %d", len(h.runs.runs))
+		t.Fatalf("auto-approve issue must NOT use the non-auto CreateScheduledRun path, got %d", len(h.runs.runs))
 	}
 	call := h.runs.autopilot[0]
 	if call.userID != h.owner || call.repoID != h.repoID || call.issueIID != 7 {
@@ -245,6 +267,31 @@ func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	}
 	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
 		t.Fatalf("recurring next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+}
+
+// TestTickAutoApproveIssueThreadsWaitOnLimit pins PRD #274 Decision 1a: an auto-approve
+// scheduled run must fire through CreateScheduledAutopilotRun and thread the schedule's
+// persisted wait_on_limit (not the poller's CreateAutopilotRun, which drops it to the
+// owner default). A nil captured value would mean the scheduler wrongly used the poller
+// seam; the assertion below fails in that case.
+func TestTickAutoApproveIssueThreadsWaitOnLimit(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule() // AutoApprove=true
+	s.WaitOnLimit = true
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+	}
+	got := h.runs.autopilot[0].waitOnLimit
+	if got == nil {
+		t.Fatalf("auto-approve scheduled run dropped wait_on_limit (nil) — it took the poller seam instead of CreateScheduledAutopilotRun")
+	}
+	if !*got {
+		t.Fatalf("auto-approve scheduled run threaded wait_on_limit = %v, want true (the schedule's persisted value)", *got)
 	}
 }
 
@@ -273,6 +320,48 @@ func TestTickNonAutoIssueScheduleUsesTheScheduledSeam(t *testing.T) {
 	}
 }
 
+// sweepSchedule builds a due sweep schedule owned by the harness owner/repo, carrying
+// the given max_issues cap (Valid=false for an unlimited/NULL cap).
+func (h *harness) sweepSchedule(maxIssues pgtype.Int4) store.RunSchedule {
+	return store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Labels:      []byte(`["PRD"]`),
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+		MaxIssues:   maxIssues,
+	}
+}
+
+// TestTickSweepThreadsMaxIssues pins PRD #274 M2 at the unit level: fireSweep must pass
+// the schedule's max_issues straight into ListSweepCandidateIssuesParams.MaxIssues so the
+// SQL LIMIT applies (the fake store runs no SQL, so this is the most a unit test can pin;
+// the real LIMIT is covered by the live-DB test). A NULL cap threads NULL (unlimited).
+func TestTickSweepThreadsMaxIssues(t *testing.T) {
+	// A set cap is threaded verbatim.
+	h := newHarness()
+	h.st.due = []store.RunSchedule{h.sweepSchedule(pgtype.Int4{Int32: 4, Valid: true})}
+	h.sched.Boot(context.Background())
+	got := h.st.sweepMaxIssuesParam
+	if !got.Valid || got.Int32 != 4 {
+		t.Fatalf("sweep max_issues param = %+v, want {Int32:4 Valid:true}", got)
+	}
+
+	// A NULL cap threads through as NULL (unlimited).
+	h2 := newHarness()
+	h2.st.due = []store.RunSchedule{h2.sweepSchedule(pgtype.Int4{})}
+	h2.sched.Boot(context.Background())
+	if h2.st.sweepMaxIssuesParam.Valid {
+		t.Fatalf("NULL max_issues must thread as an invalid (NULL) param, got %+v", h2.st.sweepMaxIssuesParam)
+	}
+}
+
 func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	h := newHarness()
 	s := h.issueSchedule()
@@ -283,7 +372,7 @@ func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	h.sched.Boot(context.Background())
 
 	if len(h.runs.autopilot) != 1 {
-		t.Fatalf("once issue: CreateAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		t.Fatalf("once issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
 	}
 	if len(h.st.advanceCalls) != 1 {
 		t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
@@ -417,5 +506,172 @@ func TestPromptTitleDerivation(t *testing.T) {
 	}
 	if promptTitle("   \n  ") != "Scheduled prompt run" {
 		t.Fatalf("blank prompt title fallback missing")
+	}
+}
+
+// ── Guidance composition (PRD #274 M3) ───────────────────────────────────────
+
+// TestComposeRunDescriptionEmptyGuidance pins the byte-identical invariant: a schedule
+// with no guidance (empty or whitespace-only) must produce exactly the body, with no
+// delimiter, so absent guidance is indistinguishable from the pre-M3 description.
+func TestComposeRunDescriptionEmptyGuidance(t *testing.T) {
+	body := "the issue body\n\nwith paragraphs"
+	for _, g := range []string{"", "   ", "\n\t \n"} {
+		if got := composeRunDescription(body, g); got != body {
+			t.Fatalf("composeRunDescription(body, %q) = %q, want body unchanged", g, got)
+		}
+	}
+}
+
+// TestComposeRunDescriptionAppendsDelineatedSection pins the composition shape: body,
+// then a delimiter, then the fixed owner-guidance header, then the guidance — with the
+// guidance clearly AFTER the body.
+func TestComposeRunDescriptionAppendsDelineatedSection(t *testing.T) {
+	body := "Fix the flaky test in the auth package."
+	guidance := "Always add a failing test first; keep the diff small."
+	got := composeRunDescription(body, guidance)
+
+	if !strings.HasPrefix(got, body) {
+		t.Fatalf("composed description must start with the body, got %q", got)
+	}
+	if !strings.Contains(got, "\n---\n") {
+		t.Fatalf("composed description missing the --- delimiter, got %q", got)
+	}
+	if !strings.Contains(got, "provided by the schedule owner to steer HOW") {
+		t.Fatalf("composed description missing the fixed owner-guidance header, got %q", got)
+	}
+	if !strings.Contains(got, guidance) {
+		t.Fatalf("composed description missing the guidance text, got %q", got)
+	}
+	// Guidance must appear after the body and after the header.
+	bodyEnd := strings.Index(got, body) + len(body)
+	if gi := strings.Index(got, guidance); gi <= bodyEnd {
+		t.Fatalf("guidance must appear after the body; bodyEnd=%d guidanceAt=%d", bodyEnd, gi)
+	}
+}
+
+// TestComposeRunDescriptionTruncatesNearCap is the silent-skip hazard: a body just under
+// the cap plus guidance must TRUNCATE the guidance to keep the composed total under the
+// cap, still emitting (a prefix of) the guidance rather than dropping to the body alone
+// (which would skip the issue via ErrDescriptionTooLarge downstream).
+func TestComposeRunDescriptionTruncatesNearCap(t *testing.T) {
+	const max = workersvc.MaxIssueDescriptionBytes
+	body := strings.Repeat("a", max-5000) // ~5000 bytes of headroom
+	guidance := strings.Repeat("g", 8*1024)
+
+	got := composeRunDescription(body, guidance)
+
+	if len(got) > max {
+		t.Fatalf("composed description len = %d, must be <= cap %d (never over)", len(got), max)
+	}
+	if got == body {
+		t.Fatalf("near-cap body dropped the guidance entirely (issue would still run but guidance lost); want a truncated guidance section")
+	}
+	if !strings.HasPrefix(got, body) {
+		t.Fatalf("composed description must still start with the full body")
+	}
+	if !strings.Contains(got, "g") {
+		t.Fatalf("truncated composition must still contain a prefix of the guidance")
+	}
+	if !strings.Contains(got, "[guidance truncated]") {
+		t.Fatalf("truncated composition must carry the truncation marker")
+	}
+}
+
+// TestComposeRunDescriptionBodyAtCapReturnsBodyUnchanged pins the no-room edge: when the
+// body alone already meets/exceeds the cap there is no room for guidance, so the body is
+// returned unchanged (createRun handles the oversized body exactly as before — guidance
+// must not make it worse).
+func TestComposeRunDescriptionBodyAtCapReturnsBodyUnchanged(t *testing.T) {
+	const max = workersvc.MaxIssueDescriptionBytes
+	body := strings.Repeat("a", max)
+	if got := composeRunDescription(body, "some guidance"); got != body {
+		t.Fatalf("body at cap must return body unchanged (len got %d, body %d)", len(got), len(body))
+	}
+}
+
+// TestComposeRunDescriptionTruncatesOnRuneBoundary pins that truncation never splits a
+// multibyte rune: the composed result stays valid UTF-8 even when the byte budget falls
+// mid-rune.
+func TestComposeRunDescriptionTruncatesOnRuneBoundary(t *testing.T) {
+	const max = workersvc.MaxIssueDescriptionBytes
+	body := strings.Repeat("a", max-5000)
+	guidance := strings.Repeat("世", 4000) // 3 bytes each — a byte cut will land mid-rune
+
+	got := composeRunDescription(body, guidance)
+	if !utf8.ValidString(got) {
+		t.Fatalf("composed description is not valid UTF-8 — truncation split a rune")
+	}
+	if len(got) > max {
+		t.Fatalf("composed description len = %d, must be <= cap %d", len(got), max)
+	}
+}
+
+// TestTruncateUTF8BacksUpToRuneStart is the direct boundary check on the truncation
+// helper: a byte budget that lands inside a multibyte rune backs up to the rune start.
+func TestTruncateUTF8BacksUpToRuneStart(t *testing.T) {
+	s := "世界foo" // 世,界 are 3 bytes each; then ASCII
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{0, ""},
+		{2, ""},    // mid first rune → back to 0
+		{3, "世"},   // exact boundary
+		{4, "世"},   // mid second rune → back to 3
+		{5, "世"},   // still mid second rune
+		{6, "世界"},  // exact boundary
+		{7, "世界f"}, // ASCII boundary
+		{100, s},   // n >= len → whole string
+	}
+	for _, c := range cases {
+		if got := truncateUTF8(s, c.n); got != c.want {
+			t.Fatalf("truncateUTF8(%q, %d) = %q, want %q", s, c.n, got, c.want)
+		}
+		if !utf8.ValidString(truncateUTF8(s, c.n)) {
+			t.Fatalf("truncateUTF8(%q, %d) produced invalid UTF-8", s, c.n)
+		}
+	}
+}
+
+// TestTickIssueScheduleComposesGuidance is the seam-level proof that a schedule carrying
+// guidance passes a COMPOSED description (body + delineated guidance) to the run-creation
+// seam. The fake captures the description on the auto-approve (autopilot) bucket.
+func TestTickIssueScheduleComposesGuidance(t *testing.T) {
+	h := newHarness() // fake forge issue Description == "body"
+	s := h.issueSchedule()
+	s.Guidance = pgtype.Text{String: "prefer table-driven tests", Valid: true}
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+	}
+	desc := h.runs.autopilot[0].description
+	if !strings.HasPrefix(desc, "body") {
+		t.Fatalf("composed description must start with the issue body, got %q", desc)
+	}
+	if !strings.Contains(desc, "prefer table-driven tests") {
+		t.Fatalf("composed description must carry the schedule's guidance, got %q", desc)
+	}
+	if !strings.Contains(desc, "provided by the schedule owner to steer HOW") {
+		t.Fatalf("composed description must carry the delineated owner-guidance header, got %q", desc)
+	}
+}
+
+// TestTickIssueScheduleNoGuidancePassesRawBody pins that a schedule WITHOUT guidance
+// passes the raw issue body to the seam, byte-identical to pre-M3 behaviour.
+func TestTickIssueScheduleNoGuidancePassesRawBody(t *testing.T) {
+	h := newHarness()
+	h.st.due = []store.RunSchedule{h.issueSchedule()} // no guidance
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+	}
+	if desc := h.runs.autopilot[0].description; desc != "body" {
+		t.Fatalf("no-guidance description = %q, want the raw body %q", desc, "body")
 	}
 }

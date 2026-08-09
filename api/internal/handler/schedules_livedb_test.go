@@ -123,8 +123,10 @@ func TestScheduleCRUDRoundTripLiveDB(t *testing.T) {
 	if dto.ID == "" || dto.Target != "issue" || dto.IssueIID == nil || *dto.IssueIID != 7 {
 		t.Fatalf("create dto = %+v, want issue/7", dto)
 	}
-	if !dto.AutoApprove || dto.WaitOnLimit || !dto.Enabled {
-		t.Fatalf("create defaults = auto:%v wait:%v enabled:%v, want true/false/true", dto.AutoApprove, dto.WaitOnLimit, dto.Enabled)
+	// PRD #274 Decision 1a: wait_on_limit now defaults ON at create time (a schedule is
+	// unattended, so a fired run parks on the usage limit rather than dying).
+	if !dto.AutoApprove || !dto.WaitOnLimit || !dto.Enabled {
+		t.Fatalf("create defaults = auto:%v wait:%v enabled:%v, want true/true/true", dto.AutoApprove, dto.WaitOnLimit, dto.Enabled)
 	}
 	if dto.NextFireAt == nil {
 		t.Fatalf("recurring schedule should have a next_fire_at")
@@ -205,6 +207,99 @@ func TestScheduleCRUDRoundTripLiveDB(t *testing.T) {
 	f.h.GetSchedule(goneRec, gone)
 	if goneRec.Code != http.StatusNotFound {
 		t.Fatalf("get after delete status = %d, want 404", goneRec.Code)
+	}
+}
+
+// TestScheduleMaxIssuesRoundTripLiveDB exercises the PRD #274 M2 sweep cap through the
+// real store column (pgtype.Int4): a new sweep defaults to 10, a config PATCH that resends
+// the cap persists it, and a config PATCH carrying an explicit null CLEARS it to unlimited
+// (the deliberate replace-semantics — a seed-and-keep would make unlimited unreachable).
+func TestScheduleMaxIssuesRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create a sweep with no explicit cap → server default 10.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.MaxIssues == nil || *dto.MaxIssues != 10 {
+		t.Fatalf("new sweep max_issues = %v, want the default 10", dto.MaxIssues)
+	}
+	id := dto.ID
+
+	patch := func(body string) apitypes.ScheduleDTO {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("patch %q status = %d, want 200 (body %s)", body, rec.Code, rec.Body.String())
+		}
+		var out apitypes.ScheduleDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		return out
+	}
+
+	// A config PATCH resending the cap persists the new value.
+	if got := patch(`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1","max_issues":3}`); got.MaxIssues == nil || *got.MaxIssues != 3 {
+		t.Fatalf("after set patch, max_issues = %v, want 3", got.MaxIssues)
+	}
+
+	// A config PATCH carrying an explicit null clears the cap to unlimited (NULL column).
+	if got := patch(`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1","max_issues":null}`); got.MaxIssues != nil {
+		t.Fatalf("after clear patch, max_issues = %v, want nil (unlimited)", got.MaxIssues)
+	}
+}
+
+// TestScheduleGuidanceRoundTripLiveDB exercises the PRD #274 M3 guidance field through the
+// real store column (pgtype.Text): a create persists guidance, a config PATCH that resends
+// it keeps it, a config PATCH omitting it CLEARS it to NULL (replace-semantics), and a blank
+// value normalizes to NULL rather than storing whitespace.
+func TestScheduleGuidanceRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create an issue schedule carrying guidance.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"add a failing test first"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.Guidance == nil || *dto.Guidance != "add a failing test first" {
+		t.Fatalf("new issue guidance = %v, want the stored value", dto.Guidance)
+	}
+	id := dto.ID
+
+	patch := func(body string) apitypes.ScheduleDTO {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("patch %q status = %d, want 200 (body %s)", body, rec.Code, rec.Body.String())
+		}
+		var out apitypes.ScheduleDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		return out
+	}
+
+	// A config PATCH resending guidance persists the new value.
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"keep the diff small"}`); got.Guidance == nil || *got.Guidance != "keep the diff small" {
+		t.Fatalf("after set patch, guidance = %v, want \"keep the diff small\"", got.Guidance)
+	}
+
+	// A config PATCH that omits guidance clears it (NULL column → nil DTO).
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1"}`); got.Guidance != nil {
+		t.Fatalf("after omit patch, guidance = %v, want nil (cleared)", got.Guidance)
+	}
+
+	// A blank guidance value normalizes to NULL, not stored whitespace.
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"   "}`); got.Guidance != nil {
+		t.Fatalf("blank guidance = %v, want nil (normalized to NULL)", got.Guidance)
 	}
 }
 

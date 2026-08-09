@@ -9,11 +9,11 @@
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled
+    auto_approve, wait_on_limit, enabled, max_issues, guidance
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
-    @auto_approve, @wait_on_limit, @enabled
+    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance')
 )
 RETURNING *;
 
@@ -54,6 +54,8 @@ SET target        = @target,
     next_fire_at  = sqlc.narg('next_fire_at'),
     auto_approve  = @auto_approve,
     wait_on_limit = @wait_on_limit,
+    max_issues    = sqlc.narg('max_issues'),
+    guidance      = sqlc.narg('guidance'),
     status        = 'active',
     updated_at    = now()
 WHERE id = @id AND user_id = @user_id
@@ -112,11 +114,18 @@ RETURNING *;
 -- calling), and jsonb containment (@>) matches rows whose labels array is a superset.
 -- author rides along for the same adder→author attribution fallback the autopilot
 -- path uses.
+--
+-- LIMIT sqlc.narg('max_issues') is the per-schedule sweep cap (PRD #274 M2, Decision 2):
+-- sqlc renders a NULL narg as an unlimited LIMIT, so a NULL max_issues preserves today's
+-- unbounded behaviour for free, and the ORDER BY forge_issue_iid ASC above makes LIMIT N
+-- a deterministic oldest-first batch. The narg FUNCTION form (not @max_issues) is
+-- deliberate — see .claude/rules/go.md on the runtime-comment byte-offset gotcha.
 SELECT forge_issue_iid, author
 FROM issues
 WHERE repo_id = @repo_id AND state = 'opened'
   AND labels @> @labels::jsonb
-ORDER BY forge_issue_iid ASC;
+ORDER BY forge_issue_iid ASC
+LIMIT sqlc.narg('max_issues');
 
 -- name: HasActiveRunForSchedule :one
 -- Whether a non-terminal prompt run already exists for this schedule. The pre-check

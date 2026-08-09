@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -81,6 +82,11 @@ type RunCreator interface {
 	// starts a link-less non-primary-eligible run (see workersvc.CreateScheduledRun).
 	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
+	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
+	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
+	// instead of the owner default. It is a distinct method so the poller's
+	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error)
 }
 
@@ -250,6 +256,11 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) ([]u
 // through the same per-issue flow as fireIssue. Per-issue failures are logged and
 // skipped so one bad issue does not abort the fan-out; only a failure to resolve the
 // repo/forge or to LIST is treated as transient for the whole schedule.
+//
+// The schedule's max_issues cap (PRD #274 M2) rides straight into the query as
+// ListSweepCandidateIssuesParams.MaxIssues: a NULL/invalid cap renders an unlimited
+// LIMIT (today's unbounded behaviour), and a set cap N returns the N OLDEST candidates
+// (the query's ORDER BY forge_issue_iid ASC), so the fan-out is an oldest-first batch.
 func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
@@ -260,7 +271,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]u
 		return nil, err
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repo.ID, Labels: labelsJSON,
+		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: sched.MaxIssues,
 	})
 	if err != nil {
 		return nil, err // transient DB error
@@ -335,24 +346,40 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 // link, description too large) are swallowed so the schedule still advances;
 // ErrRepoNotFound is permanent; anything else is transient.
 //
-// Decision 2: CreateAutopilotRun uses the OWNER's wait-on-limit default (an
-// auto-approve run has no human in the loop), so the schedule's wait_on_limit is
-// threaded ONLY on the non-auto-approve CreateScheduledRun path. This is intentional —
-// do not change the seam to thread it through the autopilot path.
+// Wait-on-limit (PRD #274 Decision 1a, revising PRD #241 Decision 2): BOTH branches now
+// thread the schedule's persisted wait_on_limit. The auto-approve branch fires through
+// CreateScheduledAutopilotRun (NOT the poller's CreateAutopilotRun, whose seam stays
+// untouched so label-driven autopilot keeps taking the owner default); the non-auto
+// branch fires through CreateScheduledRun. So a schedule's explicit wait_on_limit takes
+// effect regardless of auto_approve.
+//
+// Guidance (PRD #274 M3): before the seam call the issue body is composed with the
+// schedule's optional owner guidance into a single description via composeRunDescription
+// — a clearly delineated "how" section after the body (the untrusted forge task).
+// composeRunDescription truncates the guidance rather than let the composed total exceed
+// MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
+// ErrDescriptionTooLarge skip. It is purely additive: allowWithoutPRD is computed from
+// the raw labels and no eligibility gate sees the composed text.
 func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
+	desc := composeRunDescription(description, guidanceOf(sched))
+
+	waitOnLimit := sched.WaitOnLimit
 	var run store.Run
 	var err error
 	if sched.AutoApprove {
-		run, err = e.runs.CreateAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD)
+		// CreateScheduledAutopilotRun, NOT the poller's CreateAutopilotRun: a scheduled
+		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
+		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
+		// guarantee that label-driven autopilot behaviour is unchanged.
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit)
 	} else {
-		waitOnLimit := sched.WaitOnLimit
 		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
 		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
 		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
 		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, nil)
 	}
 
 	switch {
@@ -521,6 +548,87 @@ func (e *Scheduler) sleep(d time.Duration) {
 	if d > 0 {
 		time.Sleep(d)
 	}
+}
+
+// guidanceHeader is the fixed delimiter + framing prepended to owner guidance when it is
+// composed into a run instruction (PRD #274 M3). The wording is deliberately fixed: it
+// tells the model the section is HOW-steering authored by the schedule owner, distinct
+// from the issue body above it (the WHAT, and untrusted forge content). Do not template
+// user text into this header.
+const guidanceHeader = "\n\n---\n\n" +
+	"The guidance below was provided by the schedule owner to steer HOW this task is " +
+	"approached. It does not change WHAT the task is (described above); apply it where " +
+	"relevant.\n\n"
+
+// guidanceTruncMarker is appended when the guidance had to be truncated to keep the
+// composed description under MaxIssueDescriptionBytes, so the model (and a human reading
+// the run) can tell the guidance was cut rather than authored short.
+const guidanceTruncMarker = "\n\n…[guidance truncated]"
+
+// composeRunDescription joins an issue body (the task) with optional owner guidance (the
+// "how") into the single description passed to the run-creation seam (PRD #274 M3).
+//
+// When guidance is empty/whitespace it returns the body UNCHANGED — no delimiter — so a
+// schedule without guidance produces a byte-identical description to the pre-M3 behaviour.
+//
+// Otherwise it appends guidanceHeader + guidance. Because createRun rejects a description
+// over workersvc.MaxIssueDescriptionBytes with ErrDescriptionTooLarge — which the
+// scheduler treats as a benign skip — appending guidance must never push a runnable issue
+// over the cap. So when body + full section would exceed the cap, the GUIDANCE is
+// truncated (on a UTF-8 rune boundary) with a marker, keeping the header when there is
+// room for it, rather than the issue being silently dropped. If the body alone already
+// meets/exceeds the cap there is no room for guidance and the body is returned unchanged
+// (createRun handles the oversized body exactly as before — guidance does not make it
+// worse).
+func composeRunDescription(body, guidance string) string {
+	g := strings.TrimSpace(guidance)
+	if g == "" {
+		return body
+	}
+	const max = workersvc.MaxIssueDescriptionBytes
+
+	section := guidanceHeader + g
+	if len(body)+len(section) <= max {
+		return body + section
+	}
+
+	// Truncation path. If the body alone leaves no room, do not touch it.
+	room := max - len(body)
+	if room <= 0 {
+		return body
+	}
+	// Reserve the header and the truncation marker; whatever remains is the guidance
+	// budget. If the header + marker alone will not fit, guidance cannot be included
+	// meaningfully without risking the cap — run the body alone (it still runs).
+	avail := room - len(guidanceHeader) - len(guidanceTruncMarker)
+	if avail <= 0 {
+		return body
+	}
+	return body + guidanceHeader + truncateUTF8(g, avail) + guidanceTruncMarker
+}
+
+// guidanceOf reads a schedule's stored guidance as a plain string, "" when NULL/invalid.
+func guidanceOf(sched store.RunSchedule) string {
+	if sched.Guidance.Valid {
+		return sched.Guidance.String
+	}
+	return ""
+}
+
+// truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split
+// a multibyte rune. s is assumed valid UTF-8, so backing the cut up to the nearest rune
+// start yields a valid string.
+func truncateUTF8(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	if n <= 0 {
+		return ""
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────

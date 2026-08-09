@@ -8,6 +8,25 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Scheduled runs default to parking on a usage limit instead of failing,
+  a label sweep now caps how many issues it starts per fire, and a schedule
+  can carry optional owner guidance.** Three additive changes to the
+  schedules feature (PRD #241): (1) a new schedule's `wait_on_limit` now
+  defaults **on**, and — unlike before — that setting now actually takes
+  effect on the common auto-approve path, so an unattended, typically
+  off-hours fire parks on the Anthropic usage window rather than dying
+  silently; (2) a new label-sweep schedule defaults a `max_issues` cap of
+  **10**, applied oldest issue first, so one fire can't fan out across an
+  entire label's backlog at once (clear it in the web modal for unlimited);
+  (3) a pinned-issue or sweep schedule can carry optional `guidance` text
+  (capped at 8 KiB, truncated rather than dropped if it would push a large
+  issue over the run's size limit), injected into the run instruction as a
+  section clearly separate from the issue body to steer *how* a run
+  approaches its task without editing every issue. All three are
+  create-time defaults, per-schedule overridable, and leave existing
+  schedules untouched. CLI: `uzi schedule create` gains `--max-issues` and
+  `--guidance`, and `--wait-on-limit` now defaults on. (#274)
+
 - **A trusted repo's own conventions can now reach the agent.** The **Trusted
   repo** panel on the Repos page gains a **Repo instructions** toggle, a
   sibling of the existing **Repo skills** toggle, both independently
