@@ -30,6 +30,7 @@ import {
   retryHint,
   runBadge,
 } from "../lib/runBadge";
+import { runDurationLabel } from "../lib/runDuration";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
 import { boundedChips, chipLabels, hoistLabels } from "../lib/labelChips";
@@ -1409,6 +1410,11 @@ export function IssueCard({
   const draggable = !card.closed;
   const run = card.latest_run;
   const badge = run ? runBadge(run, Date.now()) : null;
+  // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span
+  // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`, "" for
+  // terminal (Decision 6). Rides the existing 10s poll via the same Date.now() the
+  // badge reads — no new timer (Decision 3).
+  const duration = run ? runDurationLabel(run, Date.now()) : "";
   const hint = run ? retryHint(run.run_count) : null;
   // A human-blocked run is the loudest card state: a person owes it an action while a
   // worker is held busy. Give the whole card a warn ring so it can't be missed.
@@ -1605,6 +1611,9 @@ export function IssueCard({
               </Badge>
             </span>
           ))}
+        {duration && (
+          <span className="font-mono text-[11px] text-faint">{duration}</span>
+        )}
         {hint && (
           <span className="text-[11px] text-faint" title="Number of runs on this issue">
             {hint}

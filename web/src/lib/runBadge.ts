@@ -286,15 +286,11 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };
     case "claimed":
       return { kind: "badge", label: "claimed", tone: "info", pulse: false };
-    case "running": {
-      const elapsed = formatElapsed(nowMs - Date.parse(run.created_at));
-      return {
-        kind: "badge",
-        label: `running ${elapsed}`,
-        tone: "info",
-        pulse: true,
-      };
-    }
+    case "running":
+      // The running elapsed moved OUT of the badge to the uniform per-card duration
+      // token (issue #256 M4, Decision 4) — the board now renders `running <elapsed>`
+      // via runDurationLabel, so a bare "running" badge here avoids doubling it.
+      return { kind: "badge", label: "running", tone: "info", pulse: true };
     case "awaiting_approval":
       return {
         kind: "badge",

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RunsList } from "./RunsList";
 import { api, type RunListItem } from "../lib/api";
@@ -26,6 +26,14 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+// Issue #256 M3: useNow is the single clock the duration token reads. Pin it so the
+// live buckets ("running 1h 30m") are deterministic — the real hook returns Date.now().
+const FIXED_NOW = Date.parse("2026-07-05T13:30:00Z");
+vi.mock("../lib/rateLimits", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/rateLimits")>();
+  return { ...actual, useNow: () => FIXED_NOW };
+});
 
 const mockApi = vi.mocked(api);
 
@@ -346,5 +354,85 @@ describe("RunsList milestone badge (PRD #122)", () => {
     );
     await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
+  });
+});
+
+// Issue #256 M3: each row carries a live, per-state duration token derived client-side
+// from the timestamps the run already has, driven by the pinned useNow clock above.
+describe("RunsList — live duration token (issue #256 M3)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  it("shows a running run's live age (started_at 90m before the fixed now)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "act",
+          issue_title: "Active run",
+          status: "running",
+          // 90 minutes before FIXED_NOW (2026-07-05T13:30:00Z) → "running 1h 30m".
+          started_at: "2026-07-05T12:00:00Z",
+        }),
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Active run")).toBeTruthy());
+    expect(screen.getByText(/running 1h 30m/)).toBeTruthy();
+    // The updated_at timestamp is kept alongside the token, not replaced (owner decision).
+    expect(container.textContent ?? "").toContain(new Date("2026-07-05T12:00:00Z").toLocaleString());
+  });
+
+  it("shows a terminal run's static ran-span (finished_at − started_at = 42m)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "term",
+          issue_title: "Terminal run",
+          status: "completed",
+          started_at: "2026-07-05T12:00:00Z",
+          finished_at: "2026-07-05T12:42:00Z",
+        }),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    // Terminal runs live behind the collapsed "Show past runs" toggle.
+    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/Show past runs/));
+    await waitFor(() => expect(screen.getByText("Terminal run")).toBeTruthy());
+    expect(screen.getByText(/ran 42m/)).toBeTruthy();
+  });
+
+  it("adds no token to a run whose anchor is missing (never a fabricated 0s)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      // A completed run that never started: no started_at, so the static span is "".
+      runs: [aRun({ id: "none", issue_title: "Never started", status: "completed", started_at: null, finished_at: null })],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/Show past runs/));
+    await waitFor(() => expect(screen.getByText("Never started")).toBeTruthy());
+    expect(screen.queryByText(/\bran\b/)).toBeNull();
   });
 });
