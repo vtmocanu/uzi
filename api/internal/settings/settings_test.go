@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -411,6 +412,35 @@ func TestValidateDispatch(t *testing.T) {
 	if err := Validate(KeyPrdlessLabel, "PRDLESS"); err != nil {
 		t.Errorf("Validate(prdless_label, valid) = %v, want nil", err)
 	}
+	// PRD #196: eligible_label_waives_prd_link routes to the strict bool parse —
+	// without its arm the default branch (ValidateLabel) would accept "yes"/"maybe"
+	// and the gate would fail OPEN.
+	for _, ok := range []string{"true", "false"} {
+		if err := Validate(KeyEligibleLabelWaivesPRDLink, ok); err != nil {
+			t.Errorf("Validate(eligible_label_waives_prd_link, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "yes", "maybe", "PRD", "1", "TRUE"} {
+		if err := Validate(KeyEligibleLabelWaivesPRDLink, bad); err == nil {
+			t.Errorf("Validate(eligible_label_waives_prd_link, %q) = nil, want a non-bool rejection (fails open otherwise)", bad)
+		}
+	}
+	// PRD #196: the two list keys route to validateLabelList, which ACCEPTS the comma
+	// a two-label list needs — the default branch (ValidateLabel) would reject it.
+	for _, k := range []string{KeyRunEligibleLabels, KeyBoardExtraLabels} {
+		if err := Validate(k, "PRD,bug"); err != nil {
+			t.Errorf("Validate(%s, \"PRD,bug\") = %v, want nil (comma list must be accepted)", k, err)
+		}
+		// A bad token in the list is still rejected (a too-long token; a token can
+		// never carry a comma post-split, and a whitespace-only token is dropped).
+		if err := Validate(k, "PRD,"+strings.Repeat("x", maxLabelLen+1)); err == nil {
+			t.Errorf("Validate(%s, too-long token) = nil, want a bad-token rejection", k)
+		}
+		// Empty is allowed (no extras / handled by ValidateMerged for eligible).
+		if err := Validate(k, ""); err != nil {
+			t.Errorf("Validate(%s, \"\") = %v, want nil (empty allowed)", k, err)
+		}
+	}
 }
 
 func TestLabelChanged(t *testing.T) {
@@ -435,6 +465,11 @@ func TestLabelChanged(t *testing.T) {
 		{"a prdless_enabled change does NOT force a resync", map[string]string{KeyPrdlessEnabled: "false"}, false},
 		{"a prdless_label change does NOT force a resync", map[string]string{KeyPrdlessLabel: "NOSPEC"}, false},
 		{"label + prdless together still resyncs on the label", map[string]string{KeyAutopilotLabel: "hands-off", KeyPrdlessLabel: "NOSPEC"}, true},
+		// PRD #196 Decision 5: the list keys are deliberately NOT in the whitelist —
+		// the sync fetch reads only the primary, so a resync on them is pointless and
+		// adding them re-opens the ANDed-fetch eviction defect.
+		{"a run_eligible_labels change does NOT force a resync", map[string]string{KeyRunEligibleLabels: "PRD,bug,security"}, false},
+		{"a board_extra_labels change does NOT force a resync", map[string]string{KeyBoardExtraLabels: "documentation"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -530,8 +565,9 @@ func TestValidateMergedRejectsEqualLabels(t *testing.T) {
 		t.Error("equal prd_label and autopilot_label should be rejected")
 	}
 	if err := ValidateMerged(map[string]string{
-		KeyPRDLabel:       "PRD",
-		KeyAutopilotLabel: "autopilot",
+		KeyPRDLabel:          "PRD",
+		KeyAutopilotLabel:    "autopilot",
+		KeyRunEligibleLabels: "PRD", // PRD #196: eligible set must contain the primary
 	}); err != nil {
 		t.Errorf("distinct labels rejected: %v", err)
 	}
@@ -544,9 +580,10 @@ func TestValidateMergedRejectsEqualLabels(t *testing.T) {
 func TestValidateMergedThreeWayDistinct(t *testing.T) {
 	base := func() map[string]string {
 		return map[string]string{
-			KeyPRDLabel:       "PRD",
-			KeyAutopilotLabel: "autopilot",
-			KeyPrdlessLabel:   "PRDLESS",
+			KeyPRDLabel:          "PRD",
+			KeyAutopilotLabel:    "autopilot",
+			KeyPrdlessLabel:      "PRDLESS",
+			KeyRunEligibleLabels: "PRD", // PRD #196: eligible set must contain the primary
 		}
 	}
 
@@ -572,5 +609,198 @@ func TestValidateMergedThreeWayDistinct(t *testing.T) {
 	m[KeyPRDLabel] = "PRDLESS"
 	if err := ValidateMerged(m); err == nil {
 		t.Error("prd_label renamed onto the prdless label must be rejected on the merged set")
+	}
+}
+
+func eq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestBoardMembershipDefaults pins the PRD #196 compiled-in defaults on an empty
+// table: the eligible set is the primary unioned with the stored default (PRD,bug
+// with the primary first), extras are just bug, and the waiver is ON.
+func TestBoardMembershipDefaults(t *testing.T) {
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.RunEligibleLabels(context.Background()); err != nil || !eq(got, []string{"PRD", "bug"}) {
+		t.Fatalf("RunEligibleLabels default = %v, %v; want [PRD bug]", got, err)
+	}
+	if got, err := c.BoardExtraLabels(context.Background()); err != nil || !eq(got, []string{"bug"}) {
+		t.Fatalf("BoardExtraLabels default = %v, %v; want [bug]", got, err)
+	}
+	if got, err := c.EligibleLabelWaivesPRDLink(context.Background()); err != nil || got != true {
+		t.Fatalf("EligibleLabelWaivesPRDLink default = %v, %v; want true", got, err)
+	}
+}
+
+// TestRunEligibleLabelsUnionsPrimary covers the fail-safe: the primary label is
+// always in the eligible set, placed first and deduped, even when a hand-edited row
+// dropped it or listed it out of position. The run gate must never make the primary
+// non-runnable.
+func TestRunEligibleLabelsUnionsPrimary(t *testing.T) {
+	cases := []struct {
+		name          string
+		prd, eligible string
+		want          []string
+	}{
+		{"row dropped the primary", "PRD", "bug,security", []string{"PRD", "bug", "security"}},
+		{"primary listed but not first", "PRD", "bug,PRD,security", []string{"PRD", "bug", "security"}},
+		{"row with only the primary yields it once", "PRD", "PRD", []string{"PRD"}},
+		{"duplicates within the row are collapsed", "PRD", "bug,bug", []string{"PRD", "bug"}},
+		{"custom primary is unioned in", "Feature", "bug", []string{"Feature", "bug"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(&fakeStore{rows: []store.AppSetting{
+				row(KeyPRDLabel, tc.prd),
+				row(KeyRunEligibleLabels, tc.eligible),
+			}}, time.Minute)
+			got, err := c.RunEligibleLabels(context.Background())
+			if err != nil {
+				t.Fatalf("RunEligibleLabels err = %v", err)
+			}
+			if !eq(got, tc.want) {
+				t.Fatalf("RunEligibleLabels = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBoardExtraLabelsNoPrimaryUnion covers the orthogonality (Decision 2): extras
+// carry NO primary union, so an extra is removable and membership is primary ∪
+// extras rather than a set that pins the primary twice.
+func TestBoardExtraLabelsNoPrimaryUnion(t *testing.T) {
+	c := New(&fakeStore{rows: []store.AppSetting{
+		row(KeyPRDLabel, "PRD"),
+		row(KeyBoardExtraLabels, "bug,documentation"),
+	}}, time.Minute)
+	got, err := c.BoardExtraLabels(context.Background())
+	if err != nil || !eq(got, []string{"bug", "documentation"}) {
+		t.Fatalf("BoardExtraLabels = %v, %v; want [bug documentation] with no primary", got, err)
+	}
+	// The result is always non-nil (so it JSON-encodes as [] not null): a
+	// present-but-empty value falls back to the compiled-in default like every other
+	// setting (empty → default), and parseLabelList returns a non-nil slice.
+	if got == nil {
+		t.Fatal("BoardExtraLabels returned a nil slice")
+	}
+}
+
+// TestEligibleLabelWaivesPRDLinkJunkTolerance covers the strict "true"/"false"
+// parse defaulting ON: a malformed value never silently flips the default-on gate
+// off.
+func TestEligibleLabelWaivesPRDLinkJunkTolerance(t *testing.T) {
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", true},       // empty → default true
+		{"banana", true}, // junk → default, NOT false
+		{"TRUE", true},   // non-canonical → default
+		{"1", true},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyEligibleLabelWaivesPRDLink, tc.stored)}}, time.Minute)
+		if got, _ := c.EligibleLabelWaivesPRDLink(context.Background()); got != tc.want {
+			t.Errorf("EligibleLabelWaivesPRDLink(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+}
+
+func TestParseLabelList(t *testing.T) {
+	// Order preserved, tokens trimmed, empties dropped, no dedup (dedup is a
+	// ValidateMerged concern), and the result is always non-nil.
+	if got := parseLabelList(" PRD , bug ,, PRD "); !eq(got, []string{"PRD", "bug", "PRD"}) {
+		t.Errorf("parseLabelList = %v, want [PRD bug PRD] (order, trim, no dedup)", got)
+	}
+	if got := parseLabelList(""); got == nil || len(got) != 0 {
+		t.Errorf("parseLabelList(\"\") = %v, want non-nil empty", got)
+	}
+}
+
+func TestValidateLabelList(t *testing.T) {
+	// A valid comma list passes; empty passes (no extras); a too-long token fails.
+	if err := validateLabelList("PRD,bug,security"); err != nil {
+		t.Errorf("valid list rejected: %v", err)
+	}
+	if err := validateLabelList(""); err != nil {
+		t.Errorf("empty list rejected: %v", err)
+	}
+	if err := validateLabelList("PRD," + strings.Repeat("x", maxLabelLen+1)); err == nil {
+		t.Error("a too-long token should be rejected")
+	}
+}
+
+// TestValidateMergedListRules covers the PRD #196 cross-key + structural checks:
+// the primary is not removable from the eligible set, neither list may duplicate an
+// entry, neither may exceed the count cap, and neither may carry a workflow marker
+// (autopilot / prdless).
+func TestValidateMergedListRules(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			KeyPRDLabel:          "PRD",
+			KeyAutopilotLabel:    "autopilot",
+			KeyPrdlessLabel:      "PRDLESS",
+			KeyRunEligibleLabels: "PRD,bug",
+			KeyBoardExtraLabels:  "bug",
+		}
+	}
+
+	// A well-formed default set passes.
+	if err := ValidateMerged(base()); err != nil {
+		t.Fatalf("default lists rejected: %v", err)
+	}
+
+	// The primary is not removable from the eligible set.
+	m := base()
+	m[KeyRunEligibleLabels] = "bug,security"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), KeyRunEligibleLabels) {
+		t.Errorf("eligible set without the primary: err = %v, want a rejection naming run_eligible_labels", err)
+	}
+
+	// Duplicate entries are rejected, in either list.
+	m = base()
+	m[KeyRunEligibleLabels] = "PRD,bug,bug"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("duplicate eligible entry: err = %v, want a duplicate rejection", err)
+	}
+	m = base()
+	m[KeyBoardExtraLabels] = "bug,bug"
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("duplicate extra entry: err = %v, want a duplicate rejection", err)
+	}
+
+	// The count cap bounds each list.
+	many := make([]string, 0, maxLabelListLen+2)
+	many = append(many, "PRD")
+	for i := 0; i < maxLabelListLen+1; i++ {
+		many = append(many, "lbl"+strconv.Itoa(i))
+	}
+	m = base()
+	m[KeyRunEligibleLabels] = strings.Join(many, ",")
+	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Errorf("over-cap eligible list: err = %v, want a count-cap rejection", err)
+	}
+
+	// A workflow marker (autopilot / prdless) is never membership/eligibility content.
+	for _, marker := range []string{"autopilot", "PRDLESS"} {
+		m = base()
+		m[KeyRunEligibleLabels] = "PRD," + marker
+		if err := ValidateMerged(m); err == nil {
+			t.Errorf("eligible set containing the %q marker should be rejected", marker)
+		}
+		m = base()
+		m[KeyBoardExtraLabels] = "bug," + marker
+		if err := ValidateMerged(m); err == nil {
+			t.Errorf("extras containing the %q marker should be rejected", marker)
+		}
 	}
 }

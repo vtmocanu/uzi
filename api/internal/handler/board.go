@@ -193,6 +193,10 @@ type boardDTO struct {
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
+	// BoardExtraLabels is the admin-configured default set of board membership
+	// extras (PRD #196). The client falls back to it while the user has no saved
+	// set (per-user storage is M3). Membership is primary ∪ extras (Decision 2).
+	BoardExtraLabels []string `json:"board_extra_labels"`
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
@@ -389,14 +393,20 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
 	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType)
 
+	// Board membership extras default (PRD #196), best-effort like the other
+	// settings reads: the admin default the client falls back to when the user has
+	// no saved set (per-user storage is M3).
+	extra, _ := h.settings.BoardExtraLabels(r.Context())
+
 	return boardDTO{
-		RepoID:    repo.ID.String(),
-		Path:      repo.PathWithNamespace,
-		WebURL:    repo.WebUrl,
-		ForgeType: repo.ForgeType,
-		Columns:   columns,
-		Cards:     cards,
-		Pipeline:  repoPipeline,
+		RepoID:           repo.ID.String(),
+		Path:             repo.PathWithNamespace,
+		WebURL:           repo.WebUrl,
+		ForgeType:        repo.ForgeType,
+		Columns:          columns,
+		Cards:            cards,
+		Pipeline:         repoPipeline,
+		BoardExtraLabels: extra,
 	}, true
 }
 

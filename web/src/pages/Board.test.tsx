@@ -1025,6 +1025,25 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(store.get("uzi.board.repo-1.extraLabels")).toBe("[]");
   });
 
+  it("uses the server-delivered admin default extras over the compiled-in fallback (PRD #196 M2)", async () => {
+    const cardsWithDocs = [
+      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
+      aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
+      aCard({ iid: 7, title: "issue seven", column: "", labels: ["documentation"] }),
+    ];
+    mockApi.getBoard.mockResolvedValue({
+      board: aBoard({ cards: cardsWithDocs, board_extra_labels: ["documentation"] }),
+    });
+    renderBoard();
+    await screen.findByText("Backlog");
+    // The admin default is now `documentation`, not the const `bug`: the doc card is a
+    // member, the bug card is not (the user has no saved override).
+    expect(titles()).toEqual(["issue one", "issue seven"]);
+    // The inert-default footer reflects the payload default, not DEFAULT_BOARD_EXTRA_LABELS.
+    openIssues();
+    expect(screen.getByText(/Default: PRD, documentation/)).toBeTruthy();
+  });
+
   it("adds every other open issue with 'Show all other issues' ON", async () => {
     renderBoard();
     await screen.findByText("Backlog");

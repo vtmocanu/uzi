@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 	"testing"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // parseDomain mirrors what Register does before the allowlist check: lowercase,
@@ -21,6 +24,53 @@ func parseDomain(t *testing.T, raw string) string {
 		t.Fatalf("ParseAddress(%q): %v", raw, err)
 	}
 	return emailDomain(addr.Address)
+}
+
+// TestSessionPayloadCarriesEligibilityFields pins the PRD #196 M2 contract on the
+// session payload: the eligible label set (a JSON array of strings, primary first)
+// and the PRD-link waiver (a JSON bool) ride this response so the issue view and
+// the card Start affordance — which have no board payload — can read them.
+func TestSessionPayloadCarriesEligibilityFields(t *testing.T) {
+	h := newSettingsHandler(
+		store.AppSetting{Key: settings.KeyPRDLabel, Value: "PRD"},
+		store.AppSetting{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug,security"},
+		store.AppSetting{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "false"},
+	)
+	payload := h.sessionPayload(context.Background(), store.User{})
+
+	got, ok := payload["run_eligible_labels"].([]string)
+	if !ok {
+		t.Fatalf("run_eligible_labels = %T, want []string", payload["run_eligible_labels"])
+	}
+	if len(got) != 3 || got[0] != "PRD" || got[1] != "bug" || got[2] != "security" {
+		t.Errorf("run_eligible_labels = %v, want [PRD bug security]", got)
+	}
+	waiver, ok := payload["eligible_label_waives_prd_link"].(bool)
+	if !ok {
+		t.Fatalf("eligible_label_waives_prd_link = %T, want bool", payload["eligible_label_waives_prd_link"])
+	}
+	if waiver != false {
+		t.Errorf("eligible_label_waives_prd_link = %v, want false", waiver)
+	}
+}
+
+// TestBoardDTOMembershipField pins the PRD #196 M2 board-payload contract: the
+// board_extra_labels field serializes as a JSON array of strings under that key.
+func TestBoardDTOMembershipField(t *testing.T) {
+	b := boardDTO{BoardExtraLabels: []string{"bug", "documentation"}}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded struct {
+		Extra []string `json:"board_extra_labels"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Extra) != 2 || decoded.Extra[0] != "bug" || decoded.Extra[1] != "documentation" {
+		t.Errorf("board_extra_labels = %v, want [bug documentation]", decoded.Extra)
+	}
 }
 
 func TestEmailDomainExtraction(t *testing.T) {

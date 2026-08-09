@@ -89,6 +89,8 @@ function setAuth(prdlessEnabled: boolean) {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled,
+    runEligibleLabels: ["PRD"],
+    eligibleLabelWaivesPrdLink: true,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,

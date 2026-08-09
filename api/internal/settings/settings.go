@@ -92,6 +92,23 @@ const (
 	// gate binds at claim, and an empty value is FAIL-CLOSED (a docker worker then
 	// claims no repo-bearing run). Non-docker workers never consult it.
 	KeyDockerRepoAllowlist = "docker_repo_allowlist"
+	// Board membership / run-eligibility label lists (PRD #196). Each is stored as
+	// a comma-separated list of label names, following the KeyDockerRepoAllowlist
+	// precedent (Decision 8): safe because ValidateLabel rejects commas, so the
+	// separator can never collide with a legal label.
+	//
+	// KeyRunEligibleLabels is the ADMIN-only set of labels a human may point uzi at
+	// ("may uzi work this?"). The primary (prd_label) is always in it — the accessor
+	// unions it in — so the run gate can never make the primary non-runnable.
+	// KeyBoardExtraLabels is the admin DEFAULT for the per-user board membership
+	// extras ("which cards do I want to look at?"), applied while a user has no saved
+	// set. Board membership is primary ∪ extras (Decision 2), so extras carry no
+	// primary union — an extra must be removable.
+	// KeyEligibleLabelWaivesPRDLink is an instance-wide bool: an issue eligible by a
+	// NON-primary label does not require a prds/*.md link (Decision 7).
+	KeyRunEligibleLabels          = "run_eligible_labels"
+	KeyBoardExtraLabels           = "board_extra_labels"
+	KeyEligibleLabelWaivesPRDLink = "eligible_label_waives_prd_link"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -141,6 +158,15 @@ const (
 	// is a security control: an unconfigured instance never lets a docker worker pick
 	// up an unvetted repo's run.
 	DefaultDockerRepoAllowlist = ""
+	// PRD #196 board membership / run-eligibility defaults (open question 1:
+	// opinionated, `bug` ships in both lists). run_eligible_labels ships PRD,bug so a
+	// bug is runnable out of the box; board_extra_labels ships bug so a board shows
+	// bugs by default. The waiver defaults ON so an admin declaring bug runnable does
+	// not then hit the PRD-link gate. On upgrade these apply to any instance that
+	// never set the key — a run-gate behaviour change called out in the changelog (M5).
+	DefaultRunEligibleLabels          = "PRD,bug"
+	DefaultBoardExtraLabels           = "bug"
+	DefaultEligibleLabelWaivesPRDLink = "true"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -162,6 +188,11 @@ const maxHostedWorkerQuota = 20
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
+
+// maxLabelListLen caps the number of entries in a label list setting (PRD #196
+// run_eligible_labels / board_extra_labels). A generous bound that only catches a
+// runaway paste, enforced in ValidateMerged.
+const maxLabelListLen = 32
 
 // Defaults maps every known key to its compiled-in default. This is the single
 // Go source of the default values: the accessors fall back to it and the
@@ -214,6 +245,12 @@ var Defaults = map[string]string{
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.
 	KeyDockerRepoAllowlist: DefaultDockerRepoAllowlist,
+	// PRD #196 board membership / run-eligibility keys. Same no-seeded-row pattern:
+	// an absent row synthesizes to these defaults, so All/AdminView surface them to
+	// the settings page on every instance and no migration seeds them.
+	KeyRunEligibleLabels:          DefaultRunEligibleLabels,
+	KeyBoardExtraLabels:           DefaultBoardExtraLabels,
+	KeyEligibleLabelWaivesPRDLink: DefaultEligibleLabelWaivesPRDLink,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -636,6 +673,78 @@ func parseRepoAllowlist(v string) []uuid.UUID {
 	return out
 }
 
+// RunEligibleLabels returns the set of labels a human may point uzi at (PRD #196,
+// admin-only). The primary label (prd_label) is ALWAYS unioned in and placed
+// first, deduped — so even a hand-edited row that dropped the primary can never
+// make it non-runnable (fail-safe: the run gate must never refuse the primary).
+// Parsed from the comma-separated run_eligible_labels value; junk-tolerant like
+// the other list accessor. Always non-nil. A cold read error is returned so a
+// strict caller can surface it, alongside the compiled-in default set (the
+// default primary unioned with the default eligible list).
+func (c *Cache) RunEligibleLabels(ctx context.Context) ([]string, error) {
+	primary, err := c.PRDLabel(ctx)
+	v, verr := c.get(ctx, KeyRunEligibleLabels)
+	if err == nil {
+		err = verr
+	}
+	labels := parseLabelList(v)
+	// Union the primary in, first, deduped.
+	out := []string{primary}
+	seen := map[string]struct{}{primary: {}}
+	for _, l := range labels {
+		if _, dup := seen[l]; dup {
+			continue
+		}
+		seen[l] = struct{}{}
+		out = append(out, l)
+	}
+	return out, err
+}
+
+// BoardExtraLabels returns the admin default set of board membership extras (PRD
+// #196), the fallback a client uses while a user has no saved set (per-user
+// storage is M3). No primary union — extras are extras, and board membership is
+// primary ∪ extras (Decision 2), so an extra must be removable. Parsed from the
+// comma-separated board_extra_labels value; always non-nil.
+func (c *Cache) BoardExtraLabels(ctx context.Context) ([]string, error) {
+	v, err := c.get(ctx, KeyBoardExtraLabels)
+	return parseLabelList(v), err
+}
+
+// EligibleLabelWaivesPRDLink reports whether an issue eligible by a NON-primary
+// label may run without a prds/*.md link (PRD #196 Decision 7), instance-wide.
+// Stored as the text "true"/"false"; any other value falls back to the
+// compiled-in default (true) rather than silently reading false — the same
+// junk-tolerance as PrdlessEnabled, so a malformed value never silently flips a
+// default-on gate off.
+func (c *Cache) EligibleLabelWaivesPRDLink(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyEligibleLabelWaivesPRDLink)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultEligibleLabelWaivesPRDLink == "true", err
+	}
+}
+
+// parseLabelList splits a comma-separated label list into trimmed, non-empty
+// tokens, preserving order. Always returns a non-nil slice (possibly empty). It
+// deliberately does NOT dedup — deduplication is a merged-validation concern
+// (ValidateMerged), not a parse concern. Mirrors parseRepoAllowlist.
+func parseLabelList(v string) []string {
+	out := []string{}
+	for _, tok := range strings.Split(v, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
 // intSetting resolves an integer setting to its parsed value, falling back to the
 // compiled-in default when the effective value is absent or unparseable. Stored
 // values pass validateHealthSeconds at write time, so an unparseable value here is
@@ -799,7 +908,8 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeySelfimproveEnabled, KeyHealthEnabled:
+	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeySelfimproveEnabled, KeyHealthEnabled,
+		KeyEligibleLabelWaivesPRDLink:
 		return validateBool(value)
 	case KeyJudgeModel:
 		return validateModelAlias(value)
@@ -812,6 +922,8 @@ func Validate(key, value string) error {
 		return validateHostedWorkerQuota(value)
 	case KeyDockerRepoAllowlist:
 		return validateRepoAllowlist(value)
+	case KeyRunEligibleLabels, KeyBoardExtraLabels:
+		return validateLabelList(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -964,6 +1076,29 @@ func validateRepoAllowlist(value string) error {
 	return nil
 }
 
+// validateLabelList is the write-time gate for a comma-separated label list (PRD
+// #196 run_eligible_labels / board_extra_labels). Empty is allowed — it is the "no
+// extras" value, and the eligible-set's must-contain-primary rule is enforced in
+// ValidateMerged, not here. Each non-empty token must pass ValidateLabel; a
+// malformed token fails the WRITE, the only moment a human is present to be told.
+//
+// Like validateRepoAllowlist, this MUST have an explicit Validate case: the
+// default branch falls through to ValidateLabel, which REJECTS the comma that a
+// two-or-more label list requires — so without this case a valid multi-label list
+// could never be saved at all.
+func validateLabelList(value string) error {
+	for _, tok := range strings.Split(value, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if err := ValidateLabel(tok); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ValidateLabel checks a single label value against Decision 8's per-value
 // rules: non-empty, at most 64 characters, and no comma (GitLab's label-list
 // separator). It does not trim: a value with surrounding whitespace would not
@@ -990,6 +1125,13 @@ func ValidateLabel(value string) error {
 // (default_theme presentation-only, the prdless gate keys, the PRD #25 slack keys)
 // is ignored, and a secret key's plaintext never participates. An idempotent write
 // (same value) returns false, matching the prior "only resync on a real change".
+//
+// The PRD #196 list keys (run_eligible_labels, board_extra_labels) are
+// DELIBERATELY omitted: the sync fetch (forgesvc) reads only the primary label,
+// with ANDed forge semantics, so a resync triggered by these keys would fetch
+// nothing new and is pointless — and adding them here is exactly how the
+// ANDed-fetch eviction defect gets re-opened from the other end (PRD #196
+// Decision 5). Their write path must never force a resync.
 func LabelChanged(committed, updates map[string]string) bool {
 	for k, v := range updates {
 		if k != KeyPRDLabel && k != KeyAutopilotLabel {
@@ -1023,5 +1165,62 @@ func ValidateMerged(merged map[string]string) error {
 	if merged[KeyPrdlessLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("prdless_label must differ from autopilot_label")
 	}
+
+	// PRD #196 list-key cross-checks on the effective post-update state. Parse both
+	// lists from the merged map (no dedup at parse time — dedup is checked here).
+	eligible := parseLabelList(merged[KeyRunEligibleLabels])
+	extras := parseLabelList(merged[KeyBoardExtraLabels])
+
+	// The primary is not removable from the eligible set (Decision 1: the run gate
+	// must never make the primary non-runnable). The accessor also unions it in as a
+	// fail-safe, but a write dropping it must be refused so an admin is told.
+	primary := merged[KeyPRDLabel]
+	if !containsLabel(eligible, primary) {
+		return fmt.Errorf("run_eligible_labels must contain the primary label %q", primary)
+	}
+
+	// Each list: no duplicates, at most maxLabelListLen entries, and no entry equal
+	// to a workflow marker (autopilot_label / prdless_label) — those are never
+	// membership or eligibility content (mock §5).
+	if err := validateLabelListMerged(KeyRunEligibleLabels, eligible, merged); err != nil {
+		return err
+	}
+	if err := validateLabelListMerged(KeyBoardExtraLabels, extras, merged); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateLabelListMerged enforces the cross-key structural rules on a parsed
+// label list (PRD #196): no duplicate entries, at most maxLabelListLen entries,
+// and no entry equal to autopilot_label or prdless_label (the workflow markers are
+// never membership/eligibility content). Errors name the key to change.
+func validateLabelListMerged(key string, list []string, merged map[string]string) error {
+	if len(list) > maxLabelListLen {
+		return fmt.Errorf("%s must have at most %d entries", key, maxLabelListLen)
+	}
+	seen := make(map[string]struct{}, len(list))
+	for _, l := range list {
+		if _, dup := seen[l]; dup {
+			return fmt.Errorf("%s must not contain duplicate entries (%q)", key, l)
+		}
+		seen[l] = struct{}{}
+		if l == merged[KeyAutopilotLabel] {
+			return fmt.Errorf("%s must not contain the autopilot label %q", key, l)
+		}
+		if l == merged[KeyPrdlessLabel] {
+			return fmt.Errorf("%s must not contain the prdless label %q", key, l)
+		}
+	}
+	return nil
+}
+
+// containsLabel reports whether list contains target.
+func containsLabel(list []string, target string) bool {
+	for _, l := range list {
+		if l == target {
+			return true
+		}
+	}
+	return false
 }

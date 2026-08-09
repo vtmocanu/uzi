@@ -586,11 +586,19 @@ export function Board() {
   // every card the viewer had hidden — which is what freeze-test 3 discriminates.
   const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
 
-  // The extras in effect: the user's saved set if they have one, else the compiled-in
-  // default (M2 delivers an admin-configured default; M1's is DEFAULT_BOARD_EXTRA_LABELS).
+  // The admin-configured default extras delivered on the board payload (PRD #196
+  // M2). DEFAULT_BOARD_EXTRA_LABELS is the last-resort fallback for an older server
+  // or a board that has not loaded yet.
+  const serverDefaultExtras = useMemo<string[]>(
+    () => board?.board_extra_labels ?? [...DEFAULT_BOARD_EXTRA_LABELS],
+    [board],
+  );
+  // The extras in effect: the user's saved set if they have one (Decision 9,
+  // absolute once written), else the admin default. Per-user server-backed
+  // persistence of the saved set is M3; here the saved set is still localStorage.
   const resolvedExtras = useMemo<string[]>(
-    () => storedExtras ?? [...DEFAULT_BOARD_EXTRA_LABELS],
-    [storedExtras],
+    () => storedExtras ?? serverDefaultExtras,
+    [storedExtras, serverDefaultExtras],
   );
   // Membership is primary ∪ extras (Decision 2), deduped, with the primary always
   // present and never removable.
@@ -643,11 +651,14 @@ export function Board() {
     const seen = new Set<string>();
     for (const c of payloadCards) for (const l of c.labels) seen.add(l);
     const labels = [...seen].filter((l) => l !== "" && !excluded.has(l));
-    for (const d of DEFAULT_BOARD_EXTRA_LABELS) {
-      if (!excluded.has(d) && !labels.includes(d)) labels.push(d);
+    // A configured-default extra (the admin default from the payload) is unioned in
+    // even with zero matching cards, so an inert default stays visible in the picker
+    // as a greyed 0 row (open question 8).
+    for (const d of serverDefaultExtras) {
+      if (!excluded.has(d) && d !== "" && !labels.includes(d)) labels.push(d);
     }
     return labels.sort();
-  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel]);
+  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel, serverDefaultExtras]);
 
   // Per-label count = cards carrying L that do NOT carry the primary — "how much
   // bigger does the board get" (mock §3: bug 6, not 7). A label with no such card
@@ -888,6 +899,7 @@ export function Board() {
               popRef={issuesPopRef}
               prdLabel={prdLabel}
               membershipLabels={membershipLabels}
+              defaultExtras={serverDefaultExtras}
               resolvedExtras={resolvedExtras}
               candidateExtras={candidateExtras}
               extraCounts={extraCounts}
@@ -1740,6 +1752,7 @@ function IssuesFilter({
   popRef,
   prdLabel,
   membershipLabels,
+  defaultExtras,
   resolvedExtras,
   candidateExtras,
   extraCounts,
@@ -1754,6 +1767,7 @@ function IssuesFilter({
   popRef: React.RefObject<HTMLDivElement>;
   prdLabel: string;
   membershipLabels: string[];
+  defaultExtras: string[];
   resolvedExtras: string[];
   candidateExtras: string[];
   extraCounts: Map<string, number>;
@@ -1764,7 +1778,9 @@ function IssuesFilter({
   onReset: () => void;
 }) {
   const hasExtras = resolvedExtras.length > 0;
-  const defaultLabel = [prdLabel, ...DEFAULT_BOARD_EXTRA_LABELS].join(", ");
+  // The inert-default row (mock §3): names what "Reset to default" re-adopts — the
+  // admin-configured default extras from the payload, not the compiled-in const.
+  const defaultLabel = [prdLabel, ...defaultExtras].join(", ");
   return (
     <div className="relative" ref={popRef}>
       <button

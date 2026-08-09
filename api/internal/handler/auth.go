@@ -341,9 +341,17 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 // (PRD #19 M2 — delivered on the existing response, no new endpoint). Labels are
 // best-effort: a cold settings read yields the compiled-in defaults, never an
 // error, so a session response is never blocked on settings.
+//
+// The PRD #196 eligible set and PRD-link waiver ride this payload (not just the
+// board payload) because the issue view is the board's second consumer of the
+// eligibility predicate and has no board payload — it reads these from useAuth().
+// They also feed the card's Start/Promote eligibility affordance, which has no
+// board payload of its own to carry them.
 func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
 	prdLabel, _ := h.settings.PRDLabel(ctx)
 	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
+	runEligible, _ := h.settings.RunEligibleLabels(ctx)
+	waiver, _ := h.settings.EligibleLabelWaivesPRDLink(ctx)
 	// Theme resolution (PRD #21 Decision 2): the SPA needs three values, not just
 	// the resolved theme. With an override active, the Appearance picker also has
 	// to render "Use default (<name>)" and set its selected state, and the default
@@ -371,6 +379,11 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"default_theme":   defaultTheme,
 		"prdless_label":   prdlessLabel,
 		"prdless_enabled": prdlessEnabled,
+		// PRD #196: the admin-configured run-eligible label set and the PRD-link
+		// waiver bool. The SPA renders the card/issue-view Start affordance from the
+		// eligible set and the waiver.
+		"run_eligible_labels":            runEligible,
+		"eligible_label_waives_prd_link": waiver,
 		// Vault status (PRD #32): the SPA shows a 🔒 badge + unlock banner and marks
 		// own queued runs "waiting for vault unlock" when locked. Delivered on the
 		// session payload so the shell needs no extra round-trip; the SPA refreshes

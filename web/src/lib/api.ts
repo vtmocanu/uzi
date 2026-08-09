@@ -420,6 +420,11 @@ export interface Board {
   forge_type: string;
   columns: BoardColumn[];
   cards: Card[];
+  // The admin-configured default board-extra labels (PRD #196 M2): the extras a
+  // board starts with until a user saves their own per-repo set. Membership is
+  // `primary ∪ extras` (Decision 2). Optional so an older server that predates the
+  // field falls back to DEFAULT_BOARD_EXTRA_LABELS client-side.
+  board_extra_labels?: string[];
   // Repo default-branch CI status (PRD #6, the board header badge), null when
   // there is no cached default-branch pipeline.
   pipeline: PipelineStatus | null;
@@ -489,6 +494,15 @@ export interface AppSettings {
   // workers are unaffected. The admin UI edits it as a repo multiselect writing the
   // ids — admins pick paths, never paste UUIDs.
   docker_repo_allowlist: string;
+  // Configurable board-membership + run-eligible labels (PRD #196 M2). All three
+  // are served as raw strings like every other setting. run_eligible_labels and
+  // board_extra_labels are COMMA-SEPARATED lists (safe because ValidateLabel rejects
+  // a comma in a label name); eligible_label_waives_prd_link is the text
+  // "true"/"false". run_eligible_labels always contains the primary (prd_label);
+  // board_extra_labels is the per-user default extras.
+  run_eligible_labels: string;
+  board_extra_labels: string;
+  eligible_label_waives_prd_link: string;
 }
 
 // SettingSource reports where a setting's effective value comes from (PRD #25):
@@ -544,6 +558,14 @@ export interface SessionResponse {
   default_theme: string;
   prdless_label?: string;
   prdless_enabled?: boolean;
+  // Run-eligible labels and the PRD-link waiver (PRD #196 M2). The eligible set
+  // rides the session (not just the board) because IssueView reads it from
+  // useAuth() with no board payload. Both optional and older-server-tolerant: an
+  // absent run_eligible_labels falls back to [prd_label] (the primary is always
+  // eligible), an absent waiver defaults true. run_eligible_labels already includes
+  // the primary — the server always sends it.
+  run_eligible_labels?: string[];
+  eligible_label_waives_prd_link?: boolean;
   // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
   // in the server process. Optional so a server that predates the field reads as
   // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
