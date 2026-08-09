@@ -1,7 +1,8 @@
 # PRD #191: Slack as a conversational surface — chat, run control, and status from a DM
 
 **GitLab Issue**: [vtmocanu/uzi#191](https://gitlab.example.com/vtmocanu/uzi/-/issues/191)
-**Status**: Draft — reviewed 2026-07-29 by two agents, all findings applied.
+**Status**: Complete (2026-08-09) — all milestones M1–M7 implemented and reviewed; retired to `prds/done/`. History below is preserved as the drafting/review record.
+**Status (drafting)**: Draft — reviewed 2026-07-29 by two agents, all findings applied.
 Architect: 2 BLOCKER + 6 MAJOR + 6 MINOR (marked ↳review) — changed the milestone
 graph, not the concept: the inbound half survived intact, the outbound and lifecycle
 half was rebuilt around a mechanism the first draft did not know about (B2 below).
@@ -381,7 +382,7 @@ calls "worse than no guard, because the surface *looks* protected".
 
 **Phase 1 — foundations (sequential).**
 
-- [ ] **M1 — Service lifting + the `Allow` seam.** `ConfirmProposalForUser` and
+- [x] **M1 — Service lifting + the `Allow` seam.** `ConfirmProposalForUser` and
       `StartRunForUser` move into `workersvc` behind a forge-builder interface
       (Decision 8); `SettingsReader` gains the prdless accessors; `mw.Limiter` exports
       `Allow(key)` (Decision 9) with routes untouched. **↳review — verification is
@@ -407,7 +408,7 @@ calls "worse than no guard, because the surface *looks* protected".
       that removes claim-first ordering reddens it; the route→limiter table
       (`route_limiter_mounts_test.go`) is unchanged, all 159 rows.
 
-- [ ] **M2 — Inbound: a top-level DM opens a chat.** `routeMessage` accepts
+- [x] **M2 — Inbound: a top-level DM opens a chat.** `routeMessage` accepts
       `thread_ts == ""` in a DM; the path creates a chat run via `CreateChatRun`
       (through `Allow`), writes the anchor with the user's ts as `root_ts`, posts the
       bot's threaded root and stores its ts as `status_ts` (Decision 2). The replier
@@ -422,7 +423,7 @@ calls "worse than no guard, because the surface *looks* protected".
 
 **Phase 2 — outbound (sequential; M3 needs M2b's context query and M2's anchor).**
 
-- [ ] **M2b — ↳review NEW: chat runs can reach the notifier at all.** A repo-less
+- [x] **M2b — ↳review NEW: chat runs can reach the notifier at all.** A repo-less
       `GetSlackChatContext` (no `repos`/`forge_connections` join) plus a chat branch in
       `Notifier.handle`, so a chat's terminal transitions stop being dropped at
       `queries/slack.sql:145`. Status edits target `status_ts`, never `root_ts`.
@@ -432,7 +433,7 @@ calls "worse than no guard, because the surface *looks* protected".
       `status_ts`; the same event on an `issue` run renders byte-identically to today;
       a chat run's transition performs **zero** `Update` calls against `root_ts`.
 
-- [ ] **M3 — Outbound: chat turns stream into the thread.** A chat-scoped
+- [x] **M3 — Outbound: chat turns stream into the thread.** A chat-scoped
       `PublishMessage` consumer posts one placeholder per turn and edits it with the
       assembled `text`-frame body, treating **all four** turn-end signals as terminal
       (Decision 6), rendered through the scrub/escape/truncate pipeline. Every other
@@ -456,7 +457,7 @@ calls "worse than no guard, because the surface *looks* protected".
 
 **Phase 3 — capabilities (parallel; both need M3's seam, ↳review: NOT M1 alone).**
 
-- [ ] **M4 — Issue proposals become Block Kit cards.** A `proposal` run message
+- [x] **M4 — Issue proposals become Block Kit cards.** A `proposal` run message
       (`agent/src/uzi-tools.ts:176`) on a Slack-anchored chat posts a card with
       Create / Dismiss, handled in the new `slack_chat_*` namespace (Decision 12);
       Create routes to `ConfirmProposalForUser`. Lands the `(run, proposal)` value
@@ -464,7 +465,7 @@ calls "worse than no guard, because the surface *looks* protected".
       second press gets an "already handled" edit; a press by a non-owner creates
       nothing; a forge failure reverts the proposal to `pending` and says so in-thread.
 
-- [ ] **M5 — `start_run` tool with a confirm card.** The tool renders a card naming
+- [x] **M5 — `start_run` tool with a confirm card.** The tool renders a card naming
       repo, issue iid and title; the owner's click calls `StartRunForUser`. Lands in
       **web** chat in the same MR. **Verified**: the tool alone creates no run (assert
       on the runs table, not on response text); a click creates exactly one run; an
@@ -474,7 +475,7 @@ calls "worse than no guard, because the surface *looks* protected".
 
 **Phase 4 — polish.**
 
-- [ ] **M6 — Lifecycle and failure UX** (now buildable on M2b). End / Continue as
+- [x] **M6 — Lifecycle and failure UX** (now buildable on M2b). End / Continue as
       thread buttons; copy for the turn cap (`CHAT_MAX_TURNS`, 50), the server idle
       backstop (`CHAT_IDLE_TIMEOUT`, 70m), and the one users will actually hit: **no
       worker connected**, where the run sits `queued`. ↳review: creation-time status
@@ -484,7 +485,7 @@ calls "worse than no guard, because the surface *looks* protected".
       Continue and the button mints exactly one new chat run carrying
       `resume_of_run_id`.
 
-- [ ] **M7 — Docs and the widened-posture record.** `docs/slack.md` gains the chat
+- [x] **M7 — Docs and the widened-posture record.** `docs/slack.md` gains the chat
       section, states Decision 10's trade in the same register as the existing plan and
       question privacy notes, **and states the second-order exposure**: an `issue`
       run's content can be quoted into Slack through chat's kind-agnostic read tools.
