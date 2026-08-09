@@ -72,7 +72,20 @@ type Window struct {
 const (
 	SourceUsageEndpoint = "usage_endpoint"
 	SourceHeaderProbe   = "header_probe"
+	// SourceLimitReport marks a gauge row written at usage-limit park time from a
+	// worker's limit report rather than measured by the poller (PRD #217 M1, D6).
+	SourceLimitReport = "limit_report"
 )
+
+// AllSources is the whole `source` vocabulary in a form a guard can enumerate, the
+// source-of-truth a drift test compares against migration 00108's CHECK (M4), the
+// same shape autoselect.AllReasons() uses for its own CHECK.
+//
+// Returns a fresh slice: a package-level var would let one caller's append corrupt
+// every other reader's view of a CLOSED set.
+func AllSources() []string {
+	return []string{SourceUsageEndpoint, SourceHeaderProbe, SourceLimitReport}
+}
 
 // ErrKind classifies a client failure so the poller can apply the D5 failure
 // semantics (fail closed vs back off vs wait for the next tick).

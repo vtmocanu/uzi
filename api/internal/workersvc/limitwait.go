@@ -421,12 +421,12 @@ func deadCredentialReset(cands []autoselect.Candidate, dead uuid.UUID, p autosel
 			return time.Time{}, false
 		}
 		var col *time.Time
-		switch *rateLimitType {
-		case "five_hour":
+		switch limitWindowFor(rateLimitType) {
+		case windowFiveHour:
 			col = c.FiveResetsAt
-		case "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included":
+		case windowSevenDay:
 			col = c.SevenResetsAt
-		default: // overage, unknown — no gauge column names this window
+		default: // overage, unknown, nil — no gauge column names this window
 			return time.Time{}, false
 		}
 		if col == nil {
@@ -435,6 +435,38 @@ func deadCredentialReset(cands []autoselect.Candidate, dead uuid.UUID, p autosel
 		return *col, true
 	}
 	return time.Time{}, false
+}
+
+// limitWindow names the gauge window a rate_limit_type maps to. The four seven-day
+// spellings collapse to one window (they are the same underlying window under
+// different names); `overage`, `unknown` and nil map to windowNone because
+// anthropic_rate_limits stores only the five-hour and seven-day windows and no column
+// names those.
+type limitWindow int
+
+const (
+	windowNone limitWindow = iota
+	windowFiveHour
+	windowSevenDay
+)
+
+// limitWindowFor is the ONE window mapping, shared by deadCredentialReset (the park's
+// cross-check) and setLimitWait's park-time gauge write (PRD #217 M1). They MUST stay
+// in lockstep — a divergence would let the write mark down a different window than the
+// cross-check reads back — so the mapping lives here rather than being copied into
+// both switches.
+func limitWindowFor(rateLimitType *string) limitWindow {
+	if rateLimitType == nil {
+		return windowNone
+	}
+	switch *rateLimitType {
+	case "five_hour":
+		return windowFiveHour
+	case "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included":
+		return windowSevenDay
+	default: // overage, unknown — no gauge column names this window
+		return windowNone
+	}
 }
 
 // limitFailureReason composes Decision 8's sentence SERVER-SIDE, from the allowlisted
@@ -538,6 +570,34 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 			WorkerID:      pgUUID(wkr.ID),
 		})
 	}
+
+	// PARK: record the dead credential's exhausted window in the gauge (PRD #217 M1,
+	// D1) so every subsequent claim, for every run, sees the exhaustion through the one
+	// classifier (autoselect.Classify) with no new concept. The window is mapped from
+	// the COERCED type d.RateLimitType via limitWindowFor — the SAME mapping
+	// deadCredentialReset uses above, so `overage`/`unknown`/nil write nothing by
+	// construction and the two cannot drift.
+	//
+	// UPDATE-only, so a zero-row result is success (a token never polled has no gauge
+	// row, D7). A write error is surfaced like the surrounding DB errors rather than
+	// swallowed: the park has already been DECIDED from candidates fetched at the top of
+	// this function (before decideLimitPark), so this write cannot perturb that decision
+	// and failing the whole report — which the worker then retries — is consistent with
+	// how this path handles a DB failure. It runs before SetRunLimitWait, whose returned
+	// row count remains this function's return value.
+	if run.AnthropicSecretID.Valid {
+		switch limitWindowFor(d.RateLimitType) {
+		case windowFiveHour:
+			if _, err := s.q.MarkFiveHourExhausted(ctx, dead); err != nil {
+				return 0, fmt.Errorf("mark five-hour exhausted: %w", err)
+			}
+		case windowSevenDay:
+			if _, err := s.q.MarkSevenDayExhausted(ctx, dead); err != nil {
+				return 0, fmt.Errorf("mark seven-day exhausted: %w", err)
+			}
+		}
+	}
+
 	return s.q.SetRunLimitWait(ctx, store.SetRunLimitWaitParams{
 		ID:             run.ID,
 		WorkerID:       pgUUID(wkr.ID),

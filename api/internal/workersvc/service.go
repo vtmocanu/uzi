@@ -431,6 +431,13 @@ type Store interface {
 	// needs the unfiltered set to tell "you pooled nothing" from "you pooled tokens
 	// that are all stale".
 	ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID) ([]store.ListAutoSelectCandidatesRow, error)
+	// Park-time exhaustion writes (PRD #217 M1): mark the dead credential's named
+	// window 100% consumed with source='limit_report', touching that one *_pct column
+	// and nothing else. UPDATE-only, so a zero-row result is success (the token was
+	// never polled). See the queries' own comments for why synced_at and the reset
+	// columns are deliberately left alone (D3/D4).
+	MarkFiveHourExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error)
+	MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error)
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
