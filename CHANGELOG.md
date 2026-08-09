@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **A trusted repo's own conventions can now reach the agent.** The **Trusted
+  repo** panel on the Repos page gains a **Repo instructions** toggle, a
+  sibling of the existing **Repo skills** toggle, both independently
+  revocable per repo. When on, the lead reads that repo's root `CLAUDE.md`
+  as advisory context on every run against it — never as instructions it
+  must follow, and never seen by subagents. The block is nonce-fenced and
+  labelled UNTRUSTED/ADVISORY (the same framing PRD #90's cross-run memory
+  uses) so a crafted file cannot forge trusted delimiters; the file is
+  structurally sanitized before injection (root-only, symlinks never
+  followed, `@`-import lines stripped, 64 KiB cap), never content-filtered.
+  `settingSources` is untouched — the read goes through uzi's own channel,
+  not the SDK's project loader — and the deny-hook, protected-branch
+  guardrail, worker-held PAT, and human MR review are all unchanged: this
+  opt-in grants context, not permissions. (#246)
+
 ## [0.23.0] - 2026-08-09
 
 ### Added

@@ -2885,8 +2885,11 @@ Serves human: "repos may carry skills the worker detects; per-repo opt-in, defau
   top-level union only covers the main-thread session, so without this a repo skill would
   never reach a subagent).
 - **Nothing else under the repo's `.claude/` is ever read for loading**: no hooks,
-  no settings, no commands, no `CLAUDE.md`. This is the **only** clone-borne config uzi
-  loads, and only through its own controlled channel.
+  no settings, no commands. Skills are loaded through uzi's own controlled channel —
+  and, separately, the repo's ROOT `CLAUDE.md` is when the sibling `repo_claudemd_enabled`
+  opt-in is on (§504, PRD #246). Those two — skills, and the root CLAUDE.md — are the
+  **only** clone-borne configs uzi loads, each behind its own per-repo opt-in and each
+  through uzi's own channel, never the SDK's loader (`settingSources: []` stays intact).
 - **Caps re-enforced worker-side over the combined delivered ∪ repo set**: delivered DB
   skills count against `SKILLS_MAX_PER_RUN`; repo skills (lowest precedence) evict first,
   so a run can never reach 2× the cap.
@@ -19257,3 +19260,57 @@ Full decision log: [prds/done/240-rate-limits-utilization-column.md](../prds/don
 - **CLI: deliberately out of scope.** Per the "new functionality ⇒ check `api/cmd/uzi/`" convention,
   recorded explicitly: this is a presentation-only web admin table with no CLI counterpart, so there
   is nothing to mirror in the CLI.
+
+## 504. PRD #246 — Trusted-repo instructions: the clone's ROOT `CLAUDE.md` as an advisory, lead-only, nonce-fenced input; the channel adds CONTEXT, never PERMISSIONS
+
+Serves human: the repo-borne prompt-injection defense + "agents only ever create MRs" primary
+directive — the same constraints §50 serves (`settingSources: []` guardrail layer 5). No
+user-stated requirement changed; this rides those existing constraints. Full rationale:
+[prds/done/246-trusted-repo-instructions.md](../prds/done/246-trusted-repo-instructions.md).
+
+- **A second per-repo trust opt-in, `repos.repo_claudemd_enabled BOOLEAN NOT NULL DEFAULT false`**
+  (migration `00108`), sibling of `repo_skills_enabled` (§105/#16). When on, the worker reads the
+  clone's **ROOT `CLAUDE.md` only** (`agent/src/repo-instructions.ts`) and injects it into the
+  **LEAD's system prompt** as a nonce-fenced **UNTRUSTED/ADVISORY** block, reusing the §90 memory
+  frame (`fenceNonce` minted AFTER the content is read, so an embedded static close-tag cannot forge
+  the fence). **Lead-only** — subagents get nothing. Read + framed **once** (one file read, one
+  nonce) and threaded to BOTH the plan-turn and implement-turn `buildLeadSystemPrompt` sites;
+  appended **LAST**, after every guardrail/lifecycle/untrusted-subagent append, so nothing untrusted
+  precedes the guardrail text. **Why:** a repo's own `CLAUDE.md` is genuinely useful project context,
+  but is exactly the clone-borne config class §50 layer 5 exists to distrust — so it is admitted only
+  behind an owner opt-in, and only as advisory data the model MAY weigh, never as instructions.
+- **`settingSources: []` is UNCHANGED — this is the crux.** The channel is uzi's OWN read+inject
+  (`readRepoInstructions` → `buildRepoInstructionsContext`), never the SDK's repo-config loader. The
+  feature adds CONTEXT to the lead prompt, not PERMISSIONS — §50 layer 5 stays intact, and a hostile
+  `CLAUDE.md` still cannot load hooks/settings, still cannot push (worker holds the PAT), still hits
+  the `PreToolUse` deny-hook. **Why:** keeping the SDK loader disabled is what makes "advisory
+  context" strictly weaker than "SDK-honored config."
+- **Structural sanitization ONLY — no prose / injection-phrase filtering.** Root-file-only; `lstat`
+  symlink-guard (a symlinked or non-regular `CLAUDE.md` is never read, mirroring §105's SKILL.md
+  guard); line-leading `@`-import lines stripped to a visible marker (defense-in-depth against a
+  model-induced `Read`, inert because WE read the file so the SDK never resolves the ref); a 64 KiB
+  cap enforced on **both** raw bytes AND post-sanitization bytes (the marker is longer than the `@…`
+  line it replaces, so a file under the raw cap could amplify over it — the injected text can never
+  exceed the cap); drop reasons (`absent` / `too_large` / `symlinked` / `read_error`) trace-logged.
+  **Why:** natural-language injection cannot be filtered without stripping legitimate content and
+  manufacturing false confidence; safety rests on the §50 layers (deny-hook + protected branch +
+  worker-held PAT + human MR review — all unchanged) plus the advisory framing, not on content scrubbing.
+- **Two separable trust flags under one UI-derived "Trusted repo" master, no third stored bool.**
+  `repo_skills_enabled` and `repo_claudemd_enabled` are set — together or individually — in ONE
+  atomic round-trip (`SetRepoTrustFlags` / `SetRepoTrustFlagsForUser`, COALESCE leaves a nil arg's
+  column unchanged), so master + sub-toggles share one path with no partial-failure window. The
+  master toggle is UI state only; the store holds just the two bools. `repo_devbox_opt_in` (§157)
+  stays its own EXCLUSIVE `PatchRepo` path and cannot be combined with the trust flags in one
+  request. Owner-or-admin authorization, reused from `repo_skills_enabled`. **Why:** the two flags
+  share a trust posture (the owner vouching for the repo's review discipline) but grant independent
+  affordances, so they are independently settable while presenting as one decision. The old
+  single-column `SetRepoSkillsEnabled{,ForUser}` queries are RETIRED, replaced by the atomic pair.
+- **Salience trade, accepted.** The block sits in the lead SYSTEM prompt (persists across plan +
+  implement) rather than the plan prompt where §90 cross-run memory lives — higher salience than
+  memory. The nonce-fence defeats delimiter-forging, and the elevated salience is accepted, mitigated
+  by the advisory framing + unchanged §50 guardrails + human MR review. Chat runs are out of scope
+  for this feature.
+- **Stub-executor parity.** `StubExecutor` performs the same read + emits the same
+  injected/dropped status trace (a whitespace-only `CLAUDE.md` frames to "" and reports
+  "not injected (empty)", never "injected"), so the opt-in's behavior is observable in the E2E and
+  the two executors cannot drift.
