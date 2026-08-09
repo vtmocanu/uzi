@@ -3,6 +3,7 @@ package slacksvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -42,10 +43,13 @@ func TestOpenChatCreatesRunAndAnchor(t *testing.T) {
 	if a.RunID != runID || a.ChannelID != "D1" || a.RootTs != "open1" {
 		t.Errorf("anchor mismapped: %+v (root_ts must be the user's message ts)", a)
 	}
-	// The status root was posted in a thread on the user's message, and its ts is
-	// status_ts — a BOT message, never the user's.
-	if len(fp.posts) != 1 || fp.posts[0].thread != "open1" {
-		t.Fatalf("want one status root threaded on the user message, got %+v", fp.posts)
+	// The status root is a Block Kit message (with an End button, M6) threaded on the
+	// user's message; its ts is status_ts — a BOT message, never the user's.
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "open1" {
+		t.Fatalf("want one status root threaded on the user message, got %+v", fp.blocks)
+	}
+	if strings.Join(fp.blocks[0].actionIDs, ",") != ActionChatEnd {
+		t.Errorf("live status must carry the End button, got %v", fp.blocks[0].actionIDs)
 	}
 	if !a.StatusTs.Valid || a.StatusTs.String != "ts1" {
 		t.Errorf("status_ts = %+v, want the bot post ts (ts1)", a.StatusTs)
@@ -55,6 +59,21 @@ func TestOpenChatCreatesRunAndAnchor(t *testing.T) {
 	}
 	if len(fp.reactions) != 1 || fp.reactions[0].ts != "open1" {
 		t.Errorf("want a ✅ ack on the opening message, got %+v", fp.reactions)
+	}
+}
+
+// With no worker online, the opener's status names that cause (M6).
+func TestOpenChatNoWorkerNamesTheCause(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user}
+	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runKindChat}} // workerOnline defaults false
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), topLevelDM("hi"))
+
+	if len(fp.blocks) != 1 || !strings.Contains(strings.ToLower(fp.blocks[0].sectionText), "no uzi worker") {
+		t.Fatalf("status should name the no-worker cause, got %+v", fp.blocks)
 	}
 }
 
@@ -73,9 +92,12 @@ func TestOpenChatAnchorFailureDoesNotAck(t *testing.T) {
 	if len(fp.reactions) != 0 {
 		t.Errorf("an anchor failure must not ack, got %+v", fp.reactions)
 	}
-	// One status root post + one anchor-failure notice, both threaded on the open msg.
-	if len(fp.posts) != 2 {
-		t.Fatalf("want status root + anchor-failure notice, got %+v", fp.posts)
+	// One status root (blocks) + one anchor-failure notice (a plain thread post).
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want the status root block, got %+v", fp.blocks)
+	}
+	if len(fp.posts) != 1 {
+		t.Fatalf("want one anchor-failure notice, got %+v", fp.posts)
 	}
 }
 

@@ -30,6 +30,10 @@ const (
 	// just clears the card (a run request has no server-side record to drop).
 	ActionChatRunStart   = "slack_chat_run_start"
 	ActionChatRunDismiss = "slack_chat_run_dismiss"
+	// Chat lifecycle buttons on the status message (PRD #191 M6): End cancels a live
+	// chat; Continue mints a new chat resuming the ended one. Value = the run id.
+	ActionChatEnd      = "slack_chat_end"
+	ActionChatContinue = "slack_chat_continue"
 )
 
 // isChatAction reports whether an action id is a chat-card action ChatActions owns.
@@ -53,12 +57,17 @@ var (
 	ErrChatProposalGone    = errors.New("slack: proposal not found or not yours")
 	ErrChatProposalHandled = errors.New("slack: proposal already resolved")
 	ErrChatProposalForge   = errors.New("slack: forge rejected the issue")
+	// Lifecycle sentinels (PRD #191 M6).
+	ErrChatGone        = errors.New("slack: chat not found or not yours")
+	ErrChatNotEndedYet = errors.New("slack: chat is still active")
 )
 
-// ChatActionStore is the store slice ChatActions reads: the confirmed-user resolve
-// that turns the Slack-authenticated presser into a uzi user. *store.Queries satisfies it.
+// ChatActionStore is the store slice ChatActions reads/writes: the confirmed-user
+// resolve, and (for Continue) the anchor insert for the resumed run. *store.Queries
+// satisfies it.
 type ChatActionStore interface {
 	GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID pgtype.Text) (store.User, error)
+	InsertSlackChatAnchor(ctx context.Context, arg store.InsertSlackChatAnchorParams) (store.SlackRunMessage, error)
 }
 
 // ChatActionSubmitter is the run service slice the chat cards drive (PRD #191 M4): the
@@ -76,6 +85,16 @@ type ChatActionSubmitter interface {
 	// id on success; on refusal the error's message is USER-SAFE (the adapter builds it
 	// from the gate sentinels and logs the raw cause), so ChatActions can surface it.
 	StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error)
+	// EndChat ends a live chat (PRD #191 M6). Translated: ErrChatEnded (already
+	// terminal), ErrChatGone (not yours / gone).
+	EndChat(ctx context.Context, userID, runID uuid.UUID) error
+	// ContinueChat mints a new chat resuming a terminal one, returning the new run's id.
+	// Translated: ErrChatNotEndedYet (still active), ErrChatGone.
+	ContinueChat(ctx context.Context, userID, runID uuid.UUID) (uuid.UUID, error)
+	// LiveChatForUser reports the user's newest non-terminal chat, if any — Continue
+	// refuses when one exists (Decision 3, and it makes a double-press idempotent since
+	// the first press's resumed run is live by the time the second is processed).
+	LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error)
 }
 
 // ChatActions handles the chat cards' Block Kit buttons (PRD #191 M4): Create files
@@ -90,6 +109,10 @@ type ChatActions struct {
 	poster  Poster
 	baseURL func(context.Context) (string, error)
 	logger  *slog.Logger
+	// chatAllow draws the Continue button from the SAME shared per-user chat spend
+	// budget the opener/web-create use (PRD #191 M6): Continue mints a run and spends
+	// the owner's token, so it must not bypass the guard. Nil (tests) is open.
+	chatAllow func(userID uuid.UUID) bool
 }
 
 // NewChatActions builds a ChatActions. poster is the shared bot-token Slack surface;
@@ -100,6 +123,11 @@ func NewChatActions(s ChatActionStore, svc ChatActionSubmitter, poster Poster, b
 	}
 	return &ChatActions{store: s, svc: svc, poster: poster, baseURL: baseURL, logger: logger}
 }
+
+// SetChatSpendGuard wires the per-user chat spend guard for the Continue button (PRD
+// #191 M6). Pass the SAME closure the opener uses so Slack opens and continues share
+// one budget.
+func (c *ChatActions) SetChatSpendGuard(allow func(userID uuid.UUID) bool) { c.chatAllow = allow }
 
 // HandleBlockAction routes a chat-card press. The actor is the Slack-authenticated
 // envelope user ONLY; the value blob carries (run, proposal) and is authorized through
@@ -116,7 +144,8 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 	// Only the chat-card actions ChatActions owns proceed; an unknown slack_chat_* id
 	// returns before the confirmed-user DB lookup.
 	switch a.ActionID {
-	case ActionChatProposalCreate, ActionChatProposalDismiss, ActionChatRunStart, ActionChatRunDismiss:
+	case ActionChatProposalCreate, ActionChatProposalDismiss, ActionChatRunStart, ActionChatRunDismiss,
+		ActionChatEnd, ActionChatContinue:
 	default:
 		return
 	}
@@ -154,6 +183,91 @@ func (c *ChatActions) HandleBlockAction(ctx context.Context, a BlockAction) {
 		} else {
 			c.editCard(ctx, a, "Dismissed — no run was started.", "")
 		}
+	case ActionChatEnd, ActionChatContinue:
+		runID, err := uuid.Parse(strings.TrimSpace(a.Value))
+		if err != nil {
+			c.logf("parse lifecycle action value", err)
+			return
+		}
+		if a.ActionID == ActionChatEnd {
+			c.endChat(ctx, a, user.ID, runID)
+		} else {
+			c.continueChat(ctx, a, user.ID, runID)
+		}
+	}
+}
+
+// endChat ends a live chat (PRD #191 M6). On success the run goes terminal and the
+// notifier's terminal transition (M2b) edits the status to the Continue form, so this
+// only needs to acknowledge; a stale click (already ended) or a foreign chat is an
+// ephemeral.
+func (c *ChatActions) endChat(ctx context.Context, a BlockAction, userID, runID uuid.UUID) {
+	err := c.svc.EndChat(ctx, userID, runID)
+	switch {
+	case err == nil:
+		// Do NOT edit the status message here: the terminal transition (M2b) owns
+		// status_ts and swaps in the Continue button. Editing it from this goroutine too
+		// would race that edit and could strip the Continue button. An ephemeral confirms
+		// the click without touching the shared message.
+		c.ephemeral(ctx, a, "Ending this conversation…")
+	case errors.Is(err, ErrChatEnded):
+		c.ephemeral(ctx, a, "This conversation has already ended.")
+	case errors.Is(err, ErrChatGone):
+		c.ephemeral(ctx, a, "That conversation isn't yours, or it no longer exists.")
+	default:
+		c.logf("end chat", err)
+		c.ephemeral(ctx, a, "Couldn't end that conversation — try again, or end it in uzi.")
+	}
+}
+
+// continueChat mints a fresh chat resuming a terminal one and anchors it on a NEW
+// status message in the DM (a new conversation = a new thread).
+//
+// Exactly one run per press (PRD #191 M6 Verified): a live-chat refusal makes a
+// double-press idempotent. Slack socket interactions are processed serially by one
+// goroutine, so the first press's ContinueChat INSERT has committed a live resumed run
+// before the second press is handled; the second then finds a live chat and refuses,
+// minting nothing. That same Decision-3 refusal (one live chat at a time) bounds the
+// spend a Continue chain can reach, and the spend guard meters the rate — Continue
+// mints a run and spends the owner's token, so it draws from the same budget as opens.
+func (c *ChatActions) continueChat(ctx context.Context, a BlockAction, userID, runID uuid.UUID) {
+	if _, ok, err := c.svc.LiveChatForUser(ctx, userID); err != nil {
+		c.logf("continue: check live chat", err)
+		return
+	} else if ok {
+		c.ephemeral(ctx, a, "You already have a live chat in this DM — reply in it (or end it) before continuing another.")
+		return
+	}
+	if c.chatAllow != nil && !c.chatAllow(userID) {
+		c.ephemeral(ctx, a, "You're starting chats faster than the limit allows — give it a moment. (This budget is shared with the web Chat page.)")
+		return
+	}
+
+	newRunID, err := c.svc.ContinueChat(ctx, userID, runID)
+	switch {
+	case err == nil:
+		// Post the new conversation's status message (top-level → a new thread) and
+		// anchor the resumed run on it (root_ts == status_ts, both this bot message).
+		statusTS, perr := c.poster.PostBlocks(ctx, a.ChannelID, "", "uzi chat",
+			chatLiveStatusBlocks(newRunID, "💬 Continuing the conversation — reply in THIS thread to keep going."))
+		if perr != nil {
+			c.logf("post continued status", perr)
+			c.ephemeral(ctx, a, "Continued — find the new conversation in uzi.")
+			return
+		}
+		if _, aerr := c.store.InsertSlackChatAnchor(ctx, store.InsertSlackChatAnchorParams{
+			RunID: newRunID, ChannelID: a.ChannelID, RootTs: statusTS, StatusTs: pgText(statusTS),
+		}); aerr != nil {
+			c.logf("anchor continued chat", aerr)
+		}
+		c.editCardLinked(ctx, a, "↩️ Continued in a new thread below.", "", "")
+	case errors.Is(err, ErrChatNotEndedYet):
+		c.ephemeral(ctx, a, "This conversation is still active — end it first, then Continue.")
+	case errors.Is(err, ErrChatGone):
+		c.ephemeral(ctx, a, "That conversation isn't yours, or it no longer exists.")
+	default:
+		c.logf("continue chat", err)
+		c.ephemeral(ctx, a, "Couldn't continue that conversation — try again, or use the Chat page in uzi.")
 	}
 }
 
@@ -357,6 +471,40 @@ func chatResolvedBlocks(text, url, linkLabel string) []slack.Block {
 			slack.NewTextBlockObject(slack.MarkdownType, fmt.Sprintf("<%s|%s>", u, linkLabel), false, false)))
 	}
 	return blocks
+}
+
+// -------------------------------------------------------------------------
+// chat status message blocks (PRD #191 M6)
+// -------------------------------------------------------------------------
+
+// chatLiveStatusBlocks is the status message for a LIVE chat: the current status line
+// plus an "End chat" button. Posted by the opener and by Continue; edited to the ended
+// form on a terminal transition (M2b). text is a fixed template — escaped as defense.
+func chatLiveStatusBlocks(runID uuid.UUID, text string) []slack.Block {
+	end := slack.NewButtonBlockElement(ActionChatEnd, runID.String(),
+		slack.NewTextBlockObject(slack.PlainTextType, "End chat", false, false))
+	end.Confirm = slack.NewConfirmationBlockObject(
+		slack.NewTextBlockObject(slack.PlainTextType, "End this conversation?", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "The chat stops here. You can Continue it later to pick up where it left off.", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "End chat", false, false),
+		slack.NewTextBlockObject(slack.PlainTextType, "Cancel", false, false),
+	)
+	return []slack.Block{
+		slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, EscapeMrkdwn(text), false, false), nil, nil),
+		slack.NewActionBlock("slack_chat_status", end),
+	}
+}
+
+// chatEndedStatusBlocks is the status message for a TERMINAL chat: the terminal line
+// plus a "Continue" button that mints a fresh chat resuming this one.
+func chatEndedStatusBlocks(runID uuid.UUID, text string) []slack.Block {
+	cont := slack.NewButtonBlockElement(ActionChatContinue, runID.String(),
+		slack.NewTextBlockObject(slack.PlainTextType, "Continue", false, false))
+	cont.Style = slack.StylePrimary
+	return []slack.Block{
+		slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, EscapeMrkdwn(text), false, false), nil, nil),
+		slack.NewActionBlock("slack_chat_status", cont),
+	}
 }
 
 // runReqValue is the start-run card's button value: the human repo path + issue iid.

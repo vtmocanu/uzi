@@ -276,6 +276,11 @@ func run() error {
 	// linker and the gatekeeper. The forge write rides the same claim-first
 	// ConfirmProposalForUser the web confirm uses (lifted in M1).
 	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
+	// The Continue button mints a run and spends the owner's token, so it draws from the
+	// SAME shared per-user chat budget the opener uses (PRD #191 M6) — same key, one pool.
+	slackChatActions.SetChatSpendGuard(func(userID uuid.UUID) bool {
+		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
+	})
 
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
@@ -887,6 +892,39 @@ func (g gateSubmitter) LiveChatForUser(ctx context.Context, userID uuid.UUID) (s
 // already drawn from the shared chat spend budget before calling this.
 func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, message string) (store.Run, error) {
 	return g.svc.CreateChatRun(ctx, userID, message)
+}
+
+// HasOnlineWorker adapts the opener's no-worker check (PRD #191 M6).
+func (g gateSubmitter) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
+	return g.svc.HasOnlineWorker(ctx, userID)
+}
+
+// EndChat adapts the Slack End-chat button (PRD #191 M6): cancel the live chat, with
+// the terminal/not-found sentinels translated for the ChatActions handler.
+func (g gateSubmitter) EndChat(ctx context.Context, userID, runID uuid.UUID) error {
+	_, err := g.svc.EndChat(ctx, userID, runID)
+	switch {
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return slacksvc.ErrChatEnded
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return slacksvc.ErrChatGone
+	}
+	return err
+}
+
+// ContinueChat adapts the Slack Continue button (PRD #191 M6): mint a fresh chat
+// resuming a terminal one, returning the new run's id, with sentinels translated.
+func (g gateSubmitter) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (uuid.UUID, error) {
+	run, err := g.svc.ContinueChat(ctx, userID, runID)
+	switch {
+	case errors.Is(err, workersvc.ErrChatNotEnded):
+		return uuid.Nil, slacksvc.ErrChatNotEndedYet
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return uuid.Nil, slacksvc.ErrChatGone
+	case err != nil:
+		return uuid.Nil, err
+	}
+	return run.ID, nil
 }
 
 // SubmitChatMessage adapts a Slack thread reply on a chat run to the run service

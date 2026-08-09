@@ -43,20 +43,33 @@ func TestNotifierChatCompletedEditsStatusTs(t *testing.T) {
 
 	n.handle(context.Background(), stateEvent{runID: runID, status: "completed"})
 
-	if len(fp.updates) != 1 {
-		t.Fatalf("want exactly one status edit, got %+v", fp.updates)
+	// Terminal edit swaps the End button for a Continue button (M6) via UpdateBlocks.
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want exactly one status edit, got %+v", fp.updateBlocks)
 	}
-	if fp.updates[0].ts != "bot1" {
-		t.Errorf("status edit must target status_ts (bot1), got %q", fp.updates[0].ts)
+	if fp.updateBlocks[0].ts != "bot1" {
+		t.Errorf("status edit must target status_ts (bot1), got %q", fp.updateBlocks[0].ts)
 	}
-	for _, u := range fp.updates {
+	if strings.Join(fp.updateBlocks[0].actionIDs, ",") != ActionChatContinue {
+		t.Errorf("terminal status must carry the Continue button, got %v", fp.updateBlocks[0].actionIDs)
+	}
+	for _, u := range append(fp.updates, updateCallsFromBlocks(fp.updateBlocks)...) {
 		if u.ts == "user1" {
-			t.Errorf("a chat transition must NEVER Update root_ts (the user's message): %+v", u)
+			t.Errorf("a chat transition must NEVER edit root_ts (the user's message): %+v", u)
 		}
 	}
-	if len(fp.posts) != 0 {
-		t.Errorf("a status_ts edit must not also post: %+v", fp.posts)
+	if len(fp.posts) != 0 || len(fp.updates) != 0 {
+		t.Errorf("a status_ts blocks-edit must not also plain-post/update: posts=%v updates=%v", fp.posts, fp.updates)
 	}
+}
+
+// updateCallsFromBlocks projects updateBlockCall to (channel, ts) for the root_ts guard.
+func updateCallsFromBlocks(bs []updateBlockCall) []updateCall {
+	out := make([]updateCall, len(bs))
+	for i, b := range bs {
+		out[i] = updateCall{channel: b.channel, ts: b.ts}
+	}
+	return out
 }
 
 // A failed chat includes the (scrubbed) failure reason on the status line.
@@ -70,11 +83,11 @@ func TestNotifierChatFailedShowsReason(t *testing.T) {
 
 	n.handle(context.Background(), stateEvent{runID: runID, status: "failed"})
 
-	if len(fp.updates) != 1 || fp.updates[0].ts != "bot1" {
-		t.Fatalf("want one status edit on status_ts, got %+v", fp.updates)
+	if len(fp.updateBlocks) != 1 || fp.updateBlocks[0].ts != "bot1" {
+		t.Fatalf("want one status edit on status_ts, got %+v", fp.updateBlocks)
 	}
-	if !strings.Contains(fp.updates[0].text, "worker disappeared mid-turn") {
-		t.Errorf("failed status should name the reason: %q", fp.updates[0].text)
+	if !strings.Contains(fp.updateBlocks[0].sectionText, "worker disappeared mid-turn") {
+		t.Errorf("failed status should name the reason: %q", fp.updateBlocks[0].sectionText)
 	}
 }
 
@@ -94,8 +107,8 @@ func TestNotifierChatNullStatusTsIsSilent(t *testing.T) {
 
 	n.handle(context.Background(), stateEvent{runID: runID, status: "completed"})
 
-	if len(fp.updates) != 0 || len(fp.posts) != 0 {
-		t.Fatalf("with no status_ts to edit the transition must be silent: updates=%v posts=%v", fp.updates, fp.posts)
+	if len(fp.updates) != 0 || len(fp.updateBlocks) != 0 || len(fp.posts) != 0 {
+		t.Fatalf("with no status_ts to edit the transition must be silent: updates=%v blocks=%v posts=%v", fp.updates, fp.updateBlocks, fp.posts)
 	}
 }
 
@@ -113,8 +126,8 @@ func TestNotifierChatRunningIsSilent(t *testing.T) {
 
 	n.handle(context.Background(), stateEvent{runID: runID, status: "running"})
 
-	if len(fp.updates) != 0 || len(fp.posts) != 0 {
-		t.Fatalf("a non-terminal chat state must be silent: updates=%v posts=%v", fp.updates, fp.posts)
+	if len(fp.updates) != 0 || len(fp.updateBlocks) != 0 || len(fp.posts) != 0 {
+		t.Fatalf("a non-terminal chat state must be silent: updates=%v blocks=%v posts=%v", fp.updates, fp.updateBlocks, fp.posts)
 	}
 }
 
@@ -128,7 +141,7 @@ func TestNotifierNonChatRepolessRunStillDropped(t *testing.T) {
 
 	n.handle(context.Background(), stateEvent{runID: runID, status: "completed"})
 
-	if len(fp.updates) != 0 || len(fp.posts) != 0 {
-		t.Fatalf("a repo-less non-chat run must not reach Slack: updates=%v posts=%v", fp.updates, fp.posts)
+	if len(fp.updates) != 0 || len(fp.updateBlocks) != 0 || len(fp.posts) != 0 {
+		t.Fatalf("a repo-less non-chat run must not reach Slack: updates=%v blocks=%v posts=%v", fp.updates, fp.updateBlocks, fp.posts)
 	}
 }

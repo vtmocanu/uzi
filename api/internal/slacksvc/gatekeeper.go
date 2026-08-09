@@ -71,6 +71,9 @@ type PlanGateSubmitter interface {
 	// #191 M2, Decision 3). The Slack opener refuses a second top-level DM while a
 	// chat is live rather than minting a second run.
 	LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error)
+	// HasOnlineWorker reports whether the user has a worker online (PRD #191 M6): the
+	// opener names "no worker connected" as the reason a fresh chat sits queued.
+	HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error)
 	// CreateChatRun queues a new chat run seeded with the opening message, returning
 	// the run (its id anchors the DM). It rides the same ownership-scoped service the
 	// web Chat page uses; the Slack path draws from the shared per-user chat spend

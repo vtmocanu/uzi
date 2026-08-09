@@ -277,6 +277,18 @@ func (s *Service) LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.
 	return run, true, nil
 }
 
+// HasOnlineWorker reports whether the user has at least one online worker (PRD #191
+// M6): the Slack chat opener names "no worker connected" as the reason a fresh chat
+// sits queued, instead of leaving the user staring at silence. Off the hot path
+// (opener only). A DB error is surfaced so the caller can degrade to a neutral message.
+func (s *Service) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
+	n, err := s.q.CountOnlineWorkersForUser(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // GetChatRun returns a CHAT run owned by the user. A non-chat run (or another
 // user's run, or an unknown id) is ErrRunNotFound — a non-chat run is simply not
 // addressable through the /api/chats surface.

@@ -13,14 +13,20 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeChatActionStore resolves the confirmed presser.
+// fakeChatActionStore resolves the confirmed presser and records anchor inserts.
 type fakeChatActionStore struct {
-	user    store.User
-	userErr error
+	user      store.User
+	userErr   error
+	anchors   []store.InsertSlackChatAnchorParams
+	anchorErr error
 }
 
 func (f *fakeChatActionStore) GetConfirmedUserBySlackID(context.Context, pgtype.Text) (store.User, error) {
 	return f.user, f.userErr
+}
+func (f *fakeChatActionStore) InsertSlackChatAnchor(_ context.Context, arg store.InsertSlackChatAnchorParams) (store.SlackRunMessage, error) {
+	f.anchors = append(f.anchors, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, ChannelID: arg.ChannelID, RootTs: arg.RootTs, StatusTs: arg.StatusTs}, f.anchorErr
 }
 
 // fakeChatActionSubmitter records the composite proposal ops and returns staged results.
@@ -34,6 +40,18 @@ type fakeChatActionSubmitter struct {
 	starts     []startCall
 	startedRun uuid.UUID
 	startErr   error
+
+	ends         []endCall
+	endErr       error
+	continues    []endCall
+	continuedRun uuid.UUID
+	continueErr  error
+	liveChatOK   bool // M6: LiveChatForUser (default false = no live chat)
+	liveChatErr  error
+}
+
+type endCall struct {
+	userID, runID uuid.UUID
 }
 
 type confirmCall struct{ userID, runID, propID uuid.UUID }
@@ -55,6 +73,17 @@ func (f *fakeChatActionSubmitter) DismissProposalForUser(_ context.Context, user
 func (f *fakeChatActionSubmitter) StartRunFromCard(_ context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
 	f.starts = append(f.starts, startCall{userID, repoPath, issueIID})
 	return f.startedRun, f.startErr
+}
+func (f *fakeChatActionSubmitter) EndChat(_ context.Context, userID, runID uuid.UUID) error {
+	f.ends = append(f.ends, endCall{userID, runID})
+	return f.endErr
+}
+func (f *fakeChatActionSubmitter) ContinueChat(_ context.Context, userID, runID uuid.UUID) (uuid.UUID, error) {
+	f.continues = append(f.continues, endCall{userID, runID})
+	return f.continuedRun, f.continueErr
+}
+func (f *fakeChatActionSubmitter) LiveChatForUser(context.Context, uuid.UUID) (store.Run, bool, error) {
+	return store.Run{}, f.liveChatOK, f.liveChatErr
 }
 
 func runCardPress(actionID, repoPath string, issueIID int64) BlockAction {
@@ -314,6 +343,129 @@ func TestChatActionRunDismiss(t *testing.T) {
 	}
 	if len(fp.updateBlocks) != 1 {
 		t.Fatalf("dismiss should edit the card, got %+v", fp.updateBlocks)
+	}
+}
+
+func lifecyclePress(actionID string, runID uuid.UUID) BlockAction {
+	return BlockAction{SlackUserID: "Uauth", ActionID: actionID, Value: runID.String(), ChannelID: "D1", MessageTS: "status1"}
+}
+
+// End routes to EndChat and edits the status message to an "ending" state.
+func TestChatActionEndChat(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	sub := &fakeChatActionSubmitter{}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatEnd, runID))
+
+	if len(sub.ends) != 1 || sub.ends[0].runID != runID || sub.ends[0].userID != user.ID {
+		t.Fatalf("end mis-routed: %+v", sub.ends)
+	}
+	// End confirms via an ephemeral and does NOT edit status_ts (M2b's terminal
+	// transition owns that edit and swaps in Continue) — avoids a two-goroutine race.
+	if len(fp.updateBlocks) != 0 {
+		t.Errorf("End must not edit the status message (M2b owns it), got %+v", fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "ending") {
+		t.Fatalf("End should confirm via an ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// A second Continue while the first resumed run is still live is refused (idempotent
+// double-press): mints nothing. Serial socket processing + this live-chat check give
+// exactly-one-per-press.
+func TestChatActionContinueRefusedWhileLive(t *testing.T) {
+	sub := &fakeChatActionSubmitter{liveChatOK: true} // a live chat already exists
+	fp := &fakePoster{}
+	fs := &fakeChatActionStore{user: store.User{ID: uuid.New()}}
+	c := NewChatActions(fs, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+
+	if len(sub.continues) != 0 {
+		t.Errorf("Continue must mint nothing while a chat is live, got %+v", sub.continues)
+	}
+	if len(fp.ephemerals) != 1 {
+		t.Fatalf("want one 'already have a live chat' ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// The Continue spend guard refuses when over budget, minting nothing.
+func TestChatActionContinueSpendGuard(t *testing.T) {
+	sub := &fakeChatActionSubmitter{continuedRun: uuid.New()}
+	fp := &fakePoster{}
+	fs := &fakeChatActionStore{user: store.User{ID: uuid.New()}}
+	c := NewChatActions(fs, sub, fp, fixedBase, nil)
+	c.SetChatSpendGuard(func(uuid.UUID) bool { return false }) // over budget
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+
+	if len(sub.continues) != 0 {
+		t.Errorf("a rate-limited Continue must mint nothing, got %+v", sub.continues)
+	}
+	if len(fp.ephemerals) != 1 {
+		t.Fatalf("want one rate-limit ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// End on an already-terminal chat is an ephemeral, no edit.
+func TestChatActionEndAlreadyEnded(t *testing.T) {
+	sub := &fakeChatActionSubmitter{endErr: ErrChatEnded}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatEnd, uuid.New()))
+
+	if len(fp.updateBlocks) != 0 || len(fp.ephemerals) != 1 {
+		t.Fatalf("already-ended End should ephemeral, not edit: edits=%v eph=%v", fp.updateBlocks, fp.ephemerals)
+	}
+}
+
+// Continue mints exactly one resumed run, posts + anchors a NEW status message, and
+// edits the old card away.
+func TestChatActionContinueMintsOneRunAndAnchors(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	oldRun, newRun := uuid.New(), uuid.New()
+	sub := &fakeChatActionSubmitter{continuedRun: newRun}
+	fs := &fakeChatActionStore{user: user}
+	fp := &fakePoster{}
+	c := NewChatActions(fs, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, oldRun))
+
+	if len(sub.continues) != 1 || sub.continues[0].runID != oldRun {
+		t.Fatalf("continue mis-routed: %+v", sub.continues)
+	}
+	// A NEW top-level status message (blocks with End) for the resumed conversation.
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "" || strings.Join(fp.blocks[0].actionIDs, ",") != ActionChatEnd {
+		t.Fatalf("continue should post a new top-level status with End, got %+v", fp.blocks)
+	}
+	// Anchored on that new bot message (root_ts == status_ts == the posted ts).
+	if len(fs.anchors) != 1 || fs.anchors[0].RunID != newRun || fs.anchors[0].RootTs != "ts1" || fs.anchors[0].StatusTs.String != "ts1" {
+		t.Fatalf("resumed run must be anchored on the new status message, got %+v", fs.anchors)
+	}
+	// The old card is edited button-free.
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 {
+		t.Fatalf("the old status card should be edited button-free, got %+v", fp.updateBlocks)
+	}
+}
+
+// Continue on a still-active chat is refused with an ephemeral, mints nothing.
+func TestChatActionContinueStillActive(t *testing.T) {
+	sub := &fakeChatActionSubmitter{continueErr: ErrChatNotEndedYet}
+	fp := &fakePoster{}
+	fs := &fakeChatActionStore{user: store.User{ID: uuid.New()}}
+	c := NewChatActions(fs, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+
+	if len(fp.blocks) != 0 || len(fs.anchors) != 0 {
+		t.Errorf("a refused Continue must post/anchor nothing")
+	}
+	if len(fp.ephemerals) != 1 {
+		t.Fatalf("want one ephemeral, got %+v", fp.ephemerals)
 	}
 }
 

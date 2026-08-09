@@ -77,14 +77,16 @@ type fakeSubmitter struct {
 	answerErr  error
 
 	// PRD #191 M2 chat verbs.
-	liveChat      store.Run
-	liveChatOK    bool
-	liveChatErr   error
-	createdChat   store.Run
-	createChatErr error
-	createdChats  []createdChat
-	chatTurns     []submittedChatTurn
-	chatTurnErr   error
+	liveChat        store.Run
+	liveChatOK      bool
+	liveChatErr     error
+	createdChat     store.Run
+	createChatErr   error
+	createdChats    []createdChat
+	chatTurns       []submittedChatTurn
+	chatTurnErr     error
+	workerOnline    bool // PRD #191 M6: HasOnlineWorker (default false)
+	workerOnlineErr error
 }
 
 type createdChat struct {
@@ -125,6 +127,9 @@ func (f *fakeSubmitter) SubmitAnswer(_ context.Context, userID, runID uuid.UUID,
 // PRD #191 M2 chat verbs.
 func (f *fakeSubmitter) LiveChatForUser(context.Context, uuid.UUID) (store.Run, bool, error) {
 	return f.liveChat, f.liveChatOK, f.liveChatErr
+}
+func (f *fakeSubmitter) HasOnlineWorker(context.Context, uuid.UUID) (bool, error) {
+	return f.workerOnline, f.workerOnlineErr
 }
 func (f *fakeSubmitter) CreateChatRun(_ context.Context, userID uuid.UUID, message string) (store.Run, error) {
 	f.createdChats = append(f.createdChats, createdChat{userID, message})

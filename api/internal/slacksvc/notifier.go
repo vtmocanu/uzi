@@ -456,9 +456,12 @@ func (n *Notifier) handleChat(ctx context.Context, ev stateEvent) {
 		// transition would duplicate it. The run stays visible in the web Chat page.
 		return
 	}
-	// Edit the bot status message in place. NEVER Update root_ts (the user's message).
-	// A redelivered terminal transition is an idempotent edit-to-same-text.
-	if err := n.poster.Update(ctx, anchor.ChannelID, anchor.StatusTs.String, ScrubSecrets(line)); err != nil {
+	// Edit the bot status message in place, swapping the End button for a Continue
+	// button (PRD #191 M6): a terminal chat offers Continue, which mints a fresh chat
+	// resuming this one. NEVER Update root_ts (the user's message). A redelivered
+	// terminal transition is an idempotent edit-to-same-blocks.
+	if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.StatusTs.String,
+		ScrubSecrets(line), chatEndedStatusBlocks(ev.runID, ScrubSecrets(line))); err != nil {
 		n.logf("update chat status", err)
 	}
 }
@@ -469,9 +472,11 @@ func (n *Notifier) handleChat(ctx context.Context, ev stateEvent) {
 func renderChatStatus(cc store.GetSlackChatContextRow) string {
 	switch cc.Status {
 	case "completed":
-		return "✅ This conversation has ended — message me again to start a new one."
+		// Idle backstop (CHAT_IDLE_TIMEOUT) or the turn cap (CHAT_MAX_TURNS): both land
+		// the run in completed. Continue picks it back up.
+		return "✅ This conversation ended (it went quiet, or hit its turn limit). Continue it to pick up where it left off."
 	case "cancelled":
-		return "🛑 This conversation was ended — message me again to start a new one."
+		return "🛑 You ended this conversation. Continue it to pick up where it left off."
 	case "failed":
 		msg := "⚠️ This chat run failed."
 		if cc.FailureReason.Valid {
@@ -479,7 +484,7 @@ func renderChatStatus(cc store.GetSlackChatContextRow) string {
 				msg += " " + reason
 			}
 		}
-		return msg
+		return msg + " You can Continue it to try again."
 	default:
 		return ""
 	}

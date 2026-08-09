@@ -31,6 +31,11 @@ const (
 	// M2b edits on a terminal transition. The agent's actual answers stream as
 	// separate threaded messages (M3).
 	chatStartedText = "💬 On it — starting a chat. I'll reply in this thread; send more here to keep the conversation going."
+	// chatQueuedNoWorkerText is shown when the opener finds no worker online (M6): the
+	// run is queued and will wait, so name the cause instead of leaving a silent thread.
+	chatQueuedNoWorkerText = "💬 Chat queued — but no uzi worker is connected right now, so it's waiting. Start your worker and it'll pick this up; your messages here are saved."
+	// chatStatusFallback is the notification/plain-text fallback for the status blocks.
+	chatStatusFallback = "uzi chat"
 	// chatBusyText refuses a second top-level DM while a chat is live (Decision 3).
 	chatBusyText = "You already have a live chat in this DM — reply in its thread to continue it (or say you're done there first). One conversation at a time keeps them from queueing behind each other."
 	// chatRateLimitedText is the shared-budget refusal (Decision 9): the chat spend
@@ -82,10 +87,13 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 		return
 	}
 
-	// Post the bot's status root in a thread on the user's message; its ts is the
-	// editable status_ts. A post failure is non-fatal — the anchor records a NULL
-	// status_ts and later per-turn answers still thread under root_ts (M3).
-	statusTS, err := r.poster.Post(ctx, m.ChannelID, m.MessageTS, chatStartedText)
+	// Post the bot's status root (with an End-chat button) in a thread on the user's
+	// message; its ts is the editable status_ts. The copy names the one cause a user
+	// will actually hit (PRD #191 M6): no worker connected, so the run sits queued. A
+	// post failure is non-fatal — the anchor records a NULL status_ts and later per-turn
+	// answers still thread under root_ts (M3).
+	statusTS, err := r.poster.PostBlocks(ctx, m.ChannelID, m.MessageTS, chatStatusFallback,
+		chatLiveStatusBlocks(run.ID, r.openingStatusText(ctx, user.ID)))
 	if err != nil {
 		r.logf("post chat status root", err)
 	}
@@ -106,6 +114,17 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 
 	// ✅ the opening message so the user sees it landed even before the worker replies.
 	r.ack(ctx, m)
+}
+
+// openingStatusText picks the opener's status line: the normal "on it" copy, or —
+// when the user has no worker connected (PRD #191 M6) — a line naming that cause, since
+// the chat run then sits queued until a worker comes online. A worker-check error
+// degrades to the neutral copy rather than a scary message.
+func (r *Replier) openingStatusText(ctx context.Context, userID uuid.UUID) string {
+	if online, err := r.svc.HasOnlineWorker(ctx, userID); err == nil && !online {
+		return chatQueuedNoWorkerText
+	}
+	return chatStartedText
 }
 
 // submitChatTurn routes a thread reply on a chat run through SubmitChatMessage (PRD
