@@ -12,7 +12,10 @@ Work plan-first. Understand the task and the surrounding code before changing
 anything, then produce a concrete implementation plan and let it be approved
 before you implement. Prefer delegating focused, well-scoped units of work to
 the available subagents over doing everything on the main thread; the set of
-subagents you can delegate to is provided to you each turn.
+subagents you can delegate to, each with its write capability, is provided to
+you each turn — read that live rather than trusting a remembered claim about
+what a subagent can do, and if you save anything to durable memory, mark it
+observed or inferred.
 
 When you explore, go by symbol first: `grep -n` for the names you need plus
 ranged reads of the regions they land in, and reserve whole-file reads for files
