@@ -81,7 +81,7 @@ describe("provisionRunTools tier-2 best-effort fallback (PRD #278 M2)", () => {
     assert.strictEqual(calls.length, 1, "provision called exactly once");
     assert.deepStrictEqual(calls[0], ["ruby@3.3"], "called with the tier-2 package");
     assert.ok(
-      h.statusTexts().some((t) => t.includes("skipping this repo's extra tool(s)") && t.includes("ruby@3.3")),
+      h.statusTexts().some((t) => t.includes("this repo's opt-in extra tool(s)") && t.includes("skipping them") && t.includes("ruby@3.3")),
       "a warning about skipping the repo extra was emitted",
     );
   });
@@ -102,7 +102,7 @@ describe("provisionRunTools tier-2 best-effort fallback (PRD #278 M2)", () => {
     assert.deepStrictEqual(calls[0], ["kubectl@1.31", "ruby@3.3"], "first call is the merged set");
     assert.deepStrictEqual(calls[1], ["kubectl@1.31"], "second call is tier-1 only");
     assert.ok(
-      h.statusTexts().some((t) => t.includes("skipping this repo's extra tool(s)") && t.includes("ruby@3.3")),
+      h.statusTexts().some((t) => t.includes("this repo's opt-in extra tool(s)") && t.includes("retrying without them") && t.includes("ruby@3.3")),
       "a warning was emitted",
     );
   });

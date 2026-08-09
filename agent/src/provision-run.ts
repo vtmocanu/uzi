@@ -82,9 +82,10 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   const provisionDir = path.join(deps.provisionRoot, ctx.runId);
 
   // Provision `packages` against provisionDir, emitting the run-feed status
-  // messages. provisionTools writes a fresh packages-only manifest on every call,
-  // so re-running against the same dir is self-contained (we clear it first so no
-  // stale devbox.json/lock from a failed attempt lingers).
+  // messages. provisionTools re-creates the dir and writes a fresh packages-only
+  // manifest on every call, so re-running against the same dir is self-contained;
+  // the catch below also rm's the dir before any retry so no stale
+  // devbox.json/lock from the failed attempt lingers.
   const install = async (packages: string[]): Promise<ProvisionRunResult> => {
     ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${packages.length} tool(s): ${packages.join(", ")}` } });
     const res = await provision({ packages, runDir: provisionDir, homeDir: deps.homeDir }, { log: deps.log });
@@ -97,13 +98,17 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   } catch (err) {
     await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
     if (tier2Added > 0) {
-      // The failed set carried repo extras — DEGRADE rather than fail the run.
+      // The failed merged set carried this repo's opt-in extras — DEGRADE rather
+      // than fail the run. Phrase the warning causation-neutrally: the extras may
+      // not be what failed (a tier-1 package in the merged set could be), and a
+      // genuine tier-1 failure still surfaces fatally via the tier-1-only retry
+      // below. So we say the merged set failed and what we do next, not who caused it.
       const tier2Only = toolPackages.slice(tier1.length);
       ctx.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: `repo devbox.json tool provisioning failed; skipping this repo's extra tool(s) (${tier2Only.join(", ")}): ${errMessage(err)}`,
+          text: `tool provisioning failed with this repo's opt-in extra tool(s) (${tier2Only.join(", ")}); ${tier1.length === 0 ? "skipping them" : "retrying without them"}: ${errMessage(err)}`,
         },
       });
       if (tier1.length === 0) return { toolEnv: {} };
