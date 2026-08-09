@@ -12,7 +12,12 @@
 // prompt-level layer.
 
 import { randomBytes } from "node:crypto";
-import type { Milestone, MilestoneProgress, RunKind } from "./protocol.js";
+import type {
+  MemoryBasis,
+  Milestone,
+  MilestoneProgress,
+  RunKind,
+} from "./protocol.js";
 import { clampToDirCharset } from "./util.js";
 
 const UNTRUSTED_FRAME =
@@ -177,6 +182,13 @@ export interface MemoryEntryView {
   title: string;
   body: string;
   created_at?: string;
+  /** Writer-declared provenance (PRD #266 M3). A missing/unknown value is treated as
+   *  `inferred` (legacy rows), so an untested deduction always wears the per-entry
+   *  re-verify caveat rather than being silently trusted. */
+  basis?: MemoryBasis;
+  /** Optional short pointer to what backs an `observed` claim; rendered inline when
+   *  present so the reader can check it. */
+  evidence?: string;
 }
 
 // memoryFrame frames the run's (user, repo) cross-run memory as INERT, UNTRUSTED,
@@ -197,11 +209,34 @@ function memoryFrame(openTag: string, closeTag: string): string {
   );
 }
 
+// memoryBasisMarker renders the PER-ENTRY provenance signal that M3 layers on top of
+// the blanket memoryFrame (PRD #266 Decision 3: the frame already existed and did not
+// stop the incident, so ADD a per-entry signal rather than replace it). An `inferred`
+// basis — OR a missing/unknown one, so legacy rows and pre-M3 responses fail safe —
+// wears an individual "re-verify against live code" caveat, distinct from the blanket
+// advisory. An `observed` basis is marked as such and carries its evidence pointer
+// when present, so the reader can check what backs the claim.
+function memoryBasisMarker(
+  basis: MemoryBasis | undefined,
+  evidence: string | undefined,
+): string {
+  if (basis === "observed") {
+    const ev = evidence && evidence.length > 0 ? `; evidence: ${evidence}` : "";
+    return `[basis: observed${ev}]`;
+  }
+  // inferred, or missing/unknown ⇒ treat as inferred (legacy row) and caveat it.
+  return "[basis: INFERRED — re-verify against live code before acting on it]";
+}
+
 /**
  * Render the run's cross-run memory as an inert, nonce-fenced, untrusted-advisory
  * block for the lead's planning prompt (PRD #90 M3). Returns "" when there are no
  * entries, so the caller injects nothing. Pure + unit-testable (the read-path
  * builder M5 exercises directly, independent of the live executor).
+ *
+ * On top of the blanket untrusted frame, each entry carries a PER-ENTRY provenance
+ * marker (PRD #266 M3): an inferred (or legacy/unknown-basis) entry is individually
+ * flagged "re-verify", while an observed entry shows its evidence when present.
  */
 export function buildMemoryContext(
   entries: readonly MemoryEntryView[],
@@ -215,7 +250,8 @@ export function buildMemoryContext(
   const rendered = entries
     .map((e, i) => {
       const when = e.created_at ? ` (saved ${e.created_at})` : "";
-      return [`[${i + 1}] ${e.title}${when}`, e.body].join("\n");
+      const marker = ` ${memoryBasisMarker(e.basis, e.evidence)}`;
+      return [`[${i + 1}] ${e.title}${when}${marker}`, e.body].join("\n");
     })
     .join("\n\n");
   return [memoryFrame(openTag, closeTag), openTag, rendered, closeTag].join(
@@ -505,6 +541,10 @@ export interface PlanPromptInput {
   branch: string;
   /** Names of the invokable subagents, surfaced so the lead can delegate. */
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. */
   memory?: readonly MemoryEntryView[];
@@ -546,7 +586,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     `</issue_description>`,
     ...(memoryBlock ? ["", memoryBlock] : []),
     "",
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
     "",
@@ -588,6 +628,10 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
 export interface ImplementPromptInput {
   branch: string;
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** True for the first implementation turn (right after approval). */
   first: boolean;
   /** The current implement⇄review iteration (1-based). */
@@ -694,7 +738,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       "</plan>",
     );
   }
-  lines.push(delegatesLine(input.subagentNames));
+  lines.push(delegatesLine(input.subagentNames, input.subagentCanWrite));
   // Facts, first turn only. A failed dir reads as failed so the agent can act on it.
   const depsNote = input.first
     ? depsProvisionImplementNote(input.deps, input.depsTruncated)
@@ -806,10 +850,27 @@ function milestoneStatusNote(
   ].join("\n");
 }
 
-function delegatesLine(subagentNames: string[]): string {
-  return subagentNames.length > 0
-    ? `Available subagents to delegate to: ${subagentNames.join(", ")}.`
-    : "No subagents are available; do the work yourself.";
+// PRD #266 M1: the roster line names each subagent AND its write capability, so the
+// lead never guesses whether a role can edit files. The capability MUST be derived
+// from the PRE-STRIP implement-turn definitions (see subagentWriteCapabilities in
+// agents.ts) — reading it off the plan-turn stripped map would falsely mark `coder`
+// (inherit-all) as read-only. `canWrite` is looked up per name; a name missing from
+// the map (should not happen for a real roster) defaults to read-only. When the map
+// is absent entirely (back-compat), the line renders names only, as before.
+function delegatesLine(
+  subagentNames: string[],
+  canWrite?: Record<string, boolean>,
+): string {
+  if (subagentNames.length === 0) {
+    return "No subagents are available; do the work yourself.";
+  }
+  if (!canWrite) {
+    return `Available subagents to delegate to: ${subagentNames.join(", ")}.`;
+  }
+  const annotated = subagentNames
+    .map((n) => `${n} (${canWrite[n] ? "can edit files" : "read-only"})`)
+    .join(", ");
+  return `Available subagents to delegate to: ${annotated}.`;
 }
 
 // ── Self-improvement runs (PRD #46 Decision 10) ──────────────────────────────
@@ -837,6 +898,10 @@ export interface SelfImprovePlanPromptInput {
   /** The accumulated improve_uzi backlog (untrusted), carried as issue_description. */
   recommendations: string;
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
    *  self_improve run can WRITE memory, so it must also READ it back (write/read
@@ -905,7 +970,7 @@ export function buildSelfImprovePlanPrompt(
     closeTag,
     ...(memoryBlock ? ["", memoryBlock] : []),
     "",
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
     "",
@@ -957,6 +1022,10 @@ export interface CIFixPlanPromptInput {
   /** The failed jobs' names/stages + log tails (UNTRUSTED evidence). */
   failedJobs: { name: string; stage: string; logTail: string }[];
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
    *  ci_fix run can WRITE memory, so it must also READ it back (write/read symmetry). */
@@ -1028,7 +1097,7 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   if (memoryBlock) lines.push(memoryBlock, "");
   lines.push(
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "Diagnose the failure. You may re-run the failing commands locally (tests,",
     "linters) to reproduce it; you cannot touch the forge or network.",
     "",

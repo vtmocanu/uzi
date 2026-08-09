@@ -613,3 +613,31 @@ func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
 		t.Fatalf("status = %d, want 404 (run not owned by this worker)", rec.Code)
 	}
 }
+
+// TestNormalizeMemoryBasis pins the READ-side default for writer-declared
+// provenance (PRD #266). normalizeMemoryBasis is a pure function that had ZERO
+// tests, so a mutation flipping its default to "observed" left the suite green.
+// This table asserts the exact returned label, not merely non-empty: the last two
+// cases would still pass under a flipped default, but the NULL/empty/unknown cases
+// each demand "inferred", so they FAIL the moment the conservative default is
+// changed to "observed" — the pin the mutation lacked.
+func TestNormalizeMemoryBasis(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		basis pgtype.Text
+		want  string
+	}{
+		{"null", pgtype.Text{Valid: false}, "inferred"},
+		{"valid empty", pgtype.Text{String: "", Valid: true}, "inferred"},
+		{"unknown value", pgtype.Text{String: "bogus", Valid: true}, "inferred"},
+		{"wrong case", pgtype.Text{String: "OBSERVED", Valid: true}, "inferred"},
+		{"observed", pgtype.Text{String: "observed", Valid: true}, "observed"},
+		{"inferred", pgtype.Text{String: "inferred", Valid: true}, "inferred"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeMemoryBasis(tc.basis); got != tc.want {
+				t.Errorf("normalizeMemoryBasis(%+v) = %q, want %q", tc.basis, got, tc.want)
+			}
+		})
+	}
+}

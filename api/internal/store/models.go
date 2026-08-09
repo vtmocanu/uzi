@@ -19,6 +19,8 @@ type AgentMemory struct {
 	Title     string             `json:"title"`
 	Body      string             `json:"body"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Basis     pgtype.Text        `json:"basis"`
+	Evidence  pgtype.Text        `json:"evidence"`
 }
 
 type AgentSkillAllocation struct {

@@ -29,6 +29,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { z } from "zod";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import type { MemoryBasis } from "./protocol.js";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
 
@@ -43,6 +44,10 @@ export const SAVE_MEMORY_TOOL = "save_memory";
  *  server-side. */
 export const MEMORY_TITLE_MAX_BYTES = 200;
 export const MEMORY_BODY_MAX_BYTES = 2048;
+/** Cap for the optional writer-declared evidence pointer (PRD #266 M2), in BYTES
+ *  (utf-8), same pattern as title/body. It is a short pointer (a `file:line`, a
+ *  command, a tool name), not prose — 200 bytes matches the title cap. */
+export const MEMORY_EVIDENCE_MAX_BYTES = 200;
 
 /**
  * Obvious "volatile snapshot" shapes a durable memory should NOT be built around:
@@ -60,6 +65,64 @@ export const MEMORY_BODY_MAX_BYTES = 2048;
  * regex (anchor it, or drop the superlinear `\d+\s*` prefixes) if the cap grows.
  */
 const VOLATILE_SNAPSHOT_RE = /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i;
+
+/**
+ * A "config claim" is a memory that asserts THIS run's OWN roster/tool/runtime
+ * configuration — which subagent can Edit/Write, which is read-only, what tools a
+ * role inherits (PRD #266 M4). That class of fact should be READ LIVE from the
+ * per-turn roster (surfaced in M1), NOT remembered: it decays as the product
+ * changes and a stale copy misleads a later run. A match appends a NON-FATAL nudge
+ * — never a rejection — exactly like VOLATILE_SNAPSHOT_RE; the memory is stored
+ * either way, and it never sets isError.
+ *
+ * The discriminator (this is an agent-framework repo, so legitimate memories name
+ * `tools`/`coder`/`Edit`/`Write` constantly): fire ONLY when a roster-subject token
+ * (CONFIG_ROLE) co-occurs with a write/tool-capability token (CONFIG_TOOL) AND that
+ * capability sits in a POSSESSION, NEGATION, or COPULA frame (CONFIG_POSS: has /
+ * lacks / no / cannot / inherits / edits via / is / are …) within a BOUNDED window
+ * of it — so "the coder IS read-only" trips too. A subagent name
+ * next to a bare filename ("the coder must update forge.ts") does NOT trip: no
+ * capability token and no possession frame.
+ *
+ * Borderline calls (documented per the M4 spec): the "coder inherits all tools
+ * including Edit and Write" fixture is a POSITIVE — an affirmative capability claim
+ * is still a runtime-config fact to read live, not remember. "the lead roster now
+ * annotates each subagent … prompt.ts" stays a NEGATIVE: it names a role and the
+ * roster but asserts no tool possession/negation, so it is quiet — which is what
+ * keeps the near-miss #5 and the tool-only/role-only cases quiet too.
+ *
+ * COST COUPLING (same discipline as VOLATILE_SNAPSHOT_RE): cost is bounded only by
+ * input length. The `bytes > MEMORY_BODY_MAX_BYTES` early-return in saveMemory runs
+ * BEFORE this regex, so `body` here is always ≤ MEMORY_BODY_MAX_BYTES (2048). Each
+ * lookahead scans once and the inter-token gap is a BOUNDED `{0,40}` (no nested
+ * unbounded quantifier), so the worst case is linear in the cap. Revisit if
+ * MEMORY_BODY_MAX_BYTES grows.
+ */
+const CONFIG_ROLE = "(?:subagents?|coders?|reviewers?|auditors?|testers?|architects?|documenters?|web-ux|leads?|rosters?)";
+const CONFIG_TOOL = "(?:MultiEdit|NotebookEdit|Edit|Write|tools?|edit files|write files|write access|write-capable|read-only)";
+const CONFIG_POSS =
+  // Copula framing (is/are/isn't/aren't) lets a directly-framed capability phrase
+  // ("the coder IS read-only", "the reviewer IS write-capable") trip without a
+  // separate possession word — but the CONFIG_TOOL-within-{0,40} requirement still
+  // means a bare "the coder is slow" (no tool/capability token) does NOT fire.
+  "(?:has|have|had|lacks?|lacked|without|cannot|can['’]?t|can not|does(?:n['’]?t| not)? have|inherit(?:s|ed)?|declare[sd]?|edits? via|is|are|isn['’]?t|aren['’]?t|no)";
+const CONFIG_CLAIM_RE = new RegExp(
+  // Anchored at ^ (no `m` flag) so both lookaheads scan the WHOLE body once from
+  // its start — a role BEFORE the capability phrase still counts (as in "the coder
+  // subagent has no Edit/Write"), which a non-anchored form would miss.
+  "^(?=[\\s\\S]*\\b" +
+    CONFIG_ROLE +
+    "\\b)(?=[\\s\\S]*(?:\\b" +
+    CONFIG_POSS +
+    "\\b[\\s\\S]{0,40}\\b" +
+    CONFIG_TOOL +
+    "\\b|\\b" +
+    CONFIG_TOOL +
+    "\\b[\\s\\S]{0,40}\\b" +
+    CONFIG_POSS +
+    "\\b))",
+  "i",
+);
 
 /** The qualified tool name to allow/deny by (extraTools / subagent deny). */
 export function memoryToolNames(): string[] {
@@ -115,7 +178,7 @@ export interface MemoryToolsDeps {
 /** The raw tool handlers (unit-testable). save_memory validates the size caps
  *  client-side, then POSTs through deps.client for deps.runId only. */
 export interface MemoryToolHandlers {
-  saveMemory(args: { title: string; body: string }): Promise<ToolTextResult>;
+  saveMemory(args: { title: string; body: string; basis?: MemoryBasis; evidence?: string }): Promise<ToolTextResult>;
 }
 
 export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandlers {
@@ -138,15 +201,33 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
       if (bytes > MEMORY_BODY_MAX_BYTES) {
         return asText(`save_memory body is too long (max ${MEMORY_BODY_MAX_BYTES} bytes; got ${bytes}). Trim it and try again.`, true);
       }
+      // Provenance (PRD #266 M2): default an omitted basis to `inferred` (never a
+      // hard failure — PRD #90). Evidence is optional; normalize empty/whitespace to
+      // undefined and byte-cap it with a clear tool error, like title/body.
+      const basis: MemoryBasis = args.basis ?? "inferred";
+      const evidenceTrimmed = (args.evidence ?? "").trim();
+      const evidence = evidenceTrimmed.length === 0 ? undefined : evidenceTrimmed;
+      if (evidence !== undefined) {
+        const evidenceBytes = Buffer.byteLength(evidence, "utf8");
+        if (evidenceBytes > MEMORY_EVIDENCE_MAX_BYTES) {
+          return asText(`save_memory evidence is too long (max ${MEMORY_EVIDENCE_MAX_BYTES} bytes; got ${evidenceBytes}). Shorten it to a pointer (a file:line, command, or tool name) and try again.`, true);
+        }
+      }
       try {
-        const entry = await client.saveMemory(runId, { title, body });
+        const entry = await client.saveMemory(runId, { title, body, basis, evidence });
         // The memory IS saved (isError stays false); this only appends an advisory
         // nudge when the body looks like a fast-decaying tally, never a rejection.
         const snapshotNudge = VOLATILE_SNAPSHOT_RE.test(body)
           ? " Note: this reads like a volatile snapshot figure (a count, ratio, or \"N of M\" tally). It is saved, but prefer recording the durable fact — the mechanism or command, not today's number, which decays and misleads a later run."
           : "";
+        // Independent of the snapshot nudge (both can append): flag a claim about
+        // THIS run's own subagent tool/roster/runtime config, which should be read
+        // live rather than remembered. Append-only prose — never a rejection.
+        const configClaimNudge = CONFIG_CLAIM_RE.test(body)
+          ? " Note: this asserts your run's own subagent tool/roster configuration (which role can Edit/Write, is read-only, or inherits tools). It is saved, but READ that live from the per-turn roster rather than remembering it — such config changes as the product evolves, so a remembered version can be wrong."
+          : "";
         return asText(
-          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}`,
+          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}${configClaimNudge}`,
         );
       } catch (err) {
         log.warn("save_memory tool failed", { run_id: runId, error: errMessage(err) });
@@ -184,6 +265,11 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
           "persist a note. Record the DURABLE fact, not a volatile snapshot: prefer a mechanism",
           "or command over today's number (a test-pass count, a version tally, an \"N of M\" ratio",
           "all decay and mislead a later run). Keep the title short and the body a couple of sentences.",
+          "Set basis to \"observed\" ONLY when the claim is backed by something you can name — a",
+          "tool result, command output, or a file:line — and put that pointer in evidence; otherwise",
+          "leave basis \"inferred\". A later run is told which, and re-verifies an inferred claim before",
+          "acting on it. Prefer to READ runtime/config facts live (your roster, tools, and environment)",
+          "rather than remembering them — they change as the product changes.",
         ].join(" "),
         {
           title: z
@@ -200,6 +286,16 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
               message: `body must be at most ${MEMORY_BODY_MAX_BYTES} bytes`,
             })
             .describe(`The durable fact to remember, not a volatile snapshot like a test-pass count or version tally (≤${MEMORY_BODY_MAX_BYTES} bytes).`),
+          basis: z
+            .enum(["observed", "inferred"])
+            .default("inferred")
+            .describe(
+              'Provenance of the claim: "observed" only when backed by a tool result, command output, or file:line you can name (put the pointer in evidence); otherwise "inferred". Defaults to "inferred".',
+            ),
+          evidence: z
+            .string()
+            .optional()
+            .describe(`Optional short pointer to what backs an "observed" claim — a file:line, command, or tool name (≤${MEMORY_EVIDENCE_MAX_BYTES} bytes).`),
         },
         (args) => h.saveMemory(args),
       ),

@@ -464,22 +464,26 @@ func TestAdminRateLimitRowDTOTags(t *testing.T) {
 		"id", "email", "name", "vault_locked", "tokens")
 }
 
-// TestAgentMemoryWriteRequestTags pins the worker save body: exactly {title, body}
-// — no identity fields exist on the wire, so (user_id, repo_id) can only be derived
-// server-side from the run claim (PRD #90 B3).
+// TestAgentMemoryWriteRequestTags pins the worker save body: {title, body} plus the
+// writer-declared provenance {basis, evidence} (PRD #266). No identity fields exist
+// on the wire, so (user_id, repo_id) can only be derived server-side from the run
+// claim (PRD #90 B3). basis/evidence are not omitempty — the worker always sends the
+// keys, and a bad/empty basis never fails the write (it is normalized on read).
 func TestAgentMemoryWriteRequestTags(t *testing.T) {
-	assertTags(t, "AgentMemoryWriteRequest", AgentMemoryWriteRequest{}, "title", "body")
+	assertTags(t, "AgentMemoryWriteRequest", AgentMemoryWriteRequest{}, "title", "body", "basis", "evidence")
 }
 
 // TestAgentMemoryDTOTags pins the read shape. repo_id/repo_name/run_id are
 // omitempty: the worker per-(user,repo) read omits the redundant repo fields, and
 // run_id drops when the writing run is pruned (FK SET NULL). The user-facing
-// cross-repo list sets all of them.
+// cross-repo list sets all of them. basis (PRD #266) is ALWAYS present — the read
+// mapper defaults an unknown/NULL value to "inferred", so it is never omitempty;
+// evidence is omitempty and drops when empty.
 func TestAgentMemoryDTOTags(t *testing.T) {
-	assertTags(t, "AgentMemoryDTO(worker)", AgentMemoryDTO{}, "id", "title", "body", "created_at")
-	full := AgentMemoryDTO{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "t", Body: "b", RunID: "run1"}
+	assertTags(t, "AgentMemoryDTO(worker)", AgentMemoryDTO{}, "id", "title", "body", "basis", "created_at")
+	full := AgentMemoryDTO{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "t", Body: "b", RunID: "run1", Basis: "observed", Evidence: "cmd: go test"}
 	assertTags(t, "AgentMemoryDTO(user list)", full,
-		"id", "repo_id", "repo_name", "title", "body", "run_id", "created_at")
+		"id", "repo_id", "repo_name", "title", "body", "run_id", "basis", "evidence", "created_at")
 }
 
 func contains(ss []string, s string) bool {

@@ -191,14 +191,18 @@ var (
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
-// MemoryMaxTitleBytes/MemoryMaxBodyBytes per entry, MemoryMaxPerRun writes per run
-// (spam bound), and MemoryMaxPerUserRepo entries per (user,repo) with the oldest
-// evicted on insert.
+// MemoryMaxTitleBytes/MemoryMaxBodyBytes/MemoryMaxEvidenceBytes per entry (all
+// measured as UTF-8 byte length via len() on the sanitized string),
+// MemoryMaxPerRun writes per run (spam bound), and MemoryMaxPerUserRepo entries
+// per (user,repo) with the oldest evicted on insert. Evidence shares the title's
+// 200-byte bound: it is a single-line pointer, mirroring the client's own 200-byte
+// cap (PRD #266).
 const (
-	MemoryMaxTitleBytes  = 200
-	MemoryMaxBodyBytes   = 2048
-	MemoryMaxPerRun      = 5
-	MemoryMaxPerUserRepo = 20
+	MemoryMaxTitleBytes    = 200
+	MemoryMaxBodyBytes     = 2048
+	MemoryMaxEvidenceBytes = 200
+	MemoryMaxPerRun        = 5
+	MemoryMaxPerUserRepo   = 20
 )
 
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
@@ -2703,12 +2707,15 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 // repo_id) are read off the OWNED run — never from the request — so a worker whose
 // join token is not user-scoped cannot write another user's memory. A repo-less run
 // (chat/self-improve) has no memory scope → ErrMemoryNoRepo. Caps are enforced
-// server-side: oversize title/body → ErrMemoryTooLarge; the per-run write count at
-// the cap → ErrMemoryWriteCap; and after the insert the (user,repo) set is trimmed
-// to the newest MemoryMaxPerUserRepo (oldest-eviction). The count-check → insert →
-// evict are sequential store calls (mirroring AppendMessages) — a single lead is
-// the only writer per run, so no cross-write race is in play.
-func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body string) (store.AgentMemory, error) {
+// server-side: oversize title/body/evidence → ErrMemoryTooLarge; the per-run write
+// count at the cap → ErrMemoryWriteCap; and after the insert the (user,repo) set is
+// trimmed to the newest MemoryMaxPerUserRepo (oldest-eviction). The count-check →
+// insert → evict are sequential store calls (mirroring AppendMessages) — a single
+// lead is the only writer per run, so no cross-write race is in play. basis/evidence
+// are the writer's declared provenance (PRD #266): basis is normalized at write to
+// one of the two known trust labels or empty, evidence is trimmed/sanitized/capped,
+// both stored NULL when empty — a bad or absent basis is never a write failure.
+func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body, basis, evidence string) (store.AgentMemory, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.AgentMemory{}, err
@@ -2727,7 +2734,31 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	if title == "" || strings.TrimSpace(body) == "" {
 		return store.AgentMemory{}, ErrMemoryEmpty
 	}
-	if len(title) > MemoryMaxTitleBytes || len(body) > MemoryMaxBodyBytes {
+	// Writer-declared provenance (PRD #266). basis is a single-line trust label and
+	// evidence a single-line free-text pointer — both untrusted, so both are trimmed
+	// and sanitized single-line (keepWhitespace=false, like the title): an embedded
+	// newline/tab in either could otherwise forge a fake marker line where the lead
+	// prompt renders evidence inline, and an injected ANSI escape would render raw
+	// when the owner runs `uzi memory list`.
+	basis = sanitizeMemoryField(strings.TrimSpace(basis), false)
+	evidence = sanitizeMemoryField(strings.TrimSpace(evidence), false)
+	// Normalize basis at WRITE, not only on read: persist only the two known trust
+	// labels ("observed"/"inferred") and store anything else — empty, garbage, or an
+	// oversized string a direct worker POST tried to smuggle past the client — as
+	// empty (→ NULL below). This closes the basis-amplification path without a
+	// separate byte cap, and never fails the write (PRD #90: memory writes must not
+	// fail a run). The read mapper's coercion of an unknown value to "inferred" then
+	// has nothing left to defend against.
+	switch basis {
+	case "observed", "inferred":
+	default:
+		basis = ""
+	}
+	// Size cap on the sanitized values (evidence stores NULL when empty, the DTO
+	// omits it). Evidence is capped like the title so a direct worker POST cannot
+	// bypass the client's own 200-byte cap; an oversize evidence is a non-fatal 400
+	// the worker treats as such, same as an oversize title/body.
+	if len(title) > MemoryMaxTitleBytes || len(body) > MemoryMaxBodyBytes || len(evidence) > MemoryMaxEvidenceBytes {
 		return store.AgentMemory{}, ErrMemoryTooLarge
 	}
 	// Per-run write cap: the spam bound within one run (Decision M4). Counted on
@@ -2742,11 +2773,13 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	}
 	repoID := uuid.UUID(run.RepoID.Bytes)
 	mem, err := s.q.InsertAgentMemory(ctx, store.InsertAgentMemoryParams{
-		UserID: run.UserID,
-		RepoID: repoID,
-		RunID:  pgUUID(runID),
-		Title:  title,
-		Body:   body,
+		UserID:   run.UserID,
+		RepoID:   repoID,
+		RunID:    pgUUID(runID),
+		Title:    title,
+		Body:     body,
+		Basis:    pgText(basis),
+		Evidence: pgText(evidence),
 	})
 	if err != nil {
 		return store.AgentMemory{}, err
