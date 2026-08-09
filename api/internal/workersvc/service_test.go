@@ -312,6 +312,40 @@ type fakeStore struct {
 	promotedLimitWait   []store.PromoteLimitWaitRunsRow
 	promoteLimitWaitErr error
 	promoteLimitWaitAt  []pgtype.Timestamptz
+
+	// PRD #217 M1: the park-time gauge write. markedFiveHour / markedSevenDay record
+	// every user_secret_id MarkFiveHourExhausted / MarkSevenDayExhausted was called
+	// with, in order, so a test can assert WHICH window a park marked down (and that
+	// the OTHER was left untouched). markExhaustedRows overrides the rows-affected the
+	// fake reports (default 1; 0 models the UPDATE-only no-op against a token that has
+	// no gauge row, D7); markExhaustedErr fails the write.
+	markedFiveHour    []uuid.UUID
+	markedSevenDay    []uuid.UUID
+	markExhaustedRows *int64
+	markExhaustedErr  error
+}
+
+// PRD #217 M1. The park path marks the dead credential's exhausted window down to
+// 100% in the gauge. Both are :execrows UPDATEs whose zero-row result is success, so
+// the default rows-affected is 1 and a fixture that wants the no-op says so.
+func (f *fakeStore) MarkFiveHourExhausted(_ context.Context, userSecretID uuid.UUID) (int64, error) {
+	f.markedFiveHour = append(f.markedFiveHour, userSecretID)
+	return f.markExhaustedResult()
+}
+
+func (f *fakeStore) MarkSevenDayExhausted(_ context.Context, userSecretID uuid.UUID) (int64, error) {
+	f.markedSevenDay = append(f.markedSevenDay, userSecretID)
+	return f.markExhaustedResult()
+}
+
+func (f *fakeStore) markExhaustedResult() (int64, error) {
+	if f.markExhaustedErr != nil {
+		return 0, f.markExhaustedErr
+	}
+	if f.markExhaustedRows != nil {
+		return *f.markExhaustedRows, nil
+	}
+	return 1, nil
 }
 
 func (f *fakeStore) SweepStuckConfirmingProposals(context.Context, pgtype.Timestamptz) ([]uuid.UUID, error) {

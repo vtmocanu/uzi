@@ -1290,7 +1290,12 @@ export interface RateLimitWindow {
 //    `synced_at` (D3), this reading is NEWER than the `synced_at` shown beside it,
 //    so a surface rendering "updated Xm ago" against a 100% bar must disclose that
 //    the 100% was recorded at the park, after that timestamp.
-export type RateLimitSource = "usage_endpoint" | "header_probe" | "limit_report";
+// RATE_LIMIT_SOURCES is the vocabulary AT RUNTIME. RateLimitSource is derived from
+// it (`(typeof RATE_LIMIT_SOURCES)[number]`) so the array IS the union — there is no
+// hand-maintained second list to fall behind. This is what lets rateLimitSource.test.ts
+// pin the union against migration 00108's CHECK, since a bare TS union erases at runtime.
+export const RATE_LIMIT_SOURCES = ["usage_endpoint", "header_probe", "limit_report"] as const;
+export type RateLimitSource = (typeof RATE_LIMIT_SOURCES)[number];
 
 // MyRateLimits is the per-user reading, discriminated on status:
 //  - "ok": a real reading (possibly stale — vault-locked users age silently, D3).
