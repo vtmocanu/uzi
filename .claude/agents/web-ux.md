@@ -140,6 +140,11 @@ attribute: the default **ember** (molten-orange on near-black) and **mission**
 (an ops-console blue set), both `color-scheme: dark`. Check appearance against
 those two themes, never against a light/dark split.
 
+**Chromium in the worker needs `--no-sandbox`.** Launches abort on the SUID
+sandbox otherwise. The launcher shim usually injects the flag, but if a browser
+launch fails that way, pass `--no-sandbox` explicitly instead of rediscovering
+it each run.
+
 **A zero-backend demo build exists: `VITE_UZI_MOCK=1`, servable via
 `web/Dockerfile.mock`.** It needs no database, no API and no compose stack, which
 makes it the default way to validate this repo's UI. The real stack serves on a

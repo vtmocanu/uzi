@@ -62,6 +62,10 @@ agent-browser operational notes (hard-won; save yourself the debugging):
   builds may re-seed and re-authenticate you. To keep or observe a
   transient state (a drag result, a logged-out shell), navigate in-app
   (click links) instead of re-`open`ing.
+- Chromium in the worker aborts on its SUID sandbox unless launched with
+  `--no-sandbox`. A launcher shim normally injects the flag, but do not
+  assume it did: if a browser launch fails on the sandbox, pass
+  `--no-sandbox` yourself rather than rediscovering it from the error.
 
 Review lenses, in priority order:
 1. Flow integrity - can the user complete the changed journeys without
