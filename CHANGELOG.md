@@ -6,6 +6,41 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Board membership and who can run what are now configurable label sets,
+  not one hardcoded PRD label.** Two new admin-only instance settings replace
+  what used to be a single gate: **run-eligible labels** (default `PRD,bug`)
+  control which issues a human may click Start run on, and **board-extra
+  labels** (admin default `bug`, overridable per user, per repo) control
+  which non-primary issues a board shows by default. The board toolbar's
+  **Issues** popover replaces the old "Show other issues" checkbox: a pinned
+  always-shown primary row, one row per label with a count of how many cards
+  it adds, a greyed `0` row for a configured default the repo has none of,
+  the old "Show all other issues" escape hatch, and **Reset to default**. A
+  third setting, `eligible_label_waives_prd_link` (default **on**), lets an
+  issue eligible via a *non-primary* label (e.g. `bug`) start a run with no
+  `prds/*.md` link — scoped to a human's own interactive Start click; it
+  never applies to autopilot or to a scheduled/timer-fired run. The primary
+  label (`prd_label`) itself is unchanged: still the only label uzi writes,
+  the only one boards fetch with, and the only one autopilot matches. (#196)
+
+  **Operators — this changes default behavior on upgrade, in two halves.**
+  *Visibility:* every board gains `bug` cards it didn't show before —
+  cosmetic, and reversible per user from the Issues popover, or instance-wide
+  by editing `board_extra_labels`. *Eligibility:* those `bug` cards also gain
+  a working **Start run** button with no admin action, because `bug` ships in
+  the eligible default (`PRD,bug`) and the PRD-link waiver defaults on — a
+  `bug` issue with no `prds/*.md` link is startable where it wasn't before.
+  **Autopilot is unaffected** — it still matches only the primary label and
+  never receives the waiver — and neither is a scheduled or swept run: the
+  waiver is scoped to an interactive, human-initiated Start click only, so
+  nothing starts unattended that couldn't before. To keep the prior
+  behavior, set `run_eligible_labels` to just the primary label, or turn
+  `eligible_label_waives_prd_link` off, from Admin → Instance settings. See
+  [docs/board.md](docs/board.md#which-issues-show-up) and
+  [docs/admin-settings.md](docs/admin-settings.md#run-eligibility-and-board-membership).
+
 ## [0.22.0] - 2026-08-08
 
 ### Added

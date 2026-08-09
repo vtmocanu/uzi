@@ -426,7 +426,9 @@ export function AdminSettings() {
                 />
               </Field>
               <p className="text-xs text-faint">
-                Marks an issue as factory work. The board only shows issues carrying this label.
+                Marks an issue as uzi&apos;s own work. This is the <b>primary</b> label — uzi writes it
+                (on Promote and on judge-filed issues) and autopilot runs only it. Which labels a person
+                can start a run on is the Run-eligible list below.
               </p>
             </div>
             <div className="space-y-1.5">
@@ -474,10 +476,10 @@ export function AdminSettings() {
                 onRemove={(name) => setBoardExtras((cur) => cur.filter((l) => l !== name))}
                 hint={
                   <>
-                    The default set of extra labels every board starts with. Issues carrying one appear
-                    alongside PRD issues, but still cannot start a run until promoted. Run-eligible labels
-                    are shown automatically and need no entry here. Each user can override this for
-                    themselves per repo.
+                    The default set of labels — beyond PRD — that every board starts with. Issues
+                    carrying one appear on boards; whether such a card can start a run depends on the
+                    Run-eligible list above (a shown label is not runnable unless it is also eligible).
+                    Each user can override this for themselves per repo.
                   </>
                 }
               />
