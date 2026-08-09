@@ -1,7 +1,7 @@
 # PRD #256: Run duration on runs — Runs page + board + CLI
 
 **GitLab Issue**: [#256](https://gitlab.example.com/vtmocanu/uzi/-/issues/256)
-**Status**: 📝 Draft — architect-reviewed 2026-08-08 (findings F1–F6 incorporated); ready for implementation
+**Status**: ✅ Done — implemented 2026-08-09 (M1–M6); web + CLI, display-only, no API/DTO/schema change
 **Priority**: High — top priority, do next (owner, 2026-08-09). Deferred only to avoid a Board.tsx collision with the in-flight #196; send the full gated PRD once #196 lands.
 **Mock**: `prds/mockups/256-run-duration-mock.html` (the Runs page with the duration token added; shown to owner 2026-08-08)
 
@@ -172,35 +172,35 @@ Crucially this needs **no board-specific code**: the same `runDurationLabel` fed
 
 **Phase 1 — parallel (separate files/modules, no shared edits):**
 
-- [ ] **M1 — Format fix.** `formatDuration` (`RunEvent.tsx`) rolls to hours
+- [x] **M1 — Format fix.** `formatDuration` (`RunEvent.tsx`) rolls to hours
   (`1h 30m 00s`) and closes the `1m 60s` seconds-carry; extend `RunEvent.test.tsx`
   (90-min, 2-hour, just-under-hour, and a `59.6s`-style carry case); update the helper's
   doc comment (its examples stop before an hour, which is what let the bug stand). Verify
   the fix reaches all callers (`RunView.tsx:97`, `:425`, `RunUsage.tsx:163`,
   `IssueView.tsx:32`, `RunEvent.tsx:446`/`:643`/`:824`). Fixes the `90m` report.
-- [ ] **M2 — Shared helper.** `web/src/lib/runDuration.ts` + `runDuration.test.ts`:
+- [x] **M2 — Shared helper.** `web/src/lib/runDuration.ts` + `runDuration.test.ts`:
   `runDurationLabel(run, nowMs)` per Decision 2, reusing `formatElapsed`; input type has
   optional `started_at`/`finished_at`/`claimed_at` (Decision 6). Tests cover every state,
   the null-`started_at` terminal → `""` case, and a future-anchor → `0s` case.
   Foundation for M3 + M4.
-- [ ] **M5 — CLI column.** `uzi run list` gains an `AGE` column (`api/cmd/uzi/run.go`),
+- [x] **M5 — CLI column.** `uzi run list` gains an `AGE` column (`api/cmd/uzi/run.go`),
   reusing `formatUptimeDuration`/`uptimeCell` (`worker.go`); test in the run-cmd test.
   Independent Go module.
 
 **Phase 2 — after M2 (parallel to each other, file-disjoint):**
 
-- [ ] **M3 — Runs page.** Duration token on each `RunRow` meta line, kept alongside the
+- [x] **M3 — Runs page.** Duration token on each `RunRow` meta line, kept alongside the
   timestamp (owner decision), live via reused `useNow(1000)`; covers owner Active/Past +
   admin lists. Tests (`RunsList.test.tsx`): token present + advancing for an active run,
   `ran …` for a terminal one.
-- [ ] **M4 — Board (degraded, Decision 6).** Uniform duration token across card states
+- [x] **M4 — Board (degraded, Decision 6).** Uniform duration token across card states
   via the shared helper; move running elapsed out of the badge into the token
   (Decision 4). Update `runBadge.test.ts` badge assertions; add `Board.test.tsx` coverage.
   Edits `runBadge.ts` (M2 only imports `formatElapsed` from it, no edit → no conflict).
 
 **Phase 3 — sequential, last:**
 
-- [ ] **M6 — Docs, mock, gates.** Commit `prds/mockups/256-run-duration-mock.html`; note
+- [x] **M6 — Docs, mock, gates.** Commit `prds/mockups/256-run-duration-mock.html`; note
   the decision in `specs/ai.md`; `task gate:web` + `task gate:api` green; a both-themes
   browser pass of the Runs page (the token is a theme-token-inheriting `text-faint` span,
   structurally theme-safe, but confirm once).

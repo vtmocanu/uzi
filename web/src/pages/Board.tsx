@@ -1612,7 +1612,7 @@ export function IssueCard({
             </span>
           ))}
         {duration && (
-          <span className="font-mono text-[11px] text-faint">{duration}</span>
+          <span className="font-mono tabular-nums text-[11px] text-faint">{duration}</span>
         )}
         {hint && (
           <span className="text-[11px] text-faint" title="Number of runs on this issue">
