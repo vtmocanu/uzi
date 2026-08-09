@@ -177,6 +177,14 @@ type FakeClient struct {
 	RunNowResult        apitypes.RunNowResponse
 	LastRunNowSchedID   string
 
+	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
+	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
+	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a
+	// transient ExitUnreachable that later recovers) by popping a queue from this
+	// hook. A nil hook keeps the static lookup, so every existing GetRun test is
+	// unaffected.
+	GetRunHook func(id string) (apitypes.RunDTO, error)
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -200,6 +208,13 @@ func (f *FakeClient) ListRuns(context.Context) ([]apitypes.RunListItemDTO, error
 func (f *FakeClient) GetRun(_ context.Context, id string) (apitypes.RunDTO, error) {
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
+	}
+	// The hook wins over the static map so a sequencing test drives the poll loop
+	// directly; it also takes precedence over RunByID for the same reason a test
+	// would set it — to return something the static lookup cannot express (a changing
+	// status, a transient error).
+	if f.GetRunHook != nil {
+		return f.GetRunHook(id)
 	}
 	if r, ok := f.RunByID[id]; ok {
 		return r, nil
