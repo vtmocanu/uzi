@@ -256,3 +256,122 @@ func TestOnlyEnabled(t *testing.T) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
 	}
 }
+
+// sptr returns a *string, the tri-state carrier for the guidance field.
+func sptr(v string) *string { return &v }
+
+// TestValidateScheduleConfigGuidance pins PRD #274 M3 guidance validation: oversize is a
+// 422; guidance on the prompt target is a 400 (out of scope — a prompt carries its own
+// text); a blank/whitespace value normalizes to nil (a cleared textarea clears rather than
+// stores whitespace); and a real value on issue/sweep is accepted and preserved.
+func TestValidateScheduleConfigGuidance(t *testing.T) {
+	// Oversize guidance → 422.
+	big := strings.Repeat("g", MaxGuidanceBytes+1)
+	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "issue", IssueIID: i64(7), Guidance: sptr(big), Timing: "recurring", CronExpr: "0 2 * * *",
+	}, fixedNow); status != http.StatusUnprocessableEntity {
+		t.Fatalf("oversize guidance status = %d, want 422", status)
+	}
+
+	// Guidance at exactly the cap on a sweep is fine.
+	atCap := strings.Repeat("g", MaxGuidanceBytes)
+	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "sweep", Guidance: sptr(atCap), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow); status != 0 {
+		t.Fatalf("at-cap guidance status = %d, want 0", status)
+	}
+
+	// Guidance on the prompt target → 400.
+	if _, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "prompt", Prompt: "do the thing", Guidance: sptr("steer me"), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow); status != http.StatusBadRequest {
+		t.Fatalf("guidance-on-prompt status = %d, want 400", status)
+	}
+
+	// A blank/whitespace guidance on prompt is NOT a rejection — it normalizes to nil first.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "prompt", Prompt: "do the thing", Guidance: sptr("   \n\t "), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow); status != 0 || n.Guidance != nil {
+		t.Fatalf("blank guidance on prompt: status=%d guidance=%v, want status 0 and nil guidance", status, n.Guidance)
+	}
+
+	// A real value on issue is accepted and preserved.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "issue", IssueIID: i64(7), Guidance: sptr("keep the diff small"), Timing: "recurring", CronExpr: "0 2 * * *",
+	}, fixedNow); status != 0 || n.Guidance == nil || *n.Guidance != "keep the diff small" {
+		t.Fatalf("valid issue guidance: status=%d guidance=%v, want status 0 and preserved value", status, n.Guidance)
+	}
+}
+
+// TestMergeScheduleGuidanceClears pins PRD #274 M3's replace-semantics for guidance,
+// mirroring max_issues: a config PATCH with Guidance=nil CLEARS stored guidance rather than
+// keeping the current value, so a cleared textarea reaches the DB as NULL.
+func TestMergeScheduleGuidanceClears(t *testing.T) {
+	cur := store.RunSchedule{
+		Target:   "issue",
+		IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		Timing:   "recurring",
+		CronExpr: pgtype.Text{String: "0 2 * * *", Valid: true},
+		Timezone: "UTC",
+		Guidance: pgtype.Text{String: "old guidance", Valid: true},
+	}
+
+	// A config PATCH that omits guidance (nil) must CLEAR it.
+	cleared := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *"})
+	if cleared.Guidance != nil {
+		t.Fatalf("merged guidance = %v, want nil (a config PATCH replaces the whole row; nil clears)", cleared.Guidance)
+	}
+
+	// A config PATCH that sets guidance takes the request value.
+	set := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *", Guidance: sptr("new guidance")})
+	if set.Guidance == nil || *set.Guidance != "new guidance" {
+		t.Fatalf("merged guidance = %v, want \"new guidance\"", set.Guidance)
+	}
+}
+
+// TestGuidanceColumn pins the store-column mapping: a non-blank value on issue/sweep is
+// Valid; a nil, blank, or non-issue/sweep target yields SQL NULL.
+func TestGuidanceColumn(t *testing.T) {
+	if c := guidanceColumn(apitypes.ScheduleRequest{Target: "issue", Guidance: sptr("go")}); !c.Valid || c.String != "go" {
+		t.Fatalf("issue guidance column = %+v, want Valid \"go\"", c)
+	}
+	if c := guidanceColumn(apitypes.ScheduleRequest{Target: "sweep", Guidance: sptr("go")}); !c.Valid {
+		t.Fatalf("sweep guidance column should be Valid, got %+v", c)
+	}
+	if c := guidanceColumn(apitypes.ScheduleRequest{Target: "issue", Guidance: nil}); c.Valid {
+		t.Fatalf("nil guidance must be SQL NULL, got %+v", c)
+	}
+	if c := guidanceColumn(apitypes.ScheduleRequest{Target: "issue", Guidance: sptr("  ")}); c.Valid {
+		t.Fatalf("blank guidance must be SQL NULL, got %+v", c)
+	}
+	if c := guidanceColumn(apitypes.ScheduleRequest{Target: "prompt", Guidance: sptr("go")}); c.Valid {
+		t.Fatalf("prompt target must never persist guidance, got %+v", c)
+	}
+}
+
+// TestScheduleDTOGuidance pins that scheduleDTO round-trips a stored guidance value into
+// the DTO pointer, and maps a NULL/empty stored value to nil.
+func TestScheduleDTOGuidance(t *testing.T) {
+	h := &Handler{}
+	base := store.RunSchedule{
+		Target:   "issue",
+		IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		Timing:   "once",
+		Timezone: "UTC",
+	}
+
+	base.Guidance = pgtype.Text{String: "always add a failing test first", Valid: true}
+	if dto := h.scheduleDTO(base, ""); dto.Guidance == nil || *dto.Guidance != "always add a failing test first" {
+		t.Fatalf("DTO guidance = %v, want the stored value", dto.Guidance)
+	}
+
+	base.Guidance = pgtype.Text{}
+	if dto := h.scheduleDTO(base, ""); dto.Guidance != nil {
+		t.Fatalf("NULL guidance must map to nil, got %v", dto.Guidance)
+	}
+
+	base.Guidance = pgtype.Text{String: "", Valid: true}
+	if dto := h.scheduleDTO(base, ""); dto.Guidance != nil {
+		t.Fatalf("empty guidance must map to nil, got %v", dto.Guidance)
+	}
+}

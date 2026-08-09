@@ -84,6 +84,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the PRD label)")
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
+	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
@@ -129,6 +130,12 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	if cmd.Flags().Changed("max-issues") && !sweep {
 		return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--max-issues is only valid with --sweep")
 	}
+	// --guidance is issue/sweep-only; reject an EXPLICIT set on the prompt target (a prompt
+	// carries its own text). --guidance is distinct from the --prompt target selector.
+	guidanceSet := cmd.Flags().Changed("guidance")
+	if guidanceSet && !(issueSet || sweep) {
+		return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--guidance is only valid with --issue or --sweep")
+	}
 
 	req := apitypes.ScheduleRequest{}
 	switch {
@@ -151,6 +158,13 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 		}
 		req.Target = schedTargetPrompt
 		req.Prompt = prompt
+	}
+
+	// Guidance rides only on issue/sweep targets (guarded above). Send it only when set so
+	// an unset flag stays absent (nil) rather than clearing on a PATCH-shaped payload.
+	if guidanceSet && (issueSet || sweep) {
+		guidance, _ := cmd.Flags().GetString("guidance")
+		req.Guidance = &guidance
 	}
 
 	// Exactly one timing.
@@ -453,6 +467,9 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	if s.Target == schedTargetSweep {
 		rows = append(rows, []string{"MAX_ISSUES", maxIssuesStr(s.MaxIssues)})
+	}
+	if s.Target == schedTargetIssue || s.Target == schedTargetSweep {
+		rows = append(rows, []string{"GUIDANCE", strOr(s.Guidance, "-")})
 	}
 	rows = append(rows,
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},

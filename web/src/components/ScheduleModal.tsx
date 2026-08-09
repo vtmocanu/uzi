@@ -196,6 +196,9 @@ export function ScheduleModal({
   // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
   // (agreeing with the server), an edit reflects the stored value (null included).
   const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
+  // Optional owner guidance for issue/sweep targets; a string in state ("" = none).
+  // Steers HOW a run approaches the task — the issue body stays the task.
+  const [guidance, setGuidance] = useState<string>(editing?.guidance ?? "");
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
   const [previewError, setPreviewError] = useState(false);
@@ -365,6 +368,14 @@ export function ScheduleModal({
     // Sweep-only cap; send explicit null (not undefined) so clearing the field
     // clears the stored value to unlimited. Omitted on non-sweep targets.
     max_issues: target === "sweep" ? maxIssues : undefined,
+    // Owner guidance on issue/sweep only; a blank/cleared textarea sends explicit
+    // null (clear to none). Omitted (undefined) on prompt so the server never rejects it.
+    guidance:
+      target === "issue" || target === "sweep"
+        ? guidance.trim() === ""
+          ? null
+          : guidance
+        : undefined,
     prompt: target === "prompt" ? prompt : undefined,
     timing,
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
@@ -405,6 +416,26 @@ export function ScheduleModal({
       setDeleting(false);
     }
   };
+
+  // Optional guidance textarea, rendered only for the issue and sweep targets
+  // (never prompt, which carries its own prompt text). Mirrors the prompt
+  // textarea's markup.
+  const guidanceField = (
+    <Field label="Guidance (optional)" htmlFor="sched-guidance">
+      <Textarea
+        id="sched-guidance"
+        rows={3}
+        maxLength={8192}
+        value={guidance}
+        onChange={(e) => setGuidance(e.target.value)}
+        placeholder="always add a failing test first"
+      />
+      <p className="mt-1 text-[11px] text-faint">
+        Steers how the run approaches the task, e.g. “always add a failing test first”. Applied to
+        every issue this schedule runs; the issue itself stays the task.
+      </p>
+    </Field>
+  );
 
   const footerSummary = [
     timing === "once" ? "One time" : "Recurring",
@@ -475,17 +506,20 @@ export function ScheduleModal({
           />
 
           {target === "issue" && (
-            <Field label="Issue number" htmlFor="sched-issue">
-              <Input
-                id="sched-issue"
-                type="number"
-                min={1}
-                value={issueIid}
-                disabled={!!pinned}
-                onChange={(e) => setIssueIid(e.target.value)}
-                placeholder="e.g. 142"
-              />
-            </Field>
+            <>
+              <Field label="Issue number" htmlFor="sched-issue">
+                <Input
+                  id="sched-issue"
+                  type="number"
+                  min={1}
+                  value={issueIid}
+                  disabled={!!pinned}
+                  onChange={(e) => setIssueIid(e.target.value)}
+                  placeholder="e.g. 142"
+                />
+              </Field>
+              {guidanceField}
+            </>
           )}
 
           {target === "sweep" && (
@@ -542,6 +576,7 @@ export function ScheduleModal({
                   Oldest issues first. Leave blank for unlimited.
                 </p>
               </Field>
+              {guidanceField}
             </div>
           )}
 

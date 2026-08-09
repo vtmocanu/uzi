@@ -15,6 +15,13 @@ import "time"
 // issues one sweep fire starts, oldest-first. A nil/absent value means unlimited; a new
 // sweep defaults to 10. It carries "present, even to clear" tri-state — the web sends an
 // explicit null to clear a sweep back to unlimited (see mergeSchedule's replace-semantics).
+//
+// Guidance is optional owner-authored steering (PRD #274 M3, issue/sweep targets ONLY):
+// injected into the run instruction as a clearly delineated "how" section after the issue
+// body, without changing WHAT the task is or any eligibility gate. A nil/absent OR blank
+// value means none; the prompt target rejects it (a prompt carries its own text). It
+// carries the same "present, even to clear" tri-state as MaxIssues — an explicit null (or
+// empty/whitespace, normalized to nil) clears stored guidance.
 type ScheduleRequest struct {
 	Target      string     `json:"target"`
 	IssueIID    *int64     `json:"issue_iid"`
@@ -28,6 +35,7 @@ type ScheduleRequest struct {
 	WaitOnLimit *bool      `json:"wait_on_limit"`
 	Enabled     *bool      `json:"enabled"`
 	MaxIssues   *int       `json:"max_issues"`
+	Guidance    *string    `json:"guidance"`
 }
 
 // ScheduleDTO is the response view of a run schedule (PRD #241 M4). All fields are
@@ -55,7 +63,11 @@ type ScheduleDTO struct {
 	// MaxIssues is the sweep fan-out cap (PRD #274 M2, sweep target only): nil means
 	// unlimited (NULL in the DB), a value is the oldest-first per-fire limit. New sweeps
 	// default to 10.
-	MaxIssues *int      `json:"max_issues"`
+	MaxIssues *int `json:"max_issues"`
+	// Guidance is optional owner-authored steering (PRD #274 M3, issue/sweep targets only):
+	// injected into the run instruction as a delineated "how" section. nil means none (NULL
+	// or empty in the DB).
+	Guidance  *string   `json:"guidance"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

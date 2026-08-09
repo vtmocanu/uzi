@@ -254,6 +254,55 @@ func TestScheduleMaxIssuesRoundTripLiveDB(t *testing.T) {
 	}
 }
 
+// TestScheduleGuidanceRoundTripLiveDB exercises the PRD #274 M3 guidance field through the
+// real store column (pgtype.Text): a create persists guidance, a config PATCH that resends
+// it keeps it, a config PATCH omitting it CLEARS it to NULL (replace-semantics), and a blank
+// value normalizes to NULL rather than storing whitespace.
+func TestScheduleGuidanceRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create an issue schedule carrying guidance.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"add a failing test first"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.Guidance == nil || *dto.Guidance != "add a failing test first" {
+		t.Fatalf("new issue guidance = %v, want the stored value", dto.Guidance)
+	}
+	id := dto.ID
+
+	patch := func(body string) apitypes.ScheduleDTO {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("patch %q status = %d, want 200 (body %s)", body, rec.Code, rec.Body.String())
+		}
+		var out apitypes.ScheduleDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		return out
+	}
+
+	// A config PATCH resending guidance persists the new value.
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"keep the diff small"}`); got.Guidance == nil || *got.Guidance != "keep the diff small" {
+		t.Fatalf("after set patch, guidance = %v, want \"keep the diff small\"", got.Guidance)
+	}
+
+	// A config PATCH that omits guidance clears it (NULL column → nil DTO).
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1"}`); got.Guidance != nil {
+		t.Fatalf("after omit patch, guidance = %v, want nil (cleared)", got.Guidance)
+	}
+
+	// A blank guidance value normalizes to NULL, not stored whitespace.
+	if got := patch(`{"target":"issue","issue_iid":7,"timing":"recurring","cron_expr":"0 9 * * 1","guidance":"   "}`); got.Guidance != nil {
+		t.Fatalf("blank guidance = %v, want nil (normalized to NULL)", got.Guidance)
+	}
+}
+
 func TestScheduleOwnerIsolationLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)

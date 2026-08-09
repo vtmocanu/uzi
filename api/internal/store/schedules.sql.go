@@ -239,11 +239,11 @@ const createRunSchedule = `-- name: CreateRunSchedule :one
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues
+    auto_approve, wait_on_limit, enabled, max_issues, guidance
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
-    $12, $13, $14, $15
+    $12, $13, $14, $15, $16
 )
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
@@ -264,6 +264,7 @@ type CreateRunScheduleParams struct {
 	WaitOnLimit bool               `json:"wait_on_limit"`
 	Enabled     bool               `json:"enabled"`
 	MaxIssues   pgtype.Int4        `json:"max_issues"`
+	Guidance    pgtype.Text        `json:"guidance"`
 }
 
 // Scheduled runs (PRD #241). run_schedules is the durable, time-driven origin of a
@@ -289,6 +290,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.WaitOnLimit,
 		arg.Enabled,
 		arg.MaxIssues,
+		arg.Guidance,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -627,9 +629,10 @@ SET target        = $1,
     auto_approve  = $10,
     wait_on_limit = $11,
     max_issues    = $12,
+    guidance      = $13,
     status        = 'active',
     updated_at    = now()
-WHERE id = $13 AND user_id = $14
+WHERE id = $14 AND user_id = $15
 RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
@@ -646,6 +649,7 @@ type UpdateRunScheduleParams struct {
 	AutoApprove bool               `json:"auto_approve"`
 	WaitOnLimit bool               `json:"wait_on_limit"`
 	MaxIssues   pgtype.Int4        `json:"max_issues"`
+	Guidance    pgtype.Text        `json:"guidance"`
 	ID          uuid.UUID          `json:"id"`
 	UserID      uuid.UUID          `json:"user_id"`
 }
@@ -674,6 +678,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.AutoApprove,
 		arg.WaitOnLimit,
 		arg.MaxIssues,
+		arg.Guidance,
 		arg.ID,
 		arg.UserID,
 	)

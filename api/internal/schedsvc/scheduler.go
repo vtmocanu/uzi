@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -351,8 +352,18 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 // untouched so label-driven autopilot keeps taking the owner default); the non-auto
 // branch fires through CreateScheduledRun. So a schedule's explicit wait_on_limit takes
 // effect regardless of auto_approve.
+//
+// Guidance (PRD #274 M3): before the seam call the issue body is composed with the
+// schedule's optional owner guidance into a single description via composeRunDescription
+// — a clearly delineated "how" section after the body (the untrusted forge task).
+// composeRunDescription truncates the guidance rather than let the composed total exceed
+// MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
+// ErrDescriptionTooLarge skip. It is purely additive: allowWithoutPRD is computed from
+// the raw labels and no eligibility gate sees the composed text.
 func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
+
+	desc := composeRunDescription(description, guidanceOf(sched))
 
 	waitOnLimit := sched.WaitOnLimit
 	var run store.Run
@@ -362,13 +373,13 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
 		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
 		// guarantee that label-driven autopilot behaviour is unchanged.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit)
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit)
 	} else {
 		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
 		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
 		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
 		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, nil)
 	}
 
 	switch {
@@ -537,6 +548,87 @@ func (e *Scheduler) sleep(d time.Duration) {
 	if d > 0 {
 		time.Sleep(d)
 	}
+}
+
+// guidanceHeader is the fixed delimiter + framing prepended to owner guidance when it is
+// composed into a run instruction (PRD #274 M3). The wording is deliberately fixed: it
+// tells the model the section is HOW-steering authored by the schedule owner, distinct
+// from the issue body above it (the WHAT, and untrusted forge content). Do not template
+// user text into this header.
+const guidanceHeader = "\n\n---\n\n" +
+	"The guidance below was provided by the schedule owner to steer HOW this task is " +
+	"approached. It does not change WHAT the task is (described above); apply it where " +
+	"relevant.\n\n"
+
+// guidanceTruncMarker is appended when the guidance had to be truncated to keep the
+// composed description under MaxIssueDescriptionBytes, so the model (and a human reading
+// the run) can tell the guidance was cut rather than authored short.
+const guidanceTruncMarker = "\n\n…[guidance truncated]"
+
+// composeRunDescription joins an issue body (the task) with optional owner guidance (the
+// "how") into the single description passed to the run-creation seam (PRD #274 M3).
+//
+// When guidance is empty/whitespace it returns the body UNCHANGED — no delimiter — so a
+// schedule without guidance produces a byte-identical description to the pre-M3 behaviour.
+//
+// Otherwise it appends guidanceHeader + guidance. Because createRun rejects a description
+// over workersvc.MaxIssueDescriptionBytes with ErrDescriptionTooLarge — which the
+// scheduler treats as a benign skip — appending guidance must never push a runnable issue
+// over the cap. So when body + full section would exceed the cap, the GUIDANCE is
+// truncated (on a UTF-8 rune boundary) with a marker, keeping the header when there is
+// room for it, rather than the issue being silently dropped. If the body alone already
+// meets/exceeds the cap there is no room for guidance and the body is returned unchanged
+// (createRun handles the oversized body exactly as before — guidance does not make it
+// worse).
+func composeRunDescription(body, guidance string) string {
+	g := strings.TrimSpace(guidance)
+	if g == "" {
+		return body
+	}
+	const max = workersvc.MaxIssueDescriptionBytes
+
+	section := guidanceHeader + g
+	if len(body)+len(section) <= max {
+		return body + section
+	}
+
+	// Truncation path. If the body alone leaves no room, do not touch it.
+	room := max - len(body)
+	if room <= 0 {
+		return body
+	}
+	// Reserve the header and the truncation marker; whatever remains is the guidance
+	// budget. If the header + marker alone will not fit, guidance cannot be included
+	// meaningfully without risking the cap — run the body alone (it still runs).
+	avail := room - len(guidanceHeader) - len(guidanceTruncMarker)
+	if avail <= 0 {
+		return body
+	}
+	return body + guidanceHeader + truncateUTF8(g, avail) + guidanceTruncMarker
+}
+
+// guidanceOf reads a schedule's stored guidance as a plain string, "" when NULL/invalid.
+func guidanceOf(sched store.RunSchedule) string {
+	if sched.Guidance.Valid {
+		return sched.Guidance.String
+	}
+	return ""
+}
+
+// truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split
+// a multibyte rune. s is assumed valid UTF-8, so backing the cut up to the nearest rune
+// start yields a valid string.
+func truncateUTF8(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	if n <= 0 {
+		return ""
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────

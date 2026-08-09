@@ -30,6 +30,12 @@ import (
 // unbounded fire computation (closes the M3-audit unbounded-N concern).
 const schedulePreviewCap = 10
 
+// MaxGuidanceBytes caps the optional owner guidance field (PRD #274 M3). It is kept well
+// below workersvc.MaxIssueDescriptionBytes (256 KiB) so guidance is a few-KB steer, not a
+// second body: the composition in schedsvc truncates guidance rather than skip an issue,
+// but a small hard cap keeps a fat guidance value from crowding out the actual task.
+const MaxGuidanceBytes = 8 * 1024
+
 // validateScheduleConfig is the PURE (no store, no clock beyond the passed-in `now`)
 // validator behind create/patch/preview, extracted so it is unit-testable without a
 // DB. It normalizes the request — a blank timezone becomes "UTC", sweep labels are
@@ -48,6 +54,17 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 	// only) is enforced per-target below.
 	if n.MaxIssues != nil && *n.MaxIssues <= 0 {
 		return n, http.StatusBadRequest, "max_issues must be a positive integer"
+	}
+
+	// guidance (PRD #274 M3): a blank/whitespace value is "none" — normalize it to nil so a
+	// cleared web textarea clears the stored guidance rather than persisting whitespace.
+	// The size cap applies regardless of target; the per-target scoping (issue/sweep only,
+	// rejected on prompt) is enforced in the switch below.
+	if n.Guidance != nil && strings.TrimSpace(*n.Guidance) == "" {
+		n.Guidance = nil
+	}
+	if n.Guidance != nil && len(*n.Guidance) > MaxGuidanceBytes {
+		return n, http.StatusUnprocessableEntity, "guidance is too large"
 	}
 
 	switch n.Target {
@@ -71,6 +88,13 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 		}
 		if n.MaxIssues != nil {
 			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
+		}
+		// Guidance steers HOW an issue/sweep run approaches a task; a prompt schedule
+		// carries its own free-form text, so guidance is out of scope there (PRD #274 M3,
+		// Out of scope). A blank was already normalized to nil above, so only a real value
+		// reaches here.
+		if n.Guidance != nil {
+			return n, http.StatusBadRequest, "guidance is not valid for a prompt schedule"
 		}
 	default:
 		return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
@@ -142,6 +166,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		WaitOnLimit: *m.WaitOnLimit,
 		Enabled:     *m.Enabled,
 		MaxIssues:   maxIssuesColumn(m),
+		Guidance:    guidanceColumn(m),
 	})
 	if err != nil {
 		slog.Error("create run schedule", "error", err)
@@ -235,6 +260,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			AutoApprove: *m.AutoApprove,
 			WaitOnLimit: *m.WaitOnLimit,
 			MaxIssues:   maxIssuesColumn(m),
+			Guidance:    guidanceColumn(m),
 			ID:          id,
 			UserID:      user.ID,
 		})
@@ -407,7 +433,8 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.Target == "" && req.Timing == "" &&
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
-		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil
+		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil &&
+		req.Guidance == nil
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -481,6 +508,13 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// leaving unlimited unreachable once a sweep has any cap set. This is the deliberate
 	// difference from the keep-on-empty fields — the *int tri-state carries "cleared".
 	m.MaxIssues = req.MaxIssues
+	// guidance (PRD #274 M3) takes the request value DIRECTLY for the same reason as
+	// max_issues above: a config PATCH rewrites the whole row (the enabled-only sparse PATCH
+	// is short-circuited by onlyEnabled), so the web sends the full config. Replace-semantics
+	// is what makes clear-to-none work — a `guidance: null` (or a cleared textarea, which
+	// validateScheduleConfig normalizes to nil) must reach the DB as NULL. A seed-and-keep
+	// would make an explicit clear indistinguishable from "omitted".
+	m.Guidance = req.Guidance
 	return m
 }
 
@@ -515,6 +549,18 @@ func maxIssuesColumn(m apitypes.ScheduleRequest) pgtype.Int4 {
 		return pgtype.Int4{Int32: int32(*m.MaxIssues), Valid: true}
 	}
 	return pgtype.Int4{}
+}
+
+// guidanceColumn maps the request's *string guidance to the nullable store column (PRD
+// #274 M3). It is set Valid ONLY for the issue/sweep targets and only for a non-blank
+// value: the prompt target carries its own text (validateScheduleConfig rejects guidance
+// there), and a blank was already normalized to nil, so a non-issue/sweep row never
+// persists a stray guidance value. A nil pointer is SQL NULL = no guidance.
+func guidanceColumn(m apitypes.ScheduleRequest) pgtype.Text {
+	if (m.Target == "issue" || m.Target == "sweep") && m.Guidance != nil && strings.TrimSpace(*m.Guidance) != "" {
+		return pgtype.Text{String: *m.Guidance, Valid: true}
+	}
+	return pgtype.Text{}
 }
 
 // nextFireFor computes the durable next_fire_at from a validated request: the next cron
@@ -590,6 +636,10 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	if s.MaxIssues.Valid {
 		v := int(s.MaxIssues.Int32)
 		dto.MaxIssues = &v
+	}
+	if s.Guidance.Valid && s.Guidance.String != "" {
+		v := s.Guidance.String
+		dto.Guidance = &v
 	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {

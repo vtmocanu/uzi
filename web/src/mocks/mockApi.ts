@@ -843,6 +843,7 @@ let schedules: Schedule[] = [
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
     max_issues: 10,
+    guidance: "Keep the diff small and add a failing test first.",
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
     updated_at: daysFromNow(-1, 2), next_fires: [],
   },
@@ -853,6 +854,7 @@ let schedules: Schedule[] = [
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
     max_issues: null,
+    guidance: "Prefer the smallest change that closes the issue; no new deps.",
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
     updated_at: daysFromNow(0, 3), next_fires: [],
   },
@@ -863,6 +865,7 @@ let schedules: Schedule[] = [
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: null, auto_approve: true, wait_on_limit: false,
     max_issues: null,
+    guidance: null,
     enabled: true, status: "active", created_at: daysFromNow(-1, 20),
     updated_at: daysFromNow(-1, 20), next_fires: [],
   },
@@ -874,6 +877,7 @@ let schedules: Schedule[] = [
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
     max_issues: null,
+    guidance: null,
     enabled: true, status: "active", created_at: daysFromNow(-21, 11),
     updated_at: daysFromNow(-7, 9), next_fires: [],
   },
@@ -884,6 +888,7 @@ let schedules: Schedule[] = [
     timezone: "UTC", next_fire_at: null,
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
     max_issues: 10,
+    guidance: null,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
     updated_at: daysFromNow(-3, 18), next_fires: [],
   },
@@ -897,6 +902,7 @@ let schedules: Schedule[] = [
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
     max_issues: null,
+    guidance: null,
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
     updated_at: daysFromNow(-1, 1, 30), next_fires: [],
   },
@@ -3266,6 +3272,8 @@ export const mockApi = {
       wait_on_limit: input.wait_on_limit ?? true,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
       max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
+      // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
+      guidance: target === "issue" || target === "sweep" ? (input.guidance ?? null) : null,
       enabled: input.enabled ?? true,
       status: "active",
       created_at: now,
@@ -3298,12 +3306,15 @@ export const mockApi = {
     if (input.wait_on_limit !== undefined) m.wait_on_limit = input.wait_on_limit;
     // Replace-semantics: apply when the key is present (explicit null = unlimited).
     if (input.max_issues !== undefined) m.max_issues = input.max_issues;
+    // Same replace-semantics for guidance (explicit null/"" clears to none).
+    if (input.guidance !== undefined) m.guidance = input.guidance;
     if (input.enabled !== undefined) m.enabled = input.enabled;
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
     m.issue_iid = m.target === "issue" ? m.issue_iid : null;
     m.labels = m.target === "sweep" ? m.labels : null;
     m.max_issues = m.target === "sweep" ? m.max_issues : null;
+    m.guidance = m.target === "issue" || m.target === "sweep" ? m.guidance : null;
     m.prompt = m.target === "prompt" ? m.prompt : "";
     m.cron_expr = m.timing === "recurring" ? m.cron_expr : "";
     m.run_at = m.timing === "once" ? m.run_at : null;

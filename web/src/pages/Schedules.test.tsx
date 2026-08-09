@@ -40,6 +40,7 @@ function sched(over: Partial<Schedule>): Schedule {
     auto_approve: true,
     wait_on_limit: true,
     max_issues: 10,
+    guidance: null,
     enabled: true,
     status: "active",
     created_at: new Date().toISOString(),

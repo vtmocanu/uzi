@@ -9,11 +9,11 @@
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues
+    auto_approve, wait_on_limit, enabled, max_issues, guidance
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
-    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues')
+    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance')
 )
 RETURNING *;
 
@@ -55,6 +55,7 @@ SET target        = @target,
     auto_approve  = @auto_approve,
     wait_on_limit = @wait_on_limit,
     max_issues    = sqlc.narg('max_issues'),
+    guidance      = sqlc.narg('guidance'),
     status        = 'active',
     updated_at    = now()
 WHERE id = @id AND user_id = @user_id
