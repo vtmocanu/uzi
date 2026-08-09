@@ -11,7 +11,7 @@ import (
 
 func TestMemoryList(t *testing.T) {
 	fc := &uzicli.FakeClient{Memories: []apitypes.AgentMemoryDTO{
-		{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "build flag", Body: "use -tags foo", CreatedAt: time.Unix(0, 0).UTC()},
+		{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "build flag", Body: "use -tags foo", Basis: "observed", CreatedAt: time.Unix(0, 0).UTC()},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "memory", "list")
 	if code != uzicli.ExitOK {
@@ -20,11 +20,15 @@ func TestMemoryList(t *testing.T) {
 	if !strings.Contains(out, "m1") || !strings.Contains(out, "org/repo") || !strings.Contains(out, "build flag") {
 		t.Errorf("list table = %q, want id/repo/title", out)
 	}
+	// The BASIS column (PRD #266) surfaces the writer-declared trust label.
+	if !strings.Contains(out, "BASIS") || !strings.Contains(out, "observed") {
+		t.Errorf("list table = %q, want a BASIS column with the entry's basis", out)
+	}
 }
 
 func TestMemoryListJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{Memories: []apitypes.AgentMemoryDTO{
-		{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "t", Body: "b", CreatedAt: time.Unix(0, 0).UTC()},
+		{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "t", Body: "b", Basis: "inferred", Evidence: "cmd: go test", CreatedAt: time.Unix(0, 0).UTC()},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "memory", "list", "--json")
 	if code != uzicli.ExitOK {
@@ -32,6 +36,10 @@ func TestMemoryListJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, `"id": "m1"`) || !strings.Contains(out, `"repo_name": "org/repo"`) {
 		t.Errorf("list --json = %q, want id/repo_name", out)
+	}
+	// Provenance flows through the DTO into --json (PRD #266).
+	if !strings.Contains(out, `"basis": "inferred"`) || !strings.Contains(out, `"evidence": "cmd: go test"`) {
+		t.Errorf("list --json = %q, want basis/evidence", out)
 	}
 }
 

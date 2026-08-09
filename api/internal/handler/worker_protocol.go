@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -639,12 +640,39 @@ func workerMemoryToDTO(m store.AgentMemory) apitypes.AgentMemoryDTO {
 		ID:        m.ID.String(),
 		Title:     m.Title,
 		Body:      m.Body,
+		Basis:     normalizeMemoryBasis(m.Basis),
+		Evidence:  memoryEvidence(m.Evidence),
 		CreatedAt: m.CreatedAt.Time,
 	}
 	if m.RunID.Valid {
 		dto.RunID = uuid.UUID(m.RunID.Bytes).String()
 	}
 	return dto
+}
+
+// normalizeMemoryBasis is the READ-side default for writer-declared provenance
+// (PRD #266): a stored basis is surfaced only when it is one of the known trust
+// labels ("observed" = the run saw it; "inferred" = the lead reasoned it). Anything
+// else — NULL (a legacy pre-provenance row), empty, or an unrecognized value a
+// worker sent — reads back as "inferred", the conservative label, so the DTO's Basis
+// is never blank and an untrusted worker cannot invent a stronger-looking basis.
+func normalizeMemoryBasis(basis pgtype.Text) string {
+	if basis.Valid {
+		switch basis.String {
+		case "observed", "inferred":
+			return basis.String
+		}
+	}
+	return "inferred"
+}
+
+// memoryEvidence surfaces the stored evidence pointer, or "" when NULL/absent (the
+// DTO field is omitempty, so an empty value is dropped from the JSON).
+func memoryEvidence(evidence pgtype.Text) string {
+	if evidence.Valid {
+		return evidence.String
+	}
+	return ""
 }
 
 // WorkerSaveMemory persists one cross-run memory entry for the run's (user, repo)
@@ -668,7 +696,7 @@ func (h *Handler) WorkerSaveMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	mem, err := h.wsvc.SaveMemory(r.Context(), wkr, runID, req.Title, req.Body)
+	mem, err := h.wsvc.SaveMemory(r.Context(), wkr, runID, req.Title, req.Body, req.Basis, req.Evidence)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
@@ -687,12 +715,16 @@ func (h *Handler) WorkerSaveMemory(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// The write echo is the bare entry {id,title,body,created_at} (run_id is present
-	// on the read path, not the write echo).
+	// The write echo is the bare entry {id,title,body,basis,evidence,created_at}
+	// (run_id is present on the read path, not the write echo). Basis is normalized
+	// the same way the read mappers do, so the echo reflects what a later read will
+	// return (an unknown/empty basis the worker sent comes back as "inferred").
 	httpx.JSON(w, http.StatusCreated, apitypes.AgentMemoryDTO{
 		ID:        mem.ID.String(),
 		Title:     mem.Title,
 		Body:      mem.Body,
+		Basis:     normalizeMemoryBasis(mem.Basis),
+		Evidence:  memoryEvidence(mem.Evidence),
 		CreatedAt: mem.CreatedAt.Time,
 	})
 }

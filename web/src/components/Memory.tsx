@@ -7,8 +7,8 @@
 // into a future run as untrusted, nonce-fenced context, never as instructions.
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type Memory } from "../lib/api";
-import { Alert, Button, Card, EmptyState, SectionTitle } from "./ui";
+import { api, ApiError, type Memory, type MemoryBasis } from "../lib/api";
+import { Alert, Badge, Button, Card, EmptyState, SectionTitle } from "./ui";
 import { ThoughtIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
 
@@ -28,6 +28,21 @@ function groupByRepo(entries: Memory[]): { repoName: string; entries: Memory[] }
     bucket.push(m);
   }
   return groups;
+}
+
+// Writer-declared provenance (PRD #266 M3). "observed" reads as verified — the writer
+// could point at a tool result, command output, or file:line; "inferred" is an untested
+// guess a human should re-check before trusting. We fold every missing/unknown value to
+// "inferred" so an unverified fact is never dressed up as a verified one: the badge is a
+// human audit signal, and the safe default is the skeptical one.
+function basisView(basis: MemoryBasis): { label: string; tone: "ok" | "warning"; title: string } {
+  return basis === "observed"
+    ? { label: "observed", tone: "ok", title: "The agent backed this with a tool result, command output, or a file:line." }
+    : { label: "inferred", tone: "warning", title: "Unverified — the agent inferred this rather than observing it. Re-check before trusting." };
+}
+
+function normalizeBasis(basis: Memory["basis"]): MemoryBasis {
+  return basis === "observed" ? "observed" : "inferred";
 }
 
 export function Memory() {
@@ -129,10 +144,27 @@ function MemoryRow({ memory, onDelete }: { memory: Memory; onDelete: () => void 
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 space-y-1.5">
           {/* Issue #124: agent-written cross-run memory, same untrusted class. */}
-          <div className="font-medium text-fg">{stripUnsafeChars(memory.title)}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-medium text-fg">{stripUnsafeChars(memory.title)}</div>
+            {(() => {
+              const view = basisView(normalizeBasis(memory.basis));
+              return (
+                <Badge tone={view.tone} title={view.title}>
+                  {view.label}
+                </Badge>
+              );
+            })()}
+          </div>
           <pre className="whitespace-pre-wrap break-words font-mono text-xs text-muted">
             {stripUnsafeChars(memory.body)}
           </pre>
+          {memory.evidence ? (
+            // Evidence is the observation the writer named. Agent-supplied free text, so
+            // it runs through stripUnsafeChars like title/body (#124 untrusted class).
+            <div className="text-xs text-faint">
+              evidence: <span className="text-muted">{stripUnsafeChars(memory.evidence)}</span>
+            </div>
+          ) : null}
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
             <span>saved {new Date(memory.created_at).toLocaleString()}</span>
             {memory.run_id ? (

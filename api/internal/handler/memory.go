@@ -39,6 +39,8 @@ func (h *Handler) ListMyMemory(w http.ResponseWriter, r *http.Request) {
 			RepoName:  m.RepoName,
 			Title:     m.Title,
 			Body:      m.Body,
+			Basis:     normalizeMemoryBasis(m.Basis),
+			Evidence:  memoryEvidence(m.Evidence),
 			CreatedAt: m.CreatedAt.Time,
 		}
 		if m.RunID.Valid {

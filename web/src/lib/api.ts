@@ -713,6 +713,14 @@ export interface CliAuthRequestMeta {
 // repo_name is the human path (e.g. "vtmocanu/uzi") the list groups by; run_id is
 // the provenance run that wrote the entry — OPTIONAL: it is `omitempty` in Go and
 // set NULL when its run is pruned (FK ON DELETE SET NULL), so it can be absent.
+//
+// basis is writer-declared provenance (PRD #266): "observed" — the claim was backed
+// by a tool result, command output, or a file:line the writer could name — vs
+// "inferred", an untested guess. It is always present on read; legacy rows and any
+// missing/unknown value read as "inferred" so an unverified fact is never rendered as
+// verified. evidence is an OPTIONAL short pointer to the observation, agent-supplied
+// free text (render it through stripUnsafeChars like title/body).
+export type MemoryBasis = "observed" | "inferred";
 export interface Memory {
   id: string;
   repo_id: string;
@@ -721,6 +729,8 @@ export interface Memory {
   body: string;
   run_id?: string;
   created_at: string;
+  basis: MemoryBasis;
+  evidence?: string;
 }
 
 // ── Scheduled runs (PRD #241) ─────────────────────────────────────────────
