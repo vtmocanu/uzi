@@ -3,7 +3,10 @@
 **Issue**: [#215](https://gitlab.example.com/vtmocanu/uzi/-/issues/215) · **Label**: PRD · **Priority**: High
 **Area**: `api/internal/agenttmpl/builtins/lead.md` (the prompt change) · **`api/internal/agenttmpl/render_test.go` (the pins M1/M2 retire — not optional, see M2)** · `api/internal/store/agent_templates_builtins.go` + `api/internal/handler/agent_templates.go` + `api/internal/store/skills_builtins.go` (delivery, M6) · `probes/` + `scripts/` (M0 artifacts) · `docs/` (M8).
 **Line references** are against `d367653b`. `lead.md` was last touched by `6814a174` (2026-08-02).
-**Status**: not started.
+**Status**: in progress — the prompt change (M1–M5) and its docs (M8) shipped and
+were reviewed on branch `agent/issue-215`; M0's instrument shipped without live
+numbers, M6 was descoped to documentation (D10 is stale — see the run note below
+the milestones), and M7 is deferred to post-deploy runs. Not moved to `prds/done/`.
 **Evidence**: measured 2026-08-03 from the live feeds of `edbc3884-…` (issue #209, uzi) and `a146df98-…` (issue #78, example-app), both on worker `base.l-da4a` (`l` = 4 CPU / 8 GiB, `max_concurrent_runs: 2`).
 **Reviewed** 2026-08-03, one pass. Four blocking findings, all applied. **Two were demonstrated by execution, not argued** — the reviewer built `agenttmpl` as a standalone module and ran the PRD's own proposals against it.
 
@@ -279,7 +282,7 @@ M4 and M5 each need a mechanism first.
       across the module boundary and whose edits move gates. Fix N, report
       variance, and prefer a **paired** comparison (same issue before and after),
       since wall clock is dominated by issue shape rather than by the prompt.
-- [ ] **M1 — Update the pins BEFORE touching the prompt.** ⟨new, blocking⟩
+- [x] **M1 — Update the pins BEFORE touching the prompt.** ⟨new, blocking⟩
       `render_test.go` pins the exact strings M2/M4 retire:
       `:172` `"commit once, run the quality gates once yourself"` and `:492`
       `"fans out again after an implementation unit lands"`, inside
@@ -298,11 +301,11 @@ M4 and M5 each need a mechanism first.
       fold measurements and applies `CLAUDE.md`'s retire-a-string sweep (grep the
       old strings across the test tree; check each negative assertion for a
       pairing).
-- [ ] **M2 — Per-unit, commit-anchored validator dispatch.** Resolve the
+- [x] **M2 — Per-unit, commit-anchored validator dispatch.** Resolve the
       `:32`/`:47` contradiction toward per-unit dispatch (D3's read-only scope),
       with validators anchored to `<base>..<sha>` (D4). **This is the milestone
       that delivers most of the benefit at the least risk; it can ship alone.**
-- [ ] **M3 — Honest test posture.** ⟨replaces the old M4⟩ The old milestone
+- [x] **M3 — Honest test posture.** ⟨replaces the old M4⟩ The old milestone
       claimed a test could pin "the file must not contain both procedures". That
       was **demonstrated false**: implemented as specified, it returned
       `perUnit=false barrier=false` and **PASSED over a `lead.md` keeping both
@@ -315,10 +318,10 @@ M4 and M5 each need a mechanism first.
       paragraph). So: either a **positive** pin on the single surviving procedure
       paired with a negative per `CLAUDE.md`'s paired-negative rule, or an
       explicit statement that no test pins this and M7 is the only check.
-- [ ] **M4 — Overlap the integration gate with the read-only wave.** Gated on
+- [x] **M4 — Overlap the integration gate with the read-only wave.** Gated on
       D3. States the gate's blocking authority over the commit explicitly so it
       is not read as optional. The implementation-wave overlap is out of scope.
-- [ ] **M5 — Seam-split for contract units.** Gated on D5 (executed, not just
+- [x] **M5 — Seam-split for contract units.** Gated on D5 (executed, not just
       committed), D9 (declared in the approved plan), D11 (stack-neutral
       wording). **Hold behind M2 and M4.**
 - [ ] **M6 — Delivery.** A tested path for applying an edited builtin to a
@@ -336,8 +339,43 @@ M4 and M5 each need a mechanism first.
       (not just per-command duration), **red-then-green-on-retry counts** (D2),
       **usage-limit parks and token spend**, and the defect classes plus
       review→fix loop count (D7).
-- [ ] **M8 — Docs.** Update the run-lifecycle docs, following the existing
+- [x] **M8 — Docs.** Update the run-lifecycle docs, following the existing
       frontmatter rules.
+
+## Implementation note (run `agent/issue-215`)
+
+What shipped this run, against the milestone boxes above:
+
+- **M1–M5 (done).** `api/internal/agenttmpl/builtins/lead.md` reworded to a single
+  per-unit read-only dispatch procedure anchored to `<base>..<sha>` (M2), an
+  integration gate overlapped with the read-only wave but retaining full blocking
+  authority over the commit (M4), and an executed-seam, plan-declared,
+  stack-neutral seam-split (M5). The `render_test.go` pins the reword retired were
+  re-derived — the whole-body gate pin became overlap + blocking-authority +
+  immutable-range pins, and the load-bearing `bulletCases` pin became a positive
+  pin on the surviving procedure (M1/M3). `task`-level `go test ./internal/agenttmpl`
+  green; reviewer + auditor + fact-checker + tester wave clean.
+- **M8 (done).** `docs/agent-templates.md` "Parallel dispatch" section updated to
+  the new behaviour; `node web/scripts/check-docs.mjs` OK.
+- **M0 (instrument only, box left unticked).** `scripts/uzi-concurrency-profile.sh`
+  + `probes/215-concurrency-baseline.md` ship the baseline instrument
+  (shellcheck-clean, unit-checked against a synthetic capture). **No baseline
+  numbers were produced** — no live run id exists in an isolated worktree — so the
+  "numbers land in `probes/`" half is not done. Folded with M7.
+- **M6 (descoped to documentation, box left unticked).** D10's premise is **stale**:
+  since the PRD was drafted (`d367653b`), PRD #275/#201 shipped `RefreshPristineBuiltin`
+  (`agent_templates_builtins.go` → `queries/agent_templates.sql`), which auto-heals
+  pristine builtin rows at boot, plus per-row `differs_from_builtin` and a web
+  reset/diff view. So a shipped `lead.md` edit is **not** a no-op, and the bulk
+  "drift query" M6 asked for is already answered per-row by the list endpoint + web
+  UI. This run therefore documented the delivery reality, the destructive-reset
+  caveat, the no-CLI rationale (admin CLI is read-only; reset mints nothing), and
+  the builtin-skills asymmetry (no boot refresh) in `docs/agent-templates.md`,
+  rather than building a redundant query/CLI. The approving human accepted this
+  descope at the plan gate. The literal M6 (a new drift query with two
+  implementations + a live-row read) was **not** built, so the box stays open.
+- **M7 (deferred).** Measured validation requires re-running M0 over post-deploy
+  live runs; it cannot execute from an isolated worktree. Box stays open.
 
 ## Success criteria
 
