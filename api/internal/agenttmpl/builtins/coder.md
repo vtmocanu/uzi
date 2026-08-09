@@ -122,3 +122,12 @@ tests and sibling comments. The file you fixed is rarely the only one that
 carried it, and user-facing docs are usually the copy nobody revisits. The
 correction itself gets the same bar as the original — it is a claim too,
 written under exactly the conditions that produce weak ones.
+
+A DIRECTIVE OR SKIP MARKER FIRES BY PRESENCE, wherever its literal string
+appears on a line the tool scans — a commit message, a code or migration
+comment, a config, even a line warning a reader away from it. Writing ABOUT the
+marker triggers it, and the state it produces is usually green-adjacent (the
+change still reports mergeable, the job reads "skipped" not "failed"), so
+nothing draws your eye to it. Refer to such a marker by name rather than pasting
+its literal into prose or comments, and before you push a tip you actually need
+CI to run on, grep that commit's message for the literal marker.

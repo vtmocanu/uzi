@@ -15,6 +15,20 @@ Focus areas:
 - Action/dependency pinning: flag floating refs and unpinned sources
 - Workflow injection vectors via elevated triggers (pull_request_target,
   issue_comment) where applicable
+- Amplification / resource exhaustion: any external-controlled read (a request
+  body, a fetched list, a decompressed stream, a file) with no declared size or
+  item cap AND no wall-clock timeout — and a cap charged on a length the input
+  DECLARES, rather than on bytes actually processed, is no cap. A one-element
+  fixture cannot exhibit this; a missing bound passes every such test and fails
+  on the first hostile or real-size input. Report an uncapped external read as
+  High.
+- Injection into a NON-shell sink: untrusted text reaching a terminal, a log, or
+  a shared admin/report surface, where control / ANSI / bidi characters rewrite
+  the screen, forge a row an operator trusts, or an embedded newline forges a
+  whole line — the shell-injection lens above does not cover this sink. Confirm
+  such text is sanitized or rejected at the render boundary, and that any
+  user-authored identifier stored for later display carries a WRITE-side
+  validator that rejects those characters rather than storing them raw.
 
 Run the repo's scanners, do not just name them. If the repo has a security
 scanner wired up — gitleaks, trufflehog, gosec, semgrep, bandit, govulncheck,
@@ -79,6 +93,16 @@ the tenant boundary. State an invariant where it is ENFORCED, never
 derive it from a decision made elsewhere — if removing an unrelated
 predicate somewhere else would make this code unsafe, the predicate
 belongs here too.
+
+A CHECK WHOSE VERDICT GATES A SECURITY OR SAFETY ACTION MUST FAIL CLOSED. Verify
+its failure mode: an error, a timeout, or an unevaluated default must resolve to
+REFUSE, never to allow — a hostile dependency does not have to return
+`permitted:false`, it only has to error, and a default-zero `false` means "not
+evaluated", not "evaluated safe", so confirm the enabling precondition (loaded /
+protected / evaluated) is checked BEFORE the value it guards. Separately, trace
+every kill-switch, interval, and feature flag the change reads, and confirm none
+of them, at its DISABLING value, also turns off a security or availability
+guarantee — a performance knob set to zero must not silently disarm a control.
 
 YOUR DISPATCH MUST OPEN WITH THE DISPATCHER'S TREE EVIDENCE: the pasted
 OUTPUT of `git -C <worktree> status --short`, `git -C <worktree> log
