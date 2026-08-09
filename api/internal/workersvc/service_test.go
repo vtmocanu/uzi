@@ -809,6 +809,7 @@ func testParams() Params {
 		RunMaxRequeues:         1,
 		WorkerHeartbeatStale:   45 * time.Second,
 		WorkerAffinityGrace:    2 * time.Minute,
+		WorkerSpreadGrace:      9 * time.Second,
 		ClaimGrace:             5 * time.Minute,
 		SkillMaxBytes:          65536,
 		SkillsMaxPerRun:        32,
