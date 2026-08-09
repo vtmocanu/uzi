@@ -19171,3 +19171,45 @@ it is NOT admin-gated** — a normal user capability gated only by repo ownershi
   `prompt` run that actually touches uzi's own guard surface gets the guard-critical MR section
   (`guardCriticalMrSection`, `runner.ts`), closing the gap that `self_improve` got this flag for
   free (it targets uzi's repo) but a repo-agnostic prompt run would not.
+
+## 502. PRD #240 — Admin Rate limits table: two window columns collapse into one stacked "Utilization" column
+
+Serves human Feature #53 (per-user Claude rate-limit visibility) — a follow-up presentation fix,
+not a new user-stated feature. The Admin › Rate limits table (`web/src/pages/AdminRateLimits.tsx`,
+§242) rendered six columns (User · Token · 5-hour window · 7-day window · Status · Updated);
+the two ~280px side-by-side window columns made the table wider than its `Card` at a laptop content
+width, so `overflow-x-auto` kicked in and the Status pill clipped behind a horizontal scrollbar.
+`web/`-only: one page + its test; no API, DTO, query, migration, service, or trust-boundary change.
+Full decision log: [prds/done/240-rate-limits-utilization-column.md](../prds/done/240-rate-limits-utilization-column.md).
+
+- **Decision (PRD Option A).** Collapse the two window columns into ONE **Utilization** column that
+  stacks the 5-hour and 7-day meters as two thin rows, and fold the **Updated** timestamp under the
+  Status pill. Six columns → four (User · Token · Utilization · Status), roughly halving the table's
+  width so it fits its card — no scrollbar, no clipped pill, and **no data removed** (both windows,
+  both percentages, both reset countdowns, and the sync time all stay on screen). The two rejected
+  mocks (B — tighten the six columns; C — responsive cards) are recorded in the PRD's Decision 1.
+- **A new `UtilizationCell` composes two `WindowRow`s; the old `WindowCell` is gone.** Each
+  `WindowRow` is a grid of a mono `5h`/`7d` chip, the shared `MeterTrack`, the percent, and the
+  reset countdown. `MeterTrack`, `Badge`, `formatCountdown`/`formatAgo`, `statusBadge`/`toneFor`,
+  and the `sortAdminRows` danger→warn→ok→stale→no-token order are all reused verbatim.
+- **The `MeterTrack` aria-labels stay the FULL window names** — `"5-hour window"` / `"7-day window"`
+  — even though the only *visible* window identity is now the short `5h`/`7d` chip. The chip is a
+  NEW visible surface (it replaces the full-size column headers), so it is `text-muted` at 12px, NOT
+  the mock's sub-AA `--faint`/10.5px — a sighted low-vision admin now relies on it, so it must clear
+  WCAG AA. Pinned by `AdminRateLimits.test.tsx`'s `getByRole("progressbar", { name: "5-hour window" })`.
+- **The folded "updated Nm ago" line keeps `text-muted`.** It is the *relocated* Updated column, not
+  a new element — that column was `text-muted` for a documented web-ux "AA at 12px" reason, and
+  moving it under the pill does not change its size, so the tone must not silently drop to faint
+  (PRD Decision 2). It renders only for an `ok` reading (a non-`ok`/`no_token` row shows no line).
+- **`overflow-x-auto` wrapper kept** as a defensive net (PRD Decision 3): inert when content fits,
+  graceful degradation on a genuinely tiny viewport rather than a broken layout.
+- **Cosmetic polish from the web-ux review:** the reset countdown is a fixed-width, right-aligned
+  grid column so a long countdown ("23h 59m") never jogs the stacked 5h/7d percents out of a clean
+  vertical column; the local window type is named `OkWindow` (it had shadowed the DOM global `Window`).
+- **Test shape change.** A `no_token` row's em-dash count drops from 4 (token + both windows +
+  Updated) to 2 (token + the single Utilization cell); a new regression assertion pins the exact
+  four-column header (User · Token · Utilization · Status) with no Updated/per-window header, so a
+  future re-widening that reintroduces the scroll bug is caught.
+- **CLI: deliberately out of scope.** Per the "new functionality ⇒ check `api/cmd/uzi/`" convention,
+  recorded explicitly: this is a presentation-only web admin table with no CLI counterpart, so there
+  is nothing to mirror in the CLI.
