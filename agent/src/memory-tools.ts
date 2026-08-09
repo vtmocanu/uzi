@@ -29,6 +29,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { z } from "zod";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import type { MemoryBasis } from "./protocol.js";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
 
@@ -43,6 +44,10 @@ export const SAVE_MEMORY_TOOL = "save_memory";
  *  server-side. */
 export const MEMORY_TITLE_MAX_BYTES = 200;
 export const MEMORY_BODY_MAX_BYTES = 2048;
+/** Cap for the optional writer-declared evidence pointer (PRD #266 M2), in BYTES
+ *  (utf-8), same pattern as title/body. It is a short pointer (a `file:line`, a
+ *  command, a tool name), not prose — 200 bytes matches the title cap. */
+export const MEMORY_EVIDENCE_MAX_BYTES = 200;
 
 /**
  * Obvious "volatile snapshot" shapes a durable memory should NOT be built around:
@@ -115,7 +120,7 @@ export interface MemoryToolsDeps {
 /** The raw tool handlers (unit-testable). save_memory validates the size caps
  *  client-side, then POSTs through deps.client for deps.runId only. */
 export interface MemoryToolHandlers {
-  saveMemory(args: { title: string; body: string }): Promise<ToolTextResult>;
+  saveMemory(args: { title: string; body: string; basis?: MemoryBasis; evidence?: string }): Promise<ToolTextResult>;
 }
 
 export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandlers {
@@ -138,8 +143,20 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
       if (bytes > MEMORY_BODY_MAX_BYTES) {
         return asText(`save_memory body is too long (max ${MEMORY_BODY_MAX_BYTES} bytes; got ${bytes}). Trim it and try again.`, true);
       }
+      // Provenance (PRD #266 M2): default an omitted basis to `inferred` (never a
+      // hard failure — PRD #90). Evidence is optional; normalize empty/whitespace to
+      // undefined and byte-cap it with a clear tool error, like title/body.
+      const basis: MemoryBasis = args.basis ?? "inferred";
+      const evidenceTrimmed = (args.evidence ?? "").trim();
+      const evidence = evidenceTrimmed.length === 0 ? undefined : evidenceTrimmed;
+      if (evidence !== undefined) {
+        const evidenceBytes = Buffer.byteLength(evidence, "utf8");
+        if (evidenceBytes > MEMORY_EVIDENCE_MAX_BYTES) {
+          return asText(`save_memory evidence is too long (max ${MEMORY_EVIDENCE_MAX_BYTES} bytes; got ${evidenceBytes}). Shorten it to a pointer (a file:line, command, or tool name) and try again.`, true);
+        }
+      }
       try {
-        const entry = await client.saveMemory(runId, { title, body });
+        const entry = await client.saveMemory(runId, { title, body, basis, evidence });
         // The memory IS saved (isError stays false); this only appends an advisory
         // nudge when the body looks like a fast-decaying tally, never a rejection.
         const snapshotNudge = VOLATILE_SNAPSHOT_RE.test(body)
@@ -184,6 +201,11 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
           "persist a note. Record the DURABLE fact, not a volatile snapshot: prefer a mechanism",
           "or command over today's number (a test-pass count, a version tally, an \"N of M\" ratio",
           "all decay and mislead a later run). Keep the title short and the body a couple of sentences.",
+          "Set basis to \"observed\" ONLY when the claim is backed by something you can name — a",
+          "tool result, command output, or a file:line — and put that pointer in evidence; otherwise",
+          "leave basis \"inferred\". A later run is told which, and re-verifies an inferred claim before",
+          "acting on it. Prefer to READ runtime/config facts live (your roster, tools, and environment)",
+          "rather than remembering them — they change as the product changes.",
         ].join(" "),
         {
           title: z
@@ -200,6 +222,16 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
               message: `body must be at most ${MEMORY_BODY_MAX_BYTES} bytes`,
             })
             .describe(`The durable fact to remember, not a volatile snapshot like a test-pass count or version tally (≤${MEMORY_BODY_MAX_BYTES} bytes).`),
+          basis: z
+            .enum(["observed", "inferred"])
+            .default("inferred")
+            .describe(
+              'Provenance of the claim: "observed" only when backed by a tool result, command output, or file:line you can name (put the pointer in evidence); otherwise "inferred". Defaults to "inferred".',
+            ),
+          evidence: z
+            .string()
+            .optional()
+            .describe(`Optional short pointer to what backs an "observed" claim — a file:line, command, or tool name (≤${MEMORY_EVIDENCE_MAX_BYTES} bytes).`),
         },
         (args) => h.saveMemory(args),
       ),

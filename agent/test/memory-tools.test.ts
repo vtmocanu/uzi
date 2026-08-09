@@ -7,6 +7,7 @@ import {
   MEMORY_SERVER_NAME,
   MEMORY_TITLE_MAX_BYTES,
   MEMORY_BODY_MAX_BYTES,
+  MEMORY_EVIDENCE_MAX_BYTES,
 } from "../src/memory-tools.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import type { MemoryEntry, SaveMemoryRequest } from "../src/protocol.js";
@@ -54,12 +55,56 @@ describe("save_memory handler (PRD #90 M2)", () => {
     assert.strictEqual(calls.saveMemory.length, 1);
     assert.deepStrictEqual(calls.saveMemory[0], {
       runId: "run-current",
-      body: { title: "gcc baked in", body: "no build-essential needed" },
+      body: { title: "gcc baked in", body: "no build-essential needed", basis: "inferred", evidence: undefined },
     });
     assert.notStrictEqual(res.isError, true);
     assert.match(bodyText(res), /Saved cross-run memory "gcc baked in"/);
     assert.match(bodyText(res), /mem-9/);
     assert.match(bodyText(res), /advisory/i);
+  });
+
+  it("defaults an OMITTED basis to `inferred` and never returns isError (PRD #266 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const res = await handlers(client).saveMemory({ title: "t", body: "a durable fact" });
+    assert.strictEqual(calls.saveMemory.length, 1);
+    assert.strictEqual(calls.saveMemory[0]!.body.basis, "inferred", "omitted basis defaults to inferred");
+    assert.strictEqual(calls.saveMemory[0]!.body.evidence, undefined, "omitted evidence stays undefined");
+    assert.notStrictEqual(res.isError, true, "defaulting basis is never a hard failure (PRD #90)");
+  });
+
+  it("round-trips an `observed` basis and its evidence to the client (PRD #266 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const res = await handlers(client).saveMemory({
+      title: "coder can edit",
+      body: "the coder subagent inherits Edit/Write on the implement turn",
+      basis: "observed",
+      evidence: "agent/src/agents.ts:27-37",
+    });
+    assert.strictEqual(calls.saveMemory.length, 1);
+    assert.strictEqual(calls.saveMemory[0]!.body.basis, "observed");
+    assert.strictEqual(calls.saveMemory[0]!.body.evidence, "agent/src/agents.ts:27-37");
+    assert.notStrictEqual(res.isError, true);
+  });
+
+  it("normalizes empty/whitespace evidence to undefined (PRD #266 M2)", async () => {
+    const { client, calls } = fakeClient();
+    const res = await handlers(client).saveMemory({ title: "t", body: "a durable fact", basis: "observed", evidence: "   " });
+    assert.strictEqual(calls.saveMemory.length, 1);
+    assert.strictEqual(calls.saveMemory[0]!.body.evidence, undefined, "whitespace evidence normalizes to undefined");
+    assert.notStrictEqual(res.isError, true);
+  });
+
+  it("rejects over-cap evidence by BYTES with a clear non-fatal tool error and NO network call (PRD #266 M2)", async () => {
+    const { client, calls } = fakeClient();
+    // 101 chars of a 2-byte code point = 202 bytes > 200, but only 101 chars —
+    // proves the evidence cap is byte-measured, matching title/body.
+    const evidence = "é".repeat(101);
+    assert.ok(evidence.length <= MEMORY_EVIDENCE_MAX_BYTES, "under the byte cap by char count");
+    assert.ok(Buffer.byteLength(evidence, "utf8") > MEMORY_EVIDENCE_MAX_BYTES, "over the byte cap by byte count");
+    const res = await handlers(client).saveMemory({ title: "t", body: "b", basis: "observed", evidence });
+    assert.strictEqual(res.isError, true, "over-cap evidence is a non-fatal tool error, not a throw");
+    assert.match(bodyText(res), /evidence is too long/);
+    assert.strictEqual(calls.saveMemory.length, 0, "no POST on a client-side rejection");
   });
 
   it("appends a NON-FATAL nudge when the body reads like a volatile snapshot (still saves)", async () => {

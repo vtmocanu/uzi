@@ -748,13 +748,31 @@ export interface CreateProposalRequest {
   labels: string[];
 }
 
+/** Writer-declared provenance for a saved memory (PRD #266 M2). `observed` = the
+ *  claim is backed by something the writer can name (a tool result, command output,
+ *  or a `file:line`); `inferred` = an untested deduction. Carried per-entry to the
+ *  reader so an inferred claim can be individually marked "re-verify before acting"
+ *  (M3), rather than diluted across the blanket advisory frame. A save omitting it
+ *  defaults to `inferred` — never a hard failure (PRD #90: memory writes must not
+ *  fail a run). */
+export type MemoryBasis = "observed" | "inferred";
+
 /** Request body for POST /api/worker/runs/:id/memory (PRD #90). The server derives
  *  (user_id, repo_id) from the run claim — the worker NEVER sends them (its join
  *  token is not user-scoped). Caps (title ≤200 chars, body ≤2048 bytes, ≤5 writes/
- *  run) are enforced server-side; the tool schema mirrors them client-side. */
+ *  run) are enforced server-side; the tool schema mirrors them client-side.
+ *  `basis`/`evidence` (PRD #266 M2) are writer-declared provenance; the API does not
+ *  parse them until M3 (extra JSON fields are ignored server-side, so this is
+ *  back-compat). */
 export interface SaveMemoryRequest {
   title: string;
   body: string;
+  /** Writer-declared provenance; a save omitting it is defaulted to `inferred`. */
+  basis: MemoryBasis;
+  /** Optional short pointer to what backs an `observed` claim (a tool result,
+   *  command output, or a `file:line`). Byte-capped, normalized to undefined when
+   *  empty. */
+  evidence?: string;
 }
 
 /** One cross-run memory entry (PRD #90). The write endpoint returns id/title/body/
