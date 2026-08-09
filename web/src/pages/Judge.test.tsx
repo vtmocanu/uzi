@@ -74,10 +74,12 @@ function backlog(over: Partial<JudgeBacklog> = {}): JudgeBacklog {
 
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user: { judge_enabled: true } } as unknown as ReturnType<typeof useAuth>);
-  // Default the PRD #244 chip-count fetch to empty so every existing suite renders; the
+  // Default the PRD #270 chip-count MATRIX fetch to empty so every existing suite renders; the
   // count-specific suites override it. vi.clearAllMocks() (afterEach) clears calls but not
   // implementations, so re-setting here each test also prevents an override leaking forward.
-  mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
+  mockApi.getJudgeCategoryStats.mockResolvedValue({
+    counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+  });
 });
 afterEach(() => {
   cleanup();
@@ -795,26 +797,27 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
 // /me/judge/category-stats aggregate, fetched ONCE on mount, rendered as a badge inside the
 // chip; a 0-count chip is dimmed. The chip's accessible name is `${label}, N groups` so the
 // count is announced without the raw digit polluting the name.
-describe("Judge — per-category chip counts (PRD #244)", () => {
-  // Whole-backlog group counts per category. improve_uzi has 6, install_worker_tool 3,
-  // enable_tool is a deliberate ZERO to exercise the dimmed state.
-  const counts = {
-    improve_uzi: 6,
-    install_worker_tool: 3,
-    add_agent: 1,
-    adjust_template: 2,
-    improve_agent: 4,
-    enable_tool: 0,
+describe("Judge — per-category chip counts (PRD #270)", () => {
+  // The count is a bucket-keyed MATRIX now, and the chip row reads the slice for the ACTIVE
+  // tab. improve_uzi reads 6 under `todo` and 9 under `all`, so a chip that reflected the wrong
+  // bucket would be caught. enable_tool is a deliberate ZERO across buckets for the dimmed
+  // state. all = todo+filed+done+dismissed per category (improve_uzi: 6+3 across done/dismissed).
+  const counts_by_bucket = {
+    todo: { improve_uzi: 6, install_worker_tool: 3, add_agent: 1, adjust_template: 2, improve_agent: 4, enable_tool: 0 },
+    filed: {},
+    done: { improve_uzi: 2 },
+    dismissed: { improve_uzi: 1 },
+    all: { improve_uzi: 9, install_worker_tool: 3, add_agent: 1, adjust_template: 2, improve_agent: 4, enable_tool: 0 },
   };
 
-  it("renders each chip's count from getJudgeCategoryStats, and dims a 0-count chip", async () => {
+  it("renders each chip's count from the active tab's matrix slice, and dims a 0-count chip", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());
-    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts });
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
     renderJudge();
 
     await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
 
-    // The accessible name carries the count honestly, singular "group" at 1.
+    // Default tab is To triage, so each chip reads its `todo` count. Singular "group" at 1.
     await waitFor(() => expect(screen.getByRole("button", { name: "Improve uzi, 6 groups" })).toBeTruthy());
     const uzi = screen.getByRole("button", { name: "Improve uzi, 6 groups" });
     const worker = screen.getByRole("button", { name: "Install a worker tool, 3 groups" });
@@ -834,32 +837,60 @@ describe("Judge — per-category chip counts (PRD #244)", () => {
     expect(zero.hasAttribute("disabled")).toBe(false);
   });
 
-  it("fetches the counts ONCE on mount, never on a bucket or category toggle", async () => {
+  it("re-scopes chips to the active bucket on a tab switch, WITHOUT re-fetching the matrix", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());
-    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts });
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
     renderJudge();
 
     await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
-    // The one mount fetch.
+    // The one mount fetch of the matrix, and the one mount read of the backlog.
     await waitFor(() => expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(1));
-    // Baseline: the backlog was read once on mount too.
     expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(1);
+    // On To triage the improve_uzi chip reads its `todo` slice (6).
+    expect(screen.getByRole("button", { name: "Improve uzi, 6 groups" })).toBeTruthy();
 
-    // A category toggle re-fetches the backlog (the list narrows)…
+    // A category toggle re-reads the backlog (the list narrows)…
     fireEvent.click(screen.getByRole("button", { name: /^Install a worker tool,/ }));
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(2));
 
-    // A bucket switch re-fetches the backlog again…
+    // A bucket switch to All re-reads the backlog and re-scopes the chip to the `all` slice (9)…
     fireEvent.click(screen.getByRole("tab", { name: /All/ }));
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Improve uzi, 9 groups" })).toBeTruthy());
 
-    // …but the counts are invariant to both, so the aggregate is NEVER re-fetched.
+    // …but the whole matrix was already in hand, so the aggregate is NEVER re-fetched on a
+    // bucket or category change.
     expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("REFETCHES the matrix after a disposition (it is triage-variant now, PRD #270)", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts_by_bucket });
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 1,
+      settled: [{ run_id: "run-1", rec_id: "rec-1" }],
+      groups: [group({ target: "shellcheck", category: "install_worker_tool", bucket: "done", open_count: 0 })],
+      truncated: false,
+      triage: { total: 11, todo: 4, filed: 2, done: 3, dismissed: 2, false_positives: 1 },
+    });
+
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    await waitFor(() => expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(1));
+
+    // Mark the shellcheck group done (it is the only single-open-member row).
+    fireEvent.click(screen.getAllByRole("button", { name: /Mark done/ })[1]);
+
+    // A disposition moves a group between buckets, so the tab-scoped chip matrix is now stale:
+    // the page refetches it on the same trigger it re-read the backlog. Fetched-once is dead.
+    await waitFor(() => expect(mockApi.getJudgeCategoryStats).toHaveBeenCalledTimes(2));
   });
 
   it("renders a 0 on every chip when the aggregate is absent, without crashing", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());
-    mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
+    mockApi.getJudgeCategoryStats.mockResolvedValue({
+      counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+    });
     renderJudge();
 
     await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());

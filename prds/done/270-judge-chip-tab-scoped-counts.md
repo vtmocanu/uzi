@@ -1,7 +1,7 @@
 # PRD #270: Judge filter-chip counts scope to the selected triage tab
 
 **GitLab Issue**: [#270](https://gitlab.example.com/vtmocanu/uzi/-/issues/270)
-**Status**: 📝 Draft — owner picked tab-scoped counts over show-both / clarify-only (2026-08-09); architect-reviewed 2026-08-09 (B1 uncapped-load blocker + S1–S5 incorporated); ready for implementation
+**Status**: ✅ Done — implemented 2026-08-09 (all milestones M1–M6 landed and reviewed on branch `agent/issue-270`; backend matrix + uncapped SQL, frontend tab-scoped refetch, mock parity + differential test, docs + specs §506)
 **Priority**: Medium
 
 ## Problem
@@ -168,7 +168,7 @@ totals.
 
 ## Milestones
 
-- [ ] **M1 — Backend matrix aggregate (uncapped).** New/extended service method returns the
+- [x] **M1 — Backend matrix aggregate (uncapped).** New/extended service method returns the
   bucket × category group-count matrix via `GroupJudgeRecommendations` over an **uncapped**
   whole-backlog row load (no `Lim` — see Decision 2/Solution Overview; a capped load silently
   regresses #244 and mis-rolls groups); handler updated; owner-scoped. Tests: (a) carry
@@ -177,19 +177,19 @@ totals.
   regression M1's other assertions do NOT catch; (b) `todo+filed+done+dismissed == all` per
   category; (c) a group with one open member counts under `todo` only, and a fully-settled
   group counts under its highest rung. Gate: `task gate:api`.
-- [ ] **M2 — Wire + DTO.** `JudgeCategoryStatsDTO` becomes the bucket-keyed matrix
+- [x] **M2 — Wire + DTO.** `JudgeCategoryStatsDTO` becomes the bucket-keyed matrix
   (Decision 3, clean break); update `api/internal/handler/judge_stats_test.go`
   (`TestJudgeCategoryStatsResponseShape` asserts the flat `counts` key + builds a
   `CountJudgeGroupsByCategoryForUserRow` fake — both change) and the `apitypes` wire test.
   Confirm no other Go/CLI consumer (grep of `api/cmd/uzi` is empty).
-- [ ] **M3 — Frontend rewire.** `Judge.tsx` indexes the matrix by active bucket; `LabelFilter`
+- [x] **M3 — Frontend rewire.** `Judge.tsx` indexes the matrix by active bucket; `LabelFilter`
   unchanged (still receives `{category: count}`); matrix refetches on disposition/undo/file
   and run-anchor change, not on bucket/category change (Decision 6); aria-label still honest.
   Rewrite the fetch-once tests that Decision 6 reverses: `Judge.test.tsx` (the
   `getJudgeCategoryStats … toHaveBeenCalledTimes(1)` assertions) to assert refetch-on-dispose;
   update the `getJudgeCategoryStats` stubs in `JudgeNavBadge.test.tsx` to the matrix shape.
   Gate: `task gate:web`.
-- [ ] **M4 — Mock parity + differential test.** `computeCategoryStats` recomputes the matrix
+- [x] **M4 — Mock parity + differential test.** `computeCategoryStats` recomputes the matrix
   (this adds a *second* implementation of the "any open ⇒ todo, else highest rung" rollup, on
   the mock side). Add a **differential test** with a fixture that actually discriminates it:
   at least one category with groups spanning ≥2 *non-todo* settled buckets (exercises
@@ -197,14 +197,14 @@ totals.
   level), asserting per-category `todo+filed+done+dismissed == all` **and** that the fixture
   contains multi-bucket categories. Extend `fixtures/judge-fidelity` to the matrix; do NOT
   snapshot the demo (a demo snapshot locks in whatever spread the demo happens to have).
-- [ ] **M5 — Docs + comment sweep.** Rewrite `docs/judge-menu.md` chip-count paragraph
+- [x] **M5 — Docs + comment sweep.** Rewrite `docs/judge-menu.md` chip-count paragraph
   (~lines 133-142: no longer whole-backlog, no longer "doesn't move on tab switch or
   mark-done"); keep the truncation and dimmed-zero notes, which still hold. Same-commit comment
   fixes for the "whole-backlog / triage-invariant / fetched once" claim wherever it lives:
   `web/src/lib/api.ts:1482-1490`, `apitypes/review.go:78-92` (moves with the type), `Judge.tsx`,
   `judge_stats.go`, `judge_disposition.go`, and the mock comments `mockApi.ts:340-354`/`:2762-2764`.
   Gate: `npm run build` (`check-docs.mjs`).
-- [ ] **M6 — Full gate + manual check.** `task gate` green; manually verify in mock mode that
+- [x] **M6 — Full gate + manual check.** `task gate` green; manually verify in mock mode that
   the "Improve an agent" chip reads 3 on To triage, 12 on All, and updates after a mark-done
   (assert the 3/12 as a fixture in M4, not by eyeballing M6).
 

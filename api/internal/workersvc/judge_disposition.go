@@ -122,20 +122,45 @@ func (s *Service) JudgeTriageStats(ctx context.Context, ownerUserID uuid.UUID) (
 	return BucketTriage(tr), nil
 }
 
-// JudgeCategoryStats is the Judge filter-chip counts (PRD #244): the caller's per-category
-// GROUP count — distinct (category, target) coordinates — across their whole backlog. The
-// COUNT(DISTINCT) is done in SQL (no Go grouping, no bucket ladder), so this method just
-// folds the rows into the map DTO. Owner-scoped by the query's user_id filter. Uncapped
-// and whole-backlog: a chip reads the TRUE count even when the backlog list truncates, and
-// the count is triage-invariant (a coordinate stays a coordinate once triaged).
-func (s *Service) JudgeCategoryStats(ctx context.Context, ownerUserID uuid.UUID) (apitypes.JudgeCategoryStatsDTO, error) {
-	rows, err := s.q.CountJudgeGroupsByCategoryForUser(ctx, ownerUserID)
+// JudgeCategoryStats is the Judge filter-chip counts (PRD #270): a
+// bucket → category → count matrix scoped to the selected triage tab. It is computed by
+// running the SHARED Go rollup GroupJudgeRecommendations ("any open member ⇒ todo, else the
+// group's highest settled rung") over an UNCAPPED whole-backlog row load, then tallying each
+// group's rollup Bucket into the matrix — PRD #94 Decision 2 forbids re-expressing the bucket
+// ladder in SQL, so the rollup path is mandatory and there is no GROUP BY disposition_status.
+//
+// The load is UNCAPPED (Lim: 0, the LIMIT NULLIF sentinel) so a group is rolled up from ALL
+// its occurrences, not a truncated prefix: a capped load mis-rolls a group whose only open
+// member fell past the cut and would regress PRD #244's uncapped chip-count guarantee.
+// Categories is nil (facet independence — Decision 4): the chip counts must NEVER apply the
+// category filter, or a chip would count only itself. runAnchor threads the ?run= deep-link
+// so an anchored Judge page's chips scope to that run's groups. Owner-scoped by the query's
+// user_id filter.
+//
+// The result is TAB-SCOPED and TRIAGE-VARIANT — a triage action moves a group between buckets
+// and so between chip tallies — unlike the whole-backlog, triage-invariant count it replaced.
+func (s *Service) JudgeCategoryStats(ctx context.Context, ownerUserID uuid.UUID, runAnchor uuid.UUID) (apitypes.JudgeCategoryStatsDTO, error) {
+	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+		UserID:     ownerUserID,
+		RunAnchor:  nullableUUID(runAnchor), // uuid.Nil → SQL NULL → the anchor predicate is a no-op
+		Categories: nil,                     // facet independence — never filter the counts by category
+		Lim:        0,                       // UNCAPPED — the LIMIT NULLIF(@lim, 0) sentinel means no limit
+	})
 	if err != nil {
 		return apitypes.JudgeCategoryStatsDTO{}, err
 	}
-	m := make(map[string]int, len(rows))
-	for _, r := range rows {
-		m[r.Category] = int(r.GroupCount) // int64 from the bigint cast → int, explicit narrowing
+	// Pre-initialize all five bucket keys to empty inner maps, so an absent bucket serializes
+	// as {} rather than null and the frontend can index CountsByBucket[tab][cat] uniformly.
+	matrix := map[string]map[string]int{
+		BucketTodo:      {},
+		BucketFiled:     {},
+		BucketDone:      {},
+		BucketDismissed: {},
+		BucketAll:       {},
 	}
-	return apitypes.JudgeCategoryStatsDTO{Counts: m}, nil
+	for _, g := range GroupJudgeRecommendations(rows) {
+		matrix[g.Bucket][g.Category]++
+		matrix[BucketAll][g.Category]++
+	}
+	return apitypes.JudgeCategoryStatsDTO{CountsByBucket: matrix}, nil
 }

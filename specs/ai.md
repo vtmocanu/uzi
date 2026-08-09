@@ -19180,6 +19180,13 @@ it is NOT admin-gated** — a normal user capability gated only by repo ownershi
 
 ## 502. PRD #244 — the Judge chip counts are a SEPARATE uncapped GROUP-count aggregate, triage-invariant and fetched once, never a tally off `groups`
 
+**SUPERSEDED BY §506 (PRD #270): the chip counts now scope to the SELECTED bucket tab,
+so the two head properties below are reversed — no longer triage-invariant (§506 refetches
+after triage actions) and no longer a flat `{category -> count}` map (§506 returns a
+bucket-keyed matrix). The `CountJudgeGroupsByCategoryForUser` SQL aggregate and the
+`Counts` DTO field described here are REMOVED. This section stays as the PRD #244 history;
+read §506 for the current contract. The uncapped guarantee below is preserved by §506.**
+
 Serves human.md Feature #46 (the judge-recommendation inbox/worklist). Design record:
 `prds/done/244-judge-chip-counts.md`. Delivers the per-label chip counts §489 (PRD #235
 Decision 6) deferred, by adding the canonical per-category aggregate that decision named
@@ -19390,3 +19397,48 @@ mechanisms, at two layers, because neither covers the other's cases (D1/D2).
   drift test parses the migration CHECK against the three-value Go/TS vocabularies so a fourth value
   added in one place and not the others fails CI (the four-homes shape D6 costs: the CHECK, the Go
   constants, the TS union, and the mock fixture module).
+
+## 507. PRD #270 — Judge chip counts scope to the SELECTED bucket tab: a bucket-keyed MATRIX, rolled up (not `GROUP BY`d) over an UNCAPPED load, now triage-VARIANT
+
+Serves human.md Feature #46 (the judge inbox/worklist). Design record:
+`prds/done/270-judge-chip-tab-scoped-counts.md`. Reverses two head properties of §502
+(PRD #244): the counts were a whole-backlog, triage-INVARIANT per-category number fetched
+once on mount; they now scope to the currently selected bucket tab (To triage / Filed /
+Done / Dismissed / All) and refetch as the user works the list. The uncapped guarantee
+§502/§358 established is PRESERVED and load-bearing here.
+
+- **The endpoint returns a bucket-keyed MATRIX, not a flat map — a clean break.**
+  `GET /me/judge/category-stats` → `apitypes.JudgeCategoryStatsDTO` now carries
+  `counts_by_bucket: {bucket -> {category -> count}}` (buckets `todo` / `filed` / `done` /
+  `dismissed` / `all`), replacing §502's flat `Counts {category -> count}`. No back-compat
+  shim: the web page is the ONLY consumer (no CLI mirror — recorded per the
+  new-functionality⇒check-`api/cmd/uzi/` convention). The nested value stays a MAP, so the
+  six-label taxonomy still grows without a wire break (§502); the client reads
+  `counts_by_bucket[selectedBucket][cat] ?? 0` per chip.
+- **Per-bucket counts are a Go ROLLUP tally, never a SQL `GROUP BY disposition_status`.**
+  The handler runs the shared rollup `GroupJudgeRecommendations` (§358/§359 — "any open
+  member ⇒ `todo`, else the group's highest settled rung on `dismissed > done > filed`")
+  over the whole-backlog rows, then tallies each group's rollup bucket per category. A SQL
+  `GROUP BY disposition_status` is the FORBIDDEN "second ladder" (§332/§336: one Go ladder,
+  no SQL `CASE` re-implementation) — it would mis-bucket a group whose settled members are
+  overridden to `todo` by an open sibling. Invariant enforced by construction: `all` == the
+  whole-backlog per-category count (== §502's old number), and
+  `todo + filed + done + dismissed == all` per category.
+- **UNCAPPED is load-bearing, now for TWO reasons.** `ListJudgeRecommendationRowsForUser`
+  gained `LIMIT NULLIF(@lim::int, 0)`, so `Lim: 0` loads the backlog unbounded and the
+  stats handler passes `0`. A capped load would (a) understate under truncation — the §502
+  chip-count guarantee — AND (b) mis-roll groups, since a group split across the cap boundary
+  rolls up from a partial member set. The dead `CountJudgeGroupsByCategoryForUser` SQL
+  aggregate (§502's per-category `COUNT(DISTINCT)`) is REMOVED — the rollup tally is now the
+  sole path.
+- **Anchor-aware, facet-INDEPENDENT.** The matrix respects `?run=` (the same pre-cap anchor
+  as §358) but NEVER applies the `?category=` facet filter: each chip's count must reflect
+  the backlog with that facet cleared, so selecting one category cannot zero its sibling
+  chips (§489 facet independence).
+- **Now triage-VARIANT — reverses §502's "fetched once, never refetched".** The frontend
+  refetches the whole matrix after disposition / undo / file actions and on run-anchor
+  (`?run=`) change, but NOT on bucket-tab change (the full matrix is already in hand — the
+  tab switch is a client-side reslice) nor on category toggle. Known self-healing transient:
+  right after a bulk mark-done, the acted-on card stays visible at its new rollup bucket
+  while the refetched `todo` chip has already decremented; the two reconcile on the next
+  navigation/load. Accepted, not a defect.

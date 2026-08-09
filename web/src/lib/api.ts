@@ -1510,19 +1510,23 @@ export interface TriageCounts {
   false_positives: number;
 }
 
-// JudgeCategoryStats is GET /me/judge/category-stats (PRD #244): the per-category GROUP
-// count for the Judge filter chips. `counts` maps each raw recommendation category to the
-// number of distinct (category, target) coordinates across the caller's WHOLE backlog —
-// the same unit the chip filters and the list renders as cards. It is a real server
-// aggregate (COUNT(DISTINCT target) GROUP BY category, uncapped), NOT a tally of the
+// JudgeCategoryStats is GET /me/judge/category-stats (PRD #270): the per-category GROUP
+// count for the Judge filter chips, now a bucket-keyed MATRIX. `counts_by_bucket` maps each
+// triage bucket (always exactly `todo`, `filed`, `done`, `dismissed`, `all` — all five
+// present, each an object, possibly `{}`) to a per-category count, where the inner map keys
+// each raw recommendation category to the number of distinct groups in that bucket. `all`
+// is the whole-backlog per-category count and equals `todo+filed+done+dismissed` per
+// category. It is a real server aggregate over an UNCAPPED load, NOT a tally of the
 // on-screen groups: those are capped-before-grouping and bucket-filtered, so a chip can
-// honestly read 6 while the truncated list shows 4 cards. It is whole-backlog and
-// triage-invariant (a group stays a group once triaged), so it is fetched ONCE on
-// Judge-page mount and never on a bucket/category/triage change. A MAP, not a fixed-field
-// struct, so a category the client has no chip for does not break the wire — the client
-// reads `counts[cat] ?? 0` per chip (open question 6).
+// honestly read 6 while the truncated list shows 4 cards. The matrix is TAB-SCOPED
+// (the page indexes it by the active bucket) and TRIAGE-VARIANT: a mark-done moves a group
+// between buckets, so it is refetched on every disposition/undo/file mutation and on a
+// run-anchor change — NOT fetched once, NOT triage-invariant. It is anchor-aware (respects
+// `?run=`) but never category-filtered. A SEPARATE endpoint from the nav-badge stats. A
+// nested MAP, not a fixed-field struct, so a category the client has no chip for does not
+// break the wire — the client reads `counts_by_bucket[bucket][cat] ?? 0` per chip.
 export interface JudgeCategoryStats {
-  counts: Record<string, number>;
+  counts_by_bucket: Record<string, Record<string, number>>;
 }
 
 export interface RunReview {
@@ -2624,14 +2628,20 @@ const realApi = {
   // Feeds the Judge nav badge (via .todo) and the /runs list strip's successor.
   getJudgeStats: () => request<TriageCounts>("GET", "/me/judge/stats"),
 
-  // getJudgeCategoryStats is the canonical per-category GROUP count (RequireUser,
-  // owner-scoped, all-time, uncapped) the Judge filter chips render (PRD #244). It is a
+  // getJudgeCategoryStats is the canonical per-category GROUP count matrix (RequireUser,
+  // owner-scoped, all-time, uncapped) the Judge filter chips render (PRD #270). It is a
   // SEPARATE endpoint from getJudgeStats deliberately: the nav badge reads only
   // TriageCounts.todo from /me/judge/stats, so a per-category payload has no path to it.
-  // Fetched once on Judge-page mount — the count is invariant to bucket, category, and
-  // triage state — never on a filter toggle and never on the badge poll.
-  getJudgeCategoryStats: () =>
-    request<JudgeCategoryStats>("GET", "/me/judge/category-stats"),
+  // The matrix is bucket-keyed and triage-variant, so the page refetches it on every
+  // disposition/undo/file mutation and on a run-anchor change (NOT once on mount) — but not
+  // on a bucket-tab or category toggle, since all buckets arrive in one payload. `run` is
+  // the notification deep-link anchor (mirrors getJudgeBacklog): it scopes the matrix to
+  // groups recurring in that run while keeping their other-run occurrences.
+  getJudgeCategoryStats: (run?: string) =>
+    request<JudgeCategoryStats>(
+      "GET",
+      `/me/judge/category-stats${run ? `?run=${encodeURIComponent(run)}` : ""}`,
+    ),
 
   // ── Judge menu — cross-run backlog + bulk disposition (PRD #98) ─────────────
   // getJudgeBacklog reads the deduped, grouped backlog (RequireUser, owner-scoped, no

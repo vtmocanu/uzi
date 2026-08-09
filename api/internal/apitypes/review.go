@@ -75,20 +75,31 @@ type TriageDTO struct {
 	FalsePositives int `json:"false_positives"`
 }
 
-// JudgeCategoryStatsDTO is GET /me/judge/category-stats (PRD #244): the caller's
-// per-category GROUP count — distinct (category, target) coordinates across their whole
-// backlog — for the Judge filter-chip counts. Counts is keyed by the raw rr.category
-// column, one entry per category with at least one group. It is a MAP, not a fixed-field
-// struct, so the taxonomy can grow without a wire break (Decision 7): a client reads
-// counts[cat] ?? 0 per chip and an unknown category simply has no chip to render on.
+// JudgeCategoryStatsDTO is GET /me/judge/category-stats (PRD #270): the caller's Judge
+// filter-chip counts, scoped to the selected triage tab. CountsByBucket is a
+// bucket → category → count MATRIX: the outer key is a bucket rollup name
+// (todo, filed, done, dismissed, all) and the inner key is the raw rr.category column,
+// one entry per category with at least one group IN THAT BUCKET. `all` is always present
+// as a key so the frontend indexes uniformly — CountsByBucket[tab][cat] ?? 0 per chip,
+// with tab == "all" the whole-backlog fallback.
 //
-// It is a NEW DTO rather than a widening of TriageDTO (Decision 4): the count is a GROUP
-// count (a card per group), not the ROW count TriageDTO carries, and keeping it on its own
-// endpoint keeps the category dimension out of the polled nav-badge payload, which reads
-// only TriageCounts.todo. The count is uncapped and whole-backlog — exact even when the
-// backlog list truncates, and byte-stable across bucket switches and triage actions.
+// BOTH levels are maps so the taxonomy AND the bucket ladder can grow without a wire
+// break: an unknown category simply has no chip to render on, and an absent bucket serves
+// an empty inner map.
+//
+// The count is computed by running the SHARED Go rollup (workersvc.GroupJudgeRecommendations,
+// "any open member ⇒ todo, else the group's highest settled rung") over an UNCAPPED
+// whole-backlog row load, then tallying each group's rollup Bucket — PRD #94 Decision 2
+// forbids re-expressing the bucket ladder in SQL, so there is no GROUP BY disposition_status.
+// It is therefore TAB-SCOPED and TRIAGE-VARIANT (a triage action moves a group between
+// buckets and so between chip tallies), unlike the whole-backlog invariant it replaced.
+//
+// It is a NEW DTO rather than a widening of TriageDTO: the count is a GROUP count (a card
+// per group), not the ROW count TriageDTO carries, and keeping it on its own endpoint keeps
+// the category dimension out of the polled nav-badge payload, which reads only
+// TriageCounts.todo.
 type JudgeCategoryStatsDTO struct {
-	Counts map[string]int `json:"counts"`
+	CountsByBucket map[string]map[string]int `json:"counts_by_bucket"`
 }
 
 // JudgeFiledIssueRefDTO is the forge issue a single occurrence was filed as (PRD #98 M1).

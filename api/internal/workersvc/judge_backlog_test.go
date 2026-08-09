@@ -20,12 +20,14 @@ import (
 // the tests that use it.
 //
 // The fake applies the query's own LIMIT so the service's cap+1 truncation probe behaves
-// as it does against Postgres. The ?run= semi-join is NOT modelled — it is SQL, asserted
-// by the params rather than re-implemented here, which is the point of pushing it down.
+// as it does against Postgres. Lim: 0 is the LIMIT NULLIF(@lim, 0) UNCAPPED sentinel (PRD
+// #270's whole-backlog chip-count load), so a zero means "return everything" here too —
+// NOT "truncate to zero rows". The ?run= semi-join is NOT modelled — it is SQL, asserted by
+// the params rather than re-implemented here, which is the point of pushing it down.
 func (f *fakeStore) ListJudgeRecommendationRowsForUser(_ context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
 	f.backlogArg = &arg
 	rows := f.judgeBacklogRows
-	if lim := int(arg.Lim); lim >= 0 && len(rows) > lim {
+	if lim := int(arg.Lim); lim > 0 && len(rows) > lim {
 		rows = rows[:lim]
 	}
 	return rows, nil

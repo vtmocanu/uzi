@@ -114,7 +114,15 @@ ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, 
 -- most-recent-review-first, a cut drops the OLDEST occurrences — never the newest. The
 -- triage tally is deliberately NOT computed from these rows (the service reads the #94
 -- stats query for that), so the canonical counts stay whole even when this page is cut.
-LIMIT @lim;
+--
+-- @lim = 0 is the UNCAPPED sentinel: NULLIF(@lim, 0) yields SQL NULL, and Postgres reads
+-- `LIMIT NULL` as no limit at all, so a whole-backlog load (the PRD #270 chip-count
+-- rollup, which must roll up EVERY group) passes Lim: 0. The @lim::int cast is REQUIRED:
+-- without it sqlc cannot infer the param's type through NULLIF and widens Lim to
+-- interface{} (breaking `int(arg.Lim)` in the test fake and the existing int32 caller).
+-- With the cast the generated signature keeps Lim int32, so the capped backlog caller
+-- (Lim: cap+1) is unaffected — it just never hits the NULLIF branch.
+LIMIT NULLIF(@lim::int, 0);
 
 -- name: ListJudgeTriageRowsForRuns :many
 -- The per-recommendation triage facts for a SET of runs — the input to the /runs list's

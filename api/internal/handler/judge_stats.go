@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 )
@@ -27,19 +29,34 @@ func (h *Handler) JudgeStats(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, stats)
 }
 
-// JudgeCategoryStats serves the caller's per-category GROUP counts — the Judge filter-chip
-// counts (PRD #244). A SEPARATE endpoint from JudgeStats so the nav badge (which reads only
-// TriageCounts.todo from /me/judge/stats) is structurally unreachable from category data.
-// Owner-scoped (the query filters run_reviews.user_id = caller) and mounted on RequireUser
-// like /me/judge/stats. The count is whole-backlog, uncapped and triage-invariant, so the
-// Judge page fetches it once on mount.
+// JudgeCategoryStats serves the caller's Judge filter-chip counts — a bucket → category →
+// count matrix scoped to the selected triage tab (PRD #270). A SEPARATE endpoint from
+// JudgeStats so the nav badge (which reads only TriageCounts.todo from /me/judge/stats) is
+// structurally unreachable from category data. Owner-scoped (the query filters
+// run_reviews.user_id = caller) and mounted on RequireUser like /me/judge/stats.
+//
+// ?run=<uuid> is the notification deep-link anchor (/judge?run={id}), parsed exactly like the
+// backlog handler: an unparseable value is a 400, while a well-formed but unknown/foreign run
+// id matches nothing and returns empty tallies, leaking no existence oracle. The bucket tab is
+// NOT a query param here — the response carries every bucket's counts at once, so the frontend
+// switches tabs without a refetch, but the counts ARE tab-scoped and triage-variant, so the
+// page refetches this after a triage action.
 func (h *Handler) JudgeCategoryStats(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	stats, err := h.wsvc.JudgeCategoryStats(r.Context(), user.ID)
+	var runAnchor uuid.UUID
+	if raw := r.URL.Query().Get("run"); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid run id")
+			return
+		}
+		runAnchor = parsed
+	}
+	stats, err := h.wsvc.JudgeCategoryStats(r.Context(), user.ID, runAnchor)
 	if err != nil {
 		slog.Error("judge category stats", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

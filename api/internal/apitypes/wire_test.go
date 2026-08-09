@@ -220,12 +220,13 @@ func TestJudgeOccurrenceAutoDoneIsDistinguishableOnTheWire(t *testing.T) {
 	}
 }
 
-// TestJudgeCategoryStatsDTOTags pins the single top-level key `counts` (PRD #244). A NEW
-// DTO gets its own tag test rather than widening TriageDTO, keeping the six-bucket triage
-// contract untouched. The map VALUE shape is not a top-level key, so this pins the wire
-// envelope the web reads as `counts[cat] ?? 0`.
+// TestJudgeCategoryStatsDTOTags pins the single top-level key `counts_by_bucket` (PRD #270).
+// A NEW DTO gets its own tag test rather than widening TriageDTO, keeping the six-bucket
+// triage contract untouched. The nested map shape (bucket → category → count) is not a
+// top-level key, so this pins the wire envelope the web reads as
+// `counts_by_bucket[tab][cat] ?? 0`.
 func TestJudgeCategoryStatsDTOTags(t *testing.T) {
-	assertTags(t, "JudgeCategoryStatsDTO", JudgeCategoryStatsDTO{}, "counts")
+	assertTags(t, "JudgeCategoryStatsDTO", JudgeCategoryStatsDTO{}, "counts_by_bucket")
 }
 
 func TestJudgeFiledIssueRefDTOTags(t *testing.T) {

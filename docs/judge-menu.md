@@ -129,16 +129,24 @@ selection stays. Like `?run=`, it's applied **before** the row cap (see
 [the tabs, above](#3-the-tabs-and-the-one-number)), so narrowing to one or two
 labels makes the truncation banner *less* likely to show, not more.
 
-Each chip also carries a count: the number of groups in that label across
-your **whole backlog** — every bucket, every triage state — not a tally of
-what's currently on screen. It's its own server aggregate, the same kind of
-canonical count [the tabs and the triage tally](#3-the-tabs-and-the-one-number)
-use, so it stays correct even when the truncation banner is showing: a chip
-can read `6` while only 4 cards render under the cap. Switching bucket tabs
-or marking a group done doesn't move it — a group stays a group, so the
-count changes only when the backlog itself does — and it's fetched once when
-the page loads, not refetched on every toggle. A chip whose whole-backlog
-count is 0 stays in the row, just dimmed, rather than disappearing.
+Each chip also carries a count: the number of groups in that label **in the
+currently selected bucket tab** — so it predicts what the group list below
+will show. On the **All** tab it's the whole-backlog number, every triage
+state, same as before; on To triage, Filed, Done or Dismissed it's just that
+bucket's share, and the four bucket counts partition the All total (To
+triage + Filed + Done + Dismissed sum to All), because every group rolls up
+to exactly one bucket. It's still its own server aggregate, computed the
+same way [the tabs and the triage tally](#3-the-tabs-and-the-one-number)
+compute the rendered list — chip and list agree by construction — so it
+stays correct even when the truncation banner is showing: a chip can read a
+higher number than the cards rendered under the cap. What's changed is that
+it now moves: switching bucket tabs moves it, on purpose, and marking a
+group done, dismissed, or filed moves it between buckets — so it's
+refetched after those actions and after following a `?run=` link, not
+fetched once when the page loads and left alone. A chip whose count is 0
+**in the current tab** stays in the row, just dimmed, rather than
+disappearing, so the chip row is a stable, learnable set across tabs — on
+the Filed tab, for instance, most chips may sit dimmed.
 
 ## From the terminal
 
