@@ -252,3 +252,235 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     assert.ok(completed, "the run completed despite the publish failure");
   });
 });
+
+// PRD #267: the reap:false iteration-boundary checkpoint may now publish to origin on a
+// time budget, WITHOUT reaping the agent tree. These tests drive the checkpoint callback
+// through a custom executor that commits then calls ctx.checkpoint({reap:false}), with an
+// injected fake clock and a short (1000ms) interval so the time-gate is deterministic.
+describe("RunRunner — time-based checkpoint (PRD #267)", () => {
+  const progress = { completed: [], in_progress: ["m1"] };
+
+  it("reap:false past the interval with a moved tip publishes AND does zero killAgentTree", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(70);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        fakeNow = 1001; // cross the 1000ms interval since run start (lastPublish=0)
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    // A moved tip fetches, then the open time-gate publishes — and reap:false never kills.
+    assert.ok(!afterCheckpoint.includes("kill"), "reap:false did NOT kill the agent tree");
+    assert.deepStrictEqual(afterCheckpoint, ["fetch", "publish"]);
+  });
+
+  it("reap:false before the interval does not publish", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(71);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        fakeNow = 500; // still inside the interval
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    // Tip moved so it fetches, but the gate is closed — no publish.
+    assert.deepStrictEqual(afterCheckpoint, ["fetch"]);
+  });
+
+  it("idle-commit regression (Decision 9): a commit that goes idle for >= the interval still publishes exactly once", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(72);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // Interval closed at fakeNow=0: fetch happens, no publish yet.
+        await ctx.checkpoint!({ reap: false, progress });
+        assert.ok(!events.includes("publish"), "first checkpoint did not publish (gate closed)");
+        // No new commit; the tip is now unmoved since the last fetch. Advancing past the
+        // interval must STILL publish — the gate keys on lastPublishedTip, not the fetch-skip.
+        fakeNow = 1001;
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    const publishes = afterCheckpoint.filter((e) => e === "publish").length;
+    const fetches = afterCheckpoint.filter((e) => e === "fetch").length;
+    assert.equal(publishes, 1, "the idle commit shipped exactly once");
+    assert.equal(fetches, 1, "the second checkpoint skipped the fetch (tip unmoved) but still published");
+  });
+
+  it("nothing new since last publish publishes nothing", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(73);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        fakeNow = 1001;
+        await ctx.checkpoint!({ reap: false, progress }); // publishes tip
+        // No new commit; a later checkpoint sees cloneTip === lastPublishedTip.
+        fakeNow = 3000;
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    const publishes = afterCheckpoint.filter((e) => e === "publish").length;
+    assert.equal(publishes, 1, "an already-published tip is not re-published");
+  });
+
+  it("CHECKPOINT_INTERVAL=0 disables the time path", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(74);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        fakeNow = 999_999; // arbitrarily far past any interval
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 0, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    // interval 0 => the time path never publishes, however much time elapsed.
+    assert.deepStrictEqual(afterCheckpoint, ["fetch"]);
+  });
+
+  it("a milestone (reap:true) publish resets the gate so a following reap:false under the interval does not publish", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(75);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "A.txt");
+        // Milestone publishes regardless of the gate and sets lastPublish = now() = 0.
+        await ctx.checkpoint!({ reap: true, progress });
+        commitInClone(ctx.worktreePath, "B.txt");
+        fakeNow = 500; // < 1000 after the milestone at t=0
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    const publishes = afterCheckpoint.filter((e) => e === "publish").length;
+    assert.equal(publishes, 1, "only the milestone published; the gate reset blocks the next one");
+    assert.ok(afterCheckpoint.includes("kill"), "the milestone (reap:true) reaped the agent tree");
+  });
+
+  it("publishes at most once per interval even with new commits each iteration", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(76);
+    const events: string[] = [];
+    let afterCheckpoint: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "A.txt");
+        fakeNow = 1001; // crosses the interval => publishes, lastPublish := 1001
+        await ctx.checkpoint!({ reap: false, progress });
+        commitInClone(ctx.worktreePath, "B.txt");
+        fakeNow = 1400; // 399 since the last publish => gated
+        await ctx.checkpoint!({ reap: false, progress });
+        commitInClone(ctx.worktreePath, "C.txt");
+        fakeNow = 1900; // 899 since the last publish => still gated
+        await ctx.checkpoint!({ reap: false, progress });
+        afterCheckpoint = [...events];
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    const publishes = afterCheckpoint.filter((e) => e === "publish").length;
+    assert.equal(publishes, 1, "at most one origin publish per interval per run");
+  });
+});
