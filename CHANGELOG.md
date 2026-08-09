@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-09
+
 ### Added
 
 - **Board membership and who can run what are now configurable label sets,
@@ -47,6 +49,125 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   bucket and triage state — sourced from a new server aggregate, never tallied off
   the on-screen list, so a chip reads correctly even when the truncation banner is
   showing. A zero-count chip stays visible, just dimmed.
+
+- **Slack is now a two-way conversational surface: chat, run control, and status,
+  from a DM.** A top-level DM to the uzi bot opens a real conversation, backed by
+  the existing `runs.kind='chat'` machinery and streamed back into that DM's
+  thread; a threaded reply continues it. The agent can propose filing an issue or
+  starting a run, and both render as Block Kit cards with real Create/Dismiss or
+  Confirm buttons — nothing fires from text alone, and only the confirmed-linked
+  owner's click calls through. Run message content, previously withheld from
+  Slack entirely ("content minimization"), is now streamed for `chat` runs only;
+  every other run kind's notification lane is byte-for-byte unchanged. **This is a
+  real widening of what reaches Slack, not just a new feature**: a chat's read
+  tools are user-scoped but not kind-scoped, so a Slack DM can be asked to quote
+  an `issue` run's saved content (plans, diffs, tool output) into the thread —
+  `docs/slack.md` documents this plainly. No app re-install and no admin action
+  needed on any workspace that already has uzi's Slack app connected; a spend
+  limiter is shared with the web Chat page, so a heavy Slack day can rate-limit
+  it too. (#191)
+
+- **Runs can now be scheduled — one-time or recurring — instead of only starting
+  on demand or via autopilot.** A new Schedules surface (web `/schedules` page +
+  create/edit modal + an issue-view "Schedule…" action) and a `uzi schedule` CLI
+  group manage a persisted, owner-scoped schedule against one of three targets: a
+  pinned issue, a label sweep (every open issue on a repo matching a label
+  selector, still gated by the normal run-creation rules), or an ad-hoc prompt — a
+  new issue-less `prompt` run kind that opens an MR directly against a repo with
+  no issue involved. A background scheduler goroutine (the same wake-ticker shape
+  `selfimprove` already uses) claims due schedules and fires them as their owner,
+  on the owner's own Anthropic token and forge PAT. Issue and sweep targets fire
+  through the same run-creation seam autopilot uses, inheriting every existing
+  gate (PRDLESS bypass, active-run dedup, the usage-limit park); the prompt target
+  is the deliberate exception and bypasses the PRD-issue sanction gate by design.
+  Auto-approve defaults on per schedule. See [docs/scheduling.md](docs/scheduling.md).
+  (#241)
+
+- **`uzi run wait` replaces the hand-rolled poll loop for driving a gated run
+  headless.** `uzi run wait <id>` blocks until a run reaches an actionable or
+  terminal state — a plan gate, a clarification park, or done — polling
+  client-side and printing each transition to stderr; `--until` narrows the
+  target set (after approving, wait again for only `completed,failed,cancelled`,
+  since a run lingers briefly at `awaiting_approval` right after a successful
+  approve), `--timeout` gives up with a new exit code 7, and a single transient
+  server blip is retried rather than fatal. `uzi run get --field <name>`
+  complements it: a single top-level scalar field printed raw and unquoted, one
+  per line, sidestepping the footgun of piping `--json` through a shell that
+  re-interprets escapes (notably zsh's `echo`, which mangles the CLI's
+  `\uXXXX`-escaped control bytes and breaks `jq`). (#264)
+
+### Changed
+
+- **The admin rate-limits table no longer needs a horizontal scrollbar to see the
+  status.** The two ~280px 5-hour/7-day window columns are now one stacked
+  **Utilization** column (a mono `5h`/`7d` chip, meter, percent and reset
+  countdown per row), and the "Updated" timestamp folds under the Status pill —
+  six columns down to four, no data removed, fitting a normal laptop content
+  width with no scrollbar and no clipped pill. (#240)
+
+- **Six built-in agent roles picked up sharper review and gate-reading guidance,
+  synced from the role library.** `auditor` gained lenses for uncapped
+  amplification/resource-exhaustion reads, injection into a non-shell sink
+  (terminal, log, a shared admin surface), and verifying that a security-gating
+  check fails closed; `coder` gained a note that a directive or skip marker fires
+  on any line carrying its literal text, including a comment warning against it;
+  `researcher` gained the symlinked-directory blind spot (a recursive `grep`/`rg`
+  sweep silently skips a symlinked corpus and reports a clean negative);
+  `reviewer` gained "a fix at one call site is a claim about the whole sibling
+  set" plus three checks specific to a status/health/authorization predicate;
+  `tester` gained three gate-instrument traps (a shell pipeline misreporting its
+  own exit code, a severity-staged tool's warn tier passing green with findings
+  uncounted, and a stale result cache or an unstaged file silently excluded from
+  a gate's scope); and `web-ux` gained a check that a mutating control is gated
+  client-side on the same scope predicate the server enforces, not just hidden
+  from an unauthorized viewer. **Operators:** on an already-seeded install these
+  six templates badge as "differs from shipped" (issue #201's mechanism) until
+  you open each and click Reset to default. (`9b930988`)
+
+### Fixed
+
+- **A completed run no longer shows `0/N` milestones when it actually finished
+  them.** The tracker used to reconcile only from mid-run `report_progress`
+  reports, so a run that jumped straight to its final turn with no progress
+  report in between showed a misleading `0/N` at completion. The lead now
+  declares which frozen milestones it finished on its `signal_done` call, the
+  server unions that declaration into `milestones_completed` the same way it
+  already unions mid-run reports, and the UI distinguishes "not reported"
+  (neutral) from a genuine `0/N` (which now only means "reported and truly
+  none"). (#265)
+
+- **`save_memory` no longer lets an unverified claim become a self-reinforcing
+  "fact."** A run had asserted, without ever testing it, that a builtin
+  subagent lacked write tools, saved that to durable cross-run memory, and two
+  later runs cited it as "the repo convention I noted" and over-serialized work
+  onto the lead's own thread instead of delegating. `save_memory` now requires
+  the writer to declare whether a claim was **observed** (a tool result,
+  command output, or a `file:line`) or merely **inferred**, and a retrieved
+  *inferred* entry is individually marked "re-verify before acting" rather than
+  relying on the single blanket "memory is advisory" notice that had already
+  failed once. Separately, the lead's per-turn roster now states each
+  subagent's actual write capability instead of leaving it to guess — the
+  specific trigger for the incident above. `save_memory` also nudges (never
+  rejects) against saving a claim about the run's own runtime configuration, a
+  class that goes stale and should be read live instead. See
+  [docs/memory.md](docs/memory.md). (#266)
+
+- **The judge's command-not-found pre-scan no longer flags generic output
+  words as missing worker tools.** A low-confidence `X: not found` match (the
+  dash/busybox form) — which a plain word like `key` or `foo` in unrelated
+  output can trigger — is now corroborated against the commands the run
+  actually invoked, and dropped unless the run really ran that command; the
+  three high-confidence "command not found" forms are unaffected. (#263)
+
+- **A worker's own gate run no longer false-flags a large pre-existing lint
+  backlog in files it never touched.** The golangci-lint ratchet
+  (`new-from-merge-base: origin/main`) computes its merge base against the
+  runner clone's `origin/main`, but that ref was copied from the bare mirror's
+  frozen snapshot at first clone and never advanced — so on an older mirror the
+  merge base landed far enough back that the whole existing backlog read as
+  branch-introduced. The clone now advances `origin/main` to the fresh default
+  branch head before the gate runs, so the ratchet gates only what the branch
+  actually introduced. (#262)
 
 ## [0.22.0] - 2026-08-08
 
