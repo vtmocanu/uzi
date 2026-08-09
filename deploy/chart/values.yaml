@@ -380,6 +380,12 @@ workers:
   # documented in docs/worker-setup.md (PRD #58 Decision 7) and means a busy worker no
   # longer leaves a user's other runs queued behind it — so size the preset to fit that
   # many concurrent runs. The controller rejects a non-integer or a value < 1 at boot.
+  #
+  # This is still a per-worker cap, not a fleet placement policy — since PRD #216
+  # the server itself spreads queued runs across idle workers inside the claim, so
+  # you no longer need to lower this to 1 to get one-run-per-worker spread. Raising
+  # it for burst capacity on one worker no longer risks piling two simultaneously
+  # queued runs onto whichever worker happens to poll first while a sibling sits idle.
   maxConcurrentRuns: 1
   # The WORKER container's requests.ephemeral-storage (issue #224 →
   # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
