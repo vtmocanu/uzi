@@ -275,7 +275,7 @@ func run() error {
 	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
 	// linker and the gatekeeper. The forge write rides the same claim-first
 	// ConfirmProposalForUser the web confirm uses (lifted in M1).
-	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
 
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
@@ -940,6 +940,62 @@ func (g gateSubmitter) DismissProposalForUser(ctx context.Context, userID, runID
 		return slacksvc.ErrChatProposalGone
 	}
 	return err
+}
+
+// StartRunFromCard adapts the Slack start-run card's Start (PRD #191 M5): the lifted,
+// path-keyed, PRD-gated StartRunForUserByPath. On refusal it returns an error whose
+// MESSAGE is user-safe (built from the gate sentinels below, mirroring the web start
+// button's intent) and logs the raw cause, so slacksvc surfaces a helpful line without
+// importing workersvc.
+func (g gateSubmitter) StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
+	run, err := g.svc.StartRunForUserByPath(ctx, userID, repoPath, issueIID, nil, nil)
+	if err == nil {
+		return run.ID, nil
+	}
+	if isInternalStartRunErr(err) {
+		slog.Error("slack start-run card", "repo", repoPath, "issue_iid", issueIID, "error", err)
+	}
+	return uuid.Nil, errors.New(startRunCardMessage(err))
+}
+
+// isInternalStartRunErr reports whether a StartRun error is an unexpected/internal
+// failure worth logging (vs a user-actionable gate refusal).
+func isInternalStartRunErr(err error) bool {
+	switch {
+	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
+		errors.Is(err, workersvc.ErrNotPRDIssue), errors.Is(err, workersvc.ErrNoPRDLink),
+		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
+		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
+		return false
+	default:
+		return true
+	}
+}
+
+// startRunCardMessage maps a StartRun error to a user-safe Slack message, mirroring the
+// intent of the web start button's per-sentinel copy (the web chat card gets the
+// byte-identical HTTP copy; this is the DM paraphrase).
+func startRunCardMessage(err error) string {
+	switch {
+	case errors.Is(err, workersvc.ErrRepoNotFound):
+		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrIssueNotFound):
+		return "That issue isn't on this repo's board."
+	case errors.Is(err, workersvc.ErrNotPRDIssue):
+		return "This issue isn't marked as uzi's work — promote it (add the PRD label) in uzi first."
+	case errors.Is(err, workersvc.ErrNoPRDLink):
+		return "This issue has no PRD link — add a prds/*.md link (or the PRD-less label) before starting a run."
+	case errors.Is(err, workersvc.ErrActiveRunExists):
+		return "A run is already in progress for this issue."
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		return "A CI-fix run is already working this issue's branch — cancel it first."
+	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
+		return "That issue's description is too large to run."
+	case errors.Is(err, workersvc.ErrForgeIssueRead):
+		return "Couldn't read that issue from the forge — check the issue number."
+	default:
+		return "Couldn't start the run right now — try from the Chat page in uzi."
+	}
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no

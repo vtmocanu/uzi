@@ -2971,6 +2971,16 @@ export const mockApi = {
     appendMessage(chatId, "status", null, { text: "proposal dismissed — nothing written to the forge" });
     return delay(null, 200); // 204 No Content
   },
+  startRunFromChat: async (repoPath: string, _issueIid: number) => {
+    // PRD #191 M5: start a run from a chat's start-run card. Repo paths aren't modelled
+    // in the mock state, so it resolves the first seeded board+card and mints a queued
+    // issue run via the same path as createRun; the real endpoint applies the
+    // PRD/ownership gate keyed by repo_path.
+    const repoId = [...state.boards.keys()][0];
+    const card = repoId ? state.boards.get(repoId)?.cards[0] : undefined;
+    if (!repoId || !card) throw new ApiError(404, `repo ${repoPath} not found`);
+    return mockApi.createRun(repoId, card.iid);
+  },
 
   // ── CLI tokens (PRD #64 M6) ────────────────────────────────────────────────
   // Mirrors the cookie-only CRUD: list carries no value, mint returns the

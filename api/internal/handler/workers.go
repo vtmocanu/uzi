@@ -763,13 +763,6 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// prdlessEnabled/prdlessLabel are read here only to shape the ErrNoPRDLink hint
-	// below; the actual PRDLESS gate is computed from the fresh forge snapshot inside
-	// StartRunForUser (PRD #191 M1), so the web start button and the Slack start-run
-	// card answer it identically.
-	prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context())
-	prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
-
 	// PRD #209: assemble the optional seeded plan. agent_selection is only meaningful
 	// alongside a plan (it is the roster for the seeded implement run); a selection
 	// with no plan is a confused request — the run would plan and gate normally, where
@@ -808,67 +801,65 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The forge GetIssue snapshot, the PRDLESS gate and the description cap all live
-	// inside StartRunForUser (PRD #191 M1), shared with the Slack start-run card.
+	// inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat start-run card.
 	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, seed)
 	if err != nil {
-		switch {
-		case errors.Is(err, workersvc.ErrForgeBuild):
-			slog.Error("create run: build forge for connection", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		case errors.Is(err, workersvc.ErrForgeIssueRead):
-			// err wraps the driver's already-redacted message.
-			httpx.Error(w, http.StatusBadGateway, err.Error())
-		case errors.Is(err, workersvc.ErrRepoNotFound):
-			httpx.Error(w, http.StatusNotFound, "repo not found")
-		case errors.Is(err, workersvc.ErrIssueNotFound):
-			httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
-		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
-			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
-		case errors.Is(err, workersvc.ErrPlanTooLarge):
-			// PRD #209 D5: the seeded plan exceeds the create-time cap.
-			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is too large to run")
-		case errors.Is(err, workersvc.ErrPlanEmpty):
-			// PRD #209 D8: the seeded plan is empty, or the secret scrub reduced it to
-			// whitespace. Never stored as a blank 'seeded' plan.
-			httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
-		case errors.Is(err, workersvc.ErrInvalidPlannedCommit):
-			// PRD #209 M4: --planned-commit is not a plausible commit sha (hex, 7-64).
-			// A 400 (malformed input), like ErrInvalidSelection below.
-			httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
-		case errors.Is(err, workersvc.ErrInvalidSelection):
-			// PRD #209: the agent_selection is malformed (bad source or exclusion name).
-			// Roster-existence is NOT checked here — the clone roster is unknown at
-			// create time (Open Question 1); the worker resolves that.
-			httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
-		case errors.Is(err, workersvc.ErrNotPRDIssue):
-			// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it
-			// for the same reason the gate is ordered that way in createRun: telling
-			// someone to add a prds/*.md link to an issue that is not uzi's work sends
-			// them to fix the wrong thing. Promote is the action this hint names.
-			prdLabel, _ := h.settings.PRDLabel(r.Context())
-			httpx.Error(w, http.StatusUnprocessableEntity,
-				fmt.Sprintf("this issue does not carry the %s label; promote it before starting a run", prdLabel))
-		case errors.Is(err, workersvc.ErrNoPRDLink):
-			// Extend the hint with the escape-hatch label only when the feature is
-			// enabled instance-wide, so a strict-regime instance never advertises it.
-			msg := "issue has no PRD link; add a prds/*.md link before starting a run"
-			if prdlessEnabled {
-				msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
-			}
-			httpx.Error(w, http.StatusUnprocessableEntity, msg)
-		case errors.Is(err, workersvc.ErrActiveRunExists):
-			httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
-		case errors.Is(err, workersvc.ErrBranchInUse):
-			// Cross-kind exclusion (PRD #6): a ci_fix run is already holding this
-			// issue's agent branch/worktree.
-			httpx.Error(w, http.StatusConflict, "a CI-fix run is already working this issue's branch; cancel it before starting an issue run")
-		default:
-			slog.Error("create run", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		}
+		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+}
+
+// writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
+// Shared by the board start button (CreateRun) and the chat start-run card
+// (StartChatRun, PRD #191 M5) so both surfaces refuse an issue for the SAME reason with
+// the SAME words — the PRD-gate hint especially, which names the instance's own labels.
+func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, workersvc.ErrForgeBuild):
+		slog.Error("start run: build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	case errors.Is(err, workersvc.ErrForgeIssueRead):
+		// err wraps the driver's already-redacted message.
+		httpx.Error(w, http.StatusBadGateway, err.Error())
+	case errors.Is(err, workersvc.ErrRepoNotFound):
+		httpx.Error(w, http.StatusNotFound, "repo not found")
+	case errors.Is(err, workersvc.ErrIssueNotFound):
+		httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
+	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
+		httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
+	case errors.Is(err, workersvc.ErrPlanTooLarge):
+		httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is too large to run")
+	case errors.Is(err, workersvc.ErrPlanEmpty):
+		httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
+	case errors.Is(err, workersvc.ErrInvalidPlannedCommit):
+		httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
+	case errors.Is(err, workersvc.ErrInvalidSelection):
+		httpx.Error(w, http.StatusBadRequest, "invalid agent selection: "+err.Error())
+	case errors.Is(err, workersvc.ErrNotPRDIssue):
+		// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it: telling
+		// someone to add a prds/*.md link to an issue that is not uzi's work sends them to
+		// fix the wrong thing. Promote is the action this hint names.
+		prdLabel, _ := h.settings.PRDLabel(r.Context())
+		httpx.Error(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("this issue does not carry the %s label; promote it before starting a run", prdLabel))
+	case errors.Is(err, workersvc.ErrNoPRDLink):
+		// Extend the hint with the escape-hatch label only when the feature is enabled
+		// instance-wide, so a strict-regime instance never advertises it.
+		msg := "issue has no PRD link; add a prds/*.md link before starting a run"
+		if prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context()); prdlessEnabled {
+			prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
+			msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
+		}
+		httpx.Error(w, http.StatusUnprocessableEntity, msg)
+	case errors.Is(err, workersvc.ErrActiveRunExists):
+		httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		httpx.Error(w, http.StatusConflict, "a CI-fix run is already working this issue's branch; cancel it before starting an issue run")
+	default:
+		slog.Error("start run", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 // GetRun returns one run visible to the viewer (owner, or any run for an admin).

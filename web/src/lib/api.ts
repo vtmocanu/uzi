@@ -1808,6 +1808,17 @@ export interface IssueProposal {
   created_at: string;
 }
 
+// RunRequest is the payload of a `run_request`-kind run message (PRD #191 M5): the
+// chat agent's REQUEST to start a run on an existing issue. repo_path/issue_iid are
+// what the human confirms; title is a model-authored (untrusted) hint shown inert.
+// Nothing is started until the human's Start click, which re-resolves and re-reads
+// everything server-side (gated exactly as the board start button).
+export interface RunRequest {
+  repo_path: string;
+  issue_iid: number;
+  title?: string;
+}
+
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
 // cookie rides along automatically (same origin through nginx); Origin==Host is
 // enforced server-side against cross-site hijacking.
@@ -2593,6 +2604,14 @@ const realApi = {
   // 204 No Content: the card updates its state locally.
   dismissProposal: (chatId: string, proposalId: string) =>
     request<null>("POST", `/chats/${chatId}/proposals/${proposalId}/dismiss`),
+  // Start a run from a chat's start-run card (PRD #191 M5). 201 {run}: gated exactly
+  // as the board start button (StartRunForUser), so an issue with no PRD is refused
+  // with the same message. Keyed by the human repo_path the card shows.
+  startRunFromChat: (repoPath: string, issueIid: number) =>
+    request<{ run: Run }>("POST", "/chats/run-requests", {
+      repo_path: repoPath,
+      issue_iid: issueIid,
+    }),
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),

@@ -1139,6 +1139,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Route("/chats", func(r chi.Router) {
 				r.With(chatLimiter.PerUserMiddleware).Post("/", h.CreateChat)
 				r.Get("/", h.ListChats)
+				// Start an agent run from a chat's start-run card (PRD #191 M5): a forge
+				// GetIssue + the PRD gate, so it rides the per-user forge limiter like the
+				// proposal confirm below.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/run-requests", h.StartChatRun)
 				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
 				r.Post("/{id}/end", h.EndChat)
 				// Continue mints a NEW queued chat run, so it rides the same per-user chat

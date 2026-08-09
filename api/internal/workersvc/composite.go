@@ -173,6 +173,22 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, allowWithoutPRD, waitOnLimit, seed)
 }
 
+// StartRunForUserByPath is StartRunForUser keyed by the human repo PATH the chat
+// surfaces expose (PRD #191 M5): the start-run card carries repo_path (what list_runs
+// shows), not the internal repo id. It resolves the path to the user's own repo id
+// (ErrRepoNotFound for an unknown/foreign path) and delegates. Same gate, same
+// sentinels as the web start button.
+func (s *Service) StartRunForUserByPath(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+	repoID, err := s.q.GetRepoIDByPathForUser(ctx, store.GetRepoIDByPathForUserParams{Path: repoPath, UserID: userID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, ErrRepoNotFound
+		}
+		return store.Run{}, err
+	}
+	return s.StartRunForUser(ctx, userID, repoID, issueIID, waitOnLimit, seed)
+}
+
 // prdlessAllows reports whether the PRDLESS bypass applies to an issue carrying
 // these forge labels (PRD #22 Decision 3): the instance feature is on AND the issue
 // carries the prdless label. Settings reads are best-effort and nil-safe — a nil

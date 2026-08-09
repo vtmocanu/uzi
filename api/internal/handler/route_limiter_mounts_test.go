@@ -254,6 +254,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
 	{"POST", "/api/chats/", limChat},
+	{"POST", "/api/chats/run-requests", limForge},
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},

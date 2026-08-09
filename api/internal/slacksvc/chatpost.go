@@ -3,6 +3,7 @@ package slacksvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -57,7 +58,7 @@ const (
 // PublishMessage enqueues only those (Decision 6: thinking/tool frames never post).
 func chatRelevantKind(kind string) bool {
 	switch kind {
-	case "user_message", "text", "status", "error", "proposal":
+	case "user_message", "text", "status", "error", "proposal", "run_request":
 		return true
 	default:
 		return false
@@ -147,6 +148,11 @@ func (n *Notifier) applyChatFrame(ctx context.Context, convo *chatConvo, ev chat
 		n.postProposalCard(ctx, convo, ev.runID, ev.payload)
 		return
 	}
+	if ev.kind == "run_request" {
+		// A start-run card, likewise standalone (M5).
+		n.postRunRequestCard(ctx, convo, ev.payload)
+		return
+	}
 
 	if err := json.Unmarshal(ev.payload, &p); err != nil {
 		// A payload we can't parse: ignore it rather than let a malformed status frame
@@ -209,6 +215,29 @@ func (n *Notifier) postProposalCard(ctx context.Context, convo *chatConvo, runID
 	blocks := proposalCardBlocks(runID, propID, pp.Title, pp.Description, pp.Labels, pp.RepoPath)
 	if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, "New issue proposal from uzi chat", blocks); err != nil {
 		n.logf("post proposal card", err)
+	}
+}
+
+// postRunRequestCard renders a chat agent's start_run request as a Block Kit card with
+// Start / Dismiss in the conversation thread (PRD #191 M5). The payload is the tool's
+// {repo_path, issue_iid, title}; the press is handled by ChatActions (slack_chat_*).
+func (n *Notifier) postRunRequestCard(ctx context.Context, convo *chatConvo, payload []byte) {
+	var rr struct {
+		RepoPath string `json:"repo_path"`
+		IssueIID int64  `json:"issue_iid"`
+		Title    string `json:"title"`
+	}
+	if err := json.Unmarshal(payload, &rr); err != nil {
+		n.logf("parse run_request payload", err)
+		return
+	}
+	if strings.TrimSpace(rr.RepoPath) == "" || rr.IssueIID <= 0 {
+		n.logf("run_request payload", errors.New("missing repo_path or issue_iid"))
+		return
+	}
+	blocks := runRequestCardBlocks(rr.RepoPath, rr.IssueIID, rr.Title)
+	if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, "Start-run request from uzi chat", blocks); err != nil {
+		n.logf("post run_request card", err)
 	}
 }
 

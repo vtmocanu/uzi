@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -29,9 +30,19 @@ type fakeChatActionSubmitter struct {
 	confirmErr error
 	dismisses  []confirmCall
 	dismissErr error
+
+	starts     []startCall
+	startedRun uuid.UUID
+	startErr   error
 }
 
 type confirmCall struct{ userID, runID, propID uuid.UUID }
+
+type startCall struct {
+	userID   uuid.UUID
+	repoPath string
+	issueIID int64
+}
 
 func (f *fakeChatActionSubmitter) ConfirmProposalForUser(_ context.Context, userID, runID, propID uuid.UUID) (CreatedIssue, error) {
 	f.confirms = append(f.confirms, confirmCall{userID, runID, propID})
@@ -40,6 +51,17 @@ func (f *fakeChatActionSubmitter) ConfirmProposalForUser(_ context.Context, user
 func (f *fakeChatActionSubmitter) DismissProposalForUser(_ context.Context, userID, runID, propID uuid.UUID) error {
 	f.dismisses = append(f.dismisses, confirmCall{userID, runID, propID})
 	return f.dismissErr
+}
+func (f *fakeChatActionSubmitter) StartRunFromCard(_ context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
+	f.starts = append(f.starts, startCall{userID, repoPath, issueIID})
+	return f.startedRun, f.startErr
+}
+
+func runCardPress(actionID, repoPath string, issueIID int64) BlockAction {
+	return BlockAction{
+		SlackUserID: "Uauth", ActionID: actionID,
+		Value: encodeRunReqValue(repoPath, issueIID), ChannelID: "D1", MessageTS: "card1",
+	}
 }
 
 func chatActionPress(actionID string, runID, propID uuid.UUID) BlockAction {
@@ -112,7 +134,7 @@ func TestChatActionCreateFilesOnceThenHandled(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	sub := &fakeChatActionSubmitter{confirmed: CreatedIssue{IID: 7, WebURL: "https://f/-/issues/7", Title: "Add retries"}}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
 
@@ -142,7 +164,7 @@ func TestChatActionCreateNonOwnerRefused(t *testing.T) {
 	runID, propID := uuid.New(), uuid.New()
 	sub := &fakeChatActionSubmitter{confirmErr: ErrChatProposalGone}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
 
@@ -160,7 +182,7 @@ func TestChatActionCreateForgeFailureOffersRetry(t *testing.T) {
 	runID, propID := uuid.New(), uuid.New()
 	sub := &fakeChatActionSubmitter{confirmErr: ErrChatProposalForge}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
 
@@ -178,7 +200,7 @@ func TestChatActionDismiss(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	sub := &fakeChatActionSubmitter{}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalDismiss, runID, propID))
 
@@ -195,7 +217,7 @@ func TestChatActionUnlinkedPresserRefused(t *testing.T) {
 	runID, propID := uuid.New(), uuid.New()
 	sub := &fakeChatActionSubmitter{}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{userErr: pgx.ErrNoRows}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{userErr: pgx.ErrNoRows}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
 
@@ -207,11 +229,99 @@ func TestChatActionUnlinkedPresserRefused(t *testing.T) {
 	}
 }
 
+// A run_request run message posts a Start/Dismiss card with the issue iid and repo,
+// scrubbed and inert.
+func TestRunRequestFramePostsCard(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("run_request",
+		`{"repo_path":"grp/repo","issue_iid":42,"title":"speed up the poller"}`))
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one card, got %+v", fp.blocks)
+	}
+	card := fp.blocks[0]
+	ids := strings.Join(card.actionIDs, ",")
+	if !strings.Contains(ids, ActionChatRunStart) || !strings.Contains(ids, ActionChatRunDismiss) {
+		t.Errorf("card must carry Start + Dismiss, got %v", card.actionIDs)
+	}
+	if !strings.Contains(card.sectionText, "#42") || !strings.Contains(card.sectionText, "grp/repo") {
+		t.Errorf("card should name the issue and repo: %q", card.sectionText)
+	}
+}
+
+// A malformed run_request (missing repo/iid) posts no card.
+func TestRunRequestFrameMalformedPostsNothing(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+	feed(n, runID, frame("run_request", `{"repo_path":"","issue_iid":0}`))
+	if len(fp.blocks) != 0 {
+		t.Fatalf("a malformed run_request must post no card, got %+v", fp.blocks)
+	}
+}
+
+// Start routes to the ownership-scoped StartRunFromCard and, on success, edits the card
+// to "run started" with the run link. The value carries (repo_path, issue_iid).
+func TestChatActionStartRun(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	newRun := uuid.New()
+	sub := &fakeChatActionSubmitter{startedRun: newRun}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), runCardPress(ActionChatRunStart, "grp/repo", 42))
+
+	if len(sub.starts) != 1 || sub.starts[0].repoPath != "grp/repo" || sub.starts[0].issueIID != 42 || sub.starts[0].userID != user.ID {
+		t.Fatalf("start mis-routed: %+v", sub.starts)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 {
+		t.Fatalf("card should be edited button-free on start, got %+v", fp.updateBlocks)
+	}
+	if !strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "run started") {
+		t.Errorf("resolved card should say the run started: %q", fp.updateBlocks[0].sectionText)
+	}
+}
+
+// A refused Start (a gate reason) surfaces the user-safe message and leaves the card.
+func TestChatActionStartRunRefused(t *testing.T) {
+	sub := &fakeChatActionSubmitter{startErr: errors.New("This issue has no PRD link — add a prds/*.md link before starting a run.")}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), runCardPress(ActionChatRunStart, "grp/repo", 42))
+
+	if len(fp.updateBlocks) != 0 {
+		t.Errorf("a refused start must not edit the card, got %+v", fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "PRD link") {
+		t.Fatalf("want the gate reason as an ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
+// Dismiss on a run card starts nothing and just edits the card.
+func TestChatActionRunDismiss(t *testing.T) {
+	sub := &fakeChatActionSubmitter{}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), runCardPress(ActionChatRunDismiss, "grp/repo", 42))
+
+	if len(sub.starts) != 0 {
+		t.Errorf("dismiss must start no run, got %+v", sub.starts)
+	}
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("dismiss should edit the card, got %+v", fp.updateBlocks)
+	}
+}
+
 // A non-chat action id is ignored (the mux fans every action to every handler).
 func TestChatActionIgnoresForeignNamespace(t *testing.T) {
 	sub := &fakeChatActionSubmitter{}
 	fp := &fakePoster{}
-	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, nil)
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
 
 	c.HandleBlockAction(context.Background(), BlockAction{SlackUserID: "Uauth", ActionID: ActionGateApprove, Value: uuid.New().String()})
 

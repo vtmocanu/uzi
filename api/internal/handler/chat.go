@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -171,6 +172,44 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 			slog.Error("continue chat", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+}
+
+// startChatRunRequest is the body of the chat start-run card's Start click (PRD #191
+// M5): the repo (by the human path the card showed) and the issue iid. The run is
+// gated exactly as the board start button (StartRunForUser), so an issue with no PRD is
+// refused with the same message.
+type startChatRunRequest struct {
+	RepoPath string `json:"repo_path"`
+	IssueIID int64  `json:"issue_iid"`
+}
+
+// StartChatRun starts an agent run from a chat's start-run card. Owner-scoped through
+// the repo path resolve; behind the per-user forge limiter (it does a forge GetIssue).
+func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req startChatRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.RepoPath) == "" {
+		httpx.Error(w, http.StatusBadRequest, "repo_path is required")
+		return
+	}
+	if req.IssueIID <= 0 {
+		httpx.Error(w, http.StatusBadRequest, "issue_iid must be a positive integer")
+		return
+	}
+	run, err := h.wsvc.StartRunForUserByPath(r.Context(), user.ID, req.RepoPath, req.IssueIID, nil, nil)
+	if err != nil {
+		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})

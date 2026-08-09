@@ -66,6 +66,10 @@ export type MessageKind =
   | "user_message"
   | "plan"
   | "proposal"
+  /** PRD #191 M5: a start_run REQUEST card (payload `{ repo_path, issue_iid, title }`).
+   *  Like `proposal` it is human-gated — the model emits the card, only the user's
+   *  Start click actually queues the run (through their own connection). */
+  | "run_request"
   /** PRD #41: the user's revision feedback at the approval gate (payload
    *  `{ feedback: string }`), echoed to the feed so the revision is auditable. */
   | "plan_feedback"
