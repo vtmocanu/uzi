@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/slack-go/slack"
 )
 
 // chatMsgEvent is one chat run message frame bound for Slack turn streaming (PRD #191
@@ -36,10 +37,14 @@ type chatConvo struct {
 }
 
 const (
-	// chatThinkingText is the per-turn placeholder, posted on user_message and edited to
-	// the answer on turn end. It carries the deep link so an orphaned placeholder (an api
-	// restart mid-turn) is still useful (Decision 6).
+	// chatThinkingText is the per-turn placeholder, posted on user_message as a context
+	// block and edited to the answer on turn end (PRD #268 M4). A sibling context element
+	// carries the deep link so an orphaned placeholder (an api restart mid-turn) is still
+	// useful (Decision 6).
 	chatThinkingText = "💬 _uzi is thinking…_"
+	// chatThinkingFallback is the fixed plain-text notification fallback for the
+	// placeholder Block Kit post (never model text — the placeholder has none yet).
+	chatThinkingFallback = "uzi is thinking…"
 	// chatNoAnswerText resolves a turn that produced no text frames (e.g. a tool-only
 	// turn) so the placeholder never strands.
 	chatNoAnswerText = "_(this turn produced no text reply — open it in uzi for the details)_"
@@ -242,18 +247,26 @@ func (n *Notifier) postRunRequestCard(ctx context.Context, convo *chatConvo, pay
 }
 
 // startChatTurn posts the turn's placeholder in the conversation thread and records
-// its ts for the later edit. A post failure leaves placeholderTS empty; flushChatTurn
-// then posts the answer fresh rather than editing nothing.
+// its ts for the later edit (PRD #268 M4: a Block Kit context block, not plain text).
+// The placeholder is a single de-emphasized context block — chatThinkingText, plus a
+// sibling context element carrying the deep link so an orphaned placeholder (an api
+// restart mid-turn) still opens the run. A post failure leaves placeholderTS empty;
+// flushChatTurn then posts the answer fresh rather than editing nothing.
 func (n *Notifier) startChatTurn(ctx context.Context, convo *chatConvo) {
 	convo.buf = nil
 	convo.bufRunes = 0
 	convo.active = true
 	convo.placeholderTS = ""
-	text := chatThinkingText
+
+	ctxElems := []slack.MixedElement{threadMrkdwnElem(chatThinkingText)}
 	if convo.link != "" {
-		text += " " + convo.link
+		// The deep link is server-derived <url|label> mrkdwn; ScrubSecrets is a no-op on a
+		// clean link, kept as the last-line-of-defense outbound scrub every block obeys.
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets("🔗 "+convo.link)))
 	}
-	ts, err := n.poster.Post(ctx, convo.channel, convo.rootTS, text)
+	blocks := []slack.Block{slack.NewContextBlock("slack_chat_turn_placeholder", ctxElems...)}
+
+	ts, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, chatThinkingFallback, blocks)
 	if err != nil {
 		n.logf("post chat placeholder", err)
 		return
@@ -261,9 +274,17 @@ func (n *Notifier) startChatTurn(ctx context.Context, convo *chatConvo) {
 	convo.placeholderTS = ts
 }
 
-// flushChatTurn resolves the active turn as ONE edit: the assembled text-frame body
-// (scrubbed, escaped, truncated), with extra appended (a timeout/error note) or used
-// alone when the turn produced no text. A no-op when no turn is open.
+// flushChatTurn resolves the active turn as ONE Block Kit edit (PRD #268 M4). The body
+// assembly is unchanged — the scrubbed/escaped/truncated text-frame body, with extra (a
+// timeout/error note) appended or used alone. Then it is shaped into blocks:
+//   - a NON-empty body becomes a `section` block, with the deep link moved OUT to its own
+//     `context` block (never glued into the section text anymore);
+//   - an EMPTY body (a rare post-M1 tool-only turn) degrades to a de-emphasized `context`
+//     block carrying chatNoAnswerText, plus the deep-link element when present.
+//
+// The fallback is the assembled body when non-empty (already EscapeMrkdwn'd, so any
+// mention/link in it is inert — safe as the OS-notification text), rune-bounded so a long
+// turn can't flood it; chatNoAnswerText when empty. A no-op when no turn is open.
 func (n *Notifier) flushChatTurn(ctx context.Context, convo *chatConvo, extra string) {
 	if !convo.active {
 		return
@@ -277,20 +298,44 @@ func (n *Notifier) flushChatTurn(ctx context.Context, convo *chatConvo, extra st
 	case body == "":
 		body = extra
 	}
-	if body == "" {
-		body = chatNoAnswerText
+
+	linkElem := func() (slack.MixedElement, bool) {
+		if convo.link != "" {
+			// Server-derived <url|label> mrkdwn; ScrubSecrets is a no-op-on-clean last line
+			// of defense, matching every other block's outbound scrub.
+			return threadMrkdwnElem(ScrubSecrets("🔗 " + convo.link)), true
+		}
+		return nil, false
 	}
-	if convo.link != "" {
-		body += "\n\n" + convo.link // outside the truncated region, so it always survives
+
+	var blocks []slack.Block
+	var fallback string
+	if body != "" {
+		// The body is already ScrubSecrets+EscapeMrkdwn'd+truncated by renderChatBody (or
+		// chatDynamic for extra) — put it in the section verbatim, do NOT re-render it.
+		blocks = append(blocks, threadSectionBlock(body))
+		if el, has := linkElem(); has {
+			blocks = append(blocks, slack.NewContextBlock("slack_chat_turn_link", el))
+		}
+		fallback = boundReason(body)
+	} else {
+		// Rare tool-only turn: degrade to a context block rather than a full section, per
+		// PRD #268 M4.
+		ctxElems := []slack.MixedElement{threadMrkdwnElem(chatNoAnswerText)}
+		if el, has := linkElem(); has {
+			ctxElems = append(ctxElems, el)
+		}
+		blocks = append(blocks, slack.NewContextBlock("slack_chat_turn_empty", ctxElems...))
+		fallback = chatNoAnswerText
 	}
 
 	if convo.placeholderTS != "" {
-		if err := n.poster.Update(ctx, convo.channel, convo.placeholderTS, body); err != nil {
+		if err := n.poster.UpdateBlocks(ctx, convo.channel, convo.placeholderTS, fallback, blocks); err != nil {
 			n.logf("edit chat turn", err)
 		}
 	} else {
 		// The placeholder post had failed: post the answer fresh in the thread.
-		if _, err := n.poster.Post(ctx, convo.channel, convo.rootTS, body); err != nil {
+		if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, fallback, blocks); err != nil {
 			n.logf("post chat turn", err)
 		}
 	}
