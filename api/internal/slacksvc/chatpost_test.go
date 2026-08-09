@@ -124,6 +124,37 @@ func TestChatNonResultTurnEndsResolvePlaceholder(t *testing.T) {
 	}
 }
 
+// A text-less status{event:"init"} heartbeat (the real Claude Agent SDK emits one at
+// the start of every query) must NOT flush the open turn before its answer buffers —
+// reproduces the PRD #268 init-heartbeat drop, where the answer was replaced by
+// chatNoAnswerText in Slack.
+func TestChatInitStatusDoesNotDropAnswer(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID,
+		frame("user_message", `{"text":"what runs do we have now?"}`),
+		frame("status", `{"event":"init","model":"claude-opus-4-8"}`),
+		frame("text", `{"text":"the real answer"}`),
+		frame("status", `{"event":"result"}`),
+	)
+
+	if len(fp.posts) != 1 {
+		t.Fatalf("want exactly one placeholder post, got %d: %+v", len(fp.posts), fp.posts)
+	}
+	if len(fp.updates) != 1 {
+		t.Fatalf("want exactly one edit resolving the turn, got %d: %+v", len(fp.updates), fp.updates)
+	}
+	body := fp.updates[0].text
+	if !strings.Contains(body, "the real answer") {
+		t.Errorf("edit must carry the answer, not drop it: %q", body)
+	}
+	if strings.Contains(body, chatNoAnswerText) {
+		t.Errorf("init heartbeat must not flush the turn to the no-answer placeholder: %q", body)
+	}
+}
+
 // thinking / tool frames never post: they are filtered before the queue, and even if
 // one reached the drain it carries no turn body.
 func TestChatThinkingAndToolFramesNeverPost(t *testing.T) {

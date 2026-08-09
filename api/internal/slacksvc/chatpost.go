@@ -179,10 +179,10 @@ func (n *Notifier) applyChatFrame(ctx context.Context, convo *chatConvo, ev chat
 			n.flushChatTurn(ctx, convo, "") // happy-path turn end
 			return
 		}
-		// A prose status (a turn timeout, or the conversation-end line that also lands
-		// after a cancelled turn) resolves an open turn; a status-with-text OUTSIDE a
-		// turn (resume-context-lost at conversation start) is ignored.
-		if convo.active {
+		// Only a status that carries TEXT (a turn timeout line, the conversation-end
+		// line) resolves an open turn. A text-less heartbeat (event:"init", and any
+		// future eventless status) must NOT flush the turn before its answer buffers.
+		if convo.active && strings.TrimSpace(p.Text) != "" {
 			n.flushChatTurn(ctx, convo, chatDynamic(p.Text))
 		}
 	case "error":
