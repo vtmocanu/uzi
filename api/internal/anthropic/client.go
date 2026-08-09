@@ -137,7 +137,7 @@ func (c *Client) Usage(ctx context.Context, token []byte) (Reading, error) {
 	if err != nil {
 		return Reading{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if resp.StatusCode != http.StatusOK {
 		return Reading{}, httpError("usage", resp.StatusCode, body)
@@ -153,7 +153,7 @@ func (c *Client) ProbeHeaders(ctx context.Context, token []byte) (Reading, error
 	if err != nil {
 		return Reading{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if resp.StatusCode != http.StatusOK {
 		return Reading{}, httpError("probe", resp.StatusCode, body)

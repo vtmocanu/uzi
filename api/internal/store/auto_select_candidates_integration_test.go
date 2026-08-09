@@ -466,10 +466,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// The column is display-only — nothing in the state machine, the claim path or
 	// any sweep reads it — so the database is the ONLY reader positioned to notice a
 	// value that is not in the vocabulary.
-	var legal []string
-	for _, r := range []string{"default", "pinned", "judge"} {
-		legal = append(legal, r)
-	}
+	legal := []string{"default", "pinned", "judge"}
 	for _, r := range autoselect.AllReasons() {
 		legal = append(legal, string(r))
 	}
