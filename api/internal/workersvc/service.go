@@ -618,6 +618,18 @@ type SettingsReader interface {
 	// which serves all three. A nil reader falls back to the compiled-in default and
 	// the gate still runs — "settings unavailable" must not mean "unguarded".
 	PRDLabel(ctx context.Context) (string, error)
+	// RunEligibleLabels is the ADMIN-configured set of labels a human may point uzi
+	// at (PRD #196). It generalises the run gate from "carries the primary" to
+	// "carries any run-eligible label"; the accessor always unions the primary in,
+	// so an issue carrying the primary is runnable regardless of the configured set.
+	// Autopilot candidacy and the sync fetch deliberately DO NOT read this — they
+	// stay on the primary only (PRD #196 Decisions 3/5/6).
+	RunEligibleLabels(ctx context.Context) ([]string, error)
+	// EligibleLabelWaivesPRDLink reports whether an issue eligible by a NON-primary
+	// label may run without a prds/*.md link (PRD #196 Decision 7), instance-wide,
+	// default on. It waives only a HUMAN's second click: the run gate applies it
+	// solely to a manual run eligible via a non-primary label, never to autopilot.
+	EligibleLabelWaivesPRDLink(ctx context.Context) (bool, error)
 }
 
 // DockerAllowlistReader is the narrow settings view the claim gate reads for the
@@ -3262,29 +3274,51 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// The PRD-LABEL gate (PRD #102 Decision 14). Checked BEFORE the PRD-link gate
-	// because it is the coarser question — "is this issue uzi's work at all" comes
-	// before "is this issue ready to run" — and because its rejection must not be
-	// reported as a missing PRD link, which would send a user off to add one.
+	// The RUN-ELIGIBILITY gate (PRD #102 Decision 14, generalised by PRD #196
+	// Decision 1). Checked BEFORE the PRD-link gate because it is the coarser
+	// question — "is this issue uzi's work at all" comes before "is this issue ready
+	// to run" — and because its rejection must not be reported as a missing PRD
+	// link, which would send a user off to add one.
 	//
-	// PRDLESS does NOT bypass this. It is the escape hatch for a PRD issue with no
-	// prds/*.md file yet (PRD #22 Decision 3); it was never a claim about issues
+	// PRD #196 widens this from "carries the primary label" to "carries ANY
+	// run-eligible label" (an admin-configured set that always includes the primary,
+	// default {PRD, bug}). The anti-accident property survives: an issue carrying
+	// none of those labels is exactly as unrunnable as before, PRD link or no. Only
+	// a human clicking Start on a card an admin deliberately made eligible gets in.
+	//
+	// PRDLESS does NOT bypass this. It is the escape hatch for an eligible issue with
+	// no prds/*.md file yet (PRD #22 Decision 3); it was never a claim about issues
 	// that are not uzi's, and letting it through here would restore exactly the
 	// accident this gate exists to stop.
 	//
 	// Derived from the cached labels rather than a fresh forge read (Decision 12):
 	// the same jsonb the board renders the card from, so the button a user sees and
 	// the gate the server applies cannot disagree. Promote (Decision 15) writes the
-	// label forge-first AND updates this cache row in the same request, so the
-	// promote-then-run sequence is not racing the poller.
-	if !isPRDIssue(issue.Labels, s.prdLabel(ctx)) {
+	// PRIMARY label forge-first AND updates this cache row in the same request, so
+	// the promote-then-run sequence is not racing the poller.
+	primary := s.prdLabel(ctx)
+	eligible := s.runEligibleLabels(ctx)
+	if !isEligibleIssue(issue.Labels, eligible) {
 		return store.Run{}, ErrNotPRDIssue
 	}
-	// The PRD-link gate (PRD invariant) with the PRDLESS exception (PRD #22):
-	// allowWithoutPRD is the caller's bypass decision, computed from the fresh
-	// forge snapshot's labels and the prdless settings. This is the single
+	// The PRD-link gate (PRD invariant) with the PRDLESS exception (PRD #22) and the
+	// PRD #196 waiver: allowWithoutPRD is the caller's PRDLESS bypass, computed from
+	// the fresh forge snapshot's labels and the prdless settings. This is the single
 	// enforcement point; both the manual and autopilot callers pass the bool in.
-	if !issue.HasPrdLink && !allowWithoutPRD {
+	//
+	// The PRD-link waiver (PRD #196 Decision 7): an issue eligible via a NON-PRIMARY
+	// label does not require a prds/*.md link. It is scoped two ways, and both are
+	// safety properties rather than phrasing:
+	//   1. NON-PRIMARY: a primary-only issue with no link is still refused (add a
+	//      link or PRDLESS). So an autopilot-labelled PRD issue with no link stays
+	//      refused, exactly as today.
+	//   2. !autoApprove: the waiver removes a HUMAN's second click; autopilot has no
+	//      human, so it never applies to an unattended run. Autopilot link-less runs
+	//      remain possible ONLY via PRDLESS (allowWithoutPRD), exactly as before.
+	//      Defense-in-depth so a future PRD+autopilot+<eligible> composition cannot
+	//      start unattended.
+	linkWaived := !autoApprove && s.eligibleWaivesPRDLink(ctx) && eligibleByNonPrimary(issue.Labels, eligible, primary)
+	if !issue.HasPrdLink && !allowWithoutPRD && !linkWaived {
 		return store.Run{}, ErrNoPRDLink
 	}
 	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
@@ -3358,18 +3392,91 @@ func (s *Service) prdLabel(ctx context.Context) string {
 	return settings.DefaultPRDLabel
 }
 
-// isPRDIssue reports whether a cached issue's labels jsonb carries label. A row
-// whose labels cannot be decoded is NOT a PRD issue: the gate has no basis for
-// letting it through, and a corrupt or absent value must not read as consent.
+// runEligibleLabels resolves the ADMIN-configured set of run-eligible labels (PRD
+// #196), nil-safe like prdLabel. The primary is ALWAYS unioned in, first, deduped —
+// mirroring the Cache accessor — so the gate is fail-safe: an issue carrying the
+// primary is runnable even if a hand-edited settings row dropped it from the
+// configured set, and a fake reader that returns only its eligible extras still
+// makes the primary eligible. Never returns empty.
 //
-// Matching is exact, like the forge-side label filter the sync applies and like
-// every other label comparison in this codebase.
-func isPRDIssue(labelsJSON []byte, label string) bool {
+// An unwired service falls back to the compiled-in default set (the default primary
+// unioned with DefaultRunEligibleLabels), so "settings unavailable" still enforces
+// on the default eligible set rather than degrading to unguarded.
+func (s *Service) runEligibleLabels(ctx context.Context) []string {
+	primary := s.prdLabel(ctx)
+	var raw []string
+	if s.settings != nil {
+		raw, _ = s.settings.RunEligibleLabels(ctx)
+	} else {
+		raw = strings.Split(settings.DefaultRunEligibleLabels, ",")
+	}
+	out := []string{primary}
+	seen := map[string]struct{}{primary: {}}
+	for _, l := range raw {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if _, dup := seen[l]; dup {
+			continue
+		}
+		seen[l] = struct{}{}
+		out = append(out, l)
+	}
+	return out
+}
+
+// eligibleWaivesPRDLink reports whether an issue eligible by a NON-primary label may
+// run without a prds/*.md link (PRD #196 Decision 7), nil-safe. An unavailable read
+// degrades to the compiled-in default (on), the same fail-toward-the-default
+// direction as the Cache accessor — the waiver is a convenience gate, and its
+// remaining scope (non-primary + manual) is what keeps that safe.
+func (s *Service) eligibleWaivesPRDLink(ctx context.Context) bool {
+	if s.settings != nil {
+		waives, _ := s.settings.EligibleLabelWaivesPRDLink(ctx)
+		return waives
+	}
+	return settings.DefaultEligibleLabelWaivesPRDLink == "true"
+}
+
+// isEligibleIssue reports whether a cached issue's labels jsonb carries ANY of the
+// run-eligible labels (PRD #196), generalising the old single-primary-label gate. A
+// row whose labels cannot be decoded is NOT eligible: the gate has no basis for
+// letting it through, and a corrupt or absent value must not read as consent.
+// Matching is exact, like the forge-side label filter the sync applies and like every
+// other label comparison in this codebase.
+func isEligibleIssue(labelsJSON []byte, eligible []string) bool {
 	var labels []string
 	if err := json.Unmarshal(labelsJSON, &labels); err != nil {
 		return false
 	}
-	return slices.Contains(labels, label)
+	for _, e := range eligible {
+		if slices.Contains(labels, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// eligibleByNonPrimary reports whether a cached issue is eligible via at least one
+// run-eligible label that is NOT the primary (PRD #196). This is the qualifier that
+// scopes the PRD-link waiver: an issue eligible ONLY by the primary does not get the
+// waiver, so an autopilot-labelled PRD issue with no link stays refused. Decode
+// failure → false, like the other label helpers.
+func eligibleByNonPrimary(labelsJSON []byte, eligible []string, primary string) bool {
+	var labels []string
+	if err := json.Unmarshal(labelsJSON, &labels); err != nil {
+		return false
+	}
+	for _, e := range eligible {
+		if e == primary {
+			continue
+		}
+		if slices.Contains(labels, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // originColumn resolves the issue's current column to snapshot onto the run, so a

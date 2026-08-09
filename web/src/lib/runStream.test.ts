@@ -181,6 +181,28 @@ describe("startRunGate", () => {
     expect(startRunGate({ ...ok, hasPrdLink: true, prdlessBypass: false }).enabled).toBe(true);
   });
 
+  // PRD #196 M4: the PRD-link waiver mirrors the server's per-instance
+  // eligible_label_waives_prd_link, scoped to non-primary eligibility by the caller. To
+  // the gate it is a second short-circuit alongside prdlessBypass.
+  it("prdLinkWaived lets a no-PRD-link issue through the PRD-link gate", () => {
+    // no link + waiver + worker + token + open + no active run → enabled.
+    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false, prdLinkWaived: true })).toEqual({
+      enabled: true,
+      reason: "",
+    });
+    // no link + no waiver + no bypass → still blocked on the link.
+    expect(
+      startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false, prdLinkWaived: false }).reason,
+    ).toMatch(/prds/i);
+  });
+
+  it("prdLinkWaived does not skip the OTHER preconditions", () => {
+    // A waived no-PRD-link issue with no worker is still blocked on the worker.
+    expect(
+      startRunGate({ ...ok, hasPrdLink: false, prdLinkWaived: true, hasWorker: false }).reason,
+    ).toMatch(/worker/i);
+  });
+
   it("prdless bypass does not skip the OTHER preconditions", () => {
     // A bypassed no-PRD-link issue with no worker is still blocked on the worker.
     expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: true, hasWorker: false }).reason).toMatch(

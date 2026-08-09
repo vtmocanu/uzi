@@ -78,7 +78,10 @@ function aCard(labels: string[]): Card {
   };
 }
 
-function setAuth(prdlessEnabled: boolean) {
+function setAuth(
+  prdlessEnabled: boolean,
+  opts: { runEligibleLabels?: string[]; eligibleLabelWaivesPrdLink?: boolean } = {},
+) {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
@@ -89,8 +92,10 @@ function setAuth(prdlessEnabled: boolean) {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled,
-    runEligibleLabels: ["PRD"],
-    eligibleLabelWaivesPrdLink: true,
+    // PRD #196 M4 ships `bug` as run-eligible; tests that need a non-eligible label use
+    // `documentation`. The waiver defaults on, like the shipped default.
+    runEligibleLabels: opts.runEligibleLabels ?? ["PRD", "bug"],
+    eligibleLabelWaivesPrdLink: opts.eligibleLabelWaivesPrdLink ?? true,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
@@ -401,10 +406,17 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
 // non-PRD issue opened from the board is indistinguishable from a PRD one on the
 // page where a user decides what to do with it, and which offers the run controls
 // the server-side gate now refuses.
-describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
-  it("marks a non-PRD issue and offers Promote in place of Start run", async () => {
+describe("IssueView — eligibility affordances (PRD #102 M6, widened by PRD #196 M4)", () => {
+  // Minimal worker + token so the missing PRD link is the ONLY thing a gate blocks on.
+  const withWorkerAndToken = () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as Worker] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as unknown as SecretMeta] });
+  };
+
+  it("marks a NON-ELIGIBLE issue and offers Promote in place of Start run", async () => {
+    // `documentation` is not in the eligible set, so the issue is not runnable.
     setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 
@@ -415,7 +427,20 @@ describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
     expect(screen.queryByRole("button", { name: /start run/i })).toBeNull();
   });
 
-  it("shows neither on an ordinary PRD issue", async () => {
+  it("offers Start run on an ELIGIBLE bug issue, not Promote or 'not PRD' (mock §4)", async () => {
+    // `bug` is in the shipped eligible set, so the issue is runnable: Start run shows,
+    // the non-eligible marker and Promote do not.
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    expect(screen.queryByText("not PRD")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("shows neither marker nor Promote on an ordinary PRD issue", async () => {
     setAuth(false);
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
     renderIssueView();
@@ -426,12 +451,43 @@ describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
     expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
   });
 
-  it("does not offer the PRDLESS toggle on a non-PRD issue (Decision 16)", async () => {
-    // prdlessEnabled AND has_prd_link false — the exact shape that WOULD show the
-    // toggle on a PRD issue. It grants nothing here: run eligibility also requires
-    // the PRD label now.
+  it("enables Start on an eligible bug issue with no PRD link when the waiver is on (PRD #196 M4)", async () => {
+    // The waiver mirrors the server: an issue eligible via a NON-PRIMARY label does not
+    // need a prds/*.md link. With worker + token, the missing link is the only blocker.
+    setAuth(false);
+    withWorkerAndToken();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) }); // has_prd_link:false
+    renderIssueView();
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+  });
+
+  it("GATES the same bug issue when eligibleLabelWaivesPrdLink is false (PRD #196 M4)", async () => {
+    // The scope proof: with the waiver off, the no-link bug issue is blocked on the link
+    // again, even though it is still eligible (Start run is shown, just disabled).
+    setAuth(false, { eligibleLabelWaivesPrdLink: false });
+    withWorkerAndToken();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(startBtn().disabled).toBe(true));
+  });
+
+  it("offers the PRDLESS toggle on an eligible bug issue, not on a non-eligible one (Decision 16, PRD #196 M4)", async () => {
+    // prdlessEnabled AND has_prd_link false. On an ELIGIBLE bug issue the toggle shows
+    // (the run gate lets it through, so PRDLESS can waive the link)...
     setAuth(true);
     mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    const { unmount } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("Mark PRDLESS")).toBeTruthy();
+    unmount();
+
+    // ...but on a NON-eligible documentation issue it grants nothing and is hidden.
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
     renderIssueView();
     await screen.findByText("A small typo fix");
     expect(screen.queryByText("Mark PRDLESS")).toBeNull();
@@ -439,8 +495,8 @@ describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
 
   it("promotes forge-first and adopts the returned labels", async () => {
     setAuth(false);
-    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
-    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["PRD", "bug"]) });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["documentation"] }) });
+    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["PRD", "documentation"]) });
     renderIssueView();
     await screen.findByText("A small typo fix");
 

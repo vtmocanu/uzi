@@ -130,9 +130,15 @@ func fileIssueLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *se
 		q:    q,
 		box:  box,
 		cfg:  config.Config{},
+		// run_eligible_labels deliberately DIFFERS from the primary (PRD #196 M4): the
+		// eligible set is {PRD, bug}, so every assertion below that the judge writes
+		// exactly [PRD, PRDLESS] — never "bug" — is a writer guard proving the writer
+		// reads the PRIMARY, not the run-eligible set.
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{
 			{Key: settings.KeyPRDLabel, Value: "PRD"},
 			{Key: settings.KeyPrdlessLabel, Value: "PRDLESS"},
+			{Key: settings.KeyRunEligibleLabels, Value: "PRD,bug"},
+			{Key: settings.KeyEligibleLabelWaivesPRDLink, Value: "true"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
 		wsvc: workersvc.New(q, box, workersvc.Params{}),

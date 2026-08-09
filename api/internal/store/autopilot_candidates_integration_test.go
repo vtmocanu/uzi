@@ -73,6 +73,7 @@ func apCandidateFixture(ctx context.Context, t *testing.T) (*store.Queries, uuid
 	seed(20, "opened", `["autopilot"]`)       // Decision 11b's accident: not uzi's issue
 	seed(30, "opened", `["PRD"]`)             // uzi's, but not autopiloted
 	seed(40, "closed", `["PRD","autopilot"]`) // closed: autopilot drives open work only
+	seed(70, "opened", `["bug","autopilot"]`) // PRD #196: run-eligible by a NON-PRIMARY label, but NOT the primary
 	return store.New(pool), repoID
 }
 
@@ -100,6 +101,26 @@ func TestAutopilotCandidatesRequireBothLabelsLiveDB(t *testing.T) {
 	got := candidateIIDs(t, q, repoID, "autopilot", "PRD")
 	if len(got) != 1 || got[0] != 10 {
 		t.Fatalf("candidates = %v, want [10] only; 20 is an autopilot-labelled issue that is NOT uzi's and must never reach the detector", got)
+	}
+}
+
+// TestAutopilotCandidacyIgnoresRunEligibleSetPrimaryOnlyLiveDB is PRD #196 M4 guard
+// test 2, live-DB half. PRD #196 widens the MANUAL run gate to accept any run-eligible
+// label (default {PRD, bug}), but autopilot candidacy must keep matching the PRIMARY
+// only (Decision 6): a bug-labelled issue carrying the autopilot label is run-eligible
+// for a human, yet must NOT become an unattended autopilot candidate.
+//
+// The reason is in the name because the query is unchanged by design — this test
+// exists so a later cleanup that threads the eligible set into the SQL is caught. Row
+// 70 (bug+autopilot) is run-eligible by the non-primary "bug" but carries no primary,
+// so it must be absent from the candidate set exactly as it was before PRD #196.
+func TestAutopilotCandidacyIgnoresRunEligibleSetPrimaryOnlyLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, repoID := apCandidateFixture(ctx, t)
+
+	got := candidateIIDs(t, q, repoID, "autopilot", "PRD")
+	if len(got) != 1 || got[0] != 10 {
+		t.Fatalf("candidates = %v, want [10] only; issue 70 (bug+autopilot) is run-eligible for a human but must NOT be an autopilot candidate — the query matches the PRIMARY, never the run-eligible set", got)
 	}
 }
 

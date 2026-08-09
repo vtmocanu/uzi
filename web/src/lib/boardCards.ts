@@ -67,6 +67,25 @@ export function isMemberCard(card: Pick<Card, "labels">, membershipLabels: reado
 }
 
 /**
+ * Whether a card is RUN-ELIGIBLE (PRD #196 M4): it carries ANY label in the
+ * admin-configured run-eligible set, matched exactly (any-of). This is the same
+ * shape as `isMemberCard`, but it answers a DISTINCT question — "may uzi work this?"
+ * — and is deliberately its own named predicate rather than a reuse of the membership
+ * check, because eligibility (admin-only instance policy) and membership (a per-user
+ * VIEW preference) are orthogonal by design (Decision 1/2): a card can be visible but
+ * not runnable, or runnable but hidden.
+ *
+ * `eligibleLabels` always includes the primary (the server guarantees it, and
+ * `useAuth()` falls back to `[prdLabel]` for an older server), so this stays a
+ * superset of `isPRDCard`. It is what drives the card's Start-vs-Promote affordance,
+ * the solid-vs-quiet treatment and the PRDLESS toggle's visibility — mirroring the
+ * server-side run gate so the button state matches what a Start would actually do.
+ */
+export function isEligibleCard(card: Pick<Card, "labels">, eligibleLabels: readonly string[]): boolean {
+  return eligibleLabels.some((l) => card.labels.includes(l));
+}
+
+/**
  * Whether a card is uzi's own self-improvement tracking issue (Decision 13a).
  *
  * It is open, it lives on uzi's own repo, and it deliberately carries neither a
@@ -79,9 +98,19 @@ export function isSelfImproveTracker(card: Pick<Card, "labels">): boolean {
   return card.labels.includes(SELF_IMPROVE_LABEL);
 }
 
-/** Whether Promote should be offered on a card. */
-export function canPromote(card: Pick<Card, "labels" | "closed">, prdLabel: string): boolean {
-  return !card.closed && !isPRDCard(card, prdLabel) && !isSelfImproveTracker(card);
+/**
+ * Whether Promote should be offered on a card (PRD #196 M4). Promote is offered when a
+ * card is NOT runnable — it is open, does not already carry a run-eligible label, and is
+ * not the self-improve tracker. Promote adds the PRIMARY label server-side, which makes
+ * the card runnable, so offering it on an already-eligible card would be a no-op button.
+ *
+ * Keys off the ELIGIBLE set, not the primary alone (M4): a `bug` card in an instance
+ * whose eligible set includes `bug` is already runnable and gets Start run, not Promote
+ * (mock §4); a visibility-only `documentation` card that is a board member but NOT
+ * eligible still gets Promote (mock §7).
+ */
+export function canPromote(card: Pick<Card, "labels" | "closed">, eligibleLabels: readonly string[]): boolean {
+  return !card.closed && !isEligibleCard(card, eligibleLabels) && !isSelfImproveTracker(card);
 }
 
 /**

@@ -54,6 +54,10 @@ type judgeSwitch struct{ enabled bool }
 func (j judgeSwitch) JudgeEnabled(context.Context) (bool, error) { return j.enabled, nil }
 func (j judgeSwitch) JudgeModel(context.Context) (string, error) { return "", nil }
 func (j judgeSwitch) PRDLabel(context.Context) (string, error)   { return "", nil }
+func (j judgeSwitch) RunEligibleLabels(context.Context) ([]string, error) {
+	return nil, nil
+}
+func (j judgeSwitch) EligibleLabelWaivesPRDLink(context.Context) (bool, error) { return false, nil }
 
 // rerunReq builds POST /api/runs/{id}/rejudge authenticated as user. The path is inert
 // (chi params are injected by hand below, and RerunJudge is called directly), but it is

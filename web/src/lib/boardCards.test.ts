@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   canPromote,
   DEFAULT_BOARD_EXTRA_LABELS,
+  isEligibleCard,
   isMemberCard,
   isPRDCard,
   isSelfImproveTracker,
@@ -45,6 +46,28 @@ describe("isMemberCard", () => {
 
   it("matches nothing when the membership set is empty", () => {
     expect(isMemberCard(card(["PRD"]), [])).toBe(false);
+  });
+});
+
+describe("isEligibleCard", () => {
+  it("matches a card carrying ANY eligible label, exactly (any-of)", () => {
+    // The M4 eligible set ships as ["PRD", "bug"], so a bug card is runnable...
+    expect(isEligibleCard(card(["bug"]), ["PRD", "bug"])).toBe(true);
+    // ...and so is a primary card (the primary is always in the set).
+    expect(isEligibleCard(card(["PRD"]), ["PRD", "bug"])).toBe(true);
+    // A documentation card is a possible board MEMBER but is not eligible unless the
+    // admin adds it — visibility and eligibility are orthogonal (Decision 1/2).
+    expect(isEligibleCard(card(["documentation"]), ["PRD", "bug"])).toBe(false);
+    expect(isEligibleCard(card([]), ["PRD", "bug"])).toBe(false);
+  });
+
+  it("is an exact match, no case-folding, no prefix", () => {
+    expect(isEligibleCard(card(["Bug"]), ["PRD", "bug"])).toBe(false);
+    expect(isEligibleCard(card(["bug-ish"]), ["PRD", "bug"])).toBe(false);
+  });
+
+  it("matches nothing when the eligible set is empty", () => {
+    expect(isEligibleCard(card(["PRD"]), [])).toBe(false);
   });
 });
 
@@ -139,38 +162,52 @@ describe("isSelfImproveTracker", () => {
 });
 
 describe("canPromote", () => {
-  it("offers Promote only on an open, non-PRD, non-tracker card", () => {
-    expect(canPromote(card(["bug"]), "PRD")).toBe(true);
-    expect(canPromote(card([]), "PRD")).toBe(true);
+  // PRD #196 M4: canPromote keys off the ELIGIBLE set, not the primary alone. Promote is
+  // offered when a card is NOT runnable — Promote adds the primary and makes it runnable.
+  const eligible = ["PRD", "bug"];
+
+  it("offers Promote only on an open, non-eligible, non-tracker card", () => {
+    // documentation is not in the eligible set, so it is not runnable → Promote.
+    expect(canPromote(card(["documentation"]), eligible)).toBe(true);
+    expect(canPromote(card([]), eligible)).toBe(true);
   });
 
-  it("does not offer it on a card that is already uzi's work", () => {
-    expect(canPromote(card(["PRD"]), "PRD")).toBe(false);
+  it("does not offer it on a card that is already runnable (eligible)", () => {
+    // Already carries the primary...
+    expect(canPromote(card(["PRD"]), eligible)).toBe(false);
+    // ...or a non-primary eligible label (`bug`) — it runs, so Promote is a no-op.
+    expect(canPromote(card(["bug"]), eligible)).toBe(false);
+  });
+
+  it("DOES offer it on a bug card when bug is not in the eligible set", () => {
+    // Eligibility is admin-configured: with only the primary eligible, a bug card is
+    // not runnable and Promote is the way to make it so.
+    expect(canPromote(card(["bug"]), ["PRD"])).toBe(true);
   });
 
   it("does not offer it on the self-improve tracker (Decision 13a)", () => {
-    expect(canPromote(card([SELF_IMPROVE_LABEL]), "PRD")).toBe(false);
+    expect(canPromote(card([SELF_IMPROVE_LABEL]), eligible)).toBe(false);
   });
 
   it("STILL offers it on a card whose forge issue closed but has not been evicted", () => {
     // The window docs/board.md documents. During it the row is never re-upserted —
     // the PRD fetch is label-filtered and the additive fetch is StateOpened, so
-    // neither returns a closed non-PRD issue — so issues.state stays 'opened' and
+    // neither returns a closed non-eligible issue — so issues.state stays 'opened' and
     // cardDTO.Closed derives FALSE. The card therefore looks and behaves exactly as
     // it did before it closed, Promote included.
     //
     // This test exists because a code comment asserted the opposite (no button at
     // all) and survived three readers, partly by citing docs/board.md as
     // corroboration while contradicting it.
-    expect(canPromote(card(["bug"], false), "PRD")).toBe(true);
+    expect(canPromote(card(["documentation"], false), eligible)).toBe(true);
   });
 
   it("does not offer it on a closed card", () => {
     // Reachable only when a row was cached WHILE closed — which the state=all PRD
-    // fetch does — and then stopped matching prd_label, i.e. an operator rename while
+    // fetch does — and then stopped being eligible, i.e. an operator rename while
     // closed PRD cards are cached. Not reachable through the sync alone, and stated
     // that narrowly on purpose: the comment that used to claim this was the ordinary
     // post-close window was wrong.
-    expect(canPromote(card(["bug"], true), "PRD")).toBe(false);
+    expect(canPromote(card(["documentation"], true), eligible)).toBe(false);
   });
 });

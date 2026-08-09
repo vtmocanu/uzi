@@ -36,6 +36,7 @@ import { boundedChips, chipLabels, hoistLabels } from "../lib/labelChips";
 import {
   canPromote,
   DEFAULT_BOARD_EXTRA_LABELS,
+  isEligibleCard,
   isPRDCard,
   isSelfImproveTracker,
   SELF_IMPROVE_LABEL,
@@ -84,7 +85,8 @@ function columnLabel(card: CardData): string {
 export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel } = useAuth();
+  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel, runEligibleLabels, eligibleLabelWaivesPrdLink } =
+    useAuth();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1103,6 +1105,18 @@ export function Board() {
                   // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so
                   // they cannot fall into the "+N" overflow, and highlighted (mock §4).
                   const matchedExtras = resolvedExtras.filter((l) => card.labels.includes(l));
+                  // Run-eligibility (PRD #196 M4) drives the Start-vs-Promote affordance,
+                  // the solid-vs-quiet treatment and the PRDLESS toggle — NOT membership.
+                  // A `bug` card is eligible (mock §4) and runs; a visibility-only
+                  // `documentation` card is a member but not eligible (mock §7) and gets
+                  // Promote. The PRD-link waiver is scoped to NON-PRIMARY eligibility
+                  // (Decision 7): an issue eligible only via the primary still needs its
+                  // prds/*.md link, mirroring the server so the button matches the gate.
+                  const isEligible = isEligibleCard(card, runEligibleLabels);
+                  const eligibleByNonPrimary = card.labels.some(
+                    (l) => l !== prdLabel && runEligibleLabels.includes(l),
+                  );
+                  const prdLinkWaived = eligibleLabelWaivesPrdLink && eligibleByNonPrimary;
                   return (
                   <IssueCard
                     key={card.iid}
@@ -1169,6 +1183,7 @@ export function Board() {
                     gate={startRunGate({
                       hasPrdLink: card.has_prd_link,
                       prdlessBypass: prdlessEnabled && card.labels.includes(prdlessLabel),
+                      prdLinkWaived,
                       closed: card.closed,
                       hasWorker,
                       hasToken,
@@ -1183,8 +1198,8 @@ export function Board() {
                     prdlessBusy={prdlessBusy === card.iid}
                     onTogglePrdless={() => togglePrdless(card)}
                     prdLabel={prdLabel}
-                    isPRD={isPRDCard(card, prdLabel)}
-                    canPromote={canPromote(card, prdLabel)}
+                    isEligible={isEligible}
+                    canPromote={canPromote(card, runEligibleLabels)}
                     promoting={promoting === card.iid}
                     onPromote={() => promote(card)}
                     onDragStart={(e) => {
@@ -1289,7 +1304,7 @@ export function IssueCard({
   prdlessBusy,
   onTogglePrdless,
   prdLabel,
-  isPRD,
+  isEligible,
   canPromote: promotable,
   promoting,
   onPromote,
@@ -1343,13 +1358,15 @@ export function IssueCard({
   prdlessLabel: string;
   prdlessBusy: boolean;
   onTogglePrdless: () => void;
-  // PRD #102 M6. isPRD drives the treatment and the affordances; canPromote is the
-  // narrower question (open, not already PRD, not the self-improve tracker), so the
-  // two are separate props rather than one derived from the other on the card.
-  // prdLabel rides down for the button copy: the card names the CONFIGURED label,
+  // PRD #196 M4. isEligible drives the treatment and the affordances (was isPRD in M6):
+  // run-eligibility now keys off the admin-configured eligible SET, not the primary
+  // label alone, so a `bug` card is runnable and renders solid with Start run (mock §4).
+  // canPromote is the narrower question (open, not already eligible, not the self-improve
+  // tracker), so the two are separate props rather than one derived from the other on the
+  // card. prdLabel rides down for the button copy: the card names the CONFIGURED label,
   // like the prdless button beside it, so an instance that renamed it reads right.
   prdLabel: string;
-  isPRD: boolean;
+  isEligible: boolean;
   canPromote: boolean;
   promoting: boolean;
   onPromote: () => void;
@@ -1425,35 +1442,40 @@ export function IssueCard({
         //
         // border-faint is reused rather than invented: it is the app-wide
         // de-emphasised token, so a card wearing it reads as quiet, which is what a
-        // non-PRD card is. It collides with neither treatment Decision 17 ruled out —
-        // `loud` (the warn ring, reserved for a human-blocked run) nor opacity-40
+        // non-eligible card is. It collides with neither treatment Decision 17 ruled out
+        // — `loud` (the warn ring, reserved for a human-blocked run) nor opacity-40
         // (being dragged right now).
         //
-        // Second cue: the BUTTON below reads "Promote to PRD" where a PRD card reads
-        // "Start run". It is present on every non-PRD card the sync can produce,
-        // INCLUDING one that has closed on the forge and not yet been evicted.
+        // Second cue: the BUTTON below reads "Promote to PRD" where a runnable card
+        // reads "Start run". It is present on every non-eligible card the sync can
+        // produce, INCLUDING one that has closed on the forge and not yet been evicted.
+        // Under PRD #196 M4 "runnable" is the ELIGIBLE set, not the primary alone, so a
+        // `bug` card in an instance whose eligible set includes `bug` is runnable and
+        // reads "Start run"; the quiet/Promote treatment is for a MEMBER card that is
+        // not eligible (e.g. a visibility-only `documentation` card, mock §7).
         //
         // An earlier version of this comment claimed that window renders no button at
-        // all — promotable false, isPRD false. That was WRONG, and measured wrong:
-        // canPromote({labels:["bug"], closed:false}) is true. During the window the row
-        // is never re-upserted (the PRD fetch is label-filtered, the additive fetch is
-        // StateOpened, so neither returns a closed non-PRD issue), so issues.state
+        // all — promotable false, isEligible false. That was WRONG, and measured wrong:
+        // canPromote({labels:["documentation"], closed:false}, eligibleLabels) is true
+        // when documentation is not eligible. During the window the row is never
+        // re-upserted (the PRD fetch is label-filtered, the additive fetch is
+        // StateOpened, so neither returns a closed non-eligible issue), so issues.state
         // stays 'opened', cardDTO.Closed derives false, and the card renders Promote
         // exactly as it did before it closed. docs/board.md had this right all along —
         // and the false sentence closed by citing docs/board.md as corroboration,
         // which is what let it survive three readers.
         //
         // The state it described is real but is NOT reachable through the sync: it
-        // needs closed=true AND isPRD=false, i.e. a row cached while closed (only the
-        // state=all PRD fetch writes those) that later stops matching prd_label — an
+        // needs closed=true AND isEligible=false, i.e. a row cached while closed (only
+        // the state=all PRD fetch writes those) that later stops being eligible — an
         // operator rename while closed PRD cards are cached. Untested, and left
         // untested deliberately rather than asserted.
-        isPRD ? "bg-raised/80" : "border-dashed bg-transparent",
+        isEligible ? "bg-raised/80" : "border-dashed bg-transparent",
         // One border-color class per branch, never two: Tailwind utilities of equal
         // specificity resolve by the order they appear in the generated STYLESHEET,
         // not by their order in this string, so listing border-edge and border-faint
         // together would pick a winner nobody chose.
-        loud ? "border-warn/60 ring-2 ring-warn/40" : isPRD ? "border-edge" : "border-faint",
+        loud ? "border-warn/60 ring-2 ring-warn/40" : isEligible ? "border-edge" : "border-faint",
         draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
         dimmed && "opacity-40",
         // An INSET shadow, so the card's box size never changes and the lane does not
@@ -1679,7 +1701,7 @@ export function IssueCard({
         </div>
       ) : (
         !card.closed &&
-        isPRD && (
+        isEligible && (
           <div className="mt-2.5">
             <Button
               variant={gate.enabled ? "primary" : "secondary"}
@@ -1698,10 +1720,11 @@ export function IssueCard({
           applied (so it can be removed); hide the no-op case — has a PRD link and
           no label (S2).
 
-          D16 adds isPRD: on a non-PRD card the PRDLESS label grants nothing, because
-          run eligibility now requires the PRD label as well. A button that looks like
-          it does something and does not is worse than no button. */}
-      {prdlessEnabled && isPRD && !card.closed && (prdlessApplied || !card.has_prd_link) && (
+          D16 keys on isEligible (PRD #196 M4 widened it from isPRD): on a non-eligible
+          card the PRDLESS label grants nothing, because run eligibility gates the run
+          first. A button that looks like it does something and does not is worse than no
+          button. */}
+      {prdlessEnabled && isEligible && !card.closed && (prdlessApplied || !card.has_prd_link) && (
         <button
           type="button"
           draggable={false}

@@ -61,7 +61,7 @@ function renderCard(
   over: Partial<Card> = {},
   chips: string[] = [],
   maxChips?: number,
-  props: { isPRD?: boolean; canPromote?: boolean; promoting?: boolean; onPromote?: () => void } = {},
+  props: { isEligible?: boolean; canPromote?: boolean; promoting?: boolean; onPromote?: () => void } = {},
 ) {
   return render(
     <MemoryRouter>
@@ -86,7 +86,7 @@ function renderCard(
         prdlessBusy={false}
         onTogglePrdless={vi.fn()}
         prdLabel="PRD"
-        isPRD={props.isPRD ?? true}
+        isEligible={props.isEligible ?? true}
         canPromote={props.canPromote ?? false}
         promoting={props.promoting ?? false}
         onPromote={props.onPromote ?? vi.fn()}
@@ -266,6 +266,8 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
       autopilotLabel: "autopilot",
       prdlessLabel: "PRDLESS",
       prdlessEnabled: false,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -395,6 +397,8 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
       autopilotLabel: "autopilot",
       prdlessLabel: "PRDLESS",
       prdlessEnabled: false,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -964,6 +968,8 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
       autopilotLabel: "autopilot",
       prdlessLabel: "PRDLESS",
       prdlessEnabled: true,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
@@ -1169,66 +1175,114 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   // by stylesheet order, not class-attribute order, so a card carrying both
   // border-edge and border-faint would pick a winner nobody chose — and would look
   // correct in the class list.
-  it("draws a non-PRD card with the contrast-clearing border token (Decision 17)", async () => {
+  // Minimal preconditions so the missing PRD link is the ONLY thing a gate could block
+  // on. The Board only reads workers.length and hasAnthropicToken(secrets).
+  const withWorkerAndToken = () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as import("../lib/api").Worker] });
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [{ kind: "anthropic_token" } as unknown as import("../lib/api").SecretMeta],
+    });
+  };
+  const cardOf = (title: string) =>
+    screen.getByRole("link", { name: title }).closest("div[class*='rounded-lg']") as HTMLElement;
+
+  it("draws a non-eligible card quiet and an eligible bug card solid (Decision 17, PRD #196 M4)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    // issue two (bug) is a default extra, so it is on the board without any toggle.
-
-    const cardOf = (title: string) =>
-      screen.getByRole("link", { name: title }).closest("div[class*='rounded-lg']") as HTMLElement;
+    // Show all brings the unlabelled issue four (a non-eligible card) onto the board.
+    clickShowAll();
 
     // classList, not className: these are TOKEN assertions, and a substring check
     // reports "border-edge" present on any card carrying hover:border-edge-strong,
     // which every draggable card does. That is not hypothetical — the first version
     // of this test failed for exactly that reason against correct markup.
-    const nonPRD = cardOf("issue two");
-    expect(nonPRD.classList.contains("border-dashed")).toBe(true);
-    expect(nonPRD.classList.contains("border-faint")).toBe(true);
-    expect(nonPRD.classList.contains("border-edge")).toBe(false);
+    const nonEligible = cardOf("issue four");
+    expect(nonEligible.classList.contains("border-dashed")).toBe(true);
+    expect(nonEligible.classList.contains("border-faint")).toBe(true);
+    expect(nonEligible.classList.contains("border-edge")).toBe(false);
 
-    // An ordinary card is untouched: still solid, still border-edge.
+    // issue two (bug) is RUNNABLE now — the eligible set includes bug — so it renders
+    // SOLID like a PRD card (mock §4), not dashed.
+    const bug = cardOf("issue two");
+    expect(bug.classList.contains("border-edge")).toBe(true);
+    expect(bug.classList.contains("border-faint")).toBe(false);
+    expect(bug.classList.contains("border-dashed")).toBe(false);
+
+    // An ordinary PRD card is untouched: still solid, still border-edge.
     const prd = cardOf("issue one");
     expect(prd.classList.contains("border-edge")).toBe(true);
     expect(prd.classList.contains("border-faint")).toBe(false);
     expect(prd.classList.contains("border-dashed")).toBe(false);
   });
 
-  it("offers Promote instead of Start run on a non-PRD card (Decision 15)", async () => {
+  it("offers Start run on eligible cards and Promote on the non-eligible one (Decision 15, PRD #196 M4)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
     clickShowAll();
     const lane = screen.getByText("Backlog").parentElement!.parentElement!;
-    // Three PRD cards offer Start run; the two non-PRD ones offer Promote instead.
-    expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(3);
-    expect(within(lane).getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(2);
+    // Eligible cards (1,3,5 PRD + 2 bug) offer Start run; the unlabelled #4 is the only
+    // non-eligible card and offers Promote instead.
+    expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(4);
+    expect(within(lane).getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(1);
   });
 
-  it("does not offer the PRDLESS toggle on a non-PRD card (Decision 16)", async () => {
-    // prdlessEnabled is true in this describe, and card 2 has no PRD link — the exact
-    // shape that WOULD show the button on a PRD card. It grants nothing here, because
-    // run eligibility also requires the PRD label.
+  it("makes Start ENABLED on a bug card with no PRD link when the waiver is on (PRD #196 M4)", async () => {
+    // The waiver mirrors the server: an issue eligible via a NON-PRIMARY label does not
+    // need a prds/*.md link. With a worker + token, the missing link is the only thing
+    // that could block, and the waiver clears it.
+    withWorkerAndToken();
     renderBoard();
     await screen.findByText("Backlog");
-    // card 2 (bug) is a default extra, so it is on the board with no toggle.
-    expect(screen.queryByRole("button", { name: /Mark PRDLESS/ })).toBeNull();
+    // card 2 (bug, has_prd_link:false) is a default extra → on the board.
+    const start = within(cardOf("issue two")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
+  });
+
+  it("GATES the same bug card when eligibleLabelWaivesPrdLink is false (PRD #196 M4)", async () => {
+    // The scope proof: turn the waiver off and the no-link bug card is blocked again,
+    // while a PRD card with a link is unaffected.
+    vi.mocked(useAuth).mockReturnValue({
+      ...vi.mocked(useAuth)(),
+      eligibleLabelWaivesPrdLink: false,
+    } as unknown as ReturnType<typeof useAuth>);
+    withWorkerAndToken();
+    renderBoard();
+    await screen.findByText("Backlog");
+    const bugStart = within(cardOf("issue two")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
+    await waitFor(() => expect(bugStart.disabled).toBe(true));
+    const prdStart = within(cardOf("issue one")).getByRole("button", { name: /Start run/ }) as HTMLButtonElement;
+    expect(prdStart.disabled).toBe(false);
+  });
+
+  it("offers the PRDLESS toggle on an eligible card, not on a non-eligible one (Decision 16, PRD #196 M4)", async () => {
+    // prdlessEnabled is true in this describe. card 2 (bug) is eligible and has no PRD
+    // link — the shape that shows the toggle. The unlabelled card 4 is not eligible, so
+    // the toggle grants nothing and is hidden even once show-all reveals the card.
+    renderBoard();
+    await screen.findByText("Backlog");
+    // card 2 (bug) is a default extra → on the board; eligible → toggle shown.
+    expect(screen.getByRole("button", { name: /Mark PRDLESS/ })).toBeTruthy();
+    clickShowAll();
+    // Still exactly one Mark PRDLESS (card 2's) — the non-eligible card 4 does not get one.
+    expect(screen.getAllByRole("button", { name: /Mark PRDLESS/ })).toHaveLength(1);
   });
 
   it("promotes forge-first and adopts the returned card", async () => {
+    // Promote the only non-eligible card, the unlabelled #4.
+    mockApi.promoteIssue.mockResolvedValue({
+      card: aCard({ iid: 4, title: "issue four", column: "", labels: ["PRD"] }),
+    });
     renderBoard();
     await screen.findByText("Backlog");
-    // Show all so both non-PRD cards (2 and 4) are on the board, giving two Promote
-    // buttons — the shape the length assertion below depends on.
+    // Show all so the non-eligible card 4 is on the board with its Promote button.
     clickShowAll();
-    fireEvent.click(screen.getAllByRole("button", { name: /Promote to PRD/ })[0]);
-    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 2));
-    // Wait on the PROMOTED card losing its button, not on "a Promote button exists":
-    // the other non-PRD card still has one, so the weaker wait resolves immediately
-    // and the assertion below then races the state update. Two remained before, one
-    // remains after.
-    await waitFor(() => expect(screen.getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(1));
-    // The card is now an ordinary PRD card, so it survives show-all going back off.
+    fireEvent.click(screen.getByRole("button", { name: /Promote to PRD/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 4));
+    // The promoted card is now an ordinary PRD card, so its Promote button is gone.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull());
+    // …and it survives show-all going back off (it is a member by primary now).
     clickShowAll();
-    expect(titles()).toContain("issue two");
+    expect(titles()).toContain("issue four");
   });
 });
 
@@ -1262,6 +1316,8 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
       autopilotLabel: "autopilot",
       prdlessLabel: "PRDLESS",
       prdlessEnabled: false,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
       theme: "ember",
       themeOverride: null,
       defaultTheme: "ember",
