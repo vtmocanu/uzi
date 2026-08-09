@@ -254,6 +254,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/auth/logout", noLimiter},
 	{"POST", "/api/auth/register", noLimiter},
 	{"POST", "/api/chats/", limChat},
+	{"POST", "/api/chats/run-requests", limForge},
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},
@@ -518,6 +519,44 @@ func describeLimiter(name string) string {
 //   - reordering main's ARGUMENTS is genuinely invisible here, because this test
 //     builds its own call with its own ordering and never reads main's.
 //     TestRoutesCallSitePassesLimitersInLimiterNamesOrder covers that one.
+//
+// ChatCreateRoutePattern must be the REAL mounted pattern of POST /chats, and it
+// must carry the chat limiter. The Slack chat opener (PRD #191 Decision 9) composes
+// its shared-budget key from this constant, so a route rename that left the constant
+// stale would silently split the web/Slack budget in two. This walks the real router
+// (not wantRouteMounts) so the pin cannot become a tautology.
+func TestChatCreateRoutePatternMatchesMount(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
+	routes := router.(chi.Routes)
+
+	p := &prober{}
+	var found bool
+	if err := chi.Walk(routes, func(method, pattern string, _ http.Handler, mws ...func(http.Handler) http.Handler) error {
+		if method != "POST" || pattern != ChatCreateRoutePattern {
+			return nil
+		}
+		found = true
+		got, err := p.perUserLimiterOn(mws)
+		if err != nil {
+			t.Errorf("%s %s: %v", method, pattern, err)
+			return nil
+		}
+		if got != limChat {
+			t.Errorf("POST %s carries %s, want the chat limiter — the Slack opener keys off this route",
+				ChatCreateRoutePattern, describeLimiter(got))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk the route table: %v", err)
+	}
+	if !found {
+		t.Fatalf("ChatCreateRoutePattern %q is not a mounted POST route — the Slack chat opener would draw from a bucket the web page never touches", ChatCreateRoutePattern)
+	}
+}
+
 func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	limiters := newProbeLimiters()
 	// Hosting on, so the controller routes exist and the table is unconditional.

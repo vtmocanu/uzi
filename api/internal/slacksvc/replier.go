@@ -46,6 +46,10 @@ type ReplierStore interface {
 	// replies both pass the status guard — the CAS clears revise_pending only if the
 	// anchor still shows it at the same gate_ts, so exactly one reply wins.
 	SetSlackRunGateIf(ctx context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error)
+	// InsertSlackChatAnchor records the DM anchor for a Slack-originated chat (PRD
+	// #191 M2): root_ts is the user's opening message, status_ts the bot's status
+	// message (Decision 2).
+	InsertSlackChatAnchor(ctx context.Context, arg store.InsertSlackChatAnchorParams) (store.SlackRunMessage, error)
 }
 
 // gateNudgeText is the bare-reply nudge shown while the gate is open but takes no
@@ -86,7 +90,20 @@ type Replier struct {
 	mu      sync.Mutex
 	inbound map[string]*floodWindow // per-Slack-user flood window
 	told    map[string]time.Time    // per (user, notice-kind) coalesce memory
+
+	// chatAllow draws the opener from the SHARED per-user chat spend budget (PRD #191
+	// Decision 9): main wires it to chatLimiter.Allow keyed identically to the web
+	// CreateChat route, so a heavy Slack day rate-limits the web Chat page and vice
+	// versa. Nil (tests, or a deployment that never wires it) means unlimited — the
+	// opener never blocks on a missing guard.
+	chatAllow func(userID uuid.UUID) bool
 }
+
+// SetChatSpendGuard wires the per-user chat spend guard for the top-level-DM opener
+// (PRD #191 M2, Decision 9). Call once at startup, before the socket manager serves;
+// pass a closure over the SAME chatLimiter the web /chats route mounts, keyed
+// identically, so web and Slack share one budget.
+func (r *Replier) SetChatSpendGuard(allow func(userID uuid.UUID) bool) { r.chatAllow = allow }
 
 type floodWindow struct {
 	count int
@@ -132,6 +149,15 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		return
 	}
 
+	// A top-level DM (no thread_ts) is NOT a reply to a run — it opens a new chat
+	// conversation (PRD #191 M2, Decision 1/3). Continuing an existing chat happens by
+	// replying IN its thread, which carries a thread_ts and falls through to the
+	// anchor-resolution path below.
+	if strings.TrimSpace(m.ThreadTS) == "" {
+		r.openChat(ctx, m, user)
+		return
+	}
+
 	// Resolve the run anchored at this thread (thread_ts == root_ts). No anchor →
 	// the reply isn't under a run DM; ignore silently. (channel_id, root_ts) is
 	// effectively unique: each run posts its OWN root message, so its ts is distinct
@@ -157,6 +183,15 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	}
 
 	text := boundReply(m.Text)
+
+	// Chat runs branch BEFORE the status switch (PRD #191 Decision 5). A chat's status
+	// is queued/claimed/running, which would land in the default: arm and submit a raw
+	// follow_up — which the service now REJECTS for a chat run (ErrChatInputNotAllowed).
+	// Route the reply through SubmitChatMessage so it becomes a turn, not a 409.
+	if run.Kind == runKindChat {
+		r.submitChatTurn(ctx, m, user.ID, anchor, text)
+		return
+	}
 
 	switch {
 	case run.Status == "awaiting_approval" && anchor.GateState.Valid && anchor.GateState.String == gateStateRevisePending:

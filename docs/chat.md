@@ -8,9 +8,14 @@ audience: user
 
 The **Chat** page lets you talk to uzi about itself: what it can do, how a
 feature works, why one of your runs failed, and turn an idea into a GitLab
-issue without leaving the app. The conversation is answered by an agent
+issue or a run without leaving the app. The conversation is answered by an agent
 running on **your own worker**, billed to **your own Anthropic token** — the
 same worker that executes your runs.
+
+The Chat page is not the only way in: if you have [Slack](./slack.md) linked, a
+direct message to the uzi bot opens the **same** conversation, streamed back
+into a thread. Everything below applies to both — same worker, same token, same
+human-confirmed cards for filing an issue or starting a run.
 
 Specifically, chat always spends your **default** token, even on a worker you
 have bound to a different one: the binding covers that worker's *runs*, not

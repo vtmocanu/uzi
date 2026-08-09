@@ -1,9 +1,10 @@
 import { useMemo } from "react";
-import type { IssueProposal, RunMessage } from "../lib/api";
+import type { IssueProposal, RunMessage, RunRequest } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
 import { buildToolIndex, RunEventRow } from "./RunEvent";
 import { Markdown } from "./Markdown";
 import { ProposalCard } from "./ProposalCard";
+import { RunRequestCard } from "./RunRequestCard";
 import { cx } from "./ui";
 
 // ChatMessages renders a chat conversation as bubbles over the SAME persisted,
@@ -135,6 +136,17 @@ function ChatRow({
       <div className="flex justify-start">
         <div className="w-full max-w-[92%]">
           <ProposalCard chatId={chatId} proposal={proposal} />
+        </div>
+      </div>
+    );
+  }
+
+  if (msg.kind === "run_request") {
+    const request = msg.payload as RunRequest;
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%]">
+          <RunRequestCard request={request} />
         </div>
       </div>
     );

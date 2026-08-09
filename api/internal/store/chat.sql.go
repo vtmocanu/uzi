@@ -516,6 +516,95 @@ func (q *Queries) GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (
 	return resume_session_id, err
 }
 
+const getLiveChatForUser = `-- name: GetLiveChatForUser :one
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id FROM runs
+WHERE user_id = $1 AND kind = 'chat'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+// The user's newest NON-TERMINAL chat run (PRD #191 M2, Decision 3). A second
+// top-level Slack DM while a chat is already live is refused with a threaded pointer
+// rather than minting a second run that would queue behind a conversation that will
+// not idle out for over an hour (WORKER_CHAT_SESSIONS=1). Terminal statuses
+// (completed/failed/cancelled) do not count; ErrNoRows = no live chat, so open one.
+func (q *Queries) GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (Run, error) {
+	row := q.db.QueryRow(ctx, getLiveChatForUser, userID)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+	)
+	return i, err
+}
+
 const getRepoIDByPathForUser = `-- name: GetRepoIDByPathForUser :one
 SELECT r.id
 FROM repos r

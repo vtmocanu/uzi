@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,6 +23,10 @@ import (
 // *store.Queries satisfies it.
 type NotifierStore interface {
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
+	// GetSlackChatContext is the repo-less context for a CHAT run (PRD #191 M2b): the
+	// notifier falls back to it on the run-context ErrNoRows so a Slack-anchored chat's
+	// terminal transitions reach the DM. A non-chat id returns ErrNoRows.
+	GetSlackChatContext(ctx context.Context, runID uuid.UUID) (store.GetSlackChatContextRow, error)
 	GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
 	UpsertSlackRunMessage(ctx context.Context, arg store.UpsertSlackRunMessageParams) (store.SlackRunMessage, error)
@@ -88,6 +93,12 @@ type Poster interface {
 // rather than block the request path (Slack is strictly best-effort).
 const notifierQueue = 256
 
+// notifierMsgQueue bounds the chat message-frame backlog (PRD #191 M3). Larger than
+// notifierQueue because a chat turn emits many text frames; still bounded and
+// drop-when-full (Slack streaming is best-effort — a dropped frame at worst strands a
+// placeholder the deep link and the terminal status line still cover).
+const notifierMsgQueue = 1024
+
 // Notifier turns run state transitions into per-owner Slack DMs (PRD #25 M3). It
 // implements workersvc.Broadcaster: PublishState enqueues and returns
 // immediately (never blocks the run lifecycle), and a drain goroutine does the
@@ -108,6 +119,20 @@ type Notifier struct {
 	// share none of the state path's run/repo rendering.
 	notifyCh chan notifyEvent
 	healthCh chan healthEvent
+	// msgCh carries chat run message frames for turn streaming (PRD #191 M3). A
+	// SEPARATE queue from ch: message frames are higher-volume than state transitions
+	// and their consumer is a parallel path (chatpost.go) that never touches the
+	// repo-ful renderer.
+	msgCh chan chatMsgEvent
+	// chatConvos holds per-chat-run turn-coalescing state, OWNED BY the drain goroutine
+	// (single-threaded, no lock). A present-but-nil value is the "known non-chat / no
+	// anchor — skip" marker, set once so later frames for that run drop in O(1).
+	chatConvos map[uuid.UUID]*chatConvo
+	// chatDecided mirrors the skip decision for PublishMessage's hot path (called from
+	// worker request goroutines), so a busy issue run stops enqueuing message frames
+	// after the drain has classified it. sync.Map because it is written by the drain and
+	// read by many publishers.
+	chatDecided sync.Map
 }
 
 type stateEvent struct {
@@ -142,13 +167,15 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 		logger = slog.Default()
 	}
 	return &Notifier{
-		store:    s,
-		poster:   poster,
-		baseURL:  baseURL,
-		logger:   logger,
-		ch:       make(chan stateEvent, notifierQueue),
-		notifyCh: make(chan notifyEvent, notifierQueue),
-		healthCh: make(chan healthEvent, notifierQueue),
+		store:      s,
+		poster:     poster,
+		baseURL:    baseURL,
+		logger:     logger,
+		ch:         make(chan stateEvent, notifierQueue),
+		notifyCh:   make(chan notifyEvent, notifierQueue),
+		healthCh:   make(chan healthEvent, notifierQueue),
+		msgCh:      make(chan chatMsgEvent, notifierMsgQueue),
+		chatConvos: make(map[uuid.UUID]*chatConvo),
 	}
 }
 
@@ -174,9 +201,27 @@ func (n *Notifier) PublishState(runID uuid.UUID, status string) {
 	}
 }
 
-// PublishMessage is a deliberate no-op: run message CONTENT never goes to Slack
-// (content minimization — only status/title/links do).
-func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, string, string, []byte, time.Time) {
+// PublishMessage streams a CHAT run's turns into its Slack thread (PRD #191 M3), and
+// stays a no-op for every other run kind (content minimization: an issue/ci_fix run's
+// message content never goes to Slack). It MUST NOT block the worker's message-append
+// path: it filters to the frames a chat turn is built from, skips runs the drain has
+// already classified non-chat, and enqueues (dropping if full). The drain
+// (handleChatMsg) resolves runs.kind and coalesces the turn — kind here is the MESSAGE
+// kind, not the run kind, so the run-kind decision cannot be made on this hot path.
+func (n *Notifier) PublishMessage(runID uuid.UUID, _ int32, kind, _, _, _ string, payload []byte, _ time.Time) {
+	if !chatRelevantKind(kind) {
+		return
+	}
+	// A run already classified non-chat stops enqueuing here, so a busy issue run does
+	// not flood the queue with frames the drain would only drop.
+	if v, ok := n.chatDecided.Load(runID); ok && !v.(bool) {
+		return
+	}
+	select {
+	case n.msgCh <- chatMsgEvent{runID: runID, kind: kind, payload: payload}:
+	default:
+		n.logger.Warn("slack: notifier msg queue full, dropping chat frame", "run", runID.String())
+	}
 }
 
 // PublishInput is a deliberate no-op (PRD #95): the steer-queue delivery ack is a
@@ -210,6 +255,8 @@ func (n *Notifier) Run(ctx context.Context) {
 			n.handleNotify(ctx, ev)
 		case hev := <-n.healthCh:
 			n.handleHealth(ctx, hev)
+		case mev := <-n.msgCh:
+			n.handleChatMsg(ctx, mev)
 		}
 	}
 }
@@ -277,15 +324,24 @@ func notifyLink(url string) string {
 // post the root DM (first time) or edit it and thread the outcome. Every failure
 // path logs redacted and returns — a run is never affected.
 func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
+	// On a terminal transition — for EVERY run kind — free any chat turn-streaming
+	// state so the maps track only in-flight runs (PRD #191 M3). Deferred so it runs
+	// after the render/handleChat below on all paths; a frame that trails this is caught
+	// by setupChatConvo's terminal check + the evict-cap.
+	if isTerminalStatus(ev.status) {
+		defer n.evictChatConvo(ev.runID)
+	}
 	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
 	if err != nil {
-		// No row for a chat run (PRD #39): GetSlackRunContext INNER-JOINs repos, and a
-		// chat run has no repo (repo_id NULL), so it returns ErrNoRows here. Chat
-		// transitions have no repo-scoped DM to send — skip silently (as for a run
-		// deleted out from under us), never a noisy error per chat transition.
-		if !errors.Is(err, pgx.ErrNoRows) {
-			n.logf("load run context", err)
+		// No row: GetSlackRunContext INNER-JOINs repos, so a repo-less run yields
+		// ErrNoRows here. A CHAT run (PRD #191 M2b) may still have a Slack-anchored DM
+		// to update — fall back to the repo-less chat path. A judge/self_improve run,
+		// or a run deleted out from under us, is not a chat and skips silently there.
+		if errors.Is(err, pgx.ErrNoRows) {
+			n.handleChat(ctx, ev)
+			return
 		}
+		n.logf("load run context", err)
 		return
 	}
 	// PRD #46 Decision 6: a judge or self_improve run's OWN state transitions are not
@@ -354,6 +410,84 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 
 	n.handleGate(ctx, rc, anchor, base)
 	n.handleQuestion(ctx, rc, anchor, base)
+}
+
+// handleChat renders a Slack-anchored chat run's status line on a state transition
+// (PRD #191 M2b). It is a PARALLEL path to handle's repo-ful renderer: a chat has no
+// repo, forge, issue identity or deep link, so nothing downstream of GetSlackRunContext
+// applies, and the anchor already knows the DM channel (no delivery-target resolution —
+// a user who opened a chat in Slack is confirmed and wants the reply).
+//
+// It edits the bot's OWN status message (status_ts), NEVER the user's root_ts message
+// (Decision 2: a bot cannot edit a user's message). A chat with no anchor is
+// web-originated and keeps skipping exactly as before. Only terminal transitions render
+// a line today (renderChatStatus returns "" otherwise) — the opener posted the initial
+// status and M3 streams the turns. All best-effort: a failure is logged and never
+// affects the run.
+func (n *Notifier) handleChat(ctx context.Context, ev stateEvent) {
+	cc, err := n.store.GetSlackChatContext(ctx, ev.runID)
+	if err != nil {
+		// Not a chat (a judge/self_improve run, or one deleted under us) → the original
+		// silent skip; a real DB error is logged.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("load chat context", err)
+		}
+		return
+	}
+	line := renderChatStatus(cc)
+	if line == "" {
+		return // non-terminal chat state: the opener + M3 own the live view
+	}
+	// (The turn-streaming state is freed by handle's deferred evictChatConvo, which
+	// fires for every terminal transition regardless of kind.)
+	anchor, err := n.store.GetSlackRunMessage(ctx, ev.runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return // web-originated chat, no Slack DM → skip exactly as before
+	}
+	if err != nil {
+		n.logf("load chat anchor", err)
+		return
+	}
+	if !anchor.StatusTs.Valid || anchor.StatusTs.String == "" {
+		// No bot status message to edit (the open-time post failed, a rare case). We do
+		// NOT post a fresh line here: a new Post would bypass the opt-out/deactivation
+		// gate the issue path honours (a status edit only finishes a message already in
+		// the DM the user opened) and would have no dedup key, so a redelivered terminal
+		// transition would duplicate it. The run stays visible in the web Chat page.
+		return
+	}
+	// Edit the bot status message in place, swapping the End button for a Continue
+	// button (PRD #191 M6): a terminal chat offers Continue, which mints a fresh chat
+	// resuming this one. NEVER Update root_ts (the user's message). A redelivered
+	// terminal transition is an idempotent edit-to-same-blocks.
+	if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.StatusTs.String,
+		ScrubSecrets(line), chatEndedStatusBlocks(ev.runID, ScrubSecrets(line))); err != nil {
+		n.logf("update chat status", err)
+	}
+}
+
+// renderChatStatus is the chat status line for a transition, or "" for a non-terminal
+// state the notifier does not narrate (PRD #191 M2b). Terminal states get a short,
+// content-minimized line; a failure reason is included but scrubbed by the caller.
+func renderChatStatus(cc store.GetSlackChatContextRow) string {
+	switch cc.Status {
+	case "completed":
+		// Idle backstop (CHAT_IDLE_TIMEOUT) or the turn cap (CHAT_MAX_TURNS): both land
+		// the run in completed. Continue picks it back up.
+		return "✅ This conversation ended (it went quiet, or hit its turn limit). Continue it to pick up where it left off."
+	case "cancelled":
+		return "🛑 You ended this conversation. Continue it to pick up where it left off."
+	case "failed":
+		msg := "⚠️ This chat run failed."
+		if cc.FailureReason.Valid {
+			if reason := strings.TrimSpace(cc.FailureReason.String); reason != "" {
+				msg += " " + reason
+			}
+		}
+		return msg + " You can Continue it to try again."
+	default:
+		return ""
+	}
 }
 
 // handleQuestion posts a clarification question into the run's DM thread when the run
