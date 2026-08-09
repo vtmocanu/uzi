@@ -158,6 +158,20 @@ JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the MR/PR noun (PRD #65 D2); repo-ful runs only, same rows the repos join already keeps
 WHERE r.id = $1;
 
+-- name: GetSlackChatContext :one
+-- The repo-less context the notifier renders a CHAT run's status line from (PRD #191
+-- M2b). GetSlackRunContext INNER-JOINs repos and forge_connections, so a chat run
+-- (repo_id NULL) returns no row there and its terminal transitions — idle-complete,
+-- turn-cap complete, failed — were silently dropped. This query joins nothing, is
+-- keyed by run id, and is filtered to kind='chat' so a non-chat id returns ErrNoRows
+-- (the notifier consults it ONLY on the run-context ErrNoRows fallback). It carries no
+-- repo/forge/deep-link fields because a chat has none; the anchor supplies the channel.
+-- Content-minimized: the status line names no title/identity, so nothing beyond the
+-- status + failure reason is projected.
+SELECT id, user_id, status, kind, failure_reason
+FROM runs
+WHERE id = $1 AND kind = 'chat';
+
 -- name: GetSlackRunMessage :one
 -- The DM anchor for a run (threading + edit target). Absent = not yet notified.
 SELECT * FROM slack_run_messages WHERE run_id = $1;

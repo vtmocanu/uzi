@@ -41,10 +41,25 @@ type fakeNotifStore struct {
 	// call is captured so a test can assert the advanced count was recorded (or that a
 	// deduped/no-milestone report recorded nothing).
 	milestoneSet []store.SetSlackRunMilestoneNotifiedParams
+	// PRD #191 M2b: the repo-less chat context the notifier falls back to. chatCtxErr
+	// defaults to pgx.ErrNoRows via the method below when no row is staged, modelling a
+	// non-chat run.
+	chatCtx    store.GetSlackChatContextRow
+	chatCtxSet bool
+	chatCtxErr error
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
 	return f.rc, f.rcErr
+}
+func (f *fakeNotifStore) GetSlackChatContext(context.Context, uuid.UUID) (store.GetSlackChatContextRow, error) {
+	if f.chatCtxErr != nil {
+		return store.GetSlackChatContextRow{}, f.chatCtxErr
+	}
+	if !f.chatCtxSet {
+		return store.GetSlackChatContextRow{}, pgx.ErrNoRows // not a chat run
+	}
+	return f.chatCtx, nil
 }
 func (f *fakeNotifStore) GetSlackDeliveryForUser(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.delivery, f.deliveryErr

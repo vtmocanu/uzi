@@ -123,6 +123,42 @@ func (q *Queries) GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]
 	return payload, err
 }
 
+const getSlackChatContext = `-- name: GetSlackChatContext :one
+SELECT id, user_id, status, kind, failure_reason
+FROM runs
+WHERE id = $1 AND kind = 'chat'
+`
+
+type GetSlackChatContextRow struct {
+	ID            uuid.UUID   `json:"id"`
+	UserID        uuid.UUID   `json:"user_id"`
+	Status        string      `json:"status"`
+	Kind          string      `json:"kind"`
+	FailureReason pgtype.Text `json:"failure_reason"`
+}
+
+// The repo-less context the notifier renders a CHAT run's status line from (PRD #191
+// M2b). GetSlackRunContext INNER-JOINs repos and forge_connections, so a chat run
+// (repo_id NULL) returns no row there and its terminal transitions — idle-complete,
+// turn-cap complete, failed — were silently dropped. This query joins nothing, is
+// keyed by run id, and is filtered to kind='chat' so a non-chat id returns ErrNoRows
+// (the notifier consults it ONLY on the run-context ErrNoRows fallback). It carries no
+// repo/forge/deep-link fields because a chat has none; the anchor supplies the channel.
+// Content-minimized: the status line names no title/identity, so nothing beyond the
+// status + failure reason is projected.
+func (q *Queries) GetSlackChatContext(ctx context.Context, id uuid.UUID) (GetSlackChatContextRow, error) {
+	row := q.db.QueryRow(ctx, getSlackChatContext, id)
+	var i GetSlackChatContextRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Status,
+		&i.Kind,
+		&i.FailureReason,
+	)
+	return i, err
+}
+
 const getSlackDeliveryForUser = `-- name: GetSlackDeliveryForUser :one
 SELECT slack_resolved_id
 FROM users
