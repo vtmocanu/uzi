@@ -33,7 +33,7 @@ implementation onto the lead's own thread instead of delegating to a fully
 write-capable `coder`. Nothing forced the run to have tested the claim before
 persisting it, and nothing on the reader side singled out that specific entry
 as unverified. PRD #266
-([../prds/266-agent-memory-provenance.md](../prds/266-agent-memory-provenance.md))
+([../prds/done/266-agent-memory-provenance.md](../prds/done/266-agent-memory-provenance.md))
 closes both gaps.
 
 ## Provenance: `basis` and `evidence`
@@ -43,7 +43,7 @@ closes both gaps.
 
 - **`observed`** — the claim is backed by something nameable: a tool result,
   a command's output, a `file:line`. The pointer goes in the optional
-  `evidence` field (a short string, capped like the other fields — a
+  `evidence` field (a short string, byte-capped like the title (200 bytes) — a
   `file:line`, a command, a tool name, not prose).
 - **`inferred`** — anything else, including an omitted `basis`, which
   defaults to `inferred` rather than being trusted by default.
@@ -108,6 +108,6 @@ visibility and removal of an entry you've decided not to trust.
   never fails the run** (PRD #90). The tool reports it as a clear,
   non-fatal message and the run continues.
 
-See [../prds/266-agent-memory-provenance.md](../prds/266-agent-memory-provenance.md)
+See [../prds/done/266-agent-memory-provenance.md](../prds/done/266-agent-memory-provenance.md)
 for the full design record, including the incident's file:line citations and
 the milestone-by-milestone build.

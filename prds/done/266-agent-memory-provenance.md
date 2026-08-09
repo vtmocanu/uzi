@@ -1,7 +1,7 @@
 # PRD #266: Trustworthy agent memory — evidence-gated `save_memory` and roster tool-awareness
 
 **GitLab Issue**: [vtmocanu/uzi#266](https://gitlab.example.com/vtmocanu/uzi/-/issues/266)
-**Status**: Draft — architect-reviewed 2026-08-09 (all four citations verified clean; applied F1 read-side-framing correction, F2 plan-turn-strip trap, F3/F4 touchpoint pins, F5/F7/F9 tightenings).
+**Status**: Complete — implemented and reviewed 2026-08-09 (M1–M5 landed on `agent/issue-266`; roster tool-awareness, evidence-gated `save_memory`, provenance persistence + per-entry read-side marker, config-claim nudge, and docs; each milestone reviewed and its gate green).
 **Priority**: High
 **Created**: 2026-08-09
 **Related**: PRD #90 (agent memory, `save_memory`), PRD #174 (memory-relevance-retrieval — adjacent but distinct: relevance is *which* memory surfaces, this is *how much to trust* one), PRD #203 (plan-turn tool stripping), `agent/src/agents.ts`, `agent/src/memory-tools.ts`, `agent/src/prompt.ts`
@@ -128,7 +128,7 @@ M1 in the roster/prompt seam, M2 in `memory-tools.ts`). Phase 2 runs **M3 ‖ M4
 needing M2's `basis` field — M3 persists and surfaces it, M4 adds the nudge. Phase 3 is
 **M5** (docs + cleanup), after M3. Each milestone is independently testable.
 
-- [ ] **M1 — Roster tool-awareness.** The lead's per-turn roster names each invokable
+- [x] **M1 — Roster tool-awareness.** The lead's per-turn roster names each invokable
       subagent **with its write capability** (at least "can edit files"), surfaced through
       `delegatesLine`/`buildLeadSystemPrompt` (`prompt.ts`). **The capability MUST be
       derived from the pre-strip `assembled.subagents` (implement-turn defs), NOT from the
@@ -142,7 +142,7 @@ needing M2's `basis` field — M3 persists and surfaces it, M4 adds the nudge. P
       write tools**; the injected lead prompt for a roster including `coder` names it as
       able to edit files.
 
-- [ ] **M2 — `save_memory` provenance contract.** Extend the tool schema from
+- [x] **M2 — `save_memory` provenance contract.** Extend the tool schema from
       `{title, body}` to add `basis: "observed" | "inferred"` and an optional short
       `evidence` pointer; the tool prompt requires the writer to state which and to
       prefer reading runtime/config facts over remembering them. **Verified**: a save
@@ -150,7 +150,7 @@ needing M2's `basis` field — M3 persists and surfaces it, M4 adds the nudge. P
       `observed` save round-trips its evidence; byte caps and the ≤5/run limit are
       unchanged.
 
-- [ ] **M3 — Persist provenance and surface it on read.** A migration adds nullable
+- [x] **M3 — Persist provenance and surface it on read.** A migration adds nullable
       `basis`/`evidence` columns to `agent_memory`; store queries + manual sqlc regen; the
       new fields flow through `AgentMemoryDTO` and **both** mappers to `MemoryEntry`/
       `MemoryEntryView`, so `buildMemoryContext`/`memoryFrame` (`prompt.ts:176-206`) can
@@ -163,7 +163,7 @@ needing M2's `basis` field — M3 persists and surfaces it, M4 adds the nudge. P
       frame); a legacy row (no basis) reads as `inferred`; `uzi memory list --json` and
       `/api/me/memory` both include the field and `MemorySettings` renders it.
 
-- [ ] **M4 — Config-claim nudge.** `save_memory` nudges (never rejects) a body that
+- [x] **M4 — Config-claim nudge.** `save_memory` nudges (never rejects) a body that
       asserts the run's own roster/tool/runtime configuration — the class the agent should
       read live — mirroring the existing `VOLATILE_SNAPSHOT_RE` nudge (`memory-tools.ts:62`).
       **Verified with a DISCRIMINATING fixture pair** (this is an agent-framework repo, so
@@ -173,7 +173,7 @@ needing M2's `basis` field — M3 persists and surfaces it, M4 adds the nudge. P
       legitimately (e.g. "when adding a forge driver the `coder` must update `forge.ts`")
       does **not** trip it. The nudge never sets an error that fails the run.
 
-- [ ] **M5 — Docs, cleanup, and the record.** Document the observed-vs-inferred memory
+- [x] **M5 — Docs, cleanup, and the record.** Document the observed-vs-inferred memory
       discipline (`docs/`, and a one-line note in the builtin `lead` template that facts
       about the run's own tools are to be read, not remembered); audit existing stored
       memories for runtime-config assertions and purge/flag them (noting `f8213f13` was
