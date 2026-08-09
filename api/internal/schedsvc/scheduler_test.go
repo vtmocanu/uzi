@@ -95,6 +95,16 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit})
 	return store.Run{ID: uuid.New()}, nil
 }
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+	// The non-auto-approve scheduled path (PRD #196): recorded in the same `runs`
+	// bucket as CreateRun so the existing wait-on-limit / path-selection assertions
+	// still observe it — the scheduler routes here instead of CreateRun now.
+	if f.err != nil {
+		return store.Run{}, f.err
+	}
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit})
+	return store.Run{ID: uuid.New()}, nil
+}
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err

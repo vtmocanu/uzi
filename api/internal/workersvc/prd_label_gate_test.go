@@ -280,6 +280,33 @@ func TestCreateRunPRDLinkWaiver(t *testing.T) {
 	}
 }
 
+// TestWaiverNeverStartsAScheduledRunLinkLess guards the M4-review finding that
+// !autoApprove is an imperfect proxy for "a human is here": the scheduler's
+// non-auto-approve sweep path is autoApprove=false yet has no per-run human click, so
+// it must NOT receive the PRD-link waiver. A `bug`-only issue with no prds/*.md link,
+// swept in by a non-auto schedule with the waiver ON, must still return ErrNoPRDLink —
+// otherwise a timer-fired sweep would start link-less planning runs on every open bug,
+// newly widening the scheduler past the PRD invariant that only a human click widens.
+// CreateScheduledRun (the scheduler's seam) passes allowLinkWaiver=false; CreateRun
+// (the interactive human) passes true, and TestCreateRunPRDLinkWaiver proves the SAME
+// bug-only issue SUCCEEDS via CreateRun — the two differ solely by the human.
+func TestWaiverNeverStartsAScheduledRunLinkLess(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		issueByID:       store.Issue{Title: "T", Labels: labelsJSON(t, "bug"), HasPrdLink: false},
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{prdLabel: "PRD", eligibleLabels: []string{"bug"}, waivesPRDLink: true})
+
+	if _, err := svc.CreateScheduledRun(context.Background(), user, repo, 4, "desc", false, nil, nil); err != ErrNoPRDLink {
+		t.Fatalf("err = %v, want ErrNoPRDLink — a scheduled sweep must not get the interactive PRD-link waiver", err)
+	}
+	if fs.createRunParams != nil {
+		t.Fatalf("a refused scheduled run must never reach CreateRun, got %+v", fs.createRunParams)
+	}
+}
+
 // TestWaiverNeverStartsAnAutopilotRunLinkLess is PRD #196 M4 guard test 3, and the
 // risk it guards (from the PRD's risk table) is that a waiver implemented WITHOUT the
 // !autoApprove qualifier starts a link-less run UNATTENDED. Both cases go through

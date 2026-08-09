@@ -3142,7 +3142,25 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// seed nil ⇒ an ordinary run planned from the issue (PRD #209): plan_source stays
 	// 'agent' and the run behaves byte-identically to a pre-#209 run (Success Criterion
 	// 2). Non-nil ⇒ a seeded-plan run that skips Phase 1 and the gate.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, waitOnLimit, seed)
+	//
+	// allowLinkWaiver=true: this is THE interactive, human-initiated path (the board /
+	// issue-view Start button, and `uzi run start` through the same HTTP endpoint). It
+	// is the one path PRD #196's non-primary PRD-link waiver applies to — the human is
+	// present and clicking Start on a card an admin made run-eligible. Autopilot and the
+	// scheduler use their own methods below and pass false.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, seed)
+}
+
+// CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
+// or label-sweep schedule firing an issue with the plan gate still requiring a human).
+// It is IDENTICAL to CreateRun EXCEPT it never applies PRD #196's PRD-link waiver
+// (allowLinkWaiver=false): the waiver removes a HUMAN's second click, and a timer-fired
+// run has no human in the loop at creation, so a link-less non-primary-eligible issue
+// (e.g. a `bug` swept in) is NOT waived here — it still needs a prds/*.md link or
+// PRDLESS, exactly as before M4. This keeps PRD #196's invariant that the only path the
+// eligibility change widened is a human click; a scheduled sweep is not that click.
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -3161,7 +3179,10 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// it takes the owner's default (PRD #35 Decision 7 / design brief 7.3). The final
 	// nil is the seeded plan: autopilot NEVER seeds — it derives its plan in Phase 1
 	// exactly as before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, nil, nil)
+	// allowLinkWaiver=false: autopilot is unattended, so PRD #196's PRD-link waiver
+	// never applies — a link-less autopilot run is still refused unless PRDLESS
+	// (allowWithoutPRD) exempts it, exactly as before M4.
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -3190,7 +3211,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -3307,17 +3328,22 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// enforcement point; both the manual and autopilot callers pass the bool in.
 	//
 	// The PRD-link waiver (PRD #196 Decision 7): an issue eligible via a NON-PRIMARY
-	// label does not require a prds/*.md link. It is scoped two ways, and both are
-	// safety properties rather than phrasing:
-	//   1. NON-PRIMARY: a primary-only issue with no link is still refused (add a
+	// label does not require a prds/*.md link. It is scoped THREE ways, and all three
+	// are safety properties rather than phrasing:
+	//   1. allowLinkWaiver: the waiver removes a HUMAN's SECOND CLICK, so it applies
+	//      ONLY to a genuinely interactive human-initiated run — the CreateRun endpoint.
+	//      Every non-interactive creator passes false: CreateAutopilotRun (autonomous)
+	//      AND CreateScheduledRun (timer-fired sweep). !autoApprove alone is NOT a
+	//      sufficient proxy for "a human is here" — a NON-auto-approve scheduled sweep
+	//      is autoApprove=false yet has no per-run human click, so relying on
+	//      !autoApprove would newly widen the scheduler (PRD invariant: "the only
+	//      widened path requires a human click"). This explicit flag is that invariant.
+	//   2. NON-PRIMARY: a primary-only issue with no link is still refused (add a
 	//      link or PRDLESS). So an autopilot-labelled PRD issue with no link stays
 	//      refused, exactly as today.
-	//   2. !autoApprove: the waiver removes a HUMAN's second click; autopilot has no
-	//      human, so it never applies to an unattended run. Autopilot link-less runs
-	//      remain possible ONLY via PRDLESS (allowWithoutPRD), exactly as before.
-	//      Defense-in-depth so a future PRD+autopilot+<eligible> composition cannot
-	//      start unattended.
-	linkWaived := !autoApprove && s.eligibleWaivesPRDLink(ctx) && eligibleByNonPrimary(issue.Labels, eligible, primary)
+	//   3. !autoApprove: retained as defense-in-depth so a future autoApprove path that
+	//      forgot to pass allowLinkWaiver=false still cannot start unattended.
+	linkWaived := allowLinkWaiver && !autoApprove && s.eligibleWaivesPRDLink(ctx) && eligibleByNonPrimary(issue.Labels, eligible, primary)
 	if !issue.HasPrdLink && !allowWithoutPRD && !linkWaived {
 		return store.Run{}, ErrNoPRDLink
 	}
