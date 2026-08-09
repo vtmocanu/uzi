@@ -17,7 +17,7 @@ import { MeterTrack } from "../components/Meter";
 // name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
 // at its small size: it is the only visible window identity a sighted low-vision
 // admin has now that the full column headers are gone.
-type Window = Extract<MyRateLimits, { status: "ok" }>["five_hour"];
+type OkWindow = Extract<MyRateLimits, { status: "ok" }>["five_hour"];
 
 function WindowRow({
   win,
@@ -26,7 +26,7 @@ function WindowRow({
   stale,
   now,
 }: {
-  win: Window;
+  win: OkWindow;
   chip: string;
   label: string;
   stale: boolean;
@@ -34,7 +34,7 @@ function WindowRow({
 }) {
   const reset = stale ? "stale" : (formatCountdown(win.resets_at, now) ?? "—");
   return (
-    <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_auto] items-center gap-2.5">
+    <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_4.25rem] items-center gap-2.5">
       <span className="font-mono text-xs text-muted">{chip}</span>
       <MeterTrack className="h-1.5" label={label} fillPct={win.pct} valueText={`${win.pct}%`} dim={stale} />
       <span className={cx("text-right font-mono tabular-nums", stale ? "text-faint" : "text-muted")}>
@@ -42,8 +42,14 @@ function WindowRow({
       </span>
       {/* The live countdown is data → text-muted for WCAG AA at 12px (web-ux); a
           stale row's "stale" label stays faint (de-emphasised, and the dimmed bar
-          + badge already carry the staleness). */}
-      <span className={cx("whitespace-nowrap text-xs", stale ? "text-faint" : "text-muted")}>
+          + badge already carry the staleness). Fixed-width, right-aligned so a long
+          countdown ("23h 59m") never jogs the 5h/7d percents out of a clean column. */}
+      <span
+        className={cx(
+          "whitespace-nowrap text-right text-xs tabular-nums",
+          stale ? "text-faint" : "text-muted",
+        )}
+      >
         {reset}
       </span>
     </div>
