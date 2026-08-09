@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-09
+
 ### Added
 
 - **Scheduled runs default to parking on a usage limit instead of failing,
@@ -42,6 +44,36 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   guardrail, worker-held PAT, and human MR review are all unchanged: this
   opt-in grants context, not permissions. (#246)
 
+- **Runs now show how long they have been going, on the Runs page, the board
+  cards, and the CLI.** Each run carries a duration token (elapsed for an active
+  or parked run, total for a finished one), so you can tell that a run has been
+  working for 90 minutes or waiting on your approval for half an hour without
+  opening it. Display only; no API, DTO, or schema change. (#256)
+
+- **A run now publishes its committed work to origin on a time interval, not only
+  at milestone boundaries.** A new `CHECKPOINT_INTERVAL` (a Go-style duration)
+  periodically pushes the per-iteration checkpoint to origin, bounding how much
+  work a worker's disk loss (a pod eviction or crash mid-milestone) can discard.
+  The publish path is credential-free (auditor-confirmed), reusing the
+  brokered-origin mechanism milestone checkpoints already use. (#267)
+
+- **Pristine builtin agent templates now refresh automatically on boot.** When
+  uzi ships an improved builtin role template, instances pick it up on the next
+  boot for any builtin the user has not customized; customized templates are left
+  untouched, so shipped improvements to the built-in roster propagate without a
+  manual reseed and without clobbering local edits. (#275)
+
+### Changed
+
+- **The Judge's filter-chip counts now scope to the selected triage tab** instead
+  of always counting the whole backlog, so each chip's number matches what the
+  current tab is showing. (#270)
+
+- **Builtin and dev-team agent templates refreshed from accumulated judge
+  recommendations** (the `coder` and `lead` builtins, plus the repo's
+  `coder`/`web-ux` roster). Internal template tuning; run guardrails are
+  unchanged. (`737984b0`)
+
 ### Fixed
 
 - **Returning to an already-finished multi-agent run now shows its agent lanes
@@ -51,6 +83,32 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   This generalizes the earlier watched-while-finishing fix: a done run and a live
   run now share one code path, and expansion no longer branches on run state at
   all (single-actor runs still auto-expand). (#277)
+
+- **An `auto` worker no longer immediately re-picks the Anthropic token that just
+  hit its usage limit.** After a usage-limit park, token selection excludes the
+  just-exhausted credential until its window resets, so a parked run resumes on an
+  account with real headroom instead of bouncing straight back onto the exhausted
+  one. (#217)
+
+- **Slack chat answers are delivered to the thread you asked in, and every DM now
+  renders with real Slack formatting.** Fixes two defects the Slack surface
+  shipped in v0.23.0 (PRD #191): replies landing on the channel root instead of
+  the originating thread, and direct messages rendered as raw text rather than
+  Block Kit. (#268)
+
+- **Costs of $1000 or more drop the cents in the web UI.** `formatCost` renders a
+  whole-dollar amount (for example `$1119`) at or above $1000, where the cents are
+  noise, and keeps the two-decimal form below that. (#269)
+
+- **The label filter's "Clear" control no longer shifts the layout, and now reads
+  as a button rather than a link.** Reserving its height stops the filter row from
+  jumping as Clear appears or disappears, and the restyle brings it in line with
+  the other actions. (#276)
+
+- **A repo whose `devbox.json` is JSONC (carries comments) no longer silently
+  provisions no tools.** Tier-2 worker devbox provisioning is now best-effort: a
+  parse failure warns and skips rather than aborting the run, and tier-1 versus
+  tier-2 provisioning failures are reported distinctly. (#278)
 
 ## [0.23.0] - 2026-08-09
 
