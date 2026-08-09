@@ -11,6 +11,7 @@ import {
   isHealthFlaggableStatus,
   isStoppedRun,
   milestoneBadge,
+  milestoneBadgeText,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
@@ -457,10 +458,10 @@ describe("milestoneBadge (M{done}/{total}, PRD #122)", () => {
     expect(milestoneBadge({})).toBeNull();
   });
 
-  it("a 3-of-7 run → { done: 3, total: 7 }", () => {
+  it("a 3-of-7 run → { done: 3, total: 7, reported: true }", () => {
     expect(
       milestoneBadge({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] }),
-    ).toEqual({ done: 3, total: 7 });
+    ).toEqual({ done: 3, total: 7, reported: true });
   });
 
   it("completed ids not in the frozen list are CLAMPED, so done never exceeds total", () => {
@@ -471,11 +472,49 @@ describe("milestoneBadge (M{done}/{total}, PRD #122)", () => {
         milestones: ms(7),
         milestones_completed: ["m1", "m2", "m3", "dropped-a", "dropped-b"],
       }),
-    ).toEqual({ done: 3, total: 7 });
+    ).toEqual({ done: 3, total: 7, reported: true });
   });
 
-  it("a null milestones_completed counts as zero done", () => {
-    expect(milestoneBadge({ milestones: ms(4), milestones_completed: null })).toEqual({ done: 0, total: 4 });
+  it("a null milestones_completed counts as zero done AND not reported (PRD #265 M2)", () => {
+    // The whole point of #265: null (nothing reported) must be distinguishable from a
+    // real 0-of-N so a done run that never reported does not read as failure.
+    expect(milestoneBadge({ milestones: ms(4), milestones_completed: null })).toEqual({
+      done: 0,
+      total: 4,
+      reported: false,
+    });
+  });
+
+  it("an EMPTY reported set is 0 done but REPORTED — distinct from null (PRD #265 M2)", () => {
+    expect(milestoneBadge({ milestones: ms(4), milestones_completed: [] })).toEqual({
+      done: 0,
+      total: 4,
+      reported: true,
+    });
+  });
+
+  it("a missing milestones_completed key reads as not reported", () => {
+    expect(milestoneBadge({ milestones: ms(4) })).toEqual({ done: 0, total: 4, reported: false });
+  });
+});
+
+describe("milestoneBadgeText (not-reported vs 0/N, PRD #265 M2)", () => {
+  it("a reported run shows M{done}/{total} with the completion tooltip", () => {
+    expect(milestoneBadgeText({ done: 3, total: 7, reported: true })).toEqual({
+      label: "M3/7",
+      title: "Milestones reported complete of the approved plan",
+    });
+  });
+
+  it("a reported 0-of-N still shows M0/N (a genuine zero, not 'not reported')", () => {
+    expect(milestoneBadgeText({ done: 0, total: 4, reported: true }).label).toBe("M0/4");
+  });
+
+  it("an unreported run shows M–/N and says 'not reported' in the tooltip, never a 0/N", () => {
+    const t = milestoneBadgeText({ done: 0, total: 4, reported: false });
+    expect(t.label).toBe("M–/4");
+    expect(t.label).not.toContain("0");
+    expect(t.title).toBe("No milestone completion reported for this run");
   });
 });
 

@@ -361,7 +361,12 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
 }
 
 // MilestoneProgress is the compact done/total the milestone badge renders (PRD #122).
-export type MilestoneProgress = { done: number; total: number };
+// PRD #265 M2: `reported` distinguishes "the lead reported no completion" (the
+// milestones_completed column is null — nothing was reported mid-run and nothing was
+// declared at completion) from a genuine "0 complete" (an empty-or-populated set was
+// reported). A done run that simply never reported must not read as failure, so a null
+// tracker renders as "not reported" (neutral), never a `0/N`.
+export type MilestoneProgress = { done: number; total: number; reported: boolean };
 
 // MilestoneCounted is the minimal run shape milestoneBadge reads: the FROZEN approved
 // list (the denominator) and the ids reported complete. Satisfied by Run / RunListItem.
@@ -386,9 +391,24 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
   // iterating frozen also makes `done` immune to a duplicate id in the completed set
   // (which would otherwise let the badge read M8/7): each frozen id is counted at most
   // once by construction, matching MilestoneChecklist's counter (its single source).
+  // PRD #265 M2: null (or absent) ⇒ nothing was ever reported; an array (even []) ⇒ a
+  // real reported count. `?? []` still drives the `done` tally, but `reported` keeps the
+  // null-vs-[] distinction the wire already carries (apitypes nil → JSON null) instead of
+  // collapsing them, so the caller can render "not reported" apart from "0 complete".
+  const reported = run.milestones_completed != null;
   const completed = new Set(run.milestones_completed ?? []);
   const done = frozen.reduce((n, m) => (completed.has(m.id) ? n + 1 : n), 0);
-  return { done, total: frozen.length };
+  return { done, total: frozen.length, reported };
+}
+
+// milestoneBadgeText renders the compact pill's label + tooltip from a MilestoneProgress,
+// so the board (Dashboard/RunsList) and the run header stay in lockstep (PRD #265 M2). A
+// reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
+// says so in the tooltip, never a `0/N` that reads as failure on a done run.
+export function milestoneBadgeText(p: MilestoneProgress): { label: string; title: string } {
+  return p.reported
+    ? { label: `M${p.done}/${p.total}`, title: "Milestones reported complete of the approved plan" }
+    : { label: `M–/${p.total}`, title: "No milestone completion reported for this run" };
 }
 
 // hasActiveRun reports whether a card's latest run is still non-terminal. The
