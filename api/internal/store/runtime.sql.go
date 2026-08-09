@@ -139,6 +139,8 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1060,6 +1062,8 @@ UPDATE runs SET status = 'failed',
     stop_kind          = 'auto_stopped',
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -1133,6 +1137,8 @@ func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams
 
 const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -1183,6 +1189,8 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -2946,6 +2954,8 @@ UPDATE runs SET
     failure_reason     = $1,
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -3276,6 +3286,8 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 
 const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
 UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
@@ -3815,6 +3827,28 @@ UPDATE runs SET
     -- reported by one worker in one payload, so they must not persist under
     -- different conventions.
     prd_done_path      = $6,
+    -- PRD #265 M1: reconcile the milestone tracker at completion. The lead declares on
+    -- signal_done which frozen milestones it finished; the server UNIONs them here so a
+    -- run that never emitted a mid-run ` + "`" + `report_progress` + "`" + ` still lands a truthful tracker.
+    -- This CASE is copied VERBATIM from SetRunRunning's milestones_completed union
+    -- (see this file's ` + "`" + `SetRunRunning` + "`" + `, milestones_completed) and MUST stay a UNION, not
+    -- the plain assignment mr_iid/prd_done_path use above: a run that already reported
+    -- {m1,m2} via checkpoint and then declares {m3} on signal_done must end at
+    -- {m1,m2,m3}, never be overwritten to {m3}. Keep the two union sites' dedup
+    -- semantics identical — if you change one, change both. NULL param (nothing declared,
+    -- or a non-issue/invalid set dropped by progressParams) leaves the column untouched,
+    -- so a no-declaration completion is byte-identical to before.
+    milestones_completed = CASE
+        WHEN $7::jsonb IS NULL THEN milestones_completed
+        ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
+                       FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $7::jsonb) AS e), '[]'::jsonb)
+    END,
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run, so the snapshot is
+    -- cleared on EVERY terminal transition (an explicit clear — progressParams' nil-input
+    -- convention leaves columns untouched, so it will not happen for free). Same clear
+    -- appears on SetRunFailed / MarkRunFailedByID / CancelRunServerSide / FailRunAutoStop
+    -- / RejectRunServerSide / SweepRunningTimeout and the stale-worker failers below.
+    milestones_in_progress = NULL,
     -- Arm the M5 patch marker. Explicit rather than left to the column default,
     -- because SetRunCompleted can in principle run on a row that already carries a
     -- stamp from an earlier terminal transition.
@@ -3824,19 +3858,20 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = $7 AND worker_id = $8
+WHERE id = $8 AND worker_id = $9
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunCompletedParams struct {
-	Branch      pgtype.Text `json:"branch"`
-	MrIid       pgtype.Int8 `json:"mr_iid"`
-	MrWebUrl    pgtype.Text `json:"mr_web_url"`
-	SessionID   pgtype.Text `json:"session_id"`
-	FixVerdict  pgtype.Text `json:"fix_verdict"`
-	PrdDonePath pgtype.Text `json:"prd_done_path"`
-	ID          uuid.UUID   `json:"id"`
-	WorkerID    pgtype.UUID `json:"worker_id"`
+	Branch              pgtype.Text `json:"branch"`
+	MrIid               pgtype.Int8 `json:"mr_iid"`
+	MrWebUrl            pgtype.Text `json:"mr_web_url"`
+	SessionID           pgtype.Text `json:"session_id"`
+	FixVerdict          pgtype.Text `json:"fix_verdict"`
+	PrdDonePath         pgtype.Text `json:"prd_done_path"`
+	MilestonesCompleted []byte      `json:"milestones_completed"`
+	ID                  uuid.UUID   `json:"id"`
+	WorkerID            pgtype.UUID `json:"worker_id"`
 }
 
 // completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -3850,6 +3885,7 @@ func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams
 		arg.SessionID,
 		arg.FixVerdict,
 		arg.PrdDonePath,
+		arg.MilestonesCompleted,
 		arg.ID,
 		arg.WorkerID,
 	)
@@ -3866,6 +3902,8 @@ UPDATE runs SET
     session_id         = COALESCE($2, session_id),
     move_pending_since = now(),
     finished_at        = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
@@ -4134,6 +4172,9 @@ UPDATE runs SET
     -- PRD #122 M2 (Decision 3): completed is UNIONED (monotone, dedup); in_progress is
     -- OVERWRITTEN wholesale. NULL param = "not reported this call" → column untouched.
     -- Ids are validated + membership-checked server-side (progressParams) before here.
+    -- PRD #265 M1: SetRunCompleted copies this exact milestones_completed union onto the
+    -- completion path (signal_done reconciliation). The two sites MUST keep identical
+    -- dedup semantics — if you change one, change both.
     milestones_completed = CASE
         WHEN $11::jsonb IS NULL THEN milestones_completed
         ELSE COALESCE((SELECT jsonb_agg(DISTINCT e)
@@ -4424,6 +4465,8 @@ func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Ti
 
 const sweepRunningTimeout = `-- name: SweepRunningTimeout :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()

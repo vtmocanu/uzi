@@ -277,6 +277,94 @@ func TestRunMilestoneProgressLiveDB(t *testing.T) {
 		}
 	})
 
+	// ── PRD #265 M1: SetRunCompleted reconciles the tracker. The lead's signal_done
+	//    declaration is UNIONED into milestones_completed (never overwritten), and the
+	//    in_progress snapshot is cleared. This is the R2 regression: a run that reported
+	//    {m1,m2} via a mid-run report and then declares {m3} on completion must end at
+	//    {m1,m2,m3}, proving the completion path copied SetRunRunning's UNION and not the
+	//    plain assignment mr_iid/prd_done_path use. ──
+	t.Run("completed unions the signal_done declaration and clears in_progress", func(t *testing.T) {
+		run := newRun("running")
+		// Mid-run: report {m1,m2} complete and {m3} in progress.
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID,
+			MilestonesCompleted: []byte(`["m1","m2"]`), MilestonesInProgress: []byte(`["m3"]`),
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (progress): %v", err)
+		}
+		// Completion declares {m3}: the union must yield {m1,m2,m3}, NOT {m3}.
+		if _, err := q.SetRunCompleted(ctx, store.SetRunCompletedParams{
+			Branch:              pgtype.Text{String: "agent/issue-1", Valid: true},
+			MilestonesCompleted: []byte(`["m3"]`),
+			ID:                  run, WorkerID: workerID,
+		}); err != nil {
+			t.Fatalf("SetRunCompleted: %v", err)
+		}
+		if got := readIDs(run, "milestones_completed"); !eqIDs(got, []string{"m1", "m2", "m3"}) {
+			t.Fatalf("completed after signal_done union = %v, want {m1,m2,m3} (UNION, not overwrite)", got)
+		}
+		if got := readIDs(run, "milestones_in_progress"); got != nil {
+			t.Fatalf("in_progress must be cleared on completion, got %v", got)
+		}
+	})
+
+	// ── PRD #265 M1: a completion that declares NOTHING (nil param) leaves
+	//    milestones_completed untouched — additive-absent, byte-identical to pre-#265. The
+	//    in_progress snapshot is still cleared (the clear is unconditional, not tied to the
+	//    declaration). ──
+	t.Run("completed with no declaration leaves completed untouched and still clears in_progress", func(t *testing.T) {
+		run := newRun("running")
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID,
+			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m2"]`),
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (progress): %v", err)
+		}
+		if _, err := q.SetRunCompleted(ctx, store.SetRunCompletedParams{
+			Branch:              pgtype.Text{String: "agent/issue-1", Valid: true},
+			MilestonesCompleted: nil, // nothing declared
+			ID:                  run, WorkerID: workerID,
+		}); err != nil {
+			t.Fatalf("SetRunCompleted: %v", err)
+		}
+		if got := readIDs(run, "milestones_completed"); !eqIDs(got, []string{"m1"}) {
+			t.Fatalf("completed with no declaration = %v, want an untouched {m1}", got)
+		}
+		if got := readIDs(run, "milestones_in_progress"); got != nil {
+			t.Fatalf("in_progress must be cleared on completion, got %v", got)
+		}
+	})
+
+	// ── PRD #265 D4: a FAILED terminal transition also clears the in_progress snapshot
+	//    (but never back-fills completed). ──
+	t.Run("failed clears in_progress and does not touch completed", func(t *testing.T) {
+		run := newRun("running")
+		if _, err := q.SetRunRunning(ctx, store.SetRunRunningParams{
+			ID: run, WorkerID: workerID,
+			MilestonesCompleted: []byte(`["m1"]`), MilestonesInProgress: []byte(`["m2"]`),
+			RunMaxIterations: runMaxIter, RunTimeoutSeconds: runTimeout,
+			MilestoneBudgetCap: budgetCap, BudgetWallCeilingSeconds: wallCeiling,
+		}); err != nil {
+			t.Fatalf("SetRunRunning (progress): %v", err)
+		}
+		if _, err := q.SetRunFailed(ctx, store.SetRunFailedParams{
+			FailureReason: pgtype.Text{String: "boom", Valid: true},
+			ID:            run, WorkerID: workerID,
+		}); err != nil {
+			t.Fatalf("SetRunFailed: %v", err)
+		}
+		if got := readIDs(run, "milestones_completed"); !eqIDs(got, []string{"m1"}) {
+			t.Fatalf("failed must not back-fill completed = %v, want {m1}", got)
+		}
+		if got := readIDs(run, "milestones_in_progress"); got != nil {
+			t.Fatalf("in_progress must be cleared on failure, got %v", got)
+		}
+	})
+
 	// ── SweepRunningTimeout honours the PER-RUN wall clock (Decision 5b). ──
 	t.Run("sweep honours the per-run wall clock", func(t *testing.T) {
 		base := time.Now().UTC()

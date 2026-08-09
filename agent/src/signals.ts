@@ -46,6 +46,15 @@ export interface ScannedSignals {
    *  Forwarded verbatim; the api validates it (`api/internal/prdpath`) and drops
    *  it if it does not hold. Absent unless signal_done carried a string. */
   prdDonePath?: string;
+  /** PRD #265 M1: the frozen-milestone ids the lead declares it FINISHED, carried on
+   *  signal_done and unioned server-side into `milestones_completed` on the completion
+   *  path — so a run that never emitted a mid-run progress report still reconciles its
+   *  tracker at completion. Extracted behind the same main-thread guard as `prdDonePath`
+   *  (a subagent frame never reaches the content loop). Defensively parsed (ids coerced,
+   *  deduped, bad entries dropped, never throws); membership against the frozen list is
+   *  re-checked server-side (progressParams). Present only when signal_done carried a
+   *  non-empty, parseable id list. */
+  milestonesCompleted?: string[];
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -119,6 +128,24 @@ export function buildSignalMcpServer(
         "ONLY if the issue description links a prds/*.md file AND you moved that file to prds/done/ in this run: " +
           "its new repo-relative path, e.g. prds/done/72-thing.md. Omit it entirely otherwise — including when the " +
           "PRD is only partially complete and stayed where it was, and when the issue links no PRD at all.",
+      );
+  }
+  // PRD #265 M1: on a milestone'd issue run the lead declares WHICH approved milestone
+  // ids it actually finished. The server unions these into `milestones_completed` at
+  // completion (monotone, dedup) so a run that never emitted a mid-run progress report
+  // still reconciles its tracker. Gated on the SAME issue-run discriminator as the
+  // `milestones` submit_plan param (opts.milestones) — invisible to the model on a
+  // non-issue run rather than present-and-dropped. The describe text frames it as "what
+  // you finished", never "all of them" (Decision 2): an undeclared id stays not-complete.
+  if (opts.milestones) {
+    doneShape["milestones_completed"] = z
+      .array(z.string())
+      .optional()
+      .describe(
+        "OPTIONAL. On a run with an approved milestone breakdown, the ids of the milestones " +
+          "you ACTUALLY FINISHED this run (e.g. [\"m1\", \"m2\"]). List only what you truly " +
+          "completed — omit any milestone you deliberately left undone, and omit the field " +
+          "entirely on a run with no milestones.",
       );
   }
   // PRD #122 M1. Built the same way as doneShape: a Record mutated only when the
@@ -518,6 +545,16 @@ export function scanSignals(message: unknown): ScannedSignals {
       const input = asRecord(block["input"]);
       const declared = input?.["prd_done_path"];
       if (typeof declared === "string") out.prdDonePath = declared;
+      // PRD #265 M1. Extracted HERE, in the same signal_done branch and therefore behind
+      // the same main-thread guard as prd_done_path above: the completed milestone
+      // declaration reconciles the run's tracker, so a subagent frame must never be able
+      // to move it. Parsed with the SAME defensive parseProgressIds report_progress uses
+      // (ids coerced, deduped, bad entries dropped, never throws); membership against the
+      // frozen list is re-checked server-side. Only set when at least one id parsed, so a
+      // signal_done with no/garbage milestones_completed stays additive-absent and must
+      // never affect `done` — a malformed declaration still means the run finished.
+      const completed = parseProgressIds(input?.["milestones_completed"]);
+      if (completed.length > 0) out.milestonesCompleted = completed;
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's

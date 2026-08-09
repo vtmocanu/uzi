@@ -193,6 +193,9 @@ interface TurnResult {
   done: boolean;
   /** PRD #72 M4: the PRD path the lead declared on signal_done, if any. */
   prdDonePath?: string;
+  /** PRD #265 M1: the frozen-milestone ids the lead declared FINISHED on signal_done,
+   *  if any. Carried into the terminal `completed` report and unioned server-side. */
+  milestonesCompleted?: string[];
   /** PRD #88: questions the lead asked via ask_user during this turn. Present and
    *  non-empty ⇒ the caller parks the run OUTSIDE driveTurn. */
   questions?: AskUserQuestion[];
@@ -1065,6 +1068,10 @@ export class SdkExecutor implements Executor {
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
+      // PRD #265 M1: hoisted for the same reason as declaredPrdPath — the terminating
+      // turn's signal_done declaration must survive the `break` below to reach the
+      // completed report.
+      let declaredMilestonesCompleted: string[] | undefined;
       for (;;) {
         iteration++;
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
@@ -1142,6 +1149,10 @@ export class SdkExecutor implements Executor {
         );
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
+        // PRD #265 M1: latch the finished-milestone declaration the same way, so it
+        // survives the terminating turn's `break` into the completed report.
+        if (turn.milestonesCompleted !== undefined)
+          declaredMilestonesCompleted = turn.milestonesCompleted;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -1234,6 +1245,14 @@ export class SdkExecutor implements Executor {
       // wire distinction between "declared nothing" and "field present but empty".
       if (isIssueRun && declaredPrdPath !== undefined) {
         result.prdDonePath = declaredPrdPath.slice(0, PRD_DONE_PATH_MAX_LEN);
+      }
+      // PRD #265 M1: forward the declared finished-milestone ids on `issue` runs only,
+      // for the same reasons the PRD path is gated and OMITTED-not-undefined above. The
+      // ids are transport-hygiene-parsed already (parseProgressIds); the api re-validates
+      // membership against the frozen list and unions them into milestones_completed at
+      // completion, so a non-issue run — which has no frozen list — never carries them.
+      if (isIssueRun && declaredMilestonesCompleted !== undefined) {
+        result.milestonesCompleted = declaredMilestonesCompleted;
       }
       return result;
     } finally {
@@ -1613,6 +1632,11 @@ export class SdkExecutor implements Executor {
         // if the lead somehow signals twice, the LAST declaration is the one that
         // describes the tree the worker is about to push (PRD #72 M4).
         if (sig.prdDonePath !== undefined) result.prdDonePath = sig.prdDonePath;
+        // PRD #265 M1: last-wins within the turn, mirroring prdDonePath — if the lead
+        // signals twice, the LAST declaration describes the finished set the worker is
+        // about to reconcile at completion.
+        if (sig.milestonesCompleted !== undefined)
+          result.milestonesCompleted = sig.milestonesCompleted;
         // PRD #88: accumulate across the turn rather than last-wins. A lead told to
         // batch its questions into one call normally makes exactly one, but if it
         // makes two we must ask both — dropping the earlier one would park the run on

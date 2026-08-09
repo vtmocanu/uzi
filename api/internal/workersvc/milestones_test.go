@@ -243,6 +243,70 @@ func TestSetStateAwaitingApprovalEmptyCandidateIsEmptyArray(t *testing.T) {
 	}
 }
 
+// PRD #265 M1: the terminal `completed` report reconciles the tracker — the lead's
+// declared finished ids are subset-validated against the frozen list and passed to
+// SetRunCompleted, exactly as the `running` path validates its progress set. A
+// non-member id is dropped, and a report that declares nothing carries a nil param
+// (additive-absent: byte-identical to a pre-#265 completion). The SQL UNION itself is
+// exercised by the live-DB store test (union-not-overwrite); here we prove the service
+// feeds it the right param.
+func TestSetStateCompletedReconcilesMilestones(t *testing.T) {
+	// A valid subset of the frozen list reaches SetRunCompleted verbatim.
+	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)
+	fs.runOwned.MilestonesFrozen = frozenThree()
+	fs.setCompletedRows = 1
+	if _, applied, err := svc.SetState(context.Background(), wkr, runID, StateRequest{
+		State:               "completed",
+		Branch:              strp("agent/issue-7"),
+		MilestonesCompleted: strptr("m1", "m3"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if fs.setCompleted == nil || string(fs.setCompleted.MilestonesCompleted) != `["m1","m3"]` {
+		t.Fatalf("completed param = %q, want [\"m1\",\"m3\"]", fs.setCompleted.MilestonesCompleted)
+	}
+
+	// A non-member id drops the WHOLE set to NULL (the column stays untouched by the SQL).
+	fs2, svc2, wkr2, runID2 := milestonesRunFixture(t, RunKindIssue)
+	fs2.runOwned.MilestonesFrozen = frozenThree()
+	fs2.setCompletedRows = 1
+	if _, applied, err := svc2.SetState(context.Background(), wkr2, runID2, StateRequest{
+		State:               "completed",
+		Branch:              strp("agent/issue-7"),
+		MilestonesCompleted: strptr("m1", "ghost"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if fs2.setCompleted == nil || fs2.setCompleted.MilestonesCompleted != nil {
+		t.Fatalf("a non-member id must drop to NULL, got %q", fs2.setCompleted.MilestonesCompleted)
+	}
+
+	// Additive-absent: a completion that declares nothing carries a nil param.
+	fs3, svc3, wkr3, runID3 := milestonesRunFixture(t, RunKindIssue)
+	fs3.runOwned.MilestonesFrozen = frozenThree()
+	fs3.setCompletedRows = 1
+	if _, applied, err := svc3.SetState(context.Background(), wkr3, runID3, StateRequest{
+		State: "completed", Branch: strp("agent/issue-7"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if fs3.setCompleted == nil || fs3.setCompleted.MilestonesCompleted != nil {
+		t.Fatalf("no declaration must leave the param nil, got %q", fs3.setCompleted.MilestonesCompleted)
+	}
+
+	// A non-issue run's declaration is dropped (kind gate): a ci_fix has no frozen list.
+	fs4, svc4, wkr4, runID4 := milestonesRunFixture(t, RunKindCIFix)
+	fs4.setCompletedRows = 1
+	if _, applied, err := svc4.SetState(context.Background(), wkr4, runID4, StateRequest{
+		State: "completed", MilestonesCompleted: strptr("m1"),
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if fs4.setCompleted == nil || fs4.setCompleted.MilestonesCompleted != nil {
+		t.Fatalf("a non-issue run must drop the declaration, got %q", fs4.setCompleted.MilestonesCompleted)
+	}
+}
+
 // The autopilot `running` report carries the FROZEN list.
 func TestSetStateRunningPersistsFrozenMilestones(t *testing.T) {
 	fs, svc, wkr, runID := milestonesRunFixture(t, RunKindIssue)

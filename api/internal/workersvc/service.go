@@ -2459,11 +2459,21 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
+		// PRD #265 M1: reconcile the milestone tracker from the lead's signal_done
+		// declaration. progressParams subset-validates the declared ids against the run's
+		// FROZEN list (Decision 12/13) exactly as the `running` path does — a non-issue
+		// run, an empty/absent declaration, or any non-member id yields nil, which the
+		// query's CASE leaves the column untouched for (additive-absent: byte-identical to
+		// before). The in_progress side is not declared on completion (the SQL clears it
+		// unconditionally on every terminal transition, D4), so only the completed side is
+		// passed here.
+		completedIDs, _ := progressParams(owned.Kind, owned.MilestonesFrozen, req.MilestonesCompleted, nil)
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
-			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
-			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
-			ID:          runID, WorkerID: pgUUID(wkr.ID),
+			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
+			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
+			MilestonesCompleted: completedIDs,
+			ID:                  runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)

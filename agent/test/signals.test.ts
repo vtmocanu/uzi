@@ -159,6 +159,55 @@ describe("scanSignals prd_done_path (PRD #72 M4)", () => {
   });
 });
 
+describe("scanSignals milestones_completed on signal_done (PRD #265 M1)", () => {
+  const DONE = "mcp__uzi__signal_done";
+
+  it("extracts declared finished milestone ids alongside done", () => {
+    assert.deepStrictEqual(scanSignals(toolUse(DONE, { milestones_completed: ["m1", "m2"] })), {
+      done: true,
+      milestonesCompleted: ["m1", "m2"],
+    });
+  });
+
+  it("omits the key entirely when signal_done declares nothing", () => {
+    const r = scanSignals(toolUse(DONE, {})) as Record<string, unknown>;
+    assert.deepStrictEqual(r, { done: true });
+    assert.ok(!("milestonesCompleted" in r), "absent, not undefined-valued");
+  });
+
+  it("defensively parses ids and still reports done on garbage", () => {
+    // parseProgressIds coerces scalars, drops blanks/objects, dedupes. A garbage
+    // list must never throw and must never cost the run its completion signal.
+    const r = scanSignals(
+      toolUse(DONE, { milestones_completed: ["m1", "m1", "", { x: 1 }, "m2"] }),
+    ) as { done?: boolean; milestonesCompleted?: string[] };
+    assert.strictEqual(r.done, true);
+    assert.deepStrictEqual(r.milestonesCompleted, ["m1", "m2"]);
+  });
+
+  it("ignores a non-array declaration and still reports done", () => {
+    for (const bad of [42, null, "m1", {}, true]) {
+      const r = scanSignals(toolUse(DONE, { milestones_completed: bad })) as Record<string, unknown>;
+      assert.strictEqual(r["done"], true, `done must survive input ${JSON.stringify(bad)}`);
+      assert.ok(!("milestonesCompleted" in r), `non-array ${JSON.stringify(bad)} must not be captured`);
+    }
+  });
+
+  it("IGNORES a subagent-borne declaration entirely (main-thread guard covers the new field)", () => {
+    // Reconciliation moves the run's tracker, so a prompt-injected subagent must never
+    // reach it — the same guarantee that keeps a subagent from latching done/prd_done_path.
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, { milestones_completed: ["m9"] })), {});
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { milestones_completed: ["m9"] }, { subagent_type: "coder" })),
+      {},
+    );
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { milestones_completed: ["m9"] }, { parent_tool_use_id: "toolu_x" })),
+      {},
+    );
+  });
+});
+
 describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
   // Gating the SCHEMA is the strongest layer available: on a non-issue run the
   // model never sees the parameter, rather than seeing it and having the value
@@ -186,6 +235,17 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     const shape = doneToolShape(buildSignalMcpServer({ prdDonePath: true }));
     assert.ok("prd_done_path" in shape, `expected prd_done_path; got ${Object.keys(shape).join(", ")}`);
     assert.ok("summary" in shape);
+  });
+
+  it("gates signal_done milestones_completed on the issue-run (milestones) discriminator (PRD #265 M1)", () => {
+    // Invisible to the model on a non-issue run, exposed only when milestones are enabled.
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({ milestones: false })]) {
+      const shape = doneToolShape(server);
+      assert.ok(!("milestones_completed" in shape), `milestones_completed must be absent; got ${Object.keys(shape).join(", ")}`);
+    }
+    const enabled = doneToolShape(buildSignalMcpServer({ milestones: true }));
+    assert.ok("milestones_completed" in enabled, `expected milestones_completed; got ${Object.keys(enabled).join(", ")}`);
+    assert.ok("summary" in enabled);
   });
 });
 
