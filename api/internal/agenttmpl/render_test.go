@@ -325,9 +325,9 @@ const (
 // down, past the ordering sentence but before the bullet landmark. Measured,
 // zero guards fire — the count is 1, both regions are ample, and each landmark
 // is still on its own side — and the run reds with a message that is FALSE:
-// `BULLET region lost … missing phrase "fans out again after an implementation
-// unit lands"`, while that phrase is still in the template, one line above the
-// boundary. Detection holds (rc=1 either way), so this is a MESSAGE gap rather
+// `BULLET region lost … missing phrase "Read-only work fans out per unit"`,
+// while that phrase is still in the template, one line above the boundary.
+// Detection holds (rc=1 either way), so this is a MESSAGE gap rather
 // than a detection gap — but it is the reason the sentence above says "past the
 // bullet landmark" instead of claiming every downward move.
 //
