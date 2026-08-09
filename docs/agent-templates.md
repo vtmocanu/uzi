@@ -135,28 +135,35 @@ click **Reset to default**. It re-applies the shipped builtin body
 (say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
 uzi version, your customization is gone, not folded into the new body.
 
+A shipped change to a builtin's prompt reaches a **pristine** template — one
+an admin has never edited — automatically on the next boot: uzi re-applies the
+body it ships for that builtin, so recipient fixes, prompt improvements, and
+sandbox tweaks land without a manual step. A builtin an admin has
+**customized** is never overwritten on boot; your edit stays until you
+**Reset** it, so customizations remain durable across upgrades.
+
+Editing a builtin marks it customized and opts it out of that automatic
+tracking until it is reset. That includes opening a builtin and saving it
+**unchanged** — saving is an edit, so it stops the template tracking shipped
+changes even if you changed nothing; reset it if you didn't mean to take
+ownership. **Reset to default** returns a builtin to pristine: it re-applies
+the shipped body *and* re-enables tracking, so the template picks up future
+shipped changes on boot again.
+
 A **differs from shipped** badge on the Agents list and on a builtin's
-detail page tells you when its stored description, model, tools, or prompt
-body no longer matches what this uzi version ships for it, whether that's
-your own edit or a shipped update you haven't picked up. Open the template
-before resetting: the editor shows exactly what's different, so you're not
-resetting blind.
+detail page tells you when a **customized** builtin's stored description,
+model, tools, or prompt body no longer matches what this uzi version ships for
+it. (A pristine builtin refreshes on boot, so it already matches and carries
+no badge.) Open the template before resetting: the editor shows exactly what's
+different, so you're not resetting blind.
 
-That's also why a shipped change to a builtin's prompt doesn't reach you
-automatically: it seeds into a fresh database on first boot, but an
-already-seeded row is never silently overwritten (that's what keeps your
-customizations durable across every other upgrade). The badge above is what
-tells you an update is waiting; picking it up is still manual. Reset is the
-only automatic path that pulls in a newer builtin body for an existing
-deployment, and it's all-or-nothing — the alternative is pasting the new
-body in by hand, below.
-
-To pick up a new builtin body without losing your own edits:
+To pick up a new builtin body on a **customized** template without losing your
+own edits:
 
 1. Open the template and read the shipped-vs-stored diff to see exactly
    what changed (or check `api/internal/agenttmpl/builtins/`'s git history
    in the uzi repo, or ask whoever deployed the upgrade).
-2. Reset the template.
+2. Reset the template — this returns it to pristine and re-enables tracking.
 3. Re-apply your customization on top of the new body.
 
 Or skip reset entirely and hand-merge the new paragraphs into your

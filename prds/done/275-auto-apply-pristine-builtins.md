@@ -1,7 +1,7 @@
 # PRD #275: Auto-apply pristine builtin templates on boot (M4b)
 
 **GitLab Issue**: [#275](https://gitlab.example.com/vtmocanu/uzi/-/issues/275)
-**Status**: Draft (created 2026-08-09; revised after architect review)
+**Status**: Implemented (created 2026-08-09; revised after architect review; delivered 2026-08-09)
 **Priority**: Medium
 **Related**:
 - [#201](https://gitlab.example.com/vtmocanu/uzi/-/issues/201) — the builtin drift **signal** (M4a: badge + diff UI). This PRD is the pristine-only delivery half of #201's explicitly-deferred **M4b**. See `prds/201-builtin-drift-signal.md`, "Out, and deliberately: … no boot-path change … no auto-update … All of those are M4b."
@@ -48,12 +48,12 @@ The load-bearing question is how to tell "pristine" from "admin-customized." Thr
 
 ## Milestones
 
-- [ ] **M0 — Migration.** Add `customized BOOLEAN NOT NULL DEFAULT false`; backfill builtins from `updated_at > created_at`. (Goose number assigned at merge, above the live head.)
-- [ ] **M1 — Pristine refresh on boot.** Add `RefreshPristineBuiltin` (content-guarded) and call it per builtin in `ReconcileBuiltinTemplates` after the insert. Pristine rows converge to the embedded body; customized rows untouched; the `n > 0` allocation seed still fires only on true insert.
-- [ ] **M2 — Edit marks / Reset resumes.** `UpdateAgentTemplate` (admin edit) sets `customized = true`; `ResetAgentTemplate` sets content **and** `customized = false` so a reset template returns to pristine and tracks future shipped changes.
-- [ ] **M3 — Tests (LiveDB — the in-memory `reconcilerFake` cannot model FK/`now()`/`execrows`/partial-unique).** In `agent_templates_scope_integration_test.go` style, run via `./e2e/run-store-it.sh`: pristine row refreshes on boot; **customized row preserved**; **customized row whose editing admin was deleted is STILL preserved** (the discriminating case that fails under `updated_by IS NULL`); allocation not re-added on refresh; **reset → change shipped body → boot → reset row now tracks the new body** (pins D2 end-to-end); a **user-scope** same-name template and a **shadow global** row are never touched; content guard makes an unchanged builtin a no-op.
-- [ ] **M4 — Docs.** Update `docs/agent-templates.md`, the `**Builtin agent templates**` bullet in `CLAUDE.md`, and the seed-query comment to the new contract: *pristine builtins track upstream on boot; admin-customized builtins are preserved until Reset*.
-- [ ] **M5 — Validate on a seeded DB.** On an already-seeded database, a shipped body change to a pristine template lands on the next boot with no wipe and no manual reset; a customized template does not.
+- [x] **M0 — Migration.** Add `customized BOOLEAN NOT NULL DEFAULT false`; backfill builtins from `updated_at > created_at`. (Goose number assigned at merge, above the live head.) — `api/internal/store/migrations/00112_agent_template_customized.sql` (provisional `00111`; renumber above the live head at merge).
+- [x] **M1 — Pristine refresh on boot.** Add `RefreshPristineBuiltin` (content-guarded) and call it per builtin in `ReconcileBuiltinTemplates` after the insert. Pristine rows converge to the embedded body; customized rows untouched; the `n > 0` allocation seed still fires only on true insert. — refresh runs on the no-insert path, its rowcount discarded.
+- [x] **M2 — Edit marks / Reset resumes.** `UpdateAgentTemplate` (admin edit) sets `customized = true`; `ResetAgentTemplate` sets content **and** `customized = false` (via the new `ResetBuiltinAgentTemplate` query) so a reset template returns to pristine and tracks future shipped changes.
+- [x] **M3 — Tests (LiveDB — the in-memory `reconcilerFake` cannot model FK/`now()`/`execrows`/partial-unique).** `agent_templates_pristine_refresh_integration_test.go` (`TestPristineBuiltinRefreshLiveDB`): pristine row refreshes on boot; **customized row preserved**; **customized row whose editing admin was deleted is STILL preserved** (the discriminating case that fails under `updated_by IS NULL`); allocation not re-added on refresh; **reset → change shipped body → boot → reset row now tracks the new body** (pins D2 end-to-end); a **user-scope** same-name template and a **shadow global** row are never touched; content guard makes an unchanged builtin a no-op (across all four columns incl. model/tools NULL↔set). The reconciler's no-insert→refresh wiring is pinned in the `reconcilerFake` unit test. Validated against a throwaway `postgres:17`.
+- [x] **M4 — Docs.** Update `docs/agent-templates.md`, the `**Builtin agent templates**` bullet in `CLAUDE.md`, and the seed-query comment to the new contract: *pristine builtins track upstream on boot; admin-customized builtins are preserved until Reset*.
+- [x] **M5 — Validate on a seeded DB.** On an already-seeded database, a shipped body change to a pristine template lands on the next boot with no wipe and no manual reset; a customized template does not. — validated by the LiveDB test's already-seeded-row cases (Case 1 pristine refreshes; Case 3 customized preserved), which exercise exactly the seeded-row boot path.
 
 ## Success criteria
 
@@ -85,10 +85,10 @@ The load-bearing question is how to tell "pristine" from "admin-customized." Thr
 - Library/git sync from `roles.yaml` (#85).
 - The content fixes that ride on this (web-ux `--no-sandbox`, lead/coder improvements, #210 recipient fix) — each is a separate change; this PRD only builds the delivery.
 
-## Open decisions (for the user)
+## Open decisions (resolved)
 
-1. **`customized` column (one migration) vs. `updated_at = created_at` (no migration).** The PRD takes the column: delete-proof *and* keeps the UI `updated_at` honest, at the cost of one routine migration. The no-migration variant is robust too but freezes a pristine row's `updated_at` at creation (the UI would show a stale "updated" time after a boot refresh) and needs the refresh to not write `updated_at`. **Recommend the column.** Confirm, or hold a hard no-migration constraint.
-2. **No-op-save semantics (D6).** Confirm that opening + saving a pristine builtin unchanged should permanently opt it out of upstream tracking (until Reset).
+1. **`customized` column (one migration) vs. `updated_at = created_at` (no migration).** **Resolved: the column** (approved at the plan gate). Delete-proof *and* keeps the UI `updated_at` honest, at the cost of one routine migration (`00111`).
+2. **No-op-save semantics (D6).** **Resolved: implemented as designed** — opening + saving a builtin (even unchanged) sets `customized = true` and opts it out of upstream tracking until Reset. Documented in `docs/agent-templates.md`.
 
 ## Milestone parallelization
 

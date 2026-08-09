@@ -16,6 +16,11 @@ import (
 // path unit-testable without a live database.
 type builtinReconcilerQueries interface {
 	InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error)
+	// RefreshPristineBuiltin re-applies the embedded body to a pristine builtin
+	// row (customized=false) when the shipped definition has changed (PRD #275).
+	// Deliberately a separate statement from the insert so its rowcount never
+	// feeds the insert-only default-allocation seed gate below.
+	RefreshPristineBuiltin(ctx context.Context, arg RefreshPristineBuiltinParams) (int64, error)
 	// GetSharedAgentTemplateByName reads back the row that kept a seed out, scoped
 	// to the shared namespace so it stays a unique lookup post-00047 (a user's
 	// same-name template must not win it and trigger a false shadow warning).
@@ -61,6 +66,23 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			// admin later removes stays removed. Idempotent (ON CONFLICT DO NOTHING).
 			if err := q.SeedSharedTemplateAllocationByName(ctx, def.Name); err != nil {
 				return TemplatesReconciled{}, fmt.Errorf("seed default allocation for builtin %q: %w", def.Name, err)
+			}
+		} else {
+			// The row already existed. Deliver a shipped body change to it IF it is
+			// still pristine (customized=false) — an admin-customized row and any
+			// user/global same-name row are left untouched by the query's WHERE
+			// (PRD #275 M4b). This runs only on the no-insert path, and its rowcount
+			// is intentionally discarded so it can never re-add an admin-removed
+			// default via the n > 0 seed above; the content guard makes an unchanged
+			// builtin a no-op.
+			if _, err := q.RefreshPristineBuiltin(ctx, RefreshPristineBuiltinParams{
+				Name:        def.Name,
+				Description: def.Description,
+				Model:       model,
+				Tools:       tools,
+				PromptBody:  def.PromptBody,
+			}); err != nil {
+				return TemplatesReconciled{}, fmt.Errorf("refresh pristine builtin %q: %w", def.Name, err)
 			}
 		}
 		if n == 0 {

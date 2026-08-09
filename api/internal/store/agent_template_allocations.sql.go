@@ -65,7 +65,7 @@ func (q *Queries) InsertUserTemplateAllocation(ctx context.Context, arg InsertUs
 }
 
 const listClaimAgentTemplates = `-- name: ListClaimAgentTemplates :many
-SELECT t.id, t.name, t.description, t.model, t.tools, t.prompt_body, t.is_builtin, t.updated_by, t.created_at, t.updated_at, t.scope, t.user_id FROM agent_templates t
+SELECT t.id, t.name, t.description, t.model, t.tools, t.prompt_body, t.is_builtin, t.updated_by, t.created_at, t.updated_at, t.scope, t.user_id, t.customized FROM agent_templates t
 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = $1
 LEFT JOIN agent_template_allocations g  ON g.template_id = t.id AND g.user_id IS NULL
 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = $1))
@@ -111,6 +111,7 @@ func (q *Queries) ListClaimAgentTemplates(ctx context.Context, userID pgtype.UUI
 			&i.UpdatedAt,
 			&i.Scope,
 			&i.UserID,
+			&i.Customized,
 		); err != nil {
 			return nil, err
 		}
