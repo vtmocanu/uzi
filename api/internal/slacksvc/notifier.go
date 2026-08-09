@@ -16,6 +16,7 @@ import (
 	"github.com/slack-go/slack"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -142,12 +143,18 @@ type stateEvent struct {
 
 // notifyEvent is a generic inbox notification bound for a user's DM (PRD #46 M2).
 // title is a caller-set fixed label; body is dynamic, potentially untrusted free
-// text; link is an in-app deep-link URL. All three are escaped/scrubbed at render.
+// text; link is an in-app deep-link URL. emoji is a caller-set leading glyph and
+// facts are caller-built TRUSTED short strings carrying intentional markup, built
+// from closed enums/ints (PRD #268 M3). The untrusted fields (title, body) are
+// escaped/scrubbed at render; facts are scrubbed but NOT escaped (see
+// notificationBlocks).
 type notifyEvent struct {
 	userID uuid.UUID
 	title  string
 	body   string
 	link   string
+	emoji  string
+	facts  []string
 }
 
 // healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
@@ -183,9 +190,9 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 // user's Slack DM (PRD #46 M2). It implements notifysvc.Slacker. Like PublishState
 // it MUST NOT block: it enqueues and returns, dropping the event if the queue is
 // full (Slack is strictly best-effort — the inbox row is already durable).
-func (n *Notifier) PublishNotification(userID uuid.UUID, title, body, link string) {
+func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: title, body: body, link: link}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, emoji: r.Emoji, facts: r.Facts}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}
@@ -286,38 +293,85 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 		return
 	}
 
-	if _, err := n.poster.Post(ctx, channel, "", renderNotification(ev)); err != nil {
+	blocks, fallback := notificationBlocks(ev)
+	if _, err := n.poster.PostBlocks(ctx, channel, "", fallback, blocks); err != nil {
 		n.logf("post notification", err)
 	}
 }
 
-// renderNotification builds the content-minimized DM for a generic notification.
-// The title is a fixed caller-set label and the body is dynamic, potentially
-// untrusted free text (a judge verdict summary, a repo/agent name), so BOTH are
-// mrkdwn-escaped individually — exactly like rootBlocks escapes the issue title —
-// before they sit beside the trusted deep-link markup. The link is an in-app URL
-// whose base is operator-set and http(s)-validated, rendered raw as <url|label>
-// like runLink. The whole line is then ScrubSecrets'd as a last line of defense.
-func renderNotification(ev notifyEvent) string {
-	head := EscapeMrkdwn(strings.TrimSpace(ev.title))
+// notifyFactMarkupStripper removes the intentional mrkdwn markup from a fact so it can
+// go into the plain-text notification fallback (the OS-notification text, which Slack
+// parses for mrkdwn). Facts carry `*bold*`, “ `code` “ chips and verdict emoji built
+// from closed enums; the emoji is harmless plain text, but the *, `, _ control chars
+// must go so the fallback reads cleanly and can never leave a dangling mrkdwn token.
+var notifyFactMarkupStripper = strings.NewReplacer("*", "", "`", "", "_", "")
+
+// notificationBlocks builds the content-minimized DM for a generic notification as
+// Block Kit (message family D, PRD #268 M3). Shape, in order and only for the parts
+// that apply: a section with the caller emoji + bold title; a context block of the
+// trusted facts; a blockquote section for the untrusted body; a context block for the
+// deep link.
+//
+// The field-by-field trust discipline is the load-bearing part:
+//
+//   - title is a FIXED caller label, EscapeMrkdwn'd anyway (defense in depth) before it
+//     becomes the bold head; the emoji is a fixed caller glyph rendered raw.
+//   - facts are caller-built TRUSTED strings that INTENTIONALLY carry markup (bold, code
+//     chips, verdict emoji) built from closed enums/ints, so they are ScrubSecrets'd but
+//     NOT EscapeMrkdwn'd — escaping would break the intended markup.
+//   - body is UNTRUSTED model/forge free text carrying no trusted markup of its own, so it
+//     is whole-blob EscapeMrkdwn'd (the documented exception, exactly like planThreadBlocks)
+//     after ScrubSecrets, then bounded to Slack's section limit and blockquote-prefixed.
+//   - the deep link keeps its raw <url|label> markup (operator-set base, http(s)-validated),
+//     ScrubSecrets'd as a no-op-on-clean last line of defense.
+//
+// The fallback is built from FIXED/escaped fields only — never a raw model summary alone:
+// the escaped title, then the facts with their markup stripped (so the verdict/count still
+// appear as the OS-notification text), then the escaped, length-bounded body.
+func notificationBlocks(ev notifyEvent) (blocks []slack.Block, fallback string) {
+	title := EscapeMrkdwn(strings.TrimSpace(ev.title))
+	head := "*" + title + "*"
+	if ev.emoji != "" {
+		head = ev.emoji + " " + head
+	}
+	blocks = []slack.Block{slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, head, false, false), nil, nil)}
+
+	if len(ev.facts) > 0 {
+		blocks = append(blocks, slack.NewContextBlock("slack_notify_facts",
+			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(strings.Join(ev.facts, "  ·  ")), false, false)))
+	}
+
 	if body := strings.TrimSpace(ev.body); body != "" {
-		head += " — " + EscapeMrkdwn(boundReason(body))
+		escapedBody := truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(body)))
+		// Prefix EVERY line, not just the first, so a future multi-line Body stays fully
+		// quoted — Slack's `>` quotes only the line it leads, so lines 2+ would otherwise
+		// escape the blockquote.
+		quoted := "> " + strings.ReplaceAll(escapedBody, "\n", "\n> ")
+		blocks = append(blocks, slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType, quoted, false, false), nil, nil))
 	}
-	if link := notifyLink(ev.link); link != "" {
-		head += "\n" + link
+
+	if url := strings.TrimSpace(ev.link); url != "" {
+		blocks = append(blocks, slack.NewContextBlock("slack_notify_link",
+			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(fmt.Sprintf("🔗 <%s|Open in uzi>", url)), false, false)))
 	}
-	return ScrubSecrets(head)
+
+	return blocks, notificationFallback(ev)
 }
 
-// notifyLink wraps a caller-supplied in-app deep-link URL as a Slack mrkdwn link,
-// or returns "" when no link is set. The URL is trimmed; an empty value yields no
-// markup so the DM is just the title + body.
-func notifyLink(url string) string {
-	url = strings.TrimSpace(url)
-	if url == "" {
-		return ""
+// notificationFallback is the OS-notification text for a generic notification, built
+// from fixed/escaped fields ONLY (never a raw model summary alone): the escaped title,
+// the facts with their trusted markup stripped, and the escaped, length-bounded body.
+func notificationFallback(ev notifyEvent) string {
+	s := EscapeMrkdwn(strings.TrimSpace(ev.title))
+	if len(ev.facts) > 0 {
+		s += " — " + EscapeMrkdwn(notifyFactMarkupStripper.Replace(strings.Join(ev.facts, ", ")))
 	}
-	return fmt.Sprintf("<%s|Open in uzi>", url)
+	if body := strings.TrimSpace(ev.body); body != "" {
+		s += " — " + EscapeMrkdwn(boundReason(body))
+	}
+	return ScrubSecrets(s)
 }
 
 // handle processes one transition: resolve the owner's delivery target, then
@@ -400,8 +454,8 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
 			n.logf("update root", uerr)
 		}
-		if evt := renderThread(rc); evt != "" {
-			if _, perr := n.poster.Post(ctx, existing.ChannelID, existing.RootTs, ScrubSecrets(evt)); perr != nil {
+		if tblocks, tfallback, tok := renderThreadBlocks(rc, base); tok {
+			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
 				n.logf("post thread event", perr)
 			}
 		}
@@ -693,7 +747,8 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 	if ev.health == healthApprovalIdle && anchor.GateTs.Valid && anchor.GateTs.String != "" {
 		threadTS = anchor.GateTs.String
 	}
-	if _, perr := n.poster.Post(ctx, channel, threadTS, ScrubSecrets(healthNudgeText(ev.health, ev.reason, base, rc.ID))); perr != nil {
+	hblocks, hfallback := healthNudgeBlocks(ev.health, ev.reason, base, rc.ID)
+	if _, perr := n.poster.PostBlocks(ctx, channel, threadTS, hfallback, hblocks); perr != nil {
 		n.logf("post health nudge", perr)
 	}
 }
@@ -925,11 +980,13 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 	return ""
 }
 
-// renderThread returns the threaded event for a transition, or "" when the
-// transition is not worth interrupting the owner for. Completed carries the MR link;
-// failed the reason. The worker-originated failure reason is length-bounded and
-// mrkdwn-escaped before it goes out (it is untrusted free text with no source-side
-// length bound).
+// renderThreadBlocks builds the threaded terminal-transition event as Block Kit
+// (message family B, PRD #268 M3), or returns ok=false when the transition is not
+// worth interrupting the owner for. Each event is a status section (canonical
+// glyph + bold label) plus, where they apply, a context block carrying the MR link,
+// the failure reason (a FULL section, never context), the park detail and the run
+// deep link. The plain-text fallback is built from fixed labels + the escaped
+// repo#iid, never a raw model/forge field alone.
 //
 // 🔴 THIS USED TO READ "for a terminal transition, or "" for a NON-TERMINAL one",
 // and PRD #35 made that false: `limit_wait` is non-terminal and posts. Stated as a
@@ -948,73 +1005,142 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 //
 //  1. It is bounded by construction. RUN_LIMIT_MAX_WAITS caps parks per run
 //     (default 5), so a run can post this at most that many times over its life.
-//  2. The RESUME posts nothing. `queued` falls to the default arm, which is right —
-//     resuming is a return to normal and the edited root already shows it. Without
-//     this half, a run that parks five times would produce ten posts and the feature
-//     would read as a notification stream.
-func renderThread(rc store.GetSlackRunContextRow) string {
+//  2. The RESUME posts nothing. `queued` falls to the default arm (ok=false), which is
+//     right — resuming is a return to normal and the edited root already shows it.
+//     Without this half, a run that parks five times would produce ten posts and the
+//     feature would read as a notification stream.
+//
+// The worker-originated failure reason is untrusted free text with no source-side
+// length bound, so it is ScrubSecrets'd, whole-blob EscapeMrkdwn'd, and length-bounded
+// (boundReason) before it becomes its own section. The MR link and deep link keep their
+// raw <url|label> markup (server/forge-derived, https-guarded), ScrubSecrets'd as a
+// no-op-on-clean last line of defense.
+func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Block, fallback string, ok bool) {
+	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
+	linkElem := func() (slack.MixedElement, bool) {
+		if u := runLink(base, rc.ID); u != "" {
+			return threadMrkdwnElem(ScrubSecrets("🔗 " + u)), true
+		}
+		return nil, false
+	}
+
 	switch rc.Status {
 	case "completed":
-		if mr := mrLink(rc); mr != "" {
-			return "✅ completed — " + mr
+		blocks = []slack.Block{threadSectionBlock("✅ *Completed*")}
+		var ctxElems []slack.MixedElement
+		if mr := mrContextElem(rc); mr != "" {
+			ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(mr)))
 		}
-		return "✅ completed"
+		if el, has := linkElem(); has {
+			ctxElems = append(ctxElems, el)
+		}
+		if len(ctxElems) > 0 {
+			blocks = append(blocks, slack.NewContextBlock("slack_thread_completed_ctx", ctxElems...))
+		}
+		return blocks, fmt.Sprintf("Completed · %s#%d", repo, iid(rc.IssueIid)), true
+
 	case "failed":
 		reason := strings.TrimSpace(rc.FailureReason.String)
 		if reason == "run cancelled" {
-			return "🚫 cancelled"
+			return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
 		}
+		blocks = []slack.Block{threadSectionBlock("❌ *Failed*")}
+		fallback = fmt.Sprintf("Failed · %s#%d", repo, iid(rc.IssueIid))
 		if reason != "" {
-			return "❌ failed: " + EscapeMrkdwn(boundReason(reason))
+			esc := EscapeMrkdwn(ScrubSecrets(boundReason(reason)))
+			blocks = append(blocks, threadSectionBlock(esc))
+			fallback += " — " + esc
 		}
-		return "❌ failed"
+		if el, has := linkElem(); has {
+			blocks = append(blocks, slack.NewContextBlock("slack_thread_failed_ctx", el))
+		}
+		return blocks, fallback, true
+
 	case "cancelled":
-		return "🚫 cancelled"
+		return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
+
 	case "limit_wait":
 		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
 		// two properties that bound it live on this function's doc comment above, in one
 		// place, so they cannot drift from the contract they amend.
-		return limitWaitLabel(rc)
+		blocks = []slack.Block{threadSectionBlock("⏸️ *Paused · usage limit*")}
+		var ctxElems []slack.MixedElement
+		if detail := limitWaitDetail(rc); detail != "" {
+			ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
+		}
+		if el, has := linkElem(); has {
+			ctxElems = append(ctxElems, el)
+		}
+		if len(ctxElems) > 0 {
+			blocks = append(blocks, slack.NewContextBlock("slack_thread_limit_ctx", ctxElems...))
+		}
+		return blocks, fmt.Sprintf("Paused · usage limit · %s#%d", repo, iid(rc.IssueIid)), true
+
 	default:
-		return ""
+		return nil, "", false
 	}
 }
 
-// limitWaitLabel renders the terminal thread event's park detail: the rate-limit
-// type, the resume `<!date^…>` reader-local-time token, and the pause count. Its
-// only caller since PRD #268 M2 is renderThread — the root line no longer shares it,
-// showing instead the minimized `⏸️ Paused · usage limit` glyph+label from
-// statusGlyph, so there is nothing here to keep in lockstep with the root anymore.
+// cancelledThreadBlocks is the shared shape for both cancellation paths — a `failed`
+// row whose reason is the sentinel "run cancelled", and a genuine `cancelled` status.
+// A single 🚫 section plus the run deep link (when a base URL resolves).
+func cancelledThreadBlocks(linkElem func() (slack.MixedElement, bool)) []slack.Block {
+	blocks := []slack.Block{threadSectionBlock("🚫 *Cancelled*")}
+	if el, has := linkElem(); has {
+		blocks = append(blocks, slack.NewContextBlock("slack_thread_cancelled_ctx", el))
+	}
+	return blocks
+}
+
+// threadSectionBlock / threadMrkdwnElem are the tiny mrkdwn constructors the thread
+// event builder reuses; the text is already scrubbed/escaped by the caller.
+func threadSectionBlock(text string) *slack.SectionBlock {
+	return slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil)
+}
+
+func threadMrkdwnElem(text string) *slack.TextBlockObject {
+	return slack.NewTextBlockObject(slack.MarkdownType, text, false, false)
+}
+
+// limitWaitDetail renders ONLY the park detail suffix — the rate-limit type, the
+// resume `<!date^…>` reader-local-time token, and the pause count — for the park
+// thread event's context block; the head (`⏸️ Paused · usage limit`) is the section
+// (PRD #268 M3, formerly limitWaitLabel which glued head+detail into one line).
 //
 // Every part is omitted when unknown rather than defaulted, exactly as the server's
 // own failure-reason composition does — the line never claims a fact uzi does not
-// have. A park with neither a window nor a stamp still renders honestly as
-// "⏸️ Paused · usage limit".
-func limitWaitLabel(rc store.GetSlackRunContextRow) string {
-	s := "⏸️ Paused · usage limit"
+// have. A park with neither a window nor a stamp yields "", so the context block is
+// just the deep link (or omitted when no base URL resolves).
+func limitWaitDetail(rc store.GetSlackRunContextRow) string {
+	var b strings.Builder
 	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
 		// EscapeMrkdwn even though workersvc has already allowlisted this to a
 		// seven-member enum and 00091's CHECK backstops it. The escape costs nothing and
 		// covers the exact population the CHECK exists for: a backfill, an admin tool, or
-		// a later writer that bypassed the coercion. Per-field, never on the assembled
-		// line, so the emoji and separators this function owns are not escaped.
-		s += " (" + EscapeMrkdwn(rc.RateLimitType.String) + ")"
+		// a later writer that bypassed the coercion.
+		b.WriteString("(" + EscapeMrkdwn(rc.RateLimitType.String) + ")")
 	}
 	if rc.RetryNotBefore.Valid {
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
 		// Slack's own date markup, so the timestamp renders in the READER's timezone
 		// rather than the server's. The fallback after `|` is what Slack shows when it
 		// cannot render the token, and it is UTC-explicit so a fallback is never
 		// ambiguous about which zone it means.
-		s += fmt.Sprintf("; resumes <!date^%d^{time}|%s>",
+		fmt.Fprintf(&b, "resumes <!date^%d^{time}|%s>",
 			rc.RetryNotBefore.Time.Unix(), rc.RetryNotBefore.Time.UTC().Format("15:04 MST"))
 	}
 	if rc.LimitWaitCount > 1 {
 		// Only from the SECOND park. "attempt 1" on a first park is noise; a rising
 		// count is the signal that this run is burning its retry budget and may be about
 		// to fail for good.
-		s += fmt.Sprintf(" (pause %d)", rc.LimitWaitCount)
+		if b.Len() > 0 {
+			b.WriteString(" ")
+		}
+		fmt.Fprintf(&b, "(pause %d)", rc.LimitWaitCount)
 	}
-	return s
+	return b.String()
 }
 
 // maxFailureReason bounds the worker-originated failure reason before it reaches

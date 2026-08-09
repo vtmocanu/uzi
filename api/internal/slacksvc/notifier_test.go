@@ -277,11 +277,15 @@ func TestNotifierEditsRootAndThreadsCompleted(t *testing.T) {
 	if !strings.Contains(root.contextText, "MR !7") {
 		t.Fatalf("root context missing the MR link: %q", root.contextText)
 	}
-	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
-		t.Fatalf("want 1 threaded event under ts1, got %+v", fp.posts)
+	// PRD #268 M3: the terminal thread event is now a Block Kit post (family B).
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+		t.Fatalf("want 1 threaded Block Kit event under ts1, got %+v", fp.blocks)
 	}
-	if !strings.Contains(fp.posts[0].text, "/-/merge_requests/7") {
-		t.Errorf("thread event missing MR link: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].sectionText, "Completed") {
+		t.Errorf("thread event section not Completed: %q", fp.blocks[0].sectionText)
+	}
+	if !strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/7") {
+		t.Errorf("thread event missing MR link: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -309,11 +313,11 @@ func TestNotifierForgejoRunSaysPullRequestAndUsesPersistedURL(t *testing.T) {
 	if strings.Contains(root.contextText, "MR !7") {
 		t.Errorf("Forgejo DM must not use GitLab's MR !N form: %q", root.contextText)
 	}
-	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "/pulls/7") {
-		t.Fatalf("thread event must link the persisted mr_web_url: %+v", fp.posts)
+	if len(fp.blocks) != 1 || !strings.Contains(fp.blocks[0].contextText, "/pulls/7") {
+		t.Fatalf("thread event must link the persisted mr_web_url: %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "/-/merge_requests/") {
-		t.Errorf("Forgejo DM must not reconstruct a GitLab MR URL: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/") {
+		t.Errorf("Forgejo DM must not reconstruct a GitLab MR URL: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -333,15 +337,15 @@ func TestNotifierRejectsNonHTTPSMrWebURL(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want 1 threaded event, got %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want 1 threaded event, got %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "javascript:") {
-		t.Errorf("a non-https mr_web_url must not be rendered: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].contextText, "javascript:") {
+		t.Errorf("a non-https mr_web_url must not be rendered: %q", fp.blocks[0].contextText)
 	}
 	// It falls back to the GitLab reconstruction (this row's forge is gitlab).
-	if !strings.Contains(fp.posts[0].text, "/-/merge_requests/7") {
-		t.Errorf("want the GitLab reconstruction fallback: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].contextText, "/-/merge_requests/7") {
+		t.Errorf("want the GitLab reconstruction fallback: %q", fp.blocks[0].contextText)
 	}
 }
 
@@ -439,10 +443,14 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "failed"})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want one threaded failure event, got %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one threaded failure event, got %+v", fp.blocks)
 	}
-	evt := fp.posts[0].text
+	// The reason rides its own FULL section (never a context element).
+	evt := fp.blocks[0].sectionText
+	if !strings.Contains(evt, "Failed") {
+		t.Errorf("failure event missing the Failed head: %q", evt)
+	}
 	if strings.Contains(evt, "<@U9>") {
 		t.Errorf("raw mention survived in the failure event: %q", evt)
 	}
@@ -451,6 +459,10 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 	}
 	if !strings.Contains(evt, "…") || strings.Contains(evt, strings.Repeat("x", 501)) {
 		t.Errorf("failure reason was not length-bounded: %q", evt)
+	}
+	// The fallback also carries the escaped, bounded reason — never a raw model field.
+	if strings.Contains(fp.blocks[0].fallback, "<@U9>") {
+		t.Errorf("fallback carried a raw mention: %q", fp.blocks[0].fallback)
 	}
 }
 
@@ -747,11 +759,12 @@ func TestNotifierHealthNudgeThreadsUnderRoot(t *testing.T) {
 	if _, ok := findUpdateBlock(fp.updateBlocks, "ts1"); !ok {
 		t.Fatalf("root should also be re-rendered: %+v", fp.updateBlocks)
 	}
-	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
-		t.Fatalf("nudge not threaded under the root ts1: %+v", fp.posts)
+	// PRD #268 M3: the nudge is now a Block Kit post (family E) threaded under the root.
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+		t.Fatalf("nudge not threaded under the root ts1: %+v", fp.blocks)
 	}
-	if !strings.Contains(fp.posts[0].text, "quiet") {
-		t.Errorf("nudge missing its enum-keyed framing: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].sectionText, "quiet") {
+		t.Errorf("nudge missing its enum-keyed framing: %q", fp.blocks[0].sectionText)
 	}
 }
 
@@ -766,8 +779,8 @@ func TestNotifierHealthApprovalIdleThreadsUnderGate(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "approval_idle", reason: "waiting for the plan to be approved", nudge: true})
 
-	if len(fp.posts) != 1 || fp.posts[0].thread != "gate1" {
-		t.Fatalf("approval_idle nudge should thread under the gate ts: %+v", fp.posts)
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "gate1" {
+		t.Fatalf("approval_idle nudge should thread under the gate ts: %+v", fp.blocks)
 	}
 }
 
@@ -790,13 +803,18 @@ func TestNotifierHealthCreatesRootWhenAbsent(t *testing.T) {
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "waiting_worker", reason: "no worker is online to pick up this run", nudge: true})
 
-	// The new top-level root is a Block Kit post (carrying the flag in its context); the
-	// nudge is a threaded plain post under it.
-	if len(fp.blocks) != 1 || fp.blocks[0].thread != "" || !strings.Contains(fp.blocks[0].contextText, "⚠️ waiting for a worker") {
-		t.Fatalf("root not created with the flag: %+v", fp.blocks)
+	// PRD #268 M3: both the new top-level root AND the threaded nudge are Block Kit posts
+	// now, so fp.blocks carries two — the root (thread "") first, then the nudge under it.
+	if len(fp.blocks) != 2 {
+		t.Fatalf("want the root + the nudge as two Block Kit posts: %+v", fp.blocks)
 	}
-	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
-		t.Fatalf("nudge not threaded under the new root: %+v", fp.posts)
+	root := fp.blocks[0]
+	if root.thread != "" || !strings.Contains(root.contextText, "⚠️ waiting for a worker") {
+		t.Fatalf("root not created with the flag: %+v", root)
+	}
+	nudge := fp.blocks[1]
+	if nudge.thread != "ts1" {
+		t.Fatalf("nudge not threaded under the new root: %+v", nudge)
 	}
 	if len(fs.upserted) != 1 {
 		t.Fatalf("anchor not recorded for the new root: %+v", fs.upserted)
@@ -811,14 +829,14 @@ func TestNotifierHealthNudgeScrubsSecrets(t *testing.T) {
 	// A hostile reason carrying a token must never reach Slack.
 	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "leaked xoxb-abc123DEF token", nudge: true})
 
-	if len(fp.posts) != 1 {
-		t.Fatalf("want a nudge post: %+v", fp.posts)
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want a nudge post: %+v", fp.blocks)
 	}
-	if strings.Contains(fp.posts[0].text, "xoxb-abc123DEF") {
-		t.Errorf("nudge leaked a token: %q", fp.posts[0].text)
+	if strings.Contains(fp.blocks[0].sectionText, "xoxb-abc123DEF") {
+		t.Errorf("nudge leaked a token: %q", fp.blocks[0].sectionText)
 	}
-	if !strings.Contains(fp.posts[0].text, "[redacted]") {
-		t.Errorf("token not scrubbed in nudge: %q", fp.posts[0].text)
+	if !strings.Contains(fp.blocks[0].sectionText, "[redacted]") {
+		t.Errorf("token not scrubbed in nudge: %q", fp.blocks[0].sectionText)
 	}
 }
 
@@ -849,7 +867,7 @@ func parkedCtx(rateLimitType string, resumesIn time.Duration, count int32) store
 // M2 preserves under Block Kit: the notifier has NO status filter, so a parked run must
 // not reach the default arm and leak the literal database string "limit_wait" into a
 // user's DM. The root section reads "⏸️ Paused · usage limit"; the window/resume detail
-// now rides the terminal thread event (limitWaitLabel), asserted below.
+// now rides the terminal thread event's context (limitWaitDetail), asserted below.
 func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 	blocks, fallback := rootBlocks(parkedCtx("five_hour", 4*time.Hour, 1), "https://uzi.example")
 	_, section := blockSummary(blocks)
@@ -869,33 +887,46 @@ func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 // mechanical rather than editorial: the root line is EDITED, and a Slack edit raises
 // no notification, so without this a user is never told their run paused.
 func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
-	if evt := renderThread(parkedCtx("seven_day", time.Hour, 1)); evt == "" {
+	if _, _, ok := renderThreadBlocks(parkedCtx("seven_day", time.Hour, 1), "https://uzi.example"); !ok {
 		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
 			"the user would never learn the run paused")
 	}
 	// The promotion back to queued must NOT post — resuming is a return to normal and
 	// the edited root already shows it. A run that parks five times would otherwise
 	// produce ten posts.
-	if evt := renderThread(baseRun("queued")); evt != "" {
-		t.Fatalf("the resume threaded %q; only the park is worth interrupting for", evt)
+	if _, _, ok := renderThreadBlocks(baseRun("queued"), "https://uzi.example"); ok {
+		t.Fatal("the resume threaded an event; only the park is worth interrupting for")
 	}
 }
 
 // Every part is omitted rather than defaulted when unknown, matching the server's own
-// failure-reason composition: the line must never claim a fact uzi does not have.
-func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
-	bare := renderThread(parkedCtx("", 0, 1))
-	if bare != "⏸️ Paused · usage limit" {
-		t.Fatalf("a park with no window and no stamp rendered %q; it must degrade to the "+
-			"bare statement rather than inventing a window or a time", bare)
+// failure-reason composition: the detail must never claim a fact uzi does not have. The
+// park head is the section (⏸️ Paused · usage limit); the detail suffix is the context.
+func TestLimitWaitDetailOmitsWhatItDoesNotKnow(t *testing.T) {
+	// A park with no window and no stamp on the first pause has no detail at all: the
+	// section carries the head, and the context is just the deep link.
+	if bare := limitWaitDetail(parkedCtx("", 0, 1)); bare != "" {
+		t.Fatalf("a park with no window and no stamp had detail %q; it must be empty rather "+
+			"than inventing a window or a time", bare)
 	}
-	if strings.Contains(bare, "(pause") {
-		t.Fatalf("%q shows a pause counter on the FIRST park, which is noise — the counter "+
-			"is the signal that a run is burning its retry budget", bare)
+	blocks, _, ok := renderThreadBlocks(parkedCtx("", 0, 1), "https://uzi.example")
+	if !ok {
+		t.Fatal("a bare park must still thread the head + link")
 	}
-	if repeat := renderThread(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
+	_, section := blockSummary(blocks)
+	if !strings.Contains(section, "Paused · usage limit") {
+		t.Fatalf("park section = %q, want the pause head", section)
+	}
+	if strings.Contains(limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)), "(pause") {
+		t.Fatal("a pause counter on the FIRST park is noise — the counter is the signal that a run is burning its retry budget")
+	}
+	if repeat := limitWaitDetail(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
 		t.Fatalf("%q — from the second park on, the rising count is the warning that this "+
 			"run may be about to fail for good", repeat)
+	}
+	// The reader-local resume token is preserved verbatim.
+	if d := limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)); !strings.Contains(d, "resumes <!date^") {
+		t.Fatalf("detail = %q, want the <!date^…> reader-local resume token preserved", d)
 	}
 }
 
@@ -903,10 +934,100 @@ func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
 // only fire for a writer that bypassed both — a backfill, an admin tool, a later
 // refactor. That is exactly the population the CHECK exists for, so the renderer
 // escapes rather than trusting.
-func TestLimitWaitLabelEscapesTheWindowField(t *testing.T) {
-	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
+func TestLimitWaitDetailEscapesTheWindowField(t *testing.T) {
+	got := limitWaitDetail(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
+	}
+}
+
+// --- PRD #268 M3: the Block Kit terminal thread events (family B) -----------------
+
+// Each terminal transition renders its canonical glyph + label section, the deep link,
+// and a fallback built from fixed labels + the escaped repo#iid — never a raw field.
+func TestRenderThreadBlocksShapesPerEvent(t *testing.T) {
+	failedCancelled := baseRun("failed")
+	failedCancelled.FailureReason = txt("run cancelled")
+
+	failedReason := baseRun("failed")
+	failedReason.FailureReason = txt("the agent crashed")
+
+	completedMR := baseRun("completed")
+	completedMR.MrIid = text8(7)
+
+	for _, tc := range []struct {
+		name         string
+		rc           store.GetSlackRunContextRow
+		wantSection  string
+		wantFallback string
+	}{
+		{"completed", completedMR, "✅ *Completed*", "Completed · grp/repo#42"},
+		{"failed", failedReason, "❌ *Failed*", "Failed · grp/repo#42 — the agent crashed"},
+		{"failed-run-cancelled", failedCancelled, "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
+		{"cancelled", baseRun("cancelled"), "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
+		{"limit_wait", parkedCtx("five_hour", time.Hour, 1), "⏸️ *Paused · usage limit*", "Paused · usage limit · grp/repo#42"},
+	} {
+		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example")
+		if !ok {
+			t.Errorf("%s: ok=false, want a threaded event", tc.name)
+			continue
+		}
+		_, section := blockSummary(blocks)
+		if !strings.Contains(section, tc.wantSection) {
+			t.Errorf("%s: section = %q, want it to contain %q", tc.name, section, tc.wantSection)
+		}
+		if fallback != tc.wantFallback {
+			t.Errorf("%s: fallback = %q, want %q", tc.name, fallback, tc.wantFallback)
+		}
+		// Every event carries the run deep link in a context element.
+		if !strings.Contains(contextText(blocks), "Open in uzi") {
+			t.Errorf("%s: context missing the deep link: %q", tc.name, contextText(blocks))
+		}
+	}
+}
+
+// A non-terminal, non-park transition threads nothing (ok=false).
+func TestRenderThreadBlocksSkipsRunningAndQueued(t *testing.T) {
+	for _, status := range []string{"queued", "running", "claimed", "awaiting_approval"} {
+		if _, _, ok := renderThreadBlocks(baseRun(status), "https://uzi.example"); ok {
+			t.Errorf("%s must not thread a terminal event", status)
+		}
+	}
+}
+
+// The failed reason is untrusted free text: it rides its OWN section (never a context
+// element), scrubbed and escaped, and the fallback carries the escaped reason too.
+func TestRenderThreadBlocksFailedReasonIsAnEscapedSection(t *testing.T) {
+	rc := baseRun("failed")
+	rc.FailureReason = txt("boom <@U9> leaked sk-ant-abc123DEF")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	if !ok {
+		t.Fatal("failed must thread an event")
+	}
+	_, section := blockSummary(blocks)
+	if strings.Contains(section, "<@U9>") || !strings.Contains(section, "&lt;@U9&gt;") {
+		t.Errorf("reason not escaped in its section: %q", section)
+	}
+	if strings.Contains(section, "sk-ant-abc123DEF") || strings.Contains(fallback, "sk-ant-abc123DEF") {
+		t.Errorf("reason not scrubbed: section=%q fallback=%q", section, fallback)
+	}
+}
+
+// Emoji-presentation across the thread events, same guard as the root.
+func TestRenderThreadBlocksUseEmojiPresentation(t *testing.T) {
+	completedMR := baseRun("completed")
+	completedMR.MrIid = text8(7)
+	for _, rc := range []store.GetSlackRunContextRow{
+		completedMR,
+		baseRun("cancelled"),
+		parkedCtx("five_hour", time.Hour, 2),
+	} {
+		blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+		if !ok {
+			t.Fatalf("%s: want a threaded event", rc.Status)
+		}
+		_, section := blockSummary(blocks)
+		assertEmojiPresentation(t, section+contextText(blocks)+fallback)
 	}
 }
 
