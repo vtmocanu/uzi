@@ -2,7 +2,7 @@
 
 **GitLab Issue**: [#256](https://gitlab.example.com/vtmocanu/uzi/-/issues/256)
 **Status**: 📝 Draft — architect-reviewed 2026-08-08 (findings F1–F6 incorporated); ready for implementation
-**Priority**: Low
+**Priority**: High — top priority, do next (owner, 2026-08-09). Deferred only to avoid a Board.tsx collision with the in-flight #196; send the full gated PRD once #196 lands.
 **Mock**: `prds/mockups/256-run-duration-mock.html` (the Runs page with the duration token added; shown to owner 2026-08-08)
 
 ## Problem

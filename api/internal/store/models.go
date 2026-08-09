@@ -428,6 +428,7 @@ type SlackRunMessage struct {
 	QuestionID                  pgtype.Text        `json:"question_id"`
 	QuestionTs                  pgtype.Text        `json:"question_ts"`
 	MilestonesNotifiedCompleted pgtype.Int4        `json:"milestones_notified_completed"`
+	StatusTs                    pgtype.Text        `json:"status_ts"`
 }
 
 type ToolAllowlist struct {

@@ -387,6 +387,7 @@ type Store interface {
 	CreateChatRun(ctx context.Context, arg store.CreateChatRunParams) (store.Run, error)
 	CreateChatContinueRun(ctx context.Context, arg store.CreateChatContinueRunParams) (store.Run, error)
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
+	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
@@ -633,6 +634,16 @@ type SettingsReader interface {
 	// default on. It waives only a HUMAN's second click: the run gate applies it
 	// solely to a manual run eligible via a non-primary label, never to autopilot.
 	EligibleLabelWaivesPRDLink(ctx context.Context) (bool, error)
+	// PrdlessEnabled / PrdlessLabel drive the PRDLESS bypass to that gate (PRD #22
+	// Decision 3): when the feature is on instance-wide and an issue carries the
+	// prdless label, a run may start without a prds/*.md link. They ride SettingsReader
+	// for the same reason PRDLabel does — the same *settings.Cache serves them — and
+	// are read here (not passed in by each caller) so StartRunForUser answers the gate
+	// identically for the web start button and the Slack start-run card (PRD #191 M1).
+	// Best-effort like the siblings: a cold cache returns the default (enabled=false),
+	// which keeps an unlabeled issue gated.
+	PrdlessEnabled(ctx context.Context) (bool, error)
+	PrdlessLabel(ctx context.Context) (string, error)
 }
 
 // DockerAllowlistReader is the narrow settings view the claim gate reads for the
@@ -711,12 +722,27 @@ type Service struct {
 	// the whole Publish path is exercised without a real forge. Injected as a seam
 	// rather than called directly so pushbroker stays the ONE place go-git lives.
 	publishFn func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error)
+	// forges builds a forge driver from a stored connection (PRD #191 Decision 8): the
+	// seam the composite forge-write operations lifted out of the handlers
+	// (ConfirmProposalForUser, StartRunForUser) reach the forge through. Optional
+	// (nil-safe); set via SetForges. workersvc cannot import forgesvc directly
+	// (forgesvc already imports workersvc — a cycle), so this mirrors the narrow
+	// ForgeBuilder interface privcheck/selfimprove/runlifecycle already use. Nil ⇒ the
+	// composite ops return ErrForgesUnavailable rather than panic (the pre-#191
+	// deployments and every test that never wires it are unaffected).
+	forges ForgeBuilder
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
 // before serving. A nil reader (tests, or a deployment that never enabled the judge)
 // disables the terminal-funnel enqueue and leaves the judge model unset in claims.
 func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
+
+// SetForges wires the forge builder (PRD #191 Decision 8), the seam
+// ConfirmProposalForUser/StartRunForUser reach the forge through. Call once at
+// startup, before serving; pass the same *forgesvc.Service the handlers hold. A nil
+// builder leaves the composite ops returning ErrForgesUnavailable.
+func (s *Service) SetForges(fb ForgeBuilder) { s.forges = fb }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted

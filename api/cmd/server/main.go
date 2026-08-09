@@ -260,6 +260,28 @@ func run() error {
 	// submitter as the gatekeeper.
 	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
 
+	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
+	// Created here (ahead of the other route limiters) because the Slack chat opener
+	// captures it below — the socket manager starts before the route wiring — and
+	// because web and Slack MUST share ONE bucket per user (PRD #191 Decision 9). The
+	// opener keys it identically to the web POST /chats mount (RoutePattern|userID) so a
+	// heavy Slack day rate-limits the web Chat page and vice versa.
+	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
+	slackReplier.SetChatSpendGuard(func(userID uuid.UUID) bool {
+		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
+	})
+
+	// Chat-card handler (PRD #191 M4): the slack_chat_* Block Kit buttons — Create /
+	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
+	// linker and the gatekeeper. The forge write rides the same claim-first
+	// ConfirmProposalForUser the web confirm uses (lifted in M1).
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
+	// The Continue button mints a run and spends the owner's token, so it draws from the
+	// SAME shared per-user chat budget the opener uses (PRD #191 M6) — same key, one pool.
+	slackChatActions.SetChatSpendGuard(func(userID uuid.UUID) bool {
+		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
+	})
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
@@ -270,12 +292,18 @@ func run() error {
 	// the replier.
 	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
 		HTTPTimeout: cfg.SlackHTTPTimeout,
-		Inbound:     slacksvc.InboundMux{slackLinker, slackGate},
+		Inbound:     slacksvc.InboundMux{slackLinker, slackGate, slackChatActions},
 		Messages:    slackReplier,
 		OnConnected: slackLinker.AutoMatch,
 	})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
+
+	// Wire the forge builder into workersvc so its composite forge-write operations —
+	// ConfirmProposalForUser, StartRunForUser (PRD #191 Decision 8) — reach the forge
+	// through the same decryption path the handlers use, without a forgesvc↔workersvc
+	// import cycle. selfimprove/privcheck already pass this same *forgesvc.Service.
+	wsvc.SetForges(svc)
 
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
@@ -572,8 +600,6 @@ func run() error {
 	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
 	// (PRD #25 M3 fast-follow) — see the wiring in handler.Routes.
 	slackDMLimiter := mw.NewLimiter(cfg.SlackDMRateLimitMax, cfg.SlackDMRateLimitWindow, cfg.TrustedProxies)
-	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
-	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
 	// Per-user re-run-judge budget (PRD #46 Decision 8): a dedicated spend guard on the
 	// re-run-judge action, separate from chat so neither consumes the other's allowance.
 	judgeLimiter := mw.NewLimiter(cfg.JudgeRateLimitMax, cfg.JudgeRateLimitWindow, cfg.TrustedProxies)
@@ -853,6 +879,161 @@ func (g gateSubmitter) SubmitAnswer(ctx context.Context, userID, runID uuid.UUID
 //     normalised or defaulted it here would break the identity guard silently.
 func answerInputBody(questionID, text string) ([]byte, error) {
 	return json.Marshal(workersvc.AnswerBody{QuestionID: questionID, Answers: []string{text}})
+}
+
+// LiveChatForUser adapts the Slack chat opener's Decision 3 refusal to the run
+// service (PRD #191 M2): the newest non-terminal chat run for the user, if any.
+func (g gateSubmitter) LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error) {
+	return g.svc.LiveChatForUser(ctx, userID)
+}
+
+// CreateChatRun adapts the Slack chat opener to the run service (PRD #191 M2): it
+// queues a kind='chat' run seeded with the opening message. The Slack path has
+// already drawn from the shared chat spend budget before calling this.
+func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, message string) (store.Run, error) {
+	return g.svc.CreateChatRun(ctx, userID, message)
+}
+
+// HasOnlineWorker adapts the opener's no-worker check (PRD #191 M6).
+func (g gateSubmitter) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
+	return g.svc.HasOnlineWorker(ctx, userID)
+}
+
+// EndChat adapts the Slack End-chat button (PRD #191 M6): cancel the live chat, with
+// the terminal/not-found sentinels translated for the ChatActions handler.
+func (g gateSubmitter) EndChat(ctx context.Context, userID, runID uuid.UUID) error {
+	_, err := g.svc.EndChat(ctx, userID, runID)
+	switch {
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return slacksvc.ErrChatEnded
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return slacksvc.ErrChatGone
+	}
+	return err
+}
+
+// ContinueChat adapts the Slack Continue button (PRD #191 M6): mint a fresh chat
+// resuming a terminal one, returning the new run's id, with sentinels translated.
+func (g gateSubmitter) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (uuid.UUID, error) {
+	run, err := g.svc.ContinueChat(ctx, userID, runID)
+	switch {
+	case errors.Is(err, workersvc.ErrChatNotEnded):
+		return uuid.Nil, slacksvc.ErrChatNotEndedYet
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		return uuid.Nil, slacksvc.ErrChatGone
+	case err != nil:
+		return uuid.Nil, err
+	}
+	return run.ID, nil
+}
+
+// SubmitChatMessage adapts a Slack thread reply on a chat run to the run service
+// (PRD #191 Decision 5): it rides SubmitChatMessage (turn cap + terminal 409 enforced
+// at the boundary), drops the result the replier does not use, and translates the two
+// user-facing sentinels into the slacksvc ones so the replier can say which happened —
+// the same translate-in-main pattern SubmitInput/SubmitApproval/SubmitAnswer use to
+// keep slacksvc free of a workersvc import.
+func (g gateSubmitter) SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID, message string) error {
+	_, err := g.svc.SubmitChatMessage(ctx, userID, runID, message)
+	switch {
+	case errors.Is(err, workersvc.ErrChatTurnCapReached):
+		return slacksvc.ErrChatTurnCapReached
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return slacksvc.ErrChatEnded
+	}
+	return err
+}
+
+// ConfirmProposalForUser adapts the Slack proposal card's Create to the run service
+// (PRD #191 M4): the lifted claim-first forge write (M1). It converts the workersvc
+// CreatedIssue to the slacksvc one and translates the proposal sentinels so ChatActions
+// can tell already-handled (edit the card) from not-yours (ephemeral) from a forge
+// failure (retry), all without a workersvc import on the slacksvc side.
+func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) (slacksvc.CreatedIssue, error) {
+	ci, err := g.svc.ConfirmProposalForUser(ctx, userID, runID, propID)
+	switch {
+	case errors.Is(err, workersvc.ErrProposalNotPending):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
+	case errors.Is(err, workersvc.ErrProposalNotFound):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+	case errors.Is(err, workersvc.ErrProposalRepoGone),
+		errors.Is(err, workersvc.ErrForgeBuild),
+		errors.Is(err, workersvc.ErrForgeIssueWrite),
+		errors.Is(err, workersvc.ErrForgesUnavailable):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalForge
+	case err != nil:
+		return slacksvc.CreatedIssue{}, err
+	}
+	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+}
+
+// DismissProposalForUser adapts the Slack proposal card's Dismiss (PRD #191 M4): the
+// ownership-checked, forge-free dismiss, with the two lookup sentinels translated.
+func (g gateSubmitter) DismissProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) error {
+	err := g.svc.DismissProposalForUser(ctx, userID, runID, propID)
+	switch {
+	case errors.Is(err, workersvc.ErrProposalNotPending):
+		return slacksvc.ErrChatProposalHandled
+	case errors.Is(err, workersvc.ErrProposalNotFound):
+		return slacksvc.ErrChatProposalGone
+	}
+	return err
+}
+
+// StartRunFromCard adapts the Slack start-run card's Start (PRD #191 M5): the lifted,
+// path-keyed, PRD-gated StartRunForUserByPath. On refusal it returns an error whose
+// MESSAGE is user-safe (built from the gate sentinels below, mirroring the web start
+// button's intent) and logs the raw cause, so slacksvc surfaces a helpful line without
+// importing workersvc.
+func (g gateSubmitter) StartRunFromCard(ctx context.Context, userID uuid.UUID, repoPath string, issueIID int64) (uuid.UUID, error) {
+	run, err := g.svc.StartRunForUserByPath(ctx, userID, repoPath, issueIID, nil, nil)
+	if err == nil {
+		return run.ID, nil
+	}
+	if isInternalStartRunErr(err) {
+		slog.Error("slack start-run card", "repo", repoPath, "issue_iid", issueIID, "error", err)
+	}
+	return uuid.Nil, errors.New(startRunCardMessage(err))
+}
+
+// isInternalStartRunErr reports whether a StartRun error is an unexpected/internal
+// failure worth logging (vs a user-actionable gate refusal).
+func isInternalStartRunErr(err error) bool {
+	switch {
+	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
+		errors.Is(err, workersvc.ErrNotPRDIssue), errors.Is(err, workersvc.ErrNoPRDLink),
+		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
+		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
+		return false
+	default:
+		return true
+	}
+}
+
+// startRunCardMessage maps a StartRun error to a user-safe Slack message, mirroring the
+// intent of the web start button's per-sentinel copy (the web chat card gets the
+// byte-identical HTTP copy; this is the DM paraphrase).
+func startRunCardMessage(err error) string {
+	switch {
+	case errors.Is(err, workersvc.ErrRepoNotFound):
+		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrIssueNotFound):
+		return "That issue isn't on this repo's board."
+	case errors.Is(err, workersvc.ErrNotPRDIssue):
+		return "This issue isn't marked as uzi's work — promote it (add the PRD label) in uzi first."
+	case errors.Is(err, workersvc.ErrNoPRDLink):
+		return "This issue has no PRD link — add a prds/*.md link (or the PRD-less label) before starting a run."
+	case errors.Is(err, workersvc.ErrActiveRunExists):
+		return "A run is already in progress for this issue."
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		return "A CI-fix run is already working this issue's branch — cancel it first."
+	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
+		return "That issue's description is too large to run."
+	case errors.Is(err, workersvc.ErrForgeIssueRead):
+		return "Couldn't read that issue from the forge — check the issue number."
+	default:
+		return "Couldn't start the run right now — try from the Chat page in uzi."
+	}
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no

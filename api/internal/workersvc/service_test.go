@@ -231,6 +231,7 @@ type fakeStore struct {
 	rejected           *store.RejectRunServerSideParams
 
 	// Create run.
+	repoRow         store.GetRepoForUserRow // repo GetRepoForUser returns (zero value = the pre-#191 empty row)
 	repoErr         error
 	issueByID       store.Issue
 	issueByIDErr    error
@@ -285,6 +286,11 @@ type fakeStore struct {
 	pendingProposalCount int64
 	createdProposal      *store.CreateIssueProposalParams
 	sweptStuckProposals  []uuid.UUID
+	// PRD #191 M1: the lifted ConfirmProposalForUser reverts a claimed proposal on a
+	// post-claim failure. revertedProposals records every RevertProposalToPending id,
+	// in order, so a test can assert the revert fired (and how many times).
+	revertedProposals []uuid.UUID
+	revertProposalErr error
 
 	// PRD #35 usage-limit park. setLimitWait captures the park params (which is where
 	// the computed retry_not_before is asserted); setLimitWaitRows models the SQL's
@@ -689,7 +695,11 @@ func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunSe
 	return 1, nil
 }
 func (f *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
-	return store.GetRepoForUserRow{}, f.repoErr
+	return f.repoRow, f.repoErr
+}
+func (f *fakeStore) RevertProposalToPending(_ context.Context, id uuid.UUID) (int64, error) {
+	f.revertedProposals = append(f.revertedProposals, id)
+	return 1, f.revertProposalErr
 }
 func (f *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return f.issueByID, f.issueByIDErr

@@ -1,20 +1,17 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -180,6 +177,44 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
 }
 
+// startChatRunRequest is the body of the chat start-run card's Start click (PRD #191
+// M5): the repo (by the human path the card showed) and the issue iid. The run is
+// gated exactly as the board start button (StartRunForUser), so an issue with no PRD is
+// refused with the same message.
+type startChatRunRequest struct {
+	RepoPath string `json:"repo_path"`
+	IssueIID int64  `json:"issue_iid"`
+}
+
+// StartChatRun starts an agent run from a chat's start-run card. Owner-scoped through
+// the repo path resolve; behind the per-user forge limiter (it does a forge GetIssue).
+func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req startChatRunRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.RepoPath) == "" {
+		httpx.Error(w, http.StatusBadRequest, "repo_path is required")
+		return
+	}
+	if req.IssueIID <= 0 {
+		httpx.Error(w, http.StatusBadRequest, "issue_iid must be a positive integer")
+		return
+	}
+	run, err := h.wsvc.StartRunForUserByPath(r.Context(), user.ID, req.RepoPath, req.IssueIID, nil, nil)
+	if err != nil {
+		h.writeStartRunError(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
+}
+
 // createdIssueDTO is the confirm response: the real forge issue the click created.
 type createdIssueDTO struct {
 	IID    int64  `json:"iid"`
@@ -196,71 +231,29 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Claim-first (M3, audit Minor #1): atomically move the proposal pending ->
-	// confirming BEFORE the forge write, so of two concurrent confirms exactly one
-	// reaches CreateIssue (the other 409s). Every failure after this claim reverts
-	// the row to pending so the user can retry or dismiss.
-	claim, err := h.wsvc.ClaimProposalForConfirm(r.Context(), userID, runID, propID)
+	// The whole claim-first / forge-write / settle-or-revert composite lives in
+	// workersvc.ConfirmProposalForUser (PRD #191 M1) so the Slack proposal card calls
+	// the identical path; this handler only maps its sentinels to HTTP.
+	created, err := h.wsvc.ConfirmProposalForUser(r.Context(), userID, runID, propID)
 	if err != nil {
-		h.writeProposalLookupError(w, err)
-		return
-	}
-
-	// Load the target repo + its connection PAT (the user must still own it).
-	repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: claim.RepoID, UserID: userID})
-	if err != nil {
-		h.revertProposal(r.Context(), propID)
-		if errors.Is(err, pgx.ErrNoRows) {
+		switch {
+		case errors.Is(err, workersvc.ErrProposalRepoGone):
 			httpx.Error(w, http.StatusNotFound, "the proposal's target repo is no longer available")
-			return
+		case errors.Is(err, workersvc.ErrForgeIssueWrite):
+			// err wraps the driver's already-redacted message.
+			httpx.Error(w, http.StatusBadGateway, err.Error())
+		case errors.Is(err, workersvc.ErrProposalNotFound), errors.Is(err, workersvc.ErrProposalNotPending):
+			h.writeProposalLookupError(w, err)
+		default:
+			slog.Error("confirm proposal", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
-		slog.Error("confirm proposal: load repo", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
-	}
-
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
-	if err != nil {
-		h.revertProposal(r.Context(), propID)
-		slog.Error("build forge for connection", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	var labels []string
-	if len(claim.Labels) > 0 {
-		if err := json.Unmarshal(claim.Labels, &labels); err != nil {
-			labels = nil
-		}
-	}
-
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, claim.Title, claim.Description, labels)
-	if err != nil {
-		h.revertProposal(r.Context(), propID)
-		// err is already PAT-redacted by the driver.
-		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
-		return
-	}
-
-	// Settle confirming -> confirmed with the created iid. This row is ours (we hold
-	// the claim), so a non-nil error here is unexpected; the issue WAS created, so
-	// surface it and log rather than revert (reverting would orphan the real issue).
-	if err := h.wsvc.ConfirmProposal(r.Context(), propID, created.IID); err != nil {
-		slog.Error("confirm proposal: mark confirmed after issue creation", "proposal", propID.String(), "issue_iid", created.IID, "error", err)
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"issue": createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
 	})
-}
-
-// revertProposal best-effort returns a claimed proposal to pending after a
-// post-claim failure; a revert error is logged but never changes the response the
-// user already gets for the underlying failure.
-func (h *Handler) revertProposal(ctx context.Context, propID uuid.UUID) {
-	if err := h.wsvc.RevertProposalToPending(ctx, propID); err != nil {
-		slog.Error("confirm proposal: revert to pending", "proposal", propID.String(), "error", err)
-	}
 }
 
 // DismissProposal marks a proposal dismissed. It NEVER touches the forge

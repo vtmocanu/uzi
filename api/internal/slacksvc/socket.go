@@ -207,13 +207,15 @@ func routeInteractive(ctx context.Context, inbound InboundHandler, cb slack.Inte
 	}
 }
 
-// routeMessage turns a message.im thread reply into a MessageReply for the handler
-// (M5). Only genuine user thread replies in a DM are routed: the bot's own posts
-// (BotID set), non-message subtypes (edits/deletes/joins), non-thread top-level
-// DMs, non-DM channel types, and empty text are dropped. The actor is the
-// authenticated envelope user (ev.User) — never a client-controlled value — which
-// is what makes the downstream confirmed-user/ownership join trustworthy. It is
-// the small pure seam the dial loop delegates to so it stays unit-testable.
+// routeMessage turns a message.im event into a MessageReply for the handler. Two
+// shapes route (PRD #191 M2): a THREAD REPLY (thread_ts set → a reply on an existing
+// run/chat, resolved by the anchor) and a TOP-LEVEL DM (thread_ts empty → opens a new
+// chat). Dropped either way: the bot's own posts (BotID set), non-message subtypes
+// (edits/deletes/joins carry one), non-DM channel types, an empty author, and empty
+// text. The actor is the authenticated envelope user (ev.User) — never a
+// client-controlled value — which is what makes the downstream confirmed-user /
+// ownership join trustworthy. It is the small pure seam the dial loop delegates to so
+// it stays unit-testable.
 func routeMessage(ctx context.Context, messages MessageHandler, e slackevents.EventsAPIEvent) {
 	if e.Type != slackevents.CallbackEvent {
 		return
@@ -222,18 +224,19 @@ func routeMessage(ctx context.Context, messages MessageHandler, e slackevents.Ev
 	if !ok {
 		return
 	}
-	// Plain user message in a DM only: no subtype (edits/deletes/joins carry one),
-	// not a bot post, a real author, and a thread reply (thread_ts == the run root).
+	// Plain user message in a DM only: no subtype (edits/deletes/joins carry one), not
+	// a bot post, a real author. A top-level DM (empty thread_ts) is kept — HandleMessage
+	// routes it to the chat opener; only empty text is dropped.
 	if ev.ChannelType != "im" || ev.SubType != "" || ev.BotID != "" || ev.User == "" {
 		return
 	}
-	if strings.TrimSpace(ev.ThreadTimeStamp) == "" || strings.TrimSpace(ev.Text) == "" {
+	if strings.TrimSpace(ev.Text) == "" {
 		return
 	}
 	messages.HandleMessage(ctx, MessageReply{
 		SlackUserID: ev.User,
 		ChannelID:   ev.Channel,
-		ThreadTS:    ev.ThreadTimeStamp,
+		ThreadTS:    ev.ThreadTimeStamp, // "" for a top-level DM → opens a chat
 		MessageTS:   ev.TimeStamp,
 		Text:        ev.Text,
 	})

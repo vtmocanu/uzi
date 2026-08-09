@@ -123,6 +123,42 @@ func (q *Queries) GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]
 	return payload, err
 }
 
+const getSlackChatContext = `-- name: GetSlackChatContext :one
+SELECT id, user_id, status, kind, failure_reason
+FROM runs
+WHERE id = $1 AND kind = 'chat'
+`
+
+type GetSlackChatContextRow struct {
+	ID            uuid.UUID   `json:"id"`
+	UserID        uuid.UUID   `json:"user_id"`
+	Status        string      `json:"status"`
+	Kind          string      `json:"kind"`
+	FailureReason pgtype.Text `json:"failure_reason"`
+}
+
+// The repo-less context the notifier renders a CHAT run's status line from (PRD #191
+// M2b). GetSlackRunContext INNER-JOINs repos and forge_connections, so a chat run
+// (repo_id NULL) returns no row there and its terminal transitions — idle-complete,
+// turn-cap complete, failed — were silently dropped. This query joins nothing, is
+// keyed by run id, and is filtered to kind='chat' so a non-chat id returns ErrNoRows
+// (the notifier consults it ONLY on the run-context ErrNoRows fallback). It carries no
+// repo/forge/deep-link fields because a chat has none; the anchor supplies the channel.
+// Content-minimized: the status line names no title/identity, so nothing beyond the
+// status + failure reason is projected.
+func (q *Queries) GetSlackChatContext(ctx context.Context, id uuid.UUID) (GetSlackChatContextRow, error) {
+	row := q.db.QueryRow(ctx, getSlackChatContext, id)
+	var i GetSlackChatContextRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Status,
+		&i.Kind,
+		&i.FailureReason,
+	)
+	return i, err
+}
+
 const getSlackDeliveryForUser = `-- name: GetSlackDeliveryForUser :one
 SELECT slack_resolved_id
 FROM users
@@ -247,7 +283,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 }
 
 const getSlackRunMessage = `-- name: GetSlackRunMessage :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed FROM slack_run_messages WHERE run_id = $1
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts FROM slack_run_messages WHERE run_id = $1
 `
 
 // The DM anchor for a run (threading + edit target). Absent = not yet notified.
@@ -265,12 +301,13 @@ func (q *Queries) GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (Slac
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
 
 const getSlackRunMessageByRoot = `-- name: GetSlackRunMessageByRoot :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
 `
 
 type GetSlackRunMessageByRootParams struct {
@@ -295,6 +332,7 @@ func (q *Queries) GetSlackRunMessageByRoot(ctx context.Context, arg GetSlackRunM
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -325,6 +363,50 @@ func (q *Queries) GetUserSlackLink(ctx context.Context, id uuid.UUID) (GetUserSl
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+	)
+	return i, err
+}
+
+const insertSlackChatAnchor = `-- name: InsertSlackChatAnchor :one
+INSERT INTO slack_run_messages (run_id, channel_id, root_ts, status_ts, updated_at)
+VALUES ($1, $2, $3, $4, now())
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
+`
+
+type InsertSlackChatAnchorParams struct {
+	RunID     uuid.UUID   `json:"run_id"`
+	ChannelID string      `json:"channel_id"`
+	RootTs    string      `json:"root_ts"`
+	StatusTs  pgtype.Text `json:"status_ts"`
+}
+
+// The DM anchor for a Slack-originated chat (PRD #191 M2). Distinct from
+// UpsertSlackRunMessage in two ways rooted in Decision 2: root_ts is the USER's
+// top-level message (what a thread reply's thread_ts resolves against), and status_ts
+// is the bot's OWN editable status message (the chat state path edits it; nothing
+// edits a chat row's root_ts). status_ts may be NULL when the status post failed. No
+// ON CONFLICT: a chat is created once, and the (channel_id, root_ts) unique index
+// fail-closes a redelivered open into a single anchor.
+func (q *Queries) InsertSlackChatAnchor(ctx context.Context, arg InsertSlackChatAnchorParams) (SlackRunMessage, error) {
+	row := q.db.QueryRow(ctx, insertSlackChatAnchor,
+		arg.RunID,
+		arg.ChannelID,
+		arg.RootTs,
+		arg.StatusTs,
+	)
+	var i SlackRunMessage
+	err := row.Scan(
+		&i.RunID,
+		&i.ChannelID,
+		&i.RootTs,
+		&i.GateTs,
+		&i.GateState,
+		&i.UpdatedAt,
+		&i.GateGeneration,
+		&i.QuestionID,
+		&i.QuestionTs,
+		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -404,7 +486,7 @@ const setSlackRunGate = `-- name: SetSlackRunGate :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type SetSlackRunGateParams struct {
@@ -432,6 +514,7 @@ func (q *Queries) SetSlackRunGate(ctx context.Context, arg SetSlackRunGateParams
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -440,7 +523,7 @@ const setSlackRunGateGen = `-- name: SetSlackRunGateGen :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, gate_generation = $3, updated_at = now()
 WHERE run_id = $4 AND (gate_generation IS NULL OR gate_generation < $3)
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type SetSlackRunGateGenParams struct {
@@ -474,6 +557,7 @@ func (q *Queries) SetSlackRunGateGen(ctx context.Context, arg SetSlackRunGateGen
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -482,7 +566,7 @@ const setSlackRunGateIf = `-- name: SetSlackRunGateIf :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3 AND gate_ts = $4 AND gate_state = $5
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type SetSlackRunGateIfParams struct {
@@ -519,6 +603,7 @@ func (q *Queries) SetSlackRunGateIf(ctx context.Context, arg SetSlackRunGateIfPa
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -527,7 +612,7 @@ const setSlackRunMilestoneNotified = `-- name: SetSlackRunMilestoneNotified :one
 UPDATE slack_run_messages
 SET milestones_notified_completed = $1, updated_at = now()
 WHERE run_id = $2 AND (milestones_notified_completed IS NULL OR milestones_notified_completed < $1)
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type SetSlackRunMilestoneNotifiedParams struct {
@@ -560,6 +645,7 @@ func (q *Queries) SetSlackRunMilestoneNotified(ctx context.Context, arg SetSlack
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -568,7 +654,7 @@ const setSlackRunQuestion = `-- name: SetSlackRunQuestion :one
 UPDATE slack_run_messages
 SET question_id = $1, question_ts = $2, updated_at = now()
 WHERE run_id = $3
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type SetSlackRunQuestionParams struct {
@@ -604,6 +690,7 @@ func (q *Queries) SetSlackRunQuestion(ctx context.Context, arg SetSlackRunQuesti
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }
@@ -720,7 +807,7 @@ ON CONFLICT (run_id) DO UPDATE
     SET channel_id = EXCLUDED.channel_id,
         root_ts    = EXCLUDED.root_ts,
         updated_at = now()
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts, milestones_notified_completed, status_ts
 `
 
 type UpsertSlackRunMessageParams struct {
@@ -745,6 +832,7 @@ func (q *Queries) UpsertSlackRunMessage(ctx context.Context, arg UpsertSlackRunM
 		&i.QuestionID,
 		&i.QuestionTs,
 		&i.MilestonesNotifiedCompleted,
+		&i.StatusTs,
 	)
 	return i, err
 }

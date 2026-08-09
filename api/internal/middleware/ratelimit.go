@@ -77,6 +77,14 @@ func (l *Limiter) allow(key string) bool {
 	return b.count <= l.max
 }
 
+// Allow records a hit for key and reports whether it is within budget. It is the
+// exported seam over the same fixed-window accounting PerUserMiddleware uses, for
+// non-HTTP callers (the Slack chat surface, PRD #191 Decision 9) that must draw from
+// the SAME per-user budget as the web routes rather than silently bypassing the
+// guard. Compose the key exactly as the middleware does — the route pattern, "|",
+// then the user id — to share a bucket with that route's mount.
+func (l *Limiter) Allow(key string) bool { return l.allow(key) }
+
 // Middleware limits by (route pattern, client IP). Apply it per-route so each
 // endpoint gets its own budget.
 func (l *Limiter) Middleware(next http.Handler) http.Handler {

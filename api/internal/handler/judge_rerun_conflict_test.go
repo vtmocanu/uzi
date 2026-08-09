@@ -58,6 +58,8 @@ func (j judgeSwitch) RunEligibleLabels(context.Context) ([]string, error) {
 	return nil, nil
 }
 func (j judgeSwitch) EligibleLabelWaivesPRDLink(context.Context) (bool, error) { return false, nil }
+func (j judgeSwitch) PrdlessEnabled(context.Context) (bool, error)             { return false, nil }
+func (j judgeSwitch) PrdlessLabel(context.Context) (string, error)             { return "", nil }
 
 // rerunReq builds POST /api/runs/{id}/rejudge authenticated as user. The path is inert
 // (chi params are injected by hand below, and RerunJudge is called directly), but it is

@@ -28,6 +28,8 @@ type fakeSettings struct {
 	prdLabel       string
 	eligibleLabels []string
 	waivesPRDLink  bool
+	prdlessEnabled bool
+	prdlessLabel   string
 	err            error
 }
 
@@ -40,6 +42,8 @@ func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
 func (f fakeSettings) EligibleLabelWaivesPRDLink(context.Context) (bool, error) {
 	return f.waivesPRDLink, f.err
 }
+func (f fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return f.prdlessEnabled, f.err }
+func (f fakeSettings) PrdlessLabel(context.Context) (string, error) { return f.prdlessLabel, f.err }
 
 // -------------------------------------------------------------------------
 // command-not-found scan (Decision 4)

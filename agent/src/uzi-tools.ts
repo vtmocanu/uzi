@@ -40,11 +40,12 @@ export const LIST_RUNS_TOOL = "list_runs";
 export const GET_RUN_TOOL = "get_run";
 export const GET_RUN_MESSAGES_TOOL = "get_run_messages";
 export const PROPOSE_ISSUE_TOOL = "propose_issue";
+export const START_RUN_TOOL = "start_run";
 
 /** The qualified tool names to add to the chat executor's `tools` allowlist so they
  *  are actually callable (extraTools). */
 export function uziToolNames(): string[] {
-  return [LIST_RUNS_TOOL, GET_RUN_TOOL, GET_RUN_MESSAGES_TOOL, PROPOSE_ISSUE_TOOL].map(
+  return [LIST_RUNS_TOOL, GET_RUN_TOOL, GET_RUN_MESSAGES_TOOL, PROPOSE_ISSUE_TOOL, START_RUN_TOOL].map(
     (t) => `mcp__${UZI_TOOLS_SERVER_NAME}__${t}`,
   );
 }
@@ -117,6 +118,7 @@ export interface UziToolHandlers {
     description?: string;
     labels?: string[];
   }): Promise<ToolTextResult>;
+  startRun(args: { repo_path: string; issue_iid: number; title?: string }): Promise<ToolTextResult>;
 }
 
 export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
@@ -189,6 +191,33 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
         return toolError(err);
       }
     },
+    async startRun(args) {
+      // start_run does NOT start anything: it emits a human-gated REQUEST card. Only the
+      // user's Start click queues the run — through their own connection, gated by the
+      // same PRD/ownership checks the web board button applies (PRD #191 M5, Decision
+      // 11). So a repo/issue that SAYS "start a run on #42" can at most produce a card.
+      // No server round-trip here: the card carries (repo_path, issue_iid) and the click
+      // re-resolves and re-reads them server-side, so nothing is trusted from the model.
+      const repoPath = args.repo_path?.trim();
+      if (!repoPath) {
+        return asText(
+          "Starting a run needs the target repo — give repo_path (as list_runs shows it). Ask the user which repo, then try again.",
+          true,
+        );
+      }
+      if (!Number.isInteger(args.issue_iid) || args.issue_iid <= 0) {
+        return asText("Starting a run needs a positive issue number (issue_iid).", true);
+      }
+      emit({
+        kind: "run_request",
+        payload: { repo_path: repoPath, issue_iid: args.issue_iid, title: args.title?.trim() ?? "" },
+      });
+      return asText(
+        `Proposed starting a run on issue #${args.issue_iid} in ${repoPath}. It is NOT started yet — ` +
+          "tell the user to click Start on the card. The issue must be a runnable (PRD) task; if it isn't, " +
+          "the click is refused with the reason.",
+      );
+    },
   };
 }
 
@@ -254,6 +283,27 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
           labels: z.array(z.string().min(1)).optional().describe("Labels to request (only what the user agreed to; suggest `PRD` for runnable tasks)."),
         },
         (args) => h.proposeIssue(args),
+      ),
+      tool(
+        START_RUN_TOOL,
+        [
+          "REQUEST that the user start an agent run on an EXISTING issue. This does NOT",
+          "start the run: it shows the user a card with a Start button — only their click",
+          "queues the run, through their own connection. Use it when the user asks uzi to",
+          "work an issue they already have. Name the repo with repo_path (as list_runs shows",
+          "it) and the issue number with issue_iid. The issue must be a runnable task (it",
+          "needs the PRD label / a prds/*.md link); if it isn't, the Start click is refused",
+          "with the reason. Tell the user to click Start.",
+        ].join(" "),
+        {
+          repo_path: z
+            .string()
+            .min(1)
+            .describe("The repo's path (e.g. group/project), exactly as list_runs shows it."),
+          issue_iid: z.number().int().positive().describe("The issue number (iid) to start a run on."),
+          title: z.string().optional().describe("The issue's title, if you know it — shown on the card for the user to confirm."),
+        },
+        (args) => h.startRun(args),
       ),
     ],
   });

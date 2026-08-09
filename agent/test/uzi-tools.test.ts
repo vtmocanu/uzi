@@ -229,14 +229,49 @@ describe("uzi tools — propose_issue (Decision 8/10)", () => {
   });
 });
 
+describe("uzi tool — start_run (PRD #191 M5)", () => {
+  it("emits a run_request CARD and starts nothing (no server round-trip)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client, "chat-current");
+    const res = await h.startRun({ repo_path: "group/project", issue_iid: 42, title: "Speed up the poller" });
+
+    assert.strictEqual(calls.createProposal.length, 0, "start_run makes no forge-adjacent call — the click does");
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "run_request");
+    assert.deepStrictEqual(card.payload, { repo_path: "group/project", issue_iid: 42, title: "Speed up the poller" });
+    assert.match(bodyText(res), /NOT started yet/);
+    assert.match(bodyText(res), /click Start/);
+  });
+
+  it("asks for the repo instead of guessing when repo_path is missing (no card)", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    const res = await h.startRun({ repo_path: "  ", issue_iid: 5 });
+    assert.strictEqual(emits.length, 0, "no card without a repo");
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /needs the target repo/);
+  });
+
+  it("rejects a non-positive issue number and emits no card", async () => {
+    const { client } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    const res = await h.startRun({ repo_path: "g/p", issue_iid: 0 });
+    assert.strictEqual(emits.length, 0);
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /positive issue number/);
+  });
+});
+
 describe("uzi tool wiring", () => {
-  it("exposes the four qualified tool names under the `uzi` server", () => {
+  it("exposes the qualified tool names under the `uzi` server", () => {
     assert.strictEqual(UZI_TOOLS_SERVER_NAME, "uzi");
     assert.deepStrictEqual(uziToolNames(), [
       "mcp__uzi__list_runs",
       "mcp__uzi__get_run",
       "mcp__uzi__get_run_messages",
       "mcp__uzi__propose_issue",
+      "mcp__uzi__start_run",
     ]);
   });
 });

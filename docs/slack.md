@@ -10,6 +10,8 @@ uzi can DM you about runs you own: started, needs your approval, needs your
 answer, finished with a merge request, or failed — and you can **Approve**,
 **Reject**, or **Request changes** to a plan gate right from Slack, answer a
 question an agent stopped to ask, or reply in the thread to steer a live run.
+You can also **just message the bot** to open a [chat](./chat.md) — ask what's
+running, why a run failed, or draft an issue or a run — all from the DM.
 The bot is
 **outbound-only** (Socket Mode): it opens a connection out to Slack, so there's
 no public URL or inbound port to expose. See
@@ -200,6 +202,31 @@ Open **Settings → Notifications**:
   When the run recovers, the root label reverts on its own and nudging
   stops — no action needed.
 
+## Chatting from Slack
+
+Send the uzi bot a **top-level DM** (not a thread reply) and it opens a
+conversation — the same [Chat](./chat.md) you get on the web, answered by your
+own worker on your own Anthropic token, streamed back into a thread on your
+message.
+
+- **Continue in the thread.** Reply in the thread to send the next turn. A new
+  top-level DM while a chat is already live is refused with a pointer to the
+  open one — you get one conversation at a time (a worker serves one chat at a
+  time by default).
+- **No worker connected?** The chat is queued and the status line says so —
+  start your worker and it'll pick up where you left off; your messages are
+  saved.
+- **Draft an issue or start a run.** Ask uzi to file an issue or start a run on
+  an existing issue and it posts a **card** with **Create** / **Start** buttons.
+  Nothing is written until you click — the write goes through your own
+  connection, gated exactly like the web (an issue with no PRD is refused with
+  the reason). A repo or issue that *says* "start a run on #42" can at most
+  produce a card, never a run.
+- **End / Continue.** The status message carries an **End chat** button while
+  the conversation is live and a **Continue** button once it ends (it went
+  quiet, hit its turn limit, or you ended it) — Continue resumes it in a fresh
+  thread.
+
 ## Good to know
 
 - **Privacy**: the `users:read.email` scope lets uzi resolve workspace
@@ -233,7 +260,19 @@ Open **Settings → Notifications**:
   only to your own 1:1 DM, so the added exposure is Slack's cloud (retention,
   admin export, e-discovery) and your workspace's own admin boundary, not
   other members. See [ARCHITECTURE.md](../ARCHITECTURE.md#slack-integration-outbound-only)
-  and `prds/41-plan-revision-gate.md` (Decision 10) for the full rationale.
+  and `prds/done/41-plan-revision-gate.md` (Decision 10) for the full rationale.
+- **Chat content leaves the box — and can quote a *run's* content into Slack.**
+  Chat answers are posted into your DM thread by default wherever Slack is on,
+  on the same terms as the plan above: scrubbed of known credential *patterns*
+  only, so a secret a model quotes verbatim into an answer is **not** caught.
+  There is a second-order widening worth naming: the chat agent's read tools can
+  investigate **your other runs**, so you can ask it to quote an issue run's
+  content — a plan body, a diff, tool output — into Slack. The run-status
+  notifications for non-chat runs are unchanged; what's new is that run
+  *content* now has a route to Slack, through chat. Chat DMs are still 1:1 (your
+  own), so the added exposure is Slack's cloud and your workspace's admin
+  boundary, not other members. Prefer the web Chat page if you'd rather that
+  content stay off Slack.
 - **Rotating a token from Settings**: uzi hot-reloads a changed token within
   one settings poll (about 5 seconds) and tears down the old socket — there's
   a brief window where the previous connection can still be live.
