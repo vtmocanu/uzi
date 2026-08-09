@@ -124,30 +124,35 @@ var shellNames = map[string]bool{
 // commonly mis-flags but that are never a missing WORKER TOOL: HTTP status / line
 // numbers (404, 1) and shared-object / archive / header files (libssl.so.1, foo.o,
 // bar.h). Applied ONLY to reShNotFound; the explicit "command not found" forms are
-// high-confidence and unfiltered. A generic English word ("key: not found") can still
-// slip through — distinguishing it needs context this flag-only scan lacks, so the
-// judge interprets it.
+// high-confidence and unfiltered. A generic English word ("key: not found") still
+// matches here, but is now handled downstream: scanCommandNotFound corroborates the
+// low-confidence hit against the run's invoked commands (invokedExecutables), so a
+// token in this form the run never actually invoked as a command is dropped rather
+// than passed to the judge.
 var noisyShToken = regexp.MustCompile(`(?i)^\d+$|\.(so|a|o|h|dll|dylib|la|lo)(\.\d+)*$`)
 
 // forEachNotFound applies every command-not-found pattern to one payload's text,
-// calling fn(command, evidence) per hit with the noise filter already applied to the
-// low-confidence sh form. Single implementation so the scan and the same-result veto
-// (observedGreenTools) can never disagree about what "reports X missing" means.
-func forEachNotFound(text string, fn func(cmd, evidence string)) {
+// calling fn(command, evidence, lowConfidence) per hit with the noise filter already
+// applied to the low-confidence sh form. lowConfidence is false for the three explicit
+// "command not found" / exec forms and true for the reShNotFound (`X: not found`)
+// dash/busybox shape, so callers can corroborate only the weak form. Single
+// implementation so the scan and the same-result veto (observedGreenTools) can never
+// disagree about what "reports X missing" means.
+func forEachNotFound(text string, fn func(cmd, evidence string, lowConfidence bool)) {
 	for _, m := range reCmdNotFound.FindAllStringSubmatch(text, -1) {
-		fn(m[1], m[0])
+		fn(m[1], m[0], false)
 	}
 	for _, m := range reCmdNotFoundZsh.FindAllStringSubmatch(text, -1) {
-		fn(m[1], m[0])
+		fn(m[1], m[0], false)
 	}
 	for _, m := range reExecNotFound.FindAllStringSubmatch(text, -1) {
-		fn(m[1], m[0])
+		fn(m[1], m[0], false)
 	}
 	for _, m := range reShNotFound.FindAllStringSubmatch(text, -1) {
 		if noisyShToken.MatchString(m[1]) {
 			continue
 		}
-		fn(m[1], m[0])
+		fn(m[1], m[0], true)
 	}
 }
 
@@ -188,6 +193,11 @@ func normalizeCommandToken(cmd string) string {
 // dedupes by command keeping the first evidence line AND its seq, and caps the
 // candidate count. Pure over its input so it is unit-testable without a DB.
 //
+// It corroborates the low-confidence reShNotFound (`X: not found`) hits against
+// invokedExecutables(rows): a token in that form the run never invoked as a command is
+// a generic output word ("key: not found"), not a missing worker tool, and is dropped.
+// The three high-confidence forms are unfiltered.
+//
 // 🔴 THE REGEXES RUN OVER tool_result ROWS ONLY. That is load-bearing, not an
 // optimization. Since PRD #121 M3 the trace carries both kinds; a tool_use payload
 // holds the command the agent TYPED, which by definition never ran. Feeding those to
@@ -195,6 +205,7 @@ func normalizeCommandToken(cmd string) string {
 // `foo` as a missing tool — a brand-new false positive the widening itself would
 // introduce, in the function whose whole job this milestone is to make more accurate.
 func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
+	invoked := invokedExecutables(rows)
 	var out []missCandidate
 	seen := map[string]bool{}
 	scanned := 0
@@ -213,7 +224,7 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 		scanned += len(text)
 		text = payloadText([]byte(text))
 
-		forEachNotFound(text, func(cmd, evidence string) {
+		forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
 			cmd = normalizeCommandToken(cmd)
 			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
 			// barred by Decision 6 and rejected when an admin allowlists it
@@ -233,7 +244,8 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 			// the barred class so the model reclassifies to adjust_template/improve_agent,
 			// which is the actionable category — that prompt line, not this filter, is
 			// what addresses those two.
-			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || seen[cmd] || len(out) >= judgeMissCandidateCap {
+			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) ||
+				(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
 			seen[cmd] = true
@@ -245,6 +257,45 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 		})
 	}
 	return out
+}
+
+// invokedExecutables indexes the basenamed executables the run actually RAN as
+// commands — every executable-position token of each tool_use Bash command, across
+// the whole trace. It exists to corroborate the low-confidence `X: not found`
+// (dash/busybox) form: a token in that form that the run never invoked as a command
+// is a generic output word ("key: not found"), not a missing worker tool, and must
+// not become a ToolMiss. This reuses tool_use command TEXT as an allow-signal only —
+// it deliberately does NOT run the not-found patterns over tool_use payloads (see the
+// load-bearing note on scanCommandNotFound). Bounded by judgeCommandByteBudget with
+// the same check-before-add pattern as observedGreenTools so the constant is a true
+// bound; a non-Bash tool_use yields an empty command and is skipped.
+//
+// Residual, stated rather than discovered later: a genuine miss that surfaces ONLY via
+// the low-confidence `X: not found` form AND was invoked INDIRECTLY (protoc shelled out
+// from `make build`, never typed in executable position) is not in this index, so it is
+// dropped. That is the conservative direction this fix commits to — it favours killing
+// the false positive over reporting an indirect miss, and the high-confidence forms and
+// directly-invoked misses are unaffected.
+func invokedExecutables(rows []store.ListToolTraceForRunRow) map[string]bool {
+	invoked := map[string]bool{}
+	cmdBytes := 0
+	for _, row := range rows {
+		if row.Kind != "tool_use" {
+			continue
+		}
+		_, cmd := toolUseCommand(row.Payload)
+		if cmd == "" {
+			continue
+		}
+		if cmdBytes+len(cmd) > judgeCommandByteBudget {
+			continue
+		}
+		cmdBytes += len(cmd)
+		for _, name := range executablesIn(cmd) {
+			invoked[name] = true
+		}
+	}
+	return invoked
 }
 
 // suppressResolved drops a candidate whose tool the SAME run demonstrably ran green
@@ -323,7 +374,7 @@ func observedGreenTools(rows []store.ListToolTraceForRunRow) map[string]int32 {
 			// `eslint: not found` is not evidence that eslint ran. Checked against
 			// THIS payload, so it cannot reach across to an unrelated result.
 			vetoed := map[string]bool{}
-			forEachNotFound(payloadText(row.Payload), func(cmd, _ string) {
+			forEachNotFound(payloadText(row.Payload), func(cmd, _ string, _ bool) {
 				vetoed[normalizeCommandToken(cmd)] = true
 			})
 			for _, tool := range observedTools(cmd, row.Payload) {
