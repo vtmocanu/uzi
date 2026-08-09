@@ -315,6 +315,11 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
+  // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
+  // capability behind the "Trusted repo" affordance, independently revocable from
+  // repo_skills_enabled. Default false.
+  repo_claudemd_enabled: boolean;
   // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
   // packages from the repo's own devbox.json (packages-only). Default false.
   repo_devbox_opt_in: boolean;
@@ -2309,6 +2314,19 @@ const realApi = {
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_skills_enabled: enabled,
     }),
+  // Repo-instructions opt-in (PRD #246). Owner or admin. The second capability
+  // behind the "Trusted repo" affordance; toggled independently of repo skills.
+  setRepoClaudemdEnabled: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      repo_claudemd_enabled: enabled,
+    }),
+  // Set both trust capabilities in ONE request (PRD #246). Used by the "Trusted
+  // repo" master control: enabling turns both on, disabling turns both off. The
+  // server accepts the two trust flags together (still atomic, devbox untouched).
+  setRepoTrustFlags: (
+    id: string,
+    flags: { repo_skills_enabled?: boolean; repo_claudemd_enabled?: boolean },
+  ) => request<{ repo: Repo }>("PATCH", `/repos/${id}`, flags),
   // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
