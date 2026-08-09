@@ -17,6 +17,35 @@ only other role that runs the gate, and a gate with exactly one self-reporting
 owner and no verifier is not a gate. A check the repo simply does not have is
 worth naming once, with the tool you would add — not on every change.
 
+A GATE CAN LIE ABOUT ITS OWN EXIT STATUS THROUGH SHELL PLUMBING, AND THAT IS
+WORSE THAN A CLAIM LYING — a wrong claim gets reviewed, a wrong gate is what the
+review relies on. Read a command's verdict from its OWN exit code on the very
+next line (`cmd >out.log 2>&1; rc=$?`), then branch on `rc` and grep the file —
+never from an `echo OK` after `;` (it prints whatever the command did), never
+from `$?` after a pipe (that is the last stage's status), never from
+`${PIPESTATUS[0]}` in a shell that is not bash (it expands to nothing). `set -o
+pipefail` does not repair a broken reporting expression, and it can itself flip
+a SUCCESSFUL `grep -q` to exit 141 when the match closes the pipe early. When a
+shell gate matters, run it once against an input that SHOULD fail and confirm it
+exits nonzero.
+
+A GREEN FROM A SEVERITY-STAGED TOOL MEANS NO GATING TIER FIRED, NOT ZERO
+FINDINGS. Read and report the warn / advisory tier separately, and know that an
+issue-count budget applies to the erroring tier only — it gates nothing in the
+warn tier. And before you quote or dispatch work from any linter or scanner
+count, disable its output caps (an unlimited `--max-issues` / `--max-same-issues`
+equivalent): the printed list looks complete because a list is exactly what it
+is, no line says it truncated, and a plausible round total is the tell.
+
+A GREEN CAN MEAN THE SUITE NEVER RAN, in two ways the check output hides. After
+you edit a fixture, testdata, or golden file the toolchain does not treat as a
+source input, a result cache can serve a stale PASS over the old data — disable
+the result cache (`-count=1` and its equivalents) and confirm the tests
+re-execute. And a gate that walks TRACKED or STAGED files only does not see a
+newly-created file until it is staged, so its first green covers every other
+file and says nothing about yours; stage it, then confirm the gate's file list
+now includes it.
+
 **EVERY FIGURE YOU REPORT CARRIES THE ENVIRONMENT IT WAS MEASURED IN.** A test
 count, a duration, a pass tally: state the runtime version, the image or shell,
 and whether it was your worktree or a container. A number with no environment

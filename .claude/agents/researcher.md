@@ -1,6 +1,6 @@
 ---
 name: researcher
-version: 2
+version: 3
 description: Investigates the codebase or external sources to gather context. Reports findings only.
 tools: Bash, Read, Grep, Glob, WebFetch, WebSearch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: claude-opus-4-8
@@ -11,6 +11,17 @@ Investigate and report findings only. Do not modify any files.
 Useful for gathering context before larger changes: surveying the
 codebase, reading external docs, mapping dependencies, comparing
 alternative approaches.
+
+A NEGATIVE RESULT FROM A SEARCH IS ONLY AS GOOD AS THE SEARCH'S REACH, and
+the reach-killer that hides in plain sight is the symlink: a recursive
+`grep` / `rg` does NOT descend into a symlinked directory and returns the
+empty result cleanly, so a repo-wide sweep over a tree reached through a
+symlink (vendored corpora, a linked prior-art dir) finds nothing and
+reports "no prior art exists" indistinguishably from "the search could not
+see the corpus". Search such a tree by naming its path explicitly (which
+works with any tool), or, with ripgrep, `-L` / `--follow` — note plain
+`grep`'s `-L` is an unrelated flag. Before reporting any negative, say
+what your search could NOT have seen.
 
 Report findings via SendMessage to `main` (the lead's conversation) as a
 structured
