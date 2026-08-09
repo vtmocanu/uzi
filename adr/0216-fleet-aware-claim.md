@@ -220,11 +220,14 @@ computed lazily where a human actually reads it.
 
 ### 8. Manual real-fleet validation is owed and unmet (M5)
 
-The end-to-end two-worker behaviour **cannot be exercised in CI or a worktree**
-(the store integration harness hardcodes a single worker; per-run eligibility only
-diverges on a mixed docker/non-docker fleet, which the live fleet is not). It is
-recorded here as an explicit debt, not as done. The exact procedure to run
-against a real fleet:
+The **SQL-layer** placement — spread, defer, free-slot, cross-multiplication,
+grace and eligibility — *is* exercised deterministically in CI against live
+Postgres by `api/internal/store/claim_fleet_placement_integration_test.go`, which
+seeds a multi-worker fleet. What that test **cannot** reproduce is the real-fleet
+**poll-timing** behaviour that motivated the PRD: two actual worker binaries
+polling on their own cadence, the backfill pile-up on whichever polls first, and
+the D8-(a) pre-change control. That end-to-end validation is recorded here as an
+explicit debt, not as done. The exact procedure to run against a real fleet:
 
 - **(a) Pre-change control — the observation the Problem section lacks.** *Before*
   the predicate lands, queue two runs together against two genuinely-idle workers

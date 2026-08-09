@@ -262,6 +262,57 @@ func TestClaimRunIdleClaimerNeverDefersLiveDB(t *testing.T) {
 	}
 }
 
+// (a7) SC3/D3 resume affinity BYPASSES the spread: a worker that is MORE loaded than an
+// idle peer still reclaims ITS OWN re-queued run. A (cap 2) holds 1 active; idle peer B
+// (cap 2, 0 active) is strictly less loaded, so A would defer a FRESH unowned run to B.
+// But the queued run's worker_id = A (a run A previously held and re-queued), which makes
+// the first OR-arm true in BOTH the affinity gate (r.worker_id = @worker_id) and the
+// spread clause — so A claims it despite B being strictly less loaded.
+func TestClaimRunResumeAffinityBypassesSpreadLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	a := fx.worker("A", capOf(2), false)
+	fx.worker("B", capOf(2), false) // idle peer A would normally defer a fresh run to
+	fx.holdActive(a, 1)             // A is strictly MORE loaded than B (1*2 > 0*2)
+
+	// A re-queued run OWNED by A (worker_id = A). queuedRun() always seeds worker_id NULL,
+	// so INSERT directly with the same column list, setting worker_id = A. updated_at
+	// defaults to now(), so neither the affinity nor the spread age-bypass applies — the
+	// only thing that lets A claim is resume affinity (worker_id = @worker_id).
+	run := uuid.New()
+	mustExec(fx.ctx, fx.t, fx.pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id)
+		 VALUES ($1, $2, $3, $4, 't', 'd', 'queued', $5)`,
+		run, fx.userID, fx.repoID, fx.nextIID(), a)
+
+	c, err := fx.claim(a, false, nil)
+	if err != nil {
+		t.Fatalf("resume affinity must let A reclaim its own re-queued run despite a less-loaded peer; got %v", err)
+	}
+	if c.ID != run {
+		t.Fatalf("claimed %s, want the affinity run %s", c.ID, run)
+	}
+}
+
+// (a8) D7 fail-open, NULL claimer cap: the CLAIMER (not the peer) has a NULL
+// max_concurrent_runs, so the spread's cross-multiplication product (pa.active * my.cap)
+// is NULL, the peer row is excluded from NOT EXISTS, and A claims (fail-open). Distinct
+// from (a3), which seeds a NULL-cap PEER; here the NULL cap is on the claiming worker.
+func TestClaimRunNullClaimerCapClaimsLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	a := fx.worker("A", nil, false) // NULL max_concurrent_runs on the CLAIMER
+	fx.worker("B", capOf(2), false) // idle, eligible peer with a free slot
+	fx.holdActive(a, 1)             // A busy: with a real cap it might defer to B
+	run := fx.queuedRun()           // one fresh unowned queued run
+
+	c, err := fx.claim(a, false, nil)
+	if err != nil {
+		t.Fatalf("a NULL claimer cap makes the spread product NULL -> peer excluded -> A claims (fail-open); got %v", err)
+	}
+	if c.ID != run {
+		t.Fatalf("claimed %s, want %s", c.ID, run)
+	}
+}
+
 // (b7) D5 differential eligibility: the peer clause must use the SAME fn_worker_can_claim
 // as the claimant, keyed on the SAME @docker_repo_allowlist. A non-docker worker defers a
 // repo-R run to a strictly-less-loaded DOCKER peer ONLY when R is on the allowlist (the
