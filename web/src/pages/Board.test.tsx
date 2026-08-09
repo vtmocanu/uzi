@@ -993,43 +993,74 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     );
 
   const titles = () => screen.getAllByRole("link", { name: /^issue / }).map((a) => a.textContent);
-  const toggle = () => screen.getByLabelText(/Show other issues/);
+  // Open the "Issues" popover (PRD #196 M1 replaced the checkbox with it). Idempotent:
+  // opens only when currently closed, so a second call while open does not toggle it
+  // shut (fireEvent.click on the button toggles).
+  const openIssues = () => {
+    const btn = screen.getByRole("button", { name: /^Issues:/ });
+    if (btn.getAttribute("aria-expanded") !== "true") fireEvent.click(btn);
+  };
+  // Open the popover and toggle "Show all other issues" — the old showNonPRD boolean.
+  const clickShowAll = () => {
+    openIssues();
+    fireEvent.click(screen.getByLabelText(/Show all other issues/));
+  };
 
-  it("shows exactly today's board with the toggle OFF", async () => {
-    // The criterion that protects every existing user: the additive fetch changes
-    // what is CACHED; this toggle decides what is RENDERED, and its default is off.
+  it("shows PRD plus the default-extra (bug) cards by default (PRD #196 M1)", async () => {
+    // Membership is primary ∪ extras, and DEFAULT_BOARD_EXTRA_LABELS is ["bug"], so a
+    // fresh board shows the PRD cards AND the bug card — the M1 upgrade behaviour. The
+    // unlabelled issue four and the tracker stay off.
     renderBoard();
     await screen.findByText("Backlog");
-    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
+    expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
   });
 
-  it("adds the open non-PRD issues with the toggle ON", async () => {
+  it("unticking the default extra narrows the board back to PRD only", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
+    openIssues();
+    // The `bug` row is checked by default; unticking it stores the absolute empty set.
+    fireEvent.click(screen.getByLabelText(/bug/));
+    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
+    expect(store.get("uzi.board.repo-1.extraLabels")).toBe("[]");
+  });
+
+  it("adds every other open issue with 'Show all other issues' ON", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    clickShowAll();
     expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue four", "issue five"]);
   });
 
-  it("never shows the self-improve tracker, toggle on or off (Decision 13a)", async () => {
+  it("never shows the self-improve tracker, show-all on or off (Decision 13a)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
     expect(titles()).not.toContain("issue tracker");
-    fireEvent.click(toggle());
+    clickShowAll();
     expect(titles()).not.toContain("issue tracker");
   });
 
-  it("persists the toggle per repo", async () => {
+  it("persists 'Show all other issues' per repo", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
-    expect(store.get("uzi.board.repo-1.showNonPRD")).toBe("true");
+    clickShowAll();
+    expect(store.get("uzi.board.repo-1.showAll")).toBe("true");
   });
 
-  it("reads the persisted toggle back on load", async () => {
+  it("reads the persisted show-all back on load", async () => {
+    store.set("uzi.board.repo-1.showAll", "true");
+    renderBoard();
+    await screen.findByText("Backlog");
+    // issue four is unlabelled, so it only appears once show-all is on.
+    expect(titles()).toContain("issue four");
+  });
+
+  it("migrates a legacy showNonPRD:true when showAll is absent (open question 4)", async () => {
+    // A user who had deliberately widened their board must not be silently narrowed.
     store.set("uzi.board.repo-1.showNonPRD", "true");
     renderBoard();
     await screen.findByText("Backlog");
-    expect(titles()).toContain("issue two");
+    expect(titles()).toContain("issue four");
   });
 
   // FREEZE-TEST 3 (task #13), at the wiring level. The lib test pins dropIntent's
@@ -1037,8 +1068,9 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   it("freezes the cards the viewer cannot see, in their existing relative order", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    // Toggle OFF: the viewer sees 1, 3, 5 and moves 5 up one place.
-    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
+    // Show-all OFF: the viewer sees the members (1, 2, 3, 5 — bug is a default extra)
+    // and moves 5 up one place. The unlabelled #4 stays hidden but must still freeze.
+    expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
     fireEvent.click(screen.getByRole("button", { name: /Move issue #5 up in/ }));
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
 
@@ -1067,7 +1099,7 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   it("draws a non-PRD card with the contrast-clearing border token (Decision 17)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
+    // issue two (bug) is a default extra, so it is on the board without any toggle.
 
     const cardOf = (title: string) =>
       screen.getByRole("link", { name: title }).closest("div[class*='rounded-lg']") as HTMLElement;
@@ -1091,7 +1123,7 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
   it("offers Promote instead of Start run on a non-PRD card (Decision 15)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
+    clickShowAll();
     const lane = screen.getByText("Backlog").parentElement!.parentElement!;
     // Three PRD cards offer Start run; the two non-PRD ones offer Promote instead.
     expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(3);
@@ -1104,14 +1136,16 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     // run eligibility also requires the PRD label.
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
+    // card 2 (bug) is a default extra, so it is on the board with no toggle.
     expect(screen.queryByRole("button", { name: /Mark PRDLESS/ })).toBeNull();
   });
 
   it("promotes forge-first and adopts the returned card", async () => {
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.click(toggle());
+    // Show all so both non-PRD cards (2 and 4) are on the board, giving two Promote
+    // buttons — the shape the length assertion below depends on.
+    clickShowAll();
     fireEvent.click(screen.getAllByRole("button", { name: /Promote to PRD/ })[0]);
     await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 2));
     // Wait on the PROMOTED card losing its button, not on "a Promote button exists":
@@ -1119,8 +1153,8 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     // and the assertion below then races the state update. Two remained before, one
     // remains after.
     await waitFor(() => expect(screen.getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(1));
-    // The card is now an ordinary PRD card, so it survives the toggle going back off.
-    fireEvent.click(toggle());
+    // The card is now an ordinary PRD card, so it survives show-all going back off.
+    clickShowAll();
     expect(titles()).toContain("issue two");
   });
 });

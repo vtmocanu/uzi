@@ -32,8 +32,15 @@ import {
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
-import { boundedChips, chipLabels } from "../lib/labelChips";
-import { canPromote, isPRDCard, visibleCards } from "../lib/boardCards";
+import { boundedChips, chipLabels, hoistLabels } from "../lib/labelChips";
+import {
+  canPromote,
+  DEFAULT_BOARD_EXTRA_LABELS,
+  isPRDCard,
+  isSelfImproveTracker,
+  SELF_IMPROVE_LABEL,
+  visibleCards,
+} from "../lib/boardCards";
 import {
   dropIntent,
   insertionEdgeFor,
@@ -107,26 +114,74 @@ export function Board() {
     });
   };
 
-  // Show-non-PRD toggle (PRD #102 M6), per browser and per repo like hideEmpty and
-  // the sort mode. Default OFF, so a user who never touches it sees exactly the board
-  // they saw before M6 — the additive fetch changes what is CACHED, and this decides
-  // what is RENDERED.
+  // Board membership extras (PRD #196 M1). The board renders `primary ∪ extras`
+  // (Decision 2); this is the extras half — a per-repo, per-browser view preference
+  // for now (M3 moves it server-side, per account).
   //
-  // The useEffect re-read is not optional and is not defensive: the route swaps :id
-  // without remounting this component, so a lazy useState initialiser only ever runs
-  // for the first repo visited. That bug has been fixed twice in this file already.
-  const showNonPRDKey = `uzi.board.${repoId}.showNonPRD`;
-  const [showNonPRD, setShowNonPRD] = useState(() => prefs.get(showNonPRDKey, false));
+  // The stored value is a SENTINEL (Decision 9): absent/null means "never customised,
+  // use the default"; an array — EVEN AN EMPTY ONE — is the user's ABSOLUTE set, so
+  // "unticked everything" is durable and distinguishable from "never set". Resolving
+  // to DEFAULT_BOARD_EXTRA_LABELS happens at render (resolvedExtras below), never
+  // here, so the sentinel survives round-trips.
+  //
+  // The useEffect re-read mirrors hideEmpty's and is load-bearing for the same
+  // reason: the route swaps :id without remounting, so the lazy initialiser only ever
+  // runs for the first repo visited.
+  const extraLabelsKey = `uzi.board.${repoId}.extraLabels`;
+  const [storedExtras, setStoredExtras] = useState<string[] | null>(() =>
+    prefs.get<string[] | null>(extraLabelsKey, null),
+  );
   useEffect(() => {
-    setShowNonPRD(prefs.get(`uzi.board.${repoId}.showNonPRD`, false));
+    setStoredExtras(prefs.get<string[] | null>(`uzi.board.${repoId}.extraLabels`, null));
   }, [repoId]);
-  const toggleShowNonPRD = () => {
-    setShowNonPRD((v) => {
+
+  // Show-all-other-issues toggle (PRD #196 M1) — the old `showNonPRD` boolean, kept as
+  // the last row of the picker for "I do not know what label it has". Per browser, per
+  // repo.
+  //
+  // MIGRATION (open question 4): a user who had `showNonPRD: true` had deliberately
+  // widened their board, so if the new key is absent we fall back to the old one
+  // rather than silently narrowing them. The old key is read ONLY as the initial
+  // fallback; once the user touches the control we write the new key and it wins.
+  const showAllKey = `uzi.board.${repoId}.showAll`;
+  const readShowAll = (id: string): boolean => {
+    const v = prefs.get<boolean | null>(`uzi.board.${id}.showAll`, null);
+    return v !== null ? v : prefs.get<boolean>(`uzi.board.${id}.showNonPRD`, false);
+  };
+  const [showAll, setShowAll] = useState(() => readShowAll(repoId));
+  useEffect(() => {
+    setShowAll(readShowAll(repoId));
+  }, [repoId]);
+  const toggleShowAll = () => {
+    setShowAll((v) => {
       const next = !v;
-      prefs.set(showNonPRDKey, next);
+      prefs.set(showAllKey, next);
       return next;
     });
   };
+
+  // The "Issues" popover's open state, and its container ref for outside-click.
+  const [issuesOpen, setIssuesOpen] = useState(false);
+  const issuesPopRef = useRef<HTMLDivElement>(null);
+  // Dismiss on Escape or an outside click, the BuildInfoPopover pattern. Listeners
+  // are attached only while open, so a closed popover costs nothing.
+  useEffect(() => {
+    if (!issuesOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIssuesOpen(false);
+    };
+    const onDown = (e: MouseEvent) => {
+      if (issuesPopRef.current && !issuesPopRef.current.contains(e.target as Node)) {
+        setIssuesOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [issuesOpen]);
 
   // Board-wide sort mode (PRD #102 M5, Decision 7a/8). Per-browser, per repo, exactly
   // like hideEmpty — the ORDER is durable in the DB, but the choice of whether to
@@ -530,9 +585,87 @@ export function Board() {
   // card-level filter, using renderCards for the freeze would NULL the position of
   // every card the viewer had hidden — which is what freeze-test 3 discriminates.
   const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
+
+  // The extras in effect: the user's saved set if they have one, else the compiled-in
+  // default (M2 delivers an admin-configured default; M1's is DEFAULT_BOARD_EXTRA_LABELS).
+  const resolvedExtras = useMemo<string[]>(
+    () => storedExtras ?? [...DEFAULT_BOARD_EXTRA_LABELS],
+    [storedExtras],
+  );
+  // Membership is primary ∪ extras (Decision 2), deduped, with the primary always
+  // present and never removable.
+  const membershipLabels = useMemo<string[]>(
+    () => Array.from(new Set([prdLabel, ...resolvedExtras])),
+    [prdLabel, resolvedExtras],
+  );
   const renderCards = useMemo(
-    () => visibleCards(payloadCards, prdLabel, showNonPRD),
-    [payloadCards, prdLabel, showNonPRD],
+    () => visibleCards(payloadCards, membershipLabels, showAll),
+    [payloadCards, membershipLabels, showAll],
+  );
+
+  // Writing an extras change stores the ABSOLUTE set (Decision 9), even when empty.
+  const writeExtras = useCallback(
+    (next: string[]) => {
+      setStoredExtras(next);
+      prefs.set(extraLabelsKey, next);
+    },
+    [extraLabelsKey],
+  );
+  const toggleExtra = useCallback(
+    (label: string) => {
+      const next = resolvedExtras.includes(label)
+        ? resolvedExtras.filter((l) => l !== label)
+        : [...resolvedExtras, label];
+      writeExtras(next);
+    },
+    [resolvedExtras, writeExtras],
+  );
+  // Reset clears the stored set back to the sentinel (null → default). showAll is a
+  // separate control and is left as the user chose it. Server-backed reset is M3.
+  const resetExtras = useCallback(() => {
+    setStoredExtras(null);
+    prefs.set<string[] | null>(extraLabelsKey, null);
+  }, [extraLabelsKey]);
+
+  // Candidate extra labels for the picker: the distinct CONTENT labels present on the
+  // payload — the same `seen`-Set accumulation ColumnSettings' suggester uses —
+  // excluding the primary, the configured columns and the workflow labels. A
+  // configured-default extra is unioned in even with zero matching cards, so an inert
+  // default stays visible (open question 8).
+  const candidateExtras = useMemo<string[]>(() => {
+    const excluded = new Set<string>([
+      prdLabel,
+      prdlessLabel,
+      autopilotLabel,
+      SELF_IMPROVE_LABEL,
+      ...(board?.columns ?? []).map((c) => c.label_name),
+    ]);
+    const seen = new Set<string>();
+    for (const c of payloadCards) for (const l of c.labels) seen.add(l);
+    const labels = [...seen].filter((l) => l !== "" && !excluded.has(l));
+    for (const d of DEFAULT_BOARD_EXTRA_LABELS) {
+      if (!excluded.has(d) && !labels.includes(d)) labels.push(d);
+    }
+    return labels.sort();
+  }, [payloadCards, board, prdLabel, prdlessLabel, autopilotLabel]);
+
+  // Per-label count = cards carrying L that do NOT carry the primary — "how much
+  // bigger does the board get" (mock §3: bug 6, not 7). A label with no such card
+  // (an inert default) reads 0.
+  const extraCounts = useMemo<Map<string, number>>(() => {
+    const m = new Map<string, number>();
+    for (const c of payloadCards) {
+      if (isPRDCard(c, prdLabel)) continue;
+      for (const l of c.labels) m.set(l, (m.get(l) ?? 0) + 1);
+    }
+    return m;
+  }, [payloadCards, prdLabel]);
+
+  // The "Show all other issues" population: cards that are not members-by-primary and
+  // are not the self-improve tracker — exactly the old showNonPRD count.
+  const showAllCount = useMemo<number>(
+    () => payloadCards.filter((c) => !isPRDCard(c, prdLabel) && !isSelfImproveTracker(c)).length,
+    [payloadCards, prdLabel],
   );
 
   // columnKeys is the board's lane order for the freeze: the implicit Backlog column
@@ -695,20 +828,17 @@ export function Board() {
     dragIid != null,
   );
   const hiddenCount = columns.length - visible.length;
-  // How many of the rendered cards are the non-PRD ones the toggle brought in.
-  // Computed off renderCards, not payloadCards, so it counts what is on screen — the
-  // self-improve tracker is excluded from both.
-  const nonPRDCount = renderCards.filter((c) => !isPRDCard(c, prdLabel)).length;
 
   // The board's own description, hoisted out of the JSX so the reason it changed can
   // be written down. Its last sentence read "Only PRD-labeled issues appear here."
-  // until M6, and that is the one sentence a user actually reads about what this
-  // board contains — rendered product copy, invisible to any sweep of docs or code
-  // comments. It names the CONFIGURED label, since prd_label is renameable.
+  // until M6, then referenced the "Show other issues" checkbox until PRD #196 M1
+  // renamed the control to "Issues" — this is the one sentence a user actually reads
+  // about what this board contains, rendered product copy invisible to any sweep of
+  // docs or code comments. It names the CONFIGURED label, since prd_label is renameable.
   const boardDescription =
     `Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; ` +
     `you can still drag a card to change its label on the forge. ${prdLabel}-labeled issues always appear here; ` +
-    `turn on "Show other issues" to see the repo's other open issues alongside them.`;
+    `use "Issues" to bring other labels onto the board alongside them.`;
 
   return (
     <div className="space-y-5">
@@ -747,22 +877,26 @@ export function Board() {
                 ))}
               </Select>
             </label>
-            {/* Decision 12's toggle. "Show other issues" rather than "Show non-PRD
-                issues": prd_label is operator-configurable, so a literal would be wrong
-                on any instance that renamed it, and the phrasing that survives a rename
-                is the one about the repo rather than the label. The count is the same
-                affordance Hide empty uses — it says the toggle did something even when
-                the answer is "there are none". */}
-            <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
-              <input
-                type="checkbox"
-                checked={showNonPRD}
-                onChange={toggleShowNonPRD}
-                className="h-3.5 w-3.5 rounded border-edge accent-brand"
-              />
-              Show other issues
-              {showNonPRD && <span className="text-muted">({nonPRDCount} shown)</span>}
-            </label>
+            {/* The "Issues" popover (PRD #196 M1, mock §3). Replaces the old
+                "Show other issues" checkbox: the board renders `primary ∪ extras`, and
+                this control is how a user tunes the extras half. The button names the
+                CONFIGURED membership labels (prd_label is renameable) and borders in
+                the brand tint when any extra is selected. */}
+            <IssuesFilter
+              open={issuesOpen}
+              onToggleOpen={() => setIssuesOpen((o) => !o)}
+              popRef={issuesPopRef}
+              prdLabel={prdLabel}
+              membershipLabels={membershipLabels}
+              resolvedExtras={resolvedExtras}
+              candidateExtras={candidateExtras}
+              extraCounts={extraCounts}
+              onToggleExtra={toggleExtra}
+              showAll={showAll}
+              showAllCount={showAllCount}
+              onToggleShowAll={toggleShowAll}
+              onReset={resetExtras}
+            />
             <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
               <input
                 type="checkbox"
@@ -907,13 +1041,19 @@ export function Board() {
                 </span>
               </div>
               <div className="flex flex-col gap-2">
-                {cards.map((card, i) => (
+                {cards.map((card, i) => {
+                  // The extras this card carries are the "why this card is here"
+                  // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so
+                  // they cannot fall into the "+N" overflow, and highlighted (mock §4).
+                  const matchedExtras = resolvedExtras.filter((l) => card.labels.includes(l));
+                  return (
                   <IssueCard
                     key={card.iid}
                     card={card}
                     repoId={repoId}
                     projectWebUrl={board?.web_url}
-                    chips={chipLabels(card.labels, chipExclusions)}
+                    chips={hoistLabels(chipLabels(card.labels, chipExclusions), matchedExtras)}
+                    highlightLabels={matchedExtras}
                     laneLabel={col.label}
                     // Reorder controls exist only in a droppable lane, and only where
                     // there is somewhere to go. Closed is not a drop target, so its
@@ -1000,7 +1140,8 @@ export function Board() {
                     }}
                     dimmed={dragIid === card.iid}
                   />
-                ))}
+                  );
+                })}
                 {/* N2: the drop-at-END affordance. Hovering a lane's whitespace
                     highlighted the lane and showed NOTHING about where the card would
                     land — while hovering any card showed a precise insertion edge. So
@@ -1070,6 +1211,7 @@ export function IssueCard({
   repoId,
   projectWebUrl,
   chips,
+  highlightLabels = [],
   maxChips,
   laneLabel,
   canMoveUp,
@@ -1106,6 +1248,10 @@ export function IssueCard({
   // (columns + the configured workflow labels), and keeping it out of the card is
   // what lets this component mount in a test without an auth provider.
   chips: string[];
+  // The membership extras this card carries (PRD #196 M1, mock §4). A shown chip whose
+  // label is in this set gets the brand "hit" treatment — it is why the card is on the
+  // board. Defaults to none so the direct-render tests need not supply it.
+  highlightLabels?: string[];
   // Overrides MAX_CARD_CHIPS. Exists so the cap-0 edge — where every label is overflow
   // and a shownChips-gated row would drop the "+N" along with them — is reachable from
   // a test without changing the shipped cap.
@@ -1395,15 +1541,25 @@ export function IssueCard({
               stripped where it is DISPLAYED (text and the truncation tooltip) while
               the React key stays the raw string — identity is never built from the
               stripped value. */}
-          {shownChips.map((l) => (
-            <span
-              key={l}
-              title={stripUnsafeChars(l)}
-              className="max-w-full truncate rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted"
-            >
-              {stripUnsafeChars(l)}
-            </span>
-          ))}
+          {shownChips.map((l) => {
+            // A matched membership extra is tinted brand (mock §4's `.chip.hit`) to say
+            // THIS is why the card is on the board; every other chip stays quiet. The
+            // React key is the RAW label — identity is never built from the stripped
+            // display value (Issue #124).
+            const hit = highlightLabels.includes(l);
+            return (
+              <span
+                key={l}
+                title={stripUnsafeChars(l)}
+                className={cx(
+                  "max-w-full truncate rounded-md border px-1.5 py-0.5 text-[11px]",
+                  hit ? "border-brand/50 bg-brand/10 text-brand" : "border-edge bg-raised text-muted",
+                )}
+              >
+                {stripUnsafeChars(l)}
+              </span>
+            );
+          })}
           {chipOverflow > 0 && (
             <span
               // Focusable and named, not hover-only. The withheld labels rode a `title`
@@ -1566,6 +1722,145 @@ function CreateIssueForm({
         </Button>
       </form>
     </Card>
+  );
+}
+
+// IssuesFilter is the board toolbar's "Issues" popover (PRD #196 M1, mock §3). It
+// replaces the old "Show other issues" checkbox: the board renders `primary ∪ extras`
+// and this is where a user tunes the extras. Kept inline in this file following the
+// ColumnSettings precedent below, since it is board-toolbar-only. All membership
+// state lives in Board(); this component is presentation plus the callbacks.
+//
+// Open/close, Escape and outside-click are owned by Board() (the `open`/`popRef`
+// props) so the same effect can also drive other toolbar state if needed and so the
+// listeners attach once.
+function IssuesFilter({
+  open,
+  onToggleOpen,
+  popRef,
+  prdLabel,
+  membershipLabels,
+  resolvedExtras,
+  candidateExtras,
+  extraCounts,
+  onToggleExtra,
+  showAll,
+  showAllCount,
+  onToggleShowAll,
+  onReset,
+}: {
+  open: boolean;
+  onToggleOpen: () => void;
+  popRef: React.RefObject<HTMLDivElement>;
+  prdLabel: string;
+  membershipLabels: string[];
+  resolvedExtras: string[];
+  candidateExtras: string[];
+  extraCounts: Map<string, number>;
+  onToggleExtra: (label: string) => void;
+  showAll: boolean;
+  showAllCount: number;
+  onToggleShowAll: () => void;
+  onReset: () => void;
+}) {
+  const hasExtras = resolvedExtras.length > 0;
+  const defaultLabel = [prdLabel, ...DEFAULT_BOARD_EXTRA_LABELS].join(", ");
+  return (
+    <div className="relative" ref={popRef}>
+      <button
+        type="button"
+        onClick={onToggleOpen}
+        aria-haspopup="true"
+        aria-expanded={open}
+        // Brand border when any extra is selected (mock §3's `.btn.filter.on`), so the
+        // toolbar shows at a glance that the board is widened beyond the primary.
+        className={cx(
+          "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition-colors",
+          hasExtras ? "border-brand/60 text-fg" : "border-edge text-muted hover:text-fg",
+        )}
+      >
+        <span className="text-muted">Issues:</span>
+        {/* Names the CONFIGURED membership labels — prd_label is renameable, so a
+            literal would be wrong on any instance that changed it. */}
+        <span className="font-medium text-fg">{membershipLabels.join(", ")}</span>
+        <span aria-hidden="true" className="text-[9px] text-faint">
+          ▾
+        </span>
+      </button>
+      {open && (
+        <div
+          role="group"
+          aria-label="Board issue labels"
+          className="absolute right-0 z-20 mt-1 w-72 rounded-lg border border-edge-strong bg-surface p-1.5 shadow-2xl"
+        >
+          <div className="px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-faint">
+            Show issues labelled
+          </div>
+          {/* The PRIMARY row: pinned, checked and disabled — always shown (Decision 2).
+              Only the primary is pinned; an eligible-but-not-extra label is not. */}
+          <div className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked
+              disabled
+              aria-label={`${prdLabel} (always shown)`}
+              className="h-3.5 w-3.5 rounded border-edge accent-brand"
+            />
+            {prdLabel}
+            <span className="ml-auto text-[11px] text-faint">always shown</span>
+          </div>
+          {/* One row per candidate extra (content labels on the payload, plus any inert
+              configured default). Greyed when showAll subsumes them, or when the count
+              is 0 (an inert default; open question 8) — still toggleable either way. */}
+          {candidateExtras.map((label) => {
+            const count = extraCounts.get(label) ?? 0;
+            const checked = resolvedExtras.includes(label);
+            return (
+              <label
+                key={label}
+                className={cx(
+                  "flex cursor-pointer select-none items-center gap-2 rounded-md px-2 py-1 text-xs hover:bg-raised",
+                  showAll || count === 0 ? "text-faint" : "text-fg",
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => onToggleExtra(label)}
+                  className="h-3.5 w-3.5 rounded border-edge accent-brand"
+                />
+                {/* Forge-supplied label, stripped where DISPLAYED (Issue #124); the
+                    map key stays the raw string. */}
+                <span className="truncate">{stripUnsafeChars(label)}</span>
+                <span className="ml-auto font-mono text-[11px] text-faint">{count}</span>
+              </label>
+            );
+          })}
+          <hr className="my-1.5 border-edge" />
+          {/* The old showNonPRD boolean, kept as the escape hatch (mock §3). */}
+          <label className="flex cursor-pointer select-none items-center gap-2 rounded-md px-2 py-1 text-xs text-fg hover:bg-raised">
+            <input
+              type="checkbox"
+              checked={showAll}
+              onChange={onToggleShowAll}
+              className="h-3.5 w-3.5 rounded border-edge accent-brand"
+            />
+            Show all other issues
+            <span className="ml-auto font-mono text-[11px] text-faint">{showAllCount}</span>
+          </label>
+          <div className="mt-1 flex items-center justify-between gap-2 border-t border-edge px-2 pb-1 pt-2 text-[11px] text-faint">
+            <span>Default: {defaultLabel}</span>
+            <button
+              type="button"
+              onClick={onReset}
+              className="text-brand transition-colors hover:text-brand-hover"
+            >
+              Reset to default
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -417,8 +417,9 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
   const hidden = [20, 40];
 
   it("leaves the hidden cards' relative order unchanged", () => {
-    // A viewer with the toggle OFF sees 10, 30, 50 and drags 50 to the top.
-    const seen = visibleCards(payloadCards, "PRD", false);
+    // A viewer with show-all OFF and a PRD-only membership sees 10, 30, 50 and drags
+    // 50 to the top. (PRD #196 M1 generalised visibleCards to take a membership set.)
+    const seen = visibleCards(payloadCards, ["PRD"], false);
     expect(seen.map((c) => c.iid)).toEqual([10, 30, 50]);
 
     const out = dropIntent({
@@ -443,7 +444,7 @@ describe("freeze-test 3: a freeze taken with cards hidden", () => {
     // The positive control. Without it "the hidden cards are in the list" is a claim
     // about a fixture, not about the implementation.
     const broken = dropIntent({
-      payloadCards: visibleCards(payloadCards, "PRD", false),
+      payloadCards: visibleCards(payloadCards, ["PRD"], false),
       columnKeys,
       sortMode: "manual",
       dragIid: 50,

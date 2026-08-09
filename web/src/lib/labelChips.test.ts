@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { boundedChips, chipLabels, MAX_CARD_CHIPS, type LabelChipExclusions } from "./labelChips";
+import { boundedChips, chipLabels, hoistLabels, MAX_CARD_CHIPS, type LabelChipExclusions } from "./labelChips";
 
 // The default settings values, so a case that renames one is visibly a rename.
 const defaults: LabelChipExclusions = {
@@ -58,6 +58,48 @@ describe("chipLabels", () => {
 
   it("returns nothing when every label is a workflow marker", () => {
     expect(chipLabels(["PRD", "autopilot"], defaults)).toEqual([]);
+  });
+});
+
+describe("hoistLabels", () => {
+  it("moves matched labels to the front, keeping the rest in place", () => {
+    expect(hoistLabels(["web", "bug", "k8s"], ["bug"])).toEqual(["bug", "web", "k8s"]);
+  });
+
+  it("preserves the input order among the hoisted labels", () => {
+    // Two matches: they lead, but in the order they appeared in `labels`, not in the
+    // order of `hoist`.
+    expect(hoistLabels(["a", "bug", "b", "security", "c"], ["security", "bug"])).toEqual([
+      "bug",
+      "security",
+      "a",
+      "b",
+      "c",
+    ]);
+  });
+
+  it("is a no-op when nothing matches or hoist is empty", () => {
+    expect(hoistLabels(["a", "b", "c"], ["bug"])).toEqual(["a", "b", "c"]);
+    expect(hoistLabels(["a", "b", "c"], [])).toEqual(["a", "b", "c"]);
+  });
+
+  it("does not dedup — a repeated label survives, once per occurrence", () => {
+    expect(hoistLabels(["a", "bug", "b", "bug"], ["bug"])).toEqual(["bug", "bug", "a", "b"]);
+  });
+
+  it("does not mutate its input", () => {
+    const input = ["web", "bug", "k8s"];
+    const out = hoistLabels(input, ["bug"]);
+    out.push("mutated");
+    expect(input).toEqual(["web", "bug", "k8s"]);
+  });
+
+  it("keeps a hoisted match inside the cap that would otherwise overflow it", () => {
+    // Decision 11: the "why this card is here" chip must survive MAX_CARD_CHIPS.
+    // Five chips at a cap of 4 drops the last one; hoisting bug first keeps it shown.
+    const chips = ["a", "b", "c", "d", "bug"];
+    expect(boundedChips(chips, 4).shown).not.toContain("bug");
+    expect(boundedChips(hoistLabels(chips, ["bug"]), 4).shown).toContain("bug");
   });
 });
 
