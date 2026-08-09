@@ -359,6 +359,14 @@ export function Board() {
     boardRef.current = board;
   }, [board]);
 
+  // repoIdRef tracks the repo currently displayed, so an async prefs resync (see
+  // persistPrefs) can tell whether it resolved after the route swapped :id — the same
+  // stale-repo trap the prefs load effect guards with its `cancelled` flag.
+  const repoIdRef = useRef(repoId);
+  useEffect(() => {
+    repoIdRef.current = repoId;
+  }, [repoId]);
+
   const load = useCallback(async () => {
     setError("");
     try {
@@ -634,6 +642,11 @@ export function Board() {
         setError(err instanceof ApiError ? err.message : "Could not save your board view");
         try {
           const fresh = await api.getBoardPrefs(repoId);
+          // Guard the same stale-repo trap the load effect guards: the route swaps
+          // :id without remounting, so a resync resolving after the user navigated to
+          // another repo would clobber that repo's prefs with this one's. The load
+          // effect owns the fresh repo's state; a late resync for the old repo must not.
+          if (repoIdRef.current !== repoId) return;
           setStoredExtras(fresh.extra_labels);
           setShowAll(fresh.show_all);
         } catch {
