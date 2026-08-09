@@ -83,11 +83,15 @@ RETURNING *;
 DELETE FROM agent_templates WHERE id = @id AND is_builtin = false;
 
 -- name: InsertBuiltinAgentTemplate :execrows
--- Idempotent seed used by the startup reconciler: insert a missing builtin,
--- never overwrite an existing row (admin edits survive restarts). scope='builtin'
--- is set explicitly so it satisfies builtin_scope_ck; the conflict target is the
--- shared-namespace partial unique (uq_agent_templates_shared_name), NOT the bare
--- (name) — a user-scoped template of the same name must never block a builtin seed.
+-- Idempotent seed used by the startup reconciler: insert a MISSING builtin only;
+-- an existing row is left untouched here (DO NOTHING). Applying a shipped body
+-- change to an already-seeded row is a SEPARATE concern handled by
+-- RefreshPristineBuiltin (PRD #275) — pristine rows track upstream, admin-edited
+-- rows are preserved — kept a distinct statement so this insert stays the sole
+-- trigger for the default-allocation seed. scope='builtin' is set explicitly so it
+-- satisfies builtin_scope_ck; the conflict target is the shared-namespace partial
+-- unique (uq_agent_templates_shared_name), NOT the bare (name) — a user-scoped
+-- template of the same name must never block a builtin seed.
 INSERT INTO agent_templates (name, description, model, tools, prompt_body, is_builtin, scope)
 VALUES (@name, @description, @model, @tools, @prompt_body, true, 'builtin')
 ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING;
