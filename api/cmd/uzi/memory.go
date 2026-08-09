@@ -35,9 +35,9 @@ func newMemoryCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(memories))
 			for _, m := range memories {
-				rows = append(rows, []string{m.ID, m.RepoName, m.Title, m.CreatedAt.Format("2006-01-02 15:04")})
+				rows = append(rows, []string{m.ID, m.RepoName, m.Title, m.Basis, m.CreatedAt.Format("2006-01-02 15:04")})
 			}
-			return p.Table([]string{"ID", "REPO", "TITLE", "CREATED"}, rows)
+			return p.Table([]string{"ID", "REPO", "TITLE", "BASIS", "CREATED"}, rows)
 		},
 	}
 

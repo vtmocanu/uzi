@@ -776,7 +776,10 @@ export interface SaveMemoryRequest {
 }
 
 /** One cross-run memory entry (PRD #90). The write endpoint returns id/title/body/
- *  created_at; the read endpoint also carries run_id provenance. */
+ *  created_at; the read endpoint also carries run_id provenance plus writer-declared
+ *  `basis`/`evidence` (PRD #266 M3). The read endpoint always populates `basis`; both
+ *  are optional on the type for back-compat with legacy rows and pre-M3 responses (a
+ *  missing `basis` is treated as `inferred` by the reader). */
 export interface MemoryEntry {
   id: string;
   title: string;
@@ -785,6 +788,12 @@ export interface MemoryEntry {
    *  write response. */
   run_id?: string;
   created_at: string;
+  /** Writer-declared provenance (PRD #266 M3). The read endpoint always sets it;
+   *  absent only on legacy rows / pre-M3 responses, where the reader treats it as
+   *  `inferred`. */
+  basis?: MemoryBasis;
+  /** Optional short pointer to what backs an `observed` claim. */
+  evidence?: string;
 }
 
 /** Response for GET /api/worker/runs/:id/memory (PRD #90): the run's (user, repo)

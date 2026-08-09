@@ -2,9 +2,11 @@
 -- Write one memory entry. The caller supplies user_id/repo_id DERIVED FROM THE RUN
 -- CLAIM (never the request body) plus the writing run_id as provenance. The
 -- per-run write cap and the oldest-eviction that keep the (user,repo) set bounded
--- run around this insert in the store service.
-INSERT INTO agent_memory (user_id, repo_id, run_id, title, body)
-VALUES ($1, $2, $3, $4, $5)
+-- run around this insert in the store service. basis/evidence are the writer's
+-- declared provenance (PRD #266): stored verbatim (NULL when empty), normalized by
+-- the API read mapper — an unknown/NULL basis reads back as "inferred".
+INSERT INTO agent_memory (user_id, repo_id, run_id, title, body, basis, evidence)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: ListAgentMemoryForUserRepo :many
@@ -21,7 +23,7 @@ ORDER BY created_at DESC, id DESC;
 -- first. The JOIN (not LEFT JOIN) is safe: repo_id is NOT NULL and CASCADEs, so a
 -- memory row never outlives its repo.
 SELECT m.id, m.repo_id, r.path_with_namespace AS repo_name,
-       m.title, m.body, m.run_id, m.created_at
+       m.title, m.body, m.run_id, m.basis, m.evidence, m.created_at
 FROM agent_memory m
 JOIN repos r ON r.id = m.repo_id
 WHERE m.user_id = $1

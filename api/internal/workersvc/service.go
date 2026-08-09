@@ -2667,8 +2667,10 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 // the cap → ErrMemoryWriteCap; and after the insert the (user,repo) set is trimmed
 // to the newest MemoryMaxPerUserRepo (oldest-eviction). The count-check → insert →
 // evict are sequential store calls (mirroring AppendMessages) — a single lead is
-// the only writer per run, so no cross-write race is in play.
-func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body string) (store.AgentMemory, error) {
+// the only writer per run, so no cross-write race is in play. basis/evidence are the
+// writer's declared provenance (PRD #266): stored verbatim (NULL when empty) and
+// normalized on read — a bad or absent basis is never a write failure.
+func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body, basis, evidence string) (store.AgentMemory, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.AgentMemory{}, err
@@ -2687,6 +2689,15 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	if title == "" || strings.TrimSpace(body) == "" {
 		return store.AgentMemory{}, ErrMemoryEmpty
 	}
+	// Writer-declared provenance (PRD #266). basis is a single-line trust label and
+	// evidence a free-text pointer — both untrusted, so sanitize them the same way
+	// (a title-shaped basis, a body-shaped evidence) to keep an injected ANSI escape
+	// from rendering when the owner runs `uzi memory list`. A bad/empty basis NEVER
+	// fails the write (PRD #90: memory writes must not fail a run): it is stored
+	// verbatim (NULL when empty) and the API read mapper normalizes an unknown value
+	// to "inferred". Evidence is stored NULL when empty (the DTO omits it).
+	basis = sanitizeMemoryField(strings.TrimSpace(basis), false)
+	evidence = sanitizeMemoryField(evidence, true)
 	if len(title) > MemoryMaxTitleBytes || len(body) > MemoryMaxBodyBytes {
 		return store.AgentMemory{}, ErrMemoryTooLarge
 	}
@@ -2702,11 +2713,13 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	}
 	repoID := uuid.UUID(run.RepoID.Bytes)
 	mem, err := s.q.InsertAgentMemory(ctx, store.InsertAgentMemoryParams{
-		UserID: run.UserID,
-		RepoID: repoID,
-		RunID:  pgUUID(runID),
-		Title:  title,
-		Body:   body,
+		UserID:   run.UserID,
+		RepoID:   repoID,
+		RunID:    pgUUID(runID),
+		Title:    title,
+		Body:     body,
+		Basis:    pgText(basis),
+		Evidence: pgText(evidence),
 	})
 	if err != nil {
 		return store.AgentMemory{}, err

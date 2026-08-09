@@ -30,6 +30,7 @@ function aMemory(over: Partial<Memory> = {}): Memory {
     body: "No need to install build-essential.",
     run_id: "e2d7427b",
     created_at: minsAgo(30),
+    basis: "observed",
     ...over,
   };
 }
@@ -98,6 +99,47 @@ describe("Memory list + grouping", () => {
     mockApi.listMemory.mockResolvedValue({ memories: [aMemory({ run_id: "e2d7427b" })] });
     render(<MemoryComponent />);
     expect(await screen.findByText("e2d7427b")).toBeTruthy();
+  });
+
+  // PRD #266 M3: provenance is a human audit signal — an unverified (inferred) fact must
+  // read differently from an observed one, and its evidence must be visible.
+  it("marks an inferred entry as unverified", async () => {
+    mockApi.listMemory.mockResolvedValue({ memories: [aMemory({ basis: "inferred" })] });
+    render(<MemoryComponent />);
+    await screen.findByText("gcc is baked in 0.8.3");
+    expect(screen.getByText("inferred")).toBeTruthy();
+    expect(screen.queryByText("observed")).toBeNull();
+  });
+
+  it("treats a missing/unknown basis defensively as inferred", async () => {
+    // A legacy row (or any unexpected value) must never render as verified.
+    mockApi.listMemory.mockResolvedValue({
+      memories: [aMemory({ basis: undefined as unknown as Memory["basis"] })],
+    });
+    render(<MemoryComponent />);
+    await screen.findByText("gcc is baked in 0.8.3");
+    expect(screen.getByText("inferred")).toBeTruthy();
+  });
+
+  it("marks an observed entry and renders its evidence (stripped)", async () => {
+    mockApi.listMemory.mockResolvedValue({
+      memories: [
+        aMemory({ basis: "observed", evidence: "Dockerfile:‮12 — gcc 0.8.3​" }),
+      ],
+    });
+    const { container } = render(<MemoryComponent />);
+    await screen.findByText("gcc is baked in 0.8.3");
+    expect(screen.getByText("observed")).toBeTruthy();
+    // Evidence renders, run through stripUnsafeChars (no bidi/zero-width survives).
+    expect(container.textContent).toContain("Dockerfile:12 — gcc 0.8.3");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("omits the evidence line when no evidence is present", async () => {
+    mockApi.listMemory.mockResolvedValue({ memories: [aMemory({ evidence: undefined })] });
+    render(<MemoryComponent />);
+    await screen.findByText("gcc is baked in 0.8.3");
+    expect(screen.queryByText(/evidence:/)).toBeNull();
   });
 
   it("surfaces a load error", async () => {

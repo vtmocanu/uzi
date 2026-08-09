@@ -12,7 +12,12 @@
 // prompt-level layer.
 
 import { randomBytes } from "node:crypto";
-import type { Milestone, MilestoneProgress, RunKind } from "./protocol.js";
+import type {
+  MemoryBasis,
+  Milestone,
+  MilestoneProgress,
+  RunKind,
+} from "./protocol.js";
 import { clampToDirCharset } from "./util.js";
 
 const UNTRUSTED_FRAME =
@@ -177,6 +182,13 @@ export interface MemoryEntryView {
   title: string;
   body: string;
   created_at?: string;
+  /** Writer-declared provenance (PRD #266 M3). A missing/unknown value is treated as
+   *  `inferred` (legacy rows), so an untested deduction always wears the per-entry
+   *  re-verify caveat rather than being silently trusted. */
+  basis?: MemoryBasis;
+  /** Optional short pointer to what backs an `observed` claim; rendered inline when
+   *  present so the reader can check it. */
+  evidence?: string;
 }
 
 // memoryFrame frames the run's (user, repo) cross-run memory as INERT, UNTRUSTED,
@@ -197,11 +209,34 @@ function memoryFrame(openTag: string, closeTag: string): string {
   );
 }
 
+// memoryBasisMarker renders the PER-ENTRY provenance signal that M3 layers on top of
+// the blanket memoryFrame (PRD #266 Decision 3: the frame already existed and did not
+// stop the incident, so ADD a per-entry signal rather than replace it). An `inferred`
+// basis — OR a missing/unknown one, so legacy rows and pre-M3 responses fail safe —
+// wears an individual "re-verify against live code" caveat, distinct from the blanket
+// advisory. An `observed` basis is marked as such and carries its evidence pointer
+// when present, so the reader can check what backs the claim.
+function memoryBasisMarker(
+  basis: MemoryBasis | undefined,
+  evidence: string | undefined,
+): string {
+  if (basis === "observed") {
+    const ev = evidence && evidence.length > 0 ? `; evidence: ${evidence}` : "";
+    return `[basis: observed${ev}]`;
+  }
+  // inferred, or missing/unknown ⇒ treat as inferred (legacy row) and caveat it.
+  return "[basis: INFERRED — re-verify against live code before acting on it]";
+}
+
 /**
  * Render the run's cross-run memory as an inert, nonce-fenced, untrusted-advisory
  * block for the lead's planning prompt (PRD #90 M3). Returns "" when there are no
  * entries, so the caller injects nothing. Pure + unit-testable (the read-path
  * builder M5 exercises directly, independent of the live executor).
+ *
+ * On top of the blanket untrusted frame, each entry carries a PER-ENTRY provenance
+ * marker (PRD #266 M3): an inferred (or legacy/unknown-basis) entry is individually
+ * flagged "re-verify", while an observed entry shows its evidence when present.
  */
 export function buildMemoryContext(
   entries: readonly MemoryEntryView[],
@@ -215,7 +250,8 @@ export function buildMemoryContext(
   const rendered = entries
     .map((e, i) => {
       const when = e.created_at ? ` (saved ${e.created_at})` : "";
-      return [`[${i + 1}] ${e.title}${when}`, e.body].join("\n");
+      const marker = ` ${memoryBasisMarker(e.basis, e.evidence)}`;
+      return [`[${i + 1}] ${e.title}${when}${marker}`, e.body].join("\n");
     })
     .join("\n\n");
   return [memoryFrame(openTag, closeTag), openTag, rendered, closeTag].join(

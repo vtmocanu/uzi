@@ -75,23 +75,27 @@ func (q *Queries) EvictAgentMemoryOverCap(ctx context.Context, arg EvictAgentMem
 }
 
 const insertAgentMemory = `-- name: InsertAgentMemory :one
-INSERT INTO agent_memory (user_id, repo_id, run_id, title, body)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, repo_id, run_id, title, body, created_at
+INSERT INTO agent_memory (user_id, repo_id, run_id, title, body, basis, evidence)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, user_id, repo_id, run_id, title, body, created_at, basis, evidence
 `
 
 type InsertAgentMemoryParams struct {
-	UserID uuid.UUID   `json:"user_id"`
-	RepoID uuid.UUID   `json:"repo_id"`
-	RunID  pgtype.UUID `json:"run_id"`
-	Title  string      `json:"title"`
-	Body   string      `json:"body"`
+	UserID   uuid.UUID   `json:"user_id"`
+	RepoID   uuid.UUID   `json:"repo_id"`
+	RunID    pgtype.UUID `json:"run_id"`
+	Title    string      `json:"title"`
+	Body     string      `json:"body"`
+	Basis    pgtype.Text `json:"basis"`
+	Evidence pgtype.Text `json:"evidence"`
 }
 
 // Write one memory entry. The caller supplies user_id/repo_id DERIVED FROM THE RUN
 // CLAIM (never the request body) plus the writing run_id as provenance. The
 // per-run write cap and the oldest-eviction that keep the (user,repo) set bounded
-// run around this insert in the store service.
+// run around this insert in the store service. basis/evidence are the writer's
+// declared provenance (PRD #266): stored verbatim (NULL when empty), normalized by
+// the API read mapper — an unknown/NULL basis reads back as "inferred".
 func (q *Queries) InsertAgentMemory(ctx context.Context, arg InsertAgentMemoryParams) (AgentMemory, error) {
 	row := q.db.QueryRow(ctx, insertAgentMemory,
 		arg.UserID,
@@ -99,6 +103,8 @@ func (q *Queries) InsertAgentMemory(ctx context.Context, arg InsertAgentMemoryPa
 		arg.RunID,
 		arg.Title,
 		arg.Body,
+		arg.Basis,
+		arg.Evidence,
 	)
 	var i AgentMemory
 	err := row.Scan(
@@ -109,13 +115,15 @@ func (q *Queries) InsertAgentMemory(ctx context.Context, arg InsertAgentMemoryPa
 		&i.Title,
 		&i.Body,
 		&i.CreatedAt,
+		&i.Basis,
+		&i.Evidence,
 	)
 	return i, err
 }
 
 const listAgentMemoryForUser = `-- name: ListAgentMemoryForUser :many
 SELECT m.id, m.repo_id, r.path_with_namespace AS repo_name,
-       m.title, m.body, m.run_id, m.created_at
+       m.title, m.body, m.run_id, m.basis, m.evidence, m.created_at
 FROM agent_memory m
 JOIN repos r ON r.id = m.repo_id
 WHERE m.user_id = $1
@@ -129,6 +137,8 @@ type ListAgentMemoryForUserRow struct {
 	Title     string             `json:"title"`
 	Body      string             `json:"body"`
 	RunID     pgtype.UUID        `json:"run_id"`
+	Basis     pgtype.Text        `json:"basis"`
+	Evidence  pgtype.Text        `json:"evidence"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -152,6 +162,8 @@ func (q *Queries) ListAgentMemoryForUser(ctx context.Context, userID uuid.UUID) 
 			&i.Title,
 			&i.Body,
 			&i.RunID,
+			&i.Basis,
+			&i.Evidence,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -165,7 +177,7 @@ func (q *Queries) ListAgentMemoryForUser(ctx context.Context, userID uuid.UUID) 
 }
 
 const listAgentMemoryForUserRepo = `-- name: ListAgentMemoryForUserRepo :many
-SELECT id, user_id, repo_id, run_id, title, body, created_at FROM agent_memory
+SELECT id, user_id, repo_id, run_id, title, body, created_at, basis, evidence FROM agent_memory
 WHERE user_id = $1 AND repo_id = $2
 ORDER BY created_at DESC, id DESC
 `
@@ -195,6 +207,8 @@ func (q *Queries) ListAgentMemoryForUserRepo(ctx context.Context, arg ListAgentM
 			&i.Title,
 			&i.Body,
 			&i.CreatedAt,
+			&i.Basis,
+			&i.Evidence,
 		); err != nil {
 			return nil, err
 		}
