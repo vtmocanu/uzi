@@ -10,32 +10,56 @@ import { formatAgo, formatCountdown, sortAdminRows, statusBadge, useNow } from "
 import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
 import { MeterTrack } from "../components/Meter";
 
-function WindowCell({
-  limits,
-  pick,
+// One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
+// the shared MeterTrack, its percent, and the reset countdown. The visible chip is
+// short, but MeterTrack's aria-label carries the FULL window name ("5-hour window"
+// / "7-day window") for screen readers (Decision 4 — the test selects bars by that
+// name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
+// at its small size: it is the only visible window identity a sighted low-vision
+// admin has now that the full column headers are gone.
+type Window = Extract<MyRateLimits, { status: "ok" }>["five_hour"];
+
+function WindowRow({
+  win,
+  chip,
   label,
+  stale,
   now,
 }: {
-  limits: MyRateLimits;
-  pick: "five_hour" | "seven_day";
+  win: Window;
+  chip: string;
   label: string;
+  stale: boolean;
   now: number;
 }) {
-  if (limits.status !== "ok") return <span className="text-faint">—</span>;
-  const win = limits[pick];
-  const reset = limits.stale ? "stale" : (formatCountdown(win.resets_at, now) ?? "—");
+  const reset = stale ? "stale" : (formatCountdown(win.resets_at, now) ?? "—");
   return (
-    <div className="grid grid-cols-[minmax(5rem,9rem)_3rem_5.5rem] items-center gap-2.5">
-      <MeterTrack className="h-1.5" label={label} fillPct={win.pct} valueText={`${win.pct}%`} dim={limits.stale} />
-      <span className={cx("text-right font-mono tabular-nums", limits.stale ? "text-faint" : "text-muted")}>
+    <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_auto] items-center gap-2.5">
+      <span className="font-mono text-xs text-muted">{chip}</span>
+      <MeterTrack className="h-1.5" label={label} fillPct={win.pct} valueText={`${win.pct}%`} dim={stale} />
+      <span className={cx("text-right font-mono tabular-nums", stale ? "text-faint" : "text-muted")}>
         {win.pct}%
       </span>
       {/* The live countdown is data → text-muted for WCAG AA at 12px (web-ux); a
           stale row's "stale" label stays faint (de-emphasised, and the dimmed bar
           + badge already carry the staleness). */}
-      <span className={cx("whitespace-nowrap text-xs", limits.stale ? "text-faint" : "text-muted")}>
+      <span className={cx("whitespace-nowrap text-xs", stale ? "text-faint" : "text-muted")}>
         {reset}
       </span>
+    </div>
+  );
+}
+
+// Utilization stacks the 5-hour and 7-day meters as two thin rows in ONE column
+// (PRD #240): what used to be two ~280px side-by-side columns, halving the table's
+// width so it fits its card. A non-ok reading collapses to a single em-dash — never
+// two — so the row stays one Utilization cell.
+function UtilizationCell({ limits, now }: { limits: MyRateLimits; now: number }) {
+  if (limits.status !== "ok") return <span className="text-faint">—</span>;
+  return (
+    <div className="flex max-w-[22rem] flex-col gap-2">
+      <WindowRow win={limits.five_hour} chip="5h" label="5-hour window" stale={limits.stale} now={now} />
+      <WindowRow win={limits.seven_day} chip="7d" label="7-day window" stale={limits.stale} now={now} />
     </div>
   );
 }
@@ -113,10 +137,8 @@ export function AdminRateLimits() {
                 <tr>
                   <th className="px-4 py-3 font-medium">User</th>
                   <th className="px-4 py-3 font-medium">Token</th>
-                  <th className="px-4 py-3 font-medium">5-hour window</th>
-                  <th className="px-4 py-3 font-medium">7-day window</th>
+                  <th className="px-4 py-3 font-medium">Utilization</th>
                   <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium">Updated</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-edge">
@@ -129,18 +151,17 @@ export function AdminRateLimits() {
                   u.tokens.length === 0
                     ? [
                         // Every cell keeps its column: a colSpan here would slide
-                        // the status badge under the window headers and break the
-                        // table's alignment for the one row a reader is most likely
-                        // to be scanning past.
+                        // the status badge under the Utilization header and break
+                        // the table's alignment for the one row a reader is most
+                        // likely to be scanning past. Token + Utilization are each a
+                        // single em-dash (two dashes total for a no_token row).
                         <tr key={u.id} className="transition-colors hover:bg-raised/30">
                           <UserCell user={u} rowSpan={1} showIdentity />
-                          <td className="px-4 py-3 text-xs text-faint">—</td>
                           <td className="px-4 py-3 text-xs text-faint">—</td>
                           <td className="px-4 py-3 text-xs text-faint">—</td>
                           <td className="px-4 py-3">
                             <Badge tone="neutral">no token</Badge>
                           </td>
-                          <td className="px-4 py-3 text-xs text-muted">—</td>
                         </tr>,
                       ]
                     : u.tokens.map((t, i) => {
@@ -152,27 +173,27 @@ export function AdminRateLimits() {
                             {i === 0 ? (
                               <UserCell user={u} rowSpan={u.tokens.length} showIdentity />
                             ) : null}
-                            <td className="px-4 py-3">
+                            <td className="px-4 py-3 align-top">
                               <div className="flex items-center gap-2">
                                 <span className="text-xs font-medium text-fg">{t.label}</span>
                                 {t.is_default && <Badge tone="neutral">default</Badge>}
                               </div>
                             </td>
-                            <td className="px-4 py-3">
-                              <WindowCell limits={t.limits} pick="five_hour" label="5-hour window" now={now} />
+                            <td className="px-4 py-3 align-top">
+                              <UtilizationCell limits={t.limits} now={now} />
                             </td>
-                            <td className="px-4 py-3">
-                              <WindowCell limits={t.limits} pick="seven_day" label="7-day window" now={now} />
-                            </td>
-                            <td className="px-4 py-3">
+                            <td className="px-4 py-3 align-top">
                               <Badge tone={badge.tone} dot={badge.dot}>
                                 {badge.label}
                               </Badge>
-                            </td>
-                            {/* text-muted (not faint): the "updated Xm ago" timestamp
-                                must clear WCAG AA at 12px (web-ux finding). */}
-                            <td className="px-4 py-3 text-xs tabular-nums text-muted">
-                              {t.limits.status === "ok" ? formatAgo(t.limits.synced_at, now) : "—"}
+                              {/* "Updated" folds under the Status pill (PRD #240 Decision 2):
+                                  the relocated Updated column, NOT a new element, so it keeps
+                                  text-muted — it must clear WCAG AA at 12px (web-ux finding). */}
+                              {t.limits.status === "ok" && (
+                                <div className="mt-1.5 text-xs tabular-nums text-muted">
+                                  updated {formatAgo(t.limits.synced_at, now)}
+                                </div>
+                              )}
                             </td>
                           </tr>
                         );
