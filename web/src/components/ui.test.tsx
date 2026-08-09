@@ -82,12 +82,15 @@ describe("StatusPill", () => {
     // Complements runBadge.test.ts's TONE-agreement loop over the same map: that one pins
     // the colour, this one pins the words, and a status can drift on either alone.
     //
-    // The two skips are runBadge overlays with no StatusPill counterpart, carved out the
+    // The skip is a runBadge overlay with no StatusPill counterpart, carved out the
     // same way that test carves out the stop_kind nuance:
-    //   running   — runBadge appends live elapsed ("running 4m"); a pill has no clock.
     //   cancelled — isStoppedRun rewrites it to "stopped", and RunView passes the literal
     //               "stopped" to the pill instead, so the two never meet on this key.
-    const OVERLAY_ONLY = new Set(["running", "cancelled"]);
+    // `running` used to be skipped too — runBadge once appended live elapsed
+    // ("running 4m") that a clockless pill could not match — but since issue #256 M4 the
+    // elapsed moved to the meta-line duration token and the badge is a bare "running",
+    // so the word now agrees with StatusPill and is asserted here rather than skipped.
+    const OVERLAY_ONLY = new Set(["cancelled"]);
     const checked: string[] = [];
     for (const status of Object.keys(RUN_STATUS_TONES)) {
       if (OVERLAY_ONLY.has(status)) continue;

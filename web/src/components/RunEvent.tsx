@@ -405,13 +405,18 @@ export function classifyResultState(
 
 // ── durations ───────────────────────────────────────────────────────────────
 
-// formatDuration renders a millisecond span terse: "0.8s", "12.4s", "1m 05s".
+// formatDuration renders a millisecond span terse: "0.8s", "12.4s", "1m 05s", "1h 30m 00s".
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) ms = 0;
   const secs = ms / 1000;
   if (secs < 60) return `${secs.toFixed(1)}s`;
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs - m * 60);
+  const totalSec = Math.round(secs);
+  const s = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const m = totalMin % 60;
+  const h = Math.floor(totalMin / 60);
+  if (h > 0)
+    return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 

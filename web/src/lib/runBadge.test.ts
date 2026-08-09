@@ -64,10 +64,10 @@ describe("runBadge taxonomy", () => {
     expect(b).toMatchObject({ kind: "badge", label: "claimed", tone: "info", pulse: false });
   });
 
-  it("running → pulsing info badge with elapsed since created_at", () => {
+  it("running → bare pulsing info badge (elapsed moved to the meta duration token, issue #256 M4)", () => {
     const b = runBadge(run({ status: "running", worker_name: "laptop" }), NOW);
     expect(b).toMatchObject({ kind: "badge", tone: "info", pulse: true });
-    if (b.kind === "badge") expect(b.label).toBe("running 4m");
+    if (b.kind === "badge") expect(b.label).toBe("running");
   });
 
   it("awaiting_approval → amber (warning) badge", () => {
@@ -123,7 +123,7 @@ describe("runBadge taxonomy", () => {
   it("stamped stop_kind but still running → renders by status, not 'stopped'", () => {
     const b = runBadge(run({ status: "running", stop_kind: "cancelled" }), NOW);
     expect(b).toMatchObject({ kind: "badge", tone: "info", pulse: true });
-    if (b.kind === "badge") expect(b.label).toBe("running 4m");
+    if (b.kind === "badge") expect(b.label).toBe("running");
   });
 
   it("stamped stop_kind but completed with an MR → MR chip (reject-then-approve race)", () => {
@@ -247,7 +247,7 @@ describe("runBadge health warn variant (PRD #47)", () => {
 
   it("a healthy run keeps its normal status badge (no ⚠)", () => {
     const b = runBadge(run({ status: "running", health: "ok" }), NOW);
-    expect(b).toMatchObject({ label: "running 4m", tone: "info" });
+    expect(b).toMatchObject({ label: "running", tone: "info" });
   });
 
   it("belt-and-braces: a terminal run never shows a stale flag", () => {
