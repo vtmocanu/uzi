@@ -186,10 +186,13 @@ export interface RunnerClone {
    *
    *  Load-bearing for the lead, which otherwise has to GUESS the branch's parent from the
    *  clone's local default branch. That ref is NOT a substitute, and not for the reason an
-   *  earlier version of this comment gave: the clone's `main` is a FROZEN MIRROR. `cloneBare`
-   *  rewrites the refspec to `+refs/heads/*:refs/remotes/origin/*`, so the bare's own
-   *  `refs/heads/*` never move after the first clone, and the runner clone inherits them as
-   *  its local `main` AND its `origin/main`.
+   *  earlier version of this comment gave: the clone's LOCAL `refs/heads/main` is a FROZEN
+   *  MIRROR. `cloneBare` rewrites the refspec to `+refs/heads/*:refs/remotes/origin/*`, so the
+   *  bare's own `refs/heads/*` never move after the first clone, and the runner clone inherits
+   *  that frozen head as its local `main`. Its `origin/main` used to inherit the same frozen
+   *  head, but `runnerCloneForBranch` now `update-ref`s `refs/remotes/origin/<default>` to the
+   *  fresh default head (`defaultBranchCommit`) after checkout (issue #262), so the ratchet
+   *  base is fresh; the clone's local `refs/heads/main` is left untouched and stays frozen.
    *
    *  The drift therefore has no predictable direction — the mirror can sit at, behind, or
    *  ahead of this commit, one per topology — so neither `main..HEAD` nor `main...HEAD` is
@@ -523,6 +526,24 @@ export class GitCache {
       await this.runGitAsRunner(clonePath, ["config", "user.email", AGENT_GIT_IDENTITY.email]);
       await this.runGitAsRunner(clonePath, ["config", "commit.gpgsign", "false"]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
+      // Issue #262 — refresh the clone's default remote-tracking ref to the FRESH default
+      // head. The clone's `refs/remotes/origin/<default>` is copied from the bare's
+      // `refs/heads/*` (cloneBare rewrites the fetch refspec to
+      // `+refs/heads/*:refs/remotes/origin/*`, leaving the bare's own `refs/heads/*` a
+      // FROZEN mirror fixed at first clone), so it inherits a stale head even though the
+      // branch is checked out at the fresh default tip. golangci-lint's ratchet
+      // `issues: {new-from-merge-base: origin/main, whole-files: true}` then computes
+      // `merge-base(origin/main[frozen], HEAD[fresh])` = an ancient commit and false-reds
+      // the entire pre-existing backlog as branch-introduced. Point the ratchet base at the
+      // fresh default head (already resolved in `defaultBranchCommit`, reachable via the
+      // `--shared` alternate) so it gates only branch-introduced findings. Local + offline;
+      // as RUNNER, matching the surrounding runner-owned writes. `defaultBranchCommit` may be
+      // undefined (a repo with no resolvable default branch); guard and skip so we never mask
+      // the existing merge-base pre-flight in the Taskfile.
+      const defaultBranch = await this.defaultBranchName(barePath);
+      if (defaultBranch && defaultBranchCommit) {
+        await this.runGitAsRunner(clonePath, ["update-ref", `refs/remotes/origin/${defaultBranch}`, defaultBranchCommit]);
+      }
       return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom, checkpointSetAside };
     });
   }

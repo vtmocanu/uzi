@@ -196,6 +196,50 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.notStrictEqual(second.defaultBranchCommit, second.baseCommit, "…and on a resume the two differ");
   });
 
+  // Issue #262 — the clone's `origin/main` must track the FRESH default head, not the bare's
+  // frozen mirror. cloneBare rewrites the fetch refspec to `+refs/heads/*:refs/remotes/origin/*`,
+  // so the bare's `refs/heads/main` freezes at first clone while its `refs/remotes/origin/main`
+  // stays fresh; the default `git clone` refspec then copies the FROZEN `refs/heads/*` into the
+  // clone's `origin/*`. golangci-lint's ratchet `new-from-merge-base: origin/main` would then
+  // compute `merge-base(origin/main[frozen], HEAD[fresh])` = the ancient initial commit and
+  // false-red the whole pre-existing backlog. Without the fix `origin/main` would be the frozen
+  // initial commit and the merge-base would span the whole backlog; the fix update-refs it to
+  // the fresh default head so the ratchet gates only branch-introduced findings.
+  it("advances the clone's origin/main to the fresh default head, not the bare's frozen mirror (#262)", async () => {
+    // First clone pins the bare's refs/heads/main at the fixture's initial commit.
+    const bare = await git.ensureClone(fx.originPath);
+    const initialHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+
+    // Advance the fixture ORIGIN's default branch with a new commit.
+    fs.writeFileSync(path.join(fx.originPath, "ADVANCE.txt"), "moved on\n");
+    gitIn(fx.originPath, ["add", "ADVANCE.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "advance default"]);
+    const freshHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.notStrictEqual(freshHead, initialHead, "precondition: the fresh head differs from the initial commit");
+
+    // Refresh the bare: refs/remotes/origin/main moves to freshHead while refs/heads/main
+    // stays frozen at initialHead — the exact stale-mirror condition.
+    await git.ensureClone(fx.originPath);
+    assert.strictEqual(gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]), freshHead, "precondition: bare origin-tracking is fresh");
+    assert.strictEqual(gitIn(bare, ["rev-parse", "refs/heads/main"]), initialHead, "precondition: bare's refs/heads/main is the frozen mirror");
+
+    const rc = await git.createOrAttachRunnerClone(bare, 262);
+
+    // The clone's origin/main (the ratchet base) is the FRESH head, not the frozen initial commit.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      freshHead,
+      "clone origin/main must be advanced to the fresh default head (#262)",
+    );
+    // …so the ratchet base resolves to the fresh head: an EMPTY backlog range, not one spanning
+    // the whole history back to the frozen initial commit.
+    assert.strictEqual(
+      gitIn(rc.path, ["merge-base", "refs/remotes/origin/main", "HEAD"]),
+      freshHead,
+      "merge-base(origin/main, HEAD) must be the fresh head so new-from-merge-base gates only branch findings",
+    );
+  });
+
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
   // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
   // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after
