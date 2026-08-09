@@ -32,14 +32,18 @@ func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prd
 // -------------------------------------------------------------------------
 
 func TestScanCommandNotFound(t *testing.T) {
-	payloads := rawResultRows(
+	// kubectl/helm/terraform arrive via high-confidence forms and need no corroboration;
+	// jq is the low-confidence `X: not found` form, so a tool_use invoking jq is appended
+	// to corroborate it — exercising the low-confidence path rather than bypassing it (a
+	// run sees `jq: not found` precisely because it RAN jq).
+	payloads := append(rawResultRows(
 		`{"text":"bash: kubectl: command not found"}`,
 		`{"text":"zsh: command not found: helm"}`,
 		`{"text":"exec: \"terraform\": executable file not found in $PATH"}`,
 		`{"text":"/bin/sh: 1: jq: not found"}`,
 		`{"text":"kubectl: command not found"}`, // duplicate → deduped
 		`{"text":"all good here, tests passed"}`,
-	)
+	), traceUse(1, "u-jq", "jq -r .name package.json"))
 	got := scanCommandNotFound(payloads)
 	cmds := map[string]bool{}
 	for _, m := range got {
@@ -84,12 +88,16 @@ func TestScanCommandNotFoundIgnoresToolUseRows(t *testing.T) {
 // TestScanCommandNotFoundFiltersNoise: the low-confidence "X: not found" form drops
 // HTTP/line numbers and shared-object/header files but keeps a real missing tool.
 func TestScanCommandNotFoundFiltersNoise(t *testing.T) {
-	payloads := rawResultRows(
+	// The noise tokens are dropped by noisyShToken BEFORE corroboration, so they stay
+	// dropped regardless. shellcheck is the low-confidence real-tool case, so a tool_use
+	// invoking shellcheck is appended to corroborate it — keeping the "a real missing tool
+	// survives the noise filter" intent while exercising the low-confidence path.
+	payloads := append(rawResultRows(
 		`{"text":"/bin/sh: 1: 404: not found"}`,        // numeric → dropped
 		`{"text":"ld: libssl.so.1: not found"}`,        // shared lib → dropped
 		`{"text":"link error: foo.o: not found"}`,      // object file → dropped
 		`{"text":"/bin/sh: 1: shellcheck: not found"}`, // real tool → kept
-	)
+	), traceUse(1, "u-sc", "shellcheck x.sh"))
 	got := scanCommandNotFound(payloads)
 	cmds := map[string]bool{}
 	for _, m := range got {

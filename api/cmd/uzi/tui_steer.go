@@ -82,9 +82,10 @@ type steerState2 struct {
 // already loaded through the viewer path by this point: visibility is established, so
 // the only thing the owner-only endpoint can be refusing is ownership.
 func steerAccessFor(run apitypes.RunDTO, inputsErr error) steerAccess {
-	// Chat runs are watch-only regardless of ownership. SubmitRunInput does NOT gate
-	// kind=chat, so a raw follow-up would inject into a chat outside the guarded,
-	// cookie-only /chats path — the TUI must not offer the affordance at all.
+	// Chat runs are watch-only regardless of ownership. A raw follow-up on a chat run
+	// is now rejected at the service boundary (SubmitInput -> ErrChatInputNotAllowed,
+	// #192), and chat turns belong on the guarded, cookie-only /chats path anyway — so
+	// the TUI must not offer the steer affordance at all.
 	if run.Kind == "chat" {
 		return steerChatRun
 	}

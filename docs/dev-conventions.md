@@ -161,10 +161,16 @@ adopting a linter on a codebase with a backlog. `task lint:api:all` and
 gating, and are not part of `task gate`. The npm half needed no ratchet because
 its debt was 16 findings, all fixed in the same milestone.
 
-If a Go lint target exits with `origin/main is unresolvable`, run
-`git fetch origin main`. The guard exists because without the ref golangci-lint
-does not skip the ratchet — it reports the entire backlog behind a single warning
-line, which reads as a large new regression.
+In worker runner clones the clone setup now advances `origin/main` to the real
+default-branch head before any gate runs (issue #262), so `new-from-merge-base`
+gates only branch-introduced findings rather than a stale backlog — without it the
+clone's `origin/main` inherited the bare's frozen mirror and the ratchet
+false-red the whole pre-existing backlog. If a Go lint target exits with
+`origin/main is unresolvable`, run `git fetch origin main`; that guard is
+unchanged and still fires when the ref genuinely does not resolve. The guard
+exists because without the ref golangci-lint does not skip the ratchet — it
+reports the entire backlog behind a single warning line, which reads as a large
+new regression.
 
 There **is** a dead-code check, as of PRD #103 M4: `task deadcode` runs all four
 components, and each `task gate:<component>` runs its own. Go (`api`,

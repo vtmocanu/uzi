@@ -12,6 +12,47 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countJudgeGroupsByCategoryForUser = `-- name: CountJudgeGroupsByCategoryForUser :many
+SELECT rr.category AS category, COUNT(DISTINCT rr.target)::bigint AS group_count
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+WHERE rv.user_id = $1
+GROUP BY rr.category
+`
+
+type CountJudgeGroupsByCategoryForUserRow struct {
+	Category   string `json:"category"`
+	GroupCount int64  `json:"group_count"`
+}
+
+// Per-category GROUP count (distinct (category, target) coordinates) across the
+// caller's whole backlog, for the Judge filter-chip counts (#244). Uncapped by
+// design: canonical per-category aggregate, exact even when the backlog list
+// truncates. COUNT(DISTINCT rr.target) within each category == one per group,
+// matching GroupJudgeRecommendations' (category, target) coordinate. No
+// disposition/filed joins: whole-backlog, all triage states. Drops the backlog
+// query's inner JOIN runs (target_run_id is NOT NULL UNIQUE, a lossless 1:1) --
+// do NOT re-add it.
+func (q *Queries) CountJudgeGroupsByCategoryForUser(ctx context.Context, userID uuid.UUID) ([]CountJudgeGroupsByCategoryForUserRow, error) {
+	rows, err := q.db.Query(ctx, countJudgeGroupsByCategoryForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountJudgeGroupsByCategoryForUserRow{}
+	for rows.Next() {
+		var i CountJudgeGroupsByCategoryForUserRow
+		if err := rows.Scan(&i.Category, &i.GroupCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const deleteRecommendationDisposition = `-- name: DeleteRecommendationDisposition :execrows
 DELETE FROM recommendation_dispositions
 WHERE review_id = $1 AND category = $2 AND target = $3

@@ -644,6 +644,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/me/judge", func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/stats", h.JudgeStats)
+			// Per-category GROUP counts for the Judge filter chips (PRD #244): a
+			// SEPARATE endpoint + DTO from /stats so the nav badge (which reads only
+			// triage.todo) is structurally unreachable from category data. Whole-backlog,
+			// uncapped and triage-invariant, so the Judge page fetches it once on mount.
+			r.Get("/category-stats", h.JudgeCategoryStats)
 			// The Judge menu's grouped backlog (PRD #98 M1): the same owner-scoped,
 			// all-time aggregate, deduped by (category, target) with the per-run
 			// occurrences. Same mount as /stats so `uzi review backlog` works from a CLI
