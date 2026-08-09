@@ -69,7 +69,8 @@ headless path. **In GitLab CI, `UZI_TOKEN` must be a masked variable.**
 
 ```
 uzi login | logout | auth token [--with-token] | auth status | whoami
-uzi run list | get <id> | logs <id> [--follow] [--after <seq>]
+uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
                 [--planned-commit <sha>] [--require-base]
@@ -579,6 +580,7 @@ silent contract change — so an agent always passes `--json` explicitly.
 | 4 | not found |
 | 5 | conflict (e.g. the run already finished) |
 | 6 | server unreachable / 5xx |
+| 7 | a `run wait --timeout` elapsed before any target state |
 
 Branch on the exit code, not on stderr text — the wording is for humans and
 can change. There's also no `--token` flag: a credential must never land on
@@ -597,6 +599,24 @@ verb's unwrapping for another:
 | `run list` | a top-level array: `[{…}, …]` |
 | `run logs` | **NDJSON** — one JSON object per line, not a single document |
 
+### Reading one scalar: `run get --field`
+
+To read a single value — a status, an MR url — you do not need the whole object
+or a JSON parser. `uzi run get <id> --field <name>` prints the named top-level
+**scalar** field raw and unquoted, one per line; `--field` is repeatable and the
+lines come out in the order you named them. `--field status` is the cheap poll a
+loop wants, and it sidesteps a real footgun: piping `--json` through a shell that
+re-interprets escapes (notably **zsh `echo`**, which turns the CLI's valid
+`\uXXXX`-escaped control bytes back into raw bytes and breaks `jq`) mangles the
+document. `--field` hands back the decoded value with nothing to re-mangle. If
+you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
+
+A `null` or absent field prints an empty line (so a nil array field is an empty
+line, not an error). An unknown field, or a **non-scalar** one that is populated
+— any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
+`usage`), which you read with `--json` — is a usage error (exit 2). `--field` and
+`--json` are mutually exclusive (two output modes).
+
 ### Run status, and what `--follow` waits for
 
 A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:
@@ -610,12 +630,46 @@ three non-terminal parks it will *not* stop at:
 - `limit_wait` — parked while an Anthropic usage limit resets, promoted back to
   `queued` once past its `retry_not_before`.
 
-So to wait for a plan gate or a clarification, **poll `uzi run get`** — leaning on
-`--follow` there blocks until the run truly finishes, which may be never while it
-waits on a human. If you see a `status` outside this list, the server is newer
+So to wait for a plan gate or a clarification, use **`uzi run wait <id>`** (next
+section) — leaning on `--follow` there blocks until the run truly finishes, which
+may be never while it waits on a human. If you see a `status` outside this list, the server is newer
 than this binary — upgrade rather than trusting it to mean "active". (The live
 `/api/ws` stream and `uzi tui` rewrite an unrecognised status to `unknown`; plain
 `run get`/`run list --json` pass it through as-is.)
+
+### Waiting for a state: `uzi run wait`
+
+`uzi run wait <id>` blocks until the run reaches a state you can act on — the
+built-in primitive for driving a gated run headless, replacing the hand-rolled
+`while … run get … sleep` poll loop. With no `--until` it stops on any
+**actionable or terminal** state (`awaiting_approval`, `awaiting_input`,
+`completed`, `failed`, `cancelled`) and waits through the rest
+(`queued`/`claimed`/`running`/`limit_wait`), so a bare `run wait` means "wait for
+the plan gate **or** the end".
+
+- It **exits 0** the moment a target state is reached — including if the run is
+  already in one when you call it.
+- It polls `GET /api/runs/:id` every `--interval` (default 3s) client-side (no
+  server long-poll), printing each transition to **stderr**; `--json` prints the
+  final run object (same shape as `run get --json`) to **stdout**.
+- `--timeout <dur>` is opt-in and gives **exit 7** if it elapses before any
+  target state. There is no default timeout: a healthy gated run stops at its
+  gate, so a bare wait cannot hang.
+- A single transient `6` (a server blip) is retried, not fatal; a `4` (not
+  found) is immediate.
+- `--until <a,b>` overrides the stop set, validated against the nine statuses.
+
+**Narrow the wait after approving.** A run lingers at `awaiting_approval` for a
+beat after a successful `run approve` (the async flip to `running`), so the
+second wait in a gated loop must exclude the gate it just cleared:
+
+```
+uzi run create --repo <id> --issue <iid> --json      # gated run
+uzi run wait <id>                                     # returns at awaiting_approval
+uzi run approve <id>
+uzi run wait <id> --until completed,failed,cancelled  # narrowed, not a bare wait
+uzi run get <id> --field mr_web_url                   # the MR, raw
+```
 
 ## Bundled skill and session-start hook
 

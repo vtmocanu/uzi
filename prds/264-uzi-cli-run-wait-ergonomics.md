@@ -110,7 +110,7 @@ names that does not exist in the tree fails it too. So each new verb's SKILL.md 
 in the **same** milestone as the verb (M1, M2), not deferred to a docs milestone; M3 is only
 the corrections that are independent of the new code.
 
-- [ ] **M1 — `uzi run wait <run-id>` (+ its SKILL.md/`docs/cli.md` lines).** Blocks until the
+- [x] **M1 — `uzi run wait <run-id>` (+ its SKILL.md/`docs/cli.md` lines).** Blocks until the
   run reaches a `--until` state (default per D2), polling `GET /api/runs/:id` at `--interval`
   (sane default, e.g. 3s), honoring `--timeout` (D6) and the transient-blip resilience (D9),
   printing transitions to stderr and, under `--json`, the final run object to stdout (D4).
@@ -121,13 +121,13 @@ the corrections that are independent of the new code.
   (`api/internal/uzicli/fake.go`) with a per-id status-queue / hook seam, since it currently
   returns a static run — covering: already-in-target (immediate return), gate then terminal,
   timeout (exit 7), not-found (exit 4), and a transient exit-6 that recovers (D9).
-- [ ] **M2 — `uzi run get --field <name>` scalar projection (+ its doc line).** Repeatable;
+- [x] **M2 — `uzi run get --field <name>` scalar projection (+ its doc line).** Repeatable;
   prints the named top-level scalar(s) raw, one per line; mutually exclusive with `--json`;
   non-scalar field is a usage error (D5). Ships its SKILL.md/`docs/cli.md` line in this
   milestone (drift gate). Unit tests cover a present field, a null field (empty line), an
   unknown field (usage error, exit 2), a non-scalar `milestones` field (exit 2), and `--field`
   + `--json` rejected.
-- [ ] **M3 — code-independent skill + doc corrections (D7).** Edit the embedded skill source
+- [x] **M3 — code-independent skill + doc corrections (D7).** Edit the embedded skill source
   (`api/internal/uzicli/skill/SKILL.md`) and `docs/cli.md` for the parts that do **not** add
   code: add `review backlog --category`; document `run approve`'s `--json` return, the
   post-approve async flip, and benign re-approve; add the `--json`/shell-`echo` robustness

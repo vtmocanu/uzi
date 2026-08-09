@@ -277,6 +277,21 @@ var knownInstructions = []knownInstruction{
 		note: "HELP: inside `uzi run inputs`'s own Long description (run.go), naming itself " +
 			"while explaining what a chat run's steer queue holds. Never emitted at runtime.",
 	},
+	{
+		command:  "uzi run wait",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #264 M1. The span sits inside `uzi run wait`'s own Long
+		// description (run.go), which names itself twice — once for the bare
+		// wait-for-gate-or-end case and once for the D2 narrow-after-approve rule. It is
+		// a cobra Long field, so classifyKind derives HELP; nothing emits it at runtime
+		// (the loop's stderr lines are transitions like `run r1: running`, not a command
+		// to run). The complete bar for a help reference is that the path RESOLVES —
+		// `uzi run wait` is a real subcommand, pinned by TestCommandTree and exercised by
+		// the run_wait_test.go suite.
+		note: "HELP: inside `uzi run wait`'s own Long description (run.go), naming itself " +
+			"while explaining the bare-wait default and the D2 narrow-after-approve rule. " +
+			"Never emitted at runtime.",
+	},
 
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
 	{
@@ -650,6 +665,9 @@ func liftAll(t *testing.T) map[string]*candidate {
 	commands := topLevelCommands(t)
 	found := map[string]*candidate{}
 	for _, dir := range instructionScope {
+		//nolint:staticcheck // SA1019: parser.ParseDir (deprecated since go1.25) is adequate for this
+		// test-only scan of a single build-tag-free package dir; a go/packages migration is out of scope
+		// for PRD #264 and this edit only registers a new command's instruction below.
 		pkgs, err := parser.ParseDir(fset, dir, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", dir, err)
