@@ -77,6 +77,49 @@ describe("extractRepoDevboxPackages (packages-only, hooks never run)", () => {
     await fs.symlink("/dev/zero", path.join(dir, "devbox.json"));
     assert.deepStrictEqual(await extractRepoDevboxPackages(dir), []);
   });
+
+  it("parses a JSONC manifest with a // header comment block (this repo's real shape)", async () => {
+    await writeDevbox(`{
+  // devbox.json — tool profile for this repo.
+  // Edit "packages" to add tools; https://www.jetify.com/devbox
+  "packages": ["ruby@3.3"]
+}`);
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), ["ruby@3.3"]);
+  });
+
+  it("parses a manifest with both /* block */ and // line comments", async () => {
+    await writeDevbox(`{
+  /* block comment describing the profile */
+  "packages": [
+    "jq", // a line comment after a value
+    "ruby@3.3"
+  ]
+}`);
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), ["jq", "ruby@3.3"]);
+  });
+
+  it("FALSE POSITIVE GUARD: // and /* */ inside a STRING VALUE are not treated as comments", async () => {
+    // The env URL carries `//` and `/* */`; treating them as comments would corrupt
+    // the string and break the JSON. A real line comment sits elsewhere.
+    await writeDevbox(`{
+  // real comment here
+  "packages": ["hello"],
+  "env": { "URL": "git+https://example.com/a/*b*/c" }
+}`);
+    // Extraction succeeds and "hello" survives — proof the string was not mis-cut
+    // (a mis-cut would either drop the package or fail the parse entirely → []).
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), ["hello"]);
+  });
+
+  it("tolerates trailing commas in arrays and objects", async () => {
+    await writeDevbox(`{ "packages": ["jq", "hello", ], }`);
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), ["jq", "hello"]);
+  });
+
+  it("returns [] for malformed JSONC (unterminated block comment)", async () => {
+    await writeDevbox(`{ "packages": ["x"] /* oops`);
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), []);
+  });
 });
 
 describe("mergeToolPackages (tier-1 wins conflicts)", () => {

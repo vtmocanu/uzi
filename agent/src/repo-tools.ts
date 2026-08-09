@@ -6,7 +6,9 @@
 //
 //   - ONLY the `packages` field is read; shell.init_hook, shell.scripts, env, flake
 //     references, and every other key are ignored and NEVER executed. Extraction is
-//     pure JSON parsing — no shell, no `devbox` invocation on the repo file.
+//     a comment-tolerant (JSONC) parse — comments are stripped in-process and the
+//     result handed to native JSON.parse — with no shell and no `devbox` invocation
+//     on the repo file.
 //   - Each package is shape-validated (name / name@version), which also drops flake
 //     references, paths, and junk a hostile manifest might carry.
 //   - Tier-1 (uzi-stored, allowlist-validated) always wins a version conflict.
@@ -32,6 +34,76 @@ function baseName(pkg: string): string {
 }
 
 /**
+ * Strip JSONC (hujson-style) comments and tolerate trailing commas so a
+ * comment-bearing devbox.json can be handed to the native JSON.parse validator.
+ * A devbox manifest tolerates `//` line comments, `/* … *\/` block comments, and
+ * trailing commas; strict JSON.parse throws on all three.
+ *
+ * String-context aware, modeled on guardrails.ts's `tokenize`: a `//`, `/* … *\/`,
+ * or `,` that appears INSIDE a double-quoted JSON string (e.g. a URL value like
+ * "git+https://example.com/x") is copied verbatim, NEVER treated as a comment or a
+ * trailing separator. JSON strings use only double quotes; backslash escapes
+ * (`\\"`, `\\\\`, …) are honored so an escaped quote never ends the string early.
+ *
+ * Two O(n) passes (comment strip, then trailing-comma drop), both bounded by the
+ * 1 MiB stat-gate upstream. This is NOT a validator — malformed input still fails
+ * downstream in JSON.parse and falls through to [].
+ */
+function stripJsonComments(raw: string): string {
+  // Pass 1: drop `//` line and `/* */` block comments that are outside a string.
+  let stripped = "";
+  let inStr = false;
+  let i = 0;
+  const n = raw.length;
+  while (i < n) {
+    const ch = raw[i]!;
+    if (inStr) {
+      stripped += ch;
+      if (ch === "\\" && i + 1 < n) { stripped += raw[i + 1]; i += 2; continue; }
+      if (ch === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') { inStr = true; stripped += ch; i++; continue; }
+    if (ch === "/" && raw[i + 1] === "/") {
+      i += 2;
+      while (i < n && raw[i] !== "\n") i++; // stop at (do not consume) the newline
+      continue;
+    }
+    if (ch === "/" && raw[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(raw[i] === "*" && raw[i + 1] === "/")) i++;
+      i += 2; // consume the closing */
+      continue;
+    }
+    stripped += ch;
+    i++;
+  }
+  // Pass 2: drop a trailing comma — a `,` whose next non-whitespace char is } or ]
+  // (comments are already gone). String-aware so a comma inside a value is kept.
+  let out = "";
+  inStr = false;
+  const m = stripped.length;
+  for (let j = 0; j < m; j++) {
+    const ch = stripped[j]!;
+    if (inStr) {
+      out += ch;
+      if (ch === "\\" && j + 1 < m) { out += stripped[j + 1]; j++; continue; }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; out += ch; continue; }
+    if (ch === ",") {
+      let k = j + 1;
+      while (k < m && (stripped[k] === " " || stripped[k] === "\t" || stripped[k] === "\r" || stripped[k] === "\n")) k++;
+      if (k < m && (stripped[k] === "}" || stripped[k] === "]")) continue; // drop it
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * Extract ONLY the shape-valid packages from a repo's devbox.json. A missing,
  * unreadable, or malformed file yields []. NOTHING in the file is executed —
  * init_hook/scripts/flakes/other keys are ignored. Reached only when the owner
@@ -53,7 +125,7 @@ export async function extractRepoDevboxPackages(worktreePath: string): Promise<s
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripJsonComments(raw));
   } catch {
     return [];
   }
