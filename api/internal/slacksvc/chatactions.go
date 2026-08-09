@@ -540,7 +540,7 @@ func decodeRunReqValue(v string) (repoPath string, issueIID int64, ok bool) {
 // run on #42" must not cause one.
 func runRequestCardBlocks(repoPath string, issueIID int64, note string) []slack.Block {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("*▶️ Start a run?* on issue *#%d*", issueIID))
+	fmt.Fprintf(&b, "*▶️ Start a run?* on issue *#%d*", issueIID)
 	if rp := cardField(repoPath); rp != "" {
 		b.WriteString(" in `" + rp + "`")
 	}

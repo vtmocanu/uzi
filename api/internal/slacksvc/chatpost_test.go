@@ -150,7 +150,7 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 
 	feed(n, runID,
 		frame("user_message", `{"text":"echo this"}`),
-		frame("text", `{"text":"ping <@U123> see <https://evil|Open> token glpat-ABCDEF1234567890abcd"}`),
+		frame("text", `{"text":"ping <@U123> see <https://evil|Open> token glpat-ABCDEF1234567890abcd"}`), //gitleaks:allow // fake PAT fixture: asserts a credential-shaped string is scrubbed, never a real secret
 		frame("status", `{"event":"result"}`),
 	)
 
@@ -164,7 +164,7 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 	if strings.Contains(body, "<https://evil|Open>") {
 		t.Errorf("a masquerading link must be neutralized: %q", body)
 	}
-	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") {
+	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped string was scrubbed, never a real secret
 		t.Errorf("a credential-shaped string must be scrubbed: %q", body)
 	}
 }

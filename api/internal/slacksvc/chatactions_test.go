@@ -137,14 +137,14 @@ func TestProposalCardScrubsAndBounds(t *testing.T) {
 
 	longDesc := strings.Repeat("x", 5000)
 	feed(n, runID, frame("proposal",
-		`{"id":"`+propID.String()+`","title":"tok glpat-ABCDEF1234567890abcd ping <@U9>",`+
+		`{"id":"`+propID.String()+`","title":"tok glpat-ABCDEF1234567890abcd ping <@U9>",`+ //gitleaks:allow // fake PAT fixture: asserts a credential-shaped title is scrubbed, never a real secret
 			`"description":"`+longDesc+`","labels":["glpat-ZZZZZZZZZZZZZZZZZZZZ"],"repo_path":"grp/repo"}`))
 
 	if len(fp.blocks) != 1 {
 		t.Fatalf("want one card, got %+v", fp.blocks)
 	}
 	body := fp.blocks[0].sectionText
-	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") || strings.Contains(body, "glpat-ZZZZZZZZZZZZZZZZZZZZ") {
+	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") || strings.Contains(body, "glpat-ZZZZZZZZZZZZZZZZZZZZ") { //gitleaks:allow // fake PAT fixtures: asserts credential-shaped title/label are scrubbed, never a real secret
 		t.Errorf("credential-shaped title/label must be scrubbed: %q", body[:min(200, len(body))])
 	}
 	if strings.Contains(body, "<@U9>") {
