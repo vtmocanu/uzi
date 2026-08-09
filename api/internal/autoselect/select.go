@@ -154,7 +154,18 @@ type Outcome struct {
 // busy-but-empty token drop under MinHeadroom and spuriously trigger best-of-pool,
 // spending a fallback account because a token was popular rather than because it
 // was full.
-func Select(cands []Candidate, p Policy, now time.Time) Outcome {
+//
+// # exclude
+//
+// The credential to leave out of the ranking, i.e. the one a resuming run just
+// parked on for a usage limit (PRD #217 M2). A candidate whose SecretID == exclude is
+// skipped as if it were not pooled, so it can neither be picked nor set the anchor. A
+// uuid.Nil exclude is a NO-OP — the common case, and the only value every non-resume
+// claim passes — so the exclusion costs nothing when there is nothing to exclude. The
+// parameter order mirrors NextAvailable(cands, exclude, p, now). This is the ranking
+// half of M2; the fallback half (when Select picks nothing) lives in autoChoice,
+// because that branch never consults Select's pick.
+func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outcome {
 	// scored is one pooled, measurable candidate with the two numbers that decide
 	// its fate: the gate's raw headroom and the ranker's penalized key.
 	type scored struct {
@@ -172,6 +183,14 @@ func Select(cands []Candidate, p Policy, now time.Time) Outcome {
 		// pooled nothing" from "you pooled tokens that are all stale", which are
 		// different reasons a user reads differently.
 		if !c.AutoEligible {
+			continue
+		}
+		// PRD #217 M2: the just-parked credential must not be re-picked by the run
+		// resuming from that park. Skipped BEFORE `pooled` is set, so excluding the
+		// user's only pooled token yields ReasonPoolEmpty and the caller resolves the
+		// non-auto binding — never a pick of the dead credential. uuid.Nil never matches
+		// a real SecretID, so the no-exclusion case is unaffected.
+		if exclude != uuid.Nil && c.SecretID == exclude {
 			continue
 		}
 		pooled = true

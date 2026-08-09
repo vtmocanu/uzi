@@ -31,6 +31,8 @@ The run's status stays visibly "waiting" the whole time — never "stalled" — 
 
 Once the window resets, the run resumes on the same worker, in the same session, keeping its branch and its history. If you had already approved its plan before the pause, it goes straight back to work instead of asking you to approve the plan again.
 
+The pause itself also updates that credential's rate-limit meter right away, so it reads as exhausted for anyone else's claim too — see [Claude rate limits](rate-limits.md) for what that looks like. And the resuming claim goes further: it skips the credential that just paused it even when the meter alone wouldn't have ruled it out, which is what keeps an `auto` worker from immediately picking the very token that just refused it.
+
 A run can pause and resume more than once if the limit keeps recurring, backing off between attempts, up to a cap; a second cap bounds how far out any single pause may reach. Both are operator-configured — see [Configuration](configuration.md) to change them.
 
 ## If a run isn't waiting out limits

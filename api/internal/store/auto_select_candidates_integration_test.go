@@ -446,7 +446,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	for _, perm := range perms {
 		shuffled := []autoselect.Candidate{abcCands[perm[0]], abcCands[perm[1]], abcCands[perm[2]]}
-		out := autoselect.Select(shuffled, classifyPolicy, time.Now())
+		out := autoselect.Select(shuffled, uuid.Nil, classifyPolicy, time.Now())
 		if !out.Picked {
 			t.Fatalf("A/B/C order %v picked nothing (reason %q)", perm, out.Reason)
 		}
@@ -466,10 +466,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	// The column is display-only — nothing in the state machine, the claim path or
 	// any sweep reads it — so the database is the ONLY reader positioned to notice a
 	// value that is not in the vocabulary.
-	var legal []string
-	for _, r := range []string{"default", "pinned", "judge"} {
-		legal = append(legal, r)
-	}
+	legal := []string{"default", "pinned", "judge"}
 	for _, r := range autoselect.AllReasons() {
 		legal = append(legal, string(r))
 	}

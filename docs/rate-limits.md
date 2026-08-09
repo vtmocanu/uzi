@@ -60,6 +60,15 @@ within seconds rather than at the next tick. A newly added *non-default*
 token gets no such nudge: its first reading arrives on the next scheduled
 poll, so expect up to one interval of "no reading yet" after adding one.
 
+Hitting a limit updates the meter right away too, ahead of the next poll.
+When a run pauses on a usage limit (see
+[Paused on a usage limit](run-limit-wait.md)), uzi immediately records that
+window as 100% consumed for the credential that hit it, so the meter — and
+every other claim reading it — reflects reality without waiting out the
+interval. That reading carries a **Recorded at usage limit** badge and says
+so next to the timestamp, because the timestamp itself still shows the last
+poll, not this park.
+
 If your vault is locked, uzi can't open your tokens to poll them: your
 last known reading stays on screen but greys out and is marked **stale**
 (or explicitly **vault locked** on the admin page) until you unlock again.

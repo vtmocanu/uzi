@@ -57,8 +57,9 @@ func TestNextAvailableSingleTokenUserDoesNotRegress(t *testing.T) {
 //
 // The refusal lives inside the function rather than in the caller because the
 // failure it prevents is severe and silent: without the exclusion, leg 1 fires on the
-// dead credential's own stale-but-eligible reading and the run promotes instantly
-// into the window it just exhausted.
+// dead credential's own still-eligible reading (out of date but still within
+// MaxStaleness, so classified eligible rather than stale) and the run promotes
+// instantly into the window it just exhausted.
 func TestNextAvailableNilExclusionRefuses(t *testing.T) {
 	// The pool here is ONE eligible candidate that would otherwise contribute `now`.
 	if got, ok := NextAvailable([]Candidate{cand(1, 90, at(time.Hour))}, uuid.Nil, testPolicy(), now); ok {

@@ -11,6 +11,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -431,6 +432,13 @@ type Store interface {
 	// needs the unfiltered set to tell "you pooled nothing" from "you pooled tokens
 	// that are all stale".
 	ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID) ([]store.ListAutoSelectCandidatesRow, error)
+	// Park-time exhaustion writes (PRD #217 M1): mark the dead credential's named
+	// window 100% consumed with source='limit_report', touching that one *_pct column
+	// and nothing else. UPDATE-only, so a zero-row result is success (the token was
+	// never polled). See the queries' own comments for why synced_at and the reset
+	// columns are deliberately left alone (D3/D4).
+	MarkFiveHourExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error)
+	MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error)
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
@@ -1316,7 +1324,7 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 		return staticChoice(id, selectReasonJudge), nil
 	}
 	if wkr.AnthropicBindMode == BindModeAuto {
-		return s.autoChoice(ctx, wkr, run.UserID)
+		return s.autoChoice(ctx, wkr, run)
 	}
 	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
 }
@@ -1344,7 +1352,35 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 // than as a literal nil so the rule stated in workerSecretID stays the single source
 // of what "this worker's non-auto binding" means — the current answer happens to be
 // nil for every auto worker, and the rule is what survives the next mode.
-func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, userID uuid.UUID) (secretChoice, error) {
+//
+// # The dead-credential exclusion (PRD #217 M2), on BOTH exits
+//
+// When this run is resuming from a usage-limit park, runs.limit_dead_secret_id names
+// the credential it just parked on and this claim must not re-pick it. `exclude`
+// carries that id (uuid.Nil when there is nothing to exclude — every non-resume
+// claim).
+//
+//   - Ranking exit: `exclude` is passed to Select, which drops the dead credential
+//     from the ranking so it can be neither picked nor the anchor.
+//   - Fallback exit (!out.Picked): Select never named a pick, so the exclusion has to
+//     be applied to what the fallback would RESOLVE. This branch is CONDITIONAL, and
+//     the reason is D7/SC4: auto never fails a run. workerSecretID(wkr) is nil for an
+//     auto worker ⇒ the owner default, which for a single-token user IS the dead
+//     credential — so an unconditional "refuse the excluded credential" would leave a
+//     single-token run with nothing to spend. The rule is therefore: exclude the dead
+//     credential ONLY when a DIFFERENT credential can actually be resolved; otherwise
+//     spend the dead one, because a run that cannot be placed must still run. Resolving
+//     what the fallback would spend costs a fetch (GetDefaultUserSecretMeta) when the
+//     binding is nil, because secretChoice{secretID: nil} does not NAME a credential —
+//     it is the same query openAnthropic resolves the nil case with, so the two agree
+//     on which id "the owner default" means.
+func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
+	userID := run.UserID
+	exclude := uuid.Nil
+	if run.LimitDeadSecretID.Valid {
+		exclude = uuid.UUID(run.LimitDeadSecretID.Bytes)
+	}
+
 	rows, err := s.q.ListAutoSelectCandidates(ctx, userID)
 	if err != nil {
 		return secretChoice{}, fmt.Errorf("auto-select candidates: %w", err)
@@ -1353,12 +1389,50 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, userID uuid.
 	for _, row := range rows {
 		cands = append(cands, autoselectrow.FromCandidateRow(row))
 	}
-	out := autoselect.Select(cands, s.p.Autoselect, s.now())
+	out := autoselect.Select(cands, exclude, s.p.Autoselect, s.now())
 	if !out.Picked {
 		// D7: auto never fails a run. An empty or unmeasurable pool resolves the
 		// worker's non-auto behaviour and records WHY, so "auto was on and I still got
 		// the default" is a fact the run view states rather than one a user infers.
-		return secretChoice{secretID: workerSecretID(wkr), reason: string(out.Reason)}, nil
+		base := workerSecretID(wkr)
+		if exclude == uuid.Nil {
+			return secretChoice{secretID: base, reason: string(out.Reason)}, nil
+		}
+		// Resolve what `base` would actually spend so it can be compared against the
+		// exclusion. A nil binding is the owner default, resolved with the SAME query
+		// openAnthropic uses for the nil case.
+		resolved := base
+		if resolved == nil {
+			meta, err := s.q.GetDefaultUserSecretMeta(ctx, store.GetDefaultUserSecretMetaParams{
+				UserID: userID,
+				Kind:   store.KindAnthropicToken,
+			})
+			if err != nil {
+				// No default at all (ErrNoRows) means there is nothing to compare the
+				// exclusion against: fall through to spending `base`, which the token-less
+				// user's claim already fails downstream with its existing reason. Do NOT
+				// fail the claim here (D7).
+				if errors.Is(err, pgx.ErrNoRows) {
+					return secretChoice{secretID: base, reason: string(out.Reason)}, nil
+				}
+				return secretChoice{}, fmt.Errorf("resolve owner default for dead-credential exclusion: %w", err)
+			}
+			id := meta.ID
+			resolved = &id
+		}
+		if *resolved == exclude {
+			// The fallback would spend the very credential this run just parked on. Pick a
+			// deterministic alternative — the auto-eligible candidate with the lowest
+			// secret-id bytes that is not the excluded one — so the choice is stable across
+			// claims and testable. Restricted to AutoEligible: never spend a token the user
+			// kept out of auto.
+			if alt, ok := lowestAltCandidate(cands, exclude); ok {
+				return secretChoice{secretID: &alt, reason: string(out.Reason)}, nil
+			}
+		}
+		// `resolved` differs from the exclusion, or no alternative exists: spend the
+		// default (SC4 — auto never fails a run).
+		return secretChoice{secretID: base, reason: string(out.Reason)}, nil
 	}
 	id := out.SecretID
 	// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
@@ -1366,6 +1440,26 @@ func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, userID uuid.
 	// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
 	h := int16(out.Headroom)
 	return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
+}
+
+// lowestAltCandidate returns the auto-eligible candidate with the lowest secret-id
+// bytes that is NOT the excluded credential (PRD #217 M2's conditional fallback). The
+// lowest-bytes rule is a total order over ids that are unique per row, so the pick is
+// deterministic across claims — which is what makes it assertable in a test — and
+// mirrors tieLess's final leg in autoselect. AutoEligible-only: the fallback must
+// never spend a token the user excluded from the auto pool.
+func lowestAltCandidate(cands []autoselect.Candidate, exclude uuid.UUID) (uuid.UUID, bool) {
+	var best uuid.UUID
+	found := false
+	for _, c := range cands {
+		if !c.AutoEligible || c.SecretID == exclude {
+			continue
+		}
+		if !found || bytes.Compare(c.SecretID[:], best[:]) < 0 {
+			best, found = c.SecretID, true
+		}
+	}
+	return best, found
 }
 
 // workerSecretID is a worker's Anthropic binding as openAnthropic's override: nil

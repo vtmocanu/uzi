@@ -136,6 +136,12 @@ slightly against it, so several claims arriving inside one polling interval
 do not all pile onto the same credential. It is a nudge, not a cap — an empty
 token still wins with a couple of runs on it.
 
+A credential that just paused a run on a usage limit is excluded from that
+run's next claim, so an `auto` worker doesn't immediately pick the token that
+just refused it back up. Its meter also reads 100% for the window it hit as
+soon as the pause happens, so every other run's claim ranks it as exhausted
+too — see [Paused on a usage limit](run-limit-wait.md).
+
 ### 🔴 "Auto" does not mean "only my pool"
 
 **Auto-selection never fails a run.** If it cannot pick — nothing is pooled,

@@ -1285,9 +1285,22 @@ export interface RateLimitWindow {
   resets_at: number | null;
 }
 
-// Which source produced the reading: the free usage endpoint, or the ~1-token
-// header probe fallback (Decision 2).
-export type RateLimitSource = "usage_endpoint" | "header_probe";
+// Which source produced the reading:
+//  - "usage_endpoint": the free usage endpoint (Decision 2).
+//  - "header_probe": the ~1-token header probe fallback (Decision 2).
+//  - "limit_report": a reading recorded at usage-limit park time from the
+//    worker's limit report (PRD #217 M1). It is a 100%-consumed INFERENCE for the
+//    window that just refused the run, NOT a live measurement — the park writes
+//    the pct and nothing else. Because the park deliberately does not bump
+//    `synced_at` (D3), this reading is NEWER than the `synced_at` shown beside it,
+//    so a surface rendering "updated Xm ago" against a 100% bar must disclose that
+//    the 100% was recorded at the park, after that timestamp.
+// RATE_LIMIT_SOURCES is the vocabulary AT RUNTIME. RateLimitSource is derived from
+// it (`(typeof RATE_LIMIT_SOURCES)[number]`) so the array IS the union — there is no
+// hand-maintained second list to fall behind. This is what lets rateLimitSource.test.ts
+// pin the union against migration 00109's CHECK, since a bare TS union erases at runtime.
+export const RATE_LIMIT_SOURCES = ["usage_endpoint", "header_probe", "limit_report"] as const;
+export type RateLimitSource = (typeof RATE_LIMIT_SOURCES)[number];
 
 // MyRateLimits is the per-user reading, discriminated on status:
 //  - "ok": a real reading (possibly stale — vault-locked users age silently, D3).
@@ -1320,8 +1333,9 @@ export type MyRateLimits =
  *  when the two disagreed. */
 /** SelectReason is WHY a run spent the credential it spent (PRD #111 M5, D20) — the
  *  MODE that named it. A CLOSED set of eight, mirroring autoselect.Reason in Go and
- *  migration 00089's CHECK in SQL; selectReasonMatchesMigration in
- *  runCredential.test.ts parses that migration and pins the three in step.
+ *  migration 00089's CHECK in SQL; the "reason vocabulary is one vocabulary" suite in
+ *  runCredential.test.ts (its `reasonsFromMigration()` helper) parses that migration
+ *  and pins the three in step.
  *
  *  Typed as `SelectReason | string` on the wire rather than as the union alone: the
  *  API is deployed separately from this bundle, so a newer server can ship a ninth

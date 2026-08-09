@@ -18,10 +18,12 @@ DELETE FROM anthropic_rate_limits WHERE user_id = $1
 
 // Drop every gauge row a user holds. Since #104 M5 the composite FK CASCADES a
 // token's gauge row when the token itself is deleted, so this is no longer the
-// mechanism that prevents a ghost reading — the database is. It stays as the
-// belt-and-suspenders sweep the token-delete path still runs (PRD #53 D3b), and as
-// the thing that would still clear rows if a future schema change ever loosened
-// that cascade. Idempotent: 0 rows when there is nothing to drop.
+// mechanism that prevents a ghost reading — the database is. It has NO production
+// caller today: the token-delete path (handler/secrets.go) deliberately relies on
+// the cascade and does not call this (PRD #53 D3b keeps the query available as the
+// belt-and-suspenders sweep, and as the thing that would still clear rows if a
+// future schema change ever loosened that cascade). Idempotent: 0 rows when there
+// is nothing to drop.
 func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteRateLimits, userID)
 	if err != nil {
@@ -378,6 +380,67 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const markFiveHourExhausted = `-- name: MarkFiveHourExhausted :execrows
+UPDATE anthropic_rate_limits
+SET five_hour_pct = 100, source = 'limit_report'
+WHERE user_secret_id = $1
+`
+
+// The park-time exhaustion write for a five-hour limit (PRD #217 M1). When a run
+// parks on a `five_hour` usage limit, its own credential's five-hour window is
+// recorded 100% consumed so every subsequent claim — for every run — sees it through
+// the one classifier (autoselect.Classify) with no new concept (D1).
+//
+// 🔴 IT WRITES two columns AND NOTHING ELSE, and each omission is load-bearing:
+//   - NOT synced_at (D3): Classify reads a SINGLE synced_at for the whole row, so
+//     bumping it would re-freshen the OTHER window's stale reading and can promote a
+//     dead token from "skipped as stale" to "ranked as below-threshold" — CREATING
+//     the re-pick this write exists to prevent. Verified by execution, not reading.
+//   - NOT the reset columns (D4): keeps deadCredentialReset's cross-check reading a
+//     poller-MEASURED timestamp, and keeps an untrusted far-future worker report from
+//     failing a sibling run outright. A pct write moves Status without moving
+//     Measured, which is exactly what that cross-check needs.
+//
+// source = 'limit_report' marks the row as a park-time inference so an operator can
+// tell it from a poll (D6).
+//
+// UPDATE-only, never an INSERT (D7): a missing gauge row already means "never
+// picked" (StatusNoReading, which Select skips), so a ZERO-ROW result is SUCCESS, not
+// an error — there is simply nothing to mark down.
+//
+// Note ListAutoSelectCandidates does NOT project `source` (see its SELECT above), so
+// the new value never reaches the selector; do not "fix" that by adding it. And
+// setLimitWait fetches its candidates BEFORE decideLimitPark runs, so this write
+// cannot perturb the parking run's own decision wherever it is placed.
+func (q *Queries) MarkFiveHourExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markFiveHourExhausted, userSecretID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markSevenDayExhausted = `-- name: MarkSevenDayExhausted :execrows
+UPDATE anthropic_rate_limits
+SET seven_day_pct = 100, source = 'limit_report'
+WHERE user_secret_id = $1
+`
+
+// The seven-day counterpart of MarkFiveHourExhausted (PRD #217 M1); it carries the
+// same window mapping as deadCredentialReset (all four seven-day spellings land
+// here). Read that query's comment for the full rationale: two plain single-column
+// UPDATEs rather than one CASE so sqlc's inference is trivial (R4); writes the pct and
+// source only and deliberately NOT synced_at (D3) nor the reset columns (D4);
+// UPDATE-only with a zero-row result treated as success (D7); and the new source
+// value never reaches the selector because ListAutoSelectCandidates omits it.
+func (q *Queries) MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markSevenDayExhausted, userSecretID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertRateLimits = `-- name: UpsertRateLimits :exec
