@@ -837,44 +837,62 @@ export class RunRunner {
           const timeGateOpen =
             this.checkpointIntervalMs > 0 &&
             this.now() - lastPublish >= this.checkpointIntervalMs;
+          let published = false;
           if (hasNewWork && (opts.reap || timeGateOpen)) {
-            await this.publishCheckpointBestEffort(
+            published = await this.publishCheckpointBestEffort(
               barePath,
               runnerClone.branch,
               runId,
               runLog,
             );
+            // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
+            // retry cadence to <= 1 publish/interval/run even under a persistent broker
+            // failure, so a failing publish cannot spam every iteration.
             lastPublish = this.now();
-            lastPublishedTip = cloneTip ?? lastPublishedTip;
-            // PRD #267 M3: make the time-based publish observable — the "committed work is now
-            // safe on origin" moment for a reap:false checkpoint (the milestone/reap:true publish
-            // is already visible via its running report below). Only for the time path so we do
-            // not double-log the milestone case.
-            if (!opts.reap) {
-              runLog.info("checkpoint published to origin (time-based)", {
-                run_id: runId,
-                branch: runnerClone.branch,
-                tip: cloneTip,
-              });
+            // PRD #267 Fix 1 (Decision 9 / the "worst-case loss ~one interval" criterion):
+            // advance lastPublishedTip ONLY on a CONFIRMED landed publish. On failure the tip
+            // stays un-advanced, so hasNewWork stays true and the time-gate retries the SAME
+            // tip at the next interval boundary — the idle commit still ships (bounded loss),
+            // rather than being marked published-and-forgotten by a transient broker failure.
+            if (published) {
+              lastPublishedTip = cloneTip ?? lastPublishedTip;
+              // PRD #267 M3: make the time-based publish observable — the "committed work is
+              // now safe on origin" moment for a reap:false checkpoint (the milestone/reap:true
+              // publish is already visible via its running report below). Only for the time
+              // path so we do not double-log the milestone case.
+              if (!opts.reap) {
+                runLog.info("checkpoint published to origin (time-based)", {
+                  run_id: runId,
+                  branch: runnerClone.branch,
+                  tip: cloneTip,
+                });
+              }
             }
           }
           // Report the checkpointed milestone as a `running` report — additive-optional
           // (milestone fields omitted when no progress) and wrapped so it never throws. NO
           // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
           // out keeps it from regressing the server's GREATEST-merged iteration counter.
-          await reportState({
-            status: "running",
-            ...(opts.progress
-              ? {
-                  milestones_completed: opts.progress.completed,
-                  milestones_in_progress: opts.progress.in_progress,
-                }
-              : {}),
-          }).catch((e) =>
-            runLog.warn("could not report checkpoint progress", {
-              error: errMessage(e),
-            }),
-          );
+          //
+          // PRD #267 Fix 2: emit ONLY when there was real activity — a fetch (tip moved since
+          // the last checkpoint) OR a publish. On a pure-idle checkpoint (tip unmoved AND
+          // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
+          // still signalling a time-based publish of an idle tip ("work is now safe on origin").
+          if (!tipUnmovedSinceFetch || published) {
+            await reportState({
+              status: "running",
+              ...(opts.progress
+                ? {
+                    milestones_completed: opts.progress.completed,
+                    milestones_in_progress: opts.progress.in_progress,
+                  }
+                : {}),
+            }).catch((e) =>
+              runLog.warn("could not report checkpoint progress", {
+                error: errMessage(e),
+              }),
+            );
+          }
         },
       };
 
@@ -1333,23 +1351,31 @@ export class RunRunner {
    * fetchBackBestEffort for symmetry: compute the delta pack of
    * `<origin|default>..refs/uzi-runner/<branch>` (null ⇒ nothing to publish) and ship it
    * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
-   * worker to recover cross-worker. Fired ONLY on a cooperative (reap:true) checkpoint and
-   * AFTER the fetch-back updated the tracking ref checkpointPack reads. Every failure — a
-   * null pack, a non-2xx (returned as null by the client), a thrown error — is swallowed
-   * with a warn so a publish NEVER fails the run.
+   * worker to recover cross-worker. Fired on BOTH the milestone (reap:true) checkpoint and
+   * the PRD #267 time-gated (reap:false) checkpoint, always AFTER the fetch-back updated the
+   * tracking ref checkpointPack reads. Every failure — a null pack, a non-2xx (returned as
+   * null by the client), a thrown error — is swallowed with a warn so a publish NEVER fails
+   * the run.
+   *
+   * Returns `true` IFF the publish confirmably LANDED (a non-null publish response), so the
+   * caller can advance `lastPublishedTip` only on confirmed success (PRD #267 Fix 1): a
+   * swallowed failure returns `false`, leaving the tip un-advanced so `hasNewWork` stays
+   * true and the time-gate retries at the next interval boundary.
    */
   private async publishCheckpointBestEffort(
     barePath: string,
     branch: string,
     runId: string,
     runLog: Logger,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const packed = await this.git.checkpointPack(barePath, branch);
-      if (!packed) return;
-      await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
+      if (!packed) return false;
+      const res = await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
+      return res !== null; // client returns null on any non-2xx / empty body
     } catch (e) {
       runLog.warn("checkpoint publish failed", { error: errMessage(e) });
+      return false;
     }
   }
 

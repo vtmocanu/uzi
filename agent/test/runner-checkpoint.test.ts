@@ -52,15 +52,25 @@ function spyFetch(events: string[]): () => void {
 
 /** Spy on client.publishCheckpoint (PRD #122 M8), recording a "publish" event. Drains the
  *  real pack stream so pack-objects can exit, and optionally throws to prove a publish
- *  failure never fails the run. Returns a restore fn (call it in a finally). */
-function spyPublish(events: string[], opts: { throws?: boolean } = {}): () => void {
+ *  failure never fails the run. `nullFirst` returns null (the client's non-2xx / empty-body
+ *  contract, an UNCONFIRMED publish) for the first N calls before succeeding, so a test can
+ *  drive a fail-once-then-succeed broker without throwing (PRD #267 Fix 1). Returns a
+ *  restore fn (call it in a finally). */
+function spyPublish(
+  events: string[],
+  opts: { throws?: boolean; nullFirst?: number } = {},
+): () => void {
   const orig = client.publishCheckpoint.bind(client);
+  let calls = 0;
   (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
     ...args: unknown[]
   ) => {
     events.push("publish");
     (args[2] as Readable | undefined)?.resume(); // drain the pack so the git child can exit
     if (opts.throws) throw new Error("boom publish");
+    calls += 1;
+    // null models a non-2xx / empty body: the publish did NOT confirmably land.
+    if (opts.nullFirst && calls <= opts.nullFirst) return null;
     return { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" };
   };
   return () => {
@@ -450,10 +460,14 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     const exec: Executor = {
       run: async (ctx) => {
         commitInClone(ctx.worktreePath, "A.txt");
-        // Milestone publishes regardless of the gate and sets lastPublish = now() = 0.
+        // Advance the clock to a NONZERO time BEFORE the milestone so the gate reset moves
+        // lastPublish to a distinct value (5000). If the milestone did NOT reset the gate,
+        // the reap:false at 5500 below would see 5500 - 0 >= 1000 (gate open) and publish B —
+        // so the publishes==1 assertion genuinely exercises the reset, not "never moved".
+        fakeNow = 5000;
         await ctx.checkpoint!({ reap: true, progress });
         commitInClone(ctx.worktreePath, "B.txt");
-        fakeNow = 500; // < 1000 after the milestone at t=0
+        fakeNow = 5500; // < 1000 after the milestone reset at t=5000
         await ctx.checkpoint!({ reap: false, progress });
         afterCheckpoint = [...events];
         return { branch: ctx.branch };
@@ -571,5 +585,92 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
       !infos.some((m) => m.includes(TIME_BASED_MSG)),
       "the milestone publish is visible via its running report, not the time-based line",
     );
+  });
+
+  it("a FAILED time-based publish does NOT strand the tip — the idle commit ships on retry (PRD #267 Fix 1)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(79);
+    const events: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    // The FIRST publish returns null (the client's non-2xx contract — an UNCONFIRMED
+    // publish); every later publish succeeds. A failed publish must NOT advance
+    // lastPublishedTip, so the SAME tip stays publish-eligible next interval.
+    const restorePublish = spyPublish(events, { nullFirst: 1 });
+    const publishesAtEachStage: number[] = [];
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // t=1001: gate open, tip moved → publishes, but the broker fails (null). lastPublish
+        // advances to 1001 (bounds retry cadence) yet lastPublishedTip does NOT.
+        fakeNow = 1001;
+        await ctx.checkpoint!({ reap: false, progress });
+        publishesAtEachStage.push(events.filter((e) => e === "publish").length);
+        // NO new commit. One full interval later the same idle tip must be retried and this
+        // time land — the "worst-case loss ~one interval" guarantee (Decision 9).
+        fakeNow = 2002;
+        await ctx.checkpoint!({ reap: false, progress });
+        publishesAtEachStage.push(events.filter((e) => e === "publish").length);
+        // A THIRD interval later, with the tip now CONFIRMED published, there is nothing new
+        // to ship — proving the second publish actually advanced lastPublishedTip.
+        fakeNow = 3003;
+        await ctx.checkpoint!({ reap: false, progress });
+        publishesAtEachStage.push(events.filter((e) => e === "publish").length);
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    // 1 (failed) → 2 (retry lands) → 2 (nothing new): the failed publish did not strand the
+    // tip, and the successful retry then stopped it re-publishing.
+    assert.deepStrictEqual(
+      publishesAtEachStage,
+      [1, 2, 2],
+      "a failed publish leaves the tip publish-eligible; the retry lands then stops re-publishing",
+    );
+  });
+
+  it("no running report on a pure-idle checkpoint — tip unmoved AND nothing published (PRD #267 Fix 2)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(80);
+    const events: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    let idleReportDelta = -1;
+    let idleEvents: string[] = [];
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        // First checkpoint at a CLOSED gate (t=0): the tip moved, so it fetches and emits a
+        // running report — but does not publish.
+        await ctx.checkpoint!({ reap: false, progress });
+        const beforeStates = api.states.filter((s) => s.runId === claim.run_id).length;
+        const beforeEvents = events.length;
+        // Second checkpoint: NO new commit and the gate still closed → pure idle. It must do
+        // nothing: no fetch, no publish, and — restoring the pre-M1 early-return — no report.
+        await ctx.checkpoint!({ reap: false, progress });
+        idleReportDelta =
+          api.states.filter((s) => s.runId === claim.run_id).length - beforeStates;
+        idleEvents = events.slice(beforeEvents);
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab, undefined, { checkpointIntervalMs: 1000, now }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.deepStrictEqual(idleEvents, [], "a pure-idle checkpoint neither fetches nor publishes");
+    assert.equal(idleReportDelta, 0, "a pure-idle checkpoint emits no running report");
   });
 });
