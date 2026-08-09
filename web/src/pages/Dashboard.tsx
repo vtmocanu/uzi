@@ -330,6 +330,7 @@ export function Dashboard() {
               const mrState = mrChipState(r.mr_state);
               // PRD #122: compact milestone progress; null for a non-milestone run.
               const ms = milestoneBadge(r);
+              const msBadge = ms ? milestoneBadgeText(ms) : null;
               return (
               <li key={r.id}>
                 <Link
@@ -362,9 +363,9 @@ export function Dashboard() {
                   {/* PRD #122: compact milestone progress next to the iter badge; a
                       non-milestone run keeps only the iter badge. PRD #265 M2: an
                       unreported tracker shows M–/N, not a 0/N that reads as failure. */}
-                  {ms && (
-                    <Badge tone="info" title={milestoneBadgeText(ms).title}>
-                      {milestoneBadgeText(ms).label}
+                  {msBadge && (
+                    <Badge tone="info" title={msBadge.title}>
+                      {msBadge.label}
                     </Badge>
                   )}
                   <RunHealthBadge run={r} />

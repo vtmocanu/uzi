@@ -655,8 +655,8 @@ chain in the diagram above, with no intervening `running`.
   that shipped its work. Completion is **declared, not inferred** — a milestone
   the lead leaves undeclared stays not-complete, so a deliberately-skipped
   milestone is not back-filled. `milestones_in_progress` (a snapshot, not a
-  union) is cleared on every terminal transition, since "in progress" is
-  meaningless on a done/failed/cancelled run. The web renders a **null** tracker
+  union) is cleared on every terminal transition a milestone-bearing run can
+  reach, since "in progress" is meaningless on a done/failed/cancelled run. The web renders a **null** tracker
   as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
   that simply never reported does not read as a failure.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers

@@ -59,6 +59,7 @@ function RunRow({
   // PRD #122: compact milestone progress for the row; null on a non-milestone run,
   // which then renders no new badge (the row had none before this feature).
   const ms = milestoneBadge(run);
+  const msBadge = ms ? milestoneBadgeText(ms) : null;
   return (
     <li>
       <Link
@@ -118,9 +119,9 @@ function RunRow({
             <>
               {/* PRD #122: compact milestone progress; a non-milestone run adds nothing.
                   PRD #265 M2: "not reported" (M–/N) reads distinct from a genuine 0/N. */}
-              {ms && (
-                <Badge tone="info" title={milestoneBadgeText(ms).title}>
-                  {milestoneBadgeText(ms).label}
+              {msBadge && (
+                <Badge tone="info" title={msBadge.title}>
+                  {msBadge.label}
                 </Badge>
               )}
               {/* The health flag (PRD #47) sits beside the status pill; hidden here

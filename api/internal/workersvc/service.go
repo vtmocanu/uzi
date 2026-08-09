@@ -2355,11 +2355,15 @@ type StateRequest struct {
 	// MilestonesCompleted and MilestonesInProgress are the run's live PROGRESS report
 	// (PRD #122 M2), each a POINTER to a slice of frozen milestone IDS for the same
 	// tri-state as RepoAgents/Milestones: absent (nil) = this call reports nothing about
-	// that set; `[]` = an explicitly empty set; non-empty = the ids. They ride `running`
-	// reports only. completed is UNIONED server-side (monotone, dedup); in_progress is
-	// OVERWRITTEN wholesale (Decision 3). Every id is membership-checked against the run's
-	// FROZEN list and kind-gated here (progressParams, Decision 12/13); a rejected set is
-	// DROPPED, never persisted, and never fails the report.
+	// that set; `[]` = an explicitly empty set; non-empty = the ids. MilestonesInProgress
+	// rides `running` reports only. MilestonesCompleted rides `running` reports AND — since
+	// PRD #265 M1 — the terminal `completed` report, where the lead's signal_done
+	// declaration of what it finished is unioned in (the completion path reconciles a run
+	// that never emitted a mid-run report). completed is UNIONED server-side (monotone,
+	// dedup); in_progress is OVERWRITTEN wholesale (Decision 3) and cleared on every
+	// terminal transition. Every id is membership-checked against the run's FROZEN list and
+	// kind-gated here (progressParams, Decision 12/13); a rejected set is DROPPED, never
+	// persisted, and never fails the report.
 	MilestonesCompleted  *[]string `json:"milestones_completed"`
 	MilestonesInProgress *[]string `json:"milestones_in_progress"`
 	// AgentSelection is the default an AUTOPILOT run resolved for itself (Decision 6).

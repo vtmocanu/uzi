@@ -3844,10 +3844,13 @@ UPDATE runs SET
                        FROM jsonb_array_elements_text(COALESCE(milestones_completed, '[]'::jsonb) || $7::jsonb) AS e), '[]'::jsonb)
     END,
     -- PRD #265 D4: "in progress" is meaningless on a terminal run, so the snapshot is
-    -- cleared on EVERY terminal transition (an explicit clear — progressParams' nil-input
-    -- convention leaves columns untouched, so it will not happen for free). Same clear
-    -- appears on SetRunFailed / MarkRunFailedByID / CancelRunServerSide / FailRunAutoStop
-    -- / RejectRunServerSide / SweepRunningTimeout and the stale-worker failers below.
+    -- cleared on every terminal transition a milestone-bearing (issue) run can reach (an
+    -- explicit clear — progressParams' nil-input convention leaves columns untouched, so it
+    -- will not happen for free). Same clear appears on SetRunFailed / MarkRunFailedByID /
+    -- CancelRunServerSide / FailRunAutoStop / RejectRunServerSide / SweepRunningTimeout and
+    -- the stale-worker failers below. (SweepIdleChatRuns also completes runs but is kind=
+    -- 'chat'-only, and progressParams gates milestone writes to issue runs, so its snapshot
+    -- is always NULL — the clear there would be a no-op and is deliberately omitted.)
     milestones_in_progress = NULL,
     -- Arm the M5 patch marker. Explicit rather than left to the column default,
     -- because SetRunCompleted can in principle run on a row that already carries a
