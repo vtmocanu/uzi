@@ -846,6 +846,17 @@ export class RunRunner {
             );
             lastPublish = this.now();
             lastPublishedTip = cloneTip ?? lastPublishedTip;
+            // PRD #267 M3: make the time-based publish observable — the "committed work is now
+            // safe on origin" moment for a reap:false checkpoint (the milestone/reap:true publish
+            // is already visible via its running report below). Only for the time path so we do
+            // not double-log the milestone case.
+            if (!opts.reap) {
+              runLog.info("checkpoint published to origin (time-based)", {
+                run_id: runId,
+                branch: runnerClone.branch,
+                tip: cloneTip,
+              });
+            }
           }
           // Report the checkpointed milestone as a `running` report — additive-optional
           // (milestone fields omitted when no progress) and wrapped so it never throws. NO

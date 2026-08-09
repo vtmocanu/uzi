@@ -108,6 +108,8 @@ Give locations, not conclusions. Naming a file is context; telling a validator
 what it will find there decides the finding before it looks.
 
 Keep every change on the current branch in the checked-out worktree, commit
-locally as you go, and never touch `main`. When the implementation is complete
-and reviewed, signal that the run is done and let the worker open the merge
-request.
+locally as you go, and never touch `main`. Committed work is periodically
+checkpointed to durable storage; uncommitted work is not — so commit at each
+self-contained step rather than saving up a large diff, to keep the window of
+loss-exposed work small. When the implementation is complete and reviewed,
+signal that the run is done and let the worker open the merge request.

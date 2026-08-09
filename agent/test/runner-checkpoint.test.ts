@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
+import type { Logger } from "../src/log.js";
 import {
   api,
   client,
@@ -13,6 +14,7 @@ import {
   gitlabClaim,
   installHarness,
   runner,
+  runnerWith,
 } from "./runner-harness.js";
 
 installHarness();
@@ -65,6 +67,26 @@ function spyPublish(events: string[], opts: { throws?: boolean } = {}): () => vo
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig;
   };
 }
+
+/** A Logger that records every `info` message string (across children, which share the
+ *  same list). Used to prove the PRD #267 M3 time-based-publish signal is emitted. */
+function capturingLogger(): { logger: Logger; infos: string[] } {
+  const infos: string[] = [];
+  const self: Logger = {
+    debug() {},
+    info: (msg) => {
+      infos.push(msg);
+    },
+    warn() {},
+    error() {},
+    addSecret() {},
+    removeSecret() {},
+    child: () => self,
+  };
+  return { logger: self, infos };
+}
+
+const TIME_BASED_MSG = "checkpoint published to origin (time-based)";
 
 describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
   it("reap:true reaps the agent tree BEFORE the fetch-back (reap-before-git, B1 order)", async () => {
@@ -482,5 +504,72 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     }
     const publishes = afterCheckpoint.filter((e) => e === "publish").length;
     assert.equal(publishes, 1, "at most one origin publish per interval per run");
+  });
+
+  it("logs the time-based-publish signal when a reap:false checkpoint publishes past the interval (PRD #267 M3)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(77);
+    const events: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const { logger, infos } = capturingLogger();
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const executor: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        fakeNow = 1001; // cross the 1000ms interval since run start
+        await ctx.checkpoint!({ reap: false, progress });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runnerWith(() => ({ executor }), gitlab, undefined, logger, {
+        checkpointIntervalMs: 1000,
+        now,
+      }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.ok(events.includes("publish"), "the time-based checkpoint published");
+    assert.ok(
+      infos.some((m) => m.includes(TIME_BASED_MSG)),
+      "a reap:false publish past the interval logs the time-based signal",
+    );
+  });
+
+  it("a milestone (reap:true) publish does NOT log the time-based signal (PRD #267 M3)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(78);
+    const events: string[] = [];
+    let fakeNow = 0;
+    const now = () => fakeNow;
+    const { logger, infos } = capturingLogger();
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const executor: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: true, progress });
+        return { branch: ctx.branch };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runnerWith(() => ({ executor }), gitlab, undefined, logger, {
+        checkpointIntervalMs: 1000,
+        now,
+      }).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.ok(events.includes("publish"), "the milestone checkpoint published");
+    assert.ok(
+      !infos.some((m) => m.includes(TIME_BASED_MSG)),
+      "the milestone publish is visible via its running report, not the time-based line",
+    );
   });
 });
