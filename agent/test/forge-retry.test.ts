@@ -6,6 +6,19 @@ import {
   FORGE_RETRY_SCHEDULE,
 } from "../src/forge-retry.js";
 import { ForgeError } from "../src/forge.js";
+import { DEFAULT_TERMINAL_RETRY_SCHEDULE } from "../src/client.js";
+
+// PRD #284 M1: the worker→forge retry schedule is a deliberate SECOND
+// implementation of the same bounded-backoff decision the worker→API terminal
+// callback uses (client.ts DEFAULT_TERMINAL_RETRY_SCHEDULE). The two are separate
+// constants by design (different hop, worker-side vs shared), so this differential
+// assertion is the "shared table" that keeps them pinned: if one is edited without
+// the other, this red flags the drift the forge-retry.ts docblock promises.
+describe("FORGE_RETRY_SCHEDULE ↔ DEFAULT_TERMINAL_RETRY_SCHEDULE (drift guard)", () => {
+  it("stays pinned to the terminal-retry schedule", () => {
+    assert.deepStrictEqual(FORGE_RETRY_SCHEDULE, DEFAULT_TERMINAL_RETRY_SCHEDULE);
+  });
+});
 
 // Discriminating classifier table (PRD #284 M6). Each case is asserted, and the
 // whole table is asserted exhaustively exercised so a silently dropped row is
