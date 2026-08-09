@@ -970,9 +970,14 @@ func nonEmpty(in []string) []string {
 // has no meaningful one-line raw form and is a usage error. An unknown field is likewise
 // a usage error (exit 2), never a silent blank.
 //
-// Written raw to Stdout, NOT through the Printer: like `--json`, this is a machine
+// Written to Stdout, NOT through the Printer, because on a PIPE this is a machine
 // channel whose contract is byte-fidelity — a poller reads `.status`/`.mr_web_url`
-// verbatim — so sanitizing it would corrupt the value it exists to hand back faithfully.
+// verbatim, so a non-TTY destination gets the raw decoded bytes. On a TTY, though, a
+// field can be forge-authored free text (`issue_title`, `title`, `issue_description`)
+// carrying raw control/ANSI bytes, and unlike `--json` there is no encoder here to
+// escape them — so the value is run through SanitizeTTY when stdout is a terminal.
+// That closes the same terminal-injection vector the rest of the CLI's human output
+// guards (Risk 13) while leaving the agent/pipe contract exactly raw.
 func printRunFields(env Env, run apitypes.RunDTO, fields []string) error {
 	b, err := json.Marshal(run)
 	if err != nil {
@@ -997,6 +1002,9 @@ func printRunFields(env Env, run apitypes.RunDTO, fields []string) error {
 		lines = append(lines, v)
 	}
 	for _, l := range lines {
+		if env.StdoutTTY {
+			l = uzicli.SanitizeTTY(l)
+		}
 		_, _ = fmt.Fprintln(env.Stdout, l)
 	}
 	return nil

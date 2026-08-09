@@ -16,11 +16,13 @@ func fieldFake() *uzicli.FakeClient {
 	return &uzicli.FakeClient{
 		RunByID: map[string]apitypes.RunDTO{
 			"r1": {
-				ID:         "r1",
-				Status:     "completed",
-				MrWebURL:   sptr("https://example.com/mr/7"),
-				MrState:    nil, // a null field
-				Milestones: []apitypes.Milestone{{ID: "m1", Title: "one"}},
+				ID:           "r1",
+				Status:       "completed",
+				MrWebURL:     sptr("https://example.com/mr/7"),
+				MrState:      nil, // a null field
+				WaitOnLimit:  true,
+				RequeueCount: 3,
+				Milestones:   []apitypes.Milestone{{ID: "m1", Title: "one"}},
 			},
 		},
 	}
@@ -52,6 +54,19 @@ func TestRunGetFieldRepeatablePreservesOrder(t *testing.T) {
 	}
 }
 
+// Non-string scalars (bool, number) print their raw JSON literal, unquoted — pinning
+// scalarField's number/bool passthrough, which a string-only fixture would leave dead.
+func TestRunGetFieldBoolAndNumberRaw(t *testing.T) {
+	stdout, _, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r1",
+		"--field", "wait_on_limit", "--field", "requeue_count")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if stdout != "true\n3\n" {
+		t.Errorf("stdout = %q, want raw literals \"true\\n3\\n\"", stdout)
+	}
+}
+
 func TestRunGetFieldNullIsEmptyLine(t *testing.T) {
 	stdout, _, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r1", "--field", "mr_state")
 	if code != uzicli.ExitOK {
@@ -77,6 +92,37 @@ func TestRunGetFieldNonScalarIsUsageError(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "not a scalar") {
 		t.Errorf("stderr should explain the non-scalar rejection, got %q", stderr)
+	}
+}
+
+// A forge-authored scalar (issue_title) carrying a raw ANSI/control sequence must be
+// byte-exact on a PIPE (the agent poller contract) but stripped on a TTY, where an
+// unescaped ESC would drive the terminal — the asymmetry `--json` avoids via its
+// encoder. This pins printRunFields's TTY guard.
+func TestRunGetFieldRawOnPipeSanitizedOnTTY(t *testing.T) {
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"r1": {ID: "r1", IssueTitle: "safe\x1b[2Jinjected"},
+	}}
+	// Pipe (non-TTY): raw, exact bytes.
+	stdout, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1", "--field", "issue_title")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "\x1b[2J") {
+		t.Errorf("pipe output must be raw, got %q", stdout)
+	}
+	// TTY: the ESC/CSI is stripped, printable text survives.
+	env := fakeEnv(fc)
+	env.StdoutTTY = true
+	stdout2, _, code2 := runCLI(t, env, "run", "get", "r1", "--field", "issue_title")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code2)
+	}
+	if strings.ContainsRune(stdout2, '\x1b') {
+		t.Errorf("TTY output must be sanitized of ESC, got %q", stdout2)
+	}
+	if !strings.Contains(stdout2, "safe") || !strings.Contains(stdout2, "injected") {
+		t.Errorf("printable text must survive sanitizing, got %q", stdout2)
 	}
 }
 

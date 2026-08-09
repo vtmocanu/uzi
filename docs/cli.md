@@ -611,10 +611,11 @@ re-interprets escapes (notably **zsh `echo`**, which turns the CLI's valid
 document. `--field` hands back the decoded value with nothing to re-mangle. If
 you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
 
-A `null` field prints an empty line. An unknown field, or a **non-scalar** one
-(the array fields `milestones`, `milestones_candidate`, `milestones_completed`,
-`milestones_in_progress` — read those with `--json`), is a usage error (exit 2).
-`--field` and `--json` are mutually exclusive (two output modes).
+A `null` or absent field prints an empty line (so a nil array field is an empty
+line, not an error). An unknown field, or a **non-scalar** one that is populated
+— any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
+`usage`), which you read with `--json` — is a usage error (exit 2). `--field` and
+`--json` are mutually exclusive (two output modes).
 
 ### Run status, and what `--follow` waits for
 

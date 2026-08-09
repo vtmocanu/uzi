@@ -176,10 +176,12 @@ uzi version
   field(s), raw and unquoted, one per line — so a poller reads `.status` or
   `.mr_web_url` with **no JSON parse at all**: `uzi run get <id> --field status`.
   This is the robust way to read a scalar (see the `--json`/shell-`echo` note
-  below): there is no JSON to mangle. A `null` field prints an empty line; an
-  unknown field or a **non-scalar** one (the array fields `milestones`,
-  `milestones_candidate`, `milestones_completed`, `milestones_in_progress`) is a
-  usage error (exit 2); `--field` and `--json` are mutually exclusive.
+  below): there is no JSON to mangle. A `null`/absent field prints an empty line
+  (so a nil array field is an empty line, not an error); an unknown field or a
+  **non-scalar** one that is actually populated — any array or object field, e.g.
+  `milestones`, `own_agents`, `agent_exclusions`, `usage` (read those with
+  `--json`) — is a usage error (exit 2); `--field` and `--json` are mutually
+  exclusive.
 - `uzi run logs <run-id>` — the run's message history. `--follow` polls until the
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
@@ -264,10 +266,10 @@ uzi version
   the latter until 2026-08-03.
 
   Three things a first-time caller misreads as failures, none of which are:
-  - **`--json` returns a `{"server_side": <bool>, …}` envelope**, not the run
-    object (it may also carry the queued input's `id`/`created_at`). `server_side:
-    false` — the usual case — means the approval was queued for the live worker to
-    apply; it does **not** mean anything failed.
+  - **`--json` returns the envelope `{"server_side": false}`**, not the run
+    object. For an approve `server_side` is **always** `false` — the approval is
+    always handed to the live worker to apply, never applied server-side — so
+    `false` here is success, not a failure signal.
   - **The status stays `awaiting_approval` for a beat after a successful
     approve**, then flips to `running` asynchronously. So a `run wait <id>`
     *after* approving must narrow to the terminals

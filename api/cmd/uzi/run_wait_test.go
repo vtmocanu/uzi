@@ -72,12 +72,15 @@ func TestRunWaitStopsAtGateThenNarrowedTerminal(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
-	if !strings.Contains(stderr, "awaiting_approval") {
-		t.Errorf("should have stopped at the gate, stderr = %q", stderr)
-	}
-	// The transition line is proof it did not stop before the gate.
 	if !strings.Contains(stderr, "running → awaiting_approval") {
 		t.Errorf("expected a running→awaiting_approval transition, stderr = %q", stderr)
+	}
+	// It must STOP at the gate, not merely pass through it: awaiting_approval is a
+	// DEFAULT stop-state, so the wait must never reach the later `completed` step. This
+	// is what pins gate-membership of the default --until set — a weaker "contains
+	// awaiting_approval" assertion passes even if the wait runs on to completed.
+	if strings.Contains(stderr, "→ completed") {
+		t.Errorf("must stop AT the gate, not run past it to completed; stderr = %q", stderr)
 	}
 }
 
@@ -129,6 +132,22 @@ func TestRunWaitTransientUnreachableRecovers(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "retry 1/") {
 		t.Errorf("expected a retry notice on the transient blip, stderr = %q", stderr)
+	}
+}
+
+func TestRunWaitUnreachableCounterIsConsecutiveNotCumulative(t *testing.T) {
+	shrinkWaitTimers(t)
+	// Five blips TOTAL but never five in a row — a successful poll between them must
+	// reset the counter, so the wait survives to the gate. If the counter were
+	// cumulative it would hit runWaitMaxUnreachable (5) and wrongly exit 6.
+	blip := waitStep{err: uzicli.Exitf(uzicli.ExitUnreachable, "cannot reach uzi")}
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(
+		blip, okStep("running"), blip, okStep("running"), blip, okStep("running"),
+		blip, okStep("running"), blip, okStep("awaiting_approval"),
+	)}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 — interspersed blips must not accumulate (stderr: %s)", code, stderr)
 	}
 }
 
