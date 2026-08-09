@@ -377,7 +377,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -403,6 +403,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
+			&i.RepoClaudemdEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -415,7 +416,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -441,6 +442,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
+			&i.RepoClaudemdEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -890,7 +892,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -921,6 +923,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
+			&i.RepoClaudemdEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -1019,7 +1022,7 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -1042,6 +1045,7 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }
@@ -1050,7 +1054,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -1074,6 +1078,7 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }
@@ -1082,7 +1087,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -1104,23 +1109,31 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }
 
-const setRepoSkillsEnabled = `-- name: SetRepoSkillsEnabled :one
-UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+const setRepoTrustFlags = `-- name: SetRepoTrustFlags :one
+UPDATE repos SET
+  repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
+  repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
+WHERE repos.id = $3
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
-type SetRepoSkillsEnabledParams struct {
-	ID                uuid.UUID `json:"id"`
-	RepoSkillsEnabled bool      `json:"repo_skills_enabled"`
+type SetRepoTrustFlagsParams struct {
+	Skills   pgtype.Bool `json:"skills"`
+	Claudemd pgtype.Bool `json:"claudemd"`
+	ID       uuid.UUID   `json:"id"`
 }
 
-// Admin path for the repo-skills toggle: not scoped to the owning user. The
-// handler gates this on the caller being an admin.
-func (q *Queries) SetRepoSkillsEnabled(ctx context.Context, arg SetRepoSkillsEnabledParams) (Repo, error) {
-	row := q.db.QueryRow(ctx, setRepoSkillsEnabled, arg.ID, arg.RepoSkillsEnabled)
+// Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
+// repo_claudemd_enabled in ONE round-trip. A nil arg leaves that column unchanged
+// (COALESCE), so the master toggle and each sub-toggle share one code path with no
+// partial-failure window. Admin path (not scoped to owning user).
+func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoTrustFlags, arg.Skills, arg.Claudemd, arg.ID)
 	var i Repo
 	err := row.Scan(
 		&i.ID,
@@ -1132,27 +1145,36 @@ func (q *Queries) SetRepoSkillsEnabled(ctx context.Context, arg SetRepoSkillsEna
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }
 
-const setRepoSkillsEnabledForUser = `-- name: SetRepoSkillsEnabledForUser :one
-UPDATE repos SET repo_skills_enabled = $2
-WHERE repos.id = $1
-  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+const setRepoTrustFlagsForUser = `-- name: SetRepoTrustFlagsForUser :one
+UPDATE repos SET
+  repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
+  repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
+WHERE repos.id = $3
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
-type SetRepoSkillsEnabledForUserParams struct {
-	ID                uuid.UUID `json:"id"`
-	RepoSkillsEnabled bool      `json:"repo_skills_enabled"`
-	UserID            uuid.UUID `json:"user_id"`
+type SetRepoTrustFlagsForUserParams struct {
+	Skills   pgtype.Bool `json:"skills"`
+	Claudemd pgtype.Bool `json:"claudemd"`
+	ID       uuid.UUID   `json:"id"`
+	UserID   uuid.UUID   `json:"user_id"`
 }
 
-// Repo-skills opt-in toggle, authorized through the repo's owning connection.
-// A non-owned or unknown id returns no rows (mapped to 404 in the handler).
-func (q *Queries) SetRepoSkillsEnabledForUser(ctx context.Context, arg SetRepoSkillsEnabledForUserParams) (Repo, error) {
-	row := q.db.QueryRow(ctx, setRepoSkillsEnabledForUser, arg.ID, arg.RepoSkillsEnabled, arg.UserID)
+// Owner path for the atomic Trusted-repo toggle, authorized through the repo's
+// owning connection. A non-owned or unknown id returns no rows (mapped to 404).
+func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrustFlagsForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoTrustFlagsForUser,
+		arg.Skills,
+		arg.Claudemd,
+		arg.ID,
+		arg.UserID,
+	)
 	var i Repo
 	err := row.Scan(
 		&i.ID,
@@ -1164,6 +1186,7 @@ func (q *Queries) SetRepoSkillsEnabledForUser(ctx context.Context, arg SetRepoSk
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }
@@ -1397,7 +1420,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
 `
 
 type UpsertRepoParams struct {
@@ -1430,6 +1453,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
 	)
 	return i, err
 }

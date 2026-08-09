@@ -334,6 +334,11 @@ export interface ClaimRepo {
    *  repo skills after checkout, applies the caps, and ranks them below every
    *  delivered skill (M6). Skills only — repo hooks/settings/commands never load. */
   skills_enabled?: boolean;
+  /** Repo owner's opt-in (PRD #246): let the LEAD read the clone's root CLAUDE.md
+   *  as a nonce-fenced UNTRUSTED/ADVISORY block. Default false. A sibling trust flag
+   *  of skills_enabled; read and injected through the worker's own channel, so
+   *  settingSources stays []. Additive/optional — absent ⇒ false. */
+  claudemd_enabled?: boolean;
 }
 
 /**

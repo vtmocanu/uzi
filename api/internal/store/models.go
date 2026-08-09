@@ -224,15 +224,16 @@ type RecommendationFiledIssue struct {
 }
 
 type Repo struct {
-	ID                uuid.UUID   `json:"id"`
-	ConnectionID      uuid.UUID   `json:"connection_id"`
-	ForgeProjectID    int64       `json:"forge_project_id"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	Enabled           bool        `json:"enabled"`
-	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
-	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
+	ID                  uuid.UUID   `json:"id"`
+	ConnectionID        uuid.UUID   `json:"connection_id"`
+	ForgeProjectID      int64       `json:"forge_project_id"`
+	PathWithNamespace   string      `json:"path_with_namespace"`
+	WebUrl              string      `json:"web_url"`
+	DefaultBranch       pgtype.Text `json:"default_branch"`
+	Enabled             bool        `json:"enabled"`
+	RepoSkillsEnabled   bool        `json:"repo_skills_enabled"`
+	RepoDevboxOptIn     bool        `json:"repo_devbox_opt_in"`
+	RepoClaudemdEnabled bool        `json:"repo_claudemd_enabled"`
 }
 
 type RepoToolProfile struct {

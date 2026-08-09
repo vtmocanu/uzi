@@ -29,6 +29,11 @@ test("ci_fix claim wire contract: worker parses the server's ci_fix shape", () =
   assert.equal(claim.kind, "ci_fix");
   assert.equal(claim.issue_iid, null);
 
+  // PRD #246: the trust flag rides every repo block byte-for-byte (no omitempty on
+  // the Go side), false here since this fixture's repo did not opt in — the
+  // non-default counterpart to the `true` pinned in claim-skills-contract.test.ts.
+  assert.equal(claim.repo.claudemd_enabled, false);
+
   // The failed-pipeline snapshot the agent diagnoses.
   assert.ok(claim.pipeline, "ci_fix claim must carry a pipeline snapshot");
   assert.equal(claim.pipeline!.id, 4200);

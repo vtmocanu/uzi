@@ -12,6 +12,11 @@ type RepoDTO struct {
 	DefaultBranch     *string `json:"default_branch"`
 	Enabled           bool    `json:"enabled"`
 	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
+	// RepoClaudemdEnabled is the trusted-repo instructions opt-in (PRD #246): when
+	// true, the lead reads the clone's root CLAUDE.md as a nonce-fenced,
+	// UNTRUSTED/ADVISORY block. Independent of RepoSkillsEnabled (both sit under the
+	// UI's "Trusted repo" grouping). Default false.
+	RepoClaudemdEnabled bool `json:"repo_claudemd_enabled"`
 	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): when true, a run on this
 	// repo also unions the packages from the repo's own devbox.json (packages-only,
 	// never its hooks/scripts). Default false.
