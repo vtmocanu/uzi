@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -14,8 +15,8 @@ import (
 // a live database. A name in existing or getErr makes the insert a no-op (0 rows,
 // as ON CONFLICT DO NOTHING would); everything else inserts (1 row).
 type reconcilerFake struct {
-	existing map[string]AgentTemplate // name -> the row GetSharedAgentTemplateByName returns
-	getErr   map[string]error         // name -> a read-back error
+	existing  map[string]AgentTemplate // name -> the row GetSharedAgentTemplateByName returns
+	getErr    map[string]error         // name -> a read-back error
 	inserted  []string
 	seeded    []string // names passed to SeedSharedTemplateAllocationByName
 	refreshed []string // names passed to RefreshPristineBuiltin (no-insert path only)
@@ -116,6 +117,20 @@ func TestReconcileSilentWhenBuiltinAlreadySeeded(t *testing.T) {
 	})
 	if strings.Contains(logs, "shadowed by a custom row") {
 		t.Errorf("an already-seeded builtin must not warn; logs:\n%s", logs)
+	}
+	// The already-seeded builtin took the no-insert path, so the reconciler must
+	// route it through RefreshPristineBuiltin (the boot-time pristine refresh),
+	// while a freshly-INSERTED builtin must NOT be refreshed (PRD #275). This pins
+	// the boot wiring the LiveDB test cannot reach — that test calls the query
+	// directly, so without this assertion deleting the reconciler's refresh call
+	// would leave the whole suite green.
+	if !slices.Contains(fake.refreshed, "coder") {
+		t.Errorf("an already-seeded builtin must be refreshed on boot; refreshed=%v", fake.refreshed)
+	}
+	for _, name := range fake.inserted {
+		if slices.Contains(fake.refreshed, name) {
+			t.Errorf("a freshly-inserted builtin %q must not also be refreshed", name)
+		}
 	}
 }
 

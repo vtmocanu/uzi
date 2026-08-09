@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -226,5 +227,35 @@ func TestPristineBuiltinRefreshLiveDB(t *testing.T) {
 	}
 	if defaults != 0 {
 		t.Errorf("a refresh must not re-add an admin-removed default allocation; got %d", defaults)
+	}
+
+	// --- 9. The content guard reacts to the model/tools columns, NULL<->set -----
+	// The other cases leave model/tools NULL on both sides; this one flips them
+	// from NULL to a value with the description/body held constant, proving the
+	// IS DISTINCT FROM guard spans all four columns (and is NULL-safe on the
+	// nullable ones), then that an identical re-refresh with non-NULL model/tools
+	// is still a no-op.
+	n9 := "guard-" + suffix
+	seedBuiltin(n9, "d9", "v9\n") // seeded with model + tools NULL
+	tools9 := []byte(`["Read","Grep"]`)
+	set9 := store.RefreshPristineBuiltinParams{
+		Name: n9, Description: "d9", PromptBody: "v9\n",
+		Model: pgtype.Text{String: "claude-guard", Valid: true}, Tools: tools9,
+	}
+	got9, err := q.RefreshPristineBuiltin(ctx, set9)
+	if err != nil {
+		t.Fatalf("refresh model/tools: %v", err)
+	}
+	if got9 != 1 {
+		t.Fatalf("a model/tools change (NULL->set) with an unchanged body must refresh; got %d rows", got9)
+	}
+	row9 := readBack(n9)
+	if !row9.Model.Valid || row9.Model.String != "claude-guard" || len(row9.Tools) == 0 {
+		t.Errorf("model/tools must be applied by the refresh; got model=%+v tools=%s", row9.Model, row9.Tools)
+	}
+	// Guard still holds when model/tools are non-NULL: an identical re-refresh is a
+	// no-op (jsonb normalizes both sides, so whitespace in tools9 is irrelevant).
+	if same9, err := q.RefreshPristineBuiltin(ctx, set9); err != nil || same9 != 0 {
+		t.Errorf("identical model/tools re-refresh must be a no-op; got %d rows err=%v", same9, err)
 	}
 }
