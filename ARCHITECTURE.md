@@ -641,7 +641,17 @@ chain in the diagram above, with no intervening `running`.
   for the user-facing surfaces.
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
-  failure carries a `failure_reason`.
+  failure carries a `failure_reason`. The push and the whole MR-create call are
+  wrapped in a bounded, fast transient-retry (`[1s,2s,4s,8s,16s]`,
+  `agent/src/forge-retry.ts`): a dropped HTTP/2 stream, a 5xx, or a connection
+  reset retries so a run whose work is already committed is not discarded, while
+  a **permanent** rejection — auth failure, a protected-branch guardrail,
+  non-fast-forward — fails fast and is never retried, per
+  [ADR-284](adr/0284-forge-push-retry-classifier.md). A `failed` transition also
+  lands an in-app inbox notification (`notifysvc.Notify`, inbox-only —
+  Slack is not attempted, since the existing Slack ❌ DM already covers opted-in
+  users) for the run's owner, gated on `stop_kind` so a deliberate cancel or
+  plan-rejection stays silent and only genuine breakage notifies.
 - **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265) — on a
   milestone-structured `issue` run the run view shows a *reported-complete*
   tracker (`runs.milestones_completed`, a monotone server-side union; never
