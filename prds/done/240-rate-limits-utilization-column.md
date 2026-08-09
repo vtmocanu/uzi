@@ -1,7 +1,7 @@
 # PRD #240: Rate limits table — stack the two windows into one "Utilization" column
 
 **GitLab Issue**: [#240](https://gitlab.example.com/vtmocanu/uzi/-/issues/240)
-**Status**: Draft (created 2026-08-07)
+**Status**: Complete (created 2026-08-07; shipped 2026-08-09) — all milestones done, archived to `prds/done/`
 **Priority**: Low
 **Mock**: `prds/mockups/240-rate-limits-utilization-mock.html` (Option A of three; shown to owner 2026-08-07, chosen)
 
@@ -109,20 +109,20 @@ The refactor must not silently weaken what `AdminRateLimits.tsx` already guarant
 ## Milestones
 
 ### M1 — Utilization column refactor (`web`)
-- [ ] Replace the two window `<th>`/`<td>` columns in `AdminRateLimits.tsx` with one
+- [x] Replace the two window `<th>`/`<td>` columns in `AdminRateLimits.tsx` with one
   **Utilization** column. Introduce a cell that stacks the 5h and 7d meters (either a
   new `UtilizationCell`, or `WindowCell` reworked to render both windows) — each row a
   mono `5h`/`7d` chip + `MeterTrack` + `%` + reset countdown, per the mock.
-- [ ] Remove the standalone **Updated** column; render "updated Nm ago" as a sub-line
+- [x] Remove the standalone **Updated** column; render "updated Nm ago" as a sub-line
   under the Status badge (Decision 2).
-- [ ] `no_token` and non-`ok` rows: one em-dash Utilization cell (not two), Status pill
+- [x] `no_token` and non-`ok` rows: one em-dash Utilization cell (not two), Status pill
   unchanged; keep every user present and countable (PRD #104's one-row-per-token and the
   token-less single row are unchanged).
-- [ ] Preserve all Decision 4 contracts (aria-labels, rowSpan identity, tones, AA tones).
-- [ ] Keep the `overflow-x-auto` wrapper (Decision 3).
+- [x] Preserve all Decision 4 contracts (aria-labels, rowSpan identity, tones, AA tones).
+- [x] Keep the `overflow-x-auto` wrapper (Decision 3).
 
 ### M2 — Tests + gate (`web`)
-- [ ] Update `web/src/pages/AdminRateLimits.test.tsx` for the new shape. The `no_token`
+- [x] Update `web/src/pages/AdminRateLimits.test.tsx` for the new shape. The `no_token`
   em-dash count changes: today `getAllByText("—").length` is **4** (token cell + both
   window cells + Updated); after the refactor it is **2** (token cell + the single
   Utilization cell — the Updated dash is gone, since a `no_token` row shows no "updated"
@@ -132,20 +132,20 @@ The refactor must not silently weaken what `AdminRateLimits.tsx` already guarant
   stacks two reset rows, so both "stale" labels remain; mihai's badge is "🔒 vault locked",
   not "stale", so the count is exactly the two resets). There are **no** existing header
   assertions to update — the four-column-header check below is a net-new addition.
-- [ ] Add a regression assertion that pins the fix's intent — e.g. the table renders the
+- [x] Add a regression assertion that pins the fix's intent — e.g. the table renders the
   four expected column headers and no `Updated` header — so a future re-widening is caught.
-- [ ] `task gate:web` green (deps-check + oxlint + knip + check-docs + typecheck + vitest).
-- [ ] Manual: `VITE_UZI_MOCK=1 npm run dev` on the admin rate-limits scenario — confirm
+- [x] `task gate:web` green (deps-check + oxlint + knip + check-docs + typecheck + vitest).
+- [x] Manual: `VITE_UZI_MOCK=1 npm run dev` on the admin rate-limits scenario — confirm
   no horizontal scrollbar and no clipped pill at a laptop width; spot-check the `mission`
   theme too (tokens differ, layout must still fit).
 
 ### M3 — Specs, docs, CLI check
-- [ ] `specs/ai.md` records the layout decision (Utilization column; Updated folded) as
+- [x] `specs/ai.md` records the layout decision (Utilization column; Updated folded) as
   an AI design decision.
-- [ ] **CLI check** (mandatory per the "new functionality ⇒ check `api/cmd/uzi/`"
+- [x] **CLI check** (mandatory per the "new functionality ⇒ check `api/cmd/uzi/`"
   convention): this is presentation-only for a web admin table with no CLI counterpart —
   record it as deliberately out-of-scope rather than leaving the note unmade.
-- [ ] Docs: only if a page enumerates this table's columns; otherwise none. `check-docs`
+- [x] Docs: only if a page enumerates this table's columns; otherwise none. `check-docs`
   stays green.
 
 ## Success Criteria
