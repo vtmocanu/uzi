@@ -73,7 +73,14 @@ fold `[Unreleased]` into the version being cut, with its date, BEFORE tagging, a
 the published release carries those notes rather than an auto-generated commit list.
 *(Corrected 2026-07-27: this line read "There is no `CHANGELOG.md`; the release notes are
 the tag/MR summary" — flagged by the judge, and false since the coverage gate landed. The
-same claim was in `.claude/agents/documenter.md`.)* Re-verify `main`
+same claim was in `.claude/agents/documenter.md`.)* The version bump (`deploy/README.md` step 1) and the ArgoCD
+`targetRevision` bump (step 3) each land **two ways**: **direct-to-`main` (the DEFAULT,
+preferred at this early dev stage) or an MR when review is wanted.** Both `vtmocanu/uzi` and
+`argo-apps` allow direct pushes to `main`. Direct-to-`main` is preferred because it
+skips the separate MR pipeline — one full gate cycle instead of two (MR gate, then the tag's
+re-gate) and one fewer roll against flaky tests; the release commit is only `Chart.yaml` +
+CHANGELOG on already-gated code and the tag pipeline re-gates as the safety net. Ask the lead
+which if unspecified; default to direct-to-`main`. Re-verify `main`
 mergeability IMMEDIATELY before tagging (bots + sibling PRD merges drift it); reconcile with
 a plain `git merge origin/main` (never force-push), renumber any append-numbered artifacts
 (goose migrations, `specs/ai.md` sections) above the merged head, re-run the gate on the

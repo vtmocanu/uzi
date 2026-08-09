@@ -51,24 +51,46 @@ atomically, it does not ship a half-version.
 
 ## Release procedure
 
-Cutting a release is three steps; only the tag push publishes anything.
+Cutting a release is three steps; only the tag push publishes anything. Steps 1 and 3
+(the chart-version bump and the ArgoCD `targetRevision` bump) can each land **two ways** —
+a **direct-to-`main` commit** or an **MR**. **Direct-to-`main` is the default and preferred
+at this early dev stage**; the MR way is there for when you want the change reviewed. Step 2
+(the tag) is identical either way. Both repos (`vtmocanu/uzi` and `argo-apps`) permit
+direct pushes to `main`.
 
-1. **Bump the chart version in an MR, then merge.**
-   Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z`
-   (they must be equal). Open an MR, let CI go green, merge to `main`.
+Why direct-to-`main` is preferred here: it skips the separate MR pipeline, so you wait for
+the full gate **once** (the `main`-branch build) instead of twice (the MR gate, then the
+tag's re-gate), and it runs the slow suite one fewer time — which matters because every gate
+run is an independent roll against flaky tests. The trade is that the release commit gets no
+independent pre-land review gate; that is low risk here because it only bumps `Chart.yaml` +
+CHANGELOG on code every feature MR already gated, and **the tag pipeline re-runs the whole
+gate as the safety net** (step 2). Note the Harbor layer cache is warmed by the `main`-branch
+build (MR builds are cache-less by design, Decision 2), so with either method you want the
+`main` pipeline on the release commit to have run before you tag — that is a publish-speed
+point (warm vs cold cache), not a correctness one, and it is the same for both.
 
-   **Write the CHANGELOG section in this same MR, and re-check it just before
-   tagging.** `publish:assert-changelog` fails the publish stage if any merge since
-   the previous tag changed shipping code without being cited in the new version's
-   section. Run it yourself first — `bash scripts/assert-changelog-covers-release.sh
-   main` — because the failure mode it guards is invisible in the release MR's own
-   diff: **anything that merges while your release MR is open rides into the release
-   without ever passing through it.** That has happened three times (0.11.7 and
-   0.11.8 shipped with entries still under `[Unreleased]`; issue #60 landed inside
-   0.11.10's window with no entry at all). A merge with genuinely nothing to announce
-   is exempted with a `Changelog: none` line in its commit message.
+1. **Bump the chart version and write the CHANGELOG on the release commit.**
+   Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z` (they must be
+   equal), and fold `CHANGELOG.md`'s `[Unreleased]` into a new `[X.Y.Z]` section with its
+   date — in the **same** commit. Then land it one of two ways:
 
-2. **Tag that merged commit and push the tag.**
+   - **Direct to `main` (default).** `git checkout main && git pull --rebase`, commit the
+     bump, `git push origin main`. Let the `main`-branch pipeline run (it warms the cache
+     and is the gate); tag once it is green.
+   - **Via an MR (when you want it reviewed).** Open an MR, let CI go green, merge to `main`.
+
+   **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
+   `publish:assert-changelog` fails the publish stage if any merge since the previous tag
+   changed shipping code without being cited in the new version's section. Run it yourself
+   first — `bash scripts/assert-changelog-covers-release.sh main` — because the failure mode
+   it guards is invisible in the release commit's own diff (MR or direct): **anything that
+   merges while you are preparing the release rides into it without ever passing through
+   it.** That has happened three times (0.11.7 and 0.11.8 shipped with entries still under
+   `[Unreleased]`; issue #60 landed inside 0.11.10's window with no entry at all). A merge
+   with genuinely nothing to announce is exempted with a `Changelog: none` line in its
+   commit message.
+
+2. **Tag that commit (now on `main`) and push the tag.**
 
    ```sh
    git checkout main && git pull
@@ -80,8 +102,8 @@ Cutting a release is three steps; only the tag push publishes anything.
    kaniko-builds + pushes both images (`:<tag>` + `:<short-sha>`) and
    `helm package` + `helm push`es the OCI chart, all at that version.
 
-   > **Tag a commit already merged to `main`, and never one carrying a
-   > skip-CI marker.** Its default-branch pipeline already ran a
+   > **Tag a commit already on `main` (whether it landed direct or via an
+   > MR), and never one carrying a skip-CI marker.** Its default-branch pipeline already ran a
    > protected-ref build that **warmed the Harbor layer cache**, so the tag
    > pipeline's builds are mostly cache hits. Tagging a commit whose
    > default-branch build has not run yet just means a **cold cache**: slower
@@ -116,14 +138,21 @@ Cutting a release is three steps; only the tag push publishes anything.
    > included, despite the name) recovers the release with the tag left in
    > place.
 
-3. **Point ArgoCD at the new version (a second MR, to `argo-apps`).**
-   Bump `targetRevision` in `apps/uzi/app.uzi.yaml` to the new chart version, MR
-   → merge. ArgoCD auto-syncs the uzi app to the new chart. Deploy is an
-   explicit, reviewable git change (Decision 3), not latest-tracking.
+3. **Point ArgoCD at the new version (in `argo-apps`).**
+   Bump `targetRevision` in `apps/uzi/app.uzi.yaml` to the new chart version. ArgoCD
+   auto-syncs the uzi app to the new chart once the bump is on that repo's `main`. Deploy
+   is an explicit, reviewable git change (Decision 3), not latest-tracking. Land it the
+   same two ways as step 1:
 
-**Rollback = revert the argo `targetRevision` MR** (step 3) to the previous
-version and merge; ArgoCD re-syncs to the older, still-published chart. No image
-rebuild needed — old versions stay in Harbor.
+   - **Direct to `main` (default).** Commit the `targetRevision` bump on
+     `argo-apps` `main` and push. That repo has no image build, so its only wait
+     is ArgoCD's reconcile — identical either way; direct-to-`main` just skips the MR
+     ceremony.
+   - **Via an MR (when you want the deploy bump reviewed).** MR → merge.
+
+**Rollback = revert the argo `targetRevision` change** (step 3, direct commit or MR) to the
+previous version; ArgoCD re-syncs to the older, still-published chart. No image rebuild
+needed — old versions stay in Harbor.
 
 ## Platform-admin prerequisites (one-time)
 
