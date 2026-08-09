@@ -26,6 +26,7 @@ const (
 	ExitNotFound    = 4 // not found
 	ExitConflict    = 5 // conflict (e.g. run finished)
 	ExitUnreachable = 6 // server unreachable / 5xx
+	ExitTimeout     = 7 // a wait deadline elapsed before the target state (`run wait --timeout`)
 )
 
 // ExitError carries the process exit code a command should produce. main() maps
