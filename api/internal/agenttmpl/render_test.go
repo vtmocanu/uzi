@@ -194,7 +194,9 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 		{"explicit non-overlapping file scope per implementer", "an explicit, non-overlapping list of files and directories it owns"},
 		{"parallel implementers do not commit or run repo-wide gates", "tell it not to commit and not to run repo-wide build or test commands"},
 		{"lead diffs against the last commit and confirms declared scopes", "diff the working tree against the last commit and confirm only the declared scopes changed"},
-		{"lead commits once and runs the gate once itself", "commit once, run the quality gates once yourself"},
+		{"read-only validators review an immutable commit range, not a mutating tree", "over the immutable range `<base>..<sha>`"},
+		{"integration gate overlaps the read-only wave rather than serializing ahead of it", "overlapped with the read-only wave you just dispatched, never serialized ahead of it"},
+		{"integration gate keeps blocking authority over the commit", "The gate keeps full blocking authority over the commit"},
 		{"declared scope map goes to the review wave", "include the declared scope map when you dispatch the review wave"},
 		{"when in doubt, run serially", "run them serially"},
 		{"sequential-by-nature work stays serial", "stays serial"},
@@ -511,9 +513,17 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 		{"re-planning re-cites only what changed", "re-cite only the mechanisms that changed"},
 		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
 	}
-	// The wave that runs AFTER an implementation unit lands. Kept as its own
-	// region so that a plan-turn clause moved down here, or this one moved up,
-	// reds rather than satisfying the other region's case.
+	// The dispatch of the read-only wave, which now happens PER UNIT rather than
+	// as an end-of-run barrier (PRD #215 M2). Kept as its own region so that a
+	// plan-turn clause moved down here, or this one moved up, reds rather than
+	// satisfying the other region's case.
+	//
+	// This case is a POSITIVE pin on the single surviving dispatch procedure
+	// (PRD #215 M3): the read-only lane has exactly one procedure and this bullet
+	// states it. It does NOT catch a paragraph inserted alongside it that
+	// contradicts it — `strings.Contains` is monotone under insertion, the same
+	// gap documented at length above for the plan cases — so behavior under the
+	// reworded prompt is measured by a live run (PRD #215 M7), not asserted here.
 	//
 	// THIS ONE CASE IS ALSO LOAD-BEARING FOR THE SPLIT, which is not visible
 	// from here and is why it is repeated here rather than only at the guard.
@@ -523,7 +533,7 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	// a second bullet case ahead of it, and that window widens with nothing
 	// structural behind it.
 	bulletCases := []pin{
-		{"post-implementation wave is retained and is a REPEAT", "fans out again after an implementation unit lands"},
+		{"read-only lane has exactly one dispatch procedure, stated in the bullet", "Read-only work fans out per unit"},
 	}
 
 	for _, c := range planCases {
