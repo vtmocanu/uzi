@@ -66,6 +66,21 @@ type PlanGateSubmitter interface {
 	// ErrNotAwaitingInput sentinels rather than a generic error, so the replier can say
 	// which happened.
 	SubmitAnswer(ctx context.Context, userID, runID uuid.UUID, questionID, text string) error
+
+	// LiveChatForUser reports the user's newest non-terminal chat run, if any (PRD
+	// #191 M2, Decision 3). The Slack opener refuses a second top-level DM while a
+	// chat is live rather than minting a second run.
+	LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error)
+	// CreateChatRun queues a new chat run seeded with the opening message, returning
+	// the run (its id anchors the DM). It rides the same ownership-scoped service the
+	// web Chat page uses; the Slack path draws from the shared per-user chat spend
+	// budget BEFORE calling it (Decision 9).
+	CreateChatRun(ctx context.Context, userID uuid.UUID, message string) (store.Run, error)
+	// SubmitChatMessage records a thread reply as the next chat turn (Decision 5),
+	// enforcing the turn cap and the terminal 409 at the service boundary. It
+	// translates the two user-facing sentinels so the replier can say which happened:
+	// ErrChatTurnCapReached (the cap) and ErrChatEnded (a terminal conversation).
+	SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID, message string) error
 }
 
 // Gatekeeper handles the Slack approval-gate buttons (PRD #25 M4): Approve,

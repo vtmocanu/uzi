@@ -466,6 +466,14 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, info)
 }
 
+// ChatCreateRoutePattern is the chi route pattern of POST /chats (create a chat).
+// The per-user chat spend limiter keys on RoutePattern + "|" + userID, so the Slack
+// chat opener (PRD #191 Decision 9) composes this exact key to draw from the SAME
+// per-user budget as the web Chat page. It is pinned to the real mounted pattern by
+// TestChatCreateRoutePatternMatchesMount, so a route rename cannot silently split the
+// shared bucket in two.
+const ChatCreateRoutePattern = "/api/chats/"
+
 // Routes builds the API router. authLimiter is applied per-route to the
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot

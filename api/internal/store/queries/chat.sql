@@ -52,6 +52,18 @@ SELECT * FROM (
 ORDER BY COALESCE(chat.last_message_at, chat.created_at) DESC
 LIMIT 200;
 
+-- name: GetLiveChatForUser :one
+-- The user's newest NON-TERMINAL chat run (PRD #191 M2, Decision 3). A second
+-- top-level Slack DM while a chat is already live is refused with a threaded pointer
+-- rather than minting a second run that would queue behind a conversation that will
+-- not idle out for over an hour (WORKER_CHAT_SESSIONS=1). Terminal statuses
+-- (completed/failed/cancelled) do not count; ErrNoRows = no live chat, so open one.
+SELECT * FROM runs
+WHERE user_id = @user_id AND kind = 'chat'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at DESC
+LIMIT 1;
+
 -- name: ClaimChatRun :one
 -- The chat claim lane (Decision 4): atomically claim the oldest claimable queued
 -- CHAT run for the worker's user. Identical affinity/lock semantics to ClaimRun but

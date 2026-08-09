@@ -120,12 +120,12 @@ func TestRouteMessageRoutesUserThreadReply(t *testing.T) {
 	}
 }
 
-// Everything that is not a plain user thread reply in a DM is dropped: the bot's
-// own posts, edits/deletes (subtypes), non-thread top-level DMs, non-DM channels,
-// and empty text.
+// Everything that is not a plain user message in a DM is dropped: the bot's own
+// posts, edits/deletes (subtypes), non-DM channels, empty text, empty author. A
+// top-level DM (no thread_ts) is NO LONGER dropped (PRD #191 M2 — it opens a chat);
+// see TestRouteMessageRoutesTopLevelDM.
 func TestRouteMessageIgnoresNonReplies(t *testing.T) {
 	cases := map[string]*slackevents.MessageEvent{
-		"no thread":    {User: "U", Text: "x", ChannelType: "im", TimeStamp: "t"},
 		"subtype edit": {User: "U", Text: "x", ChannelType: "im", ThreadTimeStamp: "r", SubType: "message_changed", TimeStamp: "t"},
 		"bot message":  {BotID: "B1", Text: "x", ChannelType: "im", ThreadTimeStamp: "r", TimeStamp: "t"},
 		"not a dm":     {User: "U", Text: "x", ChannelType: "channel", ThreadTimeStamp: "r", TimeStamp: "t"},
@@ -140,5 +140,23 @@ func TestRouteMessageIgnoresNonReplies(t *testing.T) {
 				t.Fatalf("%s must not route: %+v", name, rec.msgs)
 			}
 		})
+	}
+}
+
+// A top-level DM (no thread_ts) now routes with an EMPTY ThreadTS, which HandleMessage
+// reads as "open a new chat" (PRD #191 M2). MessageTS is the user's message ts — the
+// ts the chat anchor stores as root_ts.
+func TestRouteMessageRoutesTopLevelDM(t *testing.T) {
+	rec := &recordingMessages{}
+	routeMessage(context.Background(), rec, imEvent(&slackevents.MessageEvent{
+		User: "Uauth", Text: "what's running?", TimeStamp: "open1",
+		Channel: "D1", ChannelType: "im",
+	}))
+	if len(rec.msgs) != 1 {
+		t.Fatalf("want one routed top-level DM, got %d", len(rec.msgs))
+	}
+	m := rec.msgs[0]
+	if m.ThreadTS != "" || m.MessageTS != "open1" || m.SlackUserID != "Uauth" || m.Text != "what's running?" {
+		t.Fatalf("top-level DM mismapped: %+v", m)
 	}
 }

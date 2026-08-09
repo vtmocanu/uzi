@@ -75,6 +75,26 @@ type fakeSubmitter struct {
 	submitErr  error
 	approveErr error
 	answerErr  error
+
+	// PRD #191 M2 chat verbs.
+	liveChat      store.Run
+	liveChatOK    bool
+	liveChatErr   error
+	createdChat   store.Run
+	createChatErr error
+	createdChats  []createdChat
+	chatTurns     []submittedChatTurn
+	chatTurnErr   error
+}
+
+type createdChat struct {
+	userID  uuid.UUID
+	message string
+}
+
+type submittedChatTurn struct {
+	userID, runID uuid.UUID
+	message       string
 }
 
 // submittedAnswer records a PRD #88 M3 clarification answer. The question id is the
@@ -100,6 +120,19 @@ func (f *fakeSubmitter) SubmitApproval(_ context.Context, userID, runID uuid.UUI
 func (f *fakeSubmitter) SubmitAnswer(_ context.Context, userID, runID uuid.UUID, questionID, text string) error {
 	f.answers = append(f.answers, submittedAnswer{userID, runID, questionID, text})
 	return f.answerErr
+}
+
+// PRD #191 M2 chat verbs.
+func (f *fakeSubmitter) LiveChatForUser(context.Context, uuid.UUID) (store.Run, bool, error) {
+	return f.liveChat, f.liveChatOK, f.liveChatErr
+}
+func (f *fakeSubmitter) CreateChatRun(_ context.Context, userID uuid.UUID, message string) (store.Run, error) {
+	f.createdChats = append(f.createdChats, createdChat{userID, message})
+	return f.createdChat, f.createChatErr
+}
+func (f *fakeSubmitter) SubmitChatMessage(_ context.Context, userID, runID uuid.UUID, message string) error {
+	f.chatTurns = append(f.chatTurns, submittedChatTurn{userID, runID, message})
+	return f.chatTurnErr
 }
 
 func gateAction(actionID string, runID uuid.UUID) BlockAction {

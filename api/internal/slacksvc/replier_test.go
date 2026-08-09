@@ -32,6 +32,10 @@ type fakeReplierStore struct {
 	gateSetIf []store.SetSlackRunGateIfParams
 	casWon    int
 	casErr    error
+
+	// PRD #191 M2: chat anchor inserts.
+	chatAnchors   []store.InsertSlackChatAnchorParams
+	chatAnchorErr error
 }
 
 func (f *fakeReplierStore) GetConfirmedUserBySlackID(context.Context, pgtype.Text) (store.User, error) {
@@ -43,6 +47,15 @@ func (f *fakeReplierStore) GetSlackRunMessageByRoot(context.Context, store.GetSl
 func (f *fakeReplierStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
 	f.gateSet = append(f.gateSet, arg)
 	return store.SlackRunMessage{}, nil
+}
+func (f *fakeReplierStore) InsertSlackChatAnchor(_ context.Context, arg store.InsertSlackChatAnchorParams) (store.SlackRunMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.chatAnchors = append(f.chatAnchors, arg)
+	if f.chatAnchorErr != nil {
+		return store.SlackRunMessage{}, f.chatAnchorErr
+	}
+	return store.SlackRunMessage{RunID: arg.RunID, ChannelID: arg.ChannelID, RootTs: arg.RootTs, StatusTs: arg.StatusTs}, nil
 }
 func (f *fakeReplierStore) SetSlackRunGateIf(_ context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error) {
 	f.mu.Lock()

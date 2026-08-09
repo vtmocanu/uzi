@@ -260,6 +260,17 @@ func run() error {
 	// submitter as the gatekeeper.
 	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
 
+	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
+	// Created here (ahead of the other route limiters) because the Slack chat opener
+	// captures it below — the socket manager starts before the route wiring — and
+	// because web and Slack MUST share ONE bucket per user (PRD #191 Decision 9). The
+	// opener keys it identically to the web POST /chats mount (RoutePattern|userID) so a
+	// heavy Slack day rate-limits the web Chat page and vice versa.
+	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
+	slackReplier.SetChatSpendGuard(func(userID uuid.UUID) bool {
+		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
+	})
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
@@ -578,8 +589,6 @@ func run() error {
 	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
 	// (PRD #25 M3 fast-follow) — see the wiring in handler.Routes.
 	slackDMLimiter := mw.NewLimiter(cfg.SlackDMRateLimitMax, cfg.SlackDMRateLimitWindow, cfg.TrustedProxies)
-	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
-	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
 	// Per-user re-run-judge budget (PRD #46 Decision 8): a dedicated spend guard on the
 	// re-run-judge action, separate from chat so neither consumes the other's allowance.
 	judgeLimiter := mw.NewLimiter(cfg.JudgeRateLimitMax, cfg.JudgeRateLimitWindow, cfg.TrustedProxies)
@@ -859,6 +868,36 @@ func (g gateSubmitter) SubmitAnswer(ctx context.Context, userID, runID uuid.UUID
 //     normalised or defaulted it here would break the identity guard silently.
 func answerInputBody(questionID, text string) ([]byte, error) {
 	return json.Marshal(workersvc.AnswerBody{QuestionID: questionID, Answers: []string{text}})
+}
+
+// LiveChatForUser adapts the Slack chat opener's Decision 3 refusal to the run
+// service (PRD #191 M2): the newest non-terminal chat run for the user, if any.
+func (g gateSubmitter) LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error) {
+	return g.svc.LiveChatForUser(ctx, userID)
+}
+
+// CreateChatRun adapts the Slack chat opener to the run service (PRD #191 M2): it
+// queues a kind='chat' run seeded with the opening message. The Slack path has
+// already drawn from the shared chat spend budget before calling this.
+func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, message string) (store.Run, error) {
+	return g.svc.CreateChatRun(ctx, userID, message)
+}
+
+// SubmitChatMessage adapts a Slack thread reply on a chat run to the run service
+// (PRD #191 Decision 5): it rides SubmitChatMessage (turn cap + terminal 409 enforced
+// at the boundary), drops the result the replier does not use, and translates the two
+// user-facing sentinels into the slacksvc ones so the replier can say which happened —
+// the same translate-in-main pattern SubmitInput/SubmitApproval/SubmitAnswer use to
+// keep slacksvc free of a workersvc import.
+func (g gateSubmitter) SubmitChatMessage(ctx context.Context, userID, runID uuid.UUID, message string) error {
+	_, err := g.svc.SubmitChatMessage(ctx, userID, runID, message)
+	switch {
+	case errors.Is(err, workersvc.ErrChatTurnCapReached):
+		return slacksvc.ErrChatTurnCapReached
+	case errors.Is(err, workersvc.ErrRunTerminal):
+		return slacksvc.ErrChatEnded
+	}
+	return err
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no

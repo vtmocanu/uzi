@@ -262,6 +262,21 @@ func (s *Service) ListChatRuns(ctx context.Context, userID uuid.UUID) ([]store.L
 	return s.q.ListChatRunsForUser(ctx, userID)
 }
 
+// LiveChatForUser returns the user's newest non-terminal chat run and whether one
+// exists (PRD #191 M2, Decision 3): the Slack surface refuses a second top-level DM
+// while a chat is live, pointing the user at the existing thread instead of minting a
+// second run that would queue behind it. ok=false with a nil error means no live chat.
+func (s *Service) LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error) {
+	run, err := s.q.GetLiveChatForUser(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, false, nil
+		}
+		return store.Run{}, false, err
+	}
+	return run, true, nil
+}
+
 // GetChatRun returns a CHAT run owned by the user. A non-chat run (or another
 // user's run, or an unknown id) is ErrRunNotFound — a non-chat run is simply not
 // addressable through the /api/chats surface.

@@ -94,6 +94,18 @@ ON CONFLICT (run_id) DO UPDATE
         updated_at = now()
 RETURNING *;
 
+-- name: InsertSlackChatAnchor :one
+-- The DM anchor for a Slack-originated chat (PRD #191 M2). Distinct from
+-- UpsertSlackRunMessage in two ways rooted in Decision 2: root_ts is the USER's
+-- top-level message (what a thread reply's thread_ts resolves against), and status_ts
+-- is the bot's OWN editable status message (the chat state path edits it; nothing
+-- edits a chat row's root_ts). status_ts may be NULL when the status post failed. No
+-- ON CONFLICT: a chat is created once, and the (channel_id, root_ts) unique index
+-- fail-closes a redelivered open into a single anchor.
+INSERT INTO slack_run_messages (run_id, channel_id, root_ts, status_ts, updated_at)
+VALUES (@run_id, @channel_id, @root_ts, sqlc.narg('status_ts'), now())
+RETURNING *;
+
 -- name: GetSlackRunContext :one
 -- Everything the notifier renders into a run DM (content-minimized): owner,
 -- status, issue identity + title, the outcome (MR iid / branch / failure reason),

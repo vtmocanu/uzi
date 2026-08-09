@@ -387,6 +387,7 @@ type Store interface {
 	CreateChatRun(ctx context.Context, arg store.CreateChatRunParams) (store.Run, error)
 	CreateChatContinueRun(ctx context.Context, arg store.CreateChatContinueRunParams) (store.Run, error)
 	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error)
+	GetLiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, error)
 	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
 	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
 	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
