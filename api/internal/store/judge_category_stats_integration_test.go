@@ -58,6 +58,20 @@ func TestJudgeCategoryStatsUncappedAndDedupedLiveDB(t *testing.T) {
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
 
+	// targetCat below is improve_uzi, the ONE category with an instance-wide second consumer:
+	// ListOpenImproveUziRecommendations selects it across the WHOLE table (not owner-scoped,
+	// oldest-first, LIMIT @lim). The OLD improve_uzi groups this test seeds otherwise linger
+	// in the shared live-DB and evict a newer decoy from another package's top-N guard
+	// (TestFiledIssueCloseAutoDonesOnceLiveDB) — the exact cross-fixture bleed the sibling
+	// recommendation_dispositions_integration_test.go documents and defends against with the
+	// same defer. Deleting this owner's run_reviews cascades its recommendations
+	// (review_recommendations.review_id ON DELETE CASCADE, 00059_run_reviews.sql:46), so the
+	// instance-wide improve_uzi backlog returns to its prior state. Runs before pool.Close
+	// (LIFO), and on failure too (Fatalf runs defers).
+	defer func() {
+		mustExec(ctx, t, pool, `DELETE FROM run_reviews WHERE user_id = $1`, owner)
+	}()
+
 	// bulkSeed inserts one run + one review + one recommendation per issue_iid in
 	// [lo, hi], all under the SAME category, in a single round trip. Each gets a distinct
 	// target ('<cat>-<iid>') so it is its own group. updatedAt controls the backlog's
