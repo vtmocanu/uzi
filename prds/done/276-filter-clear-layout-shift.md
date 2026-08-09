@@ -1,8 +1,10 @@
 # PRD #276: Filter-by-label "Clear" — no layout shift, button-not-link styling
 
 **GitLab Issue**: [#276](https://gitlab.example.com/vtmocanu/uzi/-/issues/276)
-**Status**: 📝 Draft — 2026-08-09; architect-reviewed 2026-08-09 (third link-styled site,
-root-cause wording, WCAG level, and Option-B emphasis incorporated)
+**Status**: ✅ Done — 2026-08-09 (implemented via Option B: always-mounted, visibility-
+toggled Clear; three link-styled actions restyled as on-token ghost buttons with
+`min-h-[24px]` meeting WCAG 2.5.8; `task gate:web` green; browser-verified no shift in
+both themes)
 **Priority**: Low
 
 ## Problem
@@ -121,7 +123,7 @@ deferred, record why in the MR.
 
 ## Milestones
 
-- [ ] **M1 — Stable panel height.** The `/judge` "Filter by label" panel renders
+- [x] **M1 — Stable panel height.** The `/judge` "Filter by label" panel renders
   at the same height with and without an active filter (no shift on first chip
   click), via Decision 1. Test (Option B, the meaningful one): the Clear button is
   always in the DOM and is `aria-hidden`/non-focusable when inactive. (Option A's
@@ -129,7 +131,7 @@ deferred, record why in the MR.
   another reason to prefer B.) The pixel-height equality itself is validated in the
   browser (M3): jsdom does no layout, so a `getBoundingClientRect` height assertion
   there would be vacuous.
-- [ ] **M2 — Button-not-link styling.** The three link-styled actions
+- [x] **M2 — Button-not-link styling.** The three link-styled actions
   (`LabelFilter` Clear, run-anchor "Clear filter", `UndoToast` "Undo") render as
   on-token buttons with no persistent underline (Decisions 2, 3), keeping their
   icon + label; target size addressed or deferral recorded (Decision 4). Existing
@@ -138,7 +140,7 @@ deferred, record why in the MR.
   longer contains `underline`" assertion is a brittle unpaired-negative (per
   `.claude/rules/web.md`) — the real gate is the M3 browser pass. Gate:
   `task gate:web`.
-- [ ] **M3 — Gate + manual browser check.** `task gate:web` green; manual pass in
+- [x] **M3 — Gate + manual browser check.** `task gate:web` green; manual pass in
   mock mode (`VITE_UZI_MOCK=1 npm run dev`, `/judge`) in **both** themes (ember and
   mission) confirming: (a) panel height is identical inactive vs. active, and (b)
   the Clear/Clear-filter/Undo actions read as buttons, not links.
