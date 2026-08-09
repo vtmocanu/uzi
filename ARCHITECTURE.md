@@ -642,6 +642,23 @@ chain in the diagram above, with no intervening `running`.
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
   failure carries a `failure_reason`.
+- **Milestone tracker reconciliation** (PRD #122 M2 + PRD #265) — on a
+  milestone-structured `issue` run the run view shows a *reported-complete*
+  tracker (`runs.milestones_completed`, a monotone server-side union; never
+  "verified"). Two sources feed it, both subset-validated against the frozen
+  list server-side: mid-run `report_progress` calls (visible immediately,
+  turn-non-ending), and — since PRD #265 — the lead's declaration on
+  `signal_done` of the milestones it actually finished, unioned into the tracker
+  on the `completed` transition. The declaration is what keeps a **single-turn
+  run** honest: one that goes straight to `signal_done` never emits a mid-run
+  report, so without it the tracker would freeze at "nothing reported" on a run
+  that shipped its work. Completion is **declared, not inferred** — a milestone
+  the lead leaves undeclared stays not-complete, so a deliberately-skipped
+  milestone is not back-filled. `milestones_in_progress` (a snapshot, not a
+  union) is cleared on every terminal transition, since "in progress" is
+  meaningless on a done/failed/cancelled run. The web renders a **null** tracker
+  as "not reported" (`M–/N`), distinct from a genuine `0/N`, so a completed run
+  that simply never reported does not read as a failure.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
   5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
