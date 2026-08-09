@@ -72,4 +72,10 @@ describe("formatCost", () => {
     expect(formatCost(Number.NaN)).toBe("$0.00");
     expect(formatCost(-1)).toBe("$0.00");
   });
+  it("drops the cents at $1000 or more (rounded, no separator)", () => {
+    expect(formatCost(1118.63)).toBe("$1119");
+    expect(formatCost(1000)).toBe("$1000"); // threshold is inclusive
+    expect(formatCost(1500.5)).toBe("$1501"); // rounds up
+    expect(formatCost(999.99)).toBe("$999.99"); // just below, unchanged
+  });
 });
