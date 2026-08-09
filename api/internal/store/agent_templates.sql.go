@@ -15,7 +15,7 @@ import (
 const createAgentTemplate = `-- name: CreateAgentTemplate :one
 INSERT INTO agent_templates (name, description, model, tools, prompt_body, scope, user_id, updated_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized
 `
 
 type CreateAgentTemplateParams struct {
@@ -57,6 +57,7 @@ func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTempla
 		&i.UpdatedAt,
 		&i.Scope,
 		&i.UserID,
+		&i.Customized,
 	)
 	return i, err
 }
@@ -76,7 +77,7 @@ func (q *Queries) DeleteAgentTemplate(ctx context.Context, id uuid.UUID) (int64,
 }
 
 const getAgentTemplate = `-- name: GetAgentTemplate :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE id = $1
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized FROM agent_templates WHERE id = $1
 `
 
 // Unfiltered fetch for the write path: the handler loads the row, then applies
@@ -98,12 +99,13 @@ func (q *Queries) GetAgentTemplate(ctx context.Context, id uuid.UUID) (AgentTemp
 		&i.UpdatedAt,
 		&i.Scope,
 		&i.UserID,
+		&i.Customized,
 	)
 	return i, err
 }
 
 const getAgentTemplateForViewer = `-- name: GetAgentTemplateForViewer :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized FROM agent_templates
 WHERE id = $1
   AND ($2::boolean
        OR scope IN ('builtin', 'global')
@@ -133,12 +135,13 @@ func (q *Queries) GetAgentTemplateForViewer(ctx context.Context, arg GetAgentTem
 		&i.UpdatedAt,
 		&i.Scope,
 		&i.UserID,
+		&i.Customized,
 	)
 	return i, err
 }
 
 const getSharedAgentTemplateByName = `-- name: GetSharedAgentTemplateByName :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE name = $1 AND scope <> 'user'
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized FROM agent_templates WHERE name = $1 AND scope <> 'user'
 `
 
 // Shared-namespace lookup for the reconciler's shadow-warning classification.
@@ -161,6 +164,7 @@ func (q *Queries) GetSharedAgentTemplateByName(ctx context.Context, name string)
 		&i.UpdatedAt,
 		&i.Scope,
 		&i.UserID,
+		&i.Customized,
 	)
 	return i, err
 }
@@ -199,7 +203,7 @@ func (q *Queries) InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuil
 }
 
 const listAgentTemplates = `-- name: ListAgentTemplates :many
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates ORDER BY name
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized FROM agent_templates ORDER BY name
 `
 
 // Unfiltered list of every template (all scopes). Claim assembly uses it until
@@ -227,6 +231,7 @@ func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, erro
 			&i.UpdatedAt,
 			&i.Scope,
 			&i.UserID,
+			&i.Customized,
 		); err != nil {
 			return nil, err
 		}
@@ -239,7 +244,7 @@ func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, erro
 }
 
 const listAgentTemplatesForViewer = `-- name: ListAgentTemplatesForViewer :many
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized FROM agent_templates
 WHERE $1::boolean
    OR scope IN ('builtin', 'global')
    OR (scope = 'user' AND user_id = $2)
@@ -277,6 +282,7 @@ func (q *Queries) ListAgentTemplatesForViewer(ctx context.Context, arg ListAgent
 			&i.UpdatedAt,
 			&i.Scope,
 			&i.UserID,
+			&i.Customized,
 		); err != nil {
 			return nil, err
 		}
@@ -288,6 +294,103 @@ func (q *Queries) ListAgentTemplatesForViewer(ctx context.Context, arg ListAgent
 	return items, nil
 }
 
+const refreshPristineBuiltin = `-- name: RefreshPristineBuiltin :execrows
+UPDATE agent_templates
+SET description = $1,
+    model = $2,
+    tools = $3,
+    prompt_body = $4,
+    updated_at = now()
+WHERE name = $5 AND scope = 'builtin' AND customized = false
+  AND (description, model, tools, prompt_body)
+      IS DISTINCT FROM ($1, $2, $3, $4)
+`
+
+type RefreshPristineBuiltinParams struct {
+	Description string      `json:"description"`
+	Model       pgtype.Text `json:"model"`
+	Tools       []byte      `json:"tools"`
+	PromptBody  string      `json:"prompt_body"`
+	Name        string      `json:"name"`
+}
+
+// Boot-time delivery of shipped builtin-prompt improvements to PRISTINE rows only
+// (PRD #275 M4b). Run per builtin by the reconciler AFTER InsertBuiltinAgentTemplate,
+// as a SEPARATE statement (not ON CONFLICT DO UPDATE) so the insert-only default-
+// allocation seed — gated on the insert's own rowcount — is never triggered by a
+// refresh. Only scope='builtin' + customized=false (pristine, admin never touched)
+// rows are updated; admin-customized rows and user/global same-name rows are left
+// exactly as they are. The IS DISTINCT FROM content guard makes the write (and the
+// updated_at bump) a no-op unless the embedded body actually changed, so an
+// unchanged builtin is not rewritten on every boot.
+func (q *Queries) RefreshPristineBuiltin(ctx context.Context, arg RefreshPristineBuiltinParams) (int64, error) {
+	result, err := q.db.Exec(ctx, refreshPristineBuiltin,
+		arg.Description,
+		arg.Model,
+		arg.Tools,
+		arg.PromptBody,
+		arg.Name,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resetBuiltinAgentTemplate = `-- name: ResetBuiltinAgentTemplate :one
+UPDATE agent_templates
+SET description = $1,
+    model = $2,
+    tools = $3,
+    prompt_body = $4,
+    updated_by = $5,
+    customized = false,
+    updated_at = now()
+WHERE id = $6
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized
+`
+
+type ResetBuiltinAgentTemplateParams struct {
+	Description string      `json:"description"`
+	Model       pgtype.Text `json:"model"`
+	Tools       []byte      `json:"tools"`
+	PromptBody  string      `json:"prompt_body"`
+	UpdatedBy   pgtype.UUID `json:"updated_by"`
+	ID          uuid.UUID   `json:"id"`
+}
+
+// Reset-to-default path (PRD #275): re-apply a builtin's embedded definition AND
+// return the row to pristine (customized=false) so it resumes tracking upstream
+// shipped changes on future boots. Distinct from UpdateAgentTemplate, which marks
+// the row customized. updated_by/updated_at record who reset it and when.
+func (q *Queries) ResetBuiltinAgentTemplate(ctx context.Context, arg ResetBuiltinAgentTemplateParams) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, resetBuiltinAgentTemplate,
+		arg.Description,
+		arg.Model,
+		arg.Tools,
+		arg.PromptBody,
+		arg.UpdatedBy,
+		arg.ID,
+	)
+	var i AgentTemplate
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Model,
+		&i.Tools,
+		&i.PromptBody,
+		&i.IsBuiltin,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
+		&i.Customized,
+	)
+	return i, err
+}
+
 const updateAgentTemplate = `-- name: UpdateAgentTemplate :one
 UPDATE agent_templates
 SET description = $1,
@@ -295,9 +398,10 @@ SET description = $1,
     tools = $3,
     prompt_body = $4,
     updated_by = $5,
+    customized = true,
     updated_at = now()
 WHERE id = $6
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized
 `
 
 type UpdateAgentTemplateParams struct {
@@ -310,8 +414,10 @@ type UpdateAgentTemplateParams struct {
 }
 
 // Edits the mutable fields. name, scope, user_id and is_builtin are immutable and
-// never touched here. Also used by the reset path to re-apply a builtin's
-// embedded definition.
+// never touched here. This is the admin-edit path: any write here marks the row
+// customized (PRD #275), which opts a builtin out of the boot-time pristine
+// refresh until it is Reset. The reset path uses ResetBuiltinAgentTemplate instead
+// so a reset returns to pristine (customized=false) rather than marking it.
 func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTemplateParams) (AgentTemplate, error) {
 	row := q.db.QueryRow(ctx, updateAgentTemplate,
 		arg.Description,
@@ -335,6 +441,7 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 		&i.UpdatedAt,
 		&i.Scope,
 		&i.UserID,
+		&i.Customized,
 	)
 	return i, err
 }

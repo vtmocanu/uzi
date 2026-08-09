@@ -43,6 +43,7 @@ type AgentTemplate struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	Scope       string             `json:"scope"`
 	UserID      pgtype.UUID        `json:"user_id"`
+	Customized  bool               `json:"customized"`
 }
 
 type AgentTemplateAllocation struct {

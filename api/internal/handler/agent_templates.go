@@ -542,7 +542,11 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	row, err := h.q.UpdateAgentTemplate(r.Context(), store.UpdateAgentTemplateParams{
+	// Reset via the dedicated query, not UpdateAgentTemplate: a reset returns the
+	// row to pristine (customized=false) so it resumes tracking upstream shipped
+	// changes on future boots (PRD #275 M4b/D2), whereas UpdateAgentTemplate marks
+	// the row customized.
+	row, err := h.q.ResetBuiltinAgentTemplate(r.Context(), store.ResetBuiltinAgentTemplateParams{
 		ID:          t.ID,
 		Description: def.Description,
 		Model:       model,

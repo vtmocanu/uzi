@@ -16,8 +16,9 @@ import (
 type reconcilerFake struct {
 	existing map[string]AgentTemplate // name -> the row GetSharedAgentTemplateByName returns
 	getErr   map[string]error         // name -> a read-back error
-	inserted []string
-	seeded   []string // names passed to SeedSharedTemplateAllocationByName
+	inserted  []string
+	seeded    []string // names passed to SeedSharedTemplateAllocationByName
+	refreshed []string // names passed to RefreshPristineBuiltin (no-insert path only)
 }
 
 func (f *reconcilerFake) InsertBuiltinAgentTemplate(_ context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error) {
@@ -34,6 +35,14 @@ func (f *reconcilerFake) InsertBuiltinAgentTemplate(_ context.Context, arg Inser
 func (f *reconcilerFake) SeedSharedTemplateAllocationByName(_ context.Context, name string) error {
 	f.seeded = append(f.seeded, name)
 	return nil
+}
+
+// RefreshPristineBuiltin records the call; the in-memory fake cannot model the
+// customized/content-guard WHERE (that is LiveDB coverage), it only proves the
+// reconciler routes the no-insert path here. Returns 0 rows (a no-op refresh).
+func (f *reconcilerFake) RefreshPristineBuiltin(_ context.Context, arg RefreshPristineBuiltinParams) (int64, error) {
+	f.refreshed = append(f.refreshed, arg.Name)
+	return 0, nil
 }
 
 func (f *reconcilerFake) GetSharedAgentTemplateByName(_ context.Context, name string) (AgentTemplate, error) {
