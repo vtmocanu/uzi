@@ -331,10 +331,10 @@ describe("ActivityFeed collapse-by-default", () => {
       expect(t.getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("auto-expands a terminal run (reading a done run is not death-by-clicks)", () => {
+  it("opens a terminal run collapsed", () => {
     const { getAllByRole } = renderFeed(leadWorkerLead(), { status: "completed" });
     for (const t of getAllByRole("button", { name: /activity$/ }))
-      expect(t.getAttribute("aria-expanded")).toBe("true");
+      expect(t.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("auto-expands a single-agent run", () => {
@@ -346,8 +346,10 @@ describe("ActivityFeed collapse-by-default", () => {
     // Two non-contiguous lead blocks only exist in Timeline: By-agent coalesces them
     // into one lane, which is the whole point of PRD #99's Problem 1.
     selectTimelineView();
-    const { getAllByRole, getByRole } = renderFeed(leadWorkerLead(), { status: "completed" });
-    // Terminal → all expanded; collapse lead via its first block's chevron.
+    const { getAllByRole, getByRole, getByText } = renderFeed(leadWorkerLead(), { status: "completed" });
+    // Establish an all-expanded baseline via Expand all, then collapse lead via its
+    // first block's chevron.
+    fireEvent.click(getByText("Expand all"));
     const leadToggles = getAllByRole("button", { name: /lead activity$/ });
     expect(leadToggles).toHaveLength(2);
     fireEvent.click(leadToggles[0]);
@@ -398,10 +400,9 @@ describe("ActivityFeed collapse-by-default", () => {
   });
 
   it("a run finishing WHILE watched keeps un-touched lanes collapsed (no auto-expand on live transition)", () => {
-    // The auto-expand-on-done convenience must not fire when `terminal` flips live: it
-    // would fling every lane open and discard the collapsed view the user was reading.
-    // arrivedTerminal freezes the terminal half at mount, so watched-it-finish stays put
-    // while opened-when-done (the test above) still auto-expands.
+    // Expansion no longer branches on run state: a multi-agent run is collapsed by
+    // default whether opened-when-done or watched-live, so there is nothing to freeze
+    // and `terminal` flipping live cannot fling every lane open.
     const { getAllByRole, rerender } = renderFeed(leadWorkerLead(), {
       status: "running",
       health: "ok",
