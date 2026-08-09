@@ -128,6 +128,18 @@ func (s *Service) revertProposal(ctx context.Context, propID uuid.UUID) {
 	}
 }
 
+// DismissProposalForUser dismisses a pending proposal, ownership-checked through the
+// owning chat run (PRD #191 M4): the Slack Dismiss button's counterpart to the web
+// handler's GetChatProposal + DismissProposal. It NEVER touches the forge. Returns the
+// lookup sentinels (ErrProposalNotFound → not yours/gone, ErrProposalNotPending →
+// already resolved) unchanged.
+func (s *Service) DismissProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) error {
+	if _, err := s.GetChatProposal(ctx, userID, runID, propID); err != nil {
+		return err
+	}
+	return s.DismissProposal(ctx, propID)
+}
+
 // StartRunForUser queues an agent run for an issue (PRD #191 M1): the forge
 // GetIssue + PRDLESS gate + CreateRun composite lifted out of the web CreateRun
 // handler so the Slack start-run card can start a run identically. The issue

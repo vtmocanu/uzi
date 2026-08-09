@@ -57,7 +57,7 @@ const (
 // PublishMessage enqueues only those (Decision 6: thinking/tool frames never post).
 func chatRelevantKind(kind string) bool {
 	switch kind {
-	case "user_message", "text", "status", "error":
+	case "user_message", "text", "status", "error", "proposal":
 		return true
 	default:
 		return false
@@ -141,6 +141,13 @@ func (n *Notifier) applyChatFrame(ctx context.Context, convo *chatConvo, ev chat
 		Text  string `json:"text"`
 		Event string `json:"event"`
 	}
+	if ev.kind == "proposal" {
+		// A proposal card is a standalone message, not part of the turn body — post it
+		// and leave the active turn's placeholder/buffer untouched (M4).
+		n.postProposalCard(ctx, convo, ev.runID, ev.payload)
+		return
+	}
+
 	if err := json.Unmarshal(ev.payload, &p); err != nil {
 		// A payload we can't parse: ignore it rather than let a malformed status frame
 		// mis-resolve an open turn (drop later text). Server-generated JSON, so rare.
@@ -174,6 +181,34 @@ func (n *Notifier) applyChatFrame(ctx context.Context, convo *chatConvo, ev chat
 		}
 	case "error":
 		n.flushChatTurn(ctx, convo, "⚠️ "+chatDynamic(p.Text))
+	}
+}
+
+// postProposalCard renders a chat agent's issue proposal as a Block Kit card with
+// Create / Dismiss in the conversation thread (PRD #191 M4). The payload is the web
+// IssueProposal shape the worker emits (uzi-tools.ts): id, title, description, labels,
+// repo_path. The press is handled by ChatActions (the slack_chat_* namespace), not by
+// this notifier.
+func (n *Notifier) postProposalCard(ctx context.Context, convo *chatConvo, runID uuid.UUID, payload []byte) {
+	var pp struct {
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Labels      []string `json:"labels"`
+		RepoPath    string   `json:"repo_path"`
+	}
+	if err := json.Unmarshal(payload, &pp); err != nil {
+		n.logf("parse proposal payload", err)
+		return
+	}
+	propID, err := uuid.Parse(strings.TrimSpace(pp.ID))
+	if err != nil {
+		n.logf("parse proposal id", err)
+		return
+	}
+	blocks := proposalCardBlocks(runID, propID, pp.Title, pp.Description, pp.Labels, pp.RepoPath)
+	if _, err := n.poster.PostBlocks(ctx, convo.channel, convo.rootTS, "New issue proposal from uzi chat", blocks); err != nil {
+		n.logf("post proposal card", err)
 	}
 }
 

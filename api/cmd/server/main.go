@@ -271,6 +271,12 @@ func run() error {
 		return chatLimiter.Allow(handler.ChatCreateRoutePattern + "|" + userID.String())
 	})
 
+	// Chat-card handler (PRD #191 M4): the slack_chat_* Block Kit buttons — Create /
+	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
+	// linker and the gatekeeper. The forge write rides the same claim-first
+	// ConfirmProposalForUser the web confirm uses (lifted in M1).
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
@@ -281,7 +287,7 @@ func run() error {
 	// the replier.
 	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
 		HTTPTimeout: cfg.SlackHTTPTimeout,
-		Inbound:     slacksvc.InboundMux{slackLinker, slackGate},
+		Inbound:     slacksvc.InboundMux{slackLinker, slackGate, slackChatActions},
 		Messages:    slackReplier,
 		OnConnected: slackLinker.AutoMatch,
 	})
@@ -896,6 +902,42 @@ func (g gateSubmitter) SubmitChatMessage(ctx context.Context, userID, runID uuid
 		return slacksvc.ErrChatTurnCapReached
 	case errors.Is(err, workersvc.ErrRunTerminal):
 		return slacksvc.ErrChatEnded
+	}
+	return err
+}
+
+// ConfirmProposalForUser adapts the Slack proposal card's Create to the run service
+// (PRD #191 M4): the lifted claim-first forge write (M1). It converts the workersvc
+// CreatedIssue to the slacksvc one and translates the proposal sentinels so ChatActions
+// can tell already-handled (edit the card) from not-yours (ephemeral) from a forge
+// failure (retry), all without a workersvc import on the slacksvc side.
+func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) (slacksvc.CreatedIssue, error) {
+	ci, err := g.svc.ConfirmProposalForUser(ctx, userID, runID, propID)
+	switch {
+	case errors.Is(err, workersvc.ErrProposalNotPending):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
+	case errors.Is(err, workersvc.ErrProposalNotFound):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+	case errors.Is(err, workersvc.ErrProposalRepoGone),
+		errors.Is(err, workersvc.ErrForgeBuild),
+		errors.Is(err, workersvc.ErrForgeIssueWrite),
+		errors.Is(err, workersvc.ErrForgesUnavailable):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalForge
+	case err != nil:
+		return slacksvc.CreatedIssue{}, err
+	}
+	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+}
+
+// DismissProposalForUser adapts the Slack proposal card's Dismiss (PRD #191 M4): the
+// ownership-checked, forge-free dismiss, with the two lookup sentinels translated.
+func (g gateSubmitter) DismissProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) error {
+	err := g.svc.DismissProposalForUser(ctx, userID, runID, propID)
+	switch {
+	case errors.Is(err, workersvc.ErrProposalNotPending):
+		return slacksvc.ErrChatProposalHandled
+	case errors.Is(err, workersvc.ErrProposalNotFound):
+		return slacksvc.ErrChatProposalGone
 	}
 	return err
 }
