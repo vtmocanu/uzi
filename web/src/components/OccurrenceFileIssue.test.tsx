@@ -55,6 +55,7 @@ function repoOpt(id: string, path: string): Repo {
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
   };

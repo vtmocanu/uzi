@@ -5,7 +5,7 @@
 **Area**: a second repo-borne capability behind a **Trusted repo** UI grouping. Server: a new `repos.repo_claudemd_enabled` column (migration, draft `00100`), `patchRepoRequest` + `PatchRepo` (`api/internal/handler/forge.go:574-625`), the repo DTO (`api/internal/apitypes/repo.go:14`), store model + queries (`api/internal/store/models.go:222`, `forge.sql.go`), and the claim assembly (`api/internal/workersvc/claim.go`, `agent/src/protocol.ts:308-329` `ClaimRepo`). Worker: read + sanitize the clone's root `CLAUDE.md` and frame it (`agent/src/repo-instructions.ts` new, mirroring `agent/src/repo-skills.ts` + `agent/src/repoagents.ts`), inject lead-only via `buildLeadSystemPrompt` (`agent/src/prompt.ts:162`) using the `memoryFrame` nonce-fence (`agent/src/prompt.ts`, PRD #90), wired at `agent/src/sdk-executor.ts` beside the skills plugin (`:545-560`) and `agent/src/runner.ts:621`. Web: the **Trusted repo** panel refactor of the repo-skills cell (`web/src/pages/Repos.tsx:231-397`), `setRepoClaudemdEnabled` (`web/src/lib/api.ts:2126-2135`), mock parity (`web/src/mocks/data.ts`, `web/src/mocks/mockApi.ts`). Docs: `docs/skills.md` sibling / new user page, `docs/vault-threat-model.md`-class note, an ADR, `specs/ai.md`.
 **Mockup**: [`prds/mockups/246-trusted-repo-mock.html`](mockups/246-trusted-repo-mock.html) — the **Trusted repo** panel (one master affordance over two capability toggles: *Repo skills*, *Repo instructions*), the advisory-wrapper preview, and the guardrails-unchanged strip. Ember theme, tokens from `web/src/index.css`.
 **Line references** are against `ffa08957`.
-**Status**: draft — awaiting review.
+**Status**: complete (2026-08-09) — all milestones M1–M4 landed on `agent/issue-246`. Implementation line references may have drifted from `ffa08957`; the as-built anchors are in [ADR-246](../../adr/0246-trusted-repo-instructions.md) and the branch commits. The draft migration `00100` shipped as `00108` (live head was `00107` at merge time).
 
 ## Problem
 
@@ -336,7 +336,7 @@ exercisable under `VITE_UZI_MOCK=1`.
 
 ## Milestones
 
-- [ ] **M1 — Server: the `repo_claudemd_enabled` opt-in, end to end.** Migration
+- [x] **M1 — Server: the `repo_claudemd_enabled` opt-in, end to end.** Migration
       (draft `00100`); the `repos` column + the `GetRunClaimContext` select
       (`runtime.sql:572`) + the atomic `SetRepoTrustFlags(+ForUser)` query (`sqlc`
       regen, `models.go:222`); the repo DTO (`repo.go:14`) + wire tag test
@@ -346,7 +346,7 @@ exercisable under `VITE_UZI_MOCK=1`.
       **both wire goldens regenerated + the three TS contract tests updated**,
       `claim_wire_contract_test.go`, `claim_skills_test.go:163`). Resolve open
       question 7 (CLI parity check). Go + TS-contract tests; no worker/web behavior yet.
-- [ ] **M2 — Worker: read, sanitize, and inject repo instructions (lead-only).**
+- [x] **M2 — Worker: read, sanitize, and inject repo instructions (lead-only).**
       `agent/src/repo-instructions.ts` (root-only, symlink-guarded, `@`-import
       stripped, 64 KiB cap, drop reasons); `buildRepoInstructionsContext` + the
       `buildLeadSystemPrompt` `repoInstructions` append with the memory nonce-fence;
@@ -357,13 +357,13 @@ exercisable under `VITE_UZI_MOCK=1`.
       (absent/too_large/symlink/@-import), `settingSources` still `[]`, an **adversarial** test
       that a crafted `CLAUDE.md` embedding a static closing delimiter cannot forge the
       fence (mirror the memory nonce test), and that subagents receive nothing.
-- [ ] **M3 — Web: the Trusted repo panel.** `setRepoClaudemdEnabled` + repo type;
+- [x] **M3 — Web: the Trusted repo panel.** `setRepoClaudemdEnabled` + repo type;
       the `Repos.tsx` refactor to the mockup's master + two sub-toggles + confirm copy
       + guardrails note; mock/`mockApi` parity. Tests: the panel toggles each
       capability, the master patches both, confirm copy renders; a browser check under
       `VITE_UZI_MOCK=1` (never a live-proxying `vite dev`/`preview`, per
       `.claude/rules/web.md`) against the mockup.
-- [ ] **M4 — Docs, ADR, specs, changelog.** The ADR; the user doc / `docs/skills.md`
+- [x] **M4 — Docs, ADR, specs, changelog.** The ADR; the user doc / `docs/skills.md`
       section; the threat-model note; the `specs/ai.md` decision; `CHANGELOG.md`. No
       work described as shipped that is not.
 

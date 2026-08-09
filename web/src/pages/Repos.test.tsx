@@ -14,6 +14,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       listProjects: vi.fn(),
       setRepoEnabled: vi.fn(),
       setRepoSkillsEnabled: vi.fn(),
+      setRepoClaudemdEnabled: vi.fn(),
+      setRepoTrustFlags: vi.fn(),
       getRepoToolProfile: vi.fn(),
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
@@ -46,6 +48,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
     ...over,
@@ -53,8 +56,16 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
 }
 
 const REPOS: Repo[] = [
-  repo({ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", repo_skills_enabled: false }),
-  repo({ id: "repo-atlas", path_with_namespace: "vtmocanu/atlas", repo_skills_enabled: true }),
+  // Untrusted: exercises the master enable → confirm path.
+  repo({ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }),
+  // Trusted, with a mix (skills on, instructions off): exercises the sub-toggle
+  // independence and the immediate master-off path.
+  repo({
+    id: "repo-atlas",
+    path_with_namespace: "vtmocanu/atlas",
+    repo_skills_enabled: true,
+    repo_claudemd_enabled: false,
+  }),
   repo({ id: "repo-www", path_with_namespace: "example/website", enabled: false }),
 ];
 
@@ -84,73 +95,146 @@ function renderPage() {
   );
 }
 
-describe("Repos — repo-skills opt-in", () => {
-  it("offers 'Load repo skills' on an enabled repo that has it off", async () => {
+// Open the Trusted-repo panel for a repo row and return its group element.
+async function openTrustPanel(name: string): Promise<HTMLElement> {
+  renderPage();
+  await screen.findByText(name);
+  fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Trusted repo settings for/ }));
+  return screen.getByRole("group", { name: new RegExp(`Trusted repo for ${name}`) });
+}
+
+describe("Repos — Trusted repo cell", () => {
+  it("shows an Off badge + Manage on an enabled, untrusted repo", async () => {
     renderPage();
     await screen.findByText("vtmocanu/uzi");
-    expect(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ })).toBeTruthy();
+    const row = within(rowFor("vtmocanu/uzi"));
+    expect(row.getByText("Off")).toBeTruthy();
+    expect(row.getByRole("button", { name: /Trusted repo settings for vtmocanu\/uzi/ })).toBeTruthy();
   });
 
-  it("shows On + Disable when repo skills are enabled", async () => {
+  it("shows a Trusted badge when a capability is on", async () => {
     renderPage();
     await screen.findByText("vtmocanu/atlas");
-    const row = within(rowFor("vtmocanu/atlas"));
-    expect(row.getByText("On")).toBeTruthy();
-    expect(row.getByRole("button", { name: "Disable repo skills" })).toBeTruthy();
+    expect(within(rowFor("vtmocanu/atlas")).getByText("Trusted")).toBeTruthy();
   });
 
-  it("a disabled repo has no repo-skills control", async () => {
+  it("a disabled repo has no Trusted-repo control", async () => {
     renderPage();
     await screen.findByText("example/website");
     const row = within(rowFor("example/website"));
-    expect(row.queryByRole("button", { name: /Load repo skills/ })).toBeNull();
+    expect(row.queryByRole("button", { name: /Trusted repo settings/ })).toBeNull();
+  });
+});
+
+describe("Repos — Trusted repo panel", () => {
+  it("expands the panel below the table and renders the guardrails strip", async () => {
+    const panel = await openTrustPanel("vtmocanu/uzi");
+    expect(within(panel).getByText("Guardrails are unchanged")).toBeTruthy();
+    // The master switch is present and reflects the derived (off) state.
+    expect(within(panel).getByRole("switch", { name: "Trusted repo" }).getAttribute("aria-checked")).toBe("false");
   });
 
-  it("enabling shows the trust warning and only loads on confirm", async () => {
-    mockApi.setRepoSkillsEnabled.mockResolvedValue({
-      repo: { ...REPOS[0], repo_skills_enabled: true },
-    });
-    renderPage();
-    await screen.findByText("vtmocanu/uzi");
-    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ }));
-
-    // The warning spells out what loads and what never does.
-    expect(screen.getByText(".claude/skills/")).toBeTruthy();
-    expect(screen.getByText(/never the repo/i)).toBeTruthy();
-    expect(screen.getByText(/merge-request review discipline/i)).toBeTruthy();
-    // Nothing changed yet — enabling is behind the confirm.
-    expect(mockApi.setRepoSkillsEnabled).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Enable repo skills" }));
-    await waitFor(() => expect(mockApi.setRepoSkillsEnabled).toHaveBeenCalledWith("repo-uzi", true));
+  it("renders the panel OUTSIDE the horizontal-scroll container (never clipped)", async () => {
+    const panel = await openTrustPanel("vtmocanu/uzi");
+    expect(panel.closest(".overflow-x-auto")).toBeNull();
   });
 
-  it("renders the warning OUTSIDE the horizontal-scroll container (never clipped)", async () => {
-    renderPage();
-    await screen.findByText("vtmocanu/uzi");
-    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ }));
-    const warning = screen.getByRole("group", { name: /Load repo skills for vtmocanu\/uzi/ });
-    // The security caveats must not sit inside an overflow-x-auto region.
-    expect(warning.closest(".overflow-x-auto")).toBeNull();
-  });
-
-  it("moves focus into the warning when it opens", async () => {
-    renderPage();
-    await screen.findByText("vtmocanu/uzi");
-    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ }));
+  it("moves focus into the panel when it opens", async () => {
+    await openTrustPanel("vtmocanu/uzi");
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Enable repo skills" })),
+      expect(document.activeElement).toBe(screen.getByRole("switch", { name: "Trusted repo" })),
     );
   });
 
-  it("disabling repo skills is immediate (no warning)", async () => {
+  it("enabling the master is gated behind a confirm mentioning CLAUDE.md + guardrails", async () => {
+    mockApi.setRepoTrustFlags.mockResolvedValue({
+      repo: { ...REPOS[0], repo_skills_enabled: true, repo_claudemd_enabled: true },
+    });
+    const panel = await openTrustPanel("vtmocanu/uzi");
+
+    fireEvent.click(within(panel).getByRole("switch", { name: "Trusted repo" }));
+
+    // The confirm spells out both capabilities and that guardrails do not change.
+    expect(screen.getByText("CLAUDE.md")).toBeTruthy();
+    expect(screen.getByText(/advisory/i)).toBeTruthy();
+    // Unique to the confirm copy (the strip heading also says "guardrails are unchanged").
+    expect(screen.getByText(/trust grants context, never/i)).toBeTruthy();
+    // Nothing changed yet — enabling is behind the confirm.
+    expect(mockApi.setRepoTrustFlags).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark as trusted" }));
+    await waitFor(() =>
+      expect(mockApi.setRepoTrustFlags).toHaveBeenCalledWith("repo-uzi", {
+        repo_skills_enabled: true,
+        repo_claudemd_enabled: true,
+      }),
+    );
+  });
+
+  it("disabling the master is immediate and patches both flags false", async () => {
+    mockApi.setRepoTrustFlags.mockResolvedValue({
+      repo: { ...REPOS[1], repo_skills_enabled: false, repo_claudemd_enabled: false },
+    });
+    const panel = await openTrustPanel("vtmocanu/atlas");
+
+    fireEvent.click(within(panel).getByRole("switch", { name: "Trusted repo" }));
+    await waitFor(() =>
+      expect(mockApi.setRepoTrustFlags).toHaveBeenCalledWith("repo-atlas", {
+        repo_skills_enabled: false,
+        repo_claudemd_enabled: false,
+      }),
+    );
+  });
+
+  it("the Repo skills sub-toggle patches only repo_skills_enabled", async () => {
     mockApi.setRepoSkillsEnabled.mockResolvedValue({
       repo: { ...REPOS[1], repo_skills_enabled: false },
     });
-    renderPage();
-    await screen.findByText("vtmocanu/atlas");
-    fireEvent.click(within(rowFor("vtmocanu/atlas")).getByRole("button", { name: "Disable repo skills" }));
+    const panel = await openTrustPanel("vtmocanu/atlas");
+
+    // Skills is on for atlas, so toggling turns it off.
+    fireEvent.click(within(panel).getByRole("switch", { name: "Repo skills" }));
     await waitFor(() => expect(mockApi.setRepoSkillsEnabled).toHaveBeenCalledWith("repo-atlas", false));
+    expect(mockApi.setRepoClaudemdEnabled).not.toHaveBeenCalled();
+  });
+
+  it("the Repo instructions sub-toggle patches only repo_claudemd_enabled", async () => {
+    mockApi.setRepoClaudemdEnabled.mockResolvedValue({
+      repo: { ...REPOS[1], repo_claudemd_enabled: true },
+    });
+    const panel = await openTrustPanel("vtmocanu/atlas");
+
+    // Instructions is off for atlas, so toggling turns it on.
+    fireEvent.click(within(panel).getByRole("switch", { name: "Repo instructions" }));
+    await waitFor(() => expect(mockApi.setRepoClaudemdEnabled).toHaveBeenCalledWith("repo-atlas", true));
+    expect(mockApi.setRepoSkillsEnabled).not.toHaveBeenCalled();
+  });
+
+  it("disables every trust control while any trust PATCH is in flight", async () => {
+    // Hold the instructions PATCH open so we can observe the in-flight state.
+    // Skills stays on throughout, so atlas remains trusted and the panel's
+    // sub-toggles stay mounted before and after the PATCH resolves.
+    let resolveClaudemd!: (v: { repo: Repo }) => void;
+    mockApi.setRepoClaudemdEnabled.mockReturnValue(
+      new Promise((r) => {
+        resolveClaudemd = r;
+      }),
+    );
+    const panel = await openTrustPanel("vtmocanu/atlas");
+
+    // Instructions is off for atlas, so this toggles it on and leaves the PATCH pending.
+    fireEvent.click(within(panel).getByRole("switch", { name: "Repo instructions" }));
+
+    const skillsSwitch = () => within(panel).getByRole("switch", { name: "Repo skills" }) as HTMLButtonElement;
+
+    // While that PATCH is pending, the sibling skills toggle and the master switch
+    // are both disabled — no second PATCH can race the first and clobber its result.
+    await waitFor(() => expect(skillsSwitch().disabled).toBe(true));
+    expect((within(panel).getByRole("switch", { name: "Trusted repo" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Resolving the PATCH clears the busy state and re-enables the controls.
+    resolveClaudemd({ repo: { ...REPOS[1], repo_skills_enabled: true, repo_claudemd_enabled: true } });
+    await waitFor(() => expect(skillsSwitch().disabled).toBe(false));
   });
 });
 

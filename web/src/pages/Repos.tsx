@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
-import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
 import { BoardIcon } from "../components/icons";
 
@@ -17,12 +17,19 @@ export function Repos() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
-  // The repo whose "enable repo skills" warning is currently expanded (enabling
-  // is a trust decision, so it is gated behind a confirm; disabling is immediate).
-  // The warning renders OUTSIDE the horizontally-scrolling table so its security
-  // caveats are never clipped at narrow widths.
-  const [warnRepoId, setWarnRepoId] = useState<string | null>(null);
+  // The repo whose "Trusted repo" panel is currently expanded. The panel groups a
+  // master control over two independently-revocable capabilities — Repo skills and
+  // Repo instructions (PRD #246). It renders OUTSIDE the horizontally-scrolling
+  // table so its security copy is never clipped at narrow widths.
+  const [trustRepoId, setTrustRepoId] = useState<string | null>(null);
+  // Enabling the master is a trust decision, so it is gated behind a confirm step;
+  // this holds the repo whose enable-confirm is showing. Disabling (master or a
+  // sub-toggle) is immediate, matching the existing opt-in patterns.
+  const [confirmTrustId, setConfirmTrustId] = useState<string | null>(null);
+  // Per-capability busy state so each PATCH disables only its own control.
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
+  const [claudemdBusyId, setClaudemdBusyId] = useState<string | null>(null);
+  const [trustBusyId, setTrustBusyId] = useState<string | null>(null);
   // Tool profile picker (PRD #18 M4): the repo whose package picker is open, the
   // admin allowlist (loaded once), the currently-selected package strings for the
   // open repo, and the in-flight save.
@@ -30,17 +37,25 @@ export function Repos() {
   const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
   const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
   const [toolsBusy, setToolsBusy] = useState(false);
-  // Focus management: remember the "Load repo skills" trigger so focus returns to
-  // it on cancel, and move focus into the warning (its first button) when it opens.
-  const warnTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const warnBannerRef = useRef<HTMLDivElement | null>(null);
+  // Focus management: remember the cell trigger so focus returns to it when the
+  // panel closes, and move focus into the panel (its master switch) when it opens.
+  const trustTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const trustPanelRef = useRef<HTMLDivElement | null>(null);
+  // The enable-confirm block; when it opens, focus moves to its primary button
+  // ("Mark as trusted", the first button inside) so a screen-reader user hears it —
+  // the master switch's aria-checked stays false until the PATCH lands.
+  const confirmTrustRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (warnRepoId) warnBannerRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
-  }, [warnRepoId]);
+    if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [trustRepoId]);
+  useEffect(() => {
+    if (confirmTrustId) confirmTrustRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [confirmTrustId]);
 
-  const cancelWarn = () => {
-    setWarnRepoId(null);
-    warnTriggerRef.current?.focus();
+  const closeTrust = () => {
+    setTrustRepoId(null);
+    setConfirmTrustId(null);
+    trustTriggerRef.current?.focus();
   };
 
   useEffect(() => {
@@ -88,18 +103,62 @@ export function Repos() {
     }
   };
 
+  // A repo is "trusted" when either capability is on; the master control is derived
+  // from that, never stored (PRD #246 open question 1).
+  const isTrusted = (repo: Repo) => repo.repo_skills_enabled || repo.repo_claudemd_enabled;
+
+  // Repo skills sub-toggle → repo_skills_enabled. Immediate; refining an already-
+  // trusted repo is not a new trust decision.
   const setRepoSkills = async (repo: Repo, enabled: boolean) => {
     setError("");
     setSkillsBusyId(repo.id);
     try {
       const { repo: updated } = await api.setRepoSkillsEnabled(repo.id, enabled);
       setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-      setWarnRepoId(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Update failed");
     } finally {
       setSkillsBusyId(null);
     }
+  };
+
+  // Repo instructions sub-toggle → repo_claudemd_enabled. Immediate.
+  const setRepoClaudemd = async (repo: Repo, enabled: boolean) => {
+    setError("");
+    setClaudemdBusyId(repo.id);
+    try {
+      const { repo: updated } = await api.setRepoClaudemdEnabled(repo.id, enabled);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setClaudemdBusyId(null);
+    }
+  };
+
+  // Master control → both trust flags in one request. Enabling defaults both on
+  // (the trust decision, gated behind the confirm); disabling turns both off.
+  const setRepoTrust = async (repo: Repo, enabled: boolean) => {
+    setError("");
+    setTrustBusyId(repo.id);
+    try {
+      const { repo: updated } = await api.setRepoTrustFlags(repo.id, {
+        repo_skills_enabled: enabled,
+        repo_claudemd_enabled: enabled,
+      });
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      setConfirmTrustId(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setTrustBusyId(null);
+    }
+  };
+
+  // Master switch click: turning off is immediate; turning on reveals the confirm.
+  const onMasterToggle = (repo: Repo) => {
+    if (isTrusted(repo)) setRepoTrust(repo, false);
+    else setConfirmTrustId(repo.id);
   };
 
   // The package string an allowlist entry contributes: name@version when the entry
@@ -171,9 +230,16 @@ export function Repos() {
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
 
-  // The repo whose trust warning is expanded (rendered as a banner below the
-  // table, outside its horizontal scroll container).
-  const warnRepo = repos.find((r) => r.id === warnRepoId) ?? null;
+  // The repo whose Trusted-repo panel is expanded (rendered below the table,
+  // outside its horizontal scroll container).
+  const trustRepo = repos.find((r) => r.id === trustRepoId) ?? null;
+  // True while ANY of the three trust-related PATCHes (skills / instructions /
+  // master) is in flight for the open repo. Each PATCH response replaces the whole
+  // repo object, so two in flight at once can clobber each other with a stale
+  // snapshot; disabling every trust control while one runs serializes them.
+  const anyTrustBusy =
+    trustRepo != null &&
+    (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id);
   // The repo whose tool-profile picker is expanded (rendered below the table).
   const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
 
@@ -228,7 +294,7 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Project</th>
                     <th className="px-4 py-3 font-medium">Default branch</th>
                     <th className="px-4 py-3 font-medium">Status</th>
-                    <th className="px-4 py-3 font-medium">Repo skills</th>
+                    <th className="px-4 py-3 font-medium">Trusted repo</th>
                     <th className="px-4 py-3 font-medium">Tools</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
@@ -289,34 +355,25 @@ export function Repos() {
                         <td className="px-4 py-3">
                           {!r.enabled ? (
                             <span className="text-xs text-faint">—</span>
-                          ) : r.repo_skills_enabled ? (
+                          ) : (
                             <div className="flex flex-wrap items-center gap-2">
-                              <Badge tone="ok" dot>
-                                On
+                              <Badge tone={isTrusted(r) ? "ok" : "neutral"} dot>
+                                {isTrusted(r) ? "Trusted" : "Off"}
                               </Badge>
                               <Button
-                                variant="ghost"
+                                variant="secondary"
                                 size="sm"
-                                aria-label="Disable repo skills"
-                                disabled={skillsBusyId === r.id}
-                                onClick={() => setRepoSkills(r, false)}
+                                aria-expanded={trustRepoId === r.id}
+                                aria-label={`Trusted repo settings for ${r.path_with_namespace}`}
+                                onClick={(e) => {
+                                  trustTriggerRef.current = e.currentTarget;
+                                  setConfirmTrustId(null);
+                                  setTrustRepoId((id) => (id === r.id ? null : r.id));
+                                }}
                               >
-                                Disable
+                                {trustRepoId === r.id ? "Close" : "Manage"}
                               </Button>
                             </div>
-                          ) : (
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              aria-expanded={warnRepoId === r.id}
-                              disabled={skillsBusyId === r.id}
-                              onClick={(e) => {
-                                warnTriggerRef.current = e.currentTarget;
-                                setWarnRepoId((id) => (id === r.id ? null : r.id));
-                              }}
-                            >
-                              Load repo skills
-                            </Button>
                           )}
                         </td>
                         <td className="px-4 py-3">
@@ -360,44 +417,157 @@ export function Repos() {
               </table>
             </div>
 
-            {/* Rendered OUTSIDE the overflow-x-auto div above so the security
-                caveats stay fully readable at any width (never clipped behind a
-                horizontal scroll). Only one repo's warning shows at a time. */}
-            {warnRepo && (
+            {/* The Trusted-repo panel (PRD #246). Rendered OUTSIDE the
+                overflow-x-auto div above so its security copy stays fully readable
+                at any width (never clipped behind a horizontal scroll). Only one
+                repo's panel shows at a time. */}
+            {trustRepo && (
               <div
-                ref={warnBannerRef}
+                ref={trustPanelRef}
                 role="group"
-                aria-label={`Load repo skills for ${warnRepo.path_with_namespace}`}
-                className="space-y-3 border-t border-edge bg-warn/5 p-4"
+                aria-label={`Trusted repo for ${trustRepo.path_with_namespace}`}
+                className="space-y-4 border-t border-edge bg-raised/20 p-4"
               >
-                <p className="text-sm text-fg">
-                  <span className="font-medium">
-                    Load skills from {warnRepo.path_with_namespace}?
-                  </span>{" "}
-                  Enabling this loads skills from the repo&rsquo;s own{" "}
-                  <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">
-                    .claude/skills/
-                  </code>{" "}
-                  into every run on this repo. Only <code className="font-mono text-xs">SKILL.md</code>{" "}
-                  files load, never the repo&rsquo;s hooks, settings, commands, or{" "}
-                  <code className="font-mono text-xs">CLAUDE.md</code>. A skill can steer an agent, so
-                  enable this only for a repo whose merge-request review discipline you trust.
-                </p>
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    disabled={skillsBusyId === warnRepo.id}
-                    onClick={() => setRepoSkills(warnRepo, true)}
+                {/* Header: what "trusted" means, plus the master switch. */}
+                <div className="flex items-start gap-4">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+                      Trusted repo
+                      <Badge tone={isTrusted(trustRepo) ? "ok" : "neutral"} dot>
+                        {isTrusted(trustRepo) ? "Trusted" : "Off"}
+                      </Badge>
+                    </h3>
+                    <p className="max-w-2xl text-sm text-muted">
+                      You vouch that every committer to {trustRepo.path_with_namespace} is trusted. This
+                      unlocks repo-authored context below, applied to new runs immediately. It grants{" "}
+                      <span className="font-medium text-fg">context, not permissions</span>: the guardrails do
+                      not change.
+                    </p>
+                  </div>
+                  <Toggle
+                    label="Trusted repo"
+                    checked={isTrusted(trustRepo)}
+                    disabled={anyTrustBusy}
+                    onChange={() => onMasterToggle(trustRepo)}
+                  />
+                </div>
+
+                {/* Enable is a trust decision → confirm before the master turns on. */}
+                {confirmTrustId === trustRepo.id && !isTrusted(trustRepo) && (
+                  <div
+                    ref={confirmTrustRef}
+                    role="group"
+                    aria-label={`Confirm trusting ${trustRepo.path_with_namespace}`}
+                    className="space-y-3 rounded-md border border-warn/40 bg-warn/5 p-3"
                   >
-                    {skillsBusyId === warnRepo.id ? "Enabling…" : "Enable repo skills"}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={skillsBusyId === warnRepo.id}
-                    onClick={cancelWarn}
-                  >
-                    Cancel
+                    <p className="text-sm text-fg">
+                      <span className="font-medium">Mark {trustRepo.path_with_namespace} as trusted?</span>{" "}
+                      This turns on both capabilities: it loads skills from the repo&rsquo;s own{" "}
+                      <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">.claude/skills/</code>, and
+                      lets the lead read the repo&rsquo;s root{" "}
+                      <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> as{" "}
+                      <span className="font-medium">advisory</span> context. Repo content can steer an agent, so
+                      enable this only for a repo whose merge-request review discipline you trust. The{" "}
+                      <span className="font-medium">guardrails are unchanged</span> — trust grants context, never
+                      permissions. You can turn either capability off on its own afterward.
+                    </p>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        disabled={anyTrustBusy}
+                        onClick={() => setRepoTrust(trustRepo, true)}
+                      >
+                        {trustBusyId === trustRepo.id ? "Enabling…" : "Mark as trusted"}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={anyTrustBusy}
+                        onClick={() => setConfirmTrustId(null)}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Two independently-revocable capabilities, shown once trusted. */}
+                {isTrusted(trustRepo) && (
+                  <div className="grid gap-3">
+                    {/* Repo skills */}
+                    <div className="flex items-start gap-3 rounded-md border border-edge bg-raised p-3">
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <h4 className="text-sm font-semibold text-fg">Repo skills</h4>
+                        <p className="text-sm text-muted">
+                          Load skills from the repo&rsquo;s own{" "}
+                          <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">.claude/skills/</code>.
+                          The agent invokes them on demand; they rank below every built-in skill.
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
+                          <span className="rounded border border-edge px-1.5 py-0.5">.claude/skills/</span>
+                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">name + description kept</span>
+                          <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">tool grants stripped</span>
+                          <span className="rounded border border-edge px-1.5 py-0.5">lowest precedence</span>
+                        </div>
+                      </div>
+                      <Toggle
+                        label="Repo skills"
+                        checked={trustRepo.repo_skills_enabled}
+                        disabled={anyTrustBusy}
+                        onChange={(next) => setRepoSkills(trustRepo, next)}
+                      />
+                    </div>
+
+                    {/* Repo instructions */}
+                    <div className="flex items-start gap-3 rounded-md border border-edge bg-raised p-3">
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <h4 className="text-sm font-semibold text-fg">Repo instructions</h4>
+                        <p className="text-sm text-muted">
+                          Let the lead read the repo&rsquo;s root{" "}
+                          <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> as{" "}
+                          <span className="font-medium text-fg">advisory context</span> about project conventions.
+                          The lead verifies tools and paths against the worker before relying on any of it.
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
+                          <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
+                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">lead only</span>
+                          <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">@-imports stripped</span>
+                          <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">cannot override guardrails</span>
+                          <span className="rounded border border-edge px-1.5 py-0.5">64 KB cap</span>
+                        </div>
+                      </div>
+                      <Toggle
+                        label="Repo instructions"
+                        checked={trustRepo.repo_claudemd_enabled}
+                        disabled={anyTrustBusy}
+                        onChange={(next) => setRepoClaudemd(trustRepo, next)}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Guardrails-unchanged strip — true whether or not the repo is trusted. */}
+                <div className="rounded-md border border-ok/30 bg-ok/5 p-3">
+                  <h4 className="mb-2 text-sm font-semibold text-fg">Guardrails are unchanged</h4>
+                  <ul className="grid gap-1.5 text-sm text-muted sm:grid-cols-2">
+                    <li>
+                      <code className="font-mono text-xs">main</code> is never touched
+                    </li>
+                    <li>The worker holds the token, not the agent</li>
+                    <li>Protected branch + Developer role on the forge</li>
+                    <li>
+                      <code className="font-mono text-xs">settingSources</code> stays empty — no hooks or settings load
+                    </li>
+                  </ul>
+                  <p className="mt-2 text-xs text-faint">
+                    Trust adds what the agent reads. It never adds what the agent can do. Every merge still goes
+                    through human review.
+                  </p>
+                </div>
+
+                <div className="flex">
+                  <Button variant="ghost" size="sm" onClick={closeTrust}>
+                    Close
                   </Button>
                 </div>
               </div>

@@ -25,8 +25,11 @@ const fixture = join(
 test("claim wire contract: worker parses the server's skill shape", () => {
   const claim = JSON.parse(readFileSync(fixture, "utf8")) as ClaimResponse;
 
-  // Repo opt-in flag.
+  // Repo opt-in flags (PRD #16 skills, PRD #246 claudemd). Both trust flags ride the
+  // repo block byte-for-byte (no omitempty on the Go side), so the worker's parse of
+  // each is pinned across the language boundary.
   assert.equal(claim.repo.skills_enabled, true);
+  assert.equal(claim.repo.claudemd_enabled, true);
 
   // PRD #65 R8: the worker parses forge_type off the claim (the server emits it on
   // every claim; "gitlab" for a GitLab connection). Absent ⇒ gitlab on an old api;

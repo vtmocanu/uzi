@@ -100,19 +100,6 @@ WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
 
--- name: SetRepoSkillsEnabledForUser :one
--- Repo-skills opt-in toggle, authorized through the repo's owning connection.
--- A non-owned or unknown id returns no rows (mapped to 404 in the handler).
-UPDATE repos SET repo_skills_enabled = $2
-WHERE repos.id = $1
-  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING *;
-
--- name: SetRepoSkillsEnabled :one
--- Admin path for the repo-skills toggle: not scoped to the owning user. The
--- handler gates this on the caller being an admin.
-UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING *;
-
 -- name: SetRepoDevboxOptInForUser :one
 -- Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
 -- repo's owning connection. A non-owned or unknown id returns no rows (404).
@@ -125,6 +112,27 @@ RETURNING *;
 -- Admin path for the tier-2 opt-in toggle: not scoped to the owning user; gated on
 -- the caller being an admin in the handler.
 UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING *;
+
+-- name: SetRepoTrustFlags :one
+-- Atomic Trusted-repo (PRD #246) toggle: sets repo_skills_enabled and/or
+-- repo_claudemd_enabled in ONE round-trip. A nil arg leaves that column unchanged
+-- (COALESCE), so the master toggle and each sub-toggle share one code path with no
+-- partial-failure window. Admin path (not scoped to owning user).
+UPDATE repos SET
+  repo_skills_enabled   = COALESCE(sqlc.narg('skills'), repo_skills_enabled),
+  repo_claudemd_enabled = COALESCE(sqlc.narg('claudemd'), repo_claudemd_enabled)
+WHERE repos.id = sqlc.arg('id')
+RETURNING *;
+
+-- name: SetRepoTrustFlagsForUser :one
+-- Owner path for the atomic Trusted-repo toggle, authorized through the repo's
+-- owning connection. A non-owned or unknown id returns no rows (mapped to 404).
+UPDATE repos SET
+  repo_skills_enabled   = COALESCE(sqlc.narg('skills'), repo_skills_enabled),
+  repo_claudemd_enabled = COALESCE(sqlc.narg('claudemd'), repo_claudemd_enabled)
+WHERE repos.id = sqlc.arg('id')
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = sqlc.arg('user_id'))
+RETURNING *;
 
 -- name: ListEnabledReposWithConnections :many
 -- Every enabled repo across all users, with its connection, for the sync
