@@ -66,6 +66,64 @@ export const MEMORY_EVIDENCE_MAX_BYTES = 200;
  */
 const VOLATILE_SNAPSHOT_RE = /\d+\s*(?:pass|fail)|\d+\s*\/\s*\d+|\bof\s+\d+\b/i;
 
+/**
+ * A "config claim" is a memory that asserts THIS run's OWN roster/tool/runtime
+ * configuration — which subagent can Edit/Write, which is read-only, what tools a
+ * role inherits (PRD #266 M4). That class of fact should be READ LIVE from the
+ * per-turn roster (surfaced in M1), NOT remembered: it decays as the product
+ * changes and a stale copy misleads a later run. A match appends a NON-FATAL nudge
+ * — never a rejection — exactly like VOLATILE_SNAPSHOT_RE; the memory is stored
+ * either way, and it never sets isError.
+ *
+ * The discriminator (this is an agent-framework repo, so legitimate memories name
+ * `tools`/`coder`/`Edit`/`Write` constantly): fire ONLY when a roster-subject token
+ * (CONFIG_ROLE) co-occurs with a write/tool-capability token (CONFIG_TOOL) AND that
+ * capability sits in a POSSESSION, NEGATION, or COPULA frame (CONFIG_POSS: has /
+ * lacks / no / cannot / inherits / edits via / is / are …) within a BOUNDED window
+ * of it — so "the coder IS read-only" trips too. A subagent name
+ * next to a bare filename ("the coder must update forge.ts") does NOT trip: no
+ * capability token and no possession frame.
+ *
+ * Borderline calls (documented per the M4 spec): the "coder inherits all tools
+ * including Edit and Write" fixture is a POSITIVE — an affirmative capability claim
+ * is still a runtime-config fact to read live, not remember. "the lead roster now
+ * annotates each subagent … prompt.ts" stays a NEGATIVE: it names a role and the
+ * roster but asserts no tool possession/negation, so it is quiet — which is what
+ * keeps the near-miss #5 and the tool-only/role-only cases quiet too.
+ *
+ * COST COUPLING (same discipline as VOLATILE_SNAPSHOT_RE): cost is bounded only by
+ * input length. The `bytes > MEMORY_BODY_MAX_BYTES` early-return in saveMemory runs
+ * BEFORE this regex, so `body` here is always ≤ MEMORY_BODY_MAX_BYTES (2048). Each
+ * lookahead scans once and the inter-token gap is a BOUNDED `{0,40}` (no nested
+ * unbounded quantifier), so the worst case is linear in the cap. Revisit if
+ * MEMORY_BODY_MAX_BYTES grows.
+ */
+const CONFIG_ROLE = "(?:subagents?|coders?|reviewers?|auditors?|testers?|architects?|documenters?|web-ux|leads?|rosters?)";
+const CONFIG_TOOL = "(?:MultiEdit|NotebookEdit|Edit|Write|tools?|edit files|write files|write access|write-capable|read-only)";
+const CONFIG_POSS =
+  // Copula framing (is/are/isn't/aren't) lets a directly-framed capability phrase
+  // ("the coder IS read-only", "the reviewer IS write-capable") trip without a
+  // separate possession word — but the CONFIG_TOOL-within-{0,40} requirement still
+  // means a bare "the coder is slow" (no tool/capability token) does NOT fire.
+  "(?:has|have|had|lacks?|lacked|without|cannot|can['’]?t|can not|does(?:n['’]?t| not)? have|inherit(?:s|ed)?|declare[sd]?|edits? via|is|are|isn['’]?t|aren['’]?t|no)";
+const CONFIG_CLAIM_RE = new RegExp(
+  // Anchored at ^ (no `m` flag) so both lookaheads scan the WHOLE body once from
+  // its start — a role BEFORE the capability phrase still counts (as in "the coder
+  // subagent has no Edit/Write"), which a non-anchored form would miss.
+  "^(?=[\\s\\S]*\\b" +
+    CONFIG_ROLE +
+    "\\b)(?=[\\s\\S]*(?:\\b" +
+    CONFIG_POSS +
+    "\\b[\\s\\S]{0,40}\\b" +
+    CONFIG_TOOL +
+    "\\b|\\b" +
+    CONFIG_TOOL +
+    "\\b[\\s\\S]{0,40}\\b" +
+    CONFIG_POSS +
+    "\\b))",
+  "i",
+);
+
 /** The qualified tool name to allow/deny by (extraTools / subagent deny). */
 export function memoryToolNames(): string[] {
   return [`mcp__${MEMORY_SERVER_NAME}__${SAVE_MEMORY_TOOL}`];
@@ -162,8 +220,14 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
         const snapshotNudge = VOLATILE_SNAPSHOT_RE.test(body)
           ? " Note: this reads like a volatile snapshot figure (a count, ratio, or \"N of M\" tally). It is saved, but prefer recording the durable fact — the mechanism or command, not today's number, which decays and misleads a later run."
           : "";
+        // Independent of the snapshot nudge (both can append): flag a claim about
+        // THIS run's own subagent tool/roster/runtime config, which should be read
+        // live rather than remembered. Append-only prose — never a rejection.
+        const configClaimNudge = CONFIG_CLAIM_RE.test(body)
+          ? " Note: this asserts your run's own subagent tool/roster configuration (which role can Edit/Write, is read-only, or inherits tools). It is saved, but READ that live from the per-turn roster rather than remembering it — such config changes as the product evolves, so a remembered version can be wrong."
+          : "";
         return asText(
-          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}`,
+          `Saved cross-run memory "${entry.title}" (id ${entry.id}). Future runs on this repository will see it as advisory context — it is NOT authoritative and will never override the current task.${snapshotNudge}${configClaimNudge}`,
         );
       } catch (err) {
         log.warn("save_memory tool failed", { run_id: runId, error: errMessage(err) });
