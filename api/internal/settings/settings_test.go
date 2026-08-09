@@ -287,7 +287,7 @@ func TestInvalidateForcesRefetch(t *testing.T) {
 	fs := &fakeStore{rows: []store.AppSetting{row(KeyPRDLabel, "v1")}}
 	c := New(fs, time.Hour) // long TTL: only Invalidate should trigger a refetch
 
-	c.PRDLabel(context.Background())
+	_, _ = c.PRDLabel(context.Background())
 	fs.rows = []store.AppSetting{row(KeyPRDLabel, "v2")}
 
 	// Still cached before invalidation.
@@ -307,7 +307,7 @@ func TestStaleOnRefreshError(t *testing.T) {
 	c := New(fs, time.Minute)
 	c.now = func() time.Time { return now }
 
-	c.PRDLabel(context.Background()) // prime the cache
+	_, _ = c.PRDLabel(context.Background()) // prime the cache
 
 	// TTL expires and the next refresh errors: the last known-good value is
 	// served and no error surfaces.

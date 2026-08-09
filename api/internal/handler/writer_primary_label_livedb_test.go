@@ -97,13 +97,13 @@ func newBoardWriterServer(t *testing.T, s *boardWriterStub) *httptest.Server {
 			s.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"id":1,"name":%q}`, name)
+			_, _ = fmt.Fprintf(w, `{"id":1,"name":%q}`, name)
 		case r.Method == http.MethodPut && strings.Contains(path, "/issues/"):
 			s.mu.Lock()
 			s.issueUpdateAdds = splitLabels(m["add_labels"])
 			s.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"id":1,"iid":5,"state":"opened","web_url":"https://forge.example/x","labels":["PRD"]}`)
+			_, _ = fmt.Fprint(w, `{"id":1,"iid":5,"state":"opened","web_url":"https://forge.example/x","labels":["PRD"]}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/issues"):
 			s.mu.Lock()
 			s.createLabels = splitLabels(m["labels"])
@@ -113,7 +113,7 @@ func newBoardWriterServer(t *testing.T, s *boardWriterStub) *httptest.Server {
 			title, _ := m["title"].(string)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"state":"opened","web_url":"https://forge.example/g/w/-/issues/%d","labels":["PRD"]}`, iid, iid, title, iid)
+			_, _ = fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"state":"opened","web_url":"https://forge.example/g/w/-/issues/%d","labels":["PRD"]}`, iid, iid, title, iid)
 		default:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("{}"))

@@ -90,7 +90,7 @@ func newForgeStub(t *testing.T) *forgeStub {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"description":%q,"state":"opened","web_url":"https://forge.example/g/ra/-/issues/%d","labels":["PRD","PRDLESS"]}`,
+			_, _ = fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":1,"title":%q,"description":%q,"state":"opened","web_url":"https://forge.example/g/ra/-/issues/%d","labels":["PRD","PRDLESS"]}`,
 				iid, iid, title, desc, iid)
 			return
 		}
