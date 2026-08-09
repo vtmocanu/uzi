@@ -2,7 +2,15 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assembleAgents, LEAD_NAME_RE, planTurnSubagents, selectSubagents, subagentsFromTemplates } from "../src/agents.js";
+import {
+  assembleAgents,
+  LEAD_NAME_RE,
+  planTurnSubagents,
+  selectSubagents,
+  subagentsFromTemplates,
+  subagentCanWrite,
+  subagentWriteCapabilities,
+} from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -420,5 +428,70 @@ describe("planTurnSubagents (#203)", () => {
 
   it("is a no-op on an empty roster", () => {
     assert.deepStrictEqual(planTurnSubagents({}), { subagents: {}, dropped: [] });
+  });
+});
+
+describe("subagentCanWrite (PRD #266 M1)", () => {
+  const def = (tools: string[] | undefined) =>
+    ({ description: "d", prompt: "p", ...(tools ? { tools } : {}) }) as const;
+
+  it("treats an ABSENT tools list as inherit-all → can write", () => {
+    assert.strictEqual(subagentCanWrite(def(undefined)), true);
+  });
+
+  it("treats an EMPTY tools list as inherit-all → can write", () => {
+    assert.strictEqual(subagentCanWrite(def([])), true);
+  });
+
+  it("is read-only when a declared allowlist names no write tool", () => {
+    assert.strictEqual(subagentCanWrite(def(["Read", "Grep"])), false);
+  });
+
+  it("can write when a declared allowlist intersects WRITE_PATH_TOOLS", () => {
+    assert.strictEqual(subagentCanWrite(def(["Bash", "Edit"])), true);
+  });
+
+  it("counts NotebookEdit-only as write-capable (every write tool, not just Edit/Write)", () => {
+    assert.strictEqual(subagentCanWrite(def(["NotebookEdit"])), true);
+    assert.strictEqual(subagentCanWrite(def(["MultiEdit"])), true);
+  });
+});
+
+describe("subagentWriteCapabilities (PRD #266 M1)", () => {
+  it("maps every subagent name to its declared write capability", () => {
+    // coder inherits all (tools:null) → can write; reviewer declares a read-only
+    // allowlist → read-only.
+    const { subagents } = assembleAgents([coder, reviewer]);
+    assert.deepStrictEqual(subagentWriteCapabilities(subagents), {
+      coder: true,
+      reviewer: false,
+    });
+  });
+
+  it("DERIVES capability from the PRE-STRIP defs — the plan turn's stripped map would falsely show coder read-only", () => {
+    // The exact bug PRD #266 fixes. `coder` inherits all tools (tools:null) so it CAN
+    // write; planTurnSubagents subtracts the write tools for the plan wave, so reading
+    // capability off THAT map would report coder as read-only. Capability must come
+    // from `assembled.subagents` (pre-strip), where it still reads as write-capable.
+    const inheritCoder: AgentTemplate = {
+      name: "coder",
+      description: "implements",
+      prompt_body: "You implement.",
+      tools: null,
+      model: null,
+    };
+    const { subagents } = assembleAgents([inheritCoder]);
+    const { subagents: planned } = planTurnSubagents(subagents);
+
+    assert.strictEqual(
+      subagentWriteCapabilities(subagents).coder,
+      true,
+      "pre-strip map: coder is write-capable",
+    );
+    // Sanity: the plan-turn map is where the false negative would come from — coder
+    // there carries the write tools in disallowedTools, and subagentCanWrite reads
+    // only `tools` (still absent → inherit-all → true), but the roster line MUST be
+    // fed the pre-strip map, which this milestone's executor does.
+    assert.strictEqual(planned.coder?.tools, undefined, "plan turn left inherit-all intact");
   });
 });

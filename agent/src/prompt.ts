@@ -505,6 +505,10 @@ export interface PlanPromptInput {
   branch: string;
   /** Names of the invokable subagents, surfaced so the lead can delegate. */
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. */
   memory?: readonly MemoryEntryView[];
@@ -546,7 +550,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     `</issue_description>`,
     ...(memoryBlock ? ["", memoryBlock] : []),
     "",
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
     "",
@@ -588,6 +592,10 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
 export interface ImplementPromptInput {
   branch: string;
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** True for the first implementation turn (right after approval). */
   first: boolean;
   /** The current implement⇄review iteration (1-based). */
@@ -694,7 +702,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       "</plan>",
     );
   }
-  lines.push(delegatesLine(input.subagentNames));
+  lines.push(delegatesLine(input.subagentNames, input.subagentCanWrite));
   // Facts, first turn only. A failed dir reads as failed so the agent can act on it.
   const depsNote = input.first
     ? depsProvisionImplementNote(input.deps, input.depsTruncated)
@@ -790,10 +798,27 @@ function milestoneStatusNote(
   ].join("\n");
 }
 
-function delegatesLine(subagentNames: string[]): string {
-  return subagentNames.length > 0
-    ? `Available subagents to delegate to: ${subagentNames.join(", ")}.`
-    : "No subagents are available; do the work yourself.";
+// PRD #266 M1: the roster line names each subagent AND its write capability, so the
+// lead never guesses whether a role can edit files. The capability MUST be derived
+// from the PRE-STRIP implement-turn definitions (see subagentWriteCapabilities in
+// agents.ts) — reading it off the plan-turn stripped map would falsely mark `coder`
+// (inherit-all) as read-only. `canWrite` is looked up per name; a name missing from
+// the map (should not happen for a real roster) defaults to read-only. When the map
+// is absent entirely (back-compat), the line renders names only, as before.
+function delegatesLine(
+  subagentNames: string[],
+  canWrite?: Record<string, boolean>,
+): string {
+  if (subagentNames.length === 0) {
+    return "No subagents are available; do the work yourself.";
+  }
+  if (!canWrite) {
+    return `Available subagents to delegate to: ${subagentNames.join(", ")}.`;
+  }
+  const annotated = subagentNames
+    .map((n) => `${n} (${canWrite[n] ? "can edit files" : "read-only"})`)
+    .join(", ");
+  return `Available subagents to delegate to: ${annotated}.`;
 }
 
 // ── Self-improvement runs (PRD #46 Decision 10) ──────────────────────────────
@@ -821,6 +846,10 @@ export interface SelfImprovePlanPromptInput {
   /** The accumulated improve_uzi backlog (untrusted), carried as issue_description. */
   recommendations: string;
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
    *  self_improve run can WRITE memory, so it must also READ it back (write/read
@@ -889,7 +918,7 @@ export function buildSelfImprovePlanPrompt(
     closeTag,
     ...(memoryBlock ? ["", memoryBlock] : []),
     "",
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
     depsProvisionPlanNote(),
     "",
@@ -941,6 +970,10 @@ export interface CIFixPlanPromptInput {
   /** The failed jobs' names/stages + log tails (UNTRUSTED evidence). */
   failedJobs: { name: string; stage: string; logTail: string }[];
   subagentNames: string[];
+  /** PRD #266 M1: name→can-edit-files for each subagent, derived from the PRE-STRIP
+   *  implement-turn defs (agents.ts `subagentWriteCapabilities`). Absent ⇒ the roster
+   *  line renders names only (back-compat). See delegatesLine. */
+  subagentCanWrite?: Record<string, boolean>;
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
    *  ci_fix run can WRITE memory, so it must also READ it back (write/read symmetry). */
@@ -1012,7 +1045,7 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   if (memoryBlock) lines.push(memoryBlock, "");
   lines.push(
-    delegatesLine(input.subagentNames),
+    delegatesLine(input.subagentNames, input.subagentCanWrite),
     "Diagnose the failure. You may re-run the failing commands locally (tests,",
     "linters) to reproduce it; you cannot touch the forge or network.",
     "",

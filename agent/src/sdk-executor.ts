@@ -42,7 +42,12 @@ import {
   type JsDepsInstall,
   type JsDepsResult,
 } from "./js-deps.js";
-import { assembleAgents, planTurnSubagents, selectSubagents } from "./agents.js";
+import {
+  assembleAgents,
+  planTurnSubagents,
+  selectSubagents,
+  subagentWriteCapabilities,
+} from "./agents.js";
 import {
   resolveAgentSelection,
   type AgentSelectionParse,
@@ -463,6 +468,11 @@ export class SdkExecutor implements Executor {
     // derives its own from `selectSubagents`.
     const planTurn = planTurnSubagents(assembled.subagents);
     const planSubagentNames = Object.keys(planTurn.subagents);
+    // PRD #266 M1: each roster name's write capability, derived from the PRE-STRIP
+    // `assembled.subagents` (NOT `planTurn.subagents`, which subtracts the write
+    // tools and would falsely mark `coder` read-only). Built once and threaded into
+    // every plan prompt AND the implement prompt, looked up by roster name.
+    const subagentCanWrite = subagentWriteCapabilities(assembled.subagents);
     if (planTurn.dropped.length > 0) {
       // Visible rather than silent: an agent missing from the plan wave is a
       // template-shape problem the operator can fix, and the approver should not
@@ -795,6 +805,7 @@ export class SdkExecutor implements Executor {
               logTail: j.log_tail,
             })),
             subagentNames: planSubagentNames,
+            subagentCanWrite,
             // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
@@ -814,6 +825,7 @@ export class SdkExecutor implements Executor {
             branch: ctx.branch,
             recommendations: ctx.issueDescription,
             subagentNames: planSubagentNames,
+            subagentCanWrite,
             // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
@@ -831,6 +843,7 @@ export class SdkExecutor implements Executor {
             issueDescription: ctx.issueDescription,
             branch: ctx.branch,
             subagentNames: planSubagentNames,
+            subagentCanWrite,
             // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
             // runner fetched it at claim time; empty/absent injects nothing).
             memory: ctx.memory,
@@ -1023,6 +1036,14 @@ export class SdkExecutor implements Executor {
         prepared.repoSurvivorNames,
       );
       const selectedNames = Object.keys(selectedSubagents);
+      // PRD #266 M1: the implement roster's own capability map. Derived from
+      // `selectedSubagents` — NOT the plan-turn `subagentCanWrite` built off
+      // `assembled.subagents` — because the repo-source path's defs come from the repo
+      // roster and are absent from `assembled.subagents`, so reusing the plan map would
+      // miss every repo name and mislabel a write-capable repo subagent read-only.
+      // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
+      // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
+      const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
       const implementOptions: SdkOptions = {
         ...baseOptions,
         agents: selectedSubagents,
@@ -1104,6 +1125,11 @@ export class SdkExecutor implements Executor {
           buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
+            // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
+            // derived from the actual un-stripped implement defs so it is correct on
+            // both the own AND repo sources — not the plan-turn map, which is keyed by
+            // `assembled.subagents` and would miss every repo-source name.
+            subagentCanWrite: selectedCanWrite,
             first: iteration === 1,
             iteration,
             // PRD #209 (Decision A): a seeded run's first-turn opening says the user

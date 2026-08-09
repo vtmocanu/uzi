@@ -77,6 +77,41 @@ const MEMORY_SERVER_DENY = `mcp__${MEMORY_SERVER_NAME}`;
 const WRITE_TOOL_SET: ReadonlySet<string> = new Set<string>(WRITE_PATH_TOOLS);
 
 /**
+ * Whether a subagent CAN edit files, derived from its own tool allowlist exactly
+ * as the SDK will resolve it (PRD #266 M1). An ABSENT or EMPTY `tools` list is the
+ * inherit-all contract (PRD #3 — see header), so the SDK grants the full toolset
+ * and the agent CAN write; a non-empty list is an explicit allowlist, so the agent
+ * can write iff it names at least one of WRITE_PATH_TOOLS.
+ *
+ * MUST be called on a PRE-STRIP definition (`assembleAgents`' map), never on a
+ * plan-turn roster: `planTurnSubagents` subtracts the write tools, so a capability
+ * read off that map would report `coder` (inherit-all, hence write-capable) as
+ * read-only — the exact bug PRD #266 fixes. `def.disallowedTools` is not consulted
+ * here: the plan turn expresses its downgrade there, and the roster line describes
+ * the agent's own declared capability, not the plan turn's temporary restriction.
+ */
+export function subagentCanWrite(def: AgentDefinition): boolean {
+  if (!def.tools || def.tools.length === 0) return true;
+  return def.tools.some((t) => WRITE_TOOL_SET.has(t));
+}
+
+/**
+ * Build a name→can-write map over a subagent roster (PRD #266 M1). Feed the
+ * PRE-STRIP map (`assembleAgents`' `subagents`) so the capabilities reflect each
+ * agent's declared toolset, not a plan turn's write-stripped roster. The result is
+ * looked up by roster name where the lead's "Available subagents" line is built.
+ */
+export function subagentWriteCapabilities(
+  subagents: Record<string, AgentDefinition>,
+): Record<string, boolean> {
+  const caps: Record<string, boolean> = {};
+  for (const [name, def] of Object.entries(subagents)) {
+    caps[name] = subagentCanWrite(def);
+  }
+  return caps;
+}
+
+/**
  * A template is the lead orchestrator (routed to the main thread, not registered
  * as an invokable subagent) when its name matches this convention. The product
  * ships exactly one such builtin (`lead`, in api/internal/agenttmpl/builtins/);

@@ -484,6 +484,38 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.ok((leadOnly[1]!.promptText ?? "").includes("No subagents are available"), "lead-only prompt renders");
   });
 
+  it("PRD #266 M1: the implement prompt annotates write-capable REPO-source subagents as able to edit files", async () => {
+    // The regression this pins. The implement roster on the repo path comes from the
+    // repo defs, which are NOT keys in `assembled.subagents`. A capability map built off
+    // `assembled.subagents` (the plan-turn map) would miss every repo name and mislabel
+    // these write-capable agents "read-only" on 100% of repo-source implement turns —
+    // re-manufacturing the exact false belief M1 exists to kill. The implement turn must
+    // derive capability from its OWN roster. repoCoder declares Edit (→ can write);
+    // repoAuditor declares no tools (inherit-all → can write).
+    const { turns } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, approveWith("repo"));
+    const delegates = (turns[1]!.promptText ?? "")
+      .split("\n")
+      .find((l) => l.startsWith("Available subagents to delegate to:"));
+    assert.ok(delegates, `no delegates line in the implement prompt:\n${turns[1]!.promptText}`);
+    assert.match(delegates!, /coder \(can edit files\)/, "repo coder (declares Edit) is write-capable");
+    assert.match(delegates!, /auditor \(can edit files\)/, "repo auditor (inherit-all) is write-capable");
+    assert.ok(!/read-only/.test(delegates!), "no write-capable repo subagent is mislabeled read-only");
+  });
+
+  it("PRD #266 M1: the implement prompt marks a read-only OWN subagent read-only and the writer as able to edit", async () => {
+    // The control for the repo-source test above: on the own path the coder fixture
+    // declares Edit/Write (→ can write) and reviewer declares a read-only allowlist,
+    // so the annotation must distinguish them.
+    const { turns } = await runWith({}, approveWith("own"));
+    const delegates = (turns[1]!.promptText ?? "")
+      .split("\n")
+      .find((l) => l.startsWith("Available subagents to delegate to:"));
+    assert.strictEqual(
+      delegates,
+      "Available subagents to delegate to: coder (can edit files), reviewer (read-only).",
+    );
+  });
+
   it("own source reproduces today's roster, minus exclusions", async () => {
     const { turns: full } = await runWith({}, approveWith("own"));
     assert.deepStrictEqual(Object.keys(full[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
@@ -2578,10 +2610,14 @@ describe("plan-turn drop of a write-only allowlist (#203)", () => {
     assert.ok(plan.promptText, "the plan turn carried a prompt");
     const delegates = plan.promptText!.split("\n").find((l) => l.startsWith("Available subagents to delegate to:"));
     assert.ok(delegates, `no delegates line in the plan prompt:\n${plan.promptText}`);
+    // PRD #266 M1: the line now annotates each surviving name with its write
+    // capability, derived from the PRE-STRIP defs. `coder` declares Edit/Write so it
+    // reads "can edit files" EVEN THOUGH the plan turn stripped those tools —
+    // capability comes from `assembled.subagents`, not the write-stripped plan map.
     assert.strictEqual(
       delegates,
-      "Available subagents to delegate to: coder, reviewer.",
-      "the plan prompt advertises exactly the plan-turn roster",
+      "Available subagents to delegate to: coder (can edit files), reviewer (read-only).",
+      "the plan prompt advertises exactly the plan-turn roster, annotated with write capability",
     );
 
     // 4. The IMPLEMENT turn is untouched — the drop is plan-turn-scoped, and

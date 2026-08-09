@@ -71,6 +71,40 @@ describe("buildPlanPrompt", () => {
     assert.match(p, /No subagents are available/);
   });
 
+  it("annotates each subagent with its write capability (PRD #266 M1)", () => {
+    // The roster line must state whether each role can edit files, so the lead never
+    // guesses. coder inherits all → can edit; reviewer/auditor are read-only.
+    const p = buildPlanPrompt({
+      issueIid: 1,
+      issueTitle: "t",
+      issueDescription: "d",
+      branch: "agent/issue-1",
+      subagentNames: ["coder", "reviewer", "auditor"],
+      subagentCanWrite: { coder: true, reviewer: false, auditor: false },
+    });
+    assert.match(
+      p,
+      /Available subagents to delegate to: coder \(can edit files\), reviewer \(read-only\), auditor \(read-only\)\./,
+    );
+  });
+
+  it("falls back to names-only when no capability map is given (back-compat)", () => {
+    // The original rendering, unchanged when the capability map is absent.
+    assert.match(prompt, /Available subagents to delegate to: coder, reviewer\./);
+  });
+
+  it("keeps the no-subagents branch unchanged even if a capability map is passed", () => {
+    const p = buildPlanPrompt({
+      issueIid: 1,
+      issueTitle: "t",
+      issueDescription: "d",
+      branch: "b",
+      subagentNames: [],
+      subagentCanWrite: {},
+    });
+    assert.match(p, /No subagents are available/);
+  });
+
   it("offers the optional milestone breakdown (PRD #122 M1)", () => {
     assert.match(prompt, /milestone/i);
     assert.match(prompt, /`milestones`/);
@@ -182,6 +216,20 @@ describe("buildImplementPrompt", () => {
   it("renders the lead-only case when the roster is empty", () => {
     const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
     assert.match(p, /No subagents are available; do the work yourself\./);
+  });
+
+  it("annotates each subagent with its write capability (PRD #266 M1)", () => {
+    const p = buildImplementPrompt({
+      branch: "b",
+      subagentNames: ["coder", "reviewer"],
+      subagentCanWrite: { coder: true, reviewer: false },
+      first: true,
+      iteration: 1,
+    });
+    assert.match(
+      p,
+      /Available subagents to delegate to: coder \(can edit files\), reviewer \(read-only\)\./,
+    );
   });
 
   // PRD #209 (Decision A): a seeded plan was AUTHORED by the user, not approved through
