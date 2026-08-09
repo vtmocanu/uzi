@@ -382,6 +382,74 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
   });
 });
 
+describe("mockApi judge category stats (PRD #244)", () => {
+  // getJudgeCategoryStats counts DISTINCT (category, target) coordinates — GROUPS — per
+  // category, NOT rows. This test is only meaningful over a DISCRIMINATING fixture: one where
+  // a coordinate RECURS across ≥2 reviews so a rows-counter and a distinct-coordinate counter
+  // DISAGREE. The seeded fixtures satisfy this (improve_uzi/api/internal/poller recurs in all
+  // three runs, install_worker_tool/shellcheck and add_agent/deploy-agent each in two), and
+  // the guard below FAILS the test if a future fixture edit ever makes rows == distinct — at
+  // which point this test would prove nothing and must be re-seeded, not deleted.
+  it("counts distinct coordinates (groups) per category, never rows", async () => {
+    installStorage();
+    const api = await reload();
+    const { mockReviews } = await import("./data");
+
+    // Two INDEPENDENT tallies straight off the fixtures — deliberately not sharing the mock's
+    // own helper, so this compares against a second computation, not itself.
+    const rowsByCat: Record<string, number> = {};
+    const distinctByCat = new Map<string, Set<string>>();
+    for (const review of mockReviews) {
+      for (const rec of review.recommendations) {
+        rowsByCat[rec.category] = (rowsByCat[rec.category] ?? 0) + 1;
+        const set = distinctByCat.get(rec.category) ?? new Set<string>();
+        set.add(rec.target);
+        distinctByCat.set(rec.category, set);
+      }
+    }
+    const distinctByCatObj: Record<string, number> = {};
+    for (const [cat, set] of distinctByCat) distinctByCatObj[cat] = set.size;
+
+    // DISCRIMINATING-FIXTURE GUARD: at least one category must have MORE rows than distinct
+    // coordinates, or the two counters agree everywhere and the assertion below is vacuous.
+    const discriminates = Object.keys(rowsByCat).some((cat) => rowsByCat[cat] > distinctByCatObj[cat]);
+    expect(
+      discriminates,
+      "fixture is not discriminating: no category has a coordinate recurring across reviews, " +
+        "so a rows-counter and a distinct-coordinate counter cannot disagree — re-seed a " +
+        "recurring coordinate before trusting this test",
+    ).toBe(true);
+
+    const { counts } = await api.getJudgeCategoryStats();
+
+    // The endpoint matches the DISTINCT-coordinate tally exactly…
+    expect(counts).toEqual(distinctByCatObj);
+    // …and specifically NOT the rows tally, on the category where they diverge. improve_uzi
+    // has the poller coordinate three times plus one other coordinate: 4 rows, 2 groups.
+    expect(counts.improve_uzi).toBe(2);
+    expect(rowsByCat.improve_uzi).toBe(4);
+    expect(counts).not.toEqual(rowsByCat);
+  });
+
+  it("agrees with the canonical getJudgeStats coordinate universe (no bucket/triage skew)", async () => {
+    installStorage();
+    const api = await reload();
+
+    // The count is triage-invariant: settling a coordinate must NOT change the category count
+    // (a group stays a group once triaged). Dismiss shellcheck's open member and re-read.
+    const before = (await api.getJudgeCategoryStats()).counts;
+    await api.bulkSetJudgeDisposition(
+      [{ category: "install_worker_tool", target: "shellcheck" }],
+      "dismissed",
+      "wont_do",
+      "open",
+    );
+    const after = (await api.getJudgeCategoryStats()).counts;
+    expect(after).toEqual(before);
+    expect(after.install_worker_tool).toBe(1); // still one group, now dismissed
+  });
+});
+
 // PRD #104: the mock must CASCADE a token delete the way the schema does.
 // Migrations 00078/00079 hang composite FKs off user_secrets (user_id, id) with
 // ON DELETE SET NULL, so deleting a bound token unbinds its workers and the judge.

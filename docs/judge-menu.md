@@ -129,11 +129,16 @@ selection stays. Like `?run=`, it's applied **before** the row cap (see
 [the tabs, above](#3-the-tabs-and-the-one-number)), so narrowing to one or two
 labels makes the truncation banner *less* likely to show, not more.
 
-The chips don't carry a count today — there's no per-label total the way the
-tabs have a per-bucket one, only the whole-backlog tally at the top of the
-page — so an empty filtered list reads the same as anywhere else on this
-page: nothing in that label *right now*, or unknown if the truncation banner
-is also showing.
+Each chip also carries a count: the number of groups in that label across
+your **whole backlog** — every bucket, every triage state — not a tally of
+what's currently on screen. It's its own server aggregate, the same kind of
+canonical count [the tabs and the triage tally](#3-the-tabs-and-the-one-number)
+use, so it stays correct even when the truncation banner is showing: a chip
+can read `6` while only 4 cards render under the cap. Switching bucket tabs
+or marking a group done doesn't move it — a group stays a group, so the
+count changes only when the backlog itself does — and it's fetched once when
+the page loads, not refetched on every toggle. A chip whose whole-backlog
+count is 0 stays in the row, just dimmed, rather than disappearing.
 
 ## From the terminal
 

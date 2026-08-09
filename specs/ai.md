@@ -18674,13 +18674,15 @@ unchanged; this only adds a way to narrow which groups come back.
   `?category=`/`--category` value they sent (it is their own request, not server-derived), so
   echoing it back would cost a `wire_test.go` pinned-tag-set update for no new information. This was
   an explicit PRD decision (Decision 9), not an oversight.
-- **No per-label chip counts in v1.** There is no canonical per-category aggregate — `/me/judge/stats`
-  is bucketed (todo/filed/done/dismissed), not per-label — and tallying a count off the delivered
-  `groups` is the anti-pattern this codebase already forbids by name for `triage` (§358: "NEVER
-  tallied from `groups`"), for the same reason: it would be wrong under truncation and under the
-  active bucket filter. `LabelFilter` (`Judge.tsx`) ships chips with no counts; a count is a
-  deliberate follow-up that would need its own aggregate, not a tally off what happens to be on
-  screen.
+- **No per-label chip counts in v1 (SUPERSEDED by §502, PRD #244).** As #235 shipped, there was
+  no canonical per-category aggregate — `/me/judge/stats` is bucketed (todo/filed/done/dismissed),
+  not per-label — and tallying a count off the delivered `groups` is the anti-pattern this codebase
+  already forbids by name for `triage` (§358: "NEVER tallied from `groups`"), for the same reason:
+  it would be wrong under truncation and under the active bucket filter. So #235's `LabelFilter`
+  (`Judge.tsx`) shipped chips with no counts, and the count was named as a deliberate follow-up
+  needing its own aggregate. PRD #244 (§502) is that follow-up: it added the uncapped
+  `CountJudgeGroupsByCategoryForUser` aggregate (`/me/judge/category-stats`) and the chips now
+  carry counts — the count is still NEVER tallied off `groups`.
 
 ## 490. PRD #239 — the Runs nav badge counts the caller's NON-terminal, non-chat/judge runs: a strict SUBSET of the /runs page, its own endpoint, and no CLI subcommand
 
@@ -19171,3 +19173,45 @@ it is NOT admin-gated** — a normal user capability gated only by repo ownershi
   `prompt` run that actually touches uzi's own guard surface gets the guard-critical MR section
   (`guardCriticalMrSection`, `runner.ts`), closing the gap that `self_improve` got this flag for
   free (it targets uzi's repo) but a repo-agnostic prompt run would not.
+
+## 502. PRD #244 — the Judge chip counts are a SEPARATE uncapped GROUP-count aggregate, triage-invariant and fetched once, never a tally off `groups`
+
+Serves human.md Feature #46 (the judge-recommendation inbox/worklist). Design record:
+`prds/done/244-judge-chip-counts.md`. Delivers the per-label chip counts §489 (PRD #235
+Decision 6) deferred, by adding the canonical per-category aggregate that decision named
+as the precondition. No new product contract beyond one owner-scoped count endpoint.
+
+- **Its OWN endpoint and DTO, so the nav badge is structurally unreachable from category
+  data.** `GET /me/judge/category-stats` (handler `JudgeCategoryStats` beside `JudgeStats`,
+  `RequireUser`, owner-scoped) → `JudgeCategoryStatsDTO{ Counts map[string]int }` (`counts`,
+  pinned in `wire_test.go`). Deliberately NOT folded into `/me/judge/stats` / `TriageDTO`:
+  the sidebar badge reads exactly `TriageCounts.todo` from `/me/judge/stats`, and a separate
+  DTO with no `todo` field has no path to `setJudgeTodo` — the badge cannot be driven by, or
+  refetch, category data. The DTO is a MAP, not a fixed-field struct, so the six-label
+  taxonomy can grow without a wire break; the client reads `counts[cat] ?? 0` per chip.
+- **A GROUP count, not a row count.** `CountJudgeGroupsByCategoryForUser`
+  (`store/queries/dispositions.sql`) is `COUNT(DISTINCT rr.target) … GROUP BY rr.category`
+  over the owner-scoped `run_reviews ⋈ review_recommendations` spine — distinct
+  `(category, target)` coordinates, the same unit `GroupJudgeRecommendations` groups by and
+  the list renders as cards, so the count predicts what clicking a chip yields. This is a
+  DIFFERENT unit from `/me/judge/stats`, which counts rows (`BucketTriage`); hence a new
+  aggregate, not a reuse. Not bucket-scoped.
+- **Uncapped by design — the whole point.** No `LIMIT`, so the count is EXACT even when the
+  backlog list truncates at `JudgeBacklogMaxRows` (a chip can correctly read `6` while the
+  capped list shows `4` cards). This is the canonical aggregate #235 Decision 6 required; a
+  count must NEVER be tallied off the truncated/bucket-filtered `groups` (the §358 "NEVER
+  tallied from `groups`" prohibition, which §489 deferred the count on). Proven by a live-DB
+  test seeding a category's groups past the cap on the UNFILTERED backlog (a
+  `?category=`-filtered request cannot truncate that label off-page — #235 pushed the
+  category predicate below the `LIMIT`).
+- **Whole-backlog, all triage states → triage-invariant.** A group is a `(category, target)`
+  coordinate; triage moves a coordinate between buckets, it does not add or remove one, so
+  the query touches no disposition/filed side tables and the count does not change as the
+  user works the list. Consequence: fetched ONCE on Judge-page mount, no refetch on
+  bucket/category toggle or after a triage action (unlike the badge's `todo` row-count).
+- **Drops the backlog query's inner `JOIN runs`.** `run_reviews.target_run_id` is
+  `NOT NULL UNIQUE` (`00059_run_reviews.sql`), a lossless 1:1 join that adds nothing to a
+  per-category count — omitted, not "kept for consistency". `::bigint` on the count is
+  belt-and-braces (sqlc already types a top-level `COUNT` as `int64`), not a fix for the
+  `interface{}` CASE-expression trap. The web `mockApi.getJudgeCategoryStats` recomputes
+  distinct coordinates from fixtures independently, matching the `COUNT(DISTINCT)` semantics.

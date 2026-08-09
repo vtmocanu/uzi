@@ -1433,6 +1433,21 @@ export interface TriageCounts {
   false_positives: number;
 }
 
+// JudgeCategoryStats is GET /me/judge/category-stats (PRD #244): the per-category GROUP
+// count for the Judge filter chips. `counts` maps each raw recommendation category to the
+// number of distinct (category, target) coordinates across the caller's WHOLE backlog —
+// the same unit the chip filters and the list renders as cards. It is a real server
+// aggregate (COUNT(DISTINCT target) GROUP BY category, uncapped), NOT a tally of the
+// on-screen groups: those are capped-before-grouping and bucket-filtered, so a chip can
+// honestly read 6 while the truncated list shows 4 cards. It is whole-backlog and
+// triage-invariant (a group stays a group once triaged), so it is fetched ONCE on
+// Judge-page mount and never on a bucket/category/triage change. A MAP, not a fixed-field
+// struct, so a category the client has no chip for does not break the wire — the client
+// reads `counts[cat] ?? 0` per chip (open question 6).
+export interface JudgeCategoryStats {
+  counts: Record<string, number>;
+}
+
 export interface RunReview {
   id: string;
   target_run_id: string;
@@ -2497,6 +2512,15 @@ const realApi = {
   // backlog, not the filtered view — and is bucketed by the same Go ladder as `triage`.
   // Feeds the Judge nav badge (via .todo) and the /runs list strip's successor.
   getJudgeStats: () => request<TriageCounts>("GET", "/me/judge/stats"),
+
+  // getJudgeCategoryStats is the canonical per-category GROUP count (RequireUser,
+  // owner-scoped, all-time, uncapped) the Judge filter chips render (PRD #244). It is a
+  // SEPARATE endpoint from getJudgeStats deliberately: the nav badge reads only
+  // TriageCounts.todo from /me/judge/stats, so a per-category payload has no path to it.
+  // Fetched once on Judge-page mount — the count is invariant to bucket, category, and
+  // triage state — never on a filter toggle and never on the badge poll.
+  getJudgeCategoryStats: () =>
+    request<JudgeCategoryStats>("GET", "/me/judge/category-stats"),
 
   // ── Judge menu — cross-run backlog + bulk disposition (PRD #98) ─────────────
   // getJudgeBacklog reads the deduped, grouped backlog (RequireUser, owner-scoped, no

@@ -449,6 +449,8 @@ var queryInventory = []queryPin{
 		"reached through the listDispositions helper (:260), called at :225 — NOT visible to a body scan"},
 	{"ListJudgeTriageRowsForUser", "dispositions.sql", "TestJudgeTriageRowsForUserAreCoordinateScopedLiveDB",
 		"the coordinate-scoping pin; also called directly by TestRecommendationDispositionsLiveDB:183"},
+	{"CountJudgeGroupsByCategoryForUser", "dispositions.sql", "TestJudgeCategoryStatsUncappedAndDedupedLiveDB",
+		"direct call, judge_category_stats_integration_test.go — pins uncapped (counted past the backlog cap) and COUNT(DISTINCT target) dedupe (#244)"},
 	{"CreateJudgeRun", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:65 (TestClaimRunDockerRepoAllowlistLiveDB also calls it, but only as fixture setup)"},
 	{"GetActiveJudgeRunForWorkerTarget", "judge.sql", "TestJudgeQueriesLiveDB",
