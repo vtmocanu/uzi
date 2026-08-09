@@ -51,6 +51,18 @@ const staleReading: MyRateLimits = {
   synced_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
   stale: true,
 };
+// PRD #217: a park-time reading — five_hour 100% recorded at the usage-limit park
+// with source "limit_report", and a synced_at deliberately OLDER than the 100% it
+// carries (the park does not bump synced_at, D3). Not stale (14m < 15m staleness),
+// so the meter is live and the source disclosure — not the stale sentence — shows.
+const limitReportReading: MyRateLimits = {
+  status: "ok",
+  five_hour: { pct: 100, resets_at: nowSecs + 2000 },
+  seven_day: { pct: 40, resets_at: nowSecs + 200_000 },
+  source: "limit_report",
+  synced_at: new Date(Date.now() - 14 * 60_000).toISOString(),
+  stale: false,
+};
 
 // Since PRD #104 M5 the endpoint returns ONE READING PER TOKEN. These tests are
 // about how a single reading renders, so tokens() wraps one as the user's default
@@ -84,6 +96,22 @@ describe("RateLimitCard (Settings)", () => {
     expect(screen.getByText("Live")).toBeTruthy();
     // Countdown is rendered client-side from the epoch (Decision 7).
     expect(screen.getAllByText(/resets in/).length).toBeGreaterThan(0);
+    // A usage_endpoint reading carries NO park-time disclosure (PRD #217).
+    expect(screen.queryByText("Recorded at usage limit")).toBeNull();
+  });
+
+  it("discloses a limit_report reading as recorded at the usage limit (PRD #217)", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(limitReportReading));
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    // The 100% bar is a live reading, so the status pill still escalates…
+    expect(screen.getByText("5h nearly out")).toBeTruthy();
+    // …but the park-time source is disclosed: the 100% was recorded at the park,
+    // NEWER than the "updated Xm ago" timestamp beside it (D3/D6).
+    expect(screen.getByText("Recorded at usage limit")).toBeTruthy();
+    expect(screen.getByText(/recorded when this token hit its usage limit/)).toBeTruthy();
+    // The ordinary poll phrasing must NOT appear for a park-time reading.
+    expect(screen.queryByText(/refreshes every few minutes/)).toBeNull();
   });
 
   it("greys the windows and drops the Live badge on 'unavailable'", async () => {

@@ -44,7 +44,7 @@ func TestSelectPrefersMostHeadroom(t *testing.T) {
 	got := Select([]Candidate{
 		cand(1, 20, at(time.Minute)), // soonest reset, but 60 points behind
 		cand(2, 80, at(99*time.Hour)),
-	}, testPolicy(), now)
+	}, uuid.Nil, testPolicy(), now)
 	if !got.Picked || got.SecretID != id(2) {
 		t.Fatalf("picked %v (reason %q), want the 80-headroom token %v", got.SecretID, got.Reason, id(2))
 	}
@@ -70,7 +70,7 @@ func TestSelectAnchorClusterExcludesOutsiders(t *testing.T) {
 	b := cand(2, 75, at(time.Hour))
 	c := cand(3, 70, at(time.Minute)) // soonest by far — the bait
 
-	got := Select([]Candidate{a, b, c}, testPolicy(), now) // T = 5
+	got := Select([]Candidate{a, b, c}, uuid.Nil, testPolicy(), now) // T = 5
 	if got.SecretID == c.SecretID {
 		t.Fatalf("picked the 70-headroom token: it is 10 points outside a 5-point tie window, " +
 			"and only an intransitive pairwise comparator lets it in")
@@ -101,7 +101,7 @@ func TestSelectAnchorIsOverTheFilteredSet(t *testing.T) {
 	g := cand(4, 14, at(time.Second))
 	g.InFlight = 0 // rank 14 — below MinHeadroom, so NOT in the set, but the highest rank overall
 
-	got := Select([]Candidate{f, e, e2, g}, p, now)
+	got := Select([]Candidate{f, e, e2, g}, uuid.Nil, p, now)
 	if got.SecretID == g.SecretID {
 		t.Fatalf("picked the below-threshold token outright; the gate rejected it")
 	}
@@ -126,7 +126,7 @@ func TestSelectOrderIndependent(t *testing.T) {
 		cand(4, 77, at(time.Hour)),
 		cand(5, 40, at(time.Minute)), // outside the cluster
 	}
-	want := Select(cands, testPolicy(), now)
+	want := Select(cands, uuid.Nil, testPolicy(), now)
 	if !want.Picked {
 		t.Fatalf("baseline picked nothing (reason %q)", want.Reason)
 	}
@@ -134,7 +134,7 @@ func TestSelectOrderIndependent(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		shuffled := append([]Candidate(nil), cands...)
 		rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
-		if got := Select(shuffled, testPolicy(), now); got != want {
+		if got := Select(shuffled, uuid.Nil, testPolicy(), now); got != want {
 			t.Fatalf("permutation %d changed the outcome: %+v != %+v", i, got, want)
 		}
 	}
@@ -181,7 +181,7 @@ func TestSelectTieBreakUsesBindingWindowReset(t *testing.T) {
 		SyncedAt: at(-time.Minute),
 	}
 
-	got := Select([]Candidate{a, b}, p, now)
+	got := Select([]Candidate{a, b}, uuid.Nil, p, now)
 	if got.Headroom != 10 {
 		t.Fatalf("headroom = %d, want 10 — the fixture is meant to make both tokens tie", got.Headroom)
 	}
@@ -201,7 +201,7 @@ func TestSelectTieBreakUsesBindingWindowReset(t *testing.T) {
 		t.Fatalf("the swap changed Classify (%+v); it must not — that is what makes this the only "+
 			"place the swap is observable", e)
 	}
-	if got := Select([]Candidate{swapped, b}, p, now); got.SecretID != swapped.SecretID {
+	if got := Select([]Candidate{swapped, b}, uuid.Nil, p, now); got.SecretID != swapped.SecretID {
 		t.Fatalf("after swapping A's windows the pick is %v, want %v — A now binds on its seven-day "+
 			"window, which resets in 1h", got.SecretID, swapped.SecretID)
 	}
@@ -224,7 +224,7 @@ func TestSelectTieBreakEqualPctPrefersFiveHour(t *testing.T) {
 	}
 	c := mk(1, 9*time.Hour, time.Hour)
 	d := mk(2, 2*time.Hour, 99*time.Hour)
-	if got := Select([]Candidate{c, d}, p, now); got.SecretID != d.SecretID {
+	if got := Select([]Candidate{c, d}, uuid.Nil, p, now); got.SecretID != d.SecretID {
 		t.Fatalf("picked %v, want %v — on equal utilisation the FIVE-hour reset decides (2h vs 9h)",
 			got.SecretID, d.SecretID)
 	}
@@ -240,13 +240,13 @@ func TestSelectTieBreakEqualPctPrefersFiveHour(t *testing.T) {
 func TestSelectNullResetLosesTie(t *testing.T) {
 	null := cand(1, 80, nil)
 	dated := cand(2, 80, at(99*time.Hour))
-	if got := Select([]Candidate{null, dated}, testPolicy(), now); got.SecretID != dated.SecretID {
+	if got := Select([]Candidate{null, dated}, uuid.Nil, testPolicy(), now); got.SecretID != dated.SecretID {
 		t.Fatalf("picked %v, want %v — a NULL reset is +∞ and loses to a reset 99h out",
 			got.SecretID, dated.SecretID)
 	}
 	// Both NULL ⇒ neither is "about to replenish" ⇒ fall through to the lowest id.
 	null2 := cand(2, 80, nil)
-	if got := Select([]Candidate{null2, null}, testPolicy(), now); got.SecretID != id(1) {
+	if got := Select([]Candidate{null2, null}, uuid.Nil, testPolicy(), now); got.SecretID != id(1) {
 		t.Fatalf("with both resets NULL the pick is %v, want the lowest id %v", got.SecretID, id(1))
 	}
 }
@@ -259,7 +259,7 @@ func TestSelectNullResetLosesTie(t *testing.T) {
 // MUTATION THIS CATCHES: `compareUUID(...) < 0` → `> 0`, which reverses it.
 func TestSelectTieBreakLowestSecretID(t *testing.T) {
 	shared := at(time.Hour)
-	got := Select([]Candidate{cand(9, 80, shared), cand(2, 80, shared), cand(5, 80, shared)}, testPolicy(), now)
+	got := Select([]Candidate{cand(9, 80, shared), cand(2, 80, shared), cand(5, 80, shared)}, uuid.Nil, testPolicy(), now)
 	if got.SecretID != id(2) {
 		t.Fatalf("picked %v, want the lowest id %v", got.SecretID, id(2))
 	}
@@ -279,14 +279,14 @@ func TestSelectInFlightBiasSpreads(t *testing.T) {
 	busy.InFlight = 4                    // rank 68
 	idle := cand(2, 75, at(99*time.Hour))
 	// 68 vs 75: the gap is 7, wider than T=5, so `idle` is alone in the cluster.
-	got := Select([]Candidate{busy, idle}, p, now)
+	got := Select([]Candidate{busy, idle}, uuid.Nil, p, now)
 	if got.SecretID != idle.SecretID {
 		t.Fatalf("picked %v, want %v — four in-flight runs cost the emptier token 12 points",
 			got.SecretID, idle.SecretID)
 	}
 	// It is a BIAS, not a cap: one run is not enough to lose a 5-point lead.
 	busy.InFlight = 1 // rank 77, still ahead of 75 and inside T of it
-	if got := Select([]Candidate{busy, idle}, p, now); got.SecretID != busy.SecretID {
+	if got := Select([]Candidate{busy, idle}, uuid.Nil, p, now); got.SecretID != busy.SecretID {
 		t.Fatalf("picked %v, want %v — one in-flight run must not surrender the lead",
 			got.SecretID, busy.SecretID)
 	}
@@ -304,7 +304,7 @@ func TestSelectGateReadsRawHeadroomNotRank(t *testing.T) {
 	p := Policy{MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: time.Hour, InflightPenalty: 3}
 	busy := cand(1, 20, at(time.Hour))
 	busy.InFlight = 5 // raw headroom 20 (eligible), rank 5 (would be below the floor)
-	got := Select([]Candidate{busy}, p, now)
+	got := Select([]Candidate{busy}, uuid.Nil, p, now)
 	if got.Reason != ReasonAuto {
 		t.Fatalf("reason = %q, want %q — raw headroom 20 clears a floor of 15; only the RANK is 5",
 			got.Reason, ReasonAuto)
@@ -350,7 +350,7 @@ func TestSelectFallbackReasons(t *testing.T) {
 		{"pooled, mixed, none measurable", []Candidate{unpooled, stale, noReading, unmeasured}, ReasonPoolStale},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Select(tc.cands, testPolicy(), now)
+			got := Select(tc.cands, uuid.Nil, testPolicy(), now)
 			if got.Picked {
 				t.Fatalf("picked %v; nothing here is rankable", got.SecretID)
 			}
@@ -373,7 +373,7 @@ func TestSelectBestOfPool(t *testing.T) {
 		cand(1, 3, at(99*time.Hour)),
 		cand(2, 12, at(99*time.Hour)), // the least-bad
 		cand(3, 8, at(99*time.Hour)),
-	}, p, now)
+	}, uuid.Nil, p, now)
 	if !got.Picked {
 		t.Fatalf("picked nothing (reason %q); a below-threshold pool still has a best answer", got.Reason)
 	}
@@ -396,7 +396,7 @@ func TestSelectBestOfPoolNeedsEveryTokenBelow(t *testing.T) {
 	p := testPolicy() // MinHeadroom 15, T 5
 	low := cand(1, 14, at(time.Second))
 	ok := cand(2, 16, at(99*time.Hour))
-	got := Select([]Candidate{low, ok}, p, now)
+	got := Select([]Candidate{low, ok}, uuid.Nil, p, now)
 	if got.Reason != ReasonAuto {
 		t.Fatalf("reason = %q, want %q — one token clears the floor", got.Reason, ReasonAuto)
 	}
@@ -427,14 +427,14 @@ func TestSelectIsTotal(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_ = Select(tc.cands, tc.p, time.Time{})
+			_ = Select(tc.cands, uuid.Nil, tc.p, time.Time{})
 		})
 	}
 	// A negative tolerance is floored at 0, not allowed to empty the cluster: the
 	// anchor must still be reachable, and the answer must still not depend on order.
 	a, b := cand(1, 80, nil), cand(2, 80, nil)
 	p := Policy{MinHeadroom: 0, HeadroomTiePct: -7, MaxStaleness: time.Hour}
-	fwd, rev := Select([]Candidate{a, b}, p, now), Select([]Candidate{b, a}, p, now)
+	fwd, rev := Select([]Candidate{a, b}, uuid.Nil, p, now), Select([]Candidate{b, a}, uuid.Nil, p, now)
 	if fwd != rev {
 		t.Fatalf("a negative tie tolerance made the outcome order-dependent: %+v != %+v", fwd, rev)
 	}

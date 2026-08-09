@@ -132,6 +132,14 @@ The SPA lives in `web/` (Vite/React/Tailwind, ember design tokens as CSS
 variables in `web/src/index.css` — flag hardcoded palette classes as token
 violations).
 
+**The app is deliberately dark-only** — "a dark factory", declared in
+`web/src/index.css`. There is no light mode, so a dispatch framing a change as a
+"light + dark" pass is wrong on its face; do not open by reorienting around it,
+just validate the dark UI. It ships TWO dark themes selected by a `[data-theme]`
+attribute: the default **ember** (molten-orange on near-black) and **mission**
+(an ops-console blue set), both `color-scheme: dark`. Check appearance against
+those two themes, never against a light/dark split.
+
 **A zero-backend demo build exists: `VITE_UZI_MOCK=1`, servable via
 `web/Dockerfile.mock`.** It needs no database, no API and no compose stack, which
 makes it the default way to validate this repo's UI. The real stack serves on a

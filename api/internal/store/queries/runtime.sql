@@ -632,11 +632,17 @@ WHERE r.id = @run_id;
 -- So no reader of runs.updated_at applies to a claimed run on either lane. Naming
 -- one of the two readers, as this comment first did, would have left a reader of
 -- the same column unaccounted for while reading as though the set were complete.
+-- limit_dead_secret_id is cleared here, unconditionally (PRD #217 M2, D2). It is set
+-- at park by SetRunLimitWait to the credential the run just parked on; this — the
+-- first claim that successfully RECORDS a credential — is where the one-claim-lived
+-- exclusion ends. Clearing on RECORD (rather than on claim start) is what makes it
+-- survive a claim that dies before recording, so the retry still excludes the dead one.
 UPDATE runs
 SET anthropic_secret_id     = @anthropic_secret_id,
     anthropic_secret_label  = @anthropic_secret_label,
     anthropic_select_reason = @anthropic_select_reason,
     anthropic_headroom_pct  = sqlc.narg('anthropic_headroom_pct'),
+    limit_dead_secret_id    = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id;
 
@@ -957,15 +963,22 @@ WHERE id = @id AND worker_id = @worker_id
 -- RUNNING agent, and making a park flaggable re-introduces the false alarm
 -- Decision 3 banks on avoiding. health_notified_at is NOT reset, matching every
 -- other exit contract in this file.
+-- limit_dead_secret_id is SET AT PARK to the credential this run was spending (PRD
+-- #217 M2, D2): the run's own runs.anthropic_secret_id, passed through in Go so an
+-- invalid/NULL secret writes NULL. It is cleared on the first claim that records a
+-- credential (SetRunAnthropicSecret sets it back to NULL), so the exclusion lives for
+-- one recording claim and no longer. sqlc.narg, never @name — this file's multibyte
+-- comment blocks break the @name parser (repo memory).
 UPDATE runs SET
-    status           = 'limit_wait',
-    limit_resets_at  = sqlc.narg('limit_resets_at'),
-    rate_limit_type  = sqlc.narg('rate_limit_type'),
-    retry_not_before = @retry_not_before,
-    limit_wait_count = limit_wait_count + 1,
-    session_id       = COALESCE(sqlc.narg('session_id'), session_id),
+    status               = 'limit_wait',
+    limit_resets_at      = sqlc.narg('limit_resets_at'),
+    rate_limit_type      = sqlc.narg('rate_limit_type'),
+    retry_not_before     = @retry_not_before,
+    limit_wait_count     = limit_wait_count + 1,
+    limit_dead_secret_id = sqlc.narg('limit_dead_secret_id'),
+    session_id           = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
-    updated_at       = now()
+    updated_at           = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
   AND kind <> 'judge';

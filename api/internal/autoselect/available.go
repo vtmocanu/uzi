@@ -80,7 +80,9 @@ func BindingWindowReset(c Candidate) (time.Time, bool) { return resetKey(c) }
 // lives HERE rather than in the caller on purpose: the caller reaches this with a
 // nil runs.anthropic_secret_id whenever a run predates PRD #111 or its credential
 // recording failed, and without the exclusion id leg 1 would fire on the dead
-// credential's OWN stale-but-eligible reading and promote the run instantly into the
+// credential's OWN still-eligible reading — its pre-park poll is out of date (it does
+// not yet reflect the limit it just hit) but still within MaxStaleness, so it
+// classifies eligible rather than stale — and promote the run instantly into the
 // window it just exhausted. A precondition closed inside the pure function is
 // testable; the same precondition written as a caller's `if` is one refactor from
 // being dropped.

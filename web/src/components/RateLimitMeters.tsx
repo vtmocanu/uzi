@@ -139,12 +139,23 @@ function TokenMeters({ token, now, showLabel }: { token: TokenRateLimits; now: n
         <SettingsWindowRow label="7-day window" win={limits.seven_day} now={now} dim={limits.stale} />
       </div>
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
-          this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
-      <div className="mt-3 flex items-center gap-2 text-xs text-muted">
+          this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). A
+          limit_report reading (PRD #217 D6) is a park-time inference, not a poll:
+          the extra badge + phrase disclose that the 100% bar was recorded when the
+          token hit its limit, AFTER the "updated Xm ago" timestamp (D3), so the
+          timestamp does not read as the age of the 100%. flex-wrap so the second
+          badge never overflows a narrow card; the other sources render one line as
+          before. */}
+      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted">
         <Badge tone={badge.tone} dot={badge.dot}>{badge.label}</Badge>
+        {limits.source === "limit_report" && <Badge tone="neutral">Recorded at usage limit</Badge>}
         <span>
           updated {formatAgo(limits.synced_at, now)}
-          {limits.stale ? " · reading is stale (vault locked or polling off)" : " · refreshes every few minutes"}
+          {limits.source === "limit_report"
+            ? " · recorded when this token hit its usage limit, after the last poll"
+            : limits.stale
+              ? " · reading is stale (vault locked or polling off)"
+              : " · refreshes every few minutes"}
         </span>
       </div>
     </div>

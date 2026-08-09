@@ -3,7 +3,7 @@
 **Issue**: [#217](https://gitlab.example.com/vtmocanu/uzi/-/issues/217) · **Label**: PRD · **Priority**: Medium
 **Area**: `api/internal/workersvc/limitwait.go` (the park, M1) · `api/internal/store/queries/anthropic_rate_limits.sql` + a migration (M1) · `api/internal/autoselect/select.go` + `api/internal/workersvc/service.go` (the claim, M2) · `api/internal/anthropic/client.go` + `web/src/lib/api.ts` + the meter rendering (M3) · `docs/` (M5).
 **Line references** are against `d367653b`.
-**Status**: not started.
+**Status**: M1–M6 implemented, tested and reviewed (branch `agent/issue-217`). M7 (validate on dev-cluster) is not done — it needs a hosted k8s deploy outside this change's scope.
 **Evidence**: measured 2026-08-03 against the live stack, run `a146df98` (issue #78), and read out of the code at that SHA. Adversarially reviewed the same day; the review refuted four claims in the first draft and every correction is recorded inline rather than silently applied.
 
 ## Problem
@@ -223,7 +223,7 @@ why Success Criterion 2 is deliverable at all.
 
 ## Milestones
 
-- [ ] **M1 — the park records the exhaustion.** `setLimitWait` marks the dead
+- [x] **M1 — the park records the exhaustion.** `setLimitWait` marks the dead
       credential's named window at 100% consumed, via a new UPDATE-only query
       touching that one `*_pct` column and nothing else. Fires only for a window
       that has a column (`five_hour`, and the four seven-day spellings, per
@@ -238,7 +238,7 @@ why Success Criterion 2 is deliverable at all.
       `limitwait.go:509`, *before* `decideLimitPark` at `:519`, so this write
       cannot perturb the parking run's own decision wherever it is placed and no
       re-fetch is needed to "make it consistent".
-- [ ] **M2 — the claim excludes the dead credential, on both exits.**
+- [x] **M2 — the claim excludes the dead credential, on both exits.**
       `autoselect.Select` gains an `exclude uuid.UUID` (the purity guard
       `TestPackageImportsStayPure`, `autoselect_test.go:230-231`, allows exactly
       `time` and `uuid`, and `uuid` is already imported at `select.go:6`), **and**
@@ -266,7 +266,7 @@ why Success Criterion 2 is deliverable at all.
       milestone must budget: `secretChoice{secretID: nil}` does not *name* a
       credential, so the branch has to resolve the owner's default before it can
       compare it against the exclusion. It is a fetch, not an `if`.
-- [ ] **M3 — `source` becomes a value a human can actually read.** The first draft
+- [x] **M3 — `source` becomes a value a human can actually read.** The first draft
       called this "update a rendering"; the review established it is **add** one.
       Nothing renders `source` today: `web/src/pages/AdminRateLimits.tsx` contains
       the string zero times, and `RateLimitMeters.tsx:132`'s only hit is the
@@ -280,7 +280,7 @@ why Success Criterion 2 is deliverable at all.
       `VITE_UZI_MOCK=1` at all. Without a rendering, D6's justification for a new
       value is unrealised and M1 ships a meter showing 100% against an older
       `synced_at` with no disclosure.
-- [ ] **M4 — tests.** Unit: `Select` with an exclusion (including
+- [x] **M4 — tests.** Unit: `Select` with an exclusion (including
       exclude-the-only-candidate and `uuid.Nil`); `autoChoice`'s fallback
       exclusion; the park's window mapping, including that `overage`/`unknown`
       write nothing; a `synced_at`-untouched assertion whose mutation is "bump it
@@ -298,7 +298,7 @@ why Success Criterion 2 is deliverable at all.
       `api.ts:1118-1119` names** — `selectReasonMatchesMigration` exists nowhere
       in the tree; that comment is stale and M5 fixes it. Both Go gates already
       carry `-count=1`.
-- [ ] **M5 — docs.** `docs/rate-limits.md`, `docs/run-limit-wait.md` and
+- [x] **M5 — docs.** `docs/rate-limits.md`, `docs/run-limit-wait.md` and
       `docs/anthropic-token.md:102` (headroom-based selection), plus
       `specs/ai.md`. State the new `source` value and that a park now writes the
       gauge. *(The draft claimed "only the poller writes this table" is stated in
@@ -312,7 +312,7 @@ why Success Criterion 2 is deliverable at all.
       `handler/secrets.go:249` says "no `DeleteRateLimits` call needed" (the
       handler is right); and `web/src/lib/api.ts:1118-1119` names a test symbol
       `selectReasonMatchesMigration` that does not exist (see M4).
-- [ ] **M6 — fix the "stale-but-eligible" phrase at every site.**
+- [x] **M6 — fix the "stale-but-eligible" phrase at every site.**
       `available.go:83` says leg 1 would fire on the dead credential's
       "**stale**-but-eligible reading"; a stale candidate classifies
       `StatusStale` and contributes nothing (`autoselect.go:162-164`, and it hits

@@ -48,18 +48,16 @@ type fakeSlacker struct {
 	order      *[]string
 	calls      int
 	lastUserID uuid.UUID
-	lastTitle  string
-	lastBody   string
-	lastLink   string
+	lastRender SlackRender
 }
 
-func (f *fakeSlacker) PublishNotification(userID uuid.UUID, title, body, link string) {
+func (f *fakeSlacker) PublishNotification(userID uuid.UUID, r SlackRender) {
 	if f.order != nil {
 		*f.order = append(*f.order, "slack")
 	}
 	f.calls++
 	f.lastUserID = userID
-	f.lastTitle, f.lastBody, f.lastLink = title, body, link
+	f.lastRender = r
 }
 
 func TestNotifyPersistsThenPrunesThenSlack(t *testing.T) {
@@ -74,7 +72,7 @@ func TestNotifyPersistsThenPrunesThenSlack(t *testing.T) {
 		Kind:    "judge_review",
 		Payload: map[string]any{"verdict": "ok"},
 		RunID:   &run,
-		Slack:   &SlackRender{Title: "judge review ready", Body: "verdict: ok", Link: "https://uzi.example/runs/1"},
+		Slack:   &SlackRender{Title: "judge review ready", Body: "verdict: ok", Link: "https://uzi.example/runs/1", Emoji: "🔎", Facts: []string{"Verdict ✅ *ok*", "1 recommendation"}},
 	}); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -101,8 +99,11 @@ func TestNotifyPersistsThenPrunesThenSlack(t *testing.T) {
 	if payload["verdict"] != "ok" {
 		t.Fatalf("payload = %v, want verdict=ok", payload)
 	}
-	if slk.calls != 1 || slk.lastUserID != user || slk.lastBody != "verdict: ok" {
-		t.Fatalf("slack call = %d user=%s body=%q, want one call to the owner", slk.calls, slk.lastUserID, slk.lastBody)
+	if slk.calls != 1 || slk.lastUserID != user || slk.lastRender.Body != "verdict: ok" {
+		t.Fatalf("slack call = %d user=%s body=%q, want one call to the owner", slk.calls, slk.lastUserID, slk.lastRender.Body)
+	}
+	if slk.lastRender.Emoji != "🔎" || len(slk.lastRender.Facts) != 2 || slk.lastRender.Facts[0] != "Verdict ✅ *ok*" {
+		t.Fatalf("slack render = %+v, want the emoji + facts passed through as the struct", slk.lastRender)
 	}
 }
 

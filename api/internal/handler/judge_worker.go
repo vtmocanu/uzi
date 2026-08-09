@@ -256,12 +256,81 @@ func buildReviewNotification(baseURL string, targetID uuid.UUID, res workersvc.R
 		},
 		RunID:    &runID,
 		ReviewID: &reviewID,
+		// PRD #268 M3: the Slack DM is Block Kit (family D). The Facts are TRUSTED,
+		// closed-enum strings carrying intentional markup — the verdict glyph + bold
+		// verdict word, the recommendation count, and one `code` chip per DISTINCT
+		// recommendation category (the closed workersvc.RecommendationCategories enum,
+		// safe raw). The notifier scrubs but does NOT escape them. Body is the scrubbed
+		// summary preview alone (the untrusted model text, whole-blob escaped in the
+		// blockquote), NOT the verdict/count one-liner — those now ride the Facts.
 		Slack: &notifysvc.SlackRender{
+			Emoji: "🔎",
 			Title: "Run review ready",
-			Body:  body,
+			Facts: reviewSlackFacts(sub),
+			Body:  summary,
 			Link:  reviewDeepLink(baseURL, targetID),
 		},
 	}
+}
+
+// reviewSlackFacts builds the trusted Fact chips for the judge review DM (PRD #268 M3):
+// the verdict (glyph + bold word), the recommendation count, then one `code` chip per
+// DISTINCT recommendation category, capped at the enum size so a pathological review
+// cannot flood the context block. Every part is drawn from the closed verdict/category
+// enums or an int, so the markup is intentional and safe to leave un-escaped.
+func reviewSlackFacts(sub workersvc.ReviewSubmission) []string {
+	facts := []string{
+		"Verdict " + verdictGlyph(sub.Verdict) + " *" + sub.Verdict + "*",
+		recCountFact(len(sub.Recommendations)),
+	}
+	return append(facts, recommendationCategoryChips(sub.Recommendations)...)
+}
+
+// verdictGlyph maps a review verdict to its canonical DM glyph, "" for an unknown value
+// (byte-honest degrade — the fact then reads "Verdict *x*" with no glyph). The live
+// enum (workersvc.ReviewVerdicts) is ideal|ok|issues; the needs_changes/needs-changes
+// and bad keys are carried per the PRD #268 M3 spec so a later verdict rename lands
+// glyph-ready.
+func verdictGlyph(verdict string) string {
+	switch verdict {
+	case "ideal", "ok":
+		return "✅"
+	case "issues", "needs_changes", "needs-changes":
+		return "⚠️"
+	case "bad":
+		return "❌"
+	default:
+		return ""
+	}
+}
+
+// recCountFact is the singular/plural recommendation-count Fact.
+func recCountFact(n int) string {
+	if n == 1 {
+		return "1 recommendation"
+	}
+	return fmt.Sprintf("%d recommendations", n)
+}
+
+// recommendationCategoryChips renders one `code` chip per DISTINCT recommendation
+// category, in first-seen order, capped at the RecommendationCategories enum size so
+// the context block stays bounded even for a many-recommendation review. The category
+// is the closed enum (validated at ingest), so it is safe to surface raw as a chip.
+func recommendationCategoryChips(recs []workersvc.ReviewRecommendation) []string {
+	const maxChips = 6 // len(workersvc.RecommendationCategories)
+	seen := make(map[string]struct{}, maxChips)
+	chips := make([]string, 0, maxChips)
+	for _, r := range recs {
+		if _, dup := seen[r.Category]; dup {
+			continue
+		}
+		seen[r.Category] = struct{}{}
+		chips = append(chips, "`"+r.Category+"`")
+		if len(chips) >= maxChips {
+			break
+		}
+	}
+	return chips
 }
 
 // reviewNotificationBody renders the one-line summary shown in the inbox row and the
@@ -280,9 +349,12 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 	return line
 }
 
-// reviewSummaryPreviewMaxRunes caps the summary preview carried in the notification —
-// tight for a one-line inbox/DM row; the run page holds the full text.
-const reviewSummaryPreviewMaxRunes = 280
+// reviewSummaryPreviewMaxRunes caps the summary preview carried in the notification.
+// PRD #268 M3 raised it from 280 to 600: the fuller excerpt is for the Slack DM's
+// blockquote (the Body of the Block Kit render), which has room for it; the inbox
+// one-liner (Payload.body via reviewNotificationBody) is still capped, just to the same
+// longer preview. The run page still holds the full text.
+const reviewSummaryPreviewMaxRunes = 600
 
 // reviewSummaryPreview renders the judge's summary for the notification: whitespace
 // (incl. newlines) collapsed to a single space, secret-scrubbed (belt and suspenders —

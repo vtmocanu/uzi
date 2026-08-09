@@ -328,6 +328,7 @@ type Run struct {
 	BudgetMaxIterations   pgtype.Int4        `json:"budget_max_iterations"`
 	BudgetWallSeconds     pgtype.Int4        `json:"budget_wall_seconds"`
 	ScheduleID            pgtype.UUID        `json:"schedule_id"`
+	LimitDeadSecretID     pgtype.UUID        `json:"limit_dead_secret_id"`
 }
 
 type RunMessage struct {

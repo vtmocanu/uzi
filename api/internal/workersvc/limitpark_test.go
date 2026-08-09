@@ -293,7 +293,8 @@ func TestDecideLimitParkSingleTokenUserDoesNotRegress(t *testing.T) {
 
 // TestDecideLimitParkWithNoRecordedCredentialSkipsBothLegs: a pre-PRD-#111 run, or
 // one whose credential recording failed. Without the exclusion id, leg 1 would fire
-// on the dead credential's OWN stale-but-eligible reading and promote the run
+// on the dead credential's OWN still-eligible reading (out of date but still within
+// MaxStaleness, so classified eligible rather than stale) and promote the run
 // instantly into the window it just exhausted.
 func TestDecideLimitParkWithNoRecordedCredentialSkipsBothLegs(t *testing.T) {
 	gaugeLate := parkNow.Add(5 * time.Hour)

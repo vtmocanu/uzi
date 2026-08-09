@@ -212,6 +212,27 @@ func TestLinkerTestDMPerTargetCooldown(t *testing.T) {
 	}
 }
 
+// The test DM carries the new `✅ Test message …` wording and no longer prefixes the
+// `[uzi]` tag (a 1:1 DM with the bot never needed it), PRD #268 M2.
+func TestLinkerTestDMText(t *testing.T) {
+	fp := &fakePoster{}
+	l := NewLinker(&fakeLinkerStore{}, fp, nil)
+
+	if err := l.SendTestDM(context.Background(), "U2"); err != nil {
+		t.Fatalf("test DM should send: %v", err)
+	}
+	if len(fp.posts) != 1 {
+		t.Fatalf("want exactly one posted DM, got %+v", fp.posts)
+	}
+	got := fp.posts[0].text
+	if !strings.HasPrefix(got, "✅ Test message") {
+		t.Errorf("test DM text = %q, want it to start with `✅ Test message`", got)
+	}
+	if strings.Contains(got, "[uzi]") {
+		t.Errorf("test DM must not carry the [uzi] prefix: %q", got)
+	}
+}
+
 func TestLinkerConfirmMarksLinkedAndEditsDM(t *testing.T) {
 	fs := &fakeLinkerStore{confirmRows: 1}
 	fp := &fakePoster{}

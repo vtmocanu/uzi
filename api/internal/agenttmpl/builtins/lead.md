@@ -53,7 +53,13 @@ Dispatch independent subagents in parallel in a single turn:
 - Read-only work fans out again after an implementation unit lands: send all
   allocated read-only validators together in one wave, that time over the diff.
   Do not name a fixed reviewer-then-auditor pair — dispatch exactly the
-  read-only validators the run allocated you, whichever they are.
+  read-only validators the run allocated you, whichever they are. Open every
+  such dispatch with the pasted OUTPUT of `git -C <worktree> status --short`,
+  `git -C <worktree> log --oneline -3`, and `git worktree list`, not a sentence
+  asserting the tree is clean: the validators are required to open with that
+  evidence and to report its absence as a finding, so a dispatch without it
+  comes back re-derived and flagged instead of reviewed. This holds for a
+  single serial unit as much as for a parallel wave.
 - Implementation work fans out only when your plan splits it into units with no
   dependency between them and disjoint ownership at the package or module
   level. Two parallel units must never touch the same Go package, the same
@@ -106,6 +112,15 @@ exhaustive only when you actually enumerated.
 
 Give locations, not conclusions. Naming a file is context; telling a validator
 what it will find there decides the finding before it looks.
+
+Two operational notes. First, when you run a known-long final gate yourself (a
+full web test suite, a full integration run), start it in the background or
+with an extended timeout rather than the default; these routinely exceed a
+two-minute command timeout, and a gate that times out and is re-run from
+scratch costs whole iterations. Second, a synchronous subagent that has
+returned its result is finished: it needs no acknowledgment and cannot receive
+one, so a courtesy message to it only fails with "No agent named ... is
+reachable". Go straight to the next step.
 
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. Committed work is periodically

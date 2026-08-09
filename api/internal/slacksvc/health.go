@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"github.com/google/uuid"
+	"github.com/slack-go/slack"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -77,7 +78,7 @@ const reasonPersistFailing = "the agent's updates can't be saved, so it keeps re
 const reasonVerdictUndelivered = "the worker hasn't picked up your response yet"
 
 // isHealthFlaggableStatus mirrors the server's flaggable set (Decision 3): the root
-// label appends its ⚠ variant only while the run is still in one of these, so a
+// carries its ⚠️ context flag only while the run is still in one of these, so a
 // terminal run never shows a stale flag on its Slack root.
 func isHealthFlaggableStatus(status string) bool {
 	switch status {
@@ -107,17 +108,15 @@ func healthRootLabel(health string) string {
 	}
 }
 
-// healthSuffix is the ⚠ fragment appended to the root's status label (Decision 7).
-// Empty unless the run is flagged AND still in a flaggable status, so a healthy or
-// terminal run's root is unchanged.
-func healthSuffix(rc store.GetSlackRunContextRow) string {
+// healthContextLabel is the health flag word for the root's context block (PRD #268
+// M2, formerly the ⚠ label-suffix healthSuffix). Empty unless the run is flagged AND
+// still in a flaggable status, so a healthy or terminal run's root carries no flag.
+// The caller (rootBlocks) prefixes the ⚠️ glyph and scrubs/escapes the word.
+func healthContextLabel(rc store.GetSlackRunContextRow) string {
 	if rc.Health == "" || rc.Health == "ok" || !isHealthFlaggableStatus(rc.Status) {
 		return ""
 	}
-	if label := healthRootLabel(rc.Health); label != "" {
-		return " · ⚠ " + label
-	}
-	return ""
+	return healthRootLabel(rc.Health)
 }
 
 // healthNudgeHead is the fixed opening line of a threaded health nudge, keyed off the
@@ -133,17 +132,18 @@ func healthSuffix(rc store.GetSlackRunContextRow) string {
 func healthNudgeHead(health, reason string) string {
 	switch health {
 	case healthStalled:
-		return "⚠ This run has gone quiet and may be stuck."
+		return "💤 This run has gone quiet and may be stuck."
 	case healthLooping:
-		// PRD #108 M4 ADDED this arm; it did not change the one below it. The existing
-		// sentence stays exactly as written for the tool-repetition cause it was
-		// written for, so no existing nudge's wording moves.
+		// PRD #108 M4 ADDED the persistence arm; it did not change the tool-repetition
+		// one. PRD #268 M3 swaps the leading glyph on BOTH looping lines to the canonical
+		// 🔁 (from the generic ⚠️) — a glyph change, not a wording change, so the
+		// sentences after the glyph stay exactly as written and no nudge's wording moves.
 		if reason == reasonPersistFailing {
-			return "⚠ This run's updates aren't being saved, so it keeps re-sending them."
+			return "🔁 This run's updates aren't being saved, so it keeps re-sending them."
 		}
-		return "⚠ This run looks like it's repeating the same step."
+		return "🔁 This run looks like it's repeating the same step."
 	case healthSlow:
-		return "⚠ This run is taking longer than usual."
+		return "🐢 This run is taking longer than usual."
 	case healthWaitingWorker:
 		// Issue #182 ADDED this arm; it did not change the one below it. The existing
 		// sentence stays exactly as written for the unclaimed-run cause it was written
@@ -158,23 +158,33 @@ func healthNudgeHead(health, reason string) string {
 		}
 		return "⏳ This run is still waiting for a worker to pick it up."
 	case healthApprovalIdle:
-		return "⏸ This run is still waiting for your approval."
+		return "⏸️ This run is still waiting for your approval."
 	default:
-		return "⚠ This run needs a look."
+		return "⚠️ This run needs a look."
 	}
 }
 
-// healthNudgeText is the threaded nudge body: the enum-keyed framing, the
-// server-controlled reason label (empty ok), and the run deep link. It carries NO
-// forge- or worker-controlled field, so there is nothing to EscapeMrkdwn; the caller
-// still passes the whole string through ScrubSecrets.
-func healthNudgeText(health, reason, base string, runID uuid.UUID) string {
-	body := healthNudgeHead(health, reason)
+// healthNudgeBlocks builds the threaded run-health nudge as Block Kit (message family
+// E, PRD #268 M3): a section carrying the enum-keyed framing head + the
+// server-controlled reason (empty ok), and a context block with the run deep link when
+// a base URL resolves. The head is server-authored (a fixed per-enum sentence carrying
+// its own canonical glyph), so it needs no escaping; the reason carries NO forge- or
+// worker-controlled field either, but it is still ScrubSecrets'd (last line of defense)
+// and EscapeMrkdwn'd (a server reword can never smuggle markup into the DM).
+//
+// The fallback is the head sentence alone (plain, no markup): it is a fixed per-enum
+// string, never a raw reason, so it is a safe OS-notification line on its own.
+func healthNudgeBlocks(health, reason, base string, runID uuid.UUID) (blocks []slack.Block, fallback string) {
+	head := healthNudgeHead(health, reason)
+	section := head
 	if reason != "" {
-		body += " " + reason + "."
+		section += " " + EscapeMrkdwn(ScrubSecrets(reason)) + "."
 	}
+	blocks = []slack.Block{slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, section, false, false), nil, nil)}
 	if link := runLink(base, runID); link != "" {
-		body += "\n" + link
+		blocks = append(blocks, slack.NewContextBlock("slack_health_nudge_ctx",
+			slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets("🔗 "+link), false, false)))
 	}
-	return body
+	return blocks, head
 }
