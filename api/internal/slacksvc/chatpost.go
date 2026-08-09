@@ -50,7 +50,7 @@ const (
 	chatNoAnswerText = "_(this turn produced no text reply — open it in uzi for the details)_"
 	// chatDynamicMax bounds a worker-authored status/error note (timeout line, redacted
 	// error) — the answer body is bounded by truncateForSlackSection, but `extra` rides
-	// its own path, so it needs its own cap (mirrors renderThread's boundReason).
+	// its own path, so it needs its own cap (mirrors renderThreadBlocks' boundReason).
 	chatDynamicMax = 500
 	// chatConvosCap bounds the turn-state map. Above it, the drain evicts skip markers
 	// (nil entries — pure classification cache, cheap to rebuild), so a long-lived
