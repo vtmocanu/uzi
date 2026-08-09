@@ -4257,7 +4257,9 @@ Serves human: per-repo toolchains; "command not found" surfacing (plan.md 44/64)
   Decision 3, mirroring `buildSdkEnv`) → export `devbox shellenv` filtered through an
   **explicit variable allowlist** (`PATH` prepend + nix TLS/locale vars only, never a
   blind merge) into the SDK env. **Provision failure FAILS the run** (missing package,
-  allowlist reject) — never silent degradation.
+  allowlist reject) — never silent degradation. **This fatal invariant holds for
+  TIER-1 only**: a tier-2 (repo opt-in extra) provisioning failure instead degrades to
+  a run-feed warning + retry with tier-1 only (§157, issue #278).
 - **New egress**: nix substituters (cache.nixos.org). ARCHITECTURE.md's "outbound-only
   to api" worker description amended accordingly.
 
@@ -4288,13 +4290,22 @@ Serves human: repo-carried toolchains, safely.
 - **`repos.repo_devbox_opt_in BOOLEAN NOT NULL DEFAULT false`** (`00047`); per-repo
   trust toggle in the Tools panel. **Packages-only extraction** (`agent/src/repo-tools.ts`):
   only the `packages` field is read, shape-validated (name / name@version); `init_hook`,
-  `scripts`, flake refs, and every other key are ignored and NEVER executed — pure JSON
-  parse, no `devbox` invocation on the repo file. A **1 MiB stat-guard** rejects an
-  oversized manifest before reading it (the length/count caps only bite post-read —
-  audit L1).
+  `scripts`, flake refs, and every other key are ignored and NEVER executed —
+  **comment-tolerant (JSONC) parse**: an in-process, string-aware strip of `//` +
+  `/* */` comments and trailing commas fed to native `JSON.parse`; no shell, no `devbox`
+  invocation on the repo file. A **1 MiB stat-guard** rejects an oversized manifest
+  before reading it (the length/count caps only bite post-read — audit L1).
 - **Union-merge with tier-1 precedence** (`mergeToolPackages`): tier-1 wins a version
   conflict on the same base name; two tier-2 versions of one base dedup to the first
   (audit ride-along).
+- **Tier-split failure handling** (issue #278, option b): tier-1 and tier-2 install as
+  one merged devbox install. Tier-1 provisioning failure stays **fatal**
+  (REASON_PROVISION_FAILED, run fails); a **tier-2 failure degrades** — emit a run-feed
+  warning naming the dropped repo extras and **retry with tier-1 only**. Reason it was
+  needed: the extraction previously used strict `JSON.parse`, so any commented (normal)
+  manifest silently extracted nothing and tier-2 had never actually taken effect.
+  Caveat: even with the degrade, tier-2 still cannot resolve on the live cluster until
+  the egress decision in #123 — this change does not touch egress.
 - **Tier-2 bypasses BOTH the allowlist AND the credential-CLI denylist** — the PRD
   posture, **audit-ACCEPTED** (probed, no concrete escalation): bounded by opt-in +
   packages-only, and the actual security control is Decision 3's secret-scrubbed
