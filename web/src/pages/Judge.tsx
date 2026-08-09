@@ -116,11 +116,14 @@ export function Judge() {
   }, [categoryParam]);
 
   const [backlog, setBacklog] = useState<JudgeBacklog | null>(null);
-  // Per-category chip counts (PRD #244), the canonical /me/judge/category-stats aggregate.
-  // Whole-backlog, uncapped, triage-invariant — so it is fetched ONCE on mount (below), not
-  // through `load` (which re-fires on every bucket/category/run change). Defaults to {} so a
-  // slow or failed fetch renders 0-count chips rather than crashing.
-  const [categoryCounts, setCategoryCounts] = useState<JudgeCategoryStats["counts"]>({});
+  // The per-category chip-count MATRIX (PRD #270), the canonical /me/judge/category-stats
+  // aggregate: bucket → category → group count, held WHOLE in state and indexed at render by
+  // the active bucket (categoryCounts below). Uncapped and anchor-aware, but now TAB-SCOPED
+  // and TRIAGE-VARIANT — a mark-done moves a group between buckets — so it is refetched on
+  // every disposition/undo/file mutation and on a run-anchor change (loadCategoryStats),
+  // though NOT on a bucket-tab or category toggle since all buckets arrive in one payload.
+  // Defaults to {} so a slow or failed fetch renders 0-count chips rather than crashing.
+  const [categoryStats, setCategoryStats] = useState<JudgeCategoryStats["counts_by_bucket"]>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionErr, setActionErr] = useState("");
@@ -159,17 +162,34 @@ export function Judge() {
     load();
   }, [load]);
 
-  // The per-category chip counts (PRD #244) are fetched ONCE on mount, NOT via `load`. The
-  // count is a whole-backlog, uncapped, triage-invariant aggregate (a group stays a group once
-  // triaged), so it is identical across every bucket, category filter, run anchor, and after
-  // any disposition — refetching it on those changes would spend a round-trip to learn the
-  // same number. Empty deps is the fetch-once contract; a failure leaves the chips at 0.
+  // The per-category chip-count MATRIX (PRD #270) is refetched on disposition/undo/file and
+  // on a run-anchor change — NOT on a bucket-tab or category toggle: the matrix carries all
+  // five buckets in one payload, so the active tab's counts are DERIVED at render below
+  // (categoryCounts) with no round-trip. The aggregate is TAB-SCOPED and TRIAGE-VARIANT now
+  // (a mark-done moves a group between buckets), reversing PRD #244's fetched-once property.
+  // Best-effort: a failure leaves the chips at 0. `loadCategoryStats` is keyed on runAnchor
+  // only — the anchor is the sole request input — and the dispose/undo/file handlers below
+  // call it explicitly on the same triggers that re-read the backlog.
+  //
+  // Self-healing transient (Decision 6): right after a bulk mark-done on the To-triage tab the
+  // acted-on card stays visible at its new rollup (dispose re-renders it, never filters it
+  // out) while a refetched `todo` chip has already decremented — a brief, deliberate mismatch
+  // that reconciles on the next navigation/load.
+  const loadCategoryStats = useCallback(async () => {
+    try {
+      const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
+      setCategoryStats(stats.counts_by_bucket);
+    } catch {
+      /* chips render with 0 counts — a progressive enhancement, never a blocker */
+    }
+  }, [runAnchor]);
+
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const stats = await api.getJudgeCategoryStats();
-        if (alive) setCategoryCounts(stats.counts);
+        const stats = await api.getJudgeCategoryStats(runAnchor || undefined);
+        if (alive) setCategoryStats(stats.counts_by_bucket);
       } catch {
         /* chips render with 0 counts — a progressive enhancement, never a blocker */
       }
@@ -177,7 +197,20 @@ export function Judge() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [runAnchor]);
+
+  // The chip row is per-tab: index the whole matrix by the resolved bucket (todo/filed/done/
+  // dismissed/all — `all` is a real key, so indexing is uniform). A bucket with no groups is
+  // {} in the matrix, so its chips read 0; LabelFilter is untouched and still takes {cat: n}.
+  const categoryCounts = categoryStats[bucket] ?? {};
+
+  // reloadAfterMutation refreshes BOTH the backlog and the chip matrix — the file-issue path
+  // needs both (filing moves a group todo→filed), and it is passed as `onFiled` in place of a
+  // bare `load` so the chips track a filing the same way they track a dispose/undo.
+  const reloadAfterMutation = useCallback(() => {
+    load();
+    loadCategoryStats();
+  }, [load, loadCategoryStats]);
 
   // The file-issue picker lists every connected repo (#68). Best-effort: a failure just
   // leaves the picker empty and the draft still opens.
@@ -283,6 +316,11 @@ export function Judge() {
         // disposition is not one (BLK-BADGE). The response already carries the canonical
         // aggregate, so there is nothing to re-fetch.
         setJudgeTodo(res.triage.todo);
+        // Refetch the chip matrix on the SAME trigger that re-read the backlog (Decision 6):
+        // a disposition moves a group between buckets, so the tab-scoped chip counts are now
+        // stale. The bulk response carries the acted-on rows and the triage totals but NOT the
+        // per-category matrix, so this is a separate round-trip.
+        loadCategoryStats();
         setSelected(new Set());
         const verb = status === "done" ? "marked done" : "dismissed";
         showToast({
@@ -307,7 +345,7 @@ export function Judge() {
         setActionErr(e instanceof ApiError ? e.message : "Could not apply the disposition");
       }
     },
-    [showToast, setJudgeTodo],
+    [showToast, setJudgeTodo, loadCategoryStats],
   );
 
   const undo = useCallback(async () => {
@@ -351,9 +389,11 @@ export function Judge() {
       );
     }
     // Reload either way: after a partial failure the page must show what IS true, not the
-    // state either outcome would have implied.
+    // state either outcome would have implied. Refresh the chip matrix alongside the backlog —
+    // an undo moves groups back between buckets, same as a dispose (Decision 6).
     await load();
-  }, [toast, load]);
+    loadCategoryStats();
+  }, [toast, load, loadCategoryStats]);
 
   const toggleSelect = (key: string) => {
     setSelected((prev) => {
@@ -426,12 +466,14 @@ export function Judge() {
 
       {/* Recommendation-label filter (PRD #235): multi-select chips ABOVE the bucket tabs.
           The filter narrows the GROUP LIST only — the tabs and nav badge stay whole-backlog.
-          Each chip now carries a per-category GROUP count (PRD #244), sourced from the
-          canonical /me/judge/category-stats aggregate fetched once on mount (categoryCounts) —
-          the aggregate Decision 6 required. That count is a real server COUNT(DISTINCT target)
-          over the whole backlog, NOT a tally of the groups on screen: the on-screen groups are
-          capped-before-grouping and bucket-filtered, so tallying them stays the anti-pattern the
-          codebase forbids — a chip can honestly read 6 while a truncated list shows 4 cards. */}
+          Each chip carries a per-category GROUP count sourced from the canonical
+          /me/judge/category-stats matrix, now SCOPED TO THE SELECTED TAB (PRD #270): the
+          derived categoryCounts is the matrix indexed by the active bucket, so a chip on
+          To triage reads that category's `todo` count and on All reads its `all` count. The
+          count is a real server aggregate over the uncapped backlog, NOT a tally of the groups
+          on screen: the on-screen groups are capped-before-grouping and bucket-filtered, so
+          tallying them stays the anti-pattern the codebase forbids — a chip can honestly read 6
+          while a truncated list shows 4 cards. */}
       <LabelFilter
         selected={categories}
         counts={categoryCounts}
@@ -528,7 +570,7 @@ export function Judge() {
                   onToggleSelect={() => toggleSelect(coordKey(g.category, g.target))}
                   onDispose={(status, reason) => dispose([{ category: g.category, target: g.target }], status, reason)}
                   repos={repos}
-                  onFiled={load}
+                  onFiled={reloadAfterMutation}
                 />
               ))}
             </ul>
@@ -576,12 +618,13 @@ function isBucket(v: string | null): v is JudgeBacklogBucket {
 // meaningless), driving the ?category= URL param. The Clear control appears only when
 // something is selected and removes the param entirely.
 //
-// Each chip carries a per-category GROUP count (PRD #244) from `counts` — the canonical
-// /me/judge/category-stats aggregate the page fetched once on mount, NOT a tally of the
-// on-screen groups (which are capped/bucket-filtered; tallying them is the banned
-// anti-pattern). `counts[cat] ?? 0` per chip, so a category the aggregate never returned
-// reads 0. A true-zero chip is DIMMED — "none of this kind" — rather than hidden, so the six
-// chips stay a stable, learnable set (open question 3).
+// Each chip carries a per-category GROUP count from `counts` — the canonical
+// /me/judge/category-stats matrix indexed by the active tab (PRD #270; the page derives this
+// per-bucket slice and passes it here unchanged), NOT a tally of the on-screen groups (which
+// are capped/bucket-filtered; tallying them is the banned anti-pattern). `counts[cat] ?? 0`
+// per chip, so a category the aggregate never returned reads 0. A true-zero chip is DIMMED —
+// "none of this kind" — rather than hidden, so the six chips stay a stable, learnable set
+// (open question 3).
 //
 // The numeric badge is aria-hidden and the chip's accessible name is set explicitly via
 // aria-label ("Improve uzi, 6 groups") so the count is announced honestly WITHOUT the raw

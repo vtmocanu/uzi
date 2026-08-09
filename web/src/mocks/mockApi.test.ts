@@ -385,71 +385,143 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
   });
 });
 
-describe("mockApi judge category stats (PRD #244)", () => {
-  // getJudgeCategoryStats counts DISTINCT (category, target) coordinates — GROUPS — per
-  // category, NOT rows. This test is only meaningful over a DISCRIMINATING fixture: one where
-  // a coordinate RECURS across ≥2 reviews so a rows-counter and a distinct-coordinate counter
-  // DISAGREE. The seeded fixtures satisfy this (improve_uzi/api/internal/poller recurs in all
-  // three runs, install_worker_tool/shellcheck and add_agent/deploy-agent each in two), and
-  // the guard below FAILS the test if a future fixture edit ever makes rows == distinct — at
-  // which point this test would prove nothing and must be re-seeded, not deleted.
-  it("counts distinct coordinates (groups) per category, never rows", async () => {
+describe("mockApi judge category stats (PRD #270)", () => {
+  // getJudgeCategoryStats is a bucket-keyed MATRIX now (PRD #270): bucket → category → GROUP
+  // count, with `all` the whole-backlog per-category count and, by construction,
+  // todo+filed+done+dismissed == all per category. It rolls up the SAME ladder the backlog
+  // groups do (todo if any open member, else the group's highest settled rung), so a
+  // meaningful differential test needs a fixture that is genuinely multi-bucket AND exercises
+  // both the highest-settled-rung spread and open-over-settled promotion. A degenerate
+  // single-bucket fixture would make the sum invariant vacuous, so guards below fail loudly if
+  // the fixture ever collapses to one.
+  const SETTLED_BUCKETS = ["filed", "done", "dismissed"] as const;
+
+  // bucketSum totals the four disposition buckets for one category — the value that must equal
+  // that category's `all` slice.
+  function bucketSum(matrix: Record<string, Record<string, number>>, cat: string): number {
+    return (["todo", "filed", "done", "dismissed"] as const).reduce(
+      (n, b) => n + (matrix[b]?.[cat] ?? 0),
+      0,
+    );
+  }
+
+  it("is a bucket matrix whose per-category buckets sum to `all`, over a genuinely multi-bucket fixture", async () => {
     installStorage();
     const api = await reload();
     const { mockReviews } = await import("./data");
 
-    // Two INDEPENDENT tallies straight off the fixtures — deliberately not sharing the mock's
-    // own helper, so this compares against a second computation, not itself.
-    const rowsByCat: Record<string, number> = {};
-    const distinctByCat = new Map<string, Set<string>>();
-    for (const review of mockReviews) {
-      for (const rec of review.recommendations) {
-        rowsByCat[rec.category] = (rowsByCat[rec.category] ?? 0) + 1;
-        const set = distinctByCat.get(rec.category) ?? new Set<string>();
-        set.add(rec.target);
-        distinctByCat.set(rec.category, set);
+    // Force a category to span TWO distinct non-todo settled buckets: improve_uzi seeds one
+    // dismissed group (run-timeout) and one open group (api/internal/poller). Mark the open one
+    // done and improve_uzi now lands groups in BOTH done and dismissed — the highest-settled-rung
+    // spread a single-bucket fixture never exercises. install_worker_tool/shellcheck is left
+    // untouched: its group has a done member (first review) AND an open member (another run), so
+    // it must still promote to todo — the open+settled case.
+    await api.bulkSetJudgeDisposition(
+      [{ category: "improve_uzi", target: "api/internal/poller" }],
+      "done",
+      undefined,
+      "open",
+    );
+
+    const { counts_by_bucket } = await api.getJudgeCategoryStats();
+
+    // Shape: exactly the five bucket keys, each an object (possibly empty).
+    expect(Object.keys(counts_by_bucket).sort()).toEqual(["all", "dismissed", "done", "filed", "todo"]);
+    for (const b of Object.keys(counts_by_bucket)) {
+      expect(counts_by_bucket[b] && typeof counts_by_bucket[b]).toBe("object");
+    }
+
+    // Core rollup invariant: every group is counted once in its own bucket and once in `all`,
+    // so the four disposition buckets sum to `all` for every category.
+    for (const cat of Object.keys(counts_by_bucket.all)) {
+      expect(bucketSum(counts_by_bucket, cat), `todo+filed+done+dismissed must equal all for ${cat}`).toBe(
+        counts_by_bucket.all[cat],
+      );
+    }
+    // …and no category appears in a per-bucket slice without appearing in `all`.
+    for (const b of ["todo", "filed", "done", "dismissed"] as const) {
+      for (const cat of Object.keys(counts_by_bucket[b])) {
+        expect(counts_by_bucket.all[cat] ?? 0, `${cat} is in ${b} but missing from all`).toBeGreaterThan(0);
       }
     }
-    const distinctByCatObj: Record<string, number> = {};
-    for (const [cat, set] of distinctByCat) distinctByCatObj[cat] = set.size;
 
-    // DISCRIMINATING-FIXTURE GUARD: at least one category must have MORE rows than distinct
-    // coordinates, or the two counters agree everywhere and the assertion below is vacuous.
-    const discriminates = Object.keys(rowsByCat).some((cat) => rowsByCat[cat] > distinctByCatObj[cat]);
+    // DISCRIMINATION GUARD 1 — highest-rung spread: improve_uzi's groups must span ≥2 DISTINCT
+    // settled buckets. Without it the matrix could be degenerate (every group in one bucket) and
+    // the sum invariant above would be vacuous.
+    const improveUziSettled = SETTLED_BUCKETS.filter((b) => (counts_by_bucket[b].improve_uzi ?? 0) > 0);
     expect(
-      discriminates,
-      "fixture is not discriminating: no category has a coordinate recurring across reviews, " +
-        "so a rows-counter and a distinct-coordinate counter cannot disagree — re-seed a " +
-        "recurring coordinate before trusting this test",
+      improveUziSettled.length,
+      "fixture not discriminating: improve_uzi must have groups in ≥2 distinct settled buckets",
+    ).toBeGreaterThanOrEqual(2);
+    expect(counts_by_bucket.done.improve_uzi).toBe(1); // poller, just marked done
+    expect(counts_by_bucket.dismissed.improve_uzi).toBe(1); // run-timeout, dismissed in seed
+
+    // DISCRIMINATION GUARD 2 — open-over-settled promotion: install_worker_tool/shellcheck has a
+    // SETTLED member in the seed yet recurs open in another run, so its group must roll up to
+    // todo. Prove the seed really is mixed (else "in todo" proves nothing), then assert placement.
+    const shellcheckSettled = mockReviews.some((r) =>
+      r.dispositions.some((d) => d.category === "install_worker_tool" && d.target === "shellcheck"),
+    );
+    expect(
+      shellcheckSettled,
+      "fixture not discriminating: install_worker_tool/shellcheck has no settled member, so its " +
+        "presence in todo cannot demonstrate open-over-settled promotion",
     ).toBe(true);
+    expect(counts_by_bucket.todo.install_worker_tool).toBe(1);
+    expect(counts_by_bucket.all.install_worker_tool).toBe(1);
 
-    const { counts } = await api.getJudgeCategoryStats();
-
-    // The endpoint matches the DISTINCT-coordinate tally exactly…
-    expect(counts).toEqual(distinctByCatObj);
-    // …and specifically NOT the rows tally, on the category where they diverge. improve_uzi
-    // has the poller coordinate three times plus one other coordinate: 4 rows, 2 groups.
-    expect(counts.improve_uzi).toBe(2);
-    expect(rowsByCat.improve_uzi).toBe(4);
-    expect(counts).not.toEqual(rowsByCat);
+    // GROUPS, not rows: improve_uzi is 2 groups (poller, run-timeout) while its rows number 4
+    // (poller recurs in three reviews). A rows-counter would read 4 in `all`.
+    const improveUziRows = mockReviews.reduce(
+      (n, r) => n + r.recommendations.filter((x) => x.category === "improve_uzi").length,
+      0,
+    );
+    expect(counts_by_bucket.all.improve_uzi).toBe(2);
+    expect(improveUziRows).toBeGreaterThan(counts_by_bucket.all.improve_uzi);
   });
 
-  it("agrees with the canonical getJudgeStats coordinate universe (no bucket/triage skew)", async () => {
+  it("is triage-VARIANT: a disposition moves a group between buckets (PRD #270 reverses #244)", async () => {
     installStorage();
     const api = await reload();
 
-    // The count is triage-invariant: settling a coordinate must NOT change the category count
-    // (a group stays a group once triaged). Dismiss shellcheck's open member and re-read.
-    const before = (await api.getJudgeCategoryStats()).counts;
+    // install_worker_tool/shellcheck seeds as a todo group (an open member in a second run).
+    // Dismiss its open member and the group moves todo → dismissed: the matrix is no longer the
+    // fetch-once, triage-invariant aggregate #244 shipped.
+    const before = (await api.getJudgeCategoryStats()).counts_by_bucket;
+    expect(before.todo.install_worker_tool).toBe(1);
+    expect(before.dismissed.install_worker_tool ?? 0).toBe(0);
+
     await api.bulkSetJudgeDisposition(
       [{ category: "install_worker_tool", target: "shellcheck" }],
       "dismissed",
       "wont_do",
       "open",
     );
-    const after = (await api.getJudgeCategoryStats()).counts;
-    expect(after).toEqual(before);
-    expect(after.install_worker_tool).toBe(1); // still one group, now dismissed
+
+    const after = (await api.getJudgeCategoryStats()).counts_by_bucket;
+    expect(after.todo.install_worker_tool ?? 0).toBe(0);
+    expect(after.dismissed.install_worker_tool).toBe(1);
+    // The whole-backlog `all` slice is unchanged — one group, still one group.
+    expect(after.all.install_worker_tool).toBe(before.all.install_worker_tool);
+  });
+
+  it("scopes the matrix to the ?run= anchor (deep-link parity with the backlog)", async () => {
+    installStorage();
+    const api = await reload();
+
+    // The anchored matrix must be a subset of the unanchored one: a run anchor keeps only groups
+    // recurring in that run. Read the backlog at the same anchor to learn which categories are in
+    // scope, then assert the matrix's `all` slice matches that set.
+    const whole = (await api.getJudgeCategoryStats()).counts_by_bucket;
+    const anchoredBacklog = await api.getJudgeBacklog("all", "run-closed");
+    const anchoredCats = new Set(anchoredBacklog.groups.map((g) => g.category));
+
+    const anchored = (await api.getJudgeCategoryStats("run-closed")).counts_by_bucket;
+    expect(new Set(Object.keys(anchored.all))).toEqual(anchoredCats);
+    // Anchoring can only narrow: every anchored `all` count is ≤ the whole-backlog one.
+    for (const cat of Object.keys(anchored.all)) {
+      expect(anchored.all[cat]).toBeLessThanOrEqual(whole.all[cat]);
+    }
   });
 });
 

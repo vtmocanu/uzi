@@ -337,36 +337,41 @@ function computeTriage(): TriageCounts {
   return total;
 }
 
-// computeCategoryStats recomputes the per-category GROUP count the server's
-// CountJudgeGroupsByCategoryForUser aggregate serves (PRD #244): the number of DISTINCT
-// (category, target) coordinates in each category across EVERY review the caller owns.
+// computeCategoryStats recomputes the per-category GROUP count MATRIX the server's
+// category-stats aggregate serves (PRD #270): for each triage bucket, the number of groups in
+// that bucket per category, plus an `all` slice that is the whole-backlog per-category count.
 //
-// It recomputes from the fixtures INDEPENDENTLY of groupJudgeRecommendations — exactly as
-// computeTriage recomputes triage rather than reusing the grouper. Sharing the grouper would
-// be wrong twice over: the grouper is fed capBacklogRows' output (the cap applies BEFORE
-// grouping), so its group set understates under truncation — the very failure #244's uncapped
-// aggregate exists to avoid — and it also carries the ?bucket=/?run= filters, which this count
-// must ignore. So this walks the raw, uncapped reviews.
+// It reuses the grouper deliberately now — the count is TAB-SCOPED, so it must roll up the
+// same (todo if any open member, else the group's highest settled rung) that the backlog rows
+// do. It runs over the raw, UNCAPPED rows (backlogRowsFromReviews, never the capped path) with
+// no bucket or category filter, so the matrix is comparable to the server's uncapped aggregate
+// and never understates under truncation. It is anchor-aware: with a run anchor it semi-joins
+// exactly as computeBacklog does (keep a group iff it recurs in the anchor run, keeping all of
+// its occurrences).
 //
-// DISTINCT COORDINATES, never rows: a coordinate recurring across several reviews counts ONCE
-// (a Set of targets per category). Keying per category means the same `target` string filed
-// under two categories is counted once in each — the GROUP BY category the SQL does. All
-// triage states are counted: a group stays a group once triaged, so this reads no disposition.
-function computeCategoryStats(): JudgeCategoryStats {
-  const targetsByCategory = new Map<string, Set<string>>();
-  for (const review of reviews) {
-    for (const rec of review.recommendations) {
-      let targets = targetsByCategory.get(rec.category);
-      if (!targets) {
-        targets = new Set<string>();
-        targetsByCategory.set(rec.category, targets);
-      }
-      targets.add(rec.target);
+// GROUPS, never rows: groupJudgeRecommendations already dedups by (category, target) across
+// reviews, so a coordinate recurring across several reviews counts ONCE. Each group is tallied
+// into its OWN bucket and into `all`, so `todo+filed+done+dismissed == all` per category holds
+// by construction. All five bucket keys are always present (each `{}` when empty). The count is
+// TRIAGE-VARIANT: a disposition moves a group between buckets, so it is recomputed on demand.
+function computeCategoryStats(runAnchor = ""): JudgeCategoryStats {
+  let groups = groupJudgeRecommendations(backlogRowsFromReviews());
+  if (runAnchor) {
+    groups = groups.filter((g) => g.occurrences.some((o) => o.run_id === runAnchor));
+  }
+  const matrix: Record<string, Record<string, number>> = {
+    todo: {},
+    filed: {},
+    done: {},
+    dismissed: {},
+    all: {},
+  };
+  for (const g of groups) {
+    for (const bucketKey of [g.bucket, "all"]) {
+      matrix[bucketKey][g.category] = (matrix[bucketKey][g.category] ?? 0) + 1;
     }
   }
-  const counts: Record<string, number> = {};
-  for (const [category, targets] of targetsByCategory) counts[category] = targets.size;
-  return { counts };
+  return { counts_by_bucket: matrix };
 }
 
 // RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280), and the count
@@ -2775,11 +2780,13 @@ export const mockApi = {
     // page's tabs and the nav badge read — see computeTriage).
     return delay(computeTriage(), 60);
   },
-  getJudgeCategoryStats: async () => {
+  getJudgeCategoryStats: async (run?: string) => {
     requireSession();
-    // Canonical per-category GROUP count over every review the caller owns — distinct
-    // (category, target) coordinates, uncapped and triage-invariant (see computeCategoryStats).
-    return delay(computeCategoryStats(), 60);
+    // Canonical per-category GROUP count MATRIX over every review the caller owns — bucket →
+    // category → group count, uncapped and anchor-aware, tab-scoped and triage-variant (see
+    // computeCategoryStats). `run` is the deep-link anchor, threaded through the same semi-join
+    // the backlog uses.
+    return delay(computeCategoryStats(run ?? ""), 60);
   },
 
   // ── Judge menu — cross-run backlog + bulk disposition (PRD #98 M3) ───────────

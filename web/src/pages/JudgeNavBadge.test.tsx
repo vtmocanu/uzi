@@ -29,10 +29,13 @@ vi.mock("../lib/api", () => ({
     bulkSetJudgeDisposition: vi.fn(),
     deleteDisposition: vi.fn(),
     listRepos: vi.fn().mockResolvedValue({ repos: [] }),
-    // PRD #244 chip counts — the Judge page fetches this once on mount. It must NOT be able
-    // to move the nav badge (a separate endpoint with no `todo` field), which the isolation
-    // test below asserts. Defaulted here so the page renders; overridden where it matters.
-    getJudgeCategoryStats: vi.fn().mockResolvedValue({ counts: {} }),
+    // PRD #270 chip-count matrix — the Judge page fetches this and re-fetches on mutations. It
+    // must NOT be able to move the nav badge (a separate endpoint whose matrix has no `todo`
+    // scalar), which the isolation test below asserts. Defaulted here so the page renders;
+    // overridden where it matters.
+    getJudgeCategoryStats: vi.fn().mockResolvedValue({
+      counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+    }),
     // AppShell chrome
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
     unreadNotificationCount: vi.fn().mockResolvedValue({ count: 0 }),
@@ -96,7 +99,9 @@ const group = () => ({
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user } as unknown as ReturnType<typeof useAuth>);
   mockApi.getJudgeStats.mockResolvedValue(triage(3));
-  mockApi.getJudgeCategoryStats.mockResolvedValue({ counts: {} });
+  mockApi.getJudgeCategoryStats.mockResolvedValue({
+    counts_by_bucket: { todo: {}, filed: {}, done: {}, dismissed: {}, all: {} },
+  });
   mockApi.getJudgeBacklog.mockResolvedValue({
     bucket: "todo",
     run: "",
@@ -241,15 +246,21 @@ describe("Judge nav badge vs the To-triage tab (PRD #98 review BLK-BADGE)", () =
     await waitFor(() => expect(navBadgeText()).toContain("1"));
   });
 
-  // PRD #244 — the per-category chip counts must not be able to drive the nav badge. The
+  // PRD #244/#270 — the per-category chip counts must not be able to drive the nav badge. The
   // badge reads TriageCounts.todo from /me/judge/stats (via the page's publish of the same
-  // canonical number); the category aggregate is a SEPARATE endpoint with no `todo` field.
-  // Here the category counts are large and total far more than triage.todo (3), yet the badge
-  // stays 3 — proof the two payloads are structurally unrelated. An implementation that folded
-  // category data into the badge would read the wrong number and this fails.
-  it("the nav badge is unaffected by the per-category chip counts (#244 isolation)", async () => {
+  // canonical number); the category aggregate is a SEPARATE endpoint whose matrix has no `todo`
+  // scalar field. Here the category counts are large and total far more than triage.todo (3),
+  // yet the badge stays 3 — proof the two payloads are structurally unrelated. An implementation
+  // that folded category data into the badge would read the wrong number and this fails.
+  it("the nav badge is unaffected by the per-category chip counts (#244/#270 isolation)", async () => {
     mockApi.getJudgeCategoryStats.mockResolvedValue({
-      counts: { improve_uzi: 99, install_worker_tool: 42, enable_tool: 7 },
+      counts_by_bucket: {
+        todo: { improve_uzi: 99, install_worker_tool: 42, enable_tool: 7 },
+        filed: {},
+        done: {},
+        dismissed: {},
+        all: { improve_uzi: 99, install_worker_tool: 42, enable_tool: 7 },
+      },
     });
 
     renderJudgeInShell();
