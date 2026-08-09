@@ -1989,6 +1989,25 @@ WHERE id = @id AND status = @status;
 -- for a queued run already past its threshold, so it is off the hot path.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
 
+-- name: CountOnlineWorkersWithFreeSlotForUser :one
+-- How many of a user's ONLINE workers plausibly have room for another run — the
+-- queued-run reason resolver (PRD #216) uses it to tell a SATURATED fleet (every
+-- online worker at its advertised run-lane cap, so a fleet-aware claim may be
+-- deferring this run to a peer that is itself full) from a fleet with an idle
+-- worker that simply has not claimed yet. A NULL cap advertises no bound, so such a
+-- worker is treated as always having room. Active count uses the SAME run-lane
+-- definition as ListWorkersByUser.active_runs (status claimed/running/
+-- awaiting_approval/awaiting_input, kind <> 'chat'). Only called for a queued run
+-- already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND (w.max_concurrent_runs IS NULL
+       OR (SELECT count(*) FROM runs r
+            WHERE r.worker_id = w.id
+              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+              AND r.kind <> 'chat') < w.max_concurrent_runs);
+
 -- name: RunHasVerdictSinceGateOpened :one
 -- Has the owner already answered THIS approval gate, with the worker yet to act on it
 -- (issue #182)? healthTargetFor's awaiting_approval arm asks before flagging

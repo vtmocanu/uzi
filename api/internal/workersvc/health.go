@@ -62,6 +62,15 @@ const (
 	reasonVaultLocked   = "your vault is locked, so this run can't start"
 	reasonNoWorker      = "no worker is online to pick up this run"
 	reasonWaitingWorker = "waiting for a worker to pick up this run"
+	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
+	// queue: every online worker is at its advertised run-lane cap, so this run is
+	// waiting for a SLOT to free — not for a worker to come online — and the
+	// fleet-aware claim (migration 00113) may be deferring it to a peer that is itself
+	// full. Maps to the SAME healthWaitingWorker enum (no migration owed —
+	// runs.health_reason is free text, only runs.health is CHECK-constrained). A NEW
+	// const rather than reusing reasonWaitingWorker so the message tells the owner
+	// "add capacity" apart from "start a worker".
+	reasonAllWorkersBusy = "all your workers are busy; this run is waiting for a free slot"
 	// reasonPersistFailing is the PRD #108 M4 reason: the run's messages cannot be
 	// written, so the agent keeps re-sending them. Same contract as its siblings —
 	// fixed, server-controlled, no tool name, no repo content, no live duration.
@@ -436,8 +445,10 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold is not
-// running, most-actionable first (Decision 8): a locked owner vault (they unlock and
-// it claims within a poll), then no online worker, else a plain wait.
+// running, most-actionable first (Decision 8, extended by PRD #216): a locked owner
+// vault (they unlock and it claims within a poll), then no online worker at all, then
+// a saturated fleet where every online worker is at its cap (add capacity), else a
+// plain wait for an idle worker to claim.
 func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 	if s.vlt != nil && !s.vlt.Unlocked(userID) {
 		return reasonVaultLocked
@@ -449,6 +460,14 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 	}
 	if n == 0 {
 		return reasonNoWorker
+	}
+	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, userID)
+	if err != nil {
+		slog.Error("health: count online workers with free slot", "error", err)
+		return reasonWaitingWorker
+	}
+	if free == 0 {
+		return reasonAllWorkersBusy
 	}
 	return reasonWaitingWorker
 }
