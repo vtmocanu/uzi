@@ -15,7 +15,7 @@ judge, and the self-improvement job.
 
 | Setting | Default | Controls |
 |---|---|---|
-| PRD label | `PRD` | The **primary** label: which GitLab label marks an issue as uzi's own work. It's the only label uzi ever *writes* (Promote, a judge-filed issue, board issue creation), the label boards fetch with, and the only label autopilot ever matches. Every board shows it, always. Which labels a *human* may additionally start a run on is the run-eligible list below; which extra labels a board shows by default is the board-extras list below. |
+| PRD label | `PRD` | The **primary** label: which GitLab label marks an issue as uzi's own work. It's the label uzi *writes* to mark an issue as its own work (Promote, a judge-filed issue, board issue creation), the label boards fetch with, and the only label autopilot ever matches. Every board shows it, always. Which labels a *human* may additionally start a run on is the run-eligible list below; which extra labels a board shows by default is the board-extras list below. |
 | Autopilot label | `autopilot` | Which GitLab label, added alongside the PRD label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
 | PRDLESS label | `PRDLESS` | Which GitLab label lets an issue start a run with no `prds/*.md` link, when the toggle below is on. See [PRDLESS label](./prdless.md). |
 

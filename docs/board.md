@@ -230,8 +230,9 @@ they animate into **Closed** as they always have.
 
 A board's membership is **the primary label ∪ your extras**. The **primary**
 label (`PRD` by default — see [Admin settings](./admin-settings.md)) is the
-one uzi *writes* (Promote, a judge-filed issue, board issue creation) and the
-one it fetches boards with; every board shows it, always. **Extras** are the
+label uzi *writes* to mark an issue as its own work (Promote, a judge-filed
+issue, board issue creation) and the one it fetches boards with; every board
+shows it, always. **Extras** are the
 labels layered on top — `bug` by default — tuned per repo, per account, from
 the **Issues** control below.
 

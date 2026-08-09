@@ -22,8 +22,9 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   issue eligible via a *non-primary* label (e.g. `bug`) start a run with no
   `prds/*.md` link — scoped to a human's own interactive Start click; it
   never applies to autopilot or to a scheduled/timer-fired run. The primary
-  label (`prd_label`) itself is unchanged: still the only label uzi writes,
-  the only one boards fetch with, and the only one autopilot matches. (#196)
+  label (`prd_label`) itself is unchanged: still the label uzi writes to mark
+  its own work, the only one boards fetch with, and the only one autopilot
+  matches. (#196)
 
   **Operators — this changes default behavior on upgrade, in two halves.**
   *Visibility:* every board gains `bug` cards it didn't show before —

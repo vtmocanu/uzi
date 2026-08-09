@@ -328,15 +328,17 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 }
 
 // createIssueRun fires one issue through the shared seam. auto_approve schedules go
-// through CreateAutopilotRun; interactive ones through CreateRun threading the
-// schedule's wait_on_limit. The benign per-fire seam rejects (active run, not a PRD
-// issue, no PRD link, description too large) are swallowed so the schedule still
-// advances; ErrRepoNotFound is permanent; anything else is transient.
+// through CreateAutopilotRun; non-auto-approve ones through CreateScheduledRun (NOT
+// the interactive CreateRun — a timer/sweep has no human at fire time, so it must not
+// receive PRD #196's interactive PRD-link waiver) threading the schedule's
+// wait_on_limit. The benign per-fire seam rejects (active run, not eligible, no PRD
+// link, description too large) are swallowed so the schedule still advances;
+// ErrRepoNotFound is permanent; anything else is transient.
 //
 // Decision 2: CreateAutopilotRun uses the OWNER's wait-on-limit default (an
 // auto-approve run has no human in the loop), so the schedule's wait_on_limit is
-// threaded ONLY on the non-auto-approve CreateRun path. This is intentional — do not
-// change the seam to thread it through the autopilot path.
+// threaded ONLY on the non-auto-approve CreateScheduledRun path. This is intentional —
+// do not change the seam to thread it through the autopilot path.
 func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
