@@ -28,6 +28,7 @@ vi.mock("../lib/api", () => ({
     // The Runs nav badge (PRD #239) polls /me/runs/in-progress-count on mount; default to
     // zero so these navigation tests assert the nav STRUCTURE without a badge in the way.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
+    listSchedules: vi.fn().mockResolvedValue([]),
     // The status favicon (PRD #70) polls listRuns on mount via useFavicon; stub it
     // so the poll resolves to an empty run set instead of throwing on an undefined
     // mock (the throw is synchronous, so the hook's own .catch never sees it).

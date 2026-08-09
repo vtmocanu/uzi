@@ -139,6 +139,8 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token/{id}", noLimiter},
 	{"DELETE", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
+	// Schedule delete (PRD #241 M4): owner-scoped DB delete, no forge read → noLimiter.
+	{"DELETE", "/api/schedules/{id}", noLimiter},
 	{"DELETE", "/api/skills/{id}", noLimiter},
 	{"DELETE", "/api/tool-allowlist/{id}", noLimiter},
 	{"DELETE", "/api/workers/{id}", limHosted},
@@ -192,6 +194,9 @@ var wantRouteMounts = []routeMount{
 	// throttle the app's own shell; it spends nothing — one indexed user-scoped
 	// count(*), no forge or model call.
 	{"GET", "/api/me/runs/in-progress-count", noLimiter},
+	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
+	{"GET", "/api/me/schedules/", noLimiter},
+	{"GET", "/api/schedules/{id}", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
@@ -236,6 +241,8 @@ var wantRouteMounts = []routeMount{
 	// unlimited.
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}/auto-eligible", noLimiter},
 	{"PATCH", "/api/repos/{id}", noLimiter},
+	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
+	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
@@ -278,6 +285,14 @@ var wantRouteMounts = []routeMount{
 	// and the same cost as the prdless toggle above it.
 	{"POST", "/api/repos/{id}/issues/{iid}/promote", limForge},
 	{"POST", "/api/repos/{id}/runs", limForge},
+	// Schedule create (PRD #241 M4): validates config + computes next_fire, no forge
+	// read → noLimiter (unlike run-now, which fires through the seam).
+	{"POST", "/api/repos/{id}/schedules", noLimiter},
+	// Schedule preview (PRD #241 M4): pure next-fire computation, no forge → noLimiter.
+	{"POST", "/api/schedules/preview", noLimiter},
+	// Run-now (PRD #241 M4): fires through the seam (forge GetIssue), so it carries the
+	// per-user forge limiter, matching CreateRun's posture.
+	{"POST", "/api/schedules/{id}/run-now", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
 	{"POST", "/api/runs/{id}/rejudge", limJudge},

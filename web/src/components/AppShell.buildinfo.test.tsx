@@ -28,6 +28,7 @@ vi.mock("../lib/api", () => ({
       .fn()
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
+    listSchedules: vi.fn().mockResolvedValue([]),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     version: vi.fn(),

@@ -231,6 +231,8 @@ type Store interface {
 	CreateCIFixRun(ctx context.Context, arg store.CreateCIFixRunParams) (store.Run, error)
 	// Self-improvement runs (PRD #46 Decision 10).
 	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
+	// Scheduled prompt runs (PRD #241).
+	CreatePromptRun(ctx context.Context, arg store.CreatePromptRunParams) (store.Run, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)

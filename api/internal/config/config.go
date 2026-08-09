@@ -247,6 +247,13 @@ type Config struct {
 	// entirely (no boot pass, no loop). A boot pass runs at start when enabled so a
 	// due cycle fires promptly after a restart instead of one cadence later.
 	SelfimproveCheckInterval time.Duration
+	// SchedulerCheckInterval is how often the run scheduler WAKES to claim due
+	// schedules (PRD #241 Decision 8). It is the tick cadence, not a per-schedule
+	// interval — "due" is the durable run_schedules.next_fire_at, checked each wake.
+	// Default 1m; 0 disables the scheduler entirely (no boot pass, no loop). A boot
+	// pass runs at start when enabled so a schedule that came due while the api was
+	// down fires promptly after a restart instead of one cadence later.
+	SchedulerCheckInterval time.Duration
 	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
 	// Empty SeedEmail disables seeding. Validated at boot (see Load).
 	SeedEmail    string
@@ -613,6 +620,10 @@ func Load() (Config, error) {
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)
 	cfg.SelfimproveCheckInterval = parseNonNegDuration("UZI_SELFIMPROVE_CHECK_INTERVAL", time.Hour)
+	// Run scheduler (PRD #241). parseNonNegDuration: 0 disables it. Default 1m — a
+	// tight wake cadence is cheap (a single indexed claim query per tick) and keeps
+	// scheduled fires punctual.
+	cfg.SchedulerCheckInterval = parseNonNegDuration("UZI_SCHEDULER_CHECK_INTERVAL", time.Minute)
 
 	// Per-user Claude rate-limit poller (PRD #53). parseNonNegDuration (not
 	// parseDuration): 0 is legitimate — it disables the engine. A nonzero value

@@ -25,6 +25,10 @@ const (
 	// autonomous improvement run against uzi's own repo. It is issue-shaped and flows
 	// through the ordinary repo-ful claim path — no fork needed here.
 	RunKindSelfImprove = "self_improve"
+	// RunKindPrompt is the scheduled-prompt kind (PRD #241): a repo-ful, issue-less
+	// run born from a run_schedules row and keyed to it via schedule_id. It carries a
+	// free-form prompt rather than an issue or pipeline.
+	RunKindPrompt = "prompt"
 )
 
 // Judge scan caps (PRD #46 Decision 4 + audit L1): the command-not-found pre-scan

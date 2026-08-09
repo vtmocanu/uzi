@@ -40,6 +40,9 @@ import {
   type PrivilegeReport,
   type RecommendationCategory,
   type Run,
+  type Schedule,
+  type ScheduleInput,
+  type SchedulePreviewInput,
   type SelfimproveConfig,
   type SelfimproveUpdate,
   type RunMessage,
@@ -736,6 +739,144 @@ let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
+
+// ── Scheduled runs (PRD #241) demo fixtures + helpers ──────────────────────
+// schedulePreviewCap mirrors the server's clamp on the preview N (PRD #241 M4).
+const schedulePreviewCap = 10;
+let scheduleSeq = 700;
+const nextScheduleId = () => `sch-${(scheduleSeq++).toString(36)}`;
+
+// mockScheduleFires computes the next N fire instants (UTC ISO) for a 5-field
+// cron string. It handles the canonical preset shapes (specific min/hour, `1-5`,
+// single dow, `*/N` steps) — enough for the demo + tests — and returns [] for
+// anything it does not understand (a day-of-month/month restriction), which the
+// UI renders as an empty preview exactly as a real invalid cron would.
+function mockScheduleFires(cron: string, n: number, from = new Date()): string[] {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) return [];
+  const [minF, hrF, domF, monF, dowF] = fields;
+  if (domF !== "*" || monF !== "*") return [];
+  const expand = (f: string, max: number): number[] => {
+    if (f === "*") return Array.from({ length: max + 1 }, (_, i) => i);
+    const step = /^\*\/(\d{1,2})$/.exec(f);
+    if (step) {
+      const s = Number(step[1]);
+      const out: number[] = [];
+      for (let i = 0; i <= max; i += s) out.push(i);
+      return out;
+    }
+    const range = /^(\d{1,2})-(\d{1,2})$/.exec(f);
+    if (range) {
+      const out: number[] = [];
+      for (let i = Number(range[1]); i <= Number(range[2]); i++) out.push(i);
+      return out;
+    }
+    if (/^\d{1,2}$/.test(f)) return [Number(f)];
+    return [];
+  };
+  const minutes = expand(minF, 59);
+  const hours = expand(hrF, 23);
+  const dows = dowF === "*" ? null : expand(dowF, 7).map((d) => d % 7);
+  if (minutes.length === 0 || hours.length === 0) return [];
+  const out: string[] = [];
+  const start = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
+  for (let day = 0; day < 400 && out.length < n; day++) {
+    const base = new Date(start.getTime() + day * 86_400_000);
+    if (dows && !dows.includes(base.getUTCDay())) continue;
+    for (const h of hours) {
+      for (const mi of minutes) {
+        const t = Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), h, mi);
+        if (t > from.getTime() && out.length < n) out.push(new Date(t).toISOString());
+      }
+    }
+  }
+  return out.slice(0, n);
+}
+
+// scheduleDTO recomputes the live next-fire preview at read time, exactly as the
+// server does — the list and the modal preview then agree by construction.
+function scheduleDTO(s: Schedule): Schedule {
+  let nextFires: string[] = [];
+  let nextFireAt: string | null = null;
+  if (s.status === "active" && s.enabled) {
+    if (s.timing === "recurring") {
+      nextFires = mockScheduleFires(s.cron_expr, 3);
+      nextFireAt = nextFires[0] ?? null;
+    } else if (s.run_at && new Date(s.run_at).getTime() > Date.now()) {
+      nextFireAt = s.run_at;
+    }
+  }
+  return { ...s, next_fire_at: nextFireAt, next_fires: nextFires };
+}
+
+const daysFromNow = (d: number, h: number, m = 0): string => {
+  const t = new Date();
+  t.setUTCHours(h, m, 0, 0);
+  t.setUTCDate(t.getUTCDate() + d);
+  return t.toISOString();
+};
+
+let schedules: Schedule[] = [
+  {
+    id: "sch-7kd2", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "sweep", issue_iid: null, labels: null, prompt: "",
+    timing: "recurring", cron_expr: "0 2 * * 1-5", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
+    enabled: true, status: "active", created_at: daysFromNow(-14, 9),
+    updated_at: daysFromNow(-1, 2), next_fires: [],
+  },
+  {
+    id: "sch-3bf1", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 142, labels: null, prompt: "",
+    timing: "recurring", cron_expr: "0 3 * * *", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
+    enabled: true, status: "active", created_at: daysFromNow(-9, 10),
+    updated_at: daysFromNow(0, 3), next_fires: [],
+  },
+  {
+    id: "sch-9qm4", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 158, labels: null, prompt: "",
+    timing: "once", cron_expr: "", run_at: daysFromNow(1, 9),
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: null, auto_approve: true, wait_on_limit: false,
+    enabled: true, status: "active", created_at: daysFromNow(-1, 20),
+    updated_at: daysFromNow(-1, 20), next_fires: [],
+  },
+  {
+    id: "sch-pr0m", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "prompt", issue_iid: null, labels: null,
+    prompt: "hunt for flaky tests and open an MR",
+    timing: "recurring", cron_expr: "0 9 * * 1", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
+    enabled: true, status: "active", created_at: daysFromNow(-21, 11),
+    updated_at: daysFromNow(-7, 9), next_fires: [],
+  },
+  {
+    id: "sch-zt88", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas-api",
+    target: "sweep", issue_iid: null, labels: ["bug"], prompt: "",
+    timing: "recurring", cron_expr: "0 */6 * * *", run_at: null,
+    timezone: "UTC", next_fire_at: null,
+    last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
+    enabled: false, status: "active", created_at: daysFromNow(-30, 8),
+    updated_at: daysFromNow(-3, 18), next_fires: [],
+  },
+  {
+    // A parked schedule (status='error'): the last fire failed and the scheduler
+    // stopped advancing it, so the list shows the red "parked" badge and an "error"
+    // Next-run pill. Demoing this state is the whole reason it's a seed row.
+    id: "sch-er0r", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
+    target: "issue", issue_iid: 173, labels: null, prompt: "",
+    timing: "recurring", cron_expr: "30 1 * * *", run_at: null,
+    timezone: "Europe/Bucharest", next_fire_at: null,
+    last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
+    enabled: true, status: "error", created_at: daysFromNow(-12, 15),
+    updated_at: daysFromNow(-1, 1, 30), next_fires: [],
+  },
+];
+
 let skills: Skill[] = mockSkills.map((s) => ({ ...s }));
 let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.fromEntries(
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
@@ -2940,6 +3081,105 @@ export const mockApi = {
     if (!m) throw new ApiError(404, "memory not found");
     memories = memories.filter((x) => x.id !== id);
     return delay(null);
+  },
+
+  // ── Scheduled runs (PRD #241) ──────────────────────────────────────────────
+  listSchedules: async () => {
+    requireSession();
+    return delay(schedules.map(scheduleDTO));
+  },
+  createSchedule: async (repoId: string, input: ScheduleInput) => {
+    requireSession();
+    const repo = repos.find((r) => r.id === repoId);
+    if (!repo) throw new ApiError(404, "repo not found");
+    const target = input.target ?? "issue";
+    const timing = input.timing ?? "recurring";
+    const now = new Date().toISOString();
+    const s: Schedule = {
+      id: nextScheduleId(),
+      repo_id: repoId,
+      repo_path: repo.path_with_namespace,
+      target,
+      issue_iid: target === "issue" ? (input.issue_iid ?? null) : null,
+      labels: target === "sweep" && input.labels && input.labels.length ? input.labels : null,
+      prompt: target === "prompt" ? (input.prompt ?? "") : "",
+      timing,
+      cron_expr: timing === "recurring" ? (input.cron_expr ?? "") : "",
+      run_at: timing === "once" ? (input.run_at ?? null) : null,
+      timezone: input.timezone || "UTC",
+      next_fire_at: null,
+      last_fired_at: null,
+      auto_approve: input.auto_approve ?? true,
+      wait_on_limit: input.wait_on_limit ?? false,
+      enabled: input.enabled ?? true,
+      status: "active",
+      created_at: now,
+      updated_at: now,
+      next_fires: [],
+    };
+    schedules = [s, ...schedules];
+    return delay(scheduleDTO(s), 250);
+  },
+  getSchedule: async (id: string) => {
+    requireSession();
+    const s = schedules.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "schedule not found");
+    return delay(scheduleDTO(s));
+  },
+  updateSchedule: async (id: string, input: ScheduleInput) => {
+    requireSession();
+    const cur = schedules.find((x) => x.id === id);
+    if (!cur) throw new ApiError(404, "schedule not found");
+    const m: Schedule = { ...cur };
+    if (input.target !== undefined) m.target = input.target;
+    if (input.timing !== undefined) m.timing = input.timing;
+    if (input.issue_iid !== undefined) m.issue_iid = input.issue_iid;
+    if (input.labels !== undefined) m.labels = input.labels.length ? input.labels : null;
+    if (input.prompt !== undefined) m.prompt = input.prompt;
+    if (input.cron_expr !== undefined) m.cron_expr = input.cron_expr;
+    if (input.run_at !== undefined) m.run_at = input.run_at;
+    if (input.timezone !== undefined) m.timezone = input.timezone;
+    if (input.auto_approve !== undefined) m.auto_approve = input.auto_approve;
+    if (input.wait_on_limit !== undefined) m.wait_on_limit = input.wait_on_limit;
+    if (input.enabled !== undefined) m.enabled = input.enabled;
+    // Re-null the fields the (possibly changed) target/timing does not use, so the
+    // stored shape matches the DB's field-presence CHECK.
+    m.issue_iid = m.target === "issue" ? m.issue_iid : null;
+    m.labels = m.target === "sweep" ? m.labels : null;
+    m.prompt = m.target === "prompt" ? m.prompt : "";
+    m.cron_expr = m.timing === "recurring" ? m.cron_expr : "";
+    m.run_at = m.timing === "once" ? m.run_at : null;
+    m.updated_at = new Date().toISOString();
+    schedules = schedules.map((x) => (x.id === id ? m : x));
+    return delay(scheduleDTO(m));
+  },
+  deleteSchedule: async (id: string) => {
+    requireSession();
+    const s = schedules.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "schedule not found");
+    schedules = schedules.filter((x) => x.id !== id);
+    return delay(null);
+  },
+  runScheduleNow: async (id: string) => {
+    requireSession();
+    const s = schedules.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "schedule not found");
+    // The demo does not spin up a live worker run; it reports one fired, matching
+    // the seam's typical single-run outcome for a pinned issue / prompt.
+    return delay({ created: 1, run_ids: [nextRunId()] }, 250);
+  },
+  previewSchedule: async (input: SchedulePreviewInput) => {
+    requireSession();
+    const n = Math.min(Math.max(input.n ?? 3, 1), schedulePreviewCap);
+    if (input.timing === "once") {
+      const fires = input.run_at && new Date(input.run_at).getTime() > Date.now()
+        ? [new Date(input.run_at).toISOString()]
+        : input.run_at
+          ? [new Date(input.run_at).toISOString()]
+          : [];
+      return delay({ fires }, 80);
+    }
+    return delay({ fires: mockScheduleFires(input.cron_expr ?? "", n) }, 80);
   },
 };
 

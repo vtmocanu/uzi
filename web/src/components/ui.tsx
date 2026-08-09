@@ -172,6 +172,48 @@ export function Textarea({
   return <textarea className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
+// Toggle: a switch input (on/off), the pill affordance the mock's per-row
+// pause/resume and the modal's option toggles reuse (PRD #241). Renders as a real
+// <button role="switch"> so it is keyboard-operable and screen-reader legible; the
+// visual thumb slides on `checked`. `label` is the accessible name.
+export function Toggle({
+  checked,
+  onChange,
+  disabled = false,
+  label,
+  title,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  label: string;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      title={title ?? label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={cx(
+        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+        checked ? "bg-brand" : "bg-edge-strong",
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cx(
+          "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
+          checked ? "translate-x-[18px]" : "translate-x-[3px]",
+        )}
+      />
+    </button>
+  );
+}
+
 // ── Feedback ─────────────────────────────────────────────────────────────────
 
 type AlertTone = "danger" | "success" | "warning" | "info";

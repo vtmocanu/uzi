@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/schedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
@@ -131,6 +133,14 @@ type Handler struct {
 	// in the classification path would make the graces testable only by sleeping.
 	now       func() time.Time
 	startedAt time.Time
+	// scheduler is the PRD #241 scheduled-runs actor, constructed in New from deps the
+	// handler already holds. M4 uses it ONLY for run-now (POST
+	// /api/schedules/{id}/run-now), which fires a schedule once through the same seam a
+	// tick would — never Boot/Run (the standalone background scheduler in cmd/server
+	// owns the periodic tick). interval 0 and a nil notifier are deliberate: this
+	// instance is never started. nil when a test builds a Handler as a struct literal;
+	// the run-now handler nil-guards it.
+	scheduler *schedsvc.Scheduler
 }
 
 // clock reads the classification clock seam, nil-safe.
@@ -238,7 +248,12 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	if wsvc != nil {
 		wsvc.SetForgeBaseURLAllowed(cfg.ForgeBaseURLAllowed)
 	}
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, version: "dev", now: time.Now, startedAt: time.Now()}
+	// Build the run-now scheduler from the same concretes main.go wires into the
+	// standalone background scheduler (Store/RunCreator/ForgeBuilder/SettingsReader).
+	// interval 0 + nil notifier: this instance is never Boot/Run — the run-now handler
+	// calls only RunNow, which fires once and never advances/parks the schedule.
+	scheduler := schedsvc.New(q, wsvc, svc, set, nil, 0, slog.Default())
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
@@ -601,6 +616,27 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/in-progress-count", h.RunsInProgressCount)
 		})
 
+		// The caller's scheduled runs (PRD #241 M4). RequireUser so `uzi schedule
+		// list` works from a CLI token; owner-scoped by the query's user_id filter.
+		r.Route("/me/schedules", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/", h.ListMySchedules)
+		})
+
+		// Schedule CRUD + preview + run-now (PRD #241 M4). RequireUser (session OR a
+		// CLI token) and owner-scoped inside every handler (GetRunScheduleForUser). The
+		// static /preview path is matched ahead of /{id}. Only run-now reads the forge
+		// (it fires through the seam), so only it carries the per-user forge limiter,
+		// matching CreateRun's posture; create/get/patch/delete/preview do not.
+		r.Route("/schedules", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Post("/preview", h.PreviewSchedule)
+			r.Get("/{id}", h.GetSchedule)
+			r.Patch("/{id}", h.PatchSchedule)
+			r.Delete("/{id}", h.DeleteSchedule)
+			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/run-now", h.RunScheduleNow)
+		})
+
 		// Global judge-triage strip (PRD #94 Decision 8): the caller's "across all your
 		// runs" tally. RequireUser (mirrors /me/memory) so `uzi review stats` works from a
 		// CLI token; owner-scoped by the query's user_id filter, bucketed by the shared
@@ -919,6 +955,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// and falls back (silently) to a shared IP bucket if it runs before auth —
 				// so auth first, limiter second (B.4).
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+				// Create a scheduled run on this repo (PRD #241 M4). Owner-scoped
+				// (GetRepoForUser inside the handler → 404 for a foreign repo). No forge
+				// limiter: create validates config and computes next_fire_at without a
+				// forge read (run-now, which does read the forge, carries the limiter).
+				r.Post("/{id}/schedules", h.CreateSchedule)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

@@ -17,6 +17,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.2
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/slack-go/slack v0.27.0
 	github.com/spf13/cobra v1.10.2
 	gitlab.com/gitlab-org/api/client-go/v2 v2.44.0
