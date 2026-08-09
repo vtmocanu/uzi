@@ -35,6 +35,10 @@ const DefaultUserCap = 200
 type Store interface {
 	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
+	// GetRunByID loads a run by id (PRD #284 M5). The run-failure notifier reads
+	// through its own narrower runReader, but keeping this on Store lets the same
+	// *store.Queries value back both the notify seam and the adapter.
+	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 }
 
 // Slacker is the best-effort Slack delivery seam. The slacksvc Notifier satisfies

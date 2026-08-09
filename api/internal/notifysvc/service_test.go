@@ -22,6 +22,17 @@ type fakeStore struct {
 	returnedID   uuid.UUID
 	insertCalled bool
 	pruneCalled  bool
+
+	// run is what GetRunByID returns (PRD #284 M5); runErr forces a load error.
+	run    store.Run
+	runErr error
+}
+
+func (f *fakeStore) GetRunByID(_ context.Context, _ uuid.UUID) (store.Run, error) {
+	if f.runErr != nil {
+		return store.Run{}, f.runErr
+	}
+	return f.run, nil
 }
 
 func (f *fakeStore) InsertNotification(_ context.Context, arg store.InsertNotificationParams) (store.Notification, error) {

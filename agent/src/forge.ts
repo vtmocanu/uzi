@@ -137,8 +137,9 @@ abstract class HttpForgeClient implements ForgeClient {
     if (!isHttps(url)) throw new ForgeError(0, "refusing to send the PAT to a non-https forge URL");
     const headers: Record<string, string> = { ...this.authHeaders(pat) };
     if (body !== undefined) headers["Content-Type"] = "application/json";
+    let res: { status: number; text(): Promise<string> };
     try {
-      return await this.fetchFn(url, {
+      res = await this.fetchFn(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -152,6 +153,16 @@ abstract class HttpForgeClient implements ForgeClient {
       // (the header, not the message, held it).
       throw new ForgeError(0, errMessage(err));
     }
+    // PRD #284 D3: a transient forge status must SURFACE as a transient ForgeError
+    // at the single transport point, so the Layer A retry loop (forge-retry.ts) can
+    // re-run — otherwise findOpenMr's `if (res.status !== 200) return undefined;`
+    // silently swallows a 5xx GET, failing a run whose MR actually exists. 409/422
+    // (< 500) still return normally into duplicateStatuses; a 404 still returns
+    // undefined. Body is capped like the createMergeRequest error path.
+    if (res.status >= 500 || res.status === 408 || res.status === 429) {
+      throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+    }
+    return res;
   }
 
   /** The auth header carrying the PAT (GitLab `PRIVATE-TOKEN`, Forgejo `Authorization: token`). */

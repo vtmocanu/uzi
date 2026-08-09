@@ -987,6 +987,11 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     GIT_TERMINAL_PROMPT: "0",
+    // Issue #284: pin git's locale to C so push stderr is language-stable for the
+    // transient-vs-permanent classifier (forge-retry.ts) — otherwise a localized
+    // "Connection reset"/"[rejected]" would slip past the pattern match.
+    LANG: "C",
+    LC_ALL: "C",
     // Neutralize /etc/gitconfig: a system config source is another place a code-exec
     // key could be planted, and it is outside the inline-pin override guarantee for
     // any key we don't pin. The worker needs nothing from it (PRD #51 M0).

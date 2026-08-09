@@ -1,0 +1,138 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  classifyForgeError,
+  withForgeRetry,
+  FORGE_RETRY_SCHEDULE,
+} from "../src/forge-retry.js";
+import { ForgeError } from "../src/forge.js";
+import { DEFAULT_TERMINAL_RETRY_SCHEDULE } from "../src/client.js";
+
+// PRD #284 M1: the worker→forge retry schedule is a deliberate SECOND
+// implementation of the same bounded-backoff decision the worker→API terminal
+// callback uses (client.ts DEFAULT_TERMINAL_RETRY_SCHEDULE). The two are separate
+// constants by design (different hop, worker-side vs shared), so this differential
+// assertion is the "shared table" that keeps them pinned: if one is edited without
+// the other, this red flags the drift the forge-retry.ts docblock promises.
+describe("FORGE_RETRY_SCHEDULE ↔ DEFAULT_TERMINAL_RETRY_SCHEDULE (drift guard)", () => {
+  it("stays pinned to the terminal-retry schedule", () => {
+    assert.deepStrictEqual(FORGE_RETRY_SCHEDULE, DEFAULT_TERMINAL_RETRY_SCHEDULE);
+  });
+});
+
+// Discriminating classifier table (PRD #284 M6). Each case is asserted, and the
+// whole table is asserted exhaustively exercised so a silently dropped row is
+// caught. Permanent-first precedence (D9) is the load-bearing invariant.
+describe("classifyForgeError", () => {
+  const cases: Array<{ name: string; err: unknown; want: "transient" | "permanent" }> = [
+    // (i) the #216 stream reset ⇒ retry
+    {
+      name: "HTTP/2 stream reset (INTERNAL_ERROR)",
+      err: new Error("HTTP/2 stream 1 reset by server (error 0x2 INTERNAL_ERROR)"),
+      want: "transient",
+    },
+    // (ii) auth failure ⇒ no retry
+    {
+      name: "git authentication failure",
+      err: new Error("fatal: Authentication failed for 'https://gitlab.example.com/x.git/'"),
+      want: "permanent",
+    },
+    // (iii) protected branch ⇒ no retry
+    {
+      name: "protected-branch rejection",
+      err: new Error("remote: GitLab: You are not allowed to push code to protected branches"),
+      want: "permanent",
+    },
+    // (iv) non-fast-forward / [rejected] ⇒ no retry
+    {
+      name: "non-fast-forward rejected",
+      err: new Error(" ! [rejected]        agent/x -> agent/x (non-fast-forward)"),
+      want: "permanent",
+    },
+    // (v) BOTH transient and permanent substrings ⇒ permanent wins (precedence)
+    {
+      name: "mixed: connection reset AND protected branch",
+      err: new Error("Connection reset while pushing to a protected branch"),
+      want: "permanent",
+    },
+    // (vi) the bare generic trailer ⇒ NOT transient (defaults permanent)
+    {
+      name: "bare 'Could not read from remote repository'",
+      err: new Error("fatal: Could not read from remote repository."),
+      want: "permanent",
+    },
+    // ForgeError status classification
+    { name: "ForgeError(0) transport failure", err: new ForgeError(0, "socket hang up"), want: "transient" },
+    { name: "ForgeError(503)", err: new ForgeError(503, "service unavailable"), want: "transient" },
+    { name: "ForgeError(429)", err: new ForgeError(429, "rate limited"), want: "transient" },
+    { name: "ForgeError(422)", err: new ForgeError(422, "validation failed"), want: "permanent" },
+    { name: "ForgeError(403)", err: new ForgeError(403, "forbidden"), want: "permanent" },
+  ];
+
+  const exercised = new Set<string>();
+  for (const c of cases) {
+    it(`classifies ${c.name} as ${c.want}`, () => {
+      assert.strictEqual(classifyForgeError(c.err), c.want);
+      exercised.add(c.name);
+    });
+  }
+
+  it("exercised every discriminating case in the table", () => {
+    assert.strictEqual(exercised.size, cases.length);
+  });
+});
+
+describe("withForgeRetry", () => {
+  it("retries a transient error and resolves on the 3rd attempt, sleeping [1000, 2000]", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts < 3) throw new ForgeError(503, "transient");
+      return "ok";
+    };
+    const result = await withForgeRetry(fn, { sleep });
+    assert.strictEqual(result, "ok");
+    assert.strictEqual(attempts, 3);
+    assert.deepStrictEqual(delays, [1_000, 2_000]);
+  });
+
+  it("fails fast on a permanent error after exactly ONE attempt (sleep never called)", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      throw new ForgeError(403, "forbidden");
+    };
+    await assert.rejects(
+      withForgeRetry(fn, { sleep }),
+      (err: unknown) => err instanceof ForgeError && err.status === 403,
+    );
+    assert.strictEqual(attempts, 1);
+    assert.deepStrictEqual(delays, []);
+  });
+
+  it("gives up after schedule.length + 1 attempts when a transient error always throws", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      throw new ForgeError(500, "always down");
+    };
+    await assert.rejects(
+      withForgeRetry(fn, { sleep }),
+      (err: unknown) => err instanceof ForgeError && err.status === 500,
+    );
+    assert.strictEqual(attempts, FORGE_RETRY_SCHEDULE.length + 1);
+    assert.deepStrictEqual(delays, FORGE_RETRY_SCHEDULE);
+  });
+});
