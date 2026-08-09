@@ -206,6 +206,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/notifications/unread_count", noLimiter},
 	{"GET", "/api/repos/", noLimiter},
 	{"GET", "/api/repos/{id}/board", noLimiter},
+	{"GET", "/api/repos/{id}/board/prefs", noLimiter},
 	{"GET", "/api/repos/{id}/issues/{iid}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
@@ -348,6 +349,7 @@ var wantRouteMounts = []routeMount{
 	// forge calls (ForgeForConnection then EnsureLabels). The decision stands on its own
 	// merits above; it never needed that claim.
 	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
+	{"PUT", "/api/repos/{id}/board/prefs", noLimiter},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,

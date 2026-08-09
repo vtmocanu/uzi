@@ -86,6 +86,36 @@ func TestFullSyncFetchesOpenIssuesAdditively(t *testing.T) {
 	}
 }
 
+// TestFullSyncDoesNotThreadTheRunEligibleSet is PRD #196's non-change, guarded from
+// the risk table: the run-eligibility gate now accepts an admin-configured SET of
+// labels (default {PRD, bug}), but the sync fetch must keep passing the PRIMARY label
+// ALONE. ListIssuesOptions.Labels is ANDed (forge.go:307-310), so handing it {PRD,
+// bug} would fetch only issues carrying BOTH — zero on a repo where the sets are
+// disjoint — and FullSync would then evict the entire cached backlog.
+//
+// The assertion is that the label-filtered fetch carries EXACTLY ONE label and it is
+// the primary. That single-label property is the cheapest thing that fails the moment
+// the eligible set (two labels by default) is threaded in here by a later cleanup.
+func TestFullSyncDoesNotThreadTheRunEligibleSet(t *testing.T) {
+	st := &fakeStore{}
+	svc := newTestService(st)
+	f := &fakeForge{
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+		openIssues: []forge.Issue{labelled(2, time.Unix(100, 0), "bug")},
+	}
+
+	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if len(f.listCalls) != 2 {
+		t.Fatalf("expected 2 ListIssues calls, got %d: %+v", len(f.listCalls), f.listCalls)
+	}
+	prd := f.listCalls[0]
+	if len(prd.Labels) != 1 || prd.Labels[0] != prdLabel {
+		t.Fatalf("label-filtered fetch labels = %v, want exactly [%s] — the run-eligible SET must never reach the ANDed sync fetch", prd.Labels, prdLabel)
+	}
+}
+
 // TestFullSyncKeepSetIsTheUnion is the one that matters. Built from the PRD fetch
 // alone the keep-set omits every non-PRD row the second fetch just wrote, and
 // DeleteIssuesNotIn removes them — every poll.

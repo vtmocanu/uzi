@@ -4,7 +4,7 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -32,6 +32,12 @@ export interface MockState {
   runs: Map<string, Run>;
   messages: Map<string, RunMessage[]>;
   boards: Map<string, Board>;
+  // Per-user, per-repo board view preferences (PRD #196 M3), keyed by repo id. Mock
+  // mode has a single session, so one map per repo is the whole per-account surface.
+  // An absent entry is the pristine row { extra_labels: null, show_all: false } —
+  // getBoardPrefs synthesizes it rather than seeding, so "never customised" and
+  // "customised then emptied" stay distinguishable (Decision 9).
+  boardPrefs: Map<string, BoardPrefs>;
   // Issue proposals from chat (PRD #39): keyed by proposal id, mutated by the
   // confirm/dismiss mock endpoints. The card in the transcript renders from its
   // run_message payload; this map is the authoritative status the actions update.
@@ -99,7 +105,15 @@ function seed(): MockState {
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
   // login/register signs straight back in).
-  return { session: { ...mockAdmin }, runs, messages, boards, proposals, vaultUnlocked: true };
+  return {
+    session: { ...mockAdmin },
+    runs,
+    messages,
+    boards,
+    boardPrefs: new Map<string, BoardPrefs>(),
+    proposals,
+    vaultUnlocked: true,
+  };
 }
 
 export const state: MockState = seed();

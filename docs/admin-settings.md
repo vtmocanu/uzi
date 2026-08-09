@@ -7,14 +7,15 @@ audience: user
 # Admin settings
 
 uzi keeps a small set of instance-wide settings in the database, editable by
-an admin from **Admin → Instance settings**. Today: three forge labels, a
-default theme, the run judge, and the self-improvement job.
+an admin from **Admin → Instance settings**. Today: three forge labels, the
+run-eligibility and board-membership label lists, a default theme, the run
+judge, and the self-improvement job.
 
 ## The three labels
 
 | Setting | Default | Controls |
 |---|---|---|
-| PRD label | `PRD` | Which GitLab label marks an issue as factory work. Only issues carrying it can start a run, and only they appear on a board by default; a board's **Show other issues** toggle reveals the repo's other open issues. |
+| PRD label | `PRD` | The **primary** label: which GitLab label marks an issue as uzi's own work. It's the label uzi *writes* to mark an issue as its own work (Promote, a judge-filed issue, board issue creation), the label boards fetch with, and the only label autopilot ever matches. Every board shows it, always. Which labels a *human* may additionally start a run on is the run-eligible list below; which extra labels a board shows by default is the board-extras list below. |
 | Autopilot label | `autopilot` | Which GitLab label, added alongside the PRD label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
 | PRDLESS label | `PRDLESS` | Which GitLab label lets an issue start a run with no `prds/*.md` link, when the toggle below is on. See [PRDLESS label](./prdless.md). |
 
@@ -24,6 +25,53 @@ Unlike the other two, the PRDLESS label also has its own instance-wide on/off
 switch, separate from its name — **on** by default. Turning it off requires
 every run on this instance to have a real PRD link again; it doesn't touch a
 run already in flight. The name field is editable only while the switch is on.
+
+## Run eligibility and board membership
+
+Three more keys, added alongside the PRD label, generalise "which issues can
+a human run" and "which issues does a board show" from one label to a
+configurable set. All three are **admin-only instance policy** — a user's
+own board preference (see [Board](./board.md#the-issues-popover)) can never
+widen what's runnable, only what's visible:
+
+| Setting | Default | Controls |
+|---|---|---|
+| Run-eligible labels | `PRD,bug` | The set of labels a **human** may click Start run on. The primary is always included and can't be removed. Autopilot is unaffected — it still matches only the primary label, never this set (see [Autopilot](./autopilot.md)). |
+| Also show on boards (`board_extra_labels`) | `bug` | The **default** set of labels, beyond the primary, that a board shows a user who hasn't customised their own view. Each user can override this for themselves, per repo, from the board's [Issues popover](./board.md#the-issues-popover); the admin default only applies while they haven't. |
+| A non-primary eligible label waives the PRD-link requirement (`eligible_label_waives_prd_link`) | on | When on, an issue eligible via a label *other than* the primary (e.g. `bug`) can start a run with no `prds/*.md` link — the same judgement PRDLESS expresses, applied to a whole label instead of one issue. Off: such an issue needs a link or PRDLESS, same as a `PRD` issue. Scoped to interactive, human-initiated Start clicks only — see the next paragraph. |
+
+**Eligibility is not the same as visibility.** A label can be run-eligible
+without being a board default (runnable the moment its card is shown some
+other way), and a label can be a board default without being run-eligible
+(shown, but offers Promote instead of Start run). Membership is always
+`primary ∪ extras`, never `eligible ∪ extras` — an eligible-by-default label
+like `bug` stays something a user can untick off their own board.
+
+**The link waiver never reaches an unattended run.** It applies only to a
+human clicking Start (the board, issue view, or `uzi run start`). Autopilot
+never gets it — it still requires a real PRD link or PRDLESS, exactly as
+before this setting existed — and neither does a scheduled (timer or sweep)
+run: a schedule with auto-approve off still needs a link or PRDLESS, because
+nobody is present at fire time to have earned the human-click waiver. See
+[Autopilot](./autopilot.md) and [Scheduling](./scheduling.md).
+
+### Validation, on top of the rules above
+
+- Both label lists are comma-separated (not JSON), following the existing
+  hosted-worker Docker-repo allowlist. A label may not contain a comma, so
+  the separator can never collide with a real label name.
+- Neither list may contain a duplicate entry, or the autopilot label, or the
+  PRDLESS label — those are workflow markers, never membership or
+  eligibility content.
+- Each list is capped at 32 entries, a generous bound meant only to catch a
+  runaway paste.
+- The primary is always folded into the effective run-eligible set even if
+  you save it without one — a hard rejection would wedge an unrelated save
+  (say, the default theme) on any instance that had renamed its PRD label
+  before this setting existed. The admin settings form pins the primary in
+  the run-eligible field so an ordinary save always carries it explicitly.
+- The waiver toggle stores a strict `true` or `false` — nothing else is
+  accepted.
 
 ## Default theme
 
@@ -126,6 +174,12 @@ A PRDLESS change (its name or its on/off switch) and a default-theme-only save
 do **not** trigger it: the PRDLESS keys change only whether a run can start
 without a PRD link, and theming is presentation-only, so neither affects what
 a board shows.
+
+Changing the run-eligible or board-extras lists doesn't trigger it either,
+and deliberately so. Every open issue is already synced into the cache
+regardless of label — only the PRD label's sync fetch narrows what's kept —
+so these two lists only change how the *already-cached* set is filtered and
+rendered, on the next ordinary poll. A resync here would do nothing useful.
 
 ## No secrets here
 

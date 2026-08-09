@@ -4,7 +4,7 @@
 // (gated by AdminRoute + the admin-only API). Validation mirrors the server
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   api,
   ApiError,
@@ -93,6 +93,128 @@ function clientValidate(prdLabel: string, autopilotLabel: string, prdlessLabel: 
   return null;
 }
 
+// parseLabelList splits a comma-separated settings value into a trimmed, non-empty
+// token list (PRD #196 M2). joinLabelList is the inverse, de-duplicating so the
+// pinned primary is never written twice.
+function parseLabelList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+function joinLabelList(labels: string[]): string {
+  return [...new Set(labels)].join(",");
+}
+
+// validateLabelLists mirrors the server's ValidateMerged cross-key rules for the two
+// new label lists (PRD #196 M2), for immediate feedback; the server re-checks. The
+// primary is auto-pinned into the eligible set by the caller, so "primary present" is
+// structurally guaranteed and not re-checked here. `eligibleExtra` is the eligible
+// set WITHOUT the primary; `boardExtras` is the visibility list.
+function validateLabelLists(
+  eligibleExtra: string[],
+  boardExtras: string[],
+  autopilotLabel: string,
+  prdlessLabel: string,
+): string | null {
+  for (const [name, list] of [
+    ["Run-eligible labels", eligibleExtra],
+    ["Also-show-on-boards labels", boardExtras],
+  ] as const) {
+    const seen = new Set<string>();
+    for (const l of list) {
+      if (l.length > 64) return `${name}: each label must be at most 64 characters.`;
+      if (l.includes(",")) return `${name}: a label must not contain a comma.`;
+      if (seen.has(l)) return `${name}: "${l}" is listed twice.`;
+      seen.add(l);
+      if (l === autopilotLabel) return `${name} must not include the autopilot label.`;
+      if (l === prdlessLabel) return `${name} must not include the PRDLESS label.`;
+    }
+  }
+  return null;
+}
+
+// TagInput is a small multi-value label editor (PRD #196 M2, mock §7), following the
+// add/remove pattern of Board.tsx's ColumnSettings: a row of removable tags plus an
+// Input that adds on Enter or the Add button. An optional `pinned` tag renders first,
+// marked "primary", and cannot be removed. It is deliberately NOT wrapped in <Field>
+// (whose implicit <label> would bind the visible label to every control at once);
+// the add input carries its own aria-label so it stays individually targetable.
+function TagInput({
+  label,
+  hint,
+  tags,
+  pinned,
+  disabled,
+  onAdd,
+  onRemove,
+}: {
+  label: string;
+  hint?: ReactNode;
+  tags: string[];
+  pinned?: string;
+  disabled?: boolean;
+  onAdd: (name: string) => void;
+  onRemove: (name: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const n = draft.trim();
+    if (n) onAdd(n);
+    setDraft("");
+  };
+  return (
+    <div className="space-y-1.5">
+      <span className="block text-sm font-medium text-muted">{label}</span>
+      <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-edge bg-raised p-1.5">
+        {pinned && (
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-brand/60 px-2 py-1 text-xs text-fg">
+            {pinned}
+            <span className="text-[10px] uppercase tracking-wide text-faint">primary</span>
+          </span>
+        )}
+        {tags.map((t) => (
+          <span
+            key={t}
+            className="inline-flex items-center gap-1.5 rounded-md border border-edge px-2 py-1 text-xs text-fg"
+          >
+            {t}
+            <button
+              type="button"
+              aria-label={`Remove ${t}`}
+              disabled={disabled}
+              onClick={() => onRemove(t)}
+              className="text-faint transition-colors hover:text-fg disabled:opacity-50"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        <input
+          aria-label={`Add to ${label}`}
+          value={draft}
+          maxLength={64}
+          autoComplete="off"
+          placeholder="add a label…"
+          disabled={disabled}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          className="min-w-32 flex-1 bg-transparent px-2 py-1 text-sm text-fg placeholder:text-faint outline-none disabled:opacity-50"
+        />
+        <Button type="button" variant="secondary" size="sm" onClick={add} disabled={disabled || !draft.trim()}>
+          Add
+        </Button>
+      </div>
+      {hint && <p className="text-xs text-faint">{hint}</p>}
+    </div>
+  );
+}
+
 export function AdminSettings() {
   const { refresh } = useAuth();
   const [saved, setSaved] = useState<AppSettings | null>(null);
@@ -112,6 +234,12 @@ export function AdminSettings() {
   const [defaultTheme, setDefaultTheme] = useState("");
   const [prdlessEnabled, setPrdlessEnabled] = useState(true);
   const [prdlessLabel, setPrdlessLabel] = useState("");
+  // PRD #196 M2. eligibleExtra is the run-eligible set WITHOUT the primary (the
+  // primary is pinned and re-added on save); boardExtras is the "also show on boards"
+  // default; waivesPrdLink is the PRD-link waiver, defaulting on.
+  const [eligibleExtra, setEligibleExtra] = useState<string[]>([]);
+  const [boardExtras, setBoardExtras] = useState<string[]>([]);
+  const [waivesPrdLink, setWaivesPrdLink] = useState(true);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -137,6 +265,11 @@ export function AdminSettings() {
     setDefaultTheme(settings.default_theme);
     setPrdlessEnabled(settings.prdless_enabled === "true");
     setPrdlessLabel(settings.prdless_label);
+    // The eligible set always contains the primary; strip it here so the pinned tag
+    // is the single source of it and the editable list holds only the extras.
+    setEligibleExtra(parseLabelList(settings.run_eligible_labels).filter((l) => l !== settings.prd_label));
+    setBoardExtras(parseLabelList(settings.board_extra_labels));
+    setWaivesPrdLink(settings.eligible_label_waives_prd_link === "true");
   }, []);
 
   const load = useCallback(async () => {
@@ -174,19 +307,31 @@ export function AdminSettings() {
     return () => clearInterval(id);
   }, []);
 
+  const isEnv = (key: string) => sources[key] === "env";
+  // The eligible set persisted with the pinned primary re-added (deduped); the
+  // board-extra list and the waiver as their raw settings strings (PRD #196 M2).
+  const runEligibleValue = joinLabelList([prdLabel, ...eligibleExtra]);
+  const boardExtraValue = joinLabelList(boardExtras);
+  const waiverValue = waivesPrdLink ? "true" : "false";
+
   const dirty =
     saved !== null &&
     (prdLabel !== saved.prd_label ||
       autopilotLabel !== saved.autopilot_label ||
       defaultTheme !== saved.default_theme ||
       (prdlessEnabled ? "true" : "false") !== saved.prdless_enabled ||
-      prdlessLabel !== saved.prdless_label);
+      prdlessLabel !== saved.prdless_label ||
+      runEligibleValue !== saved.run_eligible_labels ||
+      boardExtraValue !== saved.board_extra_labels ||
+      waiverValue !== saved.eligible_label_waives_prd_link);
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     setNotice("");
-    const invalid = clientValidate(prdLabel, autopilotLabel, prdlessLabel);
+    const invalid =
+      clientValidate(prdLabel, autopilotLabel, prdlessLabel) ??
+      validateLabelLists(eligibleExtra, boardExtras, autopilotLabel, prdlessLabel);
     if (invalid) {
       setError(invalid);
       return;
@@ -199,15 +344,21 @@ export function AdminSettings() {
     const labelChanged =
       saved !== null && (prdLabel !== saved.prd_label || autopilotLabel !== saved.autopilot_label);
     try {
-      applyResponse(
-        await api.updateSettings({
-          prd_label: prdLabel,
-          autopilot_label: autopilotLabel,
-          default_theme: defaultTheme,
-          prdless_enabled: prdlessEnabled ? "true" : "false",
-          prdless_label: prdlessLabel,
-        }),
-      );
+      const payload: UpdateSettingsPayload = {
+        prd_label: prdLabel,
+        autopilot_label: autopilotLabel,
+        default_theme: defaultTheme,
+        prdless_enabled: prdlessEnabled ? "true" : "false",
+        prdless_label: prdlessLabel,
+      };
+      // Env-sourced keys are read-only (the server 409s a write); skip them, matching
+      // the Slack/Health cards' env guard (PRD #196 M2).
+      if (!isEnv("run_eligible_labels")) payload.run_eligible_labels = runEligibleValue;
+      if (!isEnv("board_extra_labels")) payload.board_extra_labels = boardExtraValue;
+      if (!isEnv("eligible_label_waives_prd_link")) {
+        payload.eligible_label_waives_prd_link = waiverValue;
+      }
+      applyResponse(await api.updateSettings(payload));
       setNotice(
         labelChanged
           ? "Settings saved. Boards reflect the label change after the next sync."
@@ -275,7 +426,9 @@ export function AdminSettings() {
                 />
               </Field>
               <p className="text-xs text-faint">
-                Marks an issue as factory work. The board only shows issues carrying this label.
+                Marks an issue as uzi&apos;s own work. This is the <b>primary</b> label — uzi writes it
+                (on Promote and on judge-filed issues) and autopilot runs only it. Which labels a person
+                can start a run on is the Run-eligible list below.
               </p>
             </div>
             <div className="space-y-1.5">
@@ -292,6 +445,61 @@ export function AdminSettings() {
                 Adding this label to a PRD issue lets an opted-in user run it end to end, with no
                 plan-approval step.
               </p>
+            </div>
+            <div className="space-y-4 border-t border-edge pt-4">
+              <TagInput
+                label="Run-eligible labels"
+                pinned={prdLabel}
+                tags={eligibleExtra}
+                disabled={isEnv("run_eligible_labels")}
+                onAdd={(name) =>
+                  setEligibleExtra((cur) =>
+                    name === prdLabel || cur.includes(name) ? cur : [...cur, name],
+                  )
+                }
+                onRemove={(name) => setEligibleExtra((cur) => cur.filter((l) => l !== name))}
+                hint={
+                  <>
+                    An issue carrying any of these can be started by a user. The <b>primary</b> is the
+                    one uzi <i>writes</i> — on Promote, and when the judge files an issue — and the only
+                    one autopilot matches. It cannot be removed.
+                  </>
+                }
+              />
+              <TagInput
+                label="Also show on boards"
+                tags={boardExtras}
+                disabled={isEnv("board_extra_labels")}
+                onAdd={(name) =>
+                  setBoardExtras((cur) => (cur.includes(name) ? cur : [...cur, name]))
+                }
+                onRemove={(name) => setBoardExtras((cur) => cur.filter((l) => l !== name))}
+                hint={
+                  <>
+                    The default set of labels — beyond PRD — that every board starts with. Issues
+                    carrying one appear on boards; whether such a card can start a run depends on the
+                    Run-eligible list above (a shown label is not runnable unless it is also eligible).
+                    Each user can override this for themselves per repo.
+                  </>
+                }
+              />
+              <div className="space-y-1.5">
+                <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={waivesPrdLink}
+                    disabled={isEnv("eligible_label_waives_prd_link")}
+                    onChange={(e) => setWaivesPrdLink(e.target.checked)}
+                    className="h-4 w-4 rounded border-edge accent-brand disabled:opacity-50"
+                  />
+                  A non-primary eligible label waives the PRD-link requirement
+                </label>
+                <p className="text-xs text-faint">
+                  When on, an issue that is eligible by a non-primary label (e.g. <code>bug</code>) can
+                  start a run with no <code>prds/*.md</code> link. Off: it needs a link or PRDLESS, so
+                  the one-click Start becomes two clicks.
+                </p>
+              </div>
             </div>
             <div className="space-y-3 border-t border-edge pt-4">
               <label className="flex cursor-pointer select-none items-center gap-2 text-sm">

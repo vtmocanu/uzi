@@ -1153,6 +1153,30 @@ const boardFixtures: Record<string, Board> = {
       // has: one carrying a content label, one carrying none at all — the shape a
       // freshly filed issue takes, and the shape whose labels used to marshal as JSON
       // null.
+      //
+      // PRD #196: a `bug`-only issue. `bug` ships in BOTH default lists, so this card
+      // is on the board out of the box (membership = primary ∪ extras) AND runnable
+      // (the run-eligible default is PRD,bug) — it offers Start run directly, no
+      // Promote and no PRDLESS, with no prds/*.md link (the non-primary waiver). Its
+      // `bug` chip is highlighted and hoisted ahead of the cap; `web` rides along
+      // plain. The `documentation` card just below is the contrast: visible-only, so
+      // it offers Promote instead. This is the §4/§7 headline of the mock.
+      {
+        iid: 32,
+        title: "Board drag drops the card on Safari 17",
+        state: "opened",
+        labels: ["bug", "web"],
+        web_url: uziUrl(32),
+        author: "vlad",
+        forge_type: "gitlab",
+        has_prd_link: false,
+        column: "",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(30),
+        latest_run: null,
+        pipeline: null,
+      },
       {
         iid: 33,
         title: "Typo in the worker setup docs",

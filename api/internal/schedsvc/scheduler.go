@@ -76,6 +76,10 @@ type Store interface {
 // seam autopilot and the manual board use. *workersvc.Service satisfies it.
 type RunCreator interface {
 	CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
+	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but
+	// without PRD #196's interactive PRD-link waiver, so a timer-fired sweep never
+	// starts a link-less non-primary-eligible run (see workersvc.CreateScheduledRun).
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error)
 }
@@ -324,15 +328,17 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 }
 
 // createIssueRun fires one issue through the shared seam. auto_approve schedules go
-// through CreateAutopilotRun; interactive ones through CreateRun threading the
-// schedule's wait_on_limit. The benign per-fire seam rejects (active run, not a PRD
-// issue, no PRD link, description too large) are swallowed so the schedule still
-// advances; ErrRepoNotFound is permanent; anything else is transient.
+// through CreateAutopilotRun; non-auto-approve ones through CreateScheduledRun (NOT
+// the interactive CreateRun — a timer/sweep has no human at fire time, so it must not
+// receive PRD #196's interactive PRD-link waiver) threading the schedule's
+// wait_on_limit. The benign per-fire seam rejects (active run, not eligible, no PRD
+// link, description too large) are swallowed so the schedule still advances;
+// ErrRepoNotFound is permanent; anything else is transient.
 //
 // Decision 2: CreateAutopilotRun uses the OWNER's wait-on-limit default (an
 // auto-approve run has no human in the loop), so the schedule's wait_on_limit is
-// threaded ONLY on the non-auto-approve CreateRun path. This is intentional — do not
-// change the seam to thread it through the autopilot path.
+// threaded ONLY on the non-auto-approve CreateScheduledRun path. This is intentional —
+// do not change the seam to thread it through the autopilot path.
 func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
@@ -342,7 +348,11 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		run, err = e.runs.CreateAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD)
 	} else {
 		waitOnLimit := sched.WaitOnLimit
-		run, err = e.runs.CreateRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
+		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
+		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
+		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
+		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit, nil)
 	}
 
 	switch {

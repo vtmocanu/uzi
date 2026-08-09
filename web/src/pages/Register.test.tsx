@@ -41,6 +41,8 @@ beforeEach(() => {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
+    runEligibleLabels: ["PRD"],
+    eligibleLabelWaivesPrdLink: true,
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,

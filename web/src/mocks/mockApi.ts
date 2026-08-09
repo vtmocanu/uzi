@@ -14,6 +14,8 @@ import {
   type AllocatedSkill,
   type AllocationsInput,
   type AppSettings,
+  type Board,
+  type BoardPrefs,
   type BuiltinDefinition,
   type Chat,
   type CliAuthRequestMeta,
@@ -140,7 +142,21 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
   docker_repo_allowlist: "",
+  // PRD #196 M2: comma-separated label lists (run_eligible always contains the
+  // primary) and the PRD-link waiver bool, mirroring the server defaults.
+  run_eligible_labels: "PRD,bug",
+  board_extra_labels: "bug",
+  eligible_label_waives_prd_link: "true",
 };
+
+// parseLabels splits a comma-separated settings value into trimmed non-empty
+// tokens (PRD #196 M2), mirroring the server's parse.
+function parseLabels(value: string): string[] {
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 interface PersistedSettings {
   v: 1;
@@ -179,7 +195,10 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
     typeof a.health_nudge_cooldown_seconds === "string" &&
-    typeof a.docker_repo_allowlist === "string";
+    typeof a.docker_repo_allowlist === "string" &&
+    typeof a.run_eligible_labels === "string" &&
+    typeof a.board_extra_labels === "string" &&
+    typeof a.eligible_label_waives_prd_link === "string";
   return okUser && okApp;
 }
 
@@ -959,6 +978,21 @@ function settingsResponse(): SettingsResponse {
     oidc_provider_name: oidcDemo().providerName,
   };
 }
+
+// boardResponse clones a board fixture for return, injecting the admin-configured
+// default board-extra labels (PRD #196 M2) the way the server resolves them onto the
+// board payload — so every board-returning handler ships a consistent membership
+// default. Cards are shallow-cloned so a caller mutating the response never touches
+// the stored fixture.
+function boardResponse(b: Board): { board: Board } {
+  return {
+    board: {
+      ...b,
+      board_extra_labels: parseLabels(appSettings.board_extra_labels),
+      cards: b.cards.map((c) => ({ ...c })),
+    },
+  };
+}
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
@@ -1131,6 +1165,13 @@ function sessionBody() {
     default_theme: appSettings.default_theme,
     prdless_label: appSettings.prdless_label,
     prdless_enabled: appSettings.prdless_enabled === "true",
+    // PRD #196 M2: the eligible set (primary unioned in, as the server sends it) and
+    // the PRD-link waiver, delivered on the session so IssueView reads them via
+    // useAuth() with no board payload.
+    run_eligible_labels: [
+      ...new Set([appSettings.prd_label, ...parseLabels(appSettings.run_eligible_labels)]),
+    ],
+    eligible_label_waives_prd_link: appSettings.eligible_label_waives_prd_link === "true",
     // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
     // passphrase-create banner; a password demo user keeps the existing behavior.
     vault: oidcDemo().passwordless
@@ -1287,12 +1328,36 @@ export const mockApi = {
         nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled / slack_enabled / judge_enabled are strict bools, not labels.
-      if (key === "prdless_enabled" || key === "slack_enabled" || key === "judge_enabled") {
+      // prdless_enabled / slack_enabled / judge_enabled / eligible_label_waives_prd_link
+      // are strict bools, not labels (PRD #196 M2 adds the waiver — without this arm it
+      // would fall through to the label rules and fail open on "yes"/"maybe").
+      if (
+        key === "prdless_enabled" ||
+        key === "slack_enabled" ||
+        key === "judge_enabled" ||
+        key === "eligible_label_waives_prd_link"
+      ) {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // run_eligible_labels / board_extra_labels are comma-separated label lists (PRD
+      // #196 M2). Each token must be a valid label; the cross-key merged checks below
+      // enforce the primary's presence and collisions. An empty value means an empty
+      // list (board_extra_labels may be empty; the merged check rejects an eligible
+      // list that has lost the primary).
+      if (key === "run_eligible_labels" || key === "board_extra_labels") {
+        const tokens = value === "" ? [] : value.split(",").map((s) => s.trim());
+        const seen = new Set<string>();
+        for (const t of tokens) {
+          if (t === "") throw new ApiError(400, `${key}: labels must not be empty`);
+          if (t.length > 64) throw new ApiError(400, `${key}: each label must be at most 64 characters`);
+          if (seen.has(t)) throw new ApiError(400, `${key}: "${t}" is listed twice`);
+          seen.add(t);
+        }
+        (nonSecret as Record<string, string>)[key] = tokens.join(",");
         continue;
       }
       // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
@@ -1329,6 +1394,27 @@ export const mockApi = {
     }
     if (merged.prdless_label === merged.autopilot_label) {
       throw new ApiError(400, "prdless_label must differ from autopilot_label");
+    }
+    // PRD #196 M2 cross-key rules for the two label lists: the primary must remain in
+    // the eligible set, and neither list may collide with the autopilot or PRDLESS
+    // labels (the primary is allowed — it is required in the eligible set).
+    const eligibleLabels = parseLabels(merged.run_eligible_labels);
+    const extraLabels = parseLabels(merged.board_extra_labels);
+    if (!eligibleLabels.includes(merged.prd_label)) {
+      throw new ApiError(400, "run_eligible_labels must contain the primary (prd_label)");
+    }
+    for (const [field, list] of [
+      ["run_eligible_labels", eligibleLabels],
+      ["board_extra_labels", extraLabels],
+    ] as const) {
+      for (const l of list) {
+        if (l === merged.autopilot_label) {
+          throw new ApiError(400, `${field} must not contain the autopilot label`);
+        }
+        if (l === merged.prdless_label) {
+          throw new ApiError(400, `${field} must not contain the prdless label`);
+        }
+      }
     }
     appSettings = merged;
     persistSettings();
@@ -2065,7 +2151,7 @@ export const mockApi = {
   getBoard: async (repoId: string) => {
     const b = state.boards.get(repoId);
     if (!b) throw new ApiError(404, "board not found");
-    return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } });
+    return delay(boardResponse(b));
   },
   configureColumns: async (repoId: string, columns: { label_name: string }[]) => {
     const b = state.boards.get(repoId);
@@ -2073,7 +2159,7 @@ export const mockApi = {
     b.columns = columns.map((c, i) => ({ label_name: c.label_name, position: i }));
     const names = new Set(b.columns.map((c) => c.label_name));
     for (const card of b.cards) if (card.column && !names.has(card.column)) card.column = "";
-    return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } });
+    return delay(boardResponse(b));
   },
   // Manual board order (PRD #102 M5). This is a SECOND IMPLEMENTATION of the server's
   // freeze, so it is a contract, not a convenience: mockApi.reorder.test.ts pins the
@@ -2119,7 +2205,7 @@ export const mockApi = {
       const rest = b.cards.filter((c) => !seen.has(c.iid)).sort((x, y) => x.iid - y.iid);
       b.cards = [...ordered, ...rest];
     }
-    return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } });
+    return delay(boardResponse(b));
   },
   moveIssue: async (repoId: string, iid: number, toColumn: string) => {
     const b = state.boards.get(repoId);
@@ -2179,7 +2265,7 @@ export const mockApi = {
   syncRepo: async (repoId: string) => {
     const b = state.boards.get(repoId);
     if (!b) throw new ApiError(404, "board not found");
-    return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } }, 650);
+    return delay(boardResponse(b), 650);
   },
   createIssue: async (repoId: string, title: string, description: string) => {
     const b = state.boards.get(repoId);
@@ -2205,6 +2291,39 @@ export const mockApi = {
     };
     b.cards.unshift(card);
     return delay({ card: { ...card } }, 450);
+  },
+
+  // Per-user, per-repo board preferences (PRD #196 M3). A SECOND IMPLEMENTATION of the
+  // server contract, so it persists across calls within the session and matches the
+  // wire shape exactly: null extra_labels = "not customised" (fall back to the admin
+  // default), an array (incl. []) = the user's absolute set (Decision 9).
+  getBoardPrefs: async (repoId: string) => {
+    const b = state.boards.get(repoId);
+    if (!b) throw new ApiError(404, "board not found");
+    // No row yet reads as the pristine default rather than being seeded, so a later
+    // reset back to null and "never touched" stay indistinguishable to the client.
+    const prefs = state.boardPrefs.get(repoId) ?? { extra_labels: null, show_all: false };
+    return delay<BoardPrefs>({ extra_labels: prefs.extra_labels, show_all: prefs.show_all });
+  },
+  setBoardPrefs: async (repoId: string, prefs: BoardPrefs) => {
+    const b = state.boards.get(repoId);
+    if (!b) throw new ApiError(404, "board not found");
+    // Loose validation for mock-mode parity with the server: each extra label must be
+    // a non-empty, comma-free, ≤64-char string; an over-cap list is clamped rather
+    // than rejected. null (not customised) is preserved as the sentinel.
+    let extraLabels: string[] | null = null;
+    if (Array.isArray(prefs.extra_labels)) {
+      const cleaned: string[] = [];
+      for (const raw of prefs.extra_labels) {
+        const l = String(raw).trim();
+        if (l === "" || l.includes(",") || l.length > 64) continue;
+        if (!cleaned.includes(l)) cleaned.push(l);
+      }
+      extraLabels = cleaned.slice(0, 64);
+    }
+    const stored: BoardPrefs = { extra_labels: extraLabels, show_all: Boolean(prefs.show_all) };
+    state.boardPrefs.set(repoId, stored);
+    return delay<BoardPrefs>({ extra_labels: stored.extra_labels, show_all: stored.show_all }, 320);
   },
 
   // ── Workers ─────────────────────────────────────────────────────────────────

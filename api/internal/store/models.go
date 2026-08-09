@@ -84,6 +84,16 @@ type BoardColumn struct {
 	Position  int32     `json:"position"`
 }
 
+type BoardPref struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	RepoID      uuid.UUID          `json:"repo_id"`
+	ExtraLabels []byte             `json:"extra_labels"`
+	ShowAll     bool               `json:"show_all"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CliAuthRequest struct {
 	ID            uuid.UUID          `json:"id"`
 	CodeChallenge string             `json:"code_challenge"`

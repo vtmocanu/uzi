@@ -73,3 +73,21 @@ all at once. That combination starts a fully unattended run with no plan
 approval and no PRD link, because all three are separate, deliberate
 opt-ins — see [Autopilot](./autopilot.md). Worth a second look before
 adding PRDLESS to an issue that's already autopilot-eligible.
+
+## The PRD-link waiver
+
+A second, separate way to skip the PRD-link requirement exists: an admin can
+configure a whole label — not just `PRD` — as **run-eligible**, and turn on
+a setting that waives the link requirement for any issue eligible via one of
+those non-primary labels (e.g. `bug`), instance-wide. See
+[Admin settings](./admin-settings.md#run-eligibility-and-board-membership)
+for the two keys involved, and [Board](./board.md#which-issues-show-up) for
+what "eligible" means for a card.
+
+**PRDLESS itself is unchanged by this.** Same label, same instance-wide
+toggle, same per-issue application, same semantics described above. The
+waiver is a standing policy about a whole *class* of issue (defined by its
+label); PRDLESS is a deliberate, per-issue human judgement. The two aren't
+the same shape and neither replaces the other: an admin can turn the waiver
+off and PRDLESS keeps working exactly as documented on this page, and vice
+versa.

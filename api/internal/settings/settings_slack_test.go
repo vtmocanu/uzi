@@ -351,11 +351,12 @@ func TestLabelChangedIgnoresNonBoardKeys(t *testing.T) {
 // does not reach the Slack keys: a slack value equal to a label value is fine.
 func TestValidateMergedIgnoresSlackKeys(t *testing.T) {
 	if err := ValidateMerged(map[string]string{
-		KeyPRDLabel:       "PRD",
-		KeyAutopilotLabel: "autopilot",
-		KeyPrdlessLabel:   "PRDLESS",
-		KeySlackEnabled:   "PRD",       // colliding value, but not a label key
-		KeyPublicBaseURL:  "autopilot", // ditto
+		KeyPRDLabel:          "PRD",
+		KeyAutopilotLabel:    "autopilot",
+		KeyPrdlessLabel:      "PRDLESS",
+		KeyRunEligibleLabels: "PRD",       // PRD #196: eligible set must contain the primary
+		KeySlackEnabled:      "PRD",       // colliding value, but not a label key
+		KeyPublicBaseURL:     "autopilot", // ditto
 	}); err != nil {
 		t.Errorf("ValidateMerged rejected on a non-label key collision: %v", err)
 	}

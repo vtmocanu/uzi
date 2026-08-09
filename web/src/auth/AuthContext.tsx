@@ -41,6 +41,14 @@ interface AuthState {
   // fields simply hides the toggle rather than showing one the backend 422s.
   prdlessLabel: string;
   prdlessEnabled: boolean;
+  // Run-eligibility config delivered on the session bootstrap (PRD #196 M2).
+  // runEligibleLabels is the admin-configured set a human may point uzi at; it
+  // always includes the primary (prdLabel), and an older server that omits the
+  // field falls back to [prdLabel]. eligibleLabelWaivesPrdLink is the per-instance
+  // waiver, defaulting on. Both are consumed by the Start/Promote gate in M4; they
+  // are delivered here now so M4 is a pure logic change.
+  runEligibleLabels: string[];
+  eligibleLabelWaivesPrdLink: boolean;
   // Vault status (PRD #32): true when the user's secret vault is unlocked in the
   // server process. Rides the session payload; drives the header badge, the locked
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
@@ -70,6 +78,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
   const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
   const [prdlessEnabled, setPrdlessEnabled] = useState(false);
+  // Default to [] until the first session resolves; applySession falls back to
+  // [prdLabel] when the field is absent so the primary is always eligible.
+  const [runEligibleLabels, setRunEligibleLabels] = useState<string[]>([]);
+  const [eligibleLabelWaivesPrdLink, setEligibleLabelWaivesPrdLink] = useState(true);
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
@@ -84,7 +96,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // server) also reads as off.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
-    setPrdLabel(session.prd_label || DEFAULT_PRD_LABEL);
+    const prd = session.prd_label || DEFAULT_PRD_LABEL;
+    setPrdLabel(prd);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
     const resolved = resolveTheme(session.theme_override, session.default_theme);
     setThemeOverride(session.theme_override ?? null);
@@ -93,6 +106,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     applyTheme(resolved);
     setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
     setPrdlessEnabled(session.prdless_enabled ?? false);
+    // The eligible set always includes the primary; an older server that omits the
+    // field falls back to [primary] so the primary stays eligible. The waiver is a
+    // bool, so `?? true` (not `||`) preserves an explicit false.
+    setRunEligibleLabels(session.run_eligible_labels ?? [prd]);
+    setEligibleLabelWaivesPrdLink(session.eligible_label_waives_prd_link ?? true);
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultUnlocked(session.vault?.unlocked ?? true);
     // Absent → true so a password user / older server never sees the create dialog.
@@ -182,6 +200,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       defaultTheme,
       prdlessLabel,
       prdlessEnabled,
+      runEligibleLabels,
+      eligibleLabelWaivesPrdLink,
       vaultUnlocked,
       vaultExists,
       hasPassword,
@@ -200,6 +220,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       defaultTheme,
       prdlessLabel,
       prdlessEnabled,
+      runEligibleLabels,
+      eligibleLabelWaivesPrdLink,
       vaultUnlocked,
       vaultExists,
       hasPassword,

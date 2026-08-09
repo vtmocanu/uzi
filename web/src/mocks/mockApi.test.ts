@@ -59,6 +59,9 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           health_approval_seconds: "3600",
           health_nudge_cooldown_seconds: "1800",
           docker_repo_allowlist: "",
+          run_eligible_labels: "Feature,bug",
+          board_extra_labels: "bug",
+          eligible_label_waives_prd_link: "true",
         },
       }),
     });

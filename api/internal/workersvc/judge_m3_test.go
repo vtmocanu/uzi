@@ -13,21 +13,35 @@ import (
 )
 
 // fakeSettings is a SettingsReader stub for the judge gate/claim tests, and since
-// PRD #102 M6 for the run-eligibility PRD-label gate too. prdLabel is left zero by
-// the judge tests, which is the "unconfigured" case Service.prdLabel resolves to
-// the compiled-in default — the same thing a real Cache does.
+// PRD #102 M6 for the run-eligibility label gate too. prdLabel is left zero by the
+// judge tests, which is the "unconfigured" case Service.prdLabel resolves to the
+// compiled-in default — the same thing a real Cache does.
+//
+// eligibleLabels is left nil by every test that only cares about the primary: the
+// Service's runEligibleLabels ALWAYS unions the primary in (mirroring the Cache
+// accessor), so fakeSettings{prdLabel:"Feature"} still makes "Feature" eligible.
+// waivesPRDLink is likewise zero (false) by default; a test that exercises the
+// PRD #196 waiver sets it explicitly.
 type fakeSettings struct {
 	enabled        bool
 	model          string
 	prdLabel       string
+	eligibleLabels []string
+	waivesPRDLink  bool
 	prdlessEnabled bool
 	prdlessLabel   string
 	err            error
 }
 
-func (f fakeSettings) JudgeEnabled(context.Context) (bool, error)   { return f.enabled, f.err }
-func (f fakeSettings) JudgeModel(context.Context) (string, error)   { return f.model, f.err }
-func (f fakeSettings) PRDLabel(context.Context) (string, error)     { return f.prdLabel, f.err }
+func (f fakeSettings) JudgeEnabled(context.Context) (bool, error) { return f.enabled, f.err }
+func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
+func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
+func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
+	return f.eligibleLabels, f.err
+}
+func (f fakeSettings) EligibleLabelWaivesPRDLink(context.Context) (bool, error) {
+	return f.waivesPRDLink, f.err
+}
 func (f fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return f.prdlessEnabled, f.err }
 func (f fakeSettings) PrdlessLabel(context.Context) (string, error) { return f.prdlessLabel, f.err }
 

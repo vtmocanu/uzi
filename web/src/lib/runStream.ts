@@ -126,6 +126,14 @@ export interface StartRunPreconditions {
   // skipped — mirroring the server's allowWithoutPRD gate. Optional: absent means
   // no bypass (unchanged behavior for callers that don't compute it).
   prdlessBypass?: boolean;
+  // prdLinkWaived short-circuits the PRD-link requirement the way prdlessBypass does,
+  // but for a whole CLASS of issue rather than one (PRD #196 M4): the issue is
+  // run-eligible via a NON-PRIMARY label and the instance waives the PRD-link
+  // requirement for such issues (eligible_label_waives_prd_link). Mirrors the server's
+  // waiver so the button state matches the gate — an eligible `bug` with no prds/*.md
+  // link is startable here exactly as it is server-side. Optional: absent means no
+  // waiver (unchanged behavior for callers that don't compute it).
+  prdLinkWaived?: boolean;
   closed: boolean;
   hasWorker: boolean;
   hasToken: boolean;
@@ -145,7 +153,7 @@ export function startRunGate(p: StartRunPreconditions): StartRunGate {
   if (p.closed) {
     return { enabled: false, reason: "This issue is closed." };
   }
-  if (!p.hasPrdLink && !p.prdlessBypass) {
+  if (!p.hasPrdLink && !p.prdlessBypass && !p.prdLinkWaived) {
     return { enabled: false, reason: "Add a link to a prds/*.md file in the description first." };
   }
   if (!p.hasWorker) {

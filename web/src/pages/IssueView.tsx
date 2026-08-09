@@ -6,7 +6,7 @@ import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
-import { canPromote, isPRDCard } from "../lib/boardCards";
+import { canPromote, isEligibleCard } from "../lib/boardCards";
 import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
@@ -38,7 +38,8 @@ export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel } = useAuth();
+  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel, runEligibleLabels, eligibleLabelWaivesPrdLink } =
+    useAuth();
 
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -113,17 +114,19 @@ export function IssueView() {
     }
   };
 
-  // PRD #102 M6. The detail page needs its own answer to "is this uzi's work",
-  // computed from the SAME predicate the board card uses — two implementations is
-  // exactly how a card's affordances and its detail page's come to disagree.
+  // PRD #196 M4. The detail page drives its Start/Promote affordance off RUN-ELIGIBILITY
+  // (the admin-configured eligible set), the SAME predicate the board card uses — two
+  // implementations is exactly how a card's affordances and its detail page's come to
+  // disagree. This widens the M6 predicate from the primary label alone to the eligible
+  // set, so a runnable `bug` issue offers Start run here, not Promote.
   //
-  // M4 removed the PRD chip from this page, correctly: every cached issue carried
-  // the label by construction, so the chip carried no information. M6 is what gives
-  // it information again, and without an indicator a non-PRD issue opened from the
-  // board is indistinguishable from a PRD one on the very page where a user decides
-  // what to do with it — and which offers the run controls the gate will refuse.
-  const isPRD = !!issue && isPRDCard(issue, prdLabel);
-  const promotable = !!issue && canPromote(issue, prdLabel);
+  // The PRD-link waiver is scoped to NON-PRIMARY eligibility (Decision 7), mirroring the
+  // server: an issue eligible only via the primary still needs its prds/*.md link.
+  const isEligible = !!issue && isEligibleCard(issue, runEligibleLabels);
+  const promotable = !!issue && canPromote(issue, runEligibleLabels);
+  const eligibleByNonPrimary =
+    !!issue && issue.labels.some((l) => l !== prdLabel && runEligibleLabels.includes(l));
+  const prdLinkWaived = eligibleLabelWaivesPrdLink && eligibleByNonPrimary;
 
   // Promote (Decision 15), the same forge-first, adopt-the-response shape as the
   // PRDLESS toggle above.
@@ -145,6 +148,7 @@ export function IssueView() {
     ? startRunGate({
         hasPrdLink: issue.has_prd_link,
         prdlessBypass: prdlessEnabled && prdlessApplied,
+        prdLinkWaived,
         closed: issue.closed,
         hasWorker,
         hasToken,
@@ -244,7 +248,7 @@ export function IssueView() {
 
                     Neutral tone, deliberately. This is not a warning: an issue that is
                     not uzi's work is the ordinary state of most issues in a repo. */}
-                {!isPRD && (
+                {!isEligible && (
                   <Badge
                     tone="neutral"
                     title={`This issue does not carry the ${prdLabel} label, so uzi will not work it. Promote it to change that.`}
@@ -292,10 +296,10 @@ export function IssueView() {
                   {promoting ? "…" : `Promote to ${prdLabel}`}
                 </Button>
               )}
-              {/* isPRD is Decision 16, for the same reason it gates the card's button:
-                  run eligibility now requires the PRD label too, so on a non-PRD issue
-                  this grants nothing. */}
-              {prdlessEnabled && isPRD && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
+              {/* isEligible is Decision 16 (PRD #196 M4 widened it from isPRD), for the
+                  same reason it gates the card's button: the run gate refuses a
+                  non-eligible issue first, so the PRDLESS toggle grants nothing there. */}
+              {prdlessEnabled && isEligible && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
                 <Button
                   variant={prdlessApplied ? "secondary" : "ghost"}
                   disabled={prdlessBusy}
@@ -343,11 +347,12 @@ export function IssueView() {
             )}
           </Card>
 
-          {/* Hidden entirely on a non-PRD issue rather than shown gated: the server
+          {/* Hidden entirely on a non-eligible issue rather than shown gated: the server
               refuses the run (Decision 14), and Promote above is the one-click answer,
               so a disabled button explaining a rule the user can resolve in place would
-              be noise. */}
-          {!issue.closed && isPRD && gate && (
+              be noise. Keyed on eligibility (PRD #196 M4), so a runnable `bug` issue
+              DOES show Start run. */}
+          {!issue.closed && isEligible && gate && (
             <div>
               <Button
                 variant={gate.enabled ? "primary" : "ghost"}
