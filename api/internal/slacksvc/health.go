@@ -77,7 +77,7 @@ const reasonPersistFailing = "the agent's updates can't be saved, so it keeps re
 const reasonVerdictUndelivered = "the worker hasn't picked up your response yet"
 
 // isHealthFlaggableStatus mirrors the server's flaggable set (Decision 3): the root
-// label appends its ⚠ variant only while the run is still in one of these, so a
+// carries its ⚠️ context flag only while the run is still in one of these, so a
 // terminal run never shows a stale flag on its Slack root.
 func isHealthFlaggableStatus(status string) bool {
 	switch status {
@@ -107,17 +107,15 @@ func healthRootLabel(health string) string {
 	}
 }
 
-// healthSuffix is the ⚠ fragment appended to the root's status label (Decision 7).
-// Empty unless the run is flagged AND still in a flaggable status, so a healthy or
-// terminal run's root is unchanged.
-func healthSuffix(rc store.GetSlackRunContextRow) string {
+// healthContextLabel is the health flag word for the root's context block (PRD #268
+// M2, formerly the ⚠ label-suffix healthSuffix). Empty unless the run is flagged AND
+// still in a flaggable status, so a healthy or terminal run's root carries no flag.
+// The caller (rootBlocks) prefixes the ⚠️ glyph and scrubs/escapes the word.
+func healthContextLabel(rc store.GetSlackRunContextRow) string {
 	if rc.Health == "" || rc.Health == "ok" || !isHealthFlaggableStatus(rc.Status) {
 		return ""
 	}
-	if label := healthRootLabel(rc.Health); label != "" {
-		return " · ⚠ " + label
-	}
-	return ""
+	return healthRootLabel(rc.Health)
 }
 
 // healthNudgeHead is the fixed opening line of a threaded health nudge, keyed off the
@@ -133,17 +131,17 @@ func healthSuffix(rc store.GetSlackRunContextRow) string {
 func healthNudgeHead(health, reason string) string {
 	switch health {
 	case healthStalled:
-		return "⚠ This run has gone quiet and may be stuck."
+		return "⚠️ This run has gone quiet and may be stuck."
 	case healthLooping:
 		// PRD #108 M4 ADDED this arm; it did not change the one below it. The existing
 		// sentence stays exactly as written for the tool-repetition cause it was
 		// written for, so no existing nudge's wording moves.
 		if reason == reasonPersistFailing {
-			return "⚠ This run's updates aren't being saved, so it keeps re-sending them."
+			return "⚠️ This run's updates aren't being saved, so it keeps re-sending them."
 		}
-		return "⚠ This run looks like it's repeating the same step."
+		return "⚠️ This run looks like it's repeating the same step."
 	case healthSlow:
-		return "⚠ This run is taking longer than usual."
+		return "⚠️ This run is taking longer than usual."
 	case healthWaitingWorker:
 		// Issue #182 ADDED this arm; it did not change the one below it. The existing
 		// sentence stays exactly as written for the unclaimed-run cause it was written
@@ -158,9 +156,9 @@ func healthNudgeHead(health, reason string) string {
 		}
 		return "⏳ This run is still waiting for a worker to pick it up."
 	case healthApprovalIdle:
-		return "⏸ This run is still waiting for your approval."
+		return "⏸️ This run is still waiting for your approval."
 	default:
-		return "⚠ This run needs a look."
+		return "⚠️ This run needs a look."
 	}
 }
 

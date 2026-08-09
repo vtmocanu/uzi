@@ -51,7 +51,7 @@ type NotifierStore interface {
 	// re-park on the SAME question after a worker death does not post it twice.
 	SetSlackRunQuestion(ctx context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error)
 	// SetSlackRunMilestoneNotified records the last completed-milestone COUNT the notifier
-	// posted a `✓ N/M` thread line for (PRD #122 M4), generation-guarded so a redelivered
+	// posted a `🧩 N/M` thread line for (PRD #122 M4), generation-guarded so a redelivered
 	// `running` report cannot re-post a line the thread already carries. Distinct from
 	// gate_generation (the plan gate's own counter).
 	SetSlackRunMilestoneNotified(ctx context.Context, arg store.SetSlackRunMilestoneNotifiedParams) (store.SlackRunMessage, error)
@@ -294,12 +294,12 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 // renderNotification builds the content-minimized DM for a generic notification.
 // The title is a fixed caller-set label and the body is dynamic, potentially
 // untrusted free text (a judge verdict summary, a repo/agent name), so BOTH are
-// mrkdwn-escaped individually — exactly like renderRoot escapes the issue title —
+// mrkdwn-escaped individually — exactly like rootBlocks escapes the issue title —
 // before they sit beside the trusted deep-link markup. The link is an in-app URL
 // whose base is operator-set and http(s)-validated, rendered raw as <url|label>
 // like runLink. The whole line is then ScrubSecrets'd as a last line of defense.
 func renderNotification(ev notifyEvent) string {
-	head := "[uzi] " + EscapeMrkdwn(strings.TrimSpace(ev.title))
+	head := EscapeMrkdwn(strings.TrimSpace(ev.title))
 	if body := strings.TrimSpace(ev.body); body != "" {
 		head += " — " + EscapeMrkdwn(boundReason(body))
 	}
@@ -372,13 +372,13 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	}
 
 	base, _ := n.baseURL(ctx)
-	root := ScrubSecrets(renderRoot(rc, base))
+	blocks, fallback := rootBlocks(rc, base)
 
 	existing, err := n.store.GetSlackRunMessage(ctx, ev.runID)
 	var anchor store.SlackRunMessage
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		ts, perr := n.poster.Post(ctx, channel, "", root)
+		ts, perr := n.poster.PostBlocks(ctx, channel, "", fallback, blocks)
 		if perr != nil {
 			n.logf("post root", perr)
 			return
@@ -397,7 +397,7 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		return
 	default:
 		anchor = existing
-		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
+		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
 			n.logf("update root", uerr)
 		}
 		if evt := renderThread(rc); evt != "" {
@@ -674,9 +674,9 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 	}
 	base, _ := n.baseURL(ctx)
 
-	// Re-render the root so the ⚠ label reflects the current flag (create it if a
-	// stuck queued run never got a state DM). renderRoot carries the flag via
-	// healthSuffix, keyed off the run context's current health.
+	// Re-render the root so the ⚠️ flag reflects the current health (create it if a
+	// stuck queued run never got a state DM). rootBlocks carries the flag as a
+	// context element, keyed off the run context's current health.
 	anchor, ok := n.ensureRoot(ctx, rc, channel, base)
 	if !ok {
 		return
@@ -704,11 +704,11 @@ func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
 // unrecoverable error. It is the health path's counterpart to handle's inline anchor
 // flow (which also threads terminal outcome events, so the two are not merged).
 func (n *Notifier) ensureRoot(ctx context.Context, rc store.GetSlackRunContextRow, channel, base string) (store.SlackRunMessage, bool) {
-	root := ScrubSecrets(renderRoot(rc, base))
+	blocks, fallback := rootBlocks(rc, base)
 	existing, err := n.store.GetSlackRunMessage(ctx, rc.ID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		ts, perr := n.poster.Post(ctx, channel, "", root)
+		ts, perr := n.poster.PostBlocks(ctx, channel, "", fallback, blocks)
 		if perr != nil {
 			n.logf("post root (health)", perr)
 			return store.SlackRunMessage{}, false
@@ -725,7 +725,7 @@ func (n *Notifier) ensureRoot(ctx context.Context, rc store.GetSlackRunContextRo
 		n.logf("load anchor (health)", err)
 		return store.SlackRunMessage{}, false
 	default:
-		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
+		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
 			n.logf("update root (health)", uerr)
 		}
 		return existing, true
@@ -736,33 +736,72 @@ func (n *Notifier) logf(what string, err error) {
 	n.logger.Warn("slack notifier: "+what+" failed (best-effort)", "error", Redact(err.Error()))
 }
 
-// renderRoot builds the content-minimized root line: repo#iid «title» — status,
-// plus an Open-in-uzi deep link. No plan/diff — the plan is one click away. The
-// forge-controlled repo path and issue title are mrkdwn-escaped individually so
-// they cannot inject a spoofed <url|label> link or a <@Uxxx> mention into the DM;
-// the deep-link markup below stays raw (its base is operator-set, its id a uuid).
-func renderRoot(rc store.GetSlackRunContextRow, base string) string {
-	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s%s%s",
-		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle),
-		statusLabel(rc), milestoneSuffix(rc), healthSuffix(rc))
-	if link := runLink(base, rc.ID); link != "" {
-		head += "\n" + link
+// rootBlocks builds the content-minimized run-status root as Block Kit (message
+// family A, PRD #268 M2): a section carrying the status glyph + bold label, the
+// repo#iid as inline code and the bold issue title; then a context block assembling —
+// in order, and only for the elements that apply — the milestone counter, the MR/PR
+// link, a health flag, and the Open-in-uzi deep link. No plan/diff — the plan is one
+// click away. It returns the blocks plus the plain-text fallback (the OS-notification
+// text): `{Label} · {repo}#{iid} — {title}`, never a raw title.
+//
+// The forge-controlled repo path and issue title are mrkdwn-escaped AND ScrubSecrets'd
+// individually so they cannot inject a spoofed <url|label> link, a <@Uxxx> mention, or
+// a leaked token into the DM. The deep-link and MR-link markup keeps its raw <url|label>
+// mrkdwn (never EscapeMrkdwn'd — the base is operator-set, the id a uuid, and mrLink
+// https-guards + escapes the forge URL), but each context string is still ScrubSecrets'd
+// before it enters the block: blocks are not exempt from the outbound-scrub rule, and a
+// scrub is a no-op on a clean URL. The context block is omitted entirely when no element
+// applies (Slack rejects an empty one).
+func rootBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Block, fallback string) {
+	emoji, label := statusGlyph(rc)
+	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
+	title := ScrubSecrets(EscapeMrkdwn(rc.IssueTitle))
+
+	head := "*" + label + "*"
+	if emoji != "" {
+		head = emoji + " " + head
 	}
-	return head
+	sectionText := fmt.Sprintf("%s\n`%s#%d` · *%s*", head, repo, iid(rc.IssueIid), title)
+	blocks = []slack.Block{slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType, sectionText, false, false), nil, nil)}
+
+	var ctxElems []slack.MixedElement
+	if done, total, ok := milestoneCounts(rc); ok {
+		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType,
+			fmt.Sprintf("🧩 %d/%d milestones", done, total), false, false))
+	}
+	if mr := mrContextElem(rc); mr != "" {
+		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType, ScrubSecrets(mr), false, false))
+	}
+	if h := healthContextLabel(rc); h != "" {
+		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType,
+			"⚠️ "+ScrubSecrets(EscapeMrkdwn(h)), false, false))
+	}
+	if u := runURL(base, rc.ID); u != "" {
+		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType,
+			ScrubSecrets(fmt.Sprintf("🔗 <%s|Open in uzi>", u)), false, false))
+	}
+	if len(ctxElems) > 0 {
+		blocks = append(blocks, slack.NewContextBlock("slack_run_root_ctx", ctxElems...))
+	}
+
+	fallback = fmt.Sprintf("%s · %s#%d — %s", label, repo, iid(rc.IssueIid), title)
+	return blocks, fallback
 }
 
-// milestoneSuffix is the compact ` · 3/7` counter appended to the root status label of a
-// milestone-structured run (PRD #122 M4) — the same in-place edit renderRoot already
-// re-renders on every state event. Empty for a run with no frozen milestone list, so a
-// no-milestone run's root is byte-for-byte what it was before this feature. The two
-// numbers are server-derived integers (a member count and a list length), so unlike the
-// issue title there is nothing to escape.
-func milestoneSuffix(rc store.GetSlackRunContextRow) string {
-	done, total, ok := milestoneCounts(rc)
-	if !ok {
+// mrContextElem is the MR/PR context element for the root — `🔀 <url|MR !N>` in the
+// run's own forge vocabulary (PR #N on Forgejo/GitHub), or "" when the run has no
+// merge request yet. mrLink supplies the https-guarded, mrkdwn-escaped URL; the label
+// is server-derived (a forge noun + iid), so there is nothing hostile to escape in it.
+func mrContextElem(rc store.GetSlackRunContextRow) string {
+	url := mrLink(rc)
+	if url == "" {
 		return ""
 	}
-	return fmt.Sprintf(" · %d/%d", done, total)
+	if rc.MrIid.Valid {
+		return fmt.Sprintf("🔀 <%s|%s %s%d>", url, forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)
+	}
+	return fmt.Sprintf("🔀 <%s|View %s>", url, forgeMrAbbrev(rc.ForgeType))
 }
 
 // decodeMilestones decodes a runs.milestones_frozen jsonb array into a
@@ -824,7 +863,7 @@ func milestoneCounts(rc store.GetSlackRunContextRow) (done, total int, ok bool) 
 	return done, len(frozen), true
 }
 
-// handleMilestone posts ONE `✓ N/M` thread line when a milestone-structured run's
+// handleMilestone posts ONE `🧩 N/M` thread line when a milestone-structured run's
 // completed COUNT strictly advances past the count the anchor last recorded (PRD #122
 // M4). It is the milestone counterpart to handleGate/handleQuestion, bound to the
 // existing-message branch of handle: the first post (the ErrNoRows branch) is the run's
@@ -849,7 +888,7 @@ func (n *Notifier) handleMilestone(ctx context.Context, rc store.GetSlackRunCont
 		return // no advance since the last line — a redelivered report, not new progress
 	}
 
-	line := fmt.Sprintf("✓ %d/%d", done, total)
+	line := fmt.Sprintf("🧩 %d/%d", done, total)
 	if title := inProgressTitle(rc); title != "" {
 		line += " · working " + EscapeMrkdwn(title)
 	}
@@ -941,18 +980,18 @@ func renderThread(rc store.GetSlackRunContextRow) string {
 	}
 }
 
-// limitWaitLabel renders a park for both the root line and the threaded event.
-//
-// ONE function for both on purpose: the two would otherwise drift into describing
-// the same state differently in the same DM, which is the failure the reader
-// notices and cannot explain.
+// limitWaitLabel renders the terminal thread event's park detail: the rate-limit
+// type, the resume `<!date^…>` reader-local-time token, and the pause count. Its
+// only caller since PRD #268 M2 is renderThread — the root line no longer shares it,
+// showing instead the minimized `⏸️ Paused · usage limit` glyph+label from
+// statusGlyph, so there is nothing here to keep in lockstep with the root anymore.
 //
 // Every part is omitted when unknown rather than defaulted, exactly as the server's
 // own failure-reason composition does — the line never claims a fact uzi does not
 // have. A park with neither a window nor a stamp still renders honestly as
-// "⏸ paused: usage limit".
+// "⏸️ Paused · usage limit".
 func limitWaitLabel(rc store.GetSlackRunContextRow) string {
-	s := "⏸ paused: usage limit"
+	s := "⏸️ Paused · usage limit"
 	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
 		// EscapeMrkdwn even though workersvc has already allowlisted this to a
 		// seven-member enum and 00091's CHECK backstops it. The escape costs nothing and
@@ -993,37 +1032,40 @@ func boundReason(s string) string {
 	return string(r[:maxFailureReason]) + "…"
 }
 
-// statusLabel is the compact status shown on the root line.
-func statusLabel(rc store.GetSlackRunContextRow) string {
+// statusGlyph is the canonical (emoji, label) pair for a run's status on the root line
+// (PRD #268 M2). Every glyph is emoji-presentation so the DM reads consistently beside
+// the full-color ✅ ❌ 🚫. The MR ref is NOT inlined into the completed label — the MR
+// now rides the root's context block (mrContextElem) — and the milestone/health flags
+// live there too, not glued onto the label. A `failed` row whose reason is the sentinel
+// "run cancelled" reads as Cancelled, exactly as the old statusLabel special-cased it.
+func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 	switch rc.Status {
 	case "queued":
-		return "queued"
+		return "⏳", "Queued"
 	case "claimed", "running":
-		return "▶ running"
+		return "▶️", "Running"
 	case "awaiting_approval":
-		return "⏸ needs your approval"
+		return "⏸️", "Needs your approval"
 	case "awaiting_input":
 		// Without this case the default arm below renders the raw enum `awaiting_input`
 		// on the root line of a user-facing DM — the web has a replace(/_/g," ") fallback,
 		// Slack has none (PRD #88 M3).
-		return "⏸ needs your answer"
+		return "❓", "Needs your answer"
 	case "limit_wait":
-		return limitWaitLabel(rc)
+		return "⏸️", "Paused · usage limit"
 	case "completed":
-		if rc.MrIid.Valid {
-			return fmt.Sprintf("✅ completed (%s %s%d)", forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)
-		}
-		return "✅ completed"
+		return "✅", "Completed"
 	case "failed":
-		reason := strings.TrimSpace(rc.FailureReason.String)
-		if reason == "run cancelled" {
-			return "🚫 cancelled"
+		if strings.TrimSpace(rc.FailureReason.String) == "run cancelled" {
+			return "🚫", "Cancelled"
 		}
-		return "❌ failed"
+		return "❌", "Failed"
 	case "cancelled":
-		return "🚫 cancelled"
+		return "🚫", "Cancelled"
 	default:
-		return rc.Status
+		// An unknown enum keeps its raw string with no glyph, mirroring the old default
+		// arm — a byte-honest degrade rather than a fabricated emoji.
+		return "", rc.Status
 	}
 }
 

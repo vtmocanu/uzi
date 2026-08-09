@@ -45,7 +45,7 @@ func TestHealthNudgeHeadLeavesTheToolRepetitionWordingExactlyAsItWas(t *testing.
 	// PRD #108 ADDED an arm; it did not reword an existing one. This pins the old
 	// sentence verbatim so the additive change stays additive — no shipped nudge's
 	// wording moves.
-	const before = "⚠ This run looks like it's repeating the same step."
+	const before = "⚠️ This run looks like it's repeating the same step."
 	if got := healthNudgeHead(healthLooping, reasonLooping()); got != before {
 		t.Fatalf("nudge head for the tool-repetition cause = %q, want the unchanged %q", got, before)
 	}

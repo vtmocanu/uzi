@@ -218,7 +218,7 @@ func (l *Linker) SendTestDM(ctx context.Context, slackID string) error {
 	if err != nil {
 		return err
 	}
-	_, err = l.poster.Post(ctx, channel, "", ScrubSecrets("[uzi] test message — your Slack notifications are wired up."))
+	_, err = l.poster.Post(ctx, channel, "", ScrubSecrets("✅ Test message — your Slack notifications are wired up."))
 	return err
 }
 

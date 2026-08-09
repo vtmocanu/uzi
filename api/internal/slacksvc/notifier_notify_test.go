@@ -33,10 +33,14 @@ func TestHandleNotifyPostsDMWhenLinked(t *testing.T) {
 		t.Fatalf("posts = %d, want 1 DM", len(fp.posts))
 	}
 	got := fp.posts[0].text
-	for _, want := range []string{"[uzi]", "judge review ready", "verdict: issues", "<https://uzi.example/runs/abc|Open in uzi>"} {
+	for _, want := range []string{"judge review ready", "verdict: issues", "<https://uzi.example/runs/abc|Open in uzi>"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("DM %q missing %q", got, want)
 		}
+	}
+	// PRD #268 M2: the `[uzi]` prefix is gone (a 1:1 DM with the bot never needed it).
+	if strings.Contains(got, "[uzi]") {
+		t.Fatalf("DM must not carry the [uzi] prefix: %q", got)
 	}
 	if fp.posts[0].thread != "" {
 		t.Fatalf("a notification is a top-level DM, got thread %q", fp.posts[0].thread)
