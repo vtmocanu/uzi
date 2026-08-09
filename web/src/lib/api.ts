@@ -1328,8 +1328,9 @@ export type MyRateLimits =
  *  when the two disagreed. */
 /** SelectReason is WHY a run spent the credential it spent (PRD #111 M5, D20) — the
  *  MODE that named it. A CLOSED set of eight, mirroring autoselect.Reason in Go and
- *  migration 00089's CHECK in SQL; selectReasonMatchesMigration in
- *  runCredential.test.ts parses that migration and pins the three in step.
+ *  migration 00089's CHECK in SQL; the "reason vocabulary is one vocabulary" suite in
+ *  runCredential.test.ts (its `reasonsFromMigration()` helper) parses that migration
+ *  and pins the three in step.
  *
  *  Typed as `SelectReason | string` on the wire rather than as the union alone: the
  *  API is deployed separately from this bundle, so a newer server can ship a ninth

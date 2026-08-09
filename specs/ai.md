@@ -19292,3 +19292,43 @@ derived client-side from timestamps already on the run.
 - **`formatDuration` hour-tier fix (M1).** `formatDuration` (`web/src/components/RunEvent.tsx`) now
   rolls over to hours (`1h 30m 00s`), fixing the `90m 00s`/`120m 00s` no-rollover bug, and rounds to
   whole seconds up front so it can never emit `1m 60s`.
+
+## 505. PRD #217 — a usage-limit park writes the dead credential's gauge (`source = 'limit_report'`, pct only), and the resuming claim excludes it directly
+
+Closes the gap left by PRD #35/#111's switch-and-resume: nothing previously told the selector that
+the credential a run just parked on is dead, so a resumed `auto` run could re-claim the very token
+that refused it, and a sibling claiming inside the same poll window could walk onto it too. Two
+mechanisms, at two layers, because neither covers the other's cases (D1/D2).
+
+- **M1 — the park UPDATEs the gauge, never INSERTs.** `setLimitWait` marks the dead credential's
+  named window (`five_hour` or the four `seven_day` spellings; `overage`/`unknown` are no-ops by
+  construction, they name no gauge column) at 100% consumed, with the new third `source` value
+  `limit_report` (migration widens the CHECK from two values to three). A token with no gauge row
+  already classifies `StatusNoReading` and is already unpickable, so a zero-row UPDATE is a success,
+  not a bug (D7).
+- **`synced_at` and the reset columns are deliberately left untouched (D3/D4).** Bumping `synced_at`
+  looked like the obvious move — verified by execution to be the wrong one: `Classify` reads one
+  `synced_at` for the WHOLE row, so bumping it re-freshens the *other* window's stale reading too and
+  can flip `best_of_pool` onto the dead token. Writing the worker-reported reset into the shared row
+  would launder an unvalidated value into `deadCredentialReset`'s cross-check for every future run on
+  that credential, not just this one. Pct-only keeps both readings honest: a fresh row now reads
+  headroom 0 and is filtered by `MinHeadroom`; a stale row stays stale and contributes nothing.
+- **M2 — the resuming run's OWN claim excludes the dead credential too**, on both of `autoChoice`'s
+  exits: `autoselect.Select` gains an `exclude uuid.UUID`, and the `pool_stale`/`pool_empty` fallback
+  (which never consults `Select`'s pick at all) also refuses to resolve to it. Carried per-run on a
+  nullable `runs.limit_dead_secret_id`, set by `SetRunLimitWait` and cleared by the next claim that
+  successfully records — "at least one claim", not "exactly one", since a claim can still die after
+  that clear point. This is what M1 structurally cannot reach: the `overage`/`unknown` limit types, the
+  case where the dead credential is the sole measurable candidate and `best_of_pool` picks it anyway,
+  and the fallback path. The exclusion is CONDITIONAL, not absolute — a single-pooled-token user still
+  resumes on their only token, because D7 (auto never fails a run) outranks this feature.
+- **M3 — `source` gets a rendering, not just a value.** A **"Recorded at usage limit"** badge
+  (`web/src/components/RateLimitMeters.tsx`, `AdminRateLimits.tsx`) fires only for
+  `source === 'limit_report'`, so a 100% bar written mid-interval by a park doesn't read as a stale
+  poll reading — it discloses that this number is newer than the `synced_at` beside it (D6), which D3
+  makes true by construction.
+- **M4 — the untouched columns are the thing under test, not the touched one.** The live-DB case
+  asserts the pct moved and `synced_at`, the other window's pct, and both reset columns did not; a
+  drift test parses the migration CHECK against the three-value Go/TS vocabularies so a fourth value
+  added in one place and not the others fails CI (the four-homes shape D6 costs: the CHECK, the Go
+  constants, the TS union, and the mock fixture module).

@@ -18,10 +18,12 @@ DELETE FROM anthropic_rate_limits WHERE user_id = $1
 
 // Drop every gauge row a user holds. Since #104 M5 the composite FK CASCADES a
 // token's gauge row when the token itself is deleted, so this is no longer the
-// mechanism that prevents a ghost reading — the database is. It stays as the
-// belt-and-suspenders sweep the token-delete path still runs (PRD #53 D3b), and as
-// the thing that would still clear rows if a future schema change ever loosened
-// that cascade. Idempotent: 0 rows when there is nothing to drop.
+// mechanism that prevents a ghost reading — the database is. It has NO production
+// caller today: the token-delete path (handler/secrets.go) deliberately relies on
+// the cascade and does not call this (PRD #53 D3b keeps the query available as the
+// belt-and-suspenders sweep, and as the thing that would still clear rows if a
+// future schema change ever loosened that cascade). Idempotent: 0 rows when there
+// is nothing to drop.
 func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteRateLimits, userID)
 	if err != nil {
