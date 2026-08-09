@@ -210,6 +210,50 @@ func TestScheduleCRUDRoundTripLiveDB(t *testing.T) {
 	}
 }
 
+// TestScheduleMaxIssuesRoundTripLiveDB exercises the PRD #274 M2 sweep cap through the
+// real store column (pgtype.Int4): a new sweep defaults to 10, a config PATCH that resends
+// the cap persists it, and a config PATCH carrying an explicit null CLEARS it to unlimited
+// (the deliberate replace-semantics — a seed-and-keep would make unlimited unreachable).
+func TestScheduleMaxIssuesRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create a sweep with no explicit cap → server default 10.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.MaxIssues == nil || *dto.MaxIssues != 10 {
+		t.Fatalf("new sweep max_issues = %v, want the default 10", dto.MaxIssues)
+	}
+	id := dto.ID
+
+	patch := func(body string) apitypes.ScheduleDTO {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("patch %q status = %d, want 200 (body %s)", body, rec.Code, rec.Body.String())
+		}
+		var out apitypes.ScheduleDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		return out
+	}
+
+	// A config PATCH resending the cap persists the new value.
+	if got := patch(`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1","max_issues":3}`); got.MaxIssues == nil || *got.MaxIssues != 3 {
+		t.Fatalf("after set patch, max_issues = %v, want 3", got.MaxIssues)
+	}
+
+	// A config PATCH carrying an explicit null clears the cap to unlimited (NULL column).
+	if got := patch(`{"target":"sweep","labels":["bug"],"timing":"recurring","cron_expr":"0 9 * * 1","max_issues":null}`); got.MaxIssues != nil {
+		t.Fatalf("after clear patch, max_issues = %v, want nil (unlimited)", got.MaxIssues)
+	}
+}
+
 func TestScheduleOwnerIsolationLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)

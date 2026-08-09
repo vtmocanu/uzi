@@ -135,6 +135,72 @@ func TestScheduleCreateSweepBody(t *testing.T) {
 	if req.WaitOnLimit == nil || !*req.WaitOnLimit {
 		t.Errorf("wait_on_limit = %v, want true", req.WaitOnLimit)
 	}
+	// A plain --sweep sends the default cap of 10 (matching the server default).
+	if req.MaxIssues == nil || *req.MaxIssues != 10 {
+		t.Errorf("max_issues = %v, want a non-nil 10 (default sweep cap)", req.MaxIssues)
+	}
+}
+
+// TestScheduleCreateSweepMaxIssuesOverride: --max-issues overrides the default cap and is
+// sent as a non-nil pointer for the sweep target.
+func TestScheduleCreateSweepMaxIssuesOverride(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_m"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "uzi", "--sweep", "--max-issues", "3", "--cron", "0 9 * * 1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.MaxIssues == nil || *req.MaxIssues != 3 {
+		t.Errorf("max_issues = %v, want 3", req.MaxIssues)
+	}
+}
+
+// TestScheduleCreateMaxIssuesRequiresSweep: --max-issues on a non-sweep target is a usage
+// error (exit 2) before any request, mirroring the --label rule.
+func TestScheduleCreateMaxIssuesRequiresSweep(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "5", "--max-issues", "3", "--cron", "0 2 * * *")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateSchedRepo != "" {
+		t.Errorf("create should not have been called")
+	}
+}
+
+// TestScheduleCreateIssueBodyNoMaxIssues: a non-sweep target never sends max_issues.
+func TestScheduleCreateIssueBodyNoMaxIssues(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_i"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.MaxIssues != nil {
+		t.Errorf("issue target max_issues = %v, want nil (sweep-only)", req.MaxIssues)
+	}
+}
+
+// TestScheduleGetDetailShowsMaxIssues: the detail block carries a MAX_ISSUES row for a
+// sweep — the number when set, "unlimited" when nil.
+func TestScheduleGetDetailShowsMaxIssues(t *testing.T) {
+	capped := 5
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_cap": {ID: "sch_cap", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, MaxIssues: &capped},
+		"sch_unl": {ID: "sch_unl", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, MaxIssues: nil},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_cap")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "MAX_ISSUES") || !strings.Contains(out, "5") {
+		t.Errorf("detail missing MAX_ISSUES row with 5\n%s", out)
+	}
+	out2, _, _ := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_unl")
+	if !strings.Contains(out2, "MAX_ISSUES") || !strings.Contains(out2, "unlimited") {
+		t.Errorf("detail missing MAX_ISSUES unlimited row\n%s", out2)
+	}
 }
 
 // TestScheduleCreatePromptBody asserts the ad-hoc prompt target and that

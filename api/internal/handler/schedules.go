@@ -43,10 +43,20 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 		n.Timezone = "UTC"
 	}
 
+	// max_issues (PRD #274 M2), when present, must be a positive integer regardless of
+	// target — a zero/negative cap is a nonsense fan-out bound. Its target scoping (sweep
+	// only) is enforced per-target below.
+	if n.MaxIssues != nil && *n.MaxIssues <= 0 {
+		return n, http.StatusBadRequest, "max_issues must be a positive integer"
+	}
+
 	switch n.Target {
 	case "issue":
 		if n.IssueIID == nil || *n.IssueIID <= 0 {
 			return n, http.StatusBadRequest, "issue_iid is required and must be a positive integer for an issue schedule"
+		}
+		if n.MaxIssues != nil {
+			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
 		}
 	case "sweep":
 		// Labels are optional; an empty selector defaults to the PRD label at fire time
@@ -58,6 +68,9 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 		}
 		if len(n.Prompt) > workersvc.MaxIssueDescriptionBytes {
 			return n, http.StatusUnprocessableEntity, "prompt is too large to run"
+		}
+		if n.MaxIssues != nil {
+			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
 		}
 	default:
 		return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
@@ -128,6 +141,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		AutoApprove: *m.AutoApprove,
 		WaitOnLimit: *m.WaitOnLimit,
 		Enabled:     *m.Enabled,
+		MaxIssues:   maxIssuesColumn(m),
 	})
 	if err != nil {
 		slog.Error("create run schedule", "error", err)
@@ -220,6 +234,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			NextFireAt:  nextFire,
 			AutoApprove: *m.AutoApprove,
 			WaitOnLimit: *m.WaitOnLimit,
+			MaxIssues:   maxIssuesColumn(m),
 			ID:          id,
 			UserID:      user.ID,
 		})
@@ -362,6 +377,10 @@ func (h *Handler) scheduleParam(w http.ResponseWriter, r *http.Request) (store.U
 // enabled on. A nil pointer means the caller omitted the field; a present pointer (even to
 // false) is respected. Create-time only: existing rows are not rewritten (PRD #274
 // Decision 4).
+//
+// max_issues (PRD #274 M2) defaults to 10 for a NEW SWEEP with no explicit value — a
+// bounded fan-out is the safer default (Decision 2/4). It is left nil for issue/prompt
+// targets, where max_issues is not a valid field (validateScheduleConfig rejects it there).
 func applyCreateDefaults(req *apitypes.ScheduleRequest) {
 	if req.AutoApprove == nil {
 		v := true
@@ -375,6 +394,10 @@ func applyCreateDefaults(req *apitypes.ScheduleRequest) {
 		v := true
 		req.Enabled = &v
 	}
+	if req.Target == "sweep" && req.MaxIssues == nil {
+		v := 10
+		req.MaxIssues = &v
+	}
 }
 
 // onlyEnabled reports whether a PATCH body carries ONLY the enabled flag, so the
@@ -384,7 +407,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.Target == "" && req.Timing == "" &&
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
-		req.AutoApprove == nil && req.WaitOnLimit == nil
+		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -449,6 +472,15 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	if req.WaitOnLimit != nil {
 		m.WaitOnLimit = req.WaitOnLimit
 	}
+	// max_issues (PRD #274 M2) takes the request value DIRECTLY — it is NOT seeded from
+	// cur and kept-on-empty like the fields above. RATIONALE: a config PATCH rewrites the
+	// whole row, and the only sparse PATCH (enabled-only) is short-circuited by onlyEnabled
+	// before this merge, so the web always sends the full config. Replace-semantics is what
+	// makes clear-to-unlimited work: a `max_issues: null` in the PATCH must reach the DB as
+	// NULL. A seed-and-keep would make an explicit null indistinguishable from "omitted",
+	// leaving unlimited unreachable once a sweep has any cap set. This is the deliberate
+	// difference from the keep-on-empty fields — the *int tri-state carries "cleared".
+	m.MaxIssues = req.MaxIssues
 	return m
 }
 
@@ -472,6 +504,17 @@ func scheduleColumns(m apitypes.ScheduleRequest) (issueIID pgtype.Int8, labels [
 		runAt = pgtype.Timestamptz{Time: m.RunAt.UTC(), Valid: true}
 	}
 	return
+}
+
+// maxIssuesColumn maps the request's *int max_issues to the nullable store column (PRD
+// #274 M2). It is set Valid ONLY for the sweep target (mirroring labels): a non-sweep
+// row must carry SQL NULL, so an issue/prompt schedule never persists a stray cap even
+// if one slipped past validation. A nil pointer is SQL NULL = unlimited.
+func maxIssuesColumn(m apitypes.ScheduleRequest) pgtype.Int4 {
+	if m.Target == "sweep" && m.MaxIssues != nil {
+		return pgtype.Int4{Int32: int32(*m.MaxIssues), Valid: true}
+	}
+	return pgtype.Int4{}
 }
 
 // nextFireFor computes the durable next_fire_at from a validated request: the next cron
@@ -543,6 +586,10 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	if s.LastFiredAt.Valid {
 		t := s.LastFiredAt.Time
 		dto.LastFiredAt = &t
+	}
+	if s.MaxIssues.Valid {
+		v := int(s.MaxIssues.Int32)
+		dto.MaxIssues = &v
 	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {

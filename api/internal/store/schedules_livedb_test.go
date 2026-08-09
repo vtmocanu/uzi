@@ -155,6 +155,62 @@ func TestRunSchedulesClaimAdvanceLiveDB(t *testing.T) {
 	}
 }
 
+// TestListSweepCandidateIssuesMaxIssuesLiveDB is the mandatory live-DB coverage for the
+// PRD #274 M2 sweep cap: ListSweepCandidateIssues gained `LIMIT sqlc.narg('max_issues')`,
+// and the `LIMIT sqlc.narg` type-inference idiom is exactly the kind of statement a green
+// `sqlc generate` does not prove (see .claude/rules/go.md). The query cannot be verified
+// against a fake store — the LIMIT and the oldest-first ORDER BY ARE the SQL — so this
+// prepares and runs it against real Postgres.
+//
+// It seeds five open issues carrying the sweep label with ASCENDING forge_issue_iid and
+// asserts: a cap of N returns the N OLDEST (smallest iids), and a NULL cap returns all.
+func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, _, repoID := schedFixture(ctx, t)
+
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// Five candidates, all open and carrying the "bug" label, ascending iids.
+	for _, iid := range []int64{101, 102, 103, 104, 105} {
+		mustExec(ctx, t, pool,
+			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+			 VALUES ($1, $2, 't', 'opened', '["bug"]'::jsonb, 'https://x', true, now(), now())`,
+			repoID, iid)
+	}
+
+	labels := []byte(`["bug"]`)
+
+	sweepIIDs := func(max pgtype.Int4) []int64 {
+		rows, err := q.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
+			RepoID: repoID, Labels: labels, MaxIssues: max,
+		})
+		if err != nil {
+			t.Fatalf("ListSweepCandidateIssues: %v", err)
+		}
+		out := make([]int64, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, r.ForgeIssueIid)
+		}
+		return out
+	}
+
+	// A cap of 3 returns the three OLDEST (smallest forge_issue_iid) in order.
+	if got := sweepIIDs(pgtype.Int4{Int32: 3, Valid: true}); len(got) != 3 ||
+		got[0] != 101 || got[1] != 102 || got[2] != 103 {
+		t.Fatalf("max_issues=3 candidates = %v, want the 3 oldest [101 102 103]", got)
+	}
+
+	// A NULL cap (Valid=false) is unlimited — all five come back.
+	if got := sweepIIDs(pgtype.Int4{}); len(got) != 5 {
+		t.Fatalf("NULL max_issues candidates = %v, want all 5 rows (unlimited)", got)
+	}
+}
+
 func containsSchedule(rows []store.RunSchedule, id uuid.UUID) bool {
 	for _, r := range rows {
 		if r.ID == id {

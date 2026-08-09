@@ -39,6 +39,7 @@ function sched(over: Partial<Schedule>): Schedule {
     last_fired_at: null,
     auto_approve: true,
     wait_on_limit: true,
+    max_issues: 10,
     enabled: true,
     status: "active",
     created_at: new Date().toISOString(),

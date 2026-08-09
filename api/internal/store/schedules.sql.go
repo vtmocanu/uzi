@@ -19,7 +19,7 @@ SET last_fired_at = $1,
     status        = $3,
     updated_at    = now()
 WHERE id = $4
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
 type AdvanceScheduleParams struct {
@@ -61,12 +61,14 @@ func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
 
 const claimDueSchedules = `-- name: ClaimDueSchedules :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()
 ORDER BY next_fire_at
@@ -109,6 +111,8 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxIssues,
+			&i.Guidance,
 		); err != nil {
 			return nil, err
 		}
@@ -235,13 +239,13 @@ const createRunSchedule = `-- name: CreateRunSchedule :one
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled
+    auto_approve, wait_on_limit, enabled, max_issues
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
-    $12, $13, $14
+    $12, $13, $14, $15
 )
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
 type CreateRunScheduleParams struct {
@@ -259,6 +263,7 @@ type CreateRunScheduleParams struct {
 	AutoApprove bool               `json:"auto_approve"`
 	WaitOnLimit bool               `json:"wait_on_limit"`
 	Enabled     bool               `json:"enabled"`
+	MaxIssues   pgtype.Int4        `json:"max_issues"`
 }
 
 // Scheduled runs (PRD #241). run_schedules is the durable, time-driven origin of a
@@ -283,6 +288,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.AutoApprove,
 		arg.WaitOnLimit,
 		arg.Enabled,
+		arg.MaxIssues,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -305,6 +311,8 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
@@ -328,7 +336,7 @@ func (q *Queries) DeleteRunSchedule(ctx context.Context, arg DeleteRunSchedulePa
 }
 
 const getRunSchedule = `-- name: GetRunSchedule :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at FROM run_schedules WHERE id = $1
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance FROM run_schedules WHERE id = $1
 `
 
 // Unscoped fetch by id (server-internal: the claimer/firing path already holds a
@@ -356,12 +364,14 @@ func (q *Queries) GetRunSchedule(ctx context.Context, id uuid.UUID) (RunSchedule
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
 
 const getRunScheduleForUser = `-- name: GetRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at FROM run_schedules WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance FROM run_schedules WHERE id = $1 AND user_id = $2
 `
 
 type GetRunScheduleForUserParams struct {
@@ -394,6 +404,8 @@ func (q *Queries) GetRunScheduleForUser(ctx context.Context, arg GetRunScheduleF
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
@@ -417,7 +429,7 @@ func (q *Queries) HasActiveRunForSchedule(ctx context.Context, scheduleID pgtype
 }
 
 const listRunSchedulesForUser = `-- name: ListRunSchedulesForUser :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
 `
 
 // The owner's schedules, newest first.
@@ -450,6 +462,8 @@ func (q *Queries) ListRunSchedulesForUser(ctx context.Context, userID uuid.UUID)
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaxIssues,
+			&i.Guidance,
 		); err != nil {
 			return nil, err
 		}
@@ -467,11 +481,13 @@ FROM issues
 WHERE repo_id = $1 AND state = 'opened'
   AND labels @> $2::jsonb
 ORDER BY forge_issue_iid ASC
+LIMIT $3
 `
 
 type ListSweepCandidateIssuesParams struct {
-	RepoID uuid.UUID `json:"repo_id"`
-	Labels []byte    `json:"labels"`
+	RepoID    uuid.UUID   `json:"repo_id"`
+	Labels    []byte      `json:"labels"`
+	MaxIssues pgtype.Int4 `json:"max_issues"`
 }
 
 type ListSweepCandidateIssuesRow struct {
@@ -485,8 +501,14 @@ type ListSweepCandidateIssuesRow struct {
 // calling), and jsonb containment (@>) matches rows whose labels array is a superset.
 // author rides along for the same adder→author attribution fallback the autopilot
 // path uses.
+//
+// LIMIT sqlc.narg('max_issues') is the per-schedule sweep cap (PRD #274 M2, Decision 2):
+// sqlc renders a NULL narg as an unlimited LIMIT, so a NULL max_issues preserves today's
+// unbounded behaviour for free, and the ORDER BY forge_issue_iid ASC above makes LIMIT N
+// a deterministic oldest-first batch. The narg FUNCTION form (not @max_issues) is
+// deliberate — see .claude/rules/go.md on the runtime-comment byte-offset gotcha.
 func (q *Queries) ListSweepCandidateIssues(ctx context.Context, arg ListSweepCandidateIssuesParams) ([]ListSweepCandidateIssuesRow, error) {
-	rows, err := q.db.Query(ctx, listSweepCandidateIssues, arg.RepoID, arg.Labels)
+	rows, err := q.db.Query(ctx, listSweepCandidateIssues, arg.RepoID, arg.Labels, arg.MaxIssues)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +531,7 @@ const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
 type SetRunScheduleEnabledParams struct {
@@ -542,6 +564,8 @@ func (q *Queries) SetRunScheduleEnabled(ctx context.Context, arg SetRunScheduleE
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
@@ -550,7 +574,7 @@ const setRunScheduleStatus = `-- name: SetRunScheduleStatus :one
 UPDATE run_schedules
 SET status = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
 type SetRunScheduleStatusParams struct {
@@ -583,6 +607,8 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }
@@ -600,10 +626,11 @@ SET target        = $1,
     next_fire_at  = $9,
     auto_approve  = $10,
     wait_on_limit = $11,
+    max_issues    = $12,
     status        = 'active',
     updated_at    = now()
-WHERE id = $12 AND user_id = $13
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at
+WHERE id = $13 AND user_id = $14
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance
 `
 
 type UpdateRunScheduleParams struct {
@@ -618,6 +645,7 @@ type UpdateRunScheduleParams struct {
 	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
 	AutoApprove bool               `json:"auto_approve"`
 	WaitOnLimit bool               `json:"wait_on_limit"`
+	MaxIssues   pgtype.Int4        `json:"max_issues"`
 	ID          uuid.UUID          `json:"id"`
 	UserID      uuid.UUID          `json:"user_id"`
 }
@@ -645,6 +673,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.NextFireAt,
 		arg.AutoApprove,
 		arg.WaitOnLimit,
+		arg.MaxIssues,
 		arg.ID,
 		arg.UserID,
 	)
@@ -669,6 +698,8 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaxIssues,
+		&i.Guidance,
 	)
 	return i, err
 }

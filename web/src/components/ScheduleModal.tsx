@@ -193,6 +193,9 @@ export function ScheduleModal({
 
   const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+  // Sweep-only cap on issues per fire; null = unlimited. New sweeps default to 10
+  // (agreeing with the server), an edit reflects the stored value (null included).
+  const [maxIssues, setMaxIssues] = useState<number | null>(editing ? editing.max_issues : 10);
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
   const [previewError, setPreviewError] = useState(false);
@@ -346,6 +349,10 @@ export function ScheduleModal({
     if (!repoId) return false;
     if (target === "issue" && !(Number(issueIid) > 0)) return false;
     if (target === "prompt" && prompt.trim() === "") return false;
+    // Blank max_issues (null) = unlimited and is valid; a set value must be a
+    // positive integer. The server validates too.
+    if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0))
+      return false;
     if (timing === "recurring" && cron.trim() === "") return false;
     if (timing === "once" && !fromLocalInput(runAtLocal)) return false;
     return true;
@@ -355,6 +362,9 @@ export function ScheduleModal({
     target,
     issue_iid: target === "issue" ? Number(issueIid) : undefined,
     labels: target === "sweep" ? labels : undefined,
+    // Sweep-only cap; send explicit null (not undefined) so clearing the field
+    // clears the stored value to unlimited. Omitted on non-sweep targets.
+    max_issues: target === "sweep" ? maxIssues : undefined,
     prompt: target === "prompt" ? prompt : undefined,
     timing,
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
@@ -516,6 +526,22 @@ export function ScheduleModal({
                 Empty ⇒ the <span className="font-medium text-muted">{prdLabel}</span> label. A selector chooses
                 candidates; the run-creation gate (PRD link, or PRDLESS) chooses what actually fires.
               </p>
+              <Field label="Max issues per run" htmlFor="sched-max-issues">
+                <Input
+                  id="sched-max-issues"
+                  type="number"
+                  min={1}
+                  value={maxIssues ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value.trim();
+                    setMaxIssues(v === "" ? null : Number(v));
+                  }}
+                  placeholder="unlimited"
+                />
+                <p className="mt-1 text-[11px] text-faint">
+                  Oldest issues first. Leave blank for unlimited.
+                </p>
+              </Field>
             </div>
           )}
 

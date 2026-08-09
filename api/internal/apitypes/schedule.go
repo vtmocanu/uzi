@@ -10,6 +10,11 @@ import "time"
 // leaves that flag untouched, so a caller can toggle one field without restating the
 // rest. Timing/target-specific fields (CronExpr, RunAt, Timezone, IssueIID, Labels,
 // Prompt) are validated per target/timing by the handler's pure validateScheduleConfig.
+//
+// MaxIssues is the sweep fan-out cap (PRD #274 M2, sweep target ONLY): the max number of
+// issues one sweep fire starts, oldest-first. A nil/absent value means unlimited; a new
+// sweep defaults to 10. It carries "present, even to clear" tri-state — the web sends an
+// explicit null to clear a sweep back to unlimited (see mergeSchedule's replace-semantics).
 type ScheduleRequest struct {
 	Target      string     `json:"target"`
 	IssueIID    *int64     `json:"issue_iid"`
@@ -22,6 +27,7 @@ type ScheduleRequest struct {
 	AutoApprove *bool      `json:"auto_approve"`
 	WaitOnLimit *bool      `json:"wait_on_limit"`
 	Enabled     *bool      `json:"enabled"`
+	MaxIssues   *int       `json:"max_issues"`
 }
 
 // ScheduleDTO is the response view of a run schedule (PRD #241 M4). All fields are
@@ -46,9 +52,13 @@ type ScheduleDTO struct {
 	AutoApprove bool       `json:"auto_approve"`
 	WaitOnLimit bool       `json:"wait_on_limit"`
 	Enabled     bool       `json:"enabled"`
-	Status      string     `json:"status"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	// MaxIssues is the sweep fan-out cap (PRD #274 M2, sweep target only): nil means
+	// unlimited (NULL in the DB), a value is the oldest-first per-fire limit. New sweeps
+	// default to 10.
+	MaxIssues *int      `json:"max_issues"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	// NextFires is the live "next N fires" preview (up to 3), computed from the same
 	// cron/next-fire logic the modal preview endpoint uses so the list and the modal
 	// agree.

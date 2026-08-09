@@ -255,6 +255,11 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) ([]u
 // through the same per-issue flow as fireIssue. Per-issue failures are logged and
 // skipped so one bad issue does not abort the fan-out; only a failure to resolve the
 // repo/forge or to LIST is treated as transient for the whole schedule.
+//
+// The schedule's max_issues cap (PRD #274 M2) rides straight into the query as
+// ListSweepCandidateIssuesParams.MaxIssues: a NULL/invalid cap renders an unlimited
+// LIMIT (today's unbounded behaviour), and a set cap N returns the N OLDEST candidates
+// (the query's ORDER BY forge_issue_iid ASC), so the fan-out is an oldest-first batch.
 func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
@@ -265,7 +270,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]u
 		return nil, err
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
-		RepoID: repo.ID, Labels: labelsJSON,
+		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: sched.MaxIssues,
 	})
 	if err != nil {
 		return nil, err // transient DB error

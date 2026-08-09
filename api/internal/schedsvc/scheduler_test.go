@@ -26,11 +26,12 @@ type fakeStore struct {
 	repoErr error
 	repoRow store.GetRepoForUserRow
 
-	activeIssue     bool
-	activeIssueErr  error
-	activeSchedule  bool
-	sweepRows       []store.ListSweepCandidateIssuesRow
-	sweepLabelParam []byte
+	activeIssue         bool
+	activeIssueErr      error
+	activeSchedule      bool
+	sweepRows           []store.ListSweepCandidateIssuesRow
+	sweepLabelParam     []byte
+	sweepMaxIssuesParam pgtype.Int4
 }
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {
@@ -46,6 +47,7 @@ func (f *fakeStore) SetRunScheduleStatus(_ context.Context, arg store.SetRunSche
 }
 func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error) {
 	f.sweepLabelParam = arg.Labels
+	f.sweepMaxIssuesParam = arg.MaxIssues
 	return f.sweepRows, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
@@ -313,6 +315,48 @@ func TestTickNonAutoIssueScheduleUsesTheScheduledSeam(t *testing.T) {
 	}
 	if !h.runs.runs[0].scheduled {
 		t.Fatalf("non-auto issue must fire through CreateScheduledRun (waiver-free), not CreateRun (interactive, waiver-carrying)")
+	}
+}
+
+// sweepSchedule builds a due sweep schedule owned by the harness owner/repo, carrying
+// the given max_issues cap (Valid=false for an unlimited/NULL cap).
+func (h *harness) sweepSchedule(maxIssues pgtype.Int4) store.RunSchedule {
+	return store.RunSchedule{
+		ID:          uuid.New(),
+		UserID:      h.owner,
+		RepoID:      h.repoID,
+		Target:      "sweep",
+		Labels:      []byte(`["PRD"]`),
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+		Timezone:    "UTC",
+		AutoApprove: true,
+		Status:      "active",
+		Enabled:     true,
+		MaxIssues:   maxIssues,
+	}
+}
+
+// TestTickSweepThreadsMaxIssues pins PRD #274 M2 at the unit level: fireSweep must pass
+// the schedule's max_issues straight into ListSweepCandidateIssuesParams.MaxIssues so the
+// SQL LIMIT applies (the fake store runs no SQL, so this is the most a unit test can pin;
+// the real LIMIT is covered by the live-DB test). A NULL cap threads NULL (unlimited).
+func TestTickSweepThreadsMaxIssues(t *testing.T) {
+	// A set cap is threaded verbatim.
+	h := newHarness()
+	h.st.due = []store.RunSchedule{h.sweepSchedule(pgtype.Int4{Int32: 4, Valid: true})}
+	h.sched.Boot(context.Background())
+	got := h.st.sweepMaxIssuesParam
+	if !got.Valid || got.Int32 != 4 {
+		t.Fatalf("sweep max_issues param = %+v, want {Int32:4 Valid:true}", got)
+	}
+
+	// A NULL cap threads through as NULL (unlimited).
+	h2 := newHarness()
+	h2.st.due = []store.RunSchedule{h2.sweepSchedule(pgtype.Int4{})}
+	h2.sched.Boot(context.Background())
+	if h2.st.sweepMaxIssuesParam.Valid {
+		t.Fatalf("NULL max_issues must thread as an invalid (NULL) param, got %+v", h2.st.sweepMaxIssuesParam)
 	}
 }
 

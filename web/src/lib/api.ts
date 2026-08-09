@@ -772,6 +772,9 @@ export interface Schedule {
   last_fired_at: string | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
+  // Per-sweep upper bound on issues fanned out per fire, oldest-first; null =
+  // unlimited. Sweep target only (null for issue/prompt).
+  max_issues: number | null;
   enabled: boolean;
   status: ScheduleStatus;
   created_at: string;
@@ -796,6 +799,8 @@ export interface ScheduleInput {
   timezone?: string;
   auto_approve?: boolean;
   wait_on_limit?: boolean;
+  // Sweep cap (oldest-first); explicit null clears to unlimited. Sweep target only.
+  max_issues?: number | null;
   enabled?: boolean;
 }
 

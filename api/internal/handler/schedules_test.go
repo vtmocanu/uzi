@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -15,6 +18,8 @@ import (
 var fixedNow = time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 
 func i64(v int64) *int64 { return &v }
+
+func iptr(v int) *int { return &v }
 
 func TestValidateScheduleConfig(t *testing.T) {
 	future := fixedNow.Add(24 * time.Hour)
@@ -100,6 +105,31 @@ func TestValidateScheduleConfig(t *testing.T) {
 			req:        apitypes.ScheduleRequest{Target: "prompt", Prompt: strings.Repeat("x", workersvc.MaxIssueDescriptionBytes+1), Timing: "recurring", CronExpr: "0 2 * * *"},
 			wantStatus: http.StatusUnprocessableEntity,
 		},
+		{
+			name:       "sweep with max_issues ok",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(5), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: 0,
+		},
+		{
+			name:       "sweep max_issues zero rejected",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(0), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "sweep max_issues negative rejected",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(-3), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "issue with max_issues rejected (sweep-only)",
+			req:        apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), MaxIssues: iptr(5), Timing: "recurring", CronExpr: "0 2 * * *"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "prompt with max_issues rejected (sweep-only)",
+			req:        apitypes.ScheduleRequest{Target: "prompt", Prompt: "x", MaxIssues: iptr(5), Timing: "recurring", CronExpr: "0 2 * * *"},
+			wantStatus: http.StatusBadRequest,
+		},
 	}
 
 	for _, tc := range cases {
@@ -157,6 +187,60 @@ func TestApplyCreateDefaults(t *testing.T) {
 	}
 	if req.AutoApprove == nil || *req.AutoApprove {
 		t.Fatalf("explicit auto_approve=false must be respected, got %v", req.AutoApprove)
+	}
+}
+
+// TestApplyCreateDefaultsMaxIssues pins PRD #274 M2: a new SWEEP with no explicit
+// max_issues defaults to the bounded 10; an explicit value survives; and issue/prompt
+// targets are left nil (max_issues is sweep-only).
+func TestApplyCreateDefaultsMaxIssues(t *testing.T) {
+	// New sweep, no explicit value → default 10.
+	sweep := apitypes.ScheduleRequest{Target: "sweep"}
+	applyCreateDefaults(&sweep)
+	if sweep.MaxIssues == nil || *sweep.MaxIssues != 10 {
+		t.Fatalf("new sweep max_issues default = %v, want 10", sweep.MaxIssues)
+	}
+
+	// Explicit value on a sweep is respected.
+	explicit := apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(3)}
+	applyCreateDefaults(&explicit)
+	if explicit.MaxIssues == nil || *explicit.MaxIssues != 3 {
+		t.Fatalf("explicit sweep max_issues = %v, want 3", explicit.MaxIssues)
+	}
+
+	// Issue and prompt targets never get a default cap.
+	for _, target := range []string{"issue", "prompt"} {
+		req := apitypes.ScheduleRequest{Target: target}
+		applyCreateDefaults(&req)
+		if req.MaxIssues != nil {
+			t.Fatalf("%s target max_issues = %v, want nil (sweep-only)", target, req.MaxIssues)
+		}
+	}
+}
+
+// TestMergeScheduleMaxIssuesClears pins PRD #274 M2's deliberate replace-semantics for
+// max_issues: a config PATCH with MaxIssues=nil CLEARS the cap to unlimited rather than
+// keeping the current value (unlike the keep-on-empty fields). Without this, clearing a
+// sweep back to unlimited would be impossible once a cap is set.
+func TestMergeScheduleMaxIssuesClears(t *testing.T) {
+	cur := store.RunSchedule{
+		Target:    "sweep",
+		Timing:    "recurring",
+		CronExpr:  pgtype.Text{String: "0 9 * * 1", Valid: true},
+		Timezone:  "UTC",
+		MaxIssues: pgtype.Int4{Int32: 7, Valid: true},
+	}
+
+	// A config PATCH that omits max_issues (nil) must CLEAR it — replace, not keep.
+	cleared := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1"})
+	if cleared.MaxIssues != nil {
+		t.Fatalf("merged max_issues = %v, want nil (a config PATCH replaces the whole row; nil clears to unlimited)", cleared.MaxIssues)
+	}
+
+	// A config PATCH that sets max_issues takes the request value.
+	set := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * 1", MaxIssues: iptr(2)})
+	if set.MaxIssues == nil || *set.MaxIssues != 2 {
+		t.Fatalf("merged max_issues = %v, want 2", set.MaxIssues)
 	}
 }
 

@@ -83,6 +83,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt)")
 	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the PRD label)")
+	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
@@ -123,6 +124,11 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	if len(labels) > 0 && !sweep {
 		return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--label is only valid with --sweep")
 	}
+	// --max-issues is sweep-only; reject an EXPLICIT set on a non-sweep target (an
+	// unchanged default is silently ignored, mirroring the --label rule above).
+	if cmd.Flags().Changed("max-issues") && !sweep {
+		return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--max-issues is only valid with --sweep")
+	}
 
 	req := apitypes.ScheduleRequest{}
 	switch {
@@ -135,6 +141,10 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	case sweep:
 		req.Target = schedTargetSweep
 		req.Labels = labels
+		// Only a sweep sends max_issues. The flag default (10) matches the server default,
+		// so a plain `--sweep` naturally requests a bounded fan-out; --max-issues overrides.
+		maxIssues, _ := cmd.Flags().GetInt("max-issues")
+		req.MaxIssues = &maxIssues
 	case promptSet:
 		if strings.TrimSpace(prompt) == "" {
 			return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--prompt needs task text")
@@ -365,6 +375,15 @@ func scheduleTarget(s apitypes.ScheduleDTO) string {
 	}
 }
 
+// maxIssuesStr renders the sweep cap for the detail block: the number when set, or
+// "unlimited" when nil (NULL = no cap, PRD #274 M2).
+func maxIssuesStr(p *int) string {
+	if p == nil {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
 // scheduleWhen renders the WHEN column: the cron expression for a recurring schedule,
 // "once" for a one-time one.
 func scheduleWhen(s apitypes.ScheduleDTO) string {
@@ -431,6 +450,9 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	if s.Target == schedTargetPrompt && s.Prompt != "" {
 		rows = append(rows, []string{"PROMPT", s.Prompt})
+	}
+	if s.Target == schedTargetSweep {
+		rows = append(rows, []string{"MAX_ISSUES", maxIssuesStr(s.MaxIssues)})
 	}
 	rows = append(rows,
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},

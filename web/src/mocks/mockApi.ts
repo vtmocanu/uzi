@@ -842,6 +842,7 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 2 * * 1-5", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
+    max_issues: 10,
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
     updated_at: daysFromNow(-1, 2), next_fires: [],
   },
@@ -851,6 +852,7 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 3 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
+    max_issues: null,
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
     updated_at: daysFromNow(0, 3), next_fires: [],
   },
@@ -860,6 +862,7 @@ let schedules: Schedule[] = [
     timing: "once", cron_expr: "", run_at: daysFromNow(1, 9),
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: null, auto_approve: true, wait_on_limit: false,
+    max_issues: null,
     enabled: true, status: "active", created_at: daysFromNow(-1, 20),
     updated_at: daysFromNow(-1, 20), next_fires: [],
   },
@@ -870,6 +873,7 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 9 * * 1", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
+    max_issues: null,
     enabled: true, status: "active", created_at: daysFromNow(-21, 11),
     updated_at: daysFromNow(-7, 9), next_fires: [],
   },
@@ -879,6 +883,7 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 */6 * * *", run_at: null,
     timezone: "UTC", next_fire_at: null,
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
+    max_issues: 10,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
     updated_at: daysFromNow(-3, 18), next_fires: [],
   },
@@ -891,6 +896,7 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "30 1 * * *", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
+    max_issues: null,
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
     updated_at: daysFromNow(-1, 1, 30), next_fires: [],
   },
@@ -3258,6 +3264,8 @@ export const mockApi = {
       last_fired_at: null,
       auto_approve: input.auto_approve ?? true,
       wait_on_limit: input.wait_on_limit ?? true,
+      // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
+      max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
       enabled: input.enabled ?? true,
       status: "active",
       created_at: now,
@@ -3288,11 +3296,14 @@ export const mockApi = {
     if (input.timezone !== undefined) m.timezone = input.timezone;
     if (input.auto_approve !== undefined) m.auto_approve = input.auto_approve;
     if (input.wait_on_limit !== undefined) m.wait_on_limit = input.wait_on_limit;
+    // Replace-semantics: apply when the key is present (explicit null = unlimited).
+    if (input.max_issues !== undefined) m.max_issues = input.max_issues;
     if (input.enabled !== undefined) m.enabled = input.enabled;
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
     m.issue_iid = m.target === "issue" ? m.issue_iid : null;
     m.labels = m.target === "sweep" ? m.labels : null;
+    m.max_issues = m.target === "sweep" ? m.max_issues : null;
     m.prompt = m.target === "prompt" ? m.prompt : "";
     m.cron_expr = m.timing === "recurring" ? m.cron_expr : "";
     m.run_at = m.timing === "once" ? m.run_at : null;
