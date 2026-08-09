@@ -55,16 +55,19 @@ The lead can dispatch more than one subagent in the same turn when their
 work doesn't overlap, instead of always waiting for one to finish before
 starting the next:
 
-- **Validators fan out together, twice.** The lead sends every allocated
+- **Validators fan out together, once per unit.** The lead sends every allocated
   validator (`reviewer`, `auditor`, `tester`, `fact-checker` — whichever the run
   allocated) in one wave rather than one at a time: first over the **plan**,
-  before it reaches you at the approval gate, and again over the **diff** once an
-  implementation unit lands. The plan-time wave is what backs up the plan's
-  claims — for every mechanism the plan asserts, it names the file and quotes the
-  line — so what you approve has already been read against the code. Of those
-  four, `reviewer`, `auditor` and `fact-checker` declare no file-writing tools at
-  all, so they are read-only everywhere; `tester` does declare them, because
-  authoring tests is its job during implementation.
+  before it reaches you at the approval gate, and then again each time an
+  implementation unit lands — over that unit's **immutable commit range**, not the
+  live working tree, so a later unit's edits can't be mis-attributed to it. There
+  is one review procedure, run per unit and early, rather than a single wave held
+  to the end of the run. The plan-time wave is what backs up the plan's claims —
+  for every mechanism the plan asserts, it names the file and quotes the line — so
+  what you approve has already been read against the code. Of those four,
+  `reviewer`, `auditor` and `fact-checker` declare no file-writing tools at all,
+  so they are read-only everywhere; `tester` does declare them, because authoring
+  tests is its job during implementation.
 - **Nothing a subagent does before the gate can change the worktree by the
   ordinary route.** On the planning turn the worker takes the file-writing tools
   (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) off every subagent it dispatches,
@@ -81,7 +84,15 @@ starting the next:
   them. Each parallel coder gets an explicit file scope in its delegation
   prompt, doesn't commit, and doesn't run repo-wide build or test commands;
   the lead diffs the working tree against the last commit to confirm only the
-  declared scopes changed, commits once, then runs the quality gate once.
+  declared scopes changed, commits each landed unit, then runs the quality gate
+  over that commit — overlapped with the read-only validator wave rather than
+  serialized ahead of it, but still blocking: a red gate holds that unit, it is
+  not advanced or built on until the gate is green.
+- **A unit others depend on can publish its seam early.** When the plan declares
+  that one unit's output (a schema change, a shared type, an interface or route
+  shape) another builds on, the lead can land and commit that seam first so the
+  dependents start against it — but only once the seam has actually been exercised
+  by a test, not merely compiled.
 - **Anything uncertain stays serial** — overlapping scope, a dependency
   between units, or a fix that depends on a reviewer's finding.
 
@@ -156,6 +167,14 @@ model, tools, or prompt body no longer matches what this uzi version ships for
 it. (A pristine builtin refreshes on boot, so it already matches and carries
 no badge.) Open the template before resetting: the editor shows exactly what's
 different, so you're not resetting blind.
+
+Drift and reset live in the web UI and the REST API — the badge, the
+shipped-vs-stored diff, and the reset action. There is no `uzi` command for
+template or skill drift or reset, by design: the CLI's admin surface is
+read-only, and reset produces nothing a script would capture. Builtin **skills** follow the same edit-preserving rule
+with one difference worth knowing: a shipped change to a builtin skill is **not**
+re-applied on boot and carries no drift badge, so a builtin skill an admin has
+customized only picks up a newer shipped body when it is explicitly reset.
 
 To pick up a new builtin body on a **customized** template without losing your
 own edits:

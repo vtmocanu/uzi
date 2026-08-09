@@ -50,16 +50,21 @@ which you do not control.
 
 Dispatch independent subagents in parallel in a single turn:
 
-- Read-only work fans out again after an implementation unit lands: send all
-  allocated read-only validators together in one wave, that time over the diff.
-  Do not name a fixed reviewer-then-auditor pair — dispatch exactly the
-  read-only validators the run allocated you, whichever they are. Open every
-  such dispatch with the pasted OUTPUT of `git -C <worktree> status --short`,
-  `git -C <worktree> log --oneline -3`, and `git worktree list`, not a sentence
-  asserting the tree is clean: the validators are required to open with that
-  evidence and to report its absence as a finding, so a dispatch without it
-  comes back re-derived and flagged instead of reviewed. This holds for a
-  single serial unit as much as for a parallel wave.
+- Read-only work fans out per unit: the moment an implementation unit lands as a
+  commit, send all allocated read-only validators together in one wave over the
+  immutable range `<base>..<sha>` that unit landed as — never "the working tree"
+  and never "the diff", because a bare `git diff` over a tree a later unit is
+  already editing attaches a validator's finding to the wrong unit. Do not name a
+  fixed reviewer-then-auditor pair — dispatch exactly the read-only validators the
+  run allocated you, whichever they are. Open every such dispatch with the pasted
+  OUTPUT of `git -C <worktree> status --short`, `git -C <worktree> log --oneline
+  -3`, and `git worktree list`, not a sentence asserting the tree is clean: the
+  validators are required to open with that evidence and to report its absence as
+  a finding, so a dispatch without it comes back re-derived and flagged instead of
+  reviewed. This holds for a single serial unit as much as for a parallel wave.
+  This is the ONE dispatch procedure for the read-only lane: there is no second,
+  end-of-run barrier wave — the same validators do the same work, per unit and
+  earlier.
 - Implementation work fans out only when your plan splits it into units with no
   dependency between them and disjoint ownership at the package or module
   level. Two parallel units must never touch the same Go package, the same
@@ -71,19 +76,38 @@ Dispatch independent subagents in parallel in a single turn:
 - Give each parallel implementer an explicit, non-overlapping list of files and
   directories it owns, stated in its delegation prompt, and tell it not to
   commit and not to run repo-wide build or test commands.
-- After all parallel results are in, you integrate: diff the working tree
-  against the last commit and confirm only the declared scopes changed, commit
-  once, run the quality gates once yourself, and include the declared scope map
-  when you dispatch the review wave so an out-of-scope change surfaces as a
-  finding. Embed the tree baseline the validators verify against, too: paste the
-  OUTPUT of `git status --short`, `git log --oneline -3`, and `git worktree
-  list` into the review dispatch, not a sentence asserting the tree is clean.
-  Validators are required to open with that evidence; supplying it keeps them
-  from each reconstructing it, and a mismatch between what you paste and what
-  they observe is itself a finding.
+- When a unit lands you integrate it: for a parallel wave, diff the working tree
+  against the last commit and confirm only the declared scopes changed; then
+  commit that unit. Do not hold every unit for one end-of-run commit — commit each
+  landed unit so its read-only wave reviews an immutable `<base>..<sha>` and the
+  next unit proceeds concurrently, and include the declared scope map when you
+  dispatch the review wave so an out-of-scope change surfaces as a finding. Embed
+  the tree baseline the validators verify against: paste the OUTPUT of `git status
+  --short`, `git log --oneline -3`, and `git worktree list` into the review
+  dispatch, not a sentence asserting the tree is clean. Validators are required to
+  open with that evidence; supplying it keeps them from each reconstructing it, and
+  a mismatch between what you paste and what they observe is itself a finding. Then
+  run the integration gate over that commit, overlapped with the read-only wave you
+  just dispatched, never serialized ahead of it — and only ever overlapped with
+  that read-only wave, never with the next implementation wave, which shares this
+  one worktree and would make the gate compile a tree you do not control. The gate
+  keeps full blocking authority over the commit: it is the only check over the
+  integrated tree, its red blocks, and a subagent reporting "it's green" is not
+  that check.
 - When in doubt — overlapping scopes, the same package, uncertain dependencies
   — run them serially. Anything sequential by nature — a unit that needs
   another unit's output, a fix on a reviewer finding — stays serial.
+- A contract unit — one whose output other units build on — need not run to
+  completion before its dependents start. Split it at its seam: the schema change
+  and the types, interface, or route shape derived from it. Publish that seam and
+  let the dependents launch against it, but only once the seam has EXECUTED — a
+  live-DB test through at least one query, or a handler test through the route, not
+  merely a green build — because a contract that compiles but was never run is
+  exactly the drift a per-unit review cannot see. The lead commits the seam, since
+  parallel implementers do not commit; and the plan you submit must declare the
+  seam and the units that consume it, so the shape the human approved is the shape
+  that runs. Disjoint ownership still gates the fan-out and the shared-wiring rule
+  is not relaxed: the seam-split makes the dependency finer, it does not remove it.
 
 Give each one enough context to succeed and wait for the results in the same
 turn, then integrate and verify. Iterate between implementation and review
