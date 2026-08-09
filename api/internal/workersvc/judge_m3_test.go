@@ -17,15 +17,19 @@ import (
 // the judge tests, which is the "unconfigured" case Service.prdLabel resolves to
 // the compiled-in default — the same thing a real Cache does.
 type fakeSettings struct {
-	enabled  bool
-	model    string
-	prdLabel string
-	err      error
+	enabled        bool
+	model          string
+	prdLabel       string
+	prdlessEnabled bool
+	prdlessLabel   string
+	err            error
 }
 
-func (f fakeSettings) JudgeEnabled(context.Context) (bool, error) { return f.enabled, f.err }
-func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
-func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
+func (f fakeSettings) JudgeEnabled(context.Context) (bool, error)   { return f.enabled, f.err }
+func (f fakeSettings) JudgeModel(context.Context) (string, error)   { return f.model, f.err }
+func (f fakeSettings) PRDLabel(context.Context) (string, error)     { return f.prdLabel, f.err }
+func (f fakeSettings) PrdlessEnabled(context.Context) (bool, error) { return f.prdlessEnabled, f.err }
+func (f fakeSettings) PrdlessLabel(context.Context) (string, error) { return f.prdlessLabel, f.err }
 
 // -------------------------------------------------------------------------
 // command-not-found scan (Decision 4)

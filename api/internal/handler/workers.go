@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -764,30 +763,12 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
-	if err != nil {
-		slog.Error("build forge for connection", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	issue, err := f.GetIssue(r.Context(), repo.ForgeProjectID, req.IssueIID)
-	if err != nil {
-		// err is already PAT-redacted by the driver.
-		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())
-		return
-	}
-
-	// PRDLESS bypass (PRD #22 Decision 3): compute allowWithoutPRD from the fresh
-	// forge snapshot's labels and the prdless settings, then thread it into the
-	// shared createRun gate. Reading the fresh labels (not the cache) means a
-	// just-added label works immediately, without waiting for a poller cycle;
-	// matching is exact, like board column labels. Settings reads are best-effort
-	// (the accessors return the default alongside a cold error): a settings blip
-	// falls back to the default label / enabled=true, and an unlabeled issue is
-	// still gated.
+	// prdlessEnabled/prdlessLabel are read here only to shape the ErrNoPRDLink hint
+	// below; the actual PRDLESS gate is computed from the fresh forge snapshot inside
+	// StartRunForUser (PRD #191 M1), so the web start button and the Slack start-run
+	// card answer it identically.
 	prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context())
 	prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
-	allowWithoutPRD := prdlessEnabled && slices.Contains(issue.Labels, prdlessLabel)
 
 	// PRD #209: assemble the optional seeded plan. agent_selection is only meaningful
 	// alongside a plan (it is the roster for the seeded implement run); a selection
@@ -826,11 +807,17 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The description cap is enforced inside CreateRun (shared with the autopilot
-	// path), surfaced here as ErrDescriptionTooLarge → 422.
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit, seed)
+	// The forge GetIssue snapshot, the PRDLESS gate and the description cap all live
+	// inside StartRunForUser (PRD #191 M1), shared with the Slack start-run card.
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, seed)
 	if err != nil {
 		switch {
+		case errors.Is(err, workersvc.ErrForgeBuild):
+			slog.Error("create run: build forge for connection", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		case errors.Is(err, workersvc.ErrForgeIssueRead):
+			// err wraps the driver's already-redacted message.
+			httpx.Error(w, http.StatusBadGateway, err.Error())
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrIssueNotFound):

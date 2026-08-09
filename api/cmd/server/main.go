@@ -277,6 +277,12 @@ func run() error {
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
+	// Wire the forge builder into workersvc so its composite forge-write operations —
+	// ConfirmProposalForUser, StartRunForUser (PRD #191 Decision 8) — reach the forge
+	// through the same decryption path the handlers use, without a forgesvc↔workersvc
+	// import cycle. selfimprove/privcheck already pass this same *forgesvc.Service.
+	wsvc.SetForges(svc)
+
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
 	// left untouched.

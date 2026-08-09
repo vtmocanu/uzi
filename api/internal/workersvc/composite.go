@@ -1,0 +1,179 @@
+package workersvc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+)
+
+// ForgeBuilder builds a forge driver from a stored (encrypted) connection.
+// *forgesvc.Service satisfies it — the same seam privcheck, selfimprove and
+// runlifecycle already use. workersvc cannot import forgesvc directly (forgesvc
+// already imports workersvc, a cycle), so the composite forge-write operations
+// lifted out of the handlers (PRD #191 Decision 8) reach the forge through this
+// narrow interface, wired via SetForges in main.go.
+type ForgeBuilder interface {
+	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
+}
+
+// CreatedIssue is the forge issue a confirmed proposal created — the subset the
+// callers (web handler, Slack card) render. Kept local so the return type does not
+// leak forge.Issue across the service boundary.
+type CreatedIssue struct {
+	IID    int64
+	WebURL string
+	Title  string
+}
+
+// Composite-op sentinels (PRD #191 M1). The caller (web handler, Slack card) maps
+// each to a surface status. The two forge-call sentinels wrap the driver's
+// already-redacted error so the caller can surface it verbatim; the build sentinel
+// is opaque (a decryption/config failure is not the user's to read).
+var (
+	// ErrForgesUnavailable means SetForges was never wired — a misconfiguration, not
+	// a user error.
+	ErrForgesUnavailable = errors.New("forge builder not configured")
+	// ErrProposalRepoGone: the proposal's target repo is no longer owned/available.
+	ErrProposalRepoGone = errors.New("the proposal's target repo is no longer available")
+	// ErrForgeBuild: the forge client could not be built (token undecryptable, key
+	// rotated, connection misconfigured). Opaque → 500.
+	ErrForgeBuild = errors.New("could not build a forge client for the connection")
+	// ErrForgeIssueWrite: the forge rejected CreateIssue. Wraps the redacted driver
+	// error → 502.
+	ErrForgeIssueWrite = errors.New("could not create the issue on the forge")
+	// ErrForgeIssueRead: the forge rejected GetIssue. Wraps the redacted driver error
+	// → 502.
+	ErrForgeIssueRead = errors.New("could not read the issue from the forge")
+)
+
+// ConfirmProposalForUser executes a proposed issue on the forge (PRD #191 Decision
+// 8): the ONLY path that turns a pending proposal into a real forge issue, lifted
+// out of the web handler so the Slack proposal card can call the identical
+// claim/forge/settle flow. Forge-first via the caller's OWN connection, owner-scoped
+// through the chat run.
+//
+// Claim-first: the proposal atomically moves pending -> confirming BEFORE the forge
+// write, so of two concurrent confirms exactly one reaches CreateIssue (the other
+// gets ErrProposalNotPending). Every failure AFTER the claim reverts the row to
+// pending so the user can retry or dismiss. The final settle (confirming ->
+// confirmed) is log-only on error because the issue already exists — reverting then
+// would orphan a real forge issue.
+func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) (CreatedIssue, error) {
+	if s.forges == nil {
+		return CreatedIssue{}, ErrForgesUnavailable
+	}
+
+	claim, err := s.ClaimProposalForConfirm(ctx, userID, runID, propID)
+	if err != nil {
+		// ErrProposalNotFound / ErrProposalNotPending flow straight to the caller's
+		// lookup-error mapping; nothing was claimed, so there is nothing to revert.
+		return CreatedIssue{}, err
+	}
+
+	// Load the target repo + its connection PAT (the user must still own it).
+	repo, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: claim.RepoID, UserID: userID})
+	if err != nil {
+		s.revertProposal(ctx, propID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CreatedIssue{}, ErrProposalRepoGone
+		}
+		return CreatedIssue{}, err
+	}
+
+	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		s.revertProposal(ctx, propID)
+		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
+
+	var labels []string
+	if len(claim.Labels) > 0 {
+		if err := json.Unmarshal(claim.Labels, &labels); err != nil {
+			labels = nil
+		}
+	}
+
+	created, err := f.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
+	if err != nil {
+		s.revertProposal(ctx, propID)
+		// err is already PAT-redacted by the driver.
+		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeIssueWrite, err)
+	}
+
+	// Settle confirming -> confirmed with the created iid. This row is ours (we hold
+	// the claim), so a non-nil error here is unexpected; the issue WAS created, so log
+	// and surface it rather than revert.
+	if err := s.ConfirmProposal(ctx, propID, created.IID); err != nil {
+		slog.Error("confirm proposal: mark confirmed after issue creation",
+			"proposal", propID.String(), "issue_iid", created.IID, "error", err)
+	}
+	return CreatedIssue{IID: created.IID, WebURL: created.WebURL, Title: created.Title}, nil
+}
+
+// revertProposal best-effort returns a claimed ('confirming') proposal to pending
+// after a post-claim failure; a revert error is logged but never changes the error
+// the caller surfaces for the underlying failure.
+func (s *Service) revertProposal(ctx context.Context, propID uuid.UUID) {
+	if err := s.RevertProposalToPending(ctx, propID); err != nil {
+		slog.Error("confirm proposal: revert to pending", "proposal", propID.String(), "error", err)
+	}
+}
+
+// StartRunForUser queues an agent run for an issue (PRD #191 M1): the forge
+// GetIssue + PRDLESS gate + CreateRun composite lifted out of the web CreateRun
+// handler so the Slack start-run card can start a run identically. The issue
+// description is snapshotted from the forge (the source of truth) at queue time.
+//
+// The PRDLESS bypass is computed from the FRESH forge snapshot's labels and the
+// instance prdless settings, so a just-added label works without waiting for a
+// poller cycle. It returns the CreateRun sentinels unchanged (ErrNotPRDIssue,
+// ErrNoPRDLink, ErrActiveRunExists, …) plus the forge sentinels above.
+func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+	if s.forges == nil {
+		return store.Run{}, ErrForgesUnavailable
+	}
+	repo, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Run{}, ErrRepoNotFound
+		}
+		return store.Run{}, err
+	}
+	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
+	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, issueIID)
+	if err != nil {
+		// err is already PAT-redacted by the driver.
+		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
+	}
+	allowWithoutPRD := s.prdlessAllows(ctx, issue.Labels)
+	return s.CreateRun(ctx, userID, repo.ID, issueIID, issue.Description, allowWithoutPRD, waitOnLimit, seed)
+}
+
+// prdlessAllows reports whether the PRDLESS bypass applies to an issue carrying
+// these forge labels (PRD #22 Decision 3): the instance feature is on AND the issue
+// carries the prdless label. Settings reads are best-effort and nil-safe — a nil
+// reader or a cold cache falls back to disabled, so the issue stays gated
+// ("settings unavailable" must not mean "unguarded").
+func (s *Service) prdlessAllows(ctx context.Context, labels []string) bool {
+	if s.settings == nil {
+		return false
+	}
+	enabled, _ := s.settings.PrdlessEnabled(ctx)
+	if !enabled {
+		return false
+	}
+	label, _ := s.settings.PrdlessLabel(ctx)
+	return label != "" && slices.Contains(labels, label)
+}
