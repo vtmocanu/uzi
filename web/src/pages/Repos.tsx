@@ -41,9 +41,16 @@ export function Repos() {
   // panel closes, and move focus into the panel (its master switch) when it opens.
   const trustTriggerRef = useRef<HTMLButtonElement | null>(null);
   const trustPanelRef = useRef<HTMLDivElement | null>(null);
+  // The enable-confirm block; when it opens, focus moves to its primary button
+  // ("Mark as trusted", the first button inside) so a screen-reader user hears it —
+  // the master switch's aria-checked stays false until the PATCH lands.
+  const confirmTrustRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [trustRepoId]);
+  useEffect(() => {
+    if (confirmTrustId) confirmTrustRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [confirmTrustId]);
 
   const closeTrust = () => {
     setTrustRepoId(null);
@@ -226,6 +233,13 @@ export function Repos() {
   // The repo whose Trusted-repo panel is expanded (rendered below the table,
   // outside its horizontal scroll container).
   const trustRepo = repos.find((r) => r.id === trustRepoId) ?? null;
+  // True while ANY of the three trust-related PATCHes (skills / instructions /
+  // master) is in flight for the open repo. Each PATCH response replaces the whole
+  // repo object, so two in flight at once can clobber each other with a stale
+  // snapshot; disabling every trust control while one runs serializes them.
+  const anyTrustBusy =
+    trustRepo != null &&
+    (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id);
   // The repo whose tool-profile picker is expanded (rendered below the table).
   const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
 
@@ -433,14 +447,19 @@ export function Repos() {
                   <Toggle
                     label="Trusted repo"
                     checked={isTrusted(trustRepo)}
-                    disabled={trustBusyId === trustRepo.id}
+                    disabled={anyTrustBusy}
                     onChange={() => onMasterToggle(trustRepo)}
                   />
                 </div>
 
                 {/* Enable is a trust decision → confirm before the master turns on. */}
                 {confirmTrustId === trustRepo.id && !isTrusted(trustRepo) && (
-                  <div className="space-y-3 rounded-md border border-warn/40 bg-warn/5 p-3">
+                  <div
+                    ref={confirmTrustRef}
+                    role="group"
+                    aria-label={`Confirm trusting ${trustRepo.path_with_namespace}`}
+                    className="space-y-3 rounded-md border border-warn/40 bg-warn/5 p-3"
+                  >
                     <p className="text-sm text-fg">
                       <span className="font-medium">Mark {trustRepo.path_with_namespace} as trusted?</span>{" "}
                       This turns on both capabilities: it loads skills from the repo&rsquo;s own{" "}
@@ -455,7 +474,7 @@ export function Repos() {
                     <div className="flex gap-2">
                       <Button
                         size="sm"
-                        disabled={trustBusyId === trustRepo.id}
+                        disabled={anyTrustBusy}
                         onClick={() => setRepoTrust(trustRepo, true)}
                       >
                         {trustBusyId === trustRepo.id ? "Enabling…" : "Mark as trusted"}
@@ -463,7 +482,7 @@ export function Repos() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        disabled={trustBusyId === trustRepo.id}
+                        disabled={anyTrustBusy}
                         onClick={() => setConfirmTrustId(null)}
                       >
                         Cancel
@@ -494,7 +513,7 @@ export function Repos() {
                       <Toggle
                         label="Repo skills"
                         checked={trustRepo.repo_skills_enabled}
-                        disabled={skillsBusyId === trustRepo.id}
+                        disabled={anyTrustBusy}
                         onChange={(next) => setRepoSkills(trustRepo, next)}
                       />
                     </div>
@@ -520,7 +539,7 @@ export function Repos() {
                       <Toggle
                         label="Repo instructions"
                         checked={trustRepo.repo_claudemd_enabled}
-                        disabled={claudemdBusyId === trustRepo.id}
+                        disabled={anyTrustBusy}
                         onChange={(next) => setRepoClaudemd(trustRepo, next)}
                       />
                     </div>

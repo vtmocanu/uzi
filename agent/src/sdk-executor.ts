@@ -462,11 +462,16 @@ export class SdkExecutor implements Executor {
       const result = await readRepoInstructions(ctx.worktreePath);
       if ("text" in result) {
         repoInstructionsBlock = buildRepoInstructionsContext(result.text);
+        // Only claim "injected" when the FRAMED block is non-empty. A present but
+        // whitespace-only CLAUDE.md frames to "" (buildLeadSystemPrompt then injects
+        // nothing), so emitting "injected … (N bytes)" here would be a false status.
         ctx.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`,
+            text: repoInstructionsBlock
+              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+              : `repo instructions: not injected (empty)`,
           },
         });
       } else {

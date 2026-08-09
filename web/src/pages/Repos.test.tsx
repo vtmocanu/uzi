@@ -209,6 +209,33 @@ describe("Repos — Trusted repo panel", () => {
     await waitFor(() => expect(mockApi.setRepoClaudemdEnabled).toHaveBeenCalledWith("repo-atlas", true));
     expect(mockApi.setRepoSkillsEnabled).not.toHaveBeenCalled();
   });
+
+  it("disables every trust control while any trust PATCH is in flight", async () => {
+    // Hold the instructions PATCH open so we can observe the in-flight state.
+    // Skills stays on throughout, so atlas remains trusted and the panel's
+    // sub-toggles stay mounted before and after the PATCH resolves.
+    let resolveClaudemd!: (v: { repo: Repo }) => void;
+    mockApi.setRepoClaudemdEnabled.mockReturnValue(
+      new Promise((r) => {
+        resolveClaudemd = r;
+      }),
+    );
+    const panel = await openTrustPanel("vtmocanu/atlas");
+
+    // Instructions is off for atlas, so this toggles it on and leaves the PATCH pending.
+    fireEvent.click(within(panel).getByRole("switch", { name: "Repo instructions" }));
+
+    const skillsSwitch = () => within(panel).getByRole("switch", { name: "Repo skills" }) as HTMLButtonElement;
+
+    // While that PATCH is pending, the sibling skills toggle and the master switch
+    // are both disabled — no second PATCH can race the first and clobber its result.
+    await waitFor(() => expect(skillsSwitch().disabled).toBe(true));
+    expect((within(panel).getByRole("switch", { name: "Trusted repo" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Resolving the PATCH clears the busy state and re-enables the controls.
+    resolveClaudemd({ repo: { ...REPOS[1], repo_skills_enabled: true, repo_claudemd_enabled: true } });
+    await waitFor(() => expect(skillsSwitch().disabled).toBe(false));
+  });
 });
 
 describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {

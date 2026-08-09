@@ -37,6 +37,46 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "too_large" });
   });
 
+  it("a regular file lstat sees but readFile cannot open ⇒ dropped: read_error (never throws)", async (t) => {
+    // lstat passes (isFile, under cap) but the read fails — e.g. EACCES on a mode-000
+    // file. The reader must catch it structurally so BOTH callers stay non-fatal.
+    const p = repoInstructionsPath(clone);
+    write("# unreadable\n");
+    fs.chmodSync(p, 0o000);
+    // Running as root defeats mode bits (reads succeed regardless), so verify the
+    // premise holds before asserting; otherwise skip with a clear reason.
+    let reallyUnreadable = false;
+    try {
+      fs.readFileSync(p, "utf8");
+    } catch {
+      reallyUnreadable = true;
+    }
+    if (!reallyUnreadable) {
+      fs.chmodSync(p, 0o644); // restore so afterEach cleanup can remove it
+      t.skip("chmod 0o000 does not block reads here (likely running as root)");
+      return;
+    }
+    try {
+      const result = await readRepoInstructions(clone);
+      assert.deepStrictEqual(result, { dropped: "read_error" });
+    } finally {
+      fs.chmodSync(p, 0o644); // restore so afterEach cleanup can remove it
+    }
+  });
+
+  it("marker amplification over the cap ⇒ dropped: too_large (bounds the INJECTED size)", async () => {
+    // A file UNDER the raw cap made entirely of 3-byte `@a` import lines. Each line is
+    // replaced by the ~31-byte marker, so the sanitized text amplifies well over the
+    // cap. The post-sanitization re-check must drop it, so the injected text can never
+    // exceed the cap regardless of amplification.
+    const line = "@a\n"; // 3 bytes raw; stripped to a ~31-byte marker
+    const count = Math.floor((REPO_INSTRUCTIONS_MAX_BYTES - 1) / line.length);
+    const body = line.repeat(count);
+    assert.ok(Buffer.byteLength(body, "utf8") <= REPO_INSTRUCTIONS_MAX_BYTES, "raw file is under the cap");
+    write(body);
+    assert.deepStrictEqual(await readRepoInstructions(clone), { dropped: "too_large" });
+  });
+
   it("exactly at the cap is read (not dropped)", async () => {
     const body = "y".repeat(REPO_INSTRUCTIONS_MAX_BYTES);
     write(body);

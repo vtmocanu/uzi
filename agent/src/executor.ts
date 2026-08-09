@@ -21,7 +21,7 @@ import type {
   RunKind,
 } from "./protocol.js";
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
-import type { PriorWork } from "./prompt.js";
+import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
@@ -563,15 +563,20 @@ export class StubExecutor implements Executor {
     if (ctx.repoClaudemdEnabled) {
       try {
         const result = await readRepoInstructions(ctx.worktreePath);
+        // Parity with the SDK executor: a present but whitespace-only CLAUDE.md
+        // frames to "" and injects nothing, so it must not be logged as "injected".
+        let text: string;
+        if ("text" in result) {
+          text = buildRepoInstructionsContext(result.text)
+            ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+            : `repo instructions: not injected (empty)`;
+        } else {
+          text = `repo instructions: not injected (${result.dropped})`;
+        }
         ctx.emit({
           kind: "status",
           agent: "worker",
-          payload: {
-            text:
-              "text" in result
-                ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
-                : `repo instructions: not injected (${result.dropped})`,
-          },
+          payload: { text },
         });
       } catch (err) {
         this.log.warn("stub: repo instructions read failed", {

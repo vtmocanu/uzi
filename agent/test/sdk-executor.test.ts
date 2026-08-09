@@ -1559,6 +1559,29 @@ describe("SdkExecutor repo instructions (PRD #246 M2)", () => {
     assert.ok(texts.some((t) => /repo instructions: injected root CLAUDE\.md as advisory lead context \(\d+ bytes\)/.test(t)), "injection logged with byte count");
   });
 
+  it("flag ON but CLAUDE.md whitespace-only ⇒ framed block is empty, so NOT logged as injected", async () => {
+    // A present-but-whitespace-only CLAUDE.md returns {text:"   "} and frames to "";
+    // the lead prompt injects nothing. The status must reflect that (not "injected …"),
+    // else it is a false status line.
+    fs.writeFileSync(path.join(worktree, "CLAUDE.md"), "   \n\t\n");
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      worktreePath: worktree,
+      agents: [lead, coder, reviewer],
+      config: { skill_max_bytes: 65536, skills_max_per_run: 32 },
+      repoClaudemdEnabled: true,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    // Nothing framed reaches the prompt.
+    assert.ok(!/untrusted_repo_instructions/.test(appendOf(turns[0]!.options.systemPrompt)));
+    const texts = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+    assert.ok(!texts.some((t) => /repo instructions: injected/.test(t)), "must NOT claim injected");
+    assert.ok(texts.some((t) => /repo instructions: not injected \(empty\)/.test(t)), "reports the empty outcome instead");
+  });
+
   it("adversarial: a CLAUDE.md embedding a static closing tag cannot forge the fence", async () => {
     fs.writeFileSync(
       path.join(worktree, "CLAUDE.md"),
