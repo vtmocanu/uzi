@@ -101,6 +101,8 @@ Bottega's model. No backpressure, unbounded memory/CPU/token contention on a lap
 
 Option A with cap advertisement. No server-side cap *enforcement* (the worker is the sole claimant of its own slots; the server keeps enforcing the invariants that are actually cross-worker: per-issue uniqueness, per-branch exclusion, affinity). Option C is recorded as the k8s-era target shape, reachable from A without rework.
 
+**Refined by [ADR-216](0216-fleet-aware-claim.md) (run placement).** ADR-216 makes the server balance load across the fleet inside `ClaimRun`, reading a *peer's* advertised cap to pick a deferral target — this is placement/affinity, an invariant this ADR already assigns to the server, and NOT the cap *enforcement* on the claiming worker that Option B rejected here. This decision is unchanged: the server still sets no ceiling on a worker's own slots.
+
 ## Consequences
 
 - The "one run at a time" prose in specs/docs becomes "bounded by `WORKER_MAX_CONCURRENT_RUNS`, default 1".

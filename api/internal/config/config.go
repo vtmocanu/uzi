@@ -307,6 +307,7 @@ type Config struct {
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
+	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -679,6 +680,9 @@ func Load() (Config, error) {
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+	// PRD #216: a queued run older than this grace is exempt from the fleet-aware
+	// spread (fail-open, D4). Tracks the poll interval so the two stay related.
+	cfg.WorkerSpreadGrace = parseDuration("WORKER_SPREAD_GRACE", 3*cfg.WorkerPollInterval)
 
 	// PRD #35. parseNonNegInt, so RUN_LIMIT_MAX_WAITS=0 is legal and means "never
 	// park" — the deliberate off switch for an operator who wants today's

@@ -334,6 +334,7 @@ type Store interface {
 	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
 	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
 	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersWithFreeSlotForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	// RunHasVerdictSinceGateOpened backs issue #182: an awaiting_approval run whose
 	// owner already answered THIS gate reports waiting_worker rather than
 	// approval_idle. A per-run lookup like ListRunToolWindow above, and for the same
@@ -476,6 +477,9 @@ type Params struct {
 	RunMaxRequeues         int
 	WorkerHeartbeatStale   time.Duration
 	WorkerAffinityGrace    time.Duration
+	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
+	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
+	WorkerSpreadGrace time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
@@ -914,6 +918,12 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 // 204). If the claimed run's credentials are missing or undecryptable, the run
 // is failed immediately and idle is reported, so a broken run never wedges the
 // worker in a claim loop.
+//
+// Fleet-aware spread (PRD #216): a busy worker DEFERS a queued run to a
+// strictly-less-loaded, eligible, live peer of the same user rather than claiming
+// it, so runs spread across a fleet instead of piling on whichever worker polls
+// first. The deferral is a no-op at the caller level — the run simply isn't
+// returned (nil payload / 204), so the worker just re-polls and a peer claims it.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, error) {
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
@@ -935,19 +945,33 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	// carries no daemon-reaching tool, so DOCKER_HOST is inert for it; an agent/
 	// regression test pins that. This is the accepted-risk likelihood control for the non-rootless
 	// DinD tier: the trigger is repo content, so the gate binds at claim, not at
-	// provisioning. Non-docker workers skip it entirely (isDocker=false → the SQL
-	// predicate short-circuits), so their behavior is unchanged. Fail-closed: a docker
-	// worker with no allowlist reader wired, or an empty allowlist, claims no
-	// repo-bearing run. Read STRICTLY — a settings read error leaves the run unclaimed
-	// (never claim a repo run when the allowlist can't be confirmed).
+	// provisioning. Fail-closed: a docker worker with no allowlist reader wired, or
+	// an empty allowlist, claims no repo-bearing run.
+	//
+	// The fetch is UNCONDITIONAL (PRD #216): a non-docker claiming worker still needs
+	// the real allowlist so the fleet-aware spread can evaluate whether a DOCKER peer
+	// could claim a repo run — without it, spreading a repo run to a docker peer would
+	// silently stop. A read error is only fatal for a docker claiming worker (its own
+	// eligibility depends on it); a non-docker worker degrades gracefully to "don't
+	// spread repo runs to docker peers this cycle" and still claims itself.
 	isDocker := wkr.DockerEnabled.Valid && wkr.DockerEnabled.Bool
 	allowlist := []uuid.UUID{}
-	if isDocker && s.dockerAllowlist != nil {
+	if s.dockerAllowlist != nil {
 		al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx)
 		if aerr != nil {
-			return nil, aerr
+			// A docker worker's OWN eligibility depends on the allowlist, so an
+			// unconfirmable allowlist must fail-closed (never claim a repo run we
+			// can't vet). A non-docker worker doesn't need it for its own claim;
+			// it only needs it to know whether a DOCKER peer could claim a repo
+			// run. If it can't be confirmed, simply don't spread repo runs to
+			// docker peers this cycle (empty allowlist => docker peers ineligible
+			// for repo runs) — the claiming worker still claims, never a strand.
+			if isDocker {
+				return nil, aerr
+			}
+		} else {
+			allowlist = al
 		}
-		allowlist = al
 	}
 
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
@@ -956,6 +980,8 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		AffinityCutoff:      pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:      isDocker,
 		DockerRepoAllowlist: allowlist,
+		SpreadCutoff:        pgTime(s.now().Add(-s.p.WorkerSpreadGrace)),
+		HeartbeatCutoff:     pgTime(s.now().Add(-s.p.WorkerHeartbeatStale)),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

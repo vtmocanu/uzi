@@ -541,6 +541,15 @@ chain in the diagram above, with no intervening `running`.
   of starting fresh. The run continues without its earlier context; if the
   branch already carries pushed work, the planning prompt says so, so an
   amnesiac lead reads that work instead of redoing it.
+  Claim placement is also **fleet-aware** (PRD #216): affinity is checked
+  first, as above, but past that, a worker already holding an active run
+  defers a fresh queued run to a live, eligible peer that is strictly less
+  loaded and has a free slot, rather than taking a second run while that peer
+  sits idle. A queued run older than `WORKER_SPREAD_GRACE` (default 3× the
+  poll interval) is exempt from this deferral so it can never be stranded
+  waiting for a peer — see [adr/0216-fleet-aware-claim.md](adr/0216-fleet-aware-claim.md)
+  for the eligibility seam and the placement/enforcement boundary against
+  ADR-42.
 - **claimed → running, before the plan turn** — once `provisionRunTools` has set up
   the run's tool env, the executor kicks off a lockfile-driven JS dependency
   install for the cloned repo, picked per discovered lockfile (monorepo

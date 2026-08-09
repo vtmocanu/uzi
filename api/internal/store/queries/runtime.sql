@@ -68,7 +68,8 @@ SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 -- name: ListWorkersByUser :many
 -- Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
 --   * active_runs counts the worker's NON-CHAT active runs (claimed/running/
---     awaiting_approval) — the RUN lane that max_concurrent_runs bounds. Chat runs
+--     awaiting_approval/awaiting_input) — the RUN lane that max_concurrent_runs
+--     bounds. Chat runs
 --     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
 --     them, so counting a live chat here would render a false "3/2 runs" over-cap.
 --   * busy is the ANY-kind non-terminal signal (a lone active chat still shows the
@@ -479,34 +480,23 @@ SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 -- blocking (multica's queue semantics). The kind<>'chat' predicate is what keeps
 -- the run lane and the concurrent chat lane from stealing each other's work.
 --
--- Docker-worker repo allowlist (PRD #89 M-allow): a DOCKER-enabled worker
+-- Per-(worker,run) eligibility (PRD #89 M-allow) now goes through the shared
+-- fn_worker_can_claim expression (see migration 00113): a docker-enabled worker
 -- (@is_docker_worker) may claim ONLY runs whose repo is on the trusted allowlist
--- (@docker_repo_allowlist). This is the accepted-risk LIKELIHOOD control for the
--- non-rootless DinD tier — the trigger is repo content, so the gate MUST bind here
--- at claim, not at provisioning (a provision-time user allowlist can't gate the
--- repo-content trigger the acceptance rests on). Non-docker workers pass
--- @is_docker_worker=false and the predicate short-circuits (NOT false = true),
--- leaving them wholly unaffected. An EMPTY allowlist for a docker worker is
--- FAIL-CLOSED: = ANY('{}') is false for every repo, so it claims only repo-less
--- runs — never an unvetted repo's run.
+-- (@docker_repo_allowlist), repo-less JUDGE runs are exempt (fail-closed for any
+-- future repo-less kind), an empty allowlist is fail-closed, and a non-docker
+-- worker short-circuits true. The full docker/judge rationale (why the gate binds
+-- at claim, why judge is safe to exempt) lives in that function's comment, so it is
+-- stated once and reused for BOTH the claiming worker and each candidate peer below.
 --
--- The exemption is scoped to kind='judge' EXPLICITLY (r.repo_id IS NULL AND
--- r.kind = 'judge'), not to every repo-less run. judge is the only repo-less kind
--- ClaimRun can reach today (chat rides the separate ClaimChatRun lane; the
--- runs_kind_shape CHECK forbids repo_id NULL for issue/ci_fix/self_improve), so this
--- is behavior-identical now — but the `kind = 'judge'` clause makes a FUTURE repo-less
--- kind FAIL-CLOSED (a docker worker won't claim it) until it is deliberately added
--- here alongside its own executor-confinement test (auditor Low, PRD #89 M-allow).
---
--- Why judge is safe to exempt: NOT "repo-less = content-free" (a judge still reasons
--- over an untrusted, prompt-injectable trace) — it is that the repo-less EXECUTOR
--- carries no daemon-reaching tool. agent/src/judge-runner.ts runs with a deny-ALL
--- PreToolUse hook (no Bash/HTTP/shell), so even with DOCKER_HOST set it cannot invoke
--- docker. The separate chat lane (ClaimChatRun, ungated) rests on the same property:
--- agent/src/chat-executor.ts is Read/Grep/Glob + read-only uzi MCP, with no
--- Bash/Write/Edit/WebFetch/WebSearch/Agent. An agent/ regression test pins BOTH so a
--- future tool addition trips CI (auditor Medium, PRD #89 M-allow). If that invariant
--- ever changes, this exemption must be revisited before it does.
+-- Fleet-aware spread (PRD #216 D3/D4/D7/D8/R3): a busy worker DEFERS a queued run
+-- to a strictly-less-loaded, live, eligible peer of the same user rather than
+-- claiming it itself, so runs spread across a fleet instead of piling on whichever
+-- worker polls first. Resume affinity (worker_id = me) and a run older than
+-- @spread_cutoff both BYPASS the spread (D7 fail-open, so the spread can never make
+-- a run unclaimable), and a minimum-loaded worker never defers (guaranteeing
+-- claimability). Live = a heartbeat at/after @heartbeat_cutoff (D6). The spread
+-- clause is fully described inline at the WHERE below.
 UPDATE runs SET
     status     = 'claimed',
     worker_id  = @worker_id,
@@ -523,9 +513,51 @@ WHERE id = (
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)
-      AND (NOT @is_docker_worker::boolean
-           OR (r.repo_id IS NULL AND r.kind = 'judge')
-           OR r.repo_id = ANY(@docker_repo_allowlist::uuid[]))
+      -- PRD #216 D5: claiming-worker eligibility via the shared expression.
+      AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+      -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
+      -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
+      -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
+      -- can never make a run unclaimable (D7 fail-open). NOT EXISTS is two-valued
+      -- by construction (no COALESCE to forget). A peer qualifies as strictly
+      -- better iff it is live (D6 heartbeat), eligible via the SAME expression
+      -- (D5), has an advertised cap (D8: NULL cap is not a deferral target), has a
+      -- free slot (D8), and is strictly less loaded by integer cross-multiplication
+      -- (R3: peer.active * my.cap < my.active * peer.cap — exact, no float ties).
+      -- The peer/my active counts use the SAME definition as the UI's active_runs
+      -- (:93-98) so a placement is never contradicted by the displayed load. My cap
+      -- and my active count are read from the same snapshot (not racy params); a
+      -- NULL my.cap makes the product NULL -> row excluded -> I claim (fail-open);
+      -- a 0 active count on me makes the RHS 0 -> no peer qualifies -> I always
+      -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
+      AND (
+          r.worker_id = @worker_id
+          OR r.updated_at < @spread_cutoff
+          OR NOT EXISTS (
+              SELECT 1
+              FROM workers p
+              CROSS JOIN LATERAL (
+                  SELECT count(*) AS active
+                  FROM runs pr
+                  WHERE pr.worker_id = p.id
+                    AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                    AND pr.kind <> 'chat'
+              ) pa
+              WHERE p.user_id = @user_id
+                AND p.id <> @worker_id
+                AND p.last_heartbeat_at IS NOT NULL
+                AND p.last_heartbeat_at >= @heartbeat_cutoff
+                AND p.max_concurrent_runs IS NOT NULL
+                AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind)
+                AND pa.active < p.max_concurrent_runs
+                AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
+                    < (SELECT count(*) FROM runs mr
+                        WHERE mr.worker_id = @worker_id
+                          AND mr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+                          AND mr.kind <> 'chat')
+                      * p.max_concurrent_runs
+          )
+      )
     ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC, r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1956,6 +1988,25 @@ WHERE id = @id AND status = @status;
 -- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
 -- for a queued run already past its threshold, so it is off the hot path.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: CountOnlineWorkersWithFreeSlotForUser :one
+-- How many of a user's ONLINE workers plausibly have room for another run — the
+-- queued-run reason resolver (PRD #216) uses it to tell a SATURATED fleet (every
+-- online worker at its advertised run-lane cap, so a fleet-aware claim may be
+-- deferring this run to a peer that is itself full) from a fleet with an idle
+-- worker that simply has not claimed yet. A NULL cap advertises no bound, so such a
+-- worker is treated as always having room. Active count uses the SAME run-lane
+-- definition as ListWorkersByUser.active_runs (status claimed/running/
+-- awaiting_approval/awaiting_input, kind <> 'chat'). Only called for a queued run
+-- already past its health threshold, so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND (w.max_concurrent_runs IS NULL
+       OR (SELECT count(*) FROM runs r
+            WHERE r.worker_id = w.id
+              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
+              AND r.kind <> 'chat') < w.max_concurrent_runs);
 
 -- name: RunHasVerdictSinceGateOpened :one
 -- Has the owner already answered THIS approval gate, with the worker yet to act on it

@@ -23,7 +23,11 @@ type healthFakeStore struct {
 	active        []store.ListActiveRunsForHealthRow
 	window        map[uuid.UUID][]store.ListRunToolWindowRow
 	onlineWorkers int64
-	writes        []store.SetRunHealthParams
+	// freeSlotWorkers is the canned CountOnlineWorkersWithFreeSlotForUser answer (PRD
+	// #216): how many online workers still have room. 0 with onlineWorkers>0 is the
+	// saturated fleet that drives reasonAllWorkersBusy.
+	freeSlotWorkers int64
+	writes          []store.SetRunHealthParams
 	// leftStatus marks run ids whose SetRunHealth returns 0 rows — the exit race,
 	// where the run changed status between the list read and the health write.
 	leftStatus map[uuid.UUID]bool
@@ -57,6 +61,9 @@ func (f *healthFakeStore) ListRunToolWindow(_ context.Context, arg store.ListRun
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.onlineWorkers, nil
+}
+func (f *healthFakeStore) CountOnlineWorkersWithFreeSlotForUser(context.Context, uuid.UUID) (int64, error) {
+	return f.freeSlotWorkers, nil
 }
 func (f *healthFakeStore) RunHasVerdictSinceGateOpened(_ context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error) {
 	f.verdictCalls = append(f.verdictCalls, arg)
@@ -271,16 +278,20 @@ func TestHealthQueuedReasons(t *testing.T) {
 	cases := []struct {
 		name    string
 		workers int64
+		free    int64
 		want    string
 	}{
-		{"no worker online", 0, reasonNoWorker},
-		{"worker online, still waiting", 1, reasonWaitingWorker},
+		{"no worker online", 0, 0, reasonNoWorker},
+		// SC8: an online fleet with no free slot is saturated (add capacity), distinct
+		// from an idle worker that simply hasn't claimed yet.
+		{"fleet saturated, no free slot", 2, 0, reasonAllWorkersBusy},
+		{"worker online with free slot, still waiting", 1, 1, reasonWaitingWorker},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := runRow("queued")
 			r.UpdatedAt = ago(15 * time.Minute) // > 10m queued
-			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: tc.workers}
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: tc.workers, freeSlotWorkers: tc.free}
 			svc := healthSvc(fs, defaultHealthSettings()) // vlt nil → treated unlocked
 
 			svc.detectRunHealth(context.Background(), t0)
@@ -425,7 +436,7 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	r.Health = healthWaitingWorker
 	r.HealthReason = pgText(reasonNoWorker)
 	r.HealthSince = original
-	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1}
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1, freeSlotWorkers: 1}
 	svc := healthSvc(fs, defaultHealthSettings())
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {

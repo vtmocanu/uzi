@@ -191,7 +191,11 @@ budget, and Anthropic token); the cross-run credential read is closed by the
 worker/runner uid split (PRD #51, [proc-hardening.md](proc-hardening.md)) on the
 root-started compose stack (a #58 single-uid start does not split). The design behind this feature
 (`adr/0042-worker-run-concurrency.md`) has the full research and the
-container-per-run model that eventually closes the rest.
+container-per-run model that eventually closes the rest. How a queued run
+picks *which* worker to land on, across a multi-worker fleet, is a separate
+decision — see [ADR-216](../adr/0216-fleet-aware-claim.md) and
+[Multiple workers, removing a worker](#multiple-workers-removing-a-worker)
+below.
 
 **Hosted workers don't set `WORKER_MAX_CONCURRENT_RUNS` directly.** For a
 controller-managed k8s worker (see [Hosted workers](./hosted-workers.md)) the cap
@@ -204,7 +208,7 @@ it opts into the same intra-user residuals just covered.
 
 ## Multiple workers, removing a worker
 
-Register more than one worker (e.g. `laptop` and `ci-runner-1`); each claims independently from your queue. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
+Register more than one worker (e.g. `laptop` and `ci-runner-1`); each claims independently from your queue. Since PRD #216 the server itself spreads queued runs across your idle workers as part of the claim: a worker already holding a run defers a fresh queued run to a less-loaded, eligible peer instead of taking a second run while that peer is idle, so two runs queued together against two idle workers land one per worker — without lowering anyone's `WORKER_MAX_CONCURRENT_RUNS`. A resumed run still returns to its prior worker first, within the affinity grace described above. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
 
 ## Seeing raw run events
 

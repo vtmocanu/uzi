@@ -229,6 +229,7 @@ func run() error {
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
+		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
 		SkillsMaxPerRun:             cfg.SkillsMaxPerRun,
 		ChatIdleTimeout:             cfg.ChatIdleTimeout,
