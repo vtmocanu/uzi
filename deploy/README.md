@@ -410,6 +410,72 @@ each was checked rather than assumed:
   start is the rollout: watch that it reads its token, verifies the api's cert against
   the projected CA, and that its polls are not dropped by the api's default-deny.
 
+### Verifying restricted-tier egress enforcement (operator packet test)
+
+A repeatable procedure for discharging the "FQDN egress: capability proven,
+enforcement not" caveat above, on dev-cluster. **This is operator reconnaissance
+run from outside the sandbox — a hosted worker agent will (correctly) refuse to
+run it.** Until an operator runs it and records the result, "no packet has
+crossed" still stands; this section gives the steps, not the evidence.
+
+**0. Confirm the tier first.** `uzi admin workers` → the target worker's
+`docker:` flag must be `false`. The docker tier (`uzi-workers-docker`) allows
+broad egress by design (see below) and will pass every check here for the wrong
+reason. If you have no live worker to test against, a throwaway pod in the
+`uzi-workers` namespace labelled `app.kubernetes.io/name: uzi-hosted-worker`
+is selected by the same ANNP `appliedTo` and is an equally valid target.
+
+1. **Allowlist behaviour.** From that worker/pod, assert the allowlisted hosts
+   connect on 443 and the rest do not:
+
+   ```sh
+   # allowlisted — expect a completed HTTP status (any code)
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://cache.nixos.org
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://gitlab.example.com
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://api.anthropic.com
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://ghcr.io
+
+   # off-allowlist — expect a hang/timeout, not a response
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://api.github.com
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://example.com
+   ```
+
+   The discriminator: on the **restricted** tier an off-allowlist host **times
+   out** (curl exits non-zero on `--max-time`). **Any completed HTTP response —
+   a 200, 403, 404, anything** — means you are actually on the docker tier;
+   go back to step 0 and re-check the `docker:` flag before drawing any
+   conclusion (see the tier-egress-trap warning in `.claude/rules/stack.md`).
+
+2. **Deny-CIDRs hold.** From the same pod, assert these are blocked — they
+   render as a leading `action: Drop` belt ahead of every Allow rule, so even a
+   poisoned DNS answer for an allowed name resolving into one of these is
+   dropped:
+
+   ```sh
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' http://169.254.169.254/    # cloud metadata
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://10.96.0.1/          # kube-apiserver ClusterIP
+   kubectl -n uzi-workers exec <pod> -- curl --max-time 5 -sS -o /dev/null -w '%{http_code}\n' https://192.0.2.1/        # a node IP in the node CIDR
+   ```
+
+   All three should hang/timeout.
+
+3. **CNI realization.** Confirm the ANNP and the default-deny floor are actually
+   enforced by Antrea, not merely accepted by the API server:
+
+   ```sh
+   # from an antrea-agent pod (kube-system)
+   antctl get networkpolicy                 # expect the ANNP "uzi-worker-egress" and its rules
+   antctl get networkpolicystats             # expect non-zero traffic/enforcement counters against it
+   ```
+
+   Also confirm the ANNP's Allow rules compose with the vanilla default-deny
+   `NetworkPolicy` floor (`worker-networkpolicy.yaml`, `networkPolicy.enabled`
+   default true) rather than substituting for it — both objects must be present
+   and Realized.
+
+This is a procedure for obtaining evidence, not a claim that the evidence
+exists — record the actual output against each step rather than assuming it.
+
 ## Docker-capable workers: rootless vs non-rootless DinD (PRD #83 / #89)
 
 PRD #83 shipped an opt-in docker-capable hosted-worker tier: a Docker-in-Docker

@@ -1101,7 +1101,10 @@ on.
   the tier is uninterpretable:** the **restricted** tier enforces the FQDN
   allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
   default-deny floor — only `cache.nixos.org`, the forge, `*.anthropic.com`,
-  and the CNPG-chart hosts; `api.github.com` **TIMEOUT**, measured #123 §1),
+  and, as of #285, the CNPG chart's OCI pair (`ghcr.io` +
+  `pkg-containers.githubusercontent.com`, replacing four GitHub-ish hosts —
+  `github.com` is **no longer allowlisted** on this tier); `api.github.com`
+  **TIMEOUT**, measured #123 §1),
   while the **docker** tier reaches arbitrary internet hosts by design
   (`0.0.0.0/0`-except-in-cluster by CIDR, `worker-docker-networkpolicy.yaml`:
   `api.github.com` **200**, `search.devbox.sh` **404**) — [PRD #50](prds/50-llm-egress-proxy.md)'s
