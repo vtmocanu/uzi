@@ -36,6 +36,15 @@ const schedulePreviewCap = 10
 // but a small hard cap keeps a fat guidance value from crowding out the actual task.
 const MaxGuidanceBytes = 8 * 1024
 
+// MaxSweepIssues is the upper bound on a sweep's per-fire max_issues cap (PRD #274 M2).
+// A sweep fans out one run per oldest issue, so a cap in the thousands is already far past
+// any sane unattended batch; the real "no bound" intent is expressed by leaving max_issues
+// NULL (unlimited), not by a giant number. The ceiling also guards the column write:
+// max_issues persists into an int32 column (pgtype.Int4), so an unbounded *int would wrap
+// negative past math.MaxInt32 and later render `LIMIT -N`, which Postgres rejects — wedging
+// the sweep in a transient-retry loop. Rejecting above this ceiling closes that off.
+const MaxSweepIssues = 10000
+
 // validateScheduleConfig is the PURE (no store, no clock beyond the passed-in `now`)
 // validator behind create/patch/preview, extracted so it is unit-testable without a
 // DB. It normalizes the request — a blank timezone becomes "UTC", sweep labels are
@@ -54,6 +63,9 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 	// only) is enforced per-target below.
 	if n.MaxIssues != nil && *n.MaxIssues <= 0 {
 		return n, http.StatusBadRequest, "max_issues must be a positive integer"
+	}
+	if n.MaxIssues != nil && *n.MaxIssues > MaxSweepIssues {
+		return n, http.StatusBadRequest, fmt.Sprintf("max_issues must not exceed %d (leave it unset for unlimited)", MaxSweepIssues)
 	}
 
 	// guidance (PRD #274 M3): a blank/whitespace value is "none" — normalize it to nil so a

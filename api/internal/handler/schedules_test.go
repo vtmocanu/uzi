@@ -121,6 +121,21 @@ func TestValidateScheduleConfig(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "sweep max_issues at ceiling ok",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(MaxSweepIssues), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: 0,
+		},
+		{
+			name:       "sweep max_issues above ceiling rejected (int32-wrap guard)",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(MaxSweepIssues + 1), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "sweep max_issues past int32 rejected (no negative-LIMIT wrap)",
+			req:        apitypes.ScheduleRequest{Target: "sweep", MaxIssues: iptr(2147483648), Timing: "recurring", CronExpr: "0 9 * * 1"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "issue with max_issues rejected (sweep-only)",
 			req:        apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), MaxIssues: iptr(5), Timing: "recurring", CronExpr: "0 2 * * *"},
 			wantStatus: http.StatusBadRequest,
