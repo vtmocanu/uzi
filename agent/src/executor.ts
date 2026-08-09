@@ -23,6 +23,7 @@ import type {
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
+import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
@@ -99,6 +100,10 @@ export interface RunContext {
    *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
    *  precedence); default off. */
   repoSkillsEnabled?: boolean;
+  /** PRD #246: the repo owner opted in to the lead reading the clone's ROOT CLAUDE.md
+   *  as nonce-fenced UNTRUSTED/ADVISORY context (lead-only, `settingSources` untouched);
+   *  default off. Only then does the worker read + sanitize + inject it. */
+  repoClaudemdEnabled?: boolean;
   /** PRD #90: the run's (user, repo) cross-run memory, fetched at claim time. The
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
@@ -549,6 +554,31 @@ export class StubExecutor implements Executor {
         run_id: ctx.runId,
         error: String(err),
       });
+    }
+
+    // Repo instructions (PRD #246 M2). Parity with the SDK executor so the two never
+    // drift: when the repo owner opted in, read + sanitize the clone's root CLAUDE.md
+    // and emit the SAME injected/dropped trace. The stub builds no real lead prompt, so
+    // it only makes the read + outcome observable in the E2E. Non-fatal.
+    if (ctx.repoClaudemdEnabled) {
+      try {
+        const result = await readRepoInstructions(ctx.worktreePath);
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "text" in result
+                ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+                : `repo instructions: not injected (${result.dropped})`,
+          },
+        });
+      } catch (err) {
+        this.log.warn("stub: repo instructions read failed", {
+          run_id: ctx.runId,
+          error: String(err),
+        });
+      }
     }
 
     // Delivered agent templates (PRD #18 M7/M8): report the claim's template set so
