@@ -20,7 +20,11 @@ import {
   GitHubClient,
   type FetchFn,
 } from "../src/forge.js";
-import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import {
+  RunRunner,
+  type ExecutorFactory,
+  type RunnerOptions,
+} from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { UserInput } from "../src/protocol.js";
@@ -161,10 +165,11 @@ export function runner(
   executor: Executor,
   gitlab: GitLabClient,
   joinToken?: string,
+  extra?: Partial<RunnerOptions>,
 ): RunRunner {
   // Wrap the single executor as a factory (PRD #42): each execute() gets it back.
   // The per-run-executor tests below inject a real per-run factory instead.
-  return runnerWith(() => ({ executor }), gitlab, joinToken);
+  return runnerWith(() => ({ executor }), gitlab, joinToken, nullLogger(), extra);
 }
 
 export function runnerWith(
@@ -172,6 +177,7 @@ export function runnerWith(
   gitlab: GitLabClient,
   joinToken?: string,
   log: Logger = nullLogger(),
+  extra?: Partial<RunnerOptions>,
 ): RunRunner {
   return new RunRunner(client, git, makeExecutor, log, 20, joinToken, {
     pollMs: 5,
@@ -190,6 +196,9 @@ export function runnerWith(
     // actually being delivered.
     questionTimeoutMs: 600,
     gitlab,
+    // Spread LAST so a test can override checkpointIntervalMs / now (PRD #267) and any
+    // other RunnerOptions field. Optional: existing call sites pass nothing.
+    ...extra,
   });
 }
 

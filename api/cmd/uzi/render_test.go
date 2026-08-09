@@ -452,6 +452,91 @@ func TestFmtUntil(t *testing.T) {
 	}
 }
 
+// TestRunAgeCell pins `uzi run list`'s AGE column (issue #256 M5): the per-state anchor
+// (Decision 2) and that terminal is a STATIC ran-span independent of now. now is fixed so
+// every live bucket is deterministic; the buckets themselves are formatUptimeDuration's,
+// covered next door — this test proves only that the RIGHT anchor feeds them.
+func TestRunAgeCell(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	ago := func(d time.Duration) *time.Time { t := now.Add(-d); return &t }
+
+	for _, tc := range []struct {
+		name string
+		r    apitypes.RunDTO
+		want string
+	}{
+		{
+			name: "running off StartedAt",
+			r:    apitypes.RunDTO{Status: "running", StartedAt: ago(90 * time.Minute), CreatedAt: now.Add(-3 * time.Hour)},
+			want: "1h 30m",
+		},
+		{
+			// StartedAt unstamped ⇒ fall back to CreatedAt, not "-".
+			name: "running falls back to CreatedAt",
+			r:    apitypes.RunDTO{Status: "running", CreatedAt: now.Add(-45 * time.Minute)},
+			want: "45m",
+		},
+		{
+			name: "claimed off ClaimedAt",
+			r:    apitypes.RunDTO{Status: "claimed", ClaimedAt: ago(2 * time.Minute), CreatedAt: now.Add(-2 * time.Hour)},
+			want: "2m",
+		},
+		{
+			name: "queued off CreatedAt",
+			r:    apitypes.RunDTO{Status: "queued", CreatedAt: now.Add(-3 * time.Minute)},
+			want: "3m",
+		},
+		{
+			// awaiting_approval / awaiting_input / limit_wait all anchor on UpdatedAt.
+			name: "awaiting_approval off UpdatedAt",
+			r:    apitypes.RunDTO{Status: "awaiting_approval", UpdatedAt: now.Add(-25 * time.Hour), CreatedAt: now.Add(-30 * time.Hour)},
+			want: "1d 1h",
+		},
+		{
+			name: "limit_wait off UpdatedAt",
+			r:    apitypes.RunDTO{Status: statusLimitWait, UpdatedAt: now.Add(-10 * time.Minute)},
+			want: "10m",
+		},
+		{
+			// Terminal is a static span FinishedAt−StartedAt, so a now far from either end
+			// does not change it: this run ran for 2h whenever it is listed.
+			name: "completed is a static ran-span",
+			r:    apitypes.RunDTO{Status: "completed", StartedAt: ago(5 * time.Hour), FinishedAt: ago(3 * time.Hour), CreatedAt: now.Add(-6 * time.Hour)},
+			want: "2h 0m",
+		},
+		{
+			// Cancelled/failed before it ever started ⇒ never ran ⇒ "-".
+			name: "terminal with no StartedAt renders dash",
+			r:    apitypes.RunDTO{Status: "cancelled", FinishedAt: ago(1 * time.Hour), CreatedAt: now.Add(-2 * time.Hour)},
+			want: "-",
+		},
+		{
+			// Clock skew: an anchor in the future floors to "<1m", never a negative age.
+			name: "future anchor floors to <1m",
+			r:    apitypes.RunDTO{Status: "running", StartedAt: ago(-30 * time.Second)},
+			want: "<1m",
+		},
+		{
+			name: "unknown status renders dash",
+			r:    apitypes.RunDTO{Status: "teleported", CreatedAt: now.Add(-time.Hour)},
+			want: "-",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runAgeCell(tc.r, now); got != tc.want {
+				t.Errorf("runAgeCell(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+
+	// Terminal span independence from now, asserted directly: two very different clocks,
+	// same rendered span.
+	ran := apitypes.RunDTO{Status: "completed", StartedAt: ago(5 * time.Hour), FinishedAt: ago(3 * time.Hour)}
+	if a, b := runAgeCell(ran, now), runAgeCell(ran, now.Add(100*time.Hour)); a != b {
+		t.Errorf("terminal ran-span moved with now: %q vs %q", a, b)
+	}
+}
+
 // TestRenderRunDetailLimitWait pins `uzi run get`'s park block — and specifically the
 // distinction the block exists to make, since the server leaves the same three columns
 // populated after a promotion as history.

@@ -19261,7 +19261,42 @@ Full decision log: [prds/done/240-rate-limits-utilization-column.md](../prds/don
   recorded explicitly: this is a presentation-only web admin table with no CLI counterpart, so there
   is nothing to mirror in the CLI.
 
-## 504. PRD #246 — Trusted-repo instructions: the clone's ROOT `CLAUDE.md` as an advisory, lead-only, nonce-fenced input; the channel adds CONTEXT, never PERMISSIONS
+## 504. Issue #256 — run duration is a client-derived, per-state token on the Runs page, the board, and `uzi run list`, with NO API/DTO/schema change
+
+Surfaces how long each run has spent in its current lifecycle on the three run surfaces. Wholly
+display-only: no API, DTO, sqlc query, migration, or trust-boundary change — every number is
+derived client-side from timestamps already on the run.
+
+- **One pure `runDurationLabel(run, nowMs)` owns the per-state token** (`web/src/lib/runDuration.ts`).
+  It returns a verb+span string whose BOTH verb and anchor depend on state — `queued 4m` /
+  `claimed 20s` / `running 1h 30m` / `waiting 34m` (awaiting_approval, awaiting_input, limit_wait) /
+  `ran 42m` (terminal, a STATIC finished−started span) — or `""` when the anchor timestamp is missing,
+  never a fabricated `0`. It reuses `formatElapsed` from `runBadge.ts` and takes `nowMs` as a
+  PARAMETER (never an internal `Date.now()`) so the fold is deterministic under test. Its input type
+  makes `started_at`/`finished_at`/`claimed_at` optional+nullable, so both the full `Run` and the
+  board's narrow `LatestRun` satisfy it with no adapter.
+- **Per-state anchor (Decision 2).** queued→`created_at`; claimed→`claimed_at ?? created_at`;
+  running→`started_at ?? created_at`; the three waiting states→`updated_at` (the honest proxy — the
+  row has no dedicated state-entry timestamp; a `state_since` column was considered and left out of
+  scope); terminal→static `finished_at − started_at`. The CLI twin mirrors these exactly.
+- **Runs page (M3): token joins the meta line ALONGSIDE the existing timestamp** (owner decision), not
+  replacing it. Live via the reused `useNow(1000)` tick since the page loads once. A single shared
+  `RunRow` covers the owner Active/Past lists and the admin all-users list.
+- **Board (M4): web-only and DEGRADED by owner decision (Decision 6).** The same helper renders on
+  every card, and the running elapsed moved OUT of the status badge (now a bare `running`) into the
+  uniform meta-line token to avoid doubling (Decision 4). The board's `LatestRun` projection lacks
+  `started_at`/`finished_at`/`claimed_at`, so running/claimed fall back to `created_at` (includes queue
+  time — an accepted list/board anchor mismatch) and terminal cards show no token. This needed NO
+  board-specific code — it is purely a consequence of the helper's fallbacks. Widening the board DTO is
+  the noted follow-up if terminal `ran` on board cards is later wanted.
+- **CLI (M5): `uzi run list` gains an `AGE` column** via `runAgeCell` (`api/cmd/uzi/run.go`), the CLI
+  twin of `runDurationLabel` with the same per-state anchor semantics, reusing the existing
+  `formatUptimeDuration` twin of `formatElapsed`. `--json` output is unchanged.
+- **`formatDuration` hour-tier fix (M1).** `formatDuration` (`web/src/components/RunEvent.tsx`) now
+  rolls over to hours (`1h 30m 00s`), fixing the `90m 00s`/`120m 00s` no-rollover bug, and rounds to
+  whole seconds up front so it can never emit `1m 60s`.
+
+## 505. PRD #246 — Trusted-repo instructions: the clone's ROOT `CLAUDE.md` as an advisory, lead-only, nonce-fenced input; the channel adds CONTEXT, never PERMISSIONS
 
 Serves human: the repo-borne prompt-injection defense + "agents only ever create MRs" primary
 directive — the same constraints §50 serves (`settingSources: []` guardrail layer 5). No

@@ -71,6 +71,13 @@ export interface Config {
    */
   planApprovalTimeoutMs: number;
   /**
+   * PRD #267: minimum interval between time-based origin checkpoint publishes on the
+   * `reap:false` iteration-boundary path. Default 20m; `0` disables the time-based
+   * origin publish entirely, restoring milestone-only checkpoint behaviour. Read from
+   * CHECKPOINT_INTERVAL as a Go-style duration string (e.g. "20m", "0").
+   */
+  checkpointIntervalMs: number;
+  /**
    * Chat run (PRD #39) lifecycle knobs. Chat rides the run machinery as a third
    * kind but has its own clocks (Decision 3): a per-conversation turn cap, a
    * per-turn wall-clock backstop, an idle window that completes a parked chat, and
@@ -265,6 +272,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),
     httpTimeoutMs: duration(env, "WORKER_HTTP_TIMEOUT", "30s"),
     planApprovalTimeoutMs: duration(env, "WORKER_PLAN_APPROVAL_TIMEOUT", "24h"),
+    // PRD #267: min interval between time-based origin checkpoint publishes on the
+    // reap:false path. Default 20m; `0` disables the time-based origin publish
+    // (milestone-only). A Go-style duration string, NOT a `_SECONDS` variant.
+    checkpointIntervalMs: duration(env, "CHECKPOINT_INTERVAL", "20m"),
     // Chat lifecycle (PRD #39 Decisions 2/3). Defaults raised from the earlier
     // 15/20m draft because idle-death discards the conversation; poll is faster
     // than the run lane so a turn starts within ~1s of a user message.

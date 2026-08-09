@@ -135,7 +135,7 @@ everything: **Phase 3 {M4}**.
   visibility on multi-turn runs. No new plumbing: `report_progress` is already decoupled from
   `checkpoint` (D5). Explicitly **not a substitute for M1** — the prompt cannot fix the single-turn
   flush gap; M1 does. `task gate:agent` green.
-- [ ] **M4 — Docs + live acceptance.** Update the milestone-tracking docs (the PRD #122 section
+- [x] **M4 — Docs + live acceptance.** Update the milestone-tracking docs (the PRD #122 section
   of `ARCHITECTURE.md` / relevant doc). Acceptance on a live instance: a gated milestone'd run
   that finishes its plan shows its declared milestones complete (N/N, or the honest subset when a
   milestone is deliberately left undone as in run 264), and a run that reports nothing renders as
@@ -145,10 +145,13 @@ everything: **Phase 3 {M4}**.
     completion-only union, the terminal `milestones_in_progress` clear, and the web's
     not-reported-vs-`0/N` rendering. Automated acceptance is the M1 live-DB store test
     (union-not-overwrite, additive-absent, failed-clears — run green against a throwaway
-    Postgres) plus the M2 web component tests. **Left undone (why the box stays unchecked):**
-    the live-instance acceptance — a gated run on a running deployment showing its declared
-    subset — needs an instance this isolated worktree cannot reach, so it is deferred to an
-    operator.
+    Postgres) plus the M2 web component tests.
+  - _Verified live 2026-08-09 on server `0.23.0+g818d164d` (workers `0.23.0+g818d164d`):_ gated
+    run `121a6640` (#267) completed with `milestones_completed: [m1,m2,m3,m4]` — reconciled from a
+    mid-run `done=2` up to the full declared set at `signal_done` — and `milestones_in_progress`
+    cleared to `null` at completion (D4). The not-reported half is confirmed by the pre-0.23.0
+    completed runs (e.g. `a53d647d`/#265, `b449fc5e`/#264) carrying `milestones_completed: null`,
+    which now render "not reported" rather than `0/N`.
 
 ## Success Criteria
 

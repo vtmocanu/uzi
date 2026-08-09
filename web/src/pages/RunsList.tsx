@@ -16,6 +16,8 @@ import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
+import { runDurationLabel } from "../lib/runDuration";
+import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
@@ -39,10 +41,14 @@ function sortPast(a: RunListItem, b: RunListItem): number {
 
 function RunRow({
   run,
+  now,
   showOwner,
   waitingForVault = false,
 }: {
   run: RunListItem;
+  // now (issue #256 M3): a Date.now()-style clock, ticked by useNow in the parent, so
+  // the live duration token re-derives without a per-row timer.
+  now: number;
   showOwner?: boolean;
   // waitingForVault (PRD #32): this is the current user's own queued run and their
   // vault is locked, so it will not claim until they unlock — surfaced as a distinct
@@ -60,6 +66,9 @@ function RunRow({
   // which then renders no new badge (the row had none before this feature).
   const ms = milestoneBadge(run);
   const msBadge = ms ? milestoneBadgeText(ms) : null;
+  // Issue #256 M3: a live, per-state duration token ("running 1h 30m", "ran 42m", …);
+  // "" for a pre-feature/no-anchor run, which then adds nothing to the meta line.
+  const duration = runDurationLabel(run, now);
   return (
     <li>
       <Link
@@ -78,6 +87,7 @@ function RunRow({
             {run.worker_name && <span>· {run.worker_name}</span>}
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
+            {duration && <span className="font-mono tabular-nums">· {duration}</span>}
             {run.mr_iid != null && (
               <MrChip
                 variant="inline"
@@ -142,6 +152,9 @@ function RunRow({
 export function RunsList() {
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
+  // Issue #256 M3: a 1s tick drives the live duration token on every row; the page
+  // otherwise loads once (no poll), so the token would freeze without this clock.
+  const now = useNow(1000);
 
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [adminRuns, setAdminRuns] = useState<RunListItem[]>([]);
@@ -211,6 +224,7 @@ export function RunsList() {
                       <RunRow
                         key={r.id}
                         run={r}
+                        now={now}
                         waitingForVault={!vaultUnlocked && r.status === "queued"}
                       />
                     ))}
@@ -232,7 +246,7 @@ export function RunsList() {
                   {showPast && (
                     <ul className="space-y-2">
                       {past.map((r) => (
-                        <RunRow key={r.id} run={r} />
+                        <RunRow key={r.id} run={r} now={now} />
                       ))}
                     </ul>
                   )}
@@ -258,6 +272,7 @@ export function RunsList() {
                   <RunRow
                     key={r.id}
                     run={r}
+                    now={now}
                     showOwner
                     // Only the current admin's OWN queued rows can show the vault state —
                     // another owner's vault status is unknown here (PRD #32), so theirs

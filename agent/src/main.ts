@@ -134,6 +134,7 @@ async function main(): Promise<void> {
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
+    checkpointIntervalMs: config.checkpointIntervalMs,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each

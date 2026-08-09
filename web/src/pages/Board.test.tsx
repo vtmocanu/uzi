@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { Board, IssueCard } from "./Board";
-import { api, type Board as BoardData, type Card } from "../lib/api";
+import { api, type Board as BoardData, type Card, type LatestRun } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // The full Board mounts four endpoints and reads the configured label names off the
@@ -222,6 +222,71 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
     const { container } = renderCard({}, ["se\u202Ecurity"]);
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("security")).toBeTruthy();
+  });
+});
+
+// Issue #256 M4 (Decision 4/6): every card wears a uniform per-state duration token
+// beside its status badge, and the running elapsed no longer lives INSIDE the badge —
+// the badge reads a bare "running" while the token carries "running <elapsed>". The
+// board's LatestRun has no started_at, so running counts from created_at (the DEGRADED
+// variant, Decision 6): no board-specific code, and the helper returns "" for terminal
+// runs so those cards carry no token.
+describe("IssueCard duration token (issue #256 M4)", () => {
+  // Anchor Date.now() so the elapsed is deterministic — the card reads Date.now()
+  // inline (Decision 3, riding the existing poll).
+  const NOW = Date.parse("2026-07-04T12:04:00Z");
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const aRun = (over: Partial<LatestRun> = {}): LatestRun =>
+    ({
+      id: "run-1",
+      status: "running",
+      mr_iid: null,
+      mr_web_url: null,
+      mr_state: null,
+      failure_reason: null,
+      stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
+      owner_name: "someone",
+      worker_name: "laptop",
+      is_mine: true,
+      run_count: 1,
+      created_at: "2026-07-04T12:00:00Z",
+      updated_at: "2026-07-04T12:00:00Z",
+      ...over,
+    }) as LatestRun;
+
+  it("renders a bare 'running' badge PLUS a 'running <elapsed>' duration token", () => {
+    renderCard({ latest_run: aRun() });
+    // The badge lost the elapsed…
+    expect(screen.getByText("running")).toBeTruthy();
+    // …and it now rides the faint mono token, counted from created_at (4m ago).
+    expect(screen.getByText("running 4m")).toBeTruthy();
+  });
+
+  it("gives a queued card its 'queued <elapsed>' token", () => {
+    renderCard({ latest_run: aRun({ status: "queued" }) });
+    expect(screen.getByText("queued 4m")).toBeTruthy();
+  });
+
+  it("renders no duration token for a terminal run (Decision 6)", () => {
+    // The board's LatestRun carries no started_at/finished_at, so runDurationLabel's
+    // static ran-span cannot be computed and it returns "" — no mono token renders.
+    renderCard({ latest_run: aRun({ status: "completed" }) });
+    expect(screen.queryByText(/^ran /)).toBeNull();
+  });
+
+  it("renders no token at all when the card has no run", () => {
+    renderCard({ latest_run: null });
+    expect(screen.queryByText(/running|queued|ran /)).toBeNull();
   });
 });
 

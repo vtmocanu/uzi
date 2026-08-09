@@ -173,6 +173,11 @@ export interface RunnerOptions {
   /** Injected for tests; default runs the uzi test suites as real subprocesses. A
    *  self_improve run's MR carries these results as its own evidence (PRD #46). */
   checkRunner?: CheckRunner;
+  /** PRD #267: min interval between time-based origin checkpoint publishes on the
+   *  reap:false path; 0 disables. Default 20m. */
+  checkpointIntervalMs?: number;
+  /** Injectable clock for tests; defaults to Date.now. */
+  now?: () => number;
 }
 
 /**
@@ -204,6 +209,11 @@ export class RunRunner {
   // Optional test override; production builds it per-run with the scrubbed check env
   // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
   private readonly checkRunner?: CheckRunner;
+  /** PRD #267: min interval between time-based origin checkpoint publishes on the
+   *  reap:false path; 0 disables. */
+  private readonly checkpointIntervalMs: number;
+  /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable. */
+  private readonly now: () => number;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -269,6 +279,8 @@ export class RunRunner {
     this.github = opts.github ?? new GitHubClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
+    this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
+    this.now = opts.now ?? (() => Date.now());
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -381,6 +393,12 @@ export class RunRunner {
 
     let barePath: string | undefined;
     let worktreePath: string | undefined;
+    // PRD #267: time-based origin-checkpoint gate state (per run). `lastPublish` starts
+    // at run start so the first time-based publish fires ~one interval in; both are
+    // updated by ANY origin publish (milestone or time). Decision 9: the publish "new
+    // work" test keys on `lastPublishedTip`, NOT the fetch-skip below.
+    let lastPublish = this.now();
+    let lastPublishedTip: string | undefined;
     // PRD #218 M1: the run's branch, hoisted so the park/shutdown fetch-back in the
     // catch can name it. `runnerClone` is declared inside the try and there is no
     // `result` on those paths, so `runnerClone.branch` is the source of truth and it is
@@ -767,65 +785,115 @@ export class RunRunner {
           // `barePath` is the outer `let` (string | undefined); it is set before the run
           // reaches the executor, but narrow it so the closure is honest rather than `!`.
           if (!barePath) return;
-          // Decision 6 no-op rejection (tip-movement check): if the runner clone's branch
-          // tip has not moved since the last checkpoint wrote the tracking ref, there is
-          // nothing new to fetch — skip it (do NOT fail the run, do NOT fetch). A null
-          // trackTip (never checkpointed) or a null cloneTip (unresolvable) is NOT a match,
-          // so it falls through to a real fetch.
+          // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
+          // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
+          // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
           const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
           const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
-          if (trackTip !== null && cloneTip !== null && trackTip === cloneTip) {
-            runLog.info("checkpoint skipped: branch tip unmoved since last checkpoint", {
+          const tipUnmovedSinceFetch =
+            trackTip !== null && cloneTip !== null && trackTip === cloneTip;
+
+          // Skip ONLY the fetch (and reap) when there is nothing new to fetch — do NOT return,
+          // so the origin-publish gate below still runs (Decision 9: a commit fetched at an
+          // earlier iteration can become publish-eligible on a later tip-unmoved iteration once
+          // the interval opens). Reap-before-git is preserved: we reap only on the fetch path,
+          // strictly before the credential-free fetch-back.
+          if (!tipUnmovedSinceFetch) {
+            // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
+            // any CREDENTIALED git — the done path likewise reaps before its fetch-back. The
+            // fallback (reap:false) must NOT reap: a backgrounded dev server the lead means to
+            // reuse next iteration must survive.
+            if (opts.reap) executor.killAgentTree?.();
+            // Fetch back, credential-free (#218's helper): brings the committed work into
+            // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
+            await this.fetchBackBestEffort(
+              barePath,
+              runnerClone.path,
+              runnerClone.branch,
+              runId,
+              runLog,
+            );
+          } else {
+            runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
               run_id: runId,
               branch: runnerClone.branch,
             });
-            return;
           }
-          // Reap ONLY on the model-cooperative checkpoint (Decision 10b), STRICTLY before
-          // any CREDENTIALED git — the done path likewise reaps before its fetch-back.
-          // The fallback (reap:false) must NOT reap: a backgrounded dev server the lead
-          // means to reuse next iteration must survive.
-          if (opts.reap) executor.killAgentTree?.();
-          // Fetch back, credential-free (#218's helper): brings the committed work into
-          // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-          await this.fetchBackBestEffort(
-            barePath,
-            runnerClone.path,
-            runnerClone.branch,
-            runId,
-            runLog,
-          );
-          // PRD #122 M8: broker the checkpoint pack to origin (refs/uzi-checkpoints/<branch>)
-          // so another worker can recover it cross-worker. ONLY on the cooperative reap path
-          // (Decision 10b) — the reap:false fallback must not publish — and STRICTLY after
-          // the fetch-back, which updated the tracking ref checkpointPack reads. The pack
-          // computation is credential-free but stays after the reap for the callback's
-          // temporal-closure invariant. Best-effort: a publish never fails the run.
-          if (opts.reap) {
-            await this.publishCheckpointBestEffort(
+
+          // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to
+          // the api via publishCheckpoint, no PAT — publishCheckpointBestEffort -> git.checkpointPack
+          // (local objects) -> client.publishCheckpoint (worker join token)), so it is safe on the
+          // reap:false path with the agent tree ALIVE. PRD #122 Decisions 10b/14 dissolved the
+          // reap/publish coupling for the broker (it was a property of the rejected worker-side
+          // push, not a correctness invariant); reap:false originally did not publish purely for
+          // scope + broker cost, which the time-gate now bounds (<=1 publish/interval/run).
+          //   - reap:true  (milestone): publish whenever there is new committed work not yet on
+          //     origin. Behaviourally equivalent to the old always-publish minus a redundant
+          //     re-publish of an already-published tip.
+          //   - reap:false (iteration boundary, PRD #267): publish only when the time-gate is open
+          //     AND there is new committed work. "new work" keys on lastPublishedTip (Decision 9),
+          //     NOT the fetch-skip above, so a commit that then goes idle for >= the interval still
+          //     ships exactly once.
+          const hasNewWork = cloneTip !== null && cloneTip !== lastPublishedTip;
+          const timeGateOpen =
+            this.checkpointIntervalMs > 0 &&
+            this.now() - lastPublish >= this.checkpointIntervalMs;
+          let published = false;
+          if (hasNewWork && (opts.reap || timeGateOpen)) {
+            published = await this.publishCheckpointBestEffort(
               barePath,
               runnerClone.branch,
               runId,
               runLog,
             );
+            // Advance the time-gate on every ATTEMPT (not just success): this bounds broker
+            // retry cadence to <= 1 publish/interval/run even under a persistent broker
+            // failure, so a failing publish cannot spam every iteration.
+            lastPublish = this.now();
+            // PRD #267 Fix 1 (Decision 9 / the "worst-case loss ~one interval" criterion):
+            // advance lastPublishedTip ONLY on a CONFIRMED landed publish. On failure the tip
+            // stays un-advanced, so hasNewWork stays true and the time-gate retries the SAME
+            // tip at the next interval boundary — the idle commit still ships (bounded loss),
+            // rather than being marked published-and-forgotten by a transient broker failure.
+            if (published) {
+              lastPublishedTip = cloneTip ?? lastPublishedTip;
+              // PRD #267 M3: make the time-based publish observable — the "committed work is
+              // now safe on origin" moment for a reap:false checkpoint (the milestone/reap:true
+              // publish is already visible via its running report below). Only for the time
+              // path so we do not double-log the milestone case.
+              if (!opts.reap) {
+                runLog.info("checkpoint published to origin (time-based)", {
+                  run_id: runId,
+                  branch: runnerClone.branch,
+                  tip: cloneTip,
+                });
+              }
+            }
           }
           // Report the checkpointed milestone as a `running` report — additive-optional
           // (milestone fields omitted when no progress) and wrapped so it never throws. NO
           // iteration_count: a checkpoint is not an iteration-boundary report, so leaving it
           // out keeps it from regressing the server's GREATEST-merged iteration counter.
-          await reportState({
-            status: "running",
-            ...(opts.progress
-              ? {
-                  milestones_completed: opts.progress.completed,
-                  milestones_in_progress: opts.progress.in_progress,
-                }
-              : {}),
-          }).catch((e) =>
-            runLog.warn("could not report checkpoint progress", {
-              error: errMessage(e),
-            }),
-          );
+          //
+          // PRD #267 Fix 2: emit ONLY when there was real activity — a fetch (tip moved since
+          // the last checkpoint) OR a publish. On a pure-idle checkpoint (tip unmoved AND
+          // nothing published) stay silent, restoring the pre-M1 early-return behaviour while
+          // still signalling a time-based publish of an idle tip ("work is now safe on origin").
+          if (!tipUnmovedSinceFetch || published) {
+            await reportState({
+              status: "running",
+              ...(opts.progress
+                ? {
+                    milestones_completed: opts.progress.completed,
+                    milestones_in_progress: opts.progress.in_progress,
+                  }
+                : {}),
+            }).catch((e) =>
+              runLog.warn("could not report checkpoint progress", {
+                error: errMessage(e),
+              }),
+            );
+          }
         },
       };
 
@@ -1284,23 +1352,31 @@ export class RunRunner {
    * fetchBackBestEffort for symmetry: compute the delta pack of
    * `<origin|default>..refs/uzi-runner/<branch>` (null ⇒ nothing to publish) and ship it
    * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
-   * worker to recover cross-worker. Fired ONLY on a cooperative (reap:true) checkpoint and
-   * AFTER the fetch-back updated the tracking ref checkpointPack reads. Every failure — a
-   * null pack, a non-2xx (returned as null by the client), a thrown error — is swallowed
-   * with a warn so a publish NEVER fails the run.
+   * worker to recover cross-worker. Fired on BOTH the milestone (reap:true) checkpoint and
+   * the PRD #267 time-gated (reap:false) checkpoint, always AFTER the fetch-back updated the
+   * tracking ref checkpointPack reads. Every failure — a null pack, a non-2xx (returned as
+   * null by the client), a thrown error — is swallowed with a warn so a publish NEVER fails
+   * the run.
+   *
+   * Returns `true` IFF the publish confirmably LANDED (a non-null publish response), so the
+   * caller can advance `lastPublishedTip` only on confirmed success (PRD #267 Fix 1): a
+   * swallowed failure returns `false`, leaving the tip un-advanced so `hasNewWork` stays
+   * true and the time-gate retries at the next interval boundary.
    */
   private async publishCheckpointBestEffort(
     barePath: string,
     branch: string,
     runId: string,
     runLog: Logger,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const packed = await this.git.checkpointPack(barePath, branch);
-      if (!packed) return;
-      await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
+      if (!packed) return false;
+      const res = await this.client.publishCheckpoint(runId, packed.tipOid, packed.pack);
+      return res !== null; // client returns null on any non-2xx / empty body
     } catch (e) {
       runLog.warn("checkpoint publish failed", { error: errMessage(e) });
+      return false;
     }
   }
 
