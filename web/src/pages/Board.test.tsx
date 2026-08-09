@@ -14,6 +14,8 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       getBoard: vi.fn(),
+      getBoardPrefs: vi.fn(),
+      setBoardPrefs: vi.fn(),
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
       listRuns: vi.fn(),
@@ -276,6 +278,8 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
       refresh: vi.fn(),
     } as unknown as ReturnType<typeof useAuth>);
     mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });
     mockApi.listRuns.mockResolvedValue({ runs: [] });
@@ -403,6 +407,8 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
       refresh: vi.fn(),
     } as unknown as ReturnType<typeof useAuth>);
     mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });
     mockApi.listRuns.mockResolvedValue({ runs: [] });
@@ -970,6 +976,8 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
       refresh: vi.fn(),
     } as unknown as ReturnType<typeof useAuth>);
     mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });
     mockApi.listRuns.mockResolvedValue({ runs: [] });
@@ -1015,14 +1023,17 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue five"]);
   });
 
-  it("unticking the default extra narrows the board back to PRD only", async () => {
+  it("unticking the default extra narrows the board and PUTs the absolute empty set (PRD #196 M3)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
     openIssues();
-    // The `bug` row is checked by default; unticking it stores the absolute empty set.
+    // The `bug` row is checked by default; unticking it PUTs the absolute empty set to
+    // the server (Decision 9), not localStorage.
     fireEvent.click(screen.getByLabelText(/bug/));
     expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
-    expect(store.get("uzi.board.repo-1.extraLabels")).toBe("[]");
+    await waitFor(() =>
+      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: [], show_all: false }),
+    );
   });
 
   it("uses the server-delivered admin default extras over the compiled-in fallback (PRD #196 M2)", async () => {
@@ -1059,27 +1070,70 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(titles()).not.toContain("issue tracker");
   });
 
-  it("persists 'Show all other issues' per repo", async () => {
+  it("persists 'Show all other issues' to the server (PRD #196 M3)", async () => {
     renderBoard();
     await screen.findByText("Backlog");
     clickShowAll();
-    expect(store.get("uzi.board.repo-1.showAll")).toBe("true");
+    await waitFor(() =>
+      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: null, show_all: true }),
+    );
   });
 
-  it("reads the persisted show-all back on load", async () => {
-    store.set("uzi.board.repo-1.showAll", "true");
+  it("reads the server show-all back on load (PRD #196 M3)", async () => {
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: true });
     renderBoard();
     await screen.findByText("Backlog");
     // issue four is unlabelled, so it only appears once show-all is on.
-    expect(titles()).toContain("issue four");
+    await waitFor(() => expect(titles()).toContain("issue four"));
   });
 
-  it("migrates a legacy showNonPRD:true when showAll is absent (open question 4)", async () => {
-    // A user who had deliberately widened their board must not be silently narrowed.
+  it("applies a server-saved customized extras set over the admin default (PRD #196 M3)", async () => {
+    const cardsWithDocs = [
+      aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
+      aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
+      aCard({ iid: 7, title: "issue seven", column: "", labels: ["documentation"], has_prd_link: false }),
+    ];
+    // Admin default is `bug`, but this user has SAVED `documentation` — the absolute
+    // set wins (Decision 9), so the doc card is a member and the bug card is not.
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: cardsWithDocs }) });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: ["documentation"], show_all: false });
+    renderBoard();
+    await screen.findByText("Backlog");
+    await waitFor(() => expect(titles()).toEqual(["issue one", "issue seven"]));
+  });
+
+  it("Reset re-adopts the admin default by PUTting extra_labels: null (PRD #196 M3, Decision 9)", async () => {
+    // Start from a saved narrowed set so Reset has something to undo.
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: [], show_all: false });
+    renderBoard();
+    await screen.findByText("Backlog");
+    // With the empty absolute set, only PRD cards show.
+    await waitFor(() => expect(titles()).toEqual(["issue one", "issue three", "issue five"]));
+    openIssues();
+    fireEvent.click(screen.getByRole("button", { name: /Reset to default/ }));
+    // Reset PUTs the sentinel null (keeping show_all), so the admin default (bug) is
+    // re-adopted and the bug card returns.
+    await waitFor(() =>
+      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: null, show_all: false }),
+    );
+    await waitFor(() => expect(titles()).toContain("issue two"));
+  });
+
+  it("migrates a legacy showNonPRD:true exactly once and retires the key (open question 4)", async () => {
+    // A user who had deliberately widened their board (per-browser, pre-M3) must not be
+    // silently narrowed. The server row is pristine, so the legacy key seeds it once.
     store.set("uzi.board.repo-1.showNonPRD", "true");
     renderBoard();
     await screen.findByText("Backlog");
-    expect(titles()).toContain("issue four");
+    // Seeded server-side with show-all on, exactly once…
+    await waitFor(() =>
+      expect(mockApi.setBoardPrefs).toHaveBeenCalledWith("repo-1", { extra_labels: null, show_all: true }),
+    );
+    expect(mockApi.setBoardPrefs).toHaveBeenCalledTimes(1);
+    // …the legacy key is retired so it can never re-trigger…
+    expect(store.get("uzi.board.repo-1.showNonPRD")).toBe("false");
+    // …and the board is widened (issue four is unlabelled).
+    await waitFor(() => expect(titles()).toContain("issue four"));
   });
 
   // FREEZE-TEST 3 (task #13), at the wiring level. The lib test pins dropIntent's
@@ -1220,6 +1274,8 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
       refresh: vi.fn(),
     } as unknown as ReturnType<typeof useAuth>);
     mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
     mockApi.listWorkers.mockResolvedValue({ workers: [] });
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   });

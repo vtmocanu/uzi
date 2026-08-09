@@ -15,6 +15,7 @@ import {
   type AllocationsInput,
   type AppSettings,
   type Board,
+  type BoardPrefs,
   type BuiltinDefinition,
   type Chat,
   type CliAuthRequestMeta,
@@ -2257,6 +2258,39 @@ export const mockApi = {
     };
     b.cards.unshift(card);
     return delay({ card: { ...card } }, 450);
+  },
+
+  // Per-user, per-repo board preferences (PRD #196 M3). A SECOND IMPLEMENTATION of the
+  // server contract, so it persists across calls within the session and matches the
+  // wire shape exactly: null extra_labels = "not customised" (fall back to the admin
+  // default), an array (incl. []) = the user's absolute set (Decision 9).
+  getBoardPrefs: async (repoId: string) => {
+    const b = state.boards.get(repoId);
+    if (!b) throw new ApiError(404, "board not found");
+    // No row yet reads as the pristine default rather than being seeded, so a later
+    // reset back to null and "never touched" stay indistinguishable to the client.
+    const prefs = state.boardPrefs.get(repoId) ?? { extra_labels: null, show_all: false };
+    return delay<BoardPrefs>({ extra_labels: prefs.extra_labels, show_all: prefs.show_all });
+  },
+  setBoardPrefs: async (repoId: string, prefs: BoardPrefs) => {
+    const b = state.boards.get(repoId);
+    if (!b) throw new ApiError(404, "board not found");
+    // Loose validation for mock-mode parity with the server: each extra label must be
+    // a non-empty, comma-free, ≤64-char string; an over-cap list is clamped rather
+    // than rejected. null (not customised) is preserved as the sentinel.
+    let extraLabels: string[] | null = null;
+    if (Array.isArray(prefs.extra_labels)) {
+      const cleaned: string[] = [];
+      for (const raw of prefs.extra_labels) {
+        const l = String(raw).trim();
+        if (l === "" || l.includes(",") || l.length > 64) continue;
+        if (!cleaned.includes(l)) cleaned.push(l);
+      }
+      extraLabels = cleaned.slice(0, 64);
+    }
+    const stored: BoardPrefs = { extra_labels: extraLabels, show_all: Boolean(prefs.show_all) };
+    state.boardPrefs.set(repoId, stored);
+    return delay<BoardPrefs>({ extra_labels: stored.extra_labels, show_all: stored.show_all }, 320);
   },
 
   // ── Workers ─────────────────────────────────────────────────────────────────

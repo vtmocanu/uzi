@@ -430,6 +430,20 @@ export interface Board {
   pipeline: PipelineStatus | null;
 }
 
+// BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),
+// persisted server-side (per account, per repo) rather than per browser. It is the
+// stored row served by GET/PUT /repos/{id}/board/prefs.
+//
+// extra_labels is a SENTINEL (Decision 9): null means "not customised — fall back to
+// the admin default board.board_extra_labels"; an array (INCLUDING the empty one) is
+// the user's ABSOLUTE set, so "unticked everything" is durable and distinguishable
+// from "never set". show_all is the old per-browser "show all other issues" boolean,
+// now per-account. No row yet reads as { extra_labels: null, show_all: false }.
+export interface BoardPrefs {
+  extra_labels: string[] | null;
+  show_all: boolean;
+}
+
 // IssueDetail is the in-app issue view payload (PRD #12 §3): the board card
 // fields plus the issue description (rendered as markdown; it carries the PRD
 // link). Fetched live from the forge, so unlike a board card it has no latest_run
@@ -2303,6 +2317,16 @@ const realApi = {
       title,
       description,
     }),
+
+  // Per-user, per-repo board view preferences (PRD #196 M3). The stored row is the
+  // single source of truth for the board's extras override and the "show all other
+  // issues" toggle, replacing the M1 localStorage keys. GET returns the row (or the
+  // pristine { extra_labels: null, show_all: false } when none exists); PUT writes it
+  // and echoes back the stored row.
+  getBoardPrefs: (repoId: string) =>
+    request<BoardPrefs>("GET", `/repos/${repoId}/board/prefs`),
+  setBoardPrefs: (repoId: string, prefs: BoardPrefs) =>
+    request<BoardPrefs>("PUT", `/repos/${repoId}/board/prefs`, prefs),
 
   // Agent runtime (PRD #4).
   listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),

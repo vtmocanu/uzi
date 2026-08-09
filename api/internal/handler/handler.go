@@ -966,6 +966,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
 				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
+				// Per-user, per-repo board view preferences (PRD #196 M3): the
+				// membership extras override and "show all other issues" toggle, moved
+				// server-side from per-browser localStorage. No limiter — no forge call,
+				// like the board/tool-profile reads. VISIBILITY only, never eligibility.
+				r.Get("/{id}/board/prefs", h.GetBoardPrefs)
+				r.Put("/{id}/board/prefs", h.PutBoardPrefs)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
 				// Manual card order (PRD #102 M5). The other whole-board replace, so it
 				// sits beside the columns route and is a PUT for the same reason.

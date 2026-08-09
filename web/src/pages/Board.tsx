@@ -114,51 +114,62 @@ export function Board() {
     });
   };
 
-  // Board membership extras (PRD #196 M1). The board renders `primary ∪ extras`
-  // (Decision 2); this is the extras half — a per-repo, per-browser view preference
-  // for now (M3 moves it server-side, per account).
+  // Board membership extras + "show all other issues" (PRD #196). The board renders
+  // `primary ∪ extras` (Decision 2); these are the extras half and the escape hatch.
+  // SERVER-BACKED per account, per repo since M3 — the single source of truth is the
+  // GET/PUT /board/prefs row, replacing the M1 per-browser localStorage keys.
   //
-  // The stored value is a SENTINEL (Decision 9): absent/null means "never customised,
-  // use the default"; an array — EVEN AN EMPTY ONE — is the user's ABSOLUTE set, so
+  // `storedExtras` is a SENTINEL (Decision 9): null means "never customised, use the
+  // admin default"; an array — EVEN AN EMPTY ONE — is the user's ABSOLUTE set, so
   // "unticked everything" is durable and distinguishable from "never set". Resolving
-  // to DEFAULT_BOARD_EXTRA_LABELS happens at render (resolvedExtras below), never
-  // here, so the sentinel survives round-trips.
-  //
-  // The useEffect re-read mirrors hideEmpty's and is load-bearing for the same
-  // reason: the route swaps :id without remounting, so the lazy initialiser only ever
-  // runs for the first repo visited.
-  const extraLabelsKey = `uzi.board.${repoId}.extraLabels`;
-  const [storedExtras, setStoredExtras] = useState<string[] | null>(() =>
-    prefs.get<string[] | null>(extraLabelsKey, null),
-  );
-  useEffect(() => {
-    setStoredExtras(prefs.get<string[] | null>(`uzi.board.${repoId}.extraLabels`, null));
-  }, [repoId]);
+  // to the default happens at render (resolvedExtras below), so the sentinel survives
+  // round-trips.
+  const [storedExtras, setStoredExtras] = useState<string[] | null>(null);
+  const [showAll, setShowAll] = useState(false);
 
-  // Show-all-other-issues toggle (PRD #196 M1) — the old `showNonPRD` boolean, kept as
-  // the last row of the picker for "I do not know what label it has". Per browser, per
-  // repo.
+  // Fetch the server prefs on load and re-fetch whenever the route swaps :id without
+  // remounting (the same trap hideEmpty/sortMode document above). Errors are
+  // non-fatal: the board still renders and the extras fall back to the admin default.
   //
-  // MIGRATION (open question 4): a user who had `showNonPRD: true` had deliberately
-  // widened their board, so if the new key is absent we fall back to the old one
-  // rather than silently narrowing them. The old key is read ONLY as the initial
-  // fallback; once the user touches the control we write the new key and it wins.
-  const showAllKey = `uzi.board.${repoId}.showAll`;
-  const readShowAll = (id: string): boolean => {
-    const v = prefs.get<boolean | null>(`uzi.board.${id}.showAll`, null);
-    return v !== null ? v : prefs.get<boolean>(`uzi.board.${id}.showNonPRD`, false);
-  };
-  const [showAll, setShowAll] = useState(() => readShowAll(repoId));
+  // MIGRATION (open question 4): the pre-M3 per-browser key `showNonPRD` must not
+  // lapse — a user who had deliberately widened their board would otherwise be
+  // silently narrowed. On first load, if the server row is PRISTINE (never customised
+  // AND show-all off) and the legacy key is set, seed the server once with show-all
+  // on, then RETIRE the legacy key so it can never re-trigger (a user who later turns
+  // show-all off must stay off). The prefs helper has no removal method, so the key is
+  // set false per its get(key, false) convention.
   useEffect(() => {
-    setShowAll(readShowAll(repoId));
+    let cancelled = false;
+    (async () => {
+      try {
+        const serverPrefs = await api.getBoardPrefs(repoId);
+        if (cancelled) return;
+        const legacyKey = `uzi.board.${repoId}.showNonPRD`;
+        const pristine = serverPrefs.extra_labels === null && serverPrefs.show_all === false;
+        if (pristine && prefs.get<boolean>(legacyKey, false) === true) {
+          setStoredExtras(null);
+          setShowAll(true);
+          // Retire the legacy key first, so a failed seed cannot leave it armed to
+          // migrate again on the next load.
+          prefs.set(legacyKey, false);
+          try {
+            await api.setBoardPrefs(repoId, { extra_labels: null, show_all: true });
+          } catch {
+            // Best-effort seed: the local showAll still holds for this session, and
+            // the retired key means the migration will not re-run regardless.
+          }
+          return;
+        }
+        setStoredExtras(serverPrefs.extra_labels);
+        setShowAll(serverPrefs.show_all);
+      } catch {
+        // Non-fatal: keep the admin-default fallback (storedExtras stays null).
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [repoId]);
-  const toggleShowAll = () => {
-    setShowAll((v) => {
-      const next = !v;
-      prefs.set(showAllKey, next);
-      return next;
-    });
-  };
 
   // The "Issues" popover's open state, and its container ref for outside-click.
   const [issuesOpen, setIssuesOpen] = useState(false);
@@ -594,8 +605,8 @@ export function Board() {
     [board],
   );
   // The extras in effect: the user's saved set if they have one (Decision 9,
-  // absolute once written), else the admin default. Per-user server-backed
-  // persistence of the saved set is M3; here the saved set is still localStorage.
+  // absolute once written), else the admin default. The saved set is the
+  // server-backed `storedExtras` row (PRD #196 M3).
   const resolvedExtras = useMemo<string[]>(
     () => storedExtras ?? serverDefaultExtras,
     [storedExtras, serverDefaultExtras],
@@ -611,29 +622,50 @@ export function Board() {
     [payloadCards, membershipLabels, showAll],
   );
 
-  // Writing an extras change stores the ABSOLUTE set (Decision 9), even when empty.
-  const writeExtras = useCallback(
-    (next: string[]) => {
-      setStoredExtras(next);
-      prefs.set(extraLabelsKey, next);
+  // persistPrefs writes the server row OPTIMISTICALLY (PRD #196 M3): the caller has
+  // already updated local state so the toggle feels instant. On a failed PUT surface
+  // the error and reload the row to resync, so the client never silently diverges from
+  // the server.
+  const persistPrefs = useCallback(
+    async (extra_labels: string[] | null, show_all: boolean) => {
+      try {
+        await api.setBoardPrefs(repoId, { extra_labels, show_all });
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Could not save your board view");
+        try {
+          const fresh = await api.getBoardPrefs(repoId);
+          setStoredExtras(fresh.extra_labels);
+          setShowAll(fresh.show_all);
+        } catch {
+          // Leave the optimistic state; the next foreground load reconciles it.
+        }
+      }
     },
-    [extraLabelsKey],
+    [repoId],
   );
+  // Toggling an extra writes the ABSOLUTE set (Decision 9), even when empty. showAll
+  // is carried through unchanged.
   const toggleExtra = useCallback(
     (label: string) => {
       const next = resolvedExtras.includes(label)
         ? resolvedExtras.filter((l) => l !== label)
         : [...resolvedExtras, label];
-      writeExtras(next);
+      setStoredExtras(next);
+      persistPrefs(next, showAll);
     },
-    [resolvedExtras, writeExtras],
+    [resolvedExtras, showAll, persistPrefs],
   );
-  // Reset clears the stored set back to the sentinel (null → default). showAll is a
-  // separate control and is left as the user chose it. Server-backed reset is M3.
+  const toggleShowAll = useCallback(() => {
+    const next = !showAll;
+    setShowAll(next);
+    persistPrefs(storedExtras, next);
+  }, [showAll, storedExtras, persistPrefs]);
+  // Reset re-adopts the admin default (Decision 9): PUT extra_labels: null, keeping
+  // the current showAll (a separate control).
   const resetExtras = useCallback(() => {
     setStoredExtras(null);
-    prefs.set<string[] | null>(extraLabelsKey, null);
-  }, [extraLabelsKey]);
+    persistPrefs(null, showAll);
+  }, [showAll, persistPrefs]);
 
   // Candidate extra labels for the picker: the distinct CONTENT labels present on the
   // payload — the same `seen`-Set accumulation ColumnSettings' suggester uses —
