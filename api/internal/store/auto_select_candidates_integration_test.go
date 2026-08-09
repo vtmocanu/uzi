@@ -446,7 +446,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
 	for _, perm := range perms {
 		shuffled := []autoselect.Candidate{abcCands[perm[0]], abcCands[perm[1]], abcCands[perm[2]]}
-		out := autoselect.Select(shuffled, classifyPolicy, time.Now())
+		out := autoselect.Select(shuffled, uuid.Nil, classifyPolicy, time.Now())
 		if !out.Picked {
 			t.Fatalf("A/B/C order %v picked nothing (reason %q)", perm, out.Reason)
 		}

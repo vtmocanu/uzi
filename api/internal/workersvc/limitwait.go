@@ -604,7 +604,12 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		LimitResetsAt:  pgTimePtr(d.LimitResetsAt),
 		RateLimitType:  pgTextPtr(d.RateLimitType),
 		RetryNotBefore: pgTime(d.RetryNotBefore),
-		SessionID:      sessionID,
+		// PRD #217 M2: record the credential this run was spending so its NEXT claim
+		// excludes it (runs.limit_dead_secret_id). Passed straight through from the run
+		// row — an invalid/NULL AnthropicSecretID writes NULL, i.e. no exclusion, which
+		// is the honest answer for a run that never recorded a credential.
+		LimitDeadSecretID: run.AnthropicSecretID,
+		SessionID:         sessionID,
 	})
 }
 
