@@ -117,8 +117,16 @@ type fakeStore struct {
 	requeuedRun *uuid.UUID
 
 	// Ownership + messages + state.
-	runOwned         store.Run
-	runOwnedErr      error
+	runOwned    store.Run
+	runOwnedErr error
+	// Agent-memory write path (PRD #90/#266): memRunCount is the per-run write count
+	// CountAgentMemoryForRun returns; memInsertParams captures the InsertAgentMemory
+	// arg so a test can assert what was actually persisted after sanitize/normalize;
+	// memInserted flags whether the insert was reached at all (a cap must reject
+	// BEFORE it).
+	memRunCount      int64
+	memInsertParams  *store.InsertAgentMemoryParams
+	memInserted      bool
 	insertedSeqs     map[int32]bool
 	insertedMessages []store.InsertRunMessageParams
 	// upsertedUsage records every UpsertRunUsage call (PRD #40 fold); usageErr, if
@@ -472,6 +480,17 @@ func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailed
 }
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
+}
+func (f *fakeStore) CountAgentMemoryForRun(context.Context, pgtype.UUID) (int64, error) {
+	return f.memRunCount, nil
+}
+func (f *fakeStore) InsertAgentMemory(_ context.Context, arg store.InsertAgentMemoryParams) (store.AgentMemory, error) {
+	f.memInserted = true
+	f.memInsertParams = &arg
+	return store.AgentMemory{ID: uuid.New(), Title: arg.Title, Body: arg.Body, Basis: arg.Basis, Evidence: arg.Evidence}, nil
+}
+func (f *fakeStore) EvictAgentMemoryOverCap(context.Context, store.EvictAgentMemoryOverCapParams) error {
+	return nil
 }
 func (f *fakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
 	f.insertedMessages = append(f.insertedMessages, arg)
@@ -2946,5 +2965,109 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 	// It is still a repo-ful run-lane claim, not a judge claim.
 	if !fs.claimCtxCalled {
 		t.Fatal("a self_improve claim must still take the ordinary repo-ful claim path")
+	}
+}
+
+// runWithRepo builds an owned run whose repo scope is valid, the precondition
+// SaveMemory requires past the repo-less 409 gate.
+func memRunWithRepo(w store.Worker) store.Run {
+	return store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgUUID(w.ID), RepoID: pgUUID(uuid.New())}
+}
+
+// TestSaveMemoryCapsEvidenceServerSide proves the evidence byte cap is enforced in
+// the SERVICE, not just the client (PRD #266): a direct worker POST that skips the
+// client's own 200-byte cap must still be rejected with ErrMemoryTooLarge, before
+// the insert is reached. The boundary (exactly the cap) is accepted.
+func TestSaveMemoryCapsEvidenceServerSide(t *testing.T) {
+	w := worker()
+
+	// One byte over the cap → rejected, no insert.
+	fs := &fakeStore{runOwned: memRunWithRepo(w)}
+	svc := New(fs, newBox(t), testParams())
+	over := strings.Repeat("x", MemoryMaxEvidenceBytes+1)
+	if _, err := svc.SaveMemory(context.Background(), w, fs.runOwned.ID, "t", "b", "observed", over); err != ErrMemoryTooLarge {
+		t.Fatalf("SaveMemory(evidence %d bytes) err = %v, want ErrMemoryTooLarge", len(over), err)
+	}
+	if fs.memInserted {
+		t.Fatalf("oversize evidence must be rejected BEFORE the insert, but InsertAgentMemory was reached")
+	}
+
+	// Exactly the cap → accepted.
+	fs = &fakeStore{runOwned: memRunWithRepo(w)}
+	svc = New(fs, newBox(t), testParams())
+	atCap := strings.Repeat("x", MemoryMaxEvidenceBytes)
+	if _, err := svc.SaveMemory(context.Background(), w, fs.runOwned.ID, "t", "b", "observed", atCap); err != nil {
+		t.Fatalf("SaveMemory(evidence exactly %d bytes) err = %v, want nil", len(atCap), err)
+	}
+	if !fs.memInserted || fs.memInsertParams == nil {
+		t.Fatalf("evidence at the cap must be accepted and inserted")
+	}
+	if fs.memInsertParams.Evidence.String != atCap {
+		t.Errorf("stored evidence = %q, want the at-cap value", fs.memInsertParams.Evidence.String)
+	}
+}
+
+// TestSaveMemoryTrimsAndSanitizesEvidence proves evidence is TrimSpace'd and
+// single-line sanitized (keepWhitespace=false) at write (PRD #266): whitespace-only
+// evidence stores NULL, and an embedded newline/tab is dropped so it cannot forge a
+// fake marker line where the lead prompt renders evidence inline.
+func TestSaveMemoryTrimsAndSanitizesEvidence(t *testing.T) {
+	w := worker()
+
+	// Whitespace-only evidence → stored NULL.
+	fs := &fakeStore{runOwned: memRunWithRepo(w)}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.SaveMemory(context.Background(), w, fs.runOwned.ID, "t", "b", "observed", "  \n\t "); err != nil {
+		t.Fatalf("SaveMemory: %v", err)
+	}
+	if fs.memInsertParams == nil || fs.memInsertParams.Evidence.Valid {
+		t.Errorf("whitespace-only evidence must store NULL, got %+v", fs.memInsertParams.Evidence)
+	}
+
+	// Embedded newline/tab dropped; surrounding whitespace trimmed.
+	fs = &fakeStore{runOwned: memRunWithRepo(w)}
+	svc = New(fs, newBox(t), testParams())
+	if _, err := svc.SaveMemory(context.Background(), w, fs.runOwned.ID, "t", "b", "observed", "  see\nfile\ttail  "); err != nil {
+		t.Fatalf("SaveMemory: %v", err)
+	}
+	if got, want := fs.memInsertParams.Evidence.String, "seefiletail"; got != want {
+		t.Errorf("stored evidence = %q, want %q (trimmed + newline/tab dropped)", got, want)
+	}
+}
+
+// TestSaveMemoryNormalizesBasisAtWrite proves an unknown/garbage/oversized basis is
+// coerced to empty (→ NULL) at WRITE (PRD #266), closing the basis-amplification
+// path so no untrusted basis string is ever persisted; a known label passes through.
+func TestSaveMemoryNormalizesBasisAtWrite(t *testing.T) {
+	w := worker()
+	for _, tc := range []struct {
+		name     string
+		in       string
+		wantNull bool
+		want     string
+	}{
+		{"unknown", "bogus", true, ""},
+		{"wrong case", "OBSERVED", true, ""},
+		{"oversized garbage", strings.Repeat("z", 5000), true, ""},
+		{"observed", "observed", false, "observed"},
+		{"inferred", "inferred", false, "inferred"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{runOwned: memRunWithRepo(w)}
+			svc := New(fs, newBox(t), testParams())
+			if _, err := svc.SaveMemory(context.Background(), w, fs.runOwned.ID, "t", "b", tc.in, ""); err != nil {
+				t.Fatalf("SaveMemory: %v (a bad basis must never fail the write)", err)
+			}
+			if fs.memInsertParams == nil {
+				t.Fatalf("insert not reached")
+			}
+			if tc.wantNull {
+				if fs.memInsertParams.Basis.Valid {
+					t.Errorf("basis %q must store NULL, got %q", tc.in, fs.memInsertParams.Basis.String)
+				}
+			} else if fs.memInsertParams.Basis.String != tc.want {
+				t.Errorf("basis %q stored as %q, want %q", tc.in, fs.memInsertParams.Basis.String, tc.want)
+			}
+		})
 	}
 }
