@@ -133,7 +133,7 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	// --guidance is issue/sweep-only; reject an EXPLICIT set on the prompt target (a prompt
 	// carries its own text). --guidance is distinct from the --prompt target selector.
 	guidanceSet := cmd.Flags().Changed("guidance")
-	if guidanceSet && !(issueSet || sweep) {
+	if guidanceSet && !issueSet && !sweep {
 		return apitypes.ScheduleRequest{}, "", uzicli.Exitf(uzicli.ExitUsage, "--guidance is only valid with --issue or --sweep")
 	}
 
