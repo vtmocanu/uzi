@@ -855,7 +855,9 @@ Serves human: "server/client; agents work an issue"; secret-at-rest (server hold
 - **Worker affinity**: a re-queued run with a prior `worker_id` sorts its original
   worker first and is claimable by **others only after `WORKER_AFFINITY_GRACE`**
   (default 2m) — so a resume lands on the disk that still holds the session +
-  worktree. Ordering `COALESCE(worker_id = @worker_id, false) DESC, created_at ASC`.
+  worktree. Ordering `COALESCE(worker_id = @worker_id, false) DESC, created_at ASC`
+  (unchanged by PRD #216 — the fleet-aware spread is an added `WHERE` clause, not an ORDER
+  BY change; see §508).
 - **Claim payload shape** (AI wire contract, pinned across the M1/M2 branches):
   flat run fields at top level (`run_id, issue_iid, issue_title, issue_description,
   status, branch?, session_id?, last_seq, iteration_count, requeue_count, plan_md?`)
@@ -4789,7 +4791,9 @@ and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
   slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
   the cap is advertised at registration for observability but never enforced server-side.
   The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
-  block PRD #39's chat lane and encode scaling policy in the schema).
+  block PRD #39's chat lane and encode scaling policy in the schema). **Refined by PRD #216
+  (§508): the server may READ a peer's cap to TARGET placement; it still does not ENFORCE a
+  worker's own-slot cap. Reading ≠ enforcing — see §508 / ADR-0216 for the boundary.**
 - **§43's "one run at a time" becomes "bounded by the cap, default 1"** once PRD #42
   lands; §35's one-*worker*-per-user invariant is untouched.
 - **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
@@ -5118,6 +5122,11 @@ PRD carries the complete set (1–15) and the review corrections.
 - **§43's "one run at a time" prose is now "bounded by the cap, default 1"**; §35's
   one-*worker*-per-user invariant is untouched — a different guarantee this PRD does not
   touch.
+- **"never enforced server-side" refined by PRD #216 (§508, ADR-0216)**: the server now
+  READS a peer's advertised `max_concurrent_runs` to TARGET where a queued run is placed;
+  it still does not ENFORCE a cap on a worker's own slots. Reading a peer cap to route work
+  is not the server-side 1:1 constraint ADR-42 rejected — the boundary is stated crisply in
+  §508. Do not read this bullet as unweakened without §508.
 - **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
   PAT exposure during push windows; Bash cross-run worktree writes — documented at the
   knob in `docs/worker-setup.md`); the real fix is the k8s uid-split/container-per-run
@@ -19453,3 +19462,66 @@ Done / Dismissed / All) and refetch as the user works the list. The uncapped gua
   right after a bulk mark-done, the acted-on card stays visible at its new rollup bucket
   while the refetched `todo` chip has already decremented; the two reconcile on the next
   navigation/load. Accepted, not a defect.
+
+## 508. PRD #216 — ClaimRun becomes FLEET-AWARE: a busy worker DEFERS a queued run to a strictly-less-loaded live peer, decided inside the atomic claim's own snapshot
+
+Serves human: server-side run placement across a worker fleet (the mechanism-level refinement
+of the existing worker/run model; no new user-stated requirement — `specs/human.md` unchanged).
+Full rationale, rejected alternatives, and the D1–D12/R3 decision log: `adr/0216-fleet-aware-claim.md`
+and `prds/216-worker-load-balancing.md`.
+
+- **Fleet-aware spread, in-statement**: a worker holding ≥1 active run-lane run (`claimed |
+  running | awaiting_approval | awaiting_input`, `kind <> 'chat'`) **defers** a fresh queued
+  run — declines to claim, so a peer takes it on its next poll — when a strictly-less-loaded,
+  live, eligible peer with a free slot exists. The predicate is an added `WHERE` clause in the
+  atomic `ClaimRun` UPDATE (`api/internal/store/queries/runtime.sql`), evaluated in the claim's
+  own MVCC snapshot — no service-layer read-then-decide, no worker-side sleep. It is NOT
+  cross-worker mutual exclusion (peer aggregates run in `InitPlan`/`SubPlan` before `LockRows`);
+  safe because a strict comparison means the minimum-loaded set is never empty and can only
+  cause a defer, never a double-claim (`FOR UPDATE SKIP LOCKED` unchanged).
+- **Fail-open, never stranded**: resume affinity (`r.worker_id = @worker_id`) and a run older
+  than `@spread_cutoff` (`WORKER_SPREAD_GRACE`, default `3× WORKER_POLL_INTERVAL`) both BYPASS
+  the spread; a minimum-loaded worker never defers (my `active = 0` ⇒ RHS 0 ⇒ no peer
+  qualifies). Together these make "every queued run is claimable within `spread_grace`" a
+  structural invariant. The affinity-first `ORDER BY` (§40) is unchanged; FIFO is intentionally
+  relaxed (a per-row predicate may skip an older deferred run and take a younger claimable one —
+  accepted, D3).
+- **Eligibility is ONE reusable SQL expression** `fn_worker_can_claim(is_docker, allowlist,
+  run_repo_id, run_kind)` (migration `00113_fleet_aware_claim.sql`, `IMMUTABLE`, NOT `STRICT` so
+  a NULL judge `repo_id` still runs the body), applied identically to the claiming worker and to
+  each candidate peer. It carries the PRD #89 docker-repo-allowlist gate (docker worker → repo
+  on allowlist; repo-less `judge` exempt, scoped to `kind='judge'` so a future repo-less kind
+  fail-closes; empty allowlist fail-closed; non-docker short-circuits true). **PRD #84
+  (capability-aware scheduling) EXTENDS this function's signature rather than writing a second
+  predicate** — user decision 2026-08-03: #216 lands first and owns the seam; both features carry
+  a mutual reference. `Service.Claim` therefore fetches the docker allowlist unconditionally so
+  the peer scan can test whether a *docker* peer could claim a *repo* run.
+- **Peer test is `NOT EXISTS`, fail-open on NULL by construction** (no `COALESCE` to forget): an
+  empty peer set, a NULL-cap peer, and a NULL claiming-worker cap all yield "no strictly-better
+  peer → I claim". A **NULL-cap peer is not a deferral target** (D8: never defer to capacity you
+  cannot establish — prevents an A→B→A defer loop on a heterogeneous fleet). A peer qualifies iff
+  live + eligible + `pa.active < p.max_concurrent_runs` (free slot). Load is compared by **integer
+  cross-multiplication** `peer.active * my.cap < my.active * peer.cap` (R3 — exact, no division,
+  no float ties, correct under unequal caps). New **partial index** `idx_runs_worker_active` on
+  `runs(worker_id) WHERE status IN (…run lane…) AND kind <> 'chat'` serves both the peer-load
+  subquery and the UI `active_runs`; the spread's active-count uses the SAME status set + `kind
+  <> 'chat'` as the UI, so a placement is never contradicted by the displayed "N/M runs".
+- **Liveness via `last_heartbeat_at`, not `workers.status`** (D6): a peer is live iff
+  `last_heartbeat_at >= @heartbeat_cutoff` (`now() - WORKER_HEARTBEAT_STALE`, default 45s),
+  mirroring `@affinity_cutoff`. `status` lags a sweep and would let a corpse look like a target.
+- **Reads a peer's cap for TARGETING, not ENFORCEMENT**: the server uses `max_concurrent_runs`
+  only to decide where to *place* work; it still does not cap a worker's own slots (the worker
+  self-bounds via its worker-side semaphore). Consistent with ADR-42 (which rejected server-side
+  own-slot enforcement); refined by ADR-0216. Reconciled at §173/§188.
+- **Health: new `reasonAllWorkersBusy`** (`queuedReason`, `api/internal/workersvc/health.go`)
+  distinguishes a saturated fleet ("all your workers are busy; waiting for a free slot") from a
+  no-worker-online idle queue (`reasonWaitingWorker`). Resolved most-actionable-first: vault
+  locked → no worker online → every online worker at cap → plain wait; backed by an off-hot-path
+  `CountOnlineWorkersWithFreeSlotForUser`. Maps to the existing `waiting_worker` health enum —
+  `health_reason` is free text, so **no migration**. The reason is computed on the reason-resolver
+  path, NOT as a column on `ClaimRun`, to keep the hot claim path's shape/query-count unchanged
+  (and clear for PRD #84's own reshape).
+- **Validation debt**: the SQL-layer placement is covered deterministically against live Postgres
+  by `api/internal/store/claim_fleet_placement_integration_test.go`; the real-fleet poll-timing
+  observation (two binaries polling on their own cadence, the pre-change pile-up control) is owed
+  by M5 and unmet — ADR-0216 is **Proposed**, not a fully-validated outcome.

@@ -3,7 +3,7 @@
 **Issue**: [#216](https://gitlab.example.com/vtmocanu/uzi/-/issues/216) · **Label**: PRD · **Priority**: High
 **Area**: `api/internal/store/queries/runtime.sql` (`ClaimRun` — the whole feature) · `api/internal/workersvc/service.go:824-830` (the sole caller, gains params) · one migration (the partial index, D11) · `adr/0216-fleet-aware-claim.md` (M0) · `deploy/chart/` + `docs/` (M7-M8).
 **Line references** are against `d367653b`.
-**Status**: not started.
+**Status**: in progress (2026-08-09) — M0–M4, M6, M7 landed on `agent/issue-216`; M5 (real-fleet end-to-end + the pre-change control) is owed and unmet, so this PRD stays open. See `adr/0216-fleet-aware-claim.md`.
 **Related**: **PRD #84 (capability-aware scheduling) adds a predicate to this same statement** — see D5. **ADR-42** (worker run concurrency) is amended by this PRD — see M0.
 **Reviewed** 2026-08-03, one architectural pass. Five blocking findings, all applied. Two were established against a real `postgres:17` rather than reasoned about, and one of those (D7) refutes the design's most natural implementation.
 
@@ -248,17 +248,17 @@ fix-the-doc at `:554` to present- vs past-tense claims). `ListAllWorkers`
 
 ## Milestones
 
-- [ ] **M0 — ADR + the #84 seam.** `adr/0216-fleet-aware-claim.md` (numbered by
+- [x] **M0 — ADR + the #84 seam.** `adr/0216-fleet-aware-claim.md` (numbered by
       originating issue per repo convention). Records the eligibility predicate
       as a seam other code must respect, the fail-open/NULL discipline (D7), and
       amends ADR-42's "no server-side cap enforcement" so D8 does not read as a
       contradiction. Adds the mutual reference to PRD #84.
-- [ ] **M1 — Fleet-aware claim predicate.** `ClaimRun` gains the spread,
+- [x] **M1 — Fleet-aware claim predicate.** `ClaimRun` gains the spread,
       honouring D3 (per-row, affinity first), D4 (`@spread_cutoff`), D5 (one
       eligibility expression), D6 (heartbeat param), D7 (`NOT EXISTS`), D8 (peer
       free slot, NULL cap not a target). Plus D11's index and D12's comment fix.
       `ClaimRunParams` and its sole caller (`service.go:824-830`) change with it.
-- [ ] **M2 — Live-DB tests, written for the failures that exist.** Three
+- [x] **M2 — Live-DB tests, written for the failures that exist.** Three
       distinct classes, and the first is the one the original draft would have
       missed: **(a) steady-state starvation, single-threaded** — heterogeneous
       caps (D8's A/B livelock), NULL cap (D7), single-worker fleet (D7),
@@ -277,13 +277,13 @@ fix-the-doc at `:554` to present- vs past-tense claims). `ListAllWorkers`
       or user argument — it is one global settings read — so per-run eligibility
       only diverges on a mixed docker/non-docker fleet. The matrix must be
       synthetic, or it will "confirm" D5 against a fleet that cannot exhibit it.
-- [ ] **M3 — Worker-side confirmation.** Answer is **no change needed**, and it
+- [x] **M3 — Worker-side confirmation.** Answer is **no change needed**, and it
       is confirmed end-to-end rather than expected: `service.go:833` returns
       `nil, nil` on `ErrNoRows`, `handler/worker_protocol.go:335-337` turns that
       into **204**, `agent/src/client.ts:112` maps 204 to `null`, and
       `worker.ts:176` sleeps a poll on a null claim. Kept as a milestone so the
       chain is re-checked against the shipped predicate, not re-derived.
-- [ ] **M4 — Make a deferral distinguishable from an idle queue.** Today it is
+- [x] **M4 — Make a deferral distinguishable from an idle queue.** Today it is
       not: `Service.Claim` turns `pgx.ErrNoRows` into `nil, nil` → 204
       (`service.go:833-838`), so the worker, the API log and the operator all
       see "empty queue". Worse, the health detector then **mis-labels** it —
@@ -307,10 +307,10 @@ fix-the-doc at `:554` to present- vs past-tense claims). `ListAllWorkers`
       happen. **M5 cannot settle the raw-vs-occupancy question** (R3) — under
       equal caps the two give identical answers on every input, so that belongs
       in M2's synthetic heterogeneous fixtures.
-- [ ] **M6 — Retire the workaround.** Confirm `workers.maxConcurrentRuns` no
+- [x] **M6 — Retire the workaround.** Confirm `workers.maxConcurrentRuns` no
       longer needs lowering, and update the chart docs. This is the milestone
       that delivers the user-visible ask: no values edit.
-- [ ] **M7 — Docs.** Worker/run-lifecycle docs describe placement, following the
+- [x] **M7 — Docs.** Worker/run-lifecycle docs describe placement, following the
       existing frontmatter rules.
 
 ## Success criteria
