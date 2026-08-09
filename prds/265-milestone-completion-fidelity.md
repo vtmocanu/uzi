@@ -112,7 +112,7 @@ stands alone, so they run as **Phase 1 {M1 ∥ M2}**. M3 shares `agent/src/{sign
 prompt}.ts` with M1 and needs the `signal_done` field, so **Phase 2 {M3}**. M4 validates
 everything: **Phase 3 {M4}**.
 
-- [ ] **M1 — `signal_done` milestone declaration + server reconciliation (agent + api).** The
+- [x] **M1 — `signal_done` milestone declaration + server reconciliation (agent + api).** The
   lead can declare completed frozen-milestone ids on `signal_done`; the server subset-validates
   via `progressParams` (D6) and **unions** them into `milestones_completed` on the completion path
   — copying the `jsonb_agg(DISTINCT …)` union from `SetRunRunning`, **not** the plain assignment
@@ -124,13 +124,13 @@ everything: **Phase 3 {M4}**.
   `{m1,m2}`, then `signal_done` declares `{m3}` → tracker `{m1,m2,m3}`, proving R2), an
   additive-absent byte-identical assertion for a non-milestone run, and an agent-side `signal_done`
   payload test.
-- [ ] **M2 — Presentation: "not reported" ≠ "0 complete" (web only, no api change).** Stop
+- [x] **M2 — Presentation: "not reported" ≠ "0 complete" (web only, no api change).** Stop
   collapsing `null` and `[]` with `?? []` so a milestone'd run with **no reported completion**
   renders as **not reported** (neutral), never a `0/N` that reads as failure (D3). Apply it at the
   **shared badge helper** `web/src/lib/runBadge.ts` `milestoneBadge` (which feeds `Dashboard.tsx`,
   `RunsList.tsx`, and `RunView.tsx`), not only the `RunView` detail checklist, or the compact
   `M0/4` pill still reads as failure on the board. `task gate:web` green, component tests updated.
-- [ ] **M3 — Lead guidance (agent).** Prompt guidance directs the lead to declare completed
+- [x] **M3 — Lead guidance (agent).** Prompt guidance directs the lead to declare completed
   milestones on `signal_done`, and to use the existing standalone `report_progress` for mid-run
   visibility on multi-turn runs. No new plumbing: `report_progress` is already decoupled from
   `checkpoint` (D5). Explicitly **not a substitute for M1** — the prompt cannot fix the single-turn
@@ -140,6 +140,15 @@ everything: **Phase 3 {M4}**.
   that finishes its plan shows its declared milestones complete (N/N, or the honest subset when a
   milestone is deliberately left undone as in run 264), and a run that reports nothing renders as
   "not reported", not `0/N`. Capture the evidence.
+  - _Landed this run:_ docs updated — the `Run lifecycle` section of `ARCHITECTURE.md` now
+    describes the two tracker sources (`report_progress` + the `signal_done` declaration), the
+    completion-only union, the terminal `milestones_in_progress` clear, and the web's
+    not-reported-vs-`0/N` rendering. Automated acceptance is the M1 live-DB store test
+    (union-not-overwrite, additive-absent, failed-clears — run green against a throwaway
+    Postgres) plus the M2 web component tests. **Left undone (why the box stays unchecked):**
+    the live-instance acceptance — a gated run on a running deployment showing its declared
+    subset — needs an instance this isolated worktree cannot reach, so it is deferred to an
+    operator.
 
 ## Success Criteria
 

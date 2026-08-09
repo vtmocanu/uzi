@@ -1013,13 +1013,18 @@ export interface StateRequest {
   /** The lead's live milestone progress (PRD #122 M2, Decision 3). Additive + optional
    *  and OMITTED ENTIRELY when the lead has reported no progress — never `null` or `[]` —
    *  so an old worker's payload and a new worker's "no progress" payload stay the same
-   *  shape on the wire. Sent on `running` reports only, usually alongside `iteration_count`,
+   *  shape on the wire. Sent on `running` reports, usually alongside `iteration_count`,
    *  when a `report_progress` signal has been observed — EXCEPT the PRD #122 M6 checkpoint
    *  report, which sends these WITHOUT `iteration_count` (a checkpoint is not an iteration
    *  boundary, so omitting it keeps the GREATEST-merged counter from moving). The two fields
    *  are independent on the wire, so a consumer must not assume they co-occur.
    *  `milestones_completed` is unioned
    *  server-side (monotone); `milestones_in_progress` is a snapshot the server overwrites.
+   *  PRD #265 M1: `milestones_completed` ALSO rides the terminal `completed` report — the
+   *  lead's signal_done declaration of what it finished — where the server unions it into
+   *  the tracker (the same monotone union) so a run that never reported mid-run progress
+   *  still reconciles at completion. `milestones_in_progress` is never sent on a terminal
+   *  report (it is meaningless there; the server clears it on every terminal transition).
    *  Reporting is fire-and-forget: the server validates membership + shape (Decision 12)
    *  and an informational field never fails a run. */
   milestones_completed?: string[];

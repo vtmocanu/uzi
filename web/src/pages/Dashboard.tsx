@@ -9,7 +9,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
-import { milestoneBadge, mrChipState } from "../lib/runBadge";
+import { milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
@@ -330,6 +330,7 @@ export function Dashboard() {
               const mrState = mrChipState(r.mr_state);
               // PRD #122: compact milestone progress; null for a non-milestone run.
               const ms = milestoneBadge(r);
+              const msBadge = ms ? milestoneBadgeText(ms) : null;
               return (
               <li key={r.id}>
                 <Link
@@ -360,10 +361,11 @@ export function Dashboard() {
                     </Badge>
                   )}
                   {/* PRD #122: compact milestone progress next to the iter badge; a
-                      non-milestone run keeps only the iter badge. */}
-                  {ms && (
-                    <Badge tone="info" title="Milestones reported complete of the approved plan">
-                      M{ms.done}/{ms.total}
+                      non-milestone run keeps only the iter badge. PRD #265 M2: an
+                      unreported tracker shows M–/N, not a 0/N that reads as failure. */}
+                  {msBadge && (
+                    <Badge tone="info" title={msBadge.title}>
+                      {msBadge.label}
                     </Badge>
                   )}
                   <RunHealthBadge run={r} />

@@ -759,7 +759,10 @@ export function buildRevisePlanPrompt(feedback: string): string {
 
 /**
  * PRD #122 M6: render the approved milestone breakdown with each entry's live status,
- * plus the checkpoint directive that ties the boundary to the durability mechanism. The
+ * plus the checkpoint directive that ties the boundary to the durability mechanism. PRD
+ * #265 M3 adds the tracker-honesty guidance: use `report_progress` for mid-run visibility
+ * and declare the actually-finished milestones on `signal_done` so a completed run's
+ * tracker reflects what shipped (never a 0/N that reads as failure). The
  * status comes from the lead's own reported `progress` (completed ⇒ done, in_progress ⇒
  * in progress, else not started); `completed` wins if an id is somehow in both, since a
  * finished milestone is finished. Returns "" when there are no milestones, so a run with
@@ -787,6 +790,19 @@ function milestoneStatusNote(
     "committed locally, call the `checkpoint` tool once and end your turn so the work is",
     "saved durably before you start the next one:",
     ...rows,
+    "",
+    // PRD #265 M3: keep the run's milestone tracker truthful. report_progress gives
+    // mid-run visibility without ending the turn (it is already decoupled from the
+    // durability checkpoint), and the signal_done declaration is what reconciles the
+    // tracker at completion — the load-bearing fix for a single-turn run that never got
+    // to report. Framed as "what you actually finished" so it never becomes a rote
+    // "declare them all" that re-lies (a deliberately-skipped milestone stays undeclared).
+    "Keep this tracker honest as you go. On a multi-turn run you MAY call `report_progress`",
+    "at any point to mark milestones in progress or complete — it updates the tracker right",
+    "away and does NOT end your turn. When you finish, declare the milestones you ACTUALLY",
+    "completed on `signal_done` (its `milestones_completed` field): list only what you truly",
+    "finished, and leave any you deliberately left undone undeclared, so the tracker reflects",
+    "what actually shipped rather than reading as 0 on a run that succeeded.",
   ].join("\n");
 }
 

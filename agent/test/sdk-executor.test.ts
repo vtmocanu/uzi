@@ -1647,6 +1647,61 @@ describe("SdkExecutor prd_done_path (PRD #72 M4)", () => {
   });
 });
 
+describe("SdkExecutor signal_done milestones_completed (PRD #265 M1)", () => {
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { result, turns, probe };
+  }
+
+  it("carries the declared ids off the TERMINATING turn into the result", async () => {
+    // Same hoisting hazard as prd_done_path: the turn that sets done is the turn that
+    // declares the milestones, and the latch is scoped inside the implement loop — without
+    // hoisting above the loop, `break` discards it and this reads undefined. This is the
+    // load-bearing single-turn flush path (the whole reason M1 exists).
+    const { result } = await runDeclaring({ milestones_completed: ["m1", "m3"] });
+    assert.deepStrictEqual(result.milestonesCompleted, ["m1", "m3"]);
+  });
+
+  it("omits the field when the lead declares nothing (additive-absent)", async () => {
+    const { result } = await runDeclaring({});
+    assert.strictEqual(result.milestonesCompleted, undefined);
+    assert.ok(!("milestonesCompleted" in result) || result.milestonesCompleted === undefined);
+  });
+
+  it("defensively parses a garbage declaration and still forwards the clean subset", async () => {
+    const { result } = await runDeclaring({ milestones_completed: ["m1", "m1", "", { x: 1 }, "m2"] });
+    assert.deepStrictEqual(result.milestonesCompleted, ["m1", "m2"]);
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", async () => {
+    const { result } = await runDeclaring({ milestones_completed: ["m1"] }, {});
+    assert.deepStrictEqual(result.milestonesCompleted, ["m1"]);
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never puts the ids on the result, even when declared`, async () => {
+      const { result } = await runDeclaring({ milestones_completed: ["m1"] }, { kind });
+      assert.strictEqual(result.milestonesCompleted, undefined, `${kind} must not forward a declaration`);
+    });
+
+    it(`a ${kind} run is not even OFFERED the parameter`, async () => {
+      const { turns } = await runDeclaring({}, { kind });
+      const shape = doneToolShapeOf(turns[0]!.options);
+      assert.ok(!("milestones_completed" in shape), `${kind}: the schema must not expose milestones_completed`);
+    });
+  }
+
+  it("an issue run IS offered the parameter", async () => {
+    const { turns } = await runDeclaring({}, { kind: "issue" });
+    assert.ok("milestones_completed" in doneToolShapeOf(turns[0]!.options));
+  });
+});
+
 /** The signal server's signal_done zod shape, read off a turn's options. */
 function doneToolShapeOf(o: SdkOptions): Record<string, unknown> {
   const server = (o.mcpServers as Record<string, unknown>)["uzi"] as { instance?: unknown };
