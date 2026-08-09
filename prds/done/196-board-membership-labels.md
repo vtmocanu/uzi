@@ -2,9 +2,9 @@
 
 **Issue**: [#196](https://gitlab.example.com/vtmocanu/uzi/-/issues/196) · **Label**: PRD · **Priority**: Medium
 **Area**: `web/src/lib/boardCards.ts` + `web/src/pages/Board.tsx` + `web/src/pages/IssueView.tsx` (render filter and card affordances) · `api/internal/settings` (three new keys) · a new per-user board-preference table · `api/internal/workersvc/service.go` (the run-eligibility gate) · `web/src/pages/AdminSettings.tsx`.
-**Mockup**: [`prds/mockups/196-board-membership-labels-mock.html`](mockups/196-board-membership-labels-mock.html) — seven sections, reviewed and approved 2026-08-02.
+**Mockup**: [`prds/mockups/196-board-membership-labels-mock.html`](../mockups/196-board-membership-labels-mock.html) — seven sections, reviewed and approved 2026-08-02.
 **Line references** are against `a87fd521`.
-**Status**: open. **M4 (eligibility) is the milestone that touches a guardrail-adjacent gate and must be reviewed on its own**, with two named guard tests. Everything before it is a render filter plus settings rows and cannot break a run.
+**Status**: complete — all six milestones (M1–M6) landed on branch `agent/issue-196` (2026-08-09). **M4 (eligibility) touched a guardrail-adjacent gate and was reviewed on its own**, with the named guard tests. One divergence from the plan, folded in during M4 review: the PRD-link waiver is scoped to *interactive* runs via an explicit `allowLinkWaiver` flag (`CreateRun` only), not merely to `!autoApprove` — the scheduler's non-auto-approve sweep (`CreateScheduledRun`) and autopilot never receive it, so a timer-fired sweep cannot start a link-less run unattended. Everything before M4 is a render filter plus settings rows and cannot break a run.
 
 **Reviewed 2026-08-02** by a verification subagent that opened every code citation. Ten defects and eight scope gaps were found and are folded in below; the [Review findings](#review-findings) section records what changed and why, because two of them were design errors rather than typos.
 
@@ -415,22 +415,22 @@ question 7), `CHANGELOG.md` (the upgrade behaviour change, both halves).
 
 ## Milestones
 
-- [ ] **M1 — The filter, client-side only.** `visibleCards` takes a label set; `labelChips`
+- [x] **M1 — The filter, client-side only.** `visibleCards` takes a label set; `labelChips`
       excludes the primary only, with matched labels hoisted ahead of the chip cap; the
       toolbar checkbox becomes the "Issues" popover reading payload labels; `IssueView` moves
       to the same predicate. Persistence still `localStorage`. Unit tests on the pure
       functions, and the existing `boardCards.test.ts` / `labelChips.test.ts` / `IssueView.test.tsx`
       cases updated. The board can show PRD + bug and nothing else.
-- [ ] **M2 — Admin defaults and delivery.** The three settings keys with `Validate` case arms
+- [x] **M2 — Admin defaults and delivery.** The three settings keys with `Validate` case arms
       (including the `validateBool` arm — it fails open otherwise) and `ValidateMerged`
       cross-key checks; `LabelChanged` deliberately not extended; the AdminSettings tag inputs;
       the board payload carries the resolved membership set and the session payload carries the
       eligible set; `api.ts` DTOs and `mockApi.ts` updated. Visibility only — run eligibility
       does not move yet.
-- [ ] **M3 — Per-user persistence.** The migration, the endpoint pair, the board reading and
+- [x] **M3 — Per-user persistence.** The migration, the endpoint pair, the board reading and
       writing it, *Reset to default*, and the `showNonPRD` migration from open question 4. A
       user's set follows the account across browsers.
-- [ ] **M4 — Run eligibility.** `isPRDIssue` becomes a set check; the PRD-link waiver **scoped
+- [x] **M4 — Run eligibility.** `isPRDIssue` becomes a set check; the PRD-link waiver **scoped
       to non-primary eligibility**; the Start/Promote branch on the card and in IssueView; the
       PRDLESS toggle's `isPRD` gate widened to "is eligible". **Reviewed on its own.** Ships
       with three guard tests:
@@ -442,10 +442,10 @@ question 7), `CHANGELOG.md` (the upgrade behaviour change, both halves).
          `PRDLESS` still returns `ErrNoPRDLink` with the waiver ON.** Test 2 cannot fail in that
          scenario, so it is not a substitute — a waiver implemented without the non-primary
          qualifier starts that run unattended.
-- [ ] **M5 — Docs, copy, changelog.** The three strings above, `docs/board.md`,
+- [x] **M5 — Docs, copy, changelog.** The three strings above, `docs/board.md`,
       `docs/admin-settings.md`, `docs/prdless.md`, and a changelog entry stating the upgrade
       behaviour change in both halves. No CLI change (open question 3).
-- [ ] **M6 — Mock parity check.** The shipped board matches
+- [x] **M6 — Mock parity check.** The shipped board matches
       `prds/mockups/196-board-membership-labels-mock.html` §3/§4/§7, verified in a browser
       against a mock-mode build (`VITE_UZI_MOCK=1` — never a non-mock `vite dev`/`preview`,
       which proxies to the live stack per CLAUDE.md).
