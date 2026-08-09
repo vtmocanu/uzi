@@ -1171,12 +1171,20 @@ func ValidateMerged(merged map[string]string) error {
 	eligible := parseLabelList(merged[KeyRunEligibleLabels])
 	extras := parseLabelList(merged[KeyBoardExtraLabels])
 
-	// The primary is not removable from the eligible set (Decision 1: the run gate
-	// must never make the primary non-runnable). The accessor also unions it in as a
-	// fail-safe, but a write dropping it must be refused so an admin is told.
+	// The primary is always eligible (Decision 1: the run gate must never make the
+	// primary non-runnable). We UNION it into the effective eligible set here rather
+	// than rejecting a set that omits it. A hard "must contain the primary" check
+	// wedges every settings PUT on an instance that renamed prd_label: the compiled-in
+	// default is the literal "PRD,bug", so on such an instance the effective eligible
+	// set never contains the renamed primary, and an unrelated change (e.g.
+	// default_theme) would be rejected because it re-validates the whole merged state.
+	// The accessor (RunEligibleLabels) unions the primary in for the same fail-safe
+	// reason, so a stored set missing it is harmless; the AdminSettings UI additionally
+	// pins the primary so a normal save always carries it. Union before the structural
+	// checks so the dedup/cap counts reflect what the accessor will actually return.
 	primary := merged[KeyPRDLabel]
 	if !containsLabel(eligible, primary) {
-		return fmt.Errorf("run_eligible_labels must contain the primary label %q", primary)
+		eligible = append([]string{primary}, eligible...)
 	}
 
 	// Each list: no duplicates, at most maxLabelListLen entries, and no entry equal

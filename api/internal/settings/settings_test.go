@@ -759,11 +759,25 @@ func TestValidateMergedListRules(t *testing.T) {
 		t.Fatalf("default lists rejected: %v", err)
 	}
 
-	// The primary is not removable from the eligible set.
+	// An eligible set omitting the primary is ACCEPTED, not rejected: ValidateMerged
+	// unions the primary in (matching the RunEligibleLabels accessor's fail-safe), so
+	// the primary is always eligible without a write-time error that would wedge
+	// unrelated PUTs. The AdminSettings UI pins the primary so a normal save carries it.
 	m := base()
 	m[KeyRunEligibleLabels] = "bug,security"
-	if err := ValidateMerged(m); err == nil || !strings.Contains(err.Error(), KeyRunEligibleLabels) {
-		t.Errorf("eligible set without the primary: err = %v, want a rejection naming run_eligible_labels", err)
+	if err := ValidateMerged(m); err != nil {
+		t.Errorf("eligible set omitting the primary should be accepted (primary is unioned in): %v", err)
+	}
+
+	// Regression: on an instance that renamed prd_label, the compiled-in default
+	// run_eligible_labels ("PRD,bug") does not contain the renamed primary. A hard
+	// "must contain the primary" check here rejected EVERY settings PUT on such an
+	// instance (it re-validates the whole merged state). The union must make this pass.
+	m = base()
+	m[KeyPRDLabel] = "spec"
+	m[KeyRunEligibleLabels] = "PRD,bug" // the default, which lacks the renamed primary
+	if err := ValidateMerged(m); err != nil {
+		t.Errorf("renamed-primary instance with default eligible set should not wedge settings PUT: %v", err)
 	}
 
 	// Duplicate entries are rejected, in either list.
