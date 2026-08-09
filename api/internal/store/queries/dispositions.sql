@@ -80,18 +80,3 @@ LEFT JOIN recommendation_dispositions d
 LEFT JOIN recommendation_filed_issues f
     ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
 WHERE rv.user_id = @user_id;
-
--- name: CountJudgeGroupsByCategoryForUser :many
--- Per-category GROUP count (distinct (category, target) coordinates) across the
--- caller's whole backlog, for the Judge filter-chip counts (#244). Uncapped by
--- design: canonical per-category aggregate, exact even when the backlog list
--- truncates. COUNT(DISTINCT rr.target) within each category == one per group,
--- matching GroupJudgeRecommendations' (category, target) coordinate. No
--- disposition/filed joins: whole-backlog, all triage states. Drops the backlog
--- query's inner JOIN runs (target_run_id is NOT NULL UNIQUE, a lossless 1:1) --
--- do NOT re-add it.
-SELECT rr.category AS category, COUNT(DISTINCT rr.target)::bigint AS group_count
-FROM run_reviews rv
-JOIN review_recommendations rr ON rr.review_id = rv.id
-WHERE rv.user_id = @user_id
-GROUP BY rr.category;

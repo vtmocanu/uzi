@@ -13,25 +13,33 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// TestJudgeCategoryStatsUncappedAndDedupedLiveDB pins the two properties PRD #244 Decision 6
-// required of the per-category chip count, and which a fake store structurally CANNOT show
-// because the fake returns aggregate rows verbatim:
+// TestJudgeCategoryStatsMatrixUncappedAndDedupedLiveDB pins the two properties PRD #270
+// requires of the Judge chip-count matrix, and which a fake store structurally CANNOT show —
+// both are properties of the UNCAPPED whole-backlog load feeding the shared Go rollup, not of
+// any single hand-written row set:
 //
-//  1. UNCAPPED. CountJudgeGroupsByCategoryForUser has no LIMIT, so a category whose groups
-//     sit ENTIRELY past the backlog's 2000-row cap is still counted in full — the chip reads
-//     the true figure while the truncated list shows none of that category's cards.
-//  2. DEDUPED TO GROUPS. COUNT(DISTINCT rr.target) GROUP BY rr.category counts one per
-//     (category, target) coordinate, so a coordinate recurring across ≥2 reviews/runs counts
-//     ONCE — not once per row. A raw-row count would over-report.
+//  1. UNCAPPED. JudgeCategoryStats loads the rows with Lim: 0 (the LIMIT NULLIF sentinel), so
+//     a category whose groups sit ENTIRELY past the backlog's 2000-row cap is still rolled up
+//     in full — the chip reads the true figure while the truncated list shows none of that
+//     category's cards.
+//  2. DEDUPED TO GROUPS. GroupJudgeRecommendations dedups by (category, target), so a
+//     coordinate recurring across ≥2 reviews/runs counts ONCE — not once per row. A raw-row
+//     count would over-report.
+//
+// It exercises the REAL service (workersvc.JudgeCategoryStats → the shared rollup → the
+// matrix), because PRD #94 Decision 2 forbids re-expressing the bucket ladder in SQL: there is
+// no aggregate query to test in isolation any more, and the matrix's `all` count is the thing
+// the chip renders. Every seeded group is open (no disposition, no filed link), so it rolls up
+// todo; `all` and `todo` therefore carry the same true count.
 //
 // The contrast is drawn against the UNFILTERED (?bucket=all, no ?category=) backlog, because
 // #235 pushed the category predicate BELOW the LIMIT: a category-filtered request can never
-// truncate that label off-page, so only the all-labels list demonstrates the aggregate doing
-// work the delivered list cannot.
+// truncate that label off-page, so only the all-labels list demonstrates the rollup doing work
+// the delivered list cannot.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (the store-IT runner
 // e2e/run-store-it.sh provides one); `go test ./...` without it SKIPs.
-func TestJudgeCategoryStatsUncappedAndDedupedLiveDB(t *testing.T) {
+func TestJudgeCategoryStatsMatrixUncappedAndDedupedLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
@@ -138,32 +146,36 @@ func TestJudgeCategoryStatsUncappedAndDedupedLiveDB(t *testing.T) {
 	// bulk targets PLUS the one duplicated coordinate (counted once), so:
 	wantTargetCount := improveUziGroups + 1
 
-	// ---- 1. the aggregate is UNCAPPED and DEDUPED --------------------------------------
-	rows, err := q.CountJudgeGroupsByCategoryForUser(ctx, owner)
-	if err != nil {
-		t.Fatalf("CountJudgeGroupsByCategoryForUser: %v", err)
-	}
-	counts := map[string]int{}
-	for _, r := range rows {
-		counts[r.Category] = int(r.GroupCount)
-	}
-	if got := counts[targetCat]; got != wantTargetCount {
-		t.Fatalf("category-stats %s = %d, want %d — the aggregate must count EVERY group "+
-			"(uncapped, past the %d-row backlog cap) and count a cross-run coordinate ONCE "+
-			"(COUNT(DISTINCT target))", targetCat, got, wantTargetCount, workersvc.JudgeBacklogMaxRows)
-	}
-	// The filler category's own count is its distinct targets — a secondary check that
-	// GROUP BY separates the categories rather than lumping them.
-	if got := counts[fillerCat]; got != fillerRows {
-		t.Errorf("category-stats %s = %d, want %d (each filler row is its own group)", fillerCat, got, fillerRows)
-	}
-
-	// ---- 2. the UNFILTERED backlog list truncates and drops the target category off-page
 	box, err := secretbox.New(make([]byte, secretbox.KeySize))
 	if err != nil {
 		t.Fatalf("secretbox: %v", err)
 	}
 	svc := workersvc.New(q, box, workersvc.Params{})
+
+	// ---- 1. the matrix is UNCAPPED and DEDUPED -----------------------------------------
+	stats, err := svc.JudgeCategoryStats(ctx, owner, uuid.Nil)
+	if err != nil {
+		t.Fatalf("JudgeCategoryStats: %v", err)
+	}
+	// Every seeded group is open → rolls up todo, so `all` and `todo` agree; assert on `all`,
+	// the whole-backlog fallback the chip reads.
+	counts := stats.CountsByBucket["all"]
+	if got := counts[targetCat]; got != wantTargetCount {
+		t.Fatalf("category-stats all[%s] = %d, want %d — the rollup must count EVERY group "+
+			"(uncapped, past the %d-row backlog cap) and count a cross-run coordinate ONCE "+
+			"(dedup by (category, target))", targetCat, got, wantTargetCount, workersvc.JudgeBacklogMaxRows)
+	}
+	// The open groups roll up todo, never a settled rung — a second, tab-scoped assertion.
+	if got := stats.CountsByBucket["todo"][targetCat]; got != wantTargetCount {
+		t.Fatalf("category-stats todo[%s] = %d, want %d (every seeded group is open → todo)", targetCat, got, wantTargetCount)
+	}
+	// The filler category's own count is its distinct targets — a secondary check that the
+	// rollup separates the categories rather than lumping them.
+	if got := counts[fillerCat]; got != fillerRows {
+		t.Errorf("category-stats all[%s] = %d, want %d (each filler row is its own group)", fillerCat, got, fillerRows)
+	}
+
+	// ---- 2. the UNFILTERED backlog list truncates and drops the target category off-page
 	backlog, err := svc.JudgeRecommendationBacklog(ctx, owner, "all", uuid.Nil, nil)
 	if err != nil {
 		t.Fatalf("JudgeRecommendationBacklog: %v", err)
