@@ -123,8 +123,10 @@ func TestScheduleCRUDRoundTripLiveDB(t *testing.T) {
 	if dto.ID == "" || dto.Target != "issue" || dto.IssueIID == nil || *dto.IssueIID != 7 {
 		t.Fatalf("create dto = %+v, want issue/7", dto)
 	}
-	if !dto.AutoApprove || dto.WaitOnLimit || !dto.Enabled {
-		t.Fatalf("create defaults = auto:%v wait:%v enabled:%v, want true/false/true", dto.AutoApprove, dto.WaitOnLimit, dto.Enabled)
+	// PRD #274 Decision 1a: wait_on_limit now defaults ON at create time (a schedule is
+	// unattended, so a fired run parks on the usage limit rather than dying).
+	if !dto.AutoApprove || !dto.WaitOnLimit || !dto.Enabled {
+		t.Fatalf("create defaults = auto:%v wait:%v enabled:%v, want true/true/true", dto.AutoApprove, dto.WaitOnLimit, dto.Enabled)
 	}
 	if dto.NextFireAt == nil {
 		t.Fatalf("recurring schedule should have a next_fire_at")

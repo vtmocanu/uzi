@@ -131,6 +131,35 @@ func TestValidateScheduleConfigNormalizes(t *testing.T) {
 
 // TestOnlyEnabled pins the "PATCH carries only enabled" detection the handler uses to
 // skip the config UPDATE.
+// TestApplyCreateDefaults pins the create-time tri-state defaults. PRD #274 Decision 1a
+// flips wait_on_limit ON (auto_approve and enabled stay ON); a present pointer — even to
+// false — is always respected so an explicit opt-out survives.
+func TestApplyCreateDefaults(t *testing.T) {
+	// All omitted: every flag defaults on.
+	req := apitypes.ScheduleRequest{}
+	applyCreateDefaults(&req)
+	if req.AutoApprove == nil || !*req.AutoApprove {
+		t.Fatalf("auto_approve default = %v, want true", req.AutoApprove)
+	}
+	if req.WaitOnLimit == nil || !*req.WaitOnLimit {
+		t.Fatalf("wait_on_limit default = %v, want true (PRD #274 Decision 1a)", req.WaitOnLimit)
+	}
+	if req.Enabled == nil || !*req.Enabled {
+		t.Fatalf("enabled default = %v, want true", req.Enabled)
+	}
+
+	// Explicit false is preserved, not overwritten by the new ON default.
+	no := false
+	req = apitypes.ScheduleRequest{WaitOnLimit: &no, AutoApprove: &no}
+	applyCreateDefaults(&req)
+	if req.WaitOnLimit == nil || *req.WaitOnLimit {
+		t.Fatalf("explicit wait_on_limit=false must be respected, got %v", req.WaitOnLimit)
+	}
+	if req.AutoApprove == nil || *req.AutoApprove {
+		t.Fatalf("explicit auto_approve=false must be respected, got %v", req.AutoApprove)
+	}
+}
+
 func TestOnlyEnabled(t *testing.T) {
 	yes := true
 	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes}) {

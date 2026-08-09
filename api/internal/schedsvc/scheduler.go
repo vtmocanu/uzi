@@ -81,6 +81,11 @@ type RunCreator interface {
 	// starts a link-less non-primary-eligible run (see workersvc.CreateScheduledRun).
 	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *workersvc.SeededPlan) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
+	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
+	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
+	// instead of the owner default. It is a distinct method so the poller's
+	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error)
 }
 
@@ -335,19 +340,25 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 // link, description too large) are swallowed so the schedule still advances;
 // ErrRepoNotFound is permanent; anything else is transient.
 //
-// Decision 2: CreateAutopilotRun uses the OWNER's wait-on-limit default (an
-// auto-approve run has no human in the loop), so the schedule's wait_on_limit is
-// threaded ONLY on the non-auto-approve CreateScheduledRun path. This is intentional —
-// do not change the seam to thread it through the autopilot path.
+// Wait-on-limit (PRD #274 Decision 1a, revising PRD #241 Decision 2): BOTH branches now
+// thread the schedule's persisted wait_on_limit. The auto-approve branch fires through
+// CreateScheduledAutopilotRun (NOT the poller's CreateAutopilotRun, whose seam stays
+// untouched so label-driven autopilot keeps taking the owner default); the non-auto
+// branch fires through CreateScheduledRun. So a schedule's explicit wait_on_limit takes
+// effect regardless of auto_approve.
 func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
+	waitOnLimit := sched.WaitOnLimit
 	var run store.Run
 	var err error
 	if sched.AutoApprove {
-		run, err = e.runs.CreateAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD)
+		// CreateScheduledAutopilotRun, NOT the poller's CreateAutopilotRun: a scheduled
+		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
+		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
+		// guarantee that label-driven autopilot behaviour is unchanged.
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, description, allowWithoutPRD, &waitOnLimit)
 	} else {
-		waitOnLimit := sched.WaitOnLimit
 		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
 		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
 		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using

@@ -104,8 +104,8 @@ func TestScheduleCreateIssueBody(t *testing.T) {
 	if req.AutoApprove == nil || !*req.AutoApprove {
 		t.Errorf("auto_approve = %v, want a non-nil true (default ON)", req.AutoApprove)
 	}
-	if req.WaitOnLimit == nil || *req.WaitOnLimit {
-		t.Errorf("wait_on_limit = %v, want a non-nil false (default OFF)", req.WaitOnLimit)
+	if req.WaitOnLimit == nil || !*req.WaitOnLimit {
+		t.Errorf("wait_on_limit = %v, want a non-nil true (default ON)", req.WaitOnLimit)
 	}
 }
 

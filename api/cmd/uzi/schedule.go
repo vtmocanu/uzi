@@ -87,7 +87,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
 	create.Flags().Bool("auto-approve", true, "proceed past the plan gate unattended; pass --auto-approve=false to keep the gate")
-	create.Flags().Bool("wait-on-limit", false, "park a fired run until the Anthropic usage window reopens instead of failing it")
+	create.Flags().Bool("wait-on-limit", true, "park a fired run until the Anthropic usage window reopens instead of failing it; pass --wait-on-limit=false to fail on limit")
 	return create
 }
 

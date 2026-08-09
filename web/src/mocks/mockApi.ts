@@ -3257,7 +3257,7 @@ export const mockApi = {
       next_fire_at: null,
       last_fired_at: null,
       auto_approve: input.auto_approve ?? true,
-      wait_on_limit: input.wait_on_limit ?? false,
+      wait_on_limit: input.wait_on_limit ?? true,
       enabled: input.enabled ?? true,
       status: "active",
       created_at: now,

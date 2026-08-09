@@ -357,15 +357,18 @@ func (h *Handler) scheduleParam(w http.ResponseWriter, r *http.Request) (store.U
 }
 
 // applyCreateDefaults fills the create-time defaults for the three tri-state flags:
-// auto_approve ON (Decision 4), wait_on_limit off, enabled on. A nil pointer means the
-// caller omitted the field; a present pointer (even to false) is respected.
+// auto_approve ON (PRD #241 Decision 4), wait_on_limit ON (PRD #274 Decision 1a — a
+// schedule is unattended, so a fired run should park on the usage limit rather than die),
+// enabled on. A nil pointer means the caller omitted the field; a present pointer (even to
+// false) is respected. Create-time only: existing rows are not rewritten (PRD #274
+// Decision 4).
 func applyCreateDefaults(req *apitypes.ScheduleRequest) {
 	if req.AutoApprove == nil {
 		v := true
 		req.AutoApprove = &v
 	}
 	if req.WaitOnLimit == nil {
-		v := false
+		v := true
 		req.WaitOnLimit = &v
 	}
 	if req.Enabled == nil {

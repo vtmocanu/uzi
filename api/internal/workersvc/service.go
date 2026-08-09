@@ -3262,6 +3262,20 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil)
 }
 
+// CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
+// the schedule's explicit wait-on-limit intent (PRD #274 Decision 1a). It is IDENTICAL
+// to CreateAutopilotRun EXCEPT it threads the caller-supplied waitOnLimit instead of
+// forcing nil: unlike the label poller (which has no per-run choice and so falls back to
+// the owner default), a scheduled run carries a persisted per-schedule wait_on_limit that
+// must take effect. Kept as a SEPARATE method on purpose — the poller's CreateAutopilotRun
+// seam (its interface, fake, and call site) stays byte-identical, so widening the
+// scheduler seam cannot change label-driven autopilot. allowLinkWaiver=false and seed=nil
+// for the same reasons as CreateAutopilotRun: a scheduled sweep is unattended, so PRD
+// #196's PRD-link waiver never applies, and autopilot never seeds its plan.
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, nil /*seed*/)
+}
+
 // SeededPlan carries a create-time externally-authored plan and its optional agent
 // selection (PRD #209). A run created with a SeededPlan skips the Phase-1 planning
 // turn and the approval gate: the worker implements PlanMD directly. Nil for an

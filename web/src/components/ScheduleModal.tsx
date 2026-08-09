@@ -191,7 +191,7 @@ export function ScheduleModal({
   );
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? false);
+  const [waitOnLimit, setWaitOnLimit] = useState<boolean>(editing?.wait_on_limit ?? true);
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);

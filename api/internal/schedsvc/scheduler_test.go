@@ -66,6 +66,11 @@ type autopilotCall struct {
 	issueIID        int64
 	description     string
 	allowWithoutPRD bool
+	// waitOnLimit is nil for the poller-shaped CreateAutopilotRun (which drops the
+	// per-run choice and takes the owner default) and carries the schedule's captured
+	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
+	// auto-approve scheduled path threads the schedule's wait_on_limit by reading it.
+	waitOnLimit *bool
 }
 
 type runCall struct {
@@ -116,7 +121,20 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD})
+	// nil waitOnLimit: the poller seam has no per-run choice (owner default). Kept so the
+	// interface stays satisfied even though the scheduler no longer calls it.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil})
+	return store.Run{ID: uuid.New()}, nil
+}
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
+	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
+	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) so a test
+	// can prove the schedule's persisted wait_on_limit is threaded through.
+	if f.err != nil {
+		return store.Run{}, f.err
+	}
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error) {
@@ -227,10 +245,10 @@ func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	h.sched.Boot(context.Background())
 
 	if len(h.runs.autopilot) != 1 {
-		t.Fatalf("auto-approve issue: CreateAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
 	}
 	if len(h.runs.runs) != 0 {
-		t.Fatalf("auto-approve issue must NOT use the wait-on-limit CreateRun path, got %d", len(h.runs.runs))
+		t.Fatalf("auto-approve issue must NOT use the non-auto CreateScheduledRun path, got %d", len(h.runs.runs))
 	}
 	call := h.runs.autopilot[0]
 	if call.userID != h.owner || call.repoID != h.repoID || call.issueIID != 7 {
@@ -245,6 +263,31 @@ func TestTickIssueScheduleFiresAndAdvances(t *testing.T) {
 	}
 	if !adv.NextFireAt.Valid || !adv.NextFireAt.Time.After(h.now) {
 		t.Fatalf("recurring next_fire_at = %+v, want a bumped future instant", adv.NextFireAt)
+	}
+}
+
+// TestTickAutoApproveIssueThreadsWaitOnLimit pins PRD #274 Decision 1a: an auto-approve
+// scheduled run must fire through CreateScheduledAutopilotRun and thread the schedule's
+// persisted wait_on_limit (not the poller's CreateAutopilotRun, which drops it to the
+// owner default). A nil captured value would mean the scheduler wrongly used the poller
+// seam; the assertion below fails in that case.
+func TestTickAutoApproveIssueThreadsWaitOnLimit(t *testing.T) {
+	h := newHarness()
+	s := h.issueSchedule() // AutoApprove=true
+	s.WaitOnLimit = true
+	h.st.due = []store.RunSchedule{s}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.runs.autopilot) != 1 {
+		t.Fatalf("auto-approve issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+	}
+	got := h.runs.autopilot[0].waitOnLimit
+	if got == nil {
+		t.Fatalf("auto-approve scheduled run dropped wait_on_limit (nil) — it took the poller seam instead of CreateScheduledAutopilotRun")
+	}
+	if !*got {
+		t.Fatalf("auto-approve scheduled run threaded wait_on_limit = %v, want true (the schedule's persisted value)", *got)
 	}
 }
 
@@ -283,7 +326,7 @@ func TestTickOnceScheduleFiresToStatus(t *testing.T) {
 	h.sched.Boot(context.Background())
 
 	if len(h.runs.autopilot) != 1 {
-		t.Fatalf("once issue: CreateAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
+		t.Fatalf("once issue: CreateScheduledAutopilotRun calls = %d, want 1", len(h.runs.autopilot))
 	}
 	if len(h.st.advanceCalls) != 1 {
 		t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
