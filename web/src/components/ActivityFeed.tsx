@@ -484,19 +484,12 @@ export function ActivityFeed({
   const activeAgent = runningLive ? newestAgent : undefined;
   const activeLane = runningLive ? newestLane : undefined;
 
-  // ── Collapse-by-default with a finished/single-agent auto-expand escape (S5) ──
-  // Default: collapsed. Auto-expand a terminal or single-actor run so reading a done
-  // 8-agent run is not death-by-clicks. A per-actor override (user click) always wins;
-  // Expand all / Collapse all sets a bulk mode and clears overrides.
-  //
-  // The terminal half of that rule is frozen AT MOUNT (arrivedTerminal), not read live.
-  // Auto-expand exists so landing on an already-finished run does not cost 8 clicks — but
-  // when a run finishes WHILE you are watching it, letting `terminal` flip live would fling
-  // every un-touched lane open and discard the collapsed view you were reading. The feed
-  // holds no persisted per-lane state, so that expansion is unrecoverable except by
-  // re-collapsing each lane. Freezing it means: opened-when-done → expanded (unchanged);
-  // watched-it-finish → keeps whatever you had. actorKeys.length stays live because a
-  // single-actor run is already expanded throughout its life, so nothing jumps there.
+  // ── Collapse-by-default with a single-agent auto-expand escape (S5) ──
+  // Default: collapsed. A multi-agent run (live OR finished) opens collapsed; only a
+  // single-actor run auto-expands, since it is already one lane. "Expand all" is the
+  // one-click escape for reading a done 8-agent run without death-by-clicks. A per-actor
+  // override (user click) always wins; Expand all / Collapse all sets a bulk mode and
+  // clears overrides.
   //
   // Overrides are keyed by the CURRENT view's actor key (lane key vs role name). The two
   // key spaces overlap only where a lane has no instance and is keyed by its role, which
@@ -508,14 +501,7 @@ export function ActivityFeed({
   const actorKeys = byAgent ? lanes.map((l) => l.key) : crew.order;
   const countFor = (key: string): number =>
     byAgent ? (laneAgg.get(key)?.count ?? 0) : (crew.count.get(key) ?? 0);
-  // Freezing at mount stays correct across run→run navigation only because useRunStream
-  // (useRunStream.ts) calls setRun(null) on an id change, which trips RunView.tsx's
-  // `if (!run)` gate and remounts this component, so `terminal` is re-captured per run.
-  // A future "keep the previous run visible while the next loads" (anti-flash) change would
-  // drop that remount and let arrivedTerminal leak a stale `false` across navigation — pin
-  // this with a cross-run test before making it.
-  const arrivedTerminal = useRef(terminal).current;
-  const autoExpand = arrivedTerminal || actorKeys.length <= 1;
+  const autoExpand = actorKeys.length <= 1;
   const isExpanded = (key: string): boolean => {
     const o = overrides.get(key);
     if (o !== undefined) return o;

@@ -42,6 +42,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   guardrail, worker-held PAT, and human MR review are all unchanged: this
   opt-in grants context, not permissions. (#246)
 
+### Fixed
+
+- **Returning to an already-finished multi-agent run now shows its agent lanes
+  collapsed — the same as a live run — instead of auto-expanding every lane.**
+  Opening or reloading a done multi-agent run previously sprang every lane open;
+  it now opens collapsed, with "Expand all" as the one-click way to reveal them.
+  This generalizes the earlier watched-while-finishing fix: a done run and a live
+  run now share one code path, and expansion no longer branches on run state at
+  all (single-actor runs still auto-expand). (#277)
+
 ## [0.23.0] - 2026-08-09
 
 ### Added
