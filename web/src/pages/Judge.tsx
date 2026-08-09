@@ -194,11 +194,16 @@ export function Judge() {
   }, [runAnchor]);
 
   useEffect(() => {
+    // Alias the generation ref to a local so the cleanup does not read
+    // `categoryStatsGen.current` directly (react-hooks/exhaustive-deps): this ref is a
+    // monotonic invalidation counter, not a DOM node, so reading its live value in cleanup
+    // is intentional, not the stale-node hazard the rule guards against.
+    const genRef = categoryStatsGen;
     loadCategoryStats();
     // Invalidate any in-flight fetch so a late response never overwrites a fresher one (or
     // lands after unmount): the next issued fetch — or this cleanup — advances the generation.
     return () => {
-      categoryStatsGen.current++;
+      genRef.current++;
     };
   }, [loadCategoryStats]);
 
