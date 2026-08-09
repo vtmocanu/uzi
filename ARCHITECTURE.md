@@ -1097,6 +1097,19 @@ on.
   restricted namespace already relied on — plus its own default-deny
   `NetworkPolicy` (in-cluster lateral egress denied; external egress is the
   named [PRD #50](prds/50-llm-egress-proxy.md) residual, not closed here).
+  **The two tiers' external egress is OPPOSITE, and a probe that does not name
+  the tier is uninterpretable:** the **restricted** tier enforces the FQDN
+  allowlist (`worker-fqdn-egress.yaml` over the `worker-networkpolicy.yaml`
+  default-deny floor — only `cache.nixos.org`, the forge, `*.anthropic.com`,
+  and the CNPG-chart hosts; `api.github.com` **TIMEOUT**, measured #123 §1),
+  while the **docker** tier reaches arbitrary internet hosts by design
+  (`0.0.0.0/0`-except-in-cluster by CIDR, `worker-docker-networkpolicy.yaml`:
+  `api.github.com` **200**, `search.devbox.sh` **404**) — [PRD #50](prds/50-llm-egress-proxy.md)'s
+  residual, not a broken control. A docker-tier reading looks exactly like a
+  broken standard-tier allowlist; two false alarms have resulted (an operator
+  during #123, and a closed #283 on 2026-08-09), so **check `uzi admin workers`
+  → `docker:` (true = docker tier = broad egress) before concluding anything
+  about egress enforcement, and re-measure on the restricted tier.**
   Both namespaces' Roles carry the same pinned-minimal verbs: Deployments/PVCs
   create/list/patch(Deployments only)/delete; Secrets **create/delete
   only** — no `get`/`list`, so the controller writes each worker's join
