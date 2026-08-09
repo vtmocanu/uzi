@@ -405,15 +405,23 @@ func run() error {
 		settingsCache.PublicBaseURL,
 		slog.Default(),
 	)
-	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
-
 	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
 	// It persists the row first, then delivers best-effort through slackNotifier
 	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
 	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
 	// straight to the store, so the handler only needs the seam wired for future
-	// producers.
+	// producers. Built before SetBroadcaster because failNotifier (below) writes
+	// through it and joins the broadcast fan-out.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
+
+	// Run-failure inbox notifier (PRD #284 M5): a Broadcaster that lands an inbox
+	// notification when a run transitions to "failed", so a user WITHOUT Slack gets
+	// a badge on failure (the slacksvc ❌ DM only reaches opted-in users). It writes
+	// through notifier with Slack == nil (inbox-only — no double-DM), and sits in
+	// the MultiBroadcaster so it covers worker-reported AND sweep-driven failures
+	// uniformly. PublishState never blocks; a drain goroutine (below) does the work.
+	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
+	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
 
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
@@ -495,7 +503,7 @@ func run() error {
 	pcheck := privcheck.NewService(q, svc)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(5)
+	bgWG.Add(6)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -515,6 +523,10 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		slackNotifier.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		failNotifier.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)

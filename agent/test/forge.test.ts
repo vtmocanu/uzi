@@ -309,6 +309,46 @@ describe("GitHubClient.createMergeRequest", () => {
   });
 });
 
+// PRD #284 M6 (D3): the retry loop wraps the WHOLE createMergeRequest, so a
+// transient failure of the findOpenMr GET during a duplicate POST must surface as a
+// transient ForgeError (>=500) — not be swallowed to undefined and then reported as
+// the POST's permanent 409/422 — so withForgeRetry re-runs a run whose MR exists.
+describe("createMergeRequest — transient findOpenMr during a duplicate (PRD #284 D3)", () => {
+  it("adopt-existing is preserved: a duplicate POST + 200 GET returns the existing MR", async () => {
+    const { fetchFn } = recorder([
+      { status: 409, body: { message: ["Another open merge request already exists: !7"] } },
+      { status: 200, body: [{ iid: 7, web_url: "https://gitlab.example.com/x/-/merge_requests/7" }] },
+    ]);
+    const mr = await new GitLabClient({ fetchFn }).createMergeRequest(base);
+    assert.deepStrictEqual(mr, { iid: 7, webUrl: "https://gitlab.example.com/x/-/merge_requests/7" });
+  });
+
+  it("a 5xx on the findOpenMr GET now THROWS a transient ForgeError (>=500), not the POST's 409", async () => {
+    const { fetchFn, calls } = recorder([
+      { status: 409, body: { message: "duplicate" } },
+      { status: 503, body: "service unavailable" },
+    ]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).createMergeRequest(base),
+      (err: unknown) => err instanceof ForgeError && err.status === 503,
+    );
+    // Both the POST and the GET were made; the GET's 5xx surfaced as transient.
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(calls[1]!.method, "GET");
+  });
+
+  it("a duplicate POST + a 404 (no existing MR) still fails fast with the POST status", async () => {
+    const { fetchFn } = recorder([
+      { status: 409, body: { message: "duplicate" } },
+      { status: 404, body: { message: "not found" } },
+    ]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).createMergeRequest(base),
+      (err: unknown) => err instanceof ForgeError && err.status === 409,
+    );
+  });
+});
+
 describe("forgeClientFor", () => {
   it("selects GitLab for absent/gitlab, Forgejo for forgejo, GitHub for github", () => {
     assert.ok(forgeClientFor(undefined) instanceof GitLabClient);

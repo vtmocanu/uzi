@@ -36,6 +36,7 @@ import {
   type PlanVerdict,
 } from "./steering.js";
 import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
+import { withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
@@ -1041,12 +1042,24 @@ export class RunRunner {
           text: "work complete; pushing branch and opening merge request",
         },
       });
-      await this.git.pushBranch(
-        barePath,
-        result.branch,
-        claim.secrets.forge_pat,
-        claim.repo.clone_url,
-        claim.secrets.forge_username,
+      // PRD #284 Layer A: a transient push failure (a dropped HTTP/2 stream, a 5xx,
+      // a connection reset) must retry rather than discard the agent's already-
+      // committed work; a permanent rejection (auth, protected branch, non-fast-
+      // forward) still fails fast and propagates to the catch below. The push is
+      // idempotent on retry (non-forced, same commits → "Everything up-to-date").
+      // Capture the narrowed bare path in a const: barePath is an outer `let`
+      // (string | undefined) and TS drops the narrowing inside the retry closure.
+      const pushBarePath = barePath;
+      await withForgeRetry(
+        () =>
+          this.git.pushBranch(
+            pushBarePath,
+            result.branch,
+            claim.secrets.forge_pat,
+            claim.repo.clone_url,
+            claim.secrets.forge_username,
+          ),
+        { log: runLog },
       );
       const targetBranch =
         claim.repo.default_branch?.trim() ||
@@ -1065,20 +1078,29 @@ export class RunRunner {
           : claim.repo.forge_type === "github"
             ? this.github
             : this.gitlab;
-      const mr = await forge.createMergeRequest({
-        repoUrl: claim.repo.url,
-        pat: claim.secrets.forge_pat,
-        sourceBranch: result.branch,
-        targetBranch,
-        title: mrTitle(claim),
-        description: mrDescription(
-          claim,
-          result.branch,
-          result.agentSelection,
-          selfImproveSection,
-          promptGuardSection,
-        ),
-      });
+      // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
+      // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
+      // already idempotent — on a duplicate it adopts the existing MR/PR — but a
+      // transient findOpenMr failure after a duplicate POST would otherwise fail a run
+      // whose MR actually exists; retrying the whole call re-runs it instead.
+      const mr = await withForgeRetry(
+        () =>
+          forge.createMergeRequest({
+            repoUrl: claim.repo.url,
+            pat: claim.secrets.forge_pat,
+            sourceBranch: result.branch,
+            targetBranch,
+            title: mrTitle(claim),
+            description: mrDescription(
+              claim,
+              result.branch,
+              result.agentSelection,
+              selfImproveSection,
+              promptGuardSection,
+            ),
+          }),
+        { log: runLog },
+      );
       batcher.emit({
         kind: "status",
         agent: "worker",
