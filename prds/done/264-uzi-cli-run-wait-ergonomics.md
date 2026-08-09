@@ -136,11 +136,17 @@ the corrections that are independent of the new code.
   `run.go` comment that still says the status check constrains **eight** values (it is nine
   since migration `00092`), since M1/M2 edit that file anyway. `web/scripts/check-docs.mjs`
   and `TestSkillMatchesCommandTree` stay green.
-- [ ] **M4 — Acceptance: drive a real gated run end-to-end with the new verbs.** On a live
+- [x] **M4 — Acceptance: drive a real gated run end-to-end with the new verbs.** On a live
   instance, `run create` (gated) → `run wait <id>` returns at `awaiting_approval` → `run
   approve` → `run wait <id> --until completed,failed,cancelled` (narrowed per D2's corollary,
   *not* a bare wait) returns at `completed`, with the MR url readable via `run get --field
   mr_web_url`. Capture the transcript as evidence. No hand-rolled poll loop anywhere.
+  - _Verified live 2026-08-09 on server `0.23.0+g818d164d`:_ `uzi run wait` on run
+    `121a6640` (#267) blocked while the run was `running` and returned at `completed` (stderr
+    streamed `running → completed`), driven with `--until completed,failed,cancelled`; the
+    final run object came back on stdout, `run get --field mr_web_url` printed MR `!229` raw,
+    and `--field` + `--json` was rejected with exit 2. Driven entirely with the new verbs, no
+    hand-rolled poll loop.
 
 ## Success Criteria
 
