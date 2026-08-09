@@ -77,6 +77,13 @@ describe("formatDuration", () => {
     expect(formatDuration(65000)).toBe("1m 05s");
     expect(formatDuration(-5)).toBe("0.0s");
   });
+  it("rolls over to hours and never renders a 60-second field", () => {
+    expect(formatDuration(90 * 60 * 1000)).toBe("1h 30m 00s");
+    expect(formatDuration(120 * 60 * 1000)).toBe("2h 00m 00s");
+    expect(formatDuration(60 * 60 * 1000)).toBe("1h 00m 00s");
+    expect(formatDuration(59 * 60 * 1000 + 30 * 1000)).toBe("59m 30s");
+    expect(formatDuration(119600)).toBe("2m 00s");
+  });
 });
 
 describe("truncate", () => {

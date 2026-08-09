@@ -111,6 +111,59 @@ var (
 	runWaitMaxUnreachable = 5
 )
 
+// runAgeCell renders the AGE column for `uzi run list` (issue #256 M5), the CLI twin
+// of the web's runDurationLabel. AGE means different things per state, so the anchor is
+// chosen by status (Decision 2), not by a single "created" reading:
+//
+//   - running   → time since StartedAt (when the agent began), or CreatedAt if unstamped.
+//   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
+//   - queued    → time since CreatedAt (how long it has waited to be claimed).
+//   - awaiting_approval / awaiting_input / limit_wait → time since UpdatedAt, i.e. how long
+//     it has been parked in that waiting state.
+//   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
+//     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
+//     failed before it ever started) never ran, so it renders "-".
+//   - any other/unknown status → "-".
+//
+// The live (non-terminal) buckets pass now.Sub(anchor) through formatUptimeDuration, which
+// floors negatives (clock skew) to "<1m". now is taken as a parameter, not read from the
+// clock inside, so the buckets unit-test deterministically — the same split as
+// formatUptimeDuration out of uptimeCell.
+func runAgeCell(r apitypes.RunDTO, now time.Time) string {
+	var anchor *time.Time
+	switch r.Status {
+	case "running":
+		if r.StartedAt != nil {
+			anchor = r.StartedAt
+		} else {
+			anchor = &r.CreatedAt
+		}
+	case "claimed":
+		if r.ClaimedAt != nil {
+			anchor = r.ClaimedAt
+		} else {
+			anchor = &r.CreatedAt
+		}
+	case "queued":
+		anchor = &r.CreatedAt
+	case "awaiting_approval", "awaiting_input", statusLimitWait:
+		anchor = &r.UpdatedAt
+	case "completed", "failed", "cancelled":
+		// A static ran-span, not a live age: only meaningful when the run both started
+		// and finished. Missing either end (never started) → "-".
+		if r.StartedAt == nil || r.FinishedAt == nil {
+			return "-"
+		}
+		return formatUptimeDuration(r.FinishedAt.Sub(*r.StartedAt))
+	default:
+		return "-"
+	}
+	if anchor == nil {
+		return "-"
+	}
+	return formatUptimeDuration(now.Sub(*anchor))
+}
+
 // newRunCmd — `uzi run` and its verbs. Every verb is wired to the Client: the reads
 // (list/get/logs/review/inputs) and the writes (create/approve/reject/cancel/
 // follow-up/answer).
@@ -138,10 +191,11 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(runs)
 			}
 			rows := make([][]string, 0, len(runs))
+			now := time.Now()
 			for _, r := range runs {
-				rows = append(rows, []string{r.ID, r.Kind, r.Status, runTitle(r.RunDTO)})
+				rows = append(rows, []string{r.ID, r.Kind, r.Status, runAgeCell(r.RunDTO, now), runTitle(r.RunDTO)})
 			}
-			return p.Table([]string{"ID", "KIND", "STATUS", "TITLE"}, rows)
+			return p.Table([]string{"ID", "KIND", "STATUS", "AGE", "TITLE"}, rows)
 		},
 	}
 
