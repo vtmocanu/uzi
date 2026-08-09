@@ -245,8 +245,9 @@ someone later "simplifies" it:
 
 **A run with no recorded credential** (`anthropic_secret_id IS NULL` — a pre-feature
 run, or a claim whose recording failed) skips **both** legs. Without an exclusion id,
-the eligible leg could fire on the dead credential's own stale-but-eligible reading
-and promote instantly.
+the eligible leg could fire on the dead credential's own still-eligible reading (out
+of date but still within `MaxStaleness`, so classified eligible rather than stale) and
+promote instantly.
 
 **The stamp is a floor, and floors can be wrong.** Another run may consume the
 alternative between the park and the promotion; the cost is one re-park against the

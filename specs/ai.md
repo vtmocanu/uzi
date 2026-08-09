@@ -13779,7 +13779,8 @@ behaviour exactly. A poller-disabled deployment classifies everything stale, not
 and the stamp is the worker's reported reset — today's behaviour exactly. A run with **no recorded
 credential** skips both legs: the exclusion id is a **precondition closed inside the pure function**
 (`uuid.Nil` ⇒ no answer) rather than a caller's `if`, because without it the dead credential's own
-stale-but-eligible reading would vote for its own replacement and promote the run instantly.
+still-eligible reading (out of date but still within `MaxStaleness`, so classified eligible rather
+than stale) would vote for its own replacement and promote the run instantly.
 
 **The server's own clock beats the worker's, per window.** The dead credential's gauge row is in the
 same fetch, so the cross-check is free. `rate_limit_type` selects the column (`five_hour` ⇒ the
