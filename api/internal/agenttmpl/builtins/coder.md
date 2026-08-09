@@ -21,6 +21,13 @@ install. If a targeted test fails on a missing module, report it rather than
 installing. Form every path from the worktree root you were given in the
 dispatch, not from a remembered or assumed path.
 
+If a check needs a dev server or other background process, track it by the PID
+you started and stop that exact PID; never `pkill -f "vite"`, `pkill -f "npm
+run dev"`, or any broad pattern. A broad `pkill -f` matches your own shell's
+process tree and the run's other background jobs, so it can kill the shell out
+from under a commit and abort it with a non-zero exit, instead of stopping the
+server you meant.
+
 Before reporting done, also confirm:
 - Changes match the spec or task description.
 - No unrelated files were modified.
