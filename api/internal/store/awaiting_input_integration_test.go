@@ -382,6 +382,47 @@ func TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB(t *testing.T) {
 	}
 }
 
+// PRD #71 M5 (load-bearing security): parking at the plan gate must CLEAR auto_approve,
+// symmetric with the plan_source='agent' clear the sibling test above pins. A PRD #71
+// auto ci_fix run whose plan is CI-config-classified parks here (the M5 forceGate) with
+// auto_approve STILL true; if the park leaves it true, a worker-restart requeue
+// (Register orphan-recovery) resumes with plan_approved = run.AutoApprove || ... = true,
+// which short-circuits the executor's gate and pushes the CI-config edit with NO human
+// in the loop. Clearing auto_approve here is what makes the resume re-gate.
+func TestSetRunAwaitingApprovalClearsAutoApproveLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	// An auto-triggered ci_fix run carries auto_approve=true into the park (the only
+	// run that parks with it still set — a normal autopilot run short-circuits gatePlan).
+	mustExec(ctx, t, f.pool, `UPDATE runs SET auto_approve = true WHERE id = $1`, f.runID)
+
+	if rows, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd: pgT("# ci-config plan"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil || rows != 1 {
+		t.Fatalf("SetRunAwaitingApproval: rows=%d err=%v", rows, err)
+	}
+
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.AutoApprove {
+		t.Fatal("auto_approve survived the plan-gate park — a restart-requeued resume would " +
+			"ship plan_approved=true and skip the gate with no human in the loop (PRD #71 M5)")
+	}
+	// The sibling decouple is asserted here too, so both halves of the plan_approved
+	// derivation's non-human disjuncts are pinned to stop firing after a park.
+	if run.PlanSource != "agent" {
+		t.Fatalf("plan_source = %q after park, want \"agent\" (PRD #209 D8 decouple)", run.PlanSource)
+	}
+}
+
 // B1 regression: the REGISTER-time orphan sweeps must see a parked run.
 //
 // The stale-heartbeat sweeps cannot cover this and a test of them cannot stand in:

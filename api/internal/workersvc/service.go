@@ -1705,6 +1705,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// pgtype.Text unwrap. Soundness note: this decouples plan_approved from plan_md's
 		// provenance, which SetRunAwaitingApproval's plan_source='agent' write re-couples
 		// (see GetRunClaimContext's invariant block and runtime.sql D8 comment).
+		// PRD #71 M5: the run.AutoApprove disjunct is likewise decoupled from the plan
+		// GATE by SetRunAwaitingApproval's symmetric auto_approve=false clear — parking a
+		// forceGate ci_fix run for human review clears auto_approve so a restart-requeued
+		// resume re-gates rather than shipping plan_approved=true past no human (runtime.sql).
 		PlanApproved: run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded,
 		// PlanSource travels to the worker so it can tell D4 row 2 (seeded, no session ⇒
 		// implement) from row 3 (dropped session, not seeded ⇒ re-plan). Server writes

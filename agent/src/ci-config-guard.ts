@@ -10,6 +10,19 @@
 // special-casing. This module reuses that MECHANISM, parameterized by the claim's
 // ci_config_paths, rather than pulling in a glob library.
 
+// DEFAULT_CI_CONFIG_PATHS is a WORKER-SIDE FLOOR for the pre-push guard: the set the
+// backstop falls back to when a claim carries no ci_config_paths (a bug, or an older
+// server that never produced the field). It covers only the STATIC defaults —
+// the server-produced set additionally carries the project's real ci_config_path
+// (MergeCIConfigPaths), which the worker cannot know here — so this floor exists purely
+// so a missing field cannot fail the guard OPEN, never as a replacement for that set.
+export const DEFAULT_CI_CONFIG_PATHS = [
+  ".gitlab-ci.yml",
+  ".gitlab/**",
+  "**/*.gitlab-ci.yml",
+  ".github/workflows/**",
+];
+
 // ciConfigPathToRegex converts one server-supplied CI-config path/glob to an
 // anchored, dotfile-safe RegExp. Supports: `**` (any path segments, incl. none),
 // `*` (any run of non-slash chars), and literal segments; a plain path (no

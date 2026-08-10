@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ciConfigPathToRegex, flagCIConfigPaths } from "../src/ci-config-guard.js";
+import {
+  ciConfigPathToRegex,
+  flagCIConfigPaths,
+  DEFAULT_CI_CONFIG_PATHS,
+} from "../src/ci-config-guard.js";
 
 // PRD #71 M5 (load-bearing): the pre-push CI-config guard's dotfile-safe matcher.
 // These are the exact examples the milestone pins — the leading-dot defaults are
@@ -85,5 +89,35 @@ describe("flagCIConfigPaths", () => {
     assert.deepEqual(flagCIConfigPaths(["", "   ", ".gitlab-ci.yml"], paths), [
       ".gitlab-ci.yml",
     ]);
+  });
+});
+
+// PRD #71 M5: the worker-side FLOOR the runner falls back to when a claim omits
+// ci_config_paths (a bug or an older server). The whole point is that a missing field
+// cannot fail the backstop OPEN — an empty path set flags nothing — so with the floor
+// the static CI-config files are still flagged.
+describe("DEFAULT_CI_CONFIG_PATHS floor", () => {
+  it("still flags .gitlab-ci.yml (and the other static defaults) with no server paths", () => {
+    const changed = [
+      "src/app.ts",
+      ".gitlab-ci.yml",
+      ".gitlab/ci/build.yml",
+      "deep/nested/.gitlab-ci.yml",
+      ".github/workflows/ci.yml",
+      "README.md",
+    ];
+    assert.deepEqual(flagCIConfigPaths(changed, DEFAULT_CI_CONFIG_PATHS), [
+      ".gitlab-ci.yml",
+      ".gitlab/ci/build.yml",
+      "deep/nested/.gitlab-ci.yml",
+      ".github/workflows/ci.yml",
+    ]);
+  });
+
+  it("does not flag a code-only diff even under the floor", () => {
+    assert.deepEqual(
+      flagCIConfigPaths(["src/app.ts", "web/App.tsx"], DEFAULT_CI_CONFIG_PATHS),
+      [],
+    );
   });
 });

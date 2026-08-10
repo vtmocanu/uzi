@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
 import { type SDKMessage, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "../src/sdk-spawn.js";
 import { nullLogger } from "./helpers.js";
@@ -690,6 +693,90 @@ describe("RunRunner — CI-config ci_fix gate override (PRD #71 M5)", () => {
       "a code-plan ci_fix run keeps the auto-approve short-circuit",
     );
     assert.equal(statuses.at(-1), "completed", "and runs to completion unattended");
+  });
+});
+
+// PRD #71 M5 (load-bearing security): the pre-push CI-config guard on a PRE-APPROVED
+// RESUME — the execution where the gate does NOT run, so ciFixHumanApproved is decided
+// ENTIRELY by its initializer, not the gatePlan closure. The initializer now reads only
+// durable claim state: ciFixHumanApproved = auto_approve !== true. The isCIConfigPlan
+// disjunct was REMOVED — it is what let an auto-triggered (auto_approve=true) CI-config
+// run whose row was restart-requeued bypass the guard with no human in the loop.
+//
+// The executor here models the resume: it never calls ctx.gatePlan, writes a CI-config
+// file, commits it locally (as the real executor does), and returns a real diff to push,
+// so the guard's decision is what the assertions observe. plan_md is CI-config-classified
+// in BOTH cases so a regression to the old `|| isCIConfigPlan(...)` disjunct would flip
+// the auto_approve=true case green — this is the precise guard against that revert.
+describe("RunRunner — CI-config push guard on a pre-approved resume (PRD #71 M5)", () => {
+  const resumeCiConfigExec = (): Executor => ({
+    run: async (ctx) => {
+      const p = path.join(ctx.worktreePath, ".gitlab-ci.yml");
+      writeFileSync(p, "job:\n  script: echo edited by an auto ci-fix\n", "utf8");
+      const g = (args: string[]) =>
+        execFileSync("git", args, { cwd: ctx.worktreePath });
+      g(["add", ".gitlab-ci.yml"]);
+      g([
+        "-c", "user.name=uzi-agent",
+        "-c", "user.email=agent@uzi.test",
+        "-c", "commit.gpgsign=false",
+        "commit", "-m", "auto ci-fix: edit .gitlab-ci.yml",
+      ]);
+      return { branch: ctx.branch };
+    },
+  });
+
+  it("auto_approve=false (parked + human-approved) resume: guard INACTIVE, CI-config push proceeds", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(72, {
+      kind: "ci_fix",
+      auto_approve: false,
+      // The server CLEARED auto_approve when the run parked for human review; the human
+      // then approved. plan_md is CI-config-classified and must NOT matter to the outcome.
+      plan_md: `${CI_CONFIG_MARKER}\nEdit .gitlab-ci.yml to fix the pipeline`,
+      config: { ci_config_paths: [".gitlab-ci.yml"] },
+    });
+    await runner(resumeCiConfigExec(), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      statuses.includes("completed"),
+      "a human-approved CI-config fix pushes (a human was in the loop)",
+    );
+    assert.equal(calls.length, 1, "exactly one MR opened for the human-approved fix");
+  });
+
+  it("auto_approve=true (never parked, no human) resume: guard ACTIVE, CI-config push REFUSED", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(73, {
+      kind: "ci_fix",
+      // Still true on the resume ⇒ the run was AUTO-approved and never parked, so no human
+      // ever reviewed it. Under the OLD initializer the CI-config plan_md below would set
+      // ciFixHumanApproved=true and BYPASS the guard — the exact hole this closes.
+      auto_approve: true,
+      plan_md: `${CI_CONFIG_MARKER}\nEdit .gitlab-ci.yml to fix the pipeline`,
+      config: { ci_config_paths: [".gitlab-ci.yml"] },
+    });
+    await runner(resumeCiConfigExec(), gitlab).execute(claim);
+
+    const bodies = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
+    const statuses = bodies.map((s) => s.status);
+    assert.ok(
+      !statuses.includes("completed"),
+      "an auto-approved CI-config push must never complete (no human in the loop)",
+    );
+    assert.ok(statuses.includes("failed"), "the guard fails the run CLOSED");
+    const failed = bodies.find((s) => s.status === "failed")!;
+    assert.match(
+      failed.failure_reason ?? "",
+      /may not edit CI config/,
+      "the refusal names the CI-config guard",
+    );
+    assert.equal(calls.length, 0, "no MR opened for the refused push");
   });
 });
 

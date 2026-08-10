@@ -52,7 +52,7 @@ import {
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
 import { isCIConfigPlan } from "./prompt.js";
-import { flagCIConfigPaths } from "./ci-config-guard.js";
+import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -651,17 +651,14 @@ export class RunRunner {
         });
       }
 
-      // PRD #71 M5: CI-config push-guard state — did a HUMAN approve this ci_fix plan?
-      // A CI-config-touching diff may push only if so. The gatePlan closure below sets
-      // this precisely on a FRESH run; this initializer covers the PRE-APPROVED RESUME
-      // path (the gate does not run again this execution):
-      //   - a manual ci_fix run (auto_approve != true) is human-approved by definition;
-      //   - an auto ci_fix run is human-approved iff its already-approved plan is
-      //     CI-config-classified — gatePlan PARKS such a plan (never auto-approves it),
-      //     so reaching a resume with that plan means a human approved it at the gate.
-      let ciFixHumanApproved =
-        (claim.auto_approve ?? false) !== true ||
-        isCIConfigPlan(claim.plan_md ?? "");
+      // PRD #71 M5: did a HUMAN approve this ci_fix plan? On a PRE-APPROVED RESUME the gate
+      // does not run this execution, so derive from durable claim state. The server CLEARS
+      // auto_approve the moment a run PARKS at the plan gate (SetRunAwaitingApproval,
+      // symmetric with the seeded plan_source='agent' decouple), so a resumed run still
+      // carrying auto_approve=true was AUTO-approved WITHOUT ever parking (no human), while
+      // auto_approve=false means either a manual run or an auto run that parked and was
+      // human-approved. A fresh run's gate closure overwrites this precisely.
+      let ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
 
       const ctx: RunContext = {
         runId,
@@ -1066,7 +1063,13 @@ export class RunRunner {
         // Capture the narrowed bare path in a const the SAME way the push block does
         // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
         const pushBarePathForGuard = barePath;
-        const ciConfigPaths = claim.config?.ci_config_paths ?? [];
+        // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
+        // server), fall back to the static defaults so the backstop cannot fail OPEN.
+        // This floor covers the static defaults only; the server-produced set additionally
+        // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
+        const ciConfigPaths = claim.config?.ci_config_paths?.length
+          ? claim.config.ci_config_paths
+          : DEFAULT_CI_CONFIG_PATHS;
         const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
         const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
         if (changed === null || (flagged && flagged.length > 0)) {

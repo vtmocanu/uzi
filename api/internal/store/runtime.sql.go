@@ -3790,6 +3790,20 @@ UPDATE runs SET
     -- the fix the create-time 422-on-empty (service.go) is the OTHER half of — the 422
     -- closes the blank-plan ENTRY path, this closes every other fall-through. Both.
     plan_source = 'agent',
+    -- 🔴 PRD #71 M5 SAFETY FIX, symmetric with the plan_source='agent' clear above.
+    -- Parking means the run is now awaiting a HUMAN review of plan_md, so the
+    -- run.AutoApprove disjunct in the plan_approved derivation (service.go ~1708) must
+    -- STOP firing — exactly as plan_source='agent' stops the seeded disjunct for the
+    -- same reason. Without it, a PRD #71 auto ci_fix run that PARKS here for CI-config
+    -- approval (the M5 forceGate) and is then re-queued by a worker restart (Register
+    -- orphan-recovery, service.go) resumes with plan_approved=true — its still-true
+    -- auto_approve short-circuits the executor's preApproved path, skipping the gate
+    -- with NO human in the loop, and the worker's ciFixHumanApproved initializer then
+    -- reads that as approved. Clearing auto_approve here makes the resume re-gate.
+    -- Manual runs already carry auto_approve=false (no-op), and a normal autopilot run
+    -- never reaches this statement (it short-circuits in gatePlan and never parks), so
+    -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
+    auto_approve = false,
     -- PRD #122 M1: the CANDIDATE milestone list this pre-approval report carries.
     -- DIRECT assignment, not COALESCE — the candidate is REPLACED each revision round
     -- (Decision 2), so a fresh awaiting_approval report overwrites the prior proposal.
