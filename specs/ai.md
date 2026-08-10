@@ -11419,10 +11419,22 @@ the file went and the api decides what to do with it.
     exposes both; web shows a neutral "report only" chip + a Findings panel rendering
     `report_md` as ESCAPED PLAIN TEXT (never Markdown); CLI `uzi run get` prints a
     `REPORT_ONLY` row + the scrubbed `report_md`.
-  - **Accepted edge:** a DECLARED `report_only` that also committed code discards that
-    commit (no inverse guard, mirrors `not_code`; the early return precedes fetch-back,
-    and the lead prompt frames `report_only` as "no code change"). Full edge list in the
-    ADR.
+  - **Accepted edge:** a DECLARED `report_only` that also committed code (locally, unpushed)
+    discards that commit (no inverse guard, mirrors `not_code`; the early return precedes
+    fetch-back, and the lead prompt frames `report_only` as "no code change"). Leaves NO
+    remote residue. Full edge list in the ADR.
+  - **Issue #299 — a `report_only` that CHECKPOINTED work is now REFUSED, not an accepted
+    edge.** The checkpoint publish (PRD #122 M8) lands a `refs/uzi-checkpoints/<branch>` ref
+    on origin; a report-only completion opens no branch/MR, so it would orphan that ref. The
+    `report_only` path in `agent/src/runner.ts` now FAILS with an actionable reason (mirrors
+    the undeclared-empty-diff FAIL) when the run published a checkpoint. Detection is the
+    UNION of `lastPublishedTip` (a checkpoint THIS worker confirmably landed mid-run — set
+    only on a landed publish) OR `git.hasCheckpointRef(barePath, branch)` (origin's checkpoint
+    ref, mirrored into the worker bare by `fetch()`, catching a PRIOR/cross-worker attempt's
+    publish). A genuine zero-code run trips neither and still completes report-only. NO
+    checkpoint-ref deletion capability was added (the push broker is non-forced-push-only; a
+    delete-ref RPC would be a new trust-boundary crossing) — refusing loudly is the
+    proportionate fix. See [ADR-0279](../adr/0279-report-only-completion.md).
 
 ## 386. M5 — the post-merge patch is EDGE-triggered, BOUND to the run's queue-time issue snapshot, and deliberately not `mr_watch`
 
