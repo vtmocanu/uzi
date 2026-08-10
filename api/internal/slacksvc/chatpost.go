@@ -282,21 +282,30 @@ func (n *Notifier) startChatTurn(ctx context.Context, convo *chatConvo) {
 //   - an EMPTY body (a rare post-M1 tool-only turn) degrades to a de-emphasized `context`
 //     block carrying chatNoAnswerText, plus the deep-link element when present.
 //
-// The fallback is the assembled body when non-empty (already EscapeMrkdwn'd, so any
-// mention/link in it is inert — safe as the OS-notification text), rune-bounded so a long
-// turn can't flood it; chatNoAnswerText when empty. A no-op when no turn is open.
+// The fallback is the assembled body's ESCAPED twin when non-empty (renderChatFallbackText
+// — EscapeMrkdwn, not the SlackMrkdwn render, so any mention/link in it is inert and the
+// OS-notification text carries no live markup; PRD #292 §6), rune-bounded so a long turn
+// can't flood it; chatNoAnswerText when empty. A no-op when no turn is open.
 func (n *Notifier) flushChatTurn(ctx context.Context, convo *chatConvo, extra string) {
 	if !convo.active {
 		return
 	}
 	convo.active = false
 
-	body := renderChatBody(strings.Join(convo.buf, ""))
+	raw := strings.Join(convo.buf, "")
+	body := renderChatBody(raw)
+	// fallbackBody mirrors body but stays ESCAPED (renderChatFallbackText), so the OS-
+	// notification fallback keeps PRD #292 §6's discipline. extra is already
+	// EscapeMrkdwn'd (chatDynamic) or a fixed emoji prefix, so it is safe to append to
+	// both without re-escaping.
+	fallbackBody := renderChatFallbackText(raw)
 	switch {
 	case body != "" && extra != "":
 		body += "\n\n" + extra
+		fallbackBody += "\n\n" + extra
 	case body == "":
 		body = extra
+		fallbackBody = extra
 	}
 
 	linkElem := func() (slack.MixedElement, bool) {
@@ -311,13 +320,14 @@ func (n *Notifier) flushChatTurn(ctx context.Context, convo *chatConvo, extra st
 	var blocks []slack.Block
 	var fallback string
 	if body != "" {
-		// The body is already ScrubSecrets+EscapeMrkdwn'd+truncated by renderChatBody (or
-		// chatDynamic for extra) — put it in the section verbatim, do NOT re-render it.
+		// The body is already ScrubSecrets+SlackMrkdwn-rendered+truncated by renderChatBody
+		// (or chatDynamic for extra) — put it in the section verbatim, do NOT re-render it.
 		blocks = append(blocks, threadSectionBlock(body))
 		if el, has := linkElem(); has {
 			blocks = append(blocks, slack.NewContextBlock("slack_chat_turn_link", el))
 		}
-		fallback = boundReason(body)
+		// Fallback uses the ESCAPED twin (§6), not the rendered body.
+		fallback = boundReason(fallbackBody)
 	} else {
 		// Rare tool-only turn: degrade to a context block rather than a full section, per
 		// PRD #268 M4.
@@ -345,11 +355,27 @@ func (n *Notifier) flushChatTurn(ctx context.Context, convo *chatConvo, extra st
 }
 
 // renderChatBody runs model-authored answer text through the same
-// scrub→escape→truncate pipeline the plan blob uses (gate.go): ScrubSecrets removes
-// credential patterns, EscapeMrkdwn neutralizes the WHOLE blob (so a `<@U123>` mention,
-// a `<https://evil|Open>` link, or stray mrkdwn is inert), then it is bounded to
-// maxSlackSectionRunes. Empty in → empty out.
+// scrub→render→truncate pipeline the plan blob uses (gate.go): ScrubSecrets removes
+// credential patterns, then SlackMrkdwn renders the CommonMark body into Slack mrkdwn
+// (real *bold*, • bullets, <url|label> links) injection-safely — it owns its own
+// &<>-escaping, so a `<@U123>` mention or a `<https://evil|Open>` link stays inert and
+// only an https link authored in the source markdown becomes live. The result is then
+// bounded to maxSlackSectionRunes. Empty in → empty out.
 func renderChatBody(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	return truncateForSlackSection(SlackMrkdwn(ScrubSecrets(s)))
+}
+
+// renderChatFallbackText is the ESCAPED (not rendered) twin of renderChatBody, used to
+// build the OS-notification fallback text. PRD #292 safety contract §6 keeps the fallback
+// discipline unchanged: Slack parses fallbackText for mrkdwn AND mentions even when the
+// blocks render, so the fallback stays on the blunt whole-blob EscapeMrkdwn — never the
+// SlackMrkdwn render, whose emitted <url|label> markup and translated bold would otherwise
+// surface as live formatting in the notification preview. Literal `**`/`[x](y)` in the
+// preview is by design (Success Criterion 1 is scoped to block bodies, not fallback text).
+func renderChatFallbackText(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return ""
 	}

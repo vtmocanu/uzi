@@ -121,15 +121,15 @@ func questionBody(p questionPayload) string {
 
 // questionThreadBlocks renders a clarification question into the run's DM thread
 // (PRD #88 M3). It reuses the plan gate's pipeline verbatim (PRD #41 Decision 10,
-// D-J): ScrubSecrets → EscapeMrkdwn of the whole UNTRUSTED blob → truncate on a rune
+// D-J): ScrubSecrets → SlackMrkdwn RENDERS the whole UNTRUSTED blob → truncate on a rune
 // boundary → trusted markup appended as SEPARATE blocks.
 //
-// The whole-blob escape is the same documented exception planThreadBlocks takes (see
-// redact.go's per-field rule): the exception holds because the blob carries no trusted
-// markup of its own, so escaping it wholesale is exactly right and neutralizes any
-// <@Uxxx> mention or spoofed <https://evil|Open> link an injected question embeds. The
-// ASSEMBLED message is never escaped — the prompt and the deep link are their own
-// blocks, outside the truncated region, so an over-long question cannot displace them.
+// SlackMrkdwn renders the untrusted question CommonMark into real Slack mrkdwn (*bold*,
+// • bullets, an https <url|label> the question itself authored) while owning its own
+// &<>-escaping (PRD #292 Decision 2): it is injection-safe, neutralizing any <@Uxxx>
+// mention or spoofed <https://evil|Open> link an injected question embeds. The ASSEMBLED
+// message is never re-escaped — the prompt and the deep link are their own blocks, outside
+// the truncated region, so an over-long question cannot displace them.
 //
 // There are no buttons: unlike the plan gate, the answer round-trip needs no anchor
 // state, because the distinct awaiting_input status IS the routing signal (D5). The
@@ -143,7 +143,7 @@ func questionThreadBlocks(runID uuid.UUID, p questionPayload, base string) []sla
 	blocks := []slack.Block{
 		slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, prompt, false, false), nil, nil),
 		slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType,
-			truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(questionBody(p)))), false, false), nil, nil),
+			truncateForSlackSection(SlackMrkdwn(ScrubSecrets(questionBody(p)))), false, false), nil, nil),
 	}
 	if u := runURL(base, runID); u != "" {
 		blocks = append(blocks, slack.NewContextBlock("slack_question_link",

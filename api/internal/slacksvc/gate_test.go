@@ -98,10 +98,10 @@ func TestRevisePendingBlocksPromptNoButtons(t *testing.T) {
 	}
 }
 
-// The plan-in-thread render escapes the WHOLE plan blob (the documented EscapeMrkdwn
-// exception — the blob carries no trusted markup): any <, >, <@Uxxx> mention, or
-// spoofed <https://evil|Open> link a hostile plan embeds is rendered INERT, while the
-// genuine "full plan in uzi" deep link stays raw and clickable in its own block.
+// The plan-in-thread render routes the WHOLE plan blob through SlackMrkdwn (PRD #292
+// M3), which owns its own &<>-escaping: any <, >, <@Uxxx> mention, or spoofed
+// <https://evil|Open> link a hostile plan embeds is rendered INERT, while the genuine
+// "full plan in uzi" deep link stays raw and clickable in its own block.
 func TestPlanThreadBlocksEscapesHostilePlan(t *testing.T) {
 	runID := uuid.New()
 	plan := "Do <b> a thing & ping <@U123> then click <https://evil.example|Open in uzi>"
@@ -118,6 +118,28 @@ func TestPlanThreadBlocksEscapesHostilePlan(t *testing.T) {
 	// context block, OUTSIDE the escaped plan blob.
 	if link := contextText(blocks); !strings.Contains(link, "<https://uzi.example/runs/"+runID.String()+"|Open the full plan in uzi>") {
 		t.Fatalf("the trusted plan deep link must survive raw outside the escaped blob: %q", link)
+	}
+}
+
+// The plan blob is now RENDERED by SlackMrkdwn (PRD #292 M3): a markdown heading/bold
+// becomes *bold*, a list becomes • bullets, and an https link becomes <url|label>.
+func TestPlanThreadBlocksRendersMarkdown(t *testing.T) {
+	runID := uuid.New()
+	plan := "## Plan\n\n**do** this\n\n- step one\n- step two\n\nsee [docs](https://x)"
+	blocks := planThreadBlocks(runID, plan, "https://uzi.example")
+	_, section := gateSummary(blocks)
+
+	if !strings.Contains(section, "*Plan*") {
+		t.Errorf("a heading must render as a bold line, got %q", section)
+	}
+	if !strings.Contains(section, "*do*") {
+		t.Errorf("**do** must render as *do*, got %q", section)
+	}
+	if !strings.Contains(section, "• step one") || !strings.Contains(section, "• step two") {
+		t.Errorf("a markdown list must render as • bullets, got %q", section)
+	}
+	if !strings.Contains(section, "<https://x|docs>") {
+		t.Errorf("an https link must render as <url|label>, got %q", section)
 	}
 }
 
