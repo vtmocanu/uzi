@@ -25,6 +25,27 @@ import { ForgeError } from "./forge.js";
 export const FORGE_RETRY_SCHEDULE = [1_000, 2_000, 4_000, 8_000, 16_000];
 
 /**
+ * The devbox `devbox install` backoff schedule. 3 retries ⇒ 4 attempts.
+ *
+ * This is a SEPARATE constant, deliberately NOT a reuse of
+ * {@link FORGE_RETRY_SCHEDULE}, for two reasons:
+ *
+ *   1. `FORGE_RETRY_SCHEDULE` is pinned by a differential test to
+ *      `DEFAULT_TERMINAL_RETRY_SCHEDULE` (`client.ts`). That pin encodes a
+ *      SEMANTIC link to the worker→API terminal-callback hop, which the devbox
+ *      retry does not share; borrowing that constant would couple two unrelated
+ *      decisions and make either one un-tunable without dragging the other.
+ *
+ *   2. Per-attempt wall-clock is already bounded by the 10-min `execFileAsync`
+ *      timeout in provision.ts: any attempt that hangs to that limit becomes a
+ *      SIGTERM kill, which {@link classifyDevboxError} classifies PERMANENT and so
+ *      stops immediately (never retried). This schedule therefore governs only
+ *      fast-failing transient errors, and the total retry wall-clock stays far
+ *      under RUN_TIMEOUT (2h).
+ */
+export const DEVBOX_RETRY_SCHEDULE = [1_000, 4_000, 10_000];
+
+/**
  * PERMANENT stderr/message patterns, checked FIRST — a hit means "fail fast, never
  * retry" (D9). Case-insensitive. Note git's generic `Could not read from remote
  * repository` trailer is deliberately absent: it also trails an auth/permission
@@ -91,6 +112,84 @@ export function classifyForgeError(err: unknown): "transient" | "permanent" {
   return "permanent";
 }
 
+/**
+ * TRANSIENT patterns for a devbox/nix/curl `devbox install` failure. These are
+ * deliberately NETWORK PHRASES, not bare tokens (mirroring ADR-0284's
+ * `Could not read from remote repository` note): matching a bare `ssl`/`tls`
+ * token would mis-read a deterministic error like `package 'openssl' not found`
+ * as transient. Each entry is scoped so only a genuine network/timeout condition
+ * hits. Case-insensitive.
+ */
+const DEVBOX_TRANSIENT_PATTERNS: RegExp[] = [
+  /curl:\s*\(28\)/i, // operation timed out
+  /curl:\s*\(6\)/i, // could not resolve host
+  /curl:\s*\(7\)/i, // failed to connect
+  /curl:\s*\(35\)/i, // TLS handshake
+  /curl:\s*\(56\)/i, // recv failure
+  /timeout was reached/i,
+  /unable to download/i,
+  /could not resolve host/i,
+  /temporary failure in name resolution/i,
+  /connection reset/i,
+  /connection refused/i,
+  /connection timed out/i,
+  /network is unreachable/i,
+  /TLS handshake/i,
+  /SSL.*(error|handshake|connect)/i,
+  /bad gateway/i,
+  /gateway time-?out/i,
+  /\b50[023]\b/, // 500 / 502 / 503 from a binary cache or github
+];
+
+/**
+ * Classify a devbox/nix/curl `devbox install` error as "transient" (retry) or
+ * "permanent" (fail fast). Permanent-first, fail-closed.
+ *
+ * It inspects the RAW error thrown by the injected `run`. On the default path
+ * that is an `execFileAsync` rejection carrying `.stderr` / `.code` / `.killed` /
+ * `.signal`.
+ *
+ * Precedence is load-bearing:
+ *   1. A worker-timeout SIGTERM/SIGKILL kill (the 10-min `execFileAsync` timeout
+ *      in provision.ts tripped) is a HUNG install, not a transient blip —
+ *      retrying it would give 3×10min of dead wall-clock. Never retried, and
+ *      checked FIRST so that even a transient-looking stderr on a killed process
+ *      still classifies permanent.
+ *   2. Otherwise, match the combined stderr + message text against the
+ *      narrowly-scoped {@link DEVBOX_TRANSIENT_PATTERNS} ⇒ transient.
+ *   3. No match ⇒ permanent (fail-closed): deterministic failures (unknown
+ *      package, malformed manifest, resolver error) fail fast, no retry.
+ */
+export function classifyDevboxError(err: unknown): "transient" | "permanent" {
+  // 1. Worker-timeout kill, checked FIRST (precedence).
+  if (typeof err === "object" && err !== null) {
+    const obj = err as { killed?: unknown; signal?: unknown };
+    if (
+      obj.killed === true &&
+      (obj.signal === "SIGTERM" || obj.signal === "SIGKILL")
+    ) {
+      return "permanent";
+    }
+  }
+
+  // 2. Build the text to match: stderr (if a string) plus the message. Testing
+  //    both is belt-and-suspenders — devbox errors carry stderr on `.stderr` and
+  //    concatenated into `.message`, but the injected `run` may differ.
+  let text = "";
+  if (typeof err === "object" && err !== null) {
+    const stderr = (err as { stderr?: unknown }).stderr;
+    if (typeof stderr === "string") text += stderr + "\n";
+  }
+  text += err instanceof Error ? err.message : String(err);
+
+  for (const re of DEVBOX_TRANSIENT_PATTERNS) {
+    if (re.test(text)) return "transient";
+  }
+
+  // 3. Fail-closed default.
+  return "permanent";
+}
+
 const sleepReal = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -105,18 +204,29 @@ export interface WithForgeRetryOptions {
   log?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
 }
 
+export interface WithRetryOptions {
+  /** REQUIRED classifier — no default; each caller supplies its own. */
+  classify: (e: unknown) => "transient" | "permanent";
+  /** Backoff delays; defaults to {@link FORGE_RETRY_SCHEDULE}. N sleeps ⇒ N+1 attempts. */
+  schedule?: number[];
+  /** Injectable sleep (tests record delays and resolve immediately). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Optional logger; a warn is emitted before each retry sleep. */
+  log?: { warn: (msg: string, meta?: Record<string, unknown>) => void };
+  /** Message logged (log.warn) before each retry sleep. Default a generic phrase. */
+  logMessage?: string;
+}
+
 /**
- * Run `fn`, retrying it on a TRANSIENT error using the backoff schedule. A
- * permanent error (or an exhausted schedule) rethrows the last error unchanged, so
- * the caller's existing catch still fires and the run fails as it does today.
+ * Generic bounded-backoff retry runner. Run `fn`, retrying it on a TRANSIENT
+ * error (per `opts.classify`) using the backoff schedule. A permanent error (or
+ * an exhausted schedule) rethrows the last error unchanged, so the caller's
+ * existing catch still fires and the run fails as it does today.
  *
  * N schedule entries ⇒ up to N+1 attempts (1 initial + N retries).
  */
-export async function withForgeRetry<T>(
-  fn: () => Promise<T>,
-  opts: WithForgeRetryOptions = {},
-): Promise<T> {
-  const classify = opts.classify ?? classifyForgeError;
+export async function withRetry<T>(fn: () => Promise<T>, opts: WithRetryOptions): Promise<T> {
+  const classify = opts.classify;
   const schedule = opts.schedule ?? FORGE_RETRY_SCHEDULE;
   const sleep = opts.sleep ?? sleepReal;
 
@@ -126,7 +236,7 @@ export async function withForgeRetry<T>(
     } catch (err) {
       if (classify(err) === "transient" && attempt < schedule.length) {
         const delay = schedule[attempt]!;
-        opts.log?.warn("transient forge error; retrying push/MR-create", {
+        opts.log?.warn(opts.logMessage ?? "transient error; retrying", {
           attempt: attempt + 1,
           delay_ms: delay,
           error: err instanceof Error ? err.message : String(err),
@@ -137,4 +247,26 @@ export async function withForgeRetry<T>(
       throw err;
     }
   }
+}
+
+/**
+ * Run `fn`, retrying it on a TRANSIENT error using the backoff schedule. A
+ * permanent error (or an exhausted schedule) rethrows the last error unchanged, so
+ * the caller's existing catch still fires and the run fails as it does today.
+ *
+ * A thin wrapper over {@link withRetry} that supplies the forge defaults.
+ *
+ * N schedule entries ⇒ up to N+1 attempts (1 initial + N retries).
+ */
+export async function withForgeRetry<T>(
+  fn: () => Promise<T>,
+  opts: WithForgeRetryOptions = {},
+): Promise<T> {
+  return withRetry(fn, {
+    classify: opts.classify ?? classifyForgeError,
+    schedule: opts.schedule ?? FORGE_RETRY_SCHEDULE,
+    sleep: opts.sleep,
+    log: opts.log,
+    logMessage: "transient forge error; retrying push/MR-create",
+  });
 }
