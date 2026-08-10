@@ -17,6 +17,12 @@ This skill documents the CLI **shipped in the binary you are running** — it is
 written from the CLI's own command tree and shipped inside it, so it never drifts
 from the installed surface.
 
+> **Generated artifact: do not edit the installed copy.** `uzi skill install`
+> (and the session refresh hook) rewrite `~/.claude/skills/uzi-cli/SKILL.md`
+> byte-for-byte from the binary on every CLI update, so a local edit is silently
+> lost. Change it at the source in the uzi repo
+> (`api/internal/uzicli/skill/SKILL.md`) and ship a new CLI.
+
 ## Talking to it as an agent
 
 Two rules cover almost everything:
@@ -320,6 +326,12 @@ nothing a manual start cannot.
     issue matching the `--label` selector; `--label` is repeatable and defaults to the
     PRD label when omitted), or `--prompt <text>` (an issue-less repo→MR run that
     bypasses the PRD-issue gate). `--label` is valid only with `--sweep`.
+    - **Sweep gotcha (bites a bug-hunter first):** a `--sweep` picks only
+      *candidates*; the same PRD-issue gate a manual start has still decides what
+      fires. Already-PRD'd candidates fire directly, but plain un-PRD'd issues
+      (e.g. everything tagged `bug`) fire only when they ALSO carry the `PRDLESS`
+      label. So `--sweep --label bug` over raw bug reports fires on nothing until
+      you add `PRDLESS` to the ones you want worked (or pair the sweep with it).
   - **timing** — one of `--at <rfc3339>` (fires once, then goes terminal) or
     `--cron <expr>` (a recurring 5-field cron). `--tz <iana>` sets the timezone the cron
     is read in (default `UTC`).
@@ -327,6 +339,12 @@ nothing a manual start cannot.
     point of an off-hours schedule); pass `--auto-approve=false` to keep the gate.
     `--wait-on-limit` parks a fired run until the Anthropic usage window reopens instead
     of failing it.
+  - `--max-issues <n>` caps how many issues one `--sweep` fire starts, oldest (lowest
+    number) first; defaults to 10, ignored for non-sweep targets. `--max-issues 1` is
+    "one issue per fire".
+  - `--guidance <text>` (with `--issue`/`--sweep`) injects free owner steering into the
+    run instruction ("keep the diff small", "add a failing test first") without editing
+    each issue; capped at 8 KiB.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
   `NEXT`, `ON`); `--json` dumps the raw array.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
