@@ -33,7 +33,13 @@ func ValidateModel(raw string) (string, error) {
 		return "", fmt.Errorf("model must be at most %d characters", MaxModelLen)
 	}
 	for _, r := range m {
-		if r == unicode.ReplacementChar || unicode.IsControl(r) {
+		// Reject Cc control chars AND Cf format chars (bidi overrides like U+202E,
+		// zero-width joiners/spaces). unicode.IsControl only covers Cc, so without the
+		// explicit Cf check a validated model token could still carry a bidi override or
+		// a zero-width char — invisible on write, but this token is echoed onto the
+		// admin cross-owner Agents-status surface (RunDTO.Model), where a reordered or
+		// zero-width-padded token is a spoofing vector. Keep the write boundary clean.
+		if r == unicode.ReplacementChar || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return "", fmt.Errorf("model must not contain newlines or control characters")
 		}
 		if unicode.IsSpace(r) {

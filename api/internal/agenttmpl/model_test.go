@@ -35,10 +35,13 @@ func TestValidateModel(t *testing.T) {
 
 	// Interior whitespace, control chars, and over-length reject (Decision 4).
 	for name, in := range map[string]string{
-		"interior space": "claude 3",
-		"tab":            "claude\t3",
-		"newline":        "opus\nmodel: sonnet",
-		"too long":       strings.Repeat("x", MaxModelLen+1),
+		"interior space":    "claude 3",
+		"tab":               "claude\t3",
+		"newline":           "opus\nmodel: sonnet",
+		"too long":          strings.Repeat("x", MaxModelLen+1),
+		"bidi override":     "opus\u202eionrever", // U+202E RIGHT-TO-LEFT OVERRIDE (Cf)
+		"zero-width space":  "op\u200bus",         // U+200B ZERO WIDTH SPACE (Cf)
+		"zero-width joiner": "opus\u200d",         // U+200D ZERO WIDTH JOINER (Cf)
 	} {
 		if _, err := ValidateModel(in); err == nil {
 			t.Errorf("%s: expected rejection for %q", name, in)
