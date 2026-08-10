@@ -227,6 +227,35 @@
   // download / 7.5 MiB unpacked), so CI's amd64-only kaniko build SUBSTITUTES it rather than
   // compiling shellcheck (a Haskell binary) from source — the non-negotiable condition for baking it.
   //
+  // `fd` + `yq-go` (2026-08-10) close two more open `install_worker_tool` judge recs
+  // (run 13b3bda4-342f-4098-927d-1bb46311c64b). Same "every worker should have it, in ANY
+  // repo" class as jq/file/openssl/coreutils above — general-purpose CLIs an agent reaches for
+  // and 127s without, NOT a repo-specific extra like the root devbox.json's tier-2 `ruby`:
+  //   * `fd` — a fast, ergonomic file finder (a `find` replacement) that scripts and agents
+  //     reach for. The attr is bare `fd`; its mainProgram is `fd`, so it lands bin/fd.
+  //   * `yq-go` — the STANDALONE Go YAML processor (mikefarah/yq), the `jq`-for-YAML tool.
+  //     nixpkgs ships BOTH a `yq` (a thin Python jq-wrapper, `python3Packages.yq`, which drags
+  //     in a python runtime) AND `yq-go`; `yq-go` is the intended tool — it is what "yq" means
+  //     to almost everyone and is a single static Go binary — so it is chosen here. Its
+  //     mainProgram is `yq`, so the attr `yq-go` lands bin/yq: the binary is named `yq`, NOT
+  //     `yq-go` (the guard row and any smoke must call `yq`).
+  // Neither hits the openssl/file split-output trap, and this was MEASURED at the pinned rev,
+  // not assumed: both are SINGLE-output (`outputs` == ["out"], `meta.outputsToInstall` == ["out"]),
+  // so the bare attr carries the CLI and no `.bin`/`.out` selector is needed or correct.
+  // Verified at the pinned rev (2026-08-10, live x86_64-linux `devbox install` into the profile):
+  // bare `fd` and `yq-go` land bin/fd and bin/yq IN THE PROFILE (readlink -f
+  // .devbox/nix/profile/default then `ls bin/`, never `command -v` inside `devbox run` — the
+  // check that would have caught the `file` regression); exercised from that profile,
+  // `fd --version` → fd 10.4.2, `yq --version` → v4.53.3, and `yq '.a.c[1]'` over a small YAML
+  // doc evaluates. Both narinfos are HTTP 200 on cache.nixos.org for x86_64-linux (fd 10.4.2
+  // 0qakfy0pyvma5sv880fvhyl7n34hfhln, yq-go 4.53.3 cgad2c1jkcm04mrgf7djy5c4dyylr60v), so CI's
+  // amd64-only kaniko build SUBSTITUTES them rather than compiling from source — the
+  // non-negotiable condition for baking a tool in.
+  // Written BARE of any version/`@latest` suffix and added by hand-editing this file +
+  // `devbox install` (never `devbox add`, which pins each package to its own nixpkgs rev and
+  // writes a fat `systems:` block) for the pinning reason recorded above; both lock as
+  // `source: "nixpkg"` at 20535e48…, matching every entry.
+  //
   // NOT added, deliberately:
   //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
   //     any cluster by construction: `automountServiceAccountToken: false` at BOTH the
@@ -266,6 +295,8 @@
     "kubeconform",
     "go-task",
     "jq.bin",
-    "shellcheck.bin"
+    "shellcheck.bin",
+    "fd",
+    "yq-go"
   ]
 }

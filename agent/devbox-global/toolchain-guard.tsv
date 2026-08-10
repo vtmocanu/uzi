@@ -41,3 +41,5 @@ kubeconform	kubeconform	kubeconform -v
 go-task	task	task --version
 jq.bin	jq	jq --version
 shellcheck.bin	shellcheck	shellcheck --version
+fd	fd	fd --version
+yq-go	yq	yq --version
