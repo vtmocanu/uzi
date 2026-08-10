@@ -3529,7 +3529,9 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// is the one path PRD #196's non-primary PRD-link waiver applies to — the human is
 	// present and clicking Start on a card an admin made run-eligible. Autopilot and the
 	// scheduler use their own methods below and pass false.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, seed)
+	// nil model: a non-scheduled human run inherits the owner's per-user Worker default
+	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, nil, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -3540,8 +3542,8 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // (e.g. a `bug` swept in) is NOT waived here — it still needs a prds/*.md link or
 // PRDLESS, exactly as before M4. This keeps PRD #196's invariant that the only path the
 // eligibility change widened is a human click; a scheduled sweep is not that click.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, seed)
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, seed *SeededPlan) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, model, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -3556,14 +3558,16 @@ func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UU
 // invariant that an autopilot run and a manual run are born through the same path is
 // enforced structurally, not by two implementations that could drift.
 func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
-	// nil: an autopilot run has no human in the loop to express a per-run choice, so
-	// it takes the owner's default (PRD #35 Decision 7 / design brief 7.3). The final
-	// nil is the seeded plan: autopilot NEVER seeds — it derives its plan in Phase 1
-	// exactly as before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
+	// nil waitOnLimit: an autopilot run has no human in the loop to express a per-run
+	// choice, so it takes the owner's default (PRD #35 Decision 7 / design brief 7.3).
+	// nil model: the label poller's autopilot has no per-run model (PRD #300) — a
+	// label-driven run inherits the owner's per-user Worker default. The final nil is the
+	// seeded plan: autopilot NEVER seeds — it derives its plan in Phase 1 exactly as
+	// before (PRD #209 D3 keeps auto_approve and plan_source orthogonal).
 	// allowLinkWaiver=false: autopilot is unattended, so PRD #196's PRD-link waiver
 	// never applies — a link-less autopilot run is still refused unless PRDLESS
 	// (allowWithoutPRD) exempts it, exactly as before M4.
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil)
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -3576,8 +3580,8 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // scheduler seam cannot change label-driven autopilot. allowLinkWaiver=false and seed=nil
 // for the same reasons as CreateAutopilotRun: a scheduled sweep is unattended, so PRD
 // #196's PRD-link waiver never applies, and autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, nil /*seed*/)
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, model, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -3606,7 +3610,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, model *string, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -3788,6 +3792,10 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		AgentExclusions:   agentExclusions,
 		PlannedBaseCommit: plannedBaseCommit,
 		RequireBaseMatch:  requireBaseMatch,
+		// PRD #300: the per-schedule model override, frozen onto the run at fire time.
+		// nil for every non-scheduled caller (interactive, label-poller autopilot) →
+		// NULL → the run inherits the owner's per-user Worker default at claim assembly.
+		Model: pgTextPtr(model),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

@@ -343,6 +343,7 @@ type Run struct {
 	ReportOnly            bool               `json:"report_only"`
 	ReportMd              pgtype.Text        `json:"report_md"`
 	CiConfigPaths         []string           `json:"ci_config_paths"`
+	Model                 pgtype.Text        `json:"model"`
 }
 
 type RunMessage struct {
@@ -392,6 +393,7 @@ type RunSchedule struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	MaxIssues   pgtype.Int4        `json:"max_issues"`
 	Guidance    pgtype.Text        `json:"guidance"`
+	Model       pgtype.Text        `json:"model"`
 }
 
 type RunUsage struct {

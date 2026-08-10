@@ -108,6 +108,9 @@ var runDTOKeys = []string{
 	// clamped and pool-aware and is routinely EARLIER than the reported reset.
 	"wait_on_limit", "limit_resets_at", "retry_not_before", "limit_wait_count",
 	"rate_limit_type",
+	// PRD #300: the per-schedule model a schedule froze onto the run at fire time (nil ⇒
+	// null ⇒ the run inherited the owner's per-user default). Always on the wire.
+	"model",
 }
 
 func TestRunDTOTags(t *testing.T) {

@@ -341,6 +341,9 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		RetryNotBefore: timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
 		LimitWaitCount: r.LimitWaitCount,
 		RateLimitType:  textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
+		// nil (NULL column) for every run that inherited the owner's per-user default.
+		Model: textPtrValue(r.Model.Valid, r.Model.String),
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()

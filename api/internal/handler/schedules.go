@@ -653,6 +653,10 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		v := s.Guidance.String
 		dto.Guidance = &v
 	}
+	if s.Model.Valid && s.Model.String != "" {
+		v := s.Model.String
+		dto.Model = &v
+	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {
 			dto.NextFires = fires

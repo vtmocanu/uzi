@@ -282,6 +282,10 @@ type RunDTO struct {
 	// it: the vocabulary is the SDK's and a newer server can ship a member this
 	// client has not heard of. Same rule as AnthropicSelectReason above.
 	RateLimitType *string `json:"rate_limit_type"`
+	// Model is the model frozen onto the run at fire time by the schedule that created it
+	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
+	// read-only so a scheduled run's model is confirmable.
+	Model *string `json:"model"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status
