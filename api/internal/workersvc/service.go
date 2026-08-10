@@ -2652,12 +2652,17 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// unconditionally on every terminal transition, D4), so only the completed side is
 		// passed here.
 		completedIDs, _ := progressParams(owned.Kind, owned.MilestonesFrozen, req.MilestonesCompleted, nil)
+		// report_md is the deliverable of a report-only completion, so it is stored ONLY
+		// when report_only was accepted — this keeps the column's invariant (non-NULL only
+		// on a report_only run) true even against an untrusted worker that sends report_md
+		// alone. clampWireReportOnly is the issue-run gate report_md then inherits.
+		reportOnly := clampWireReportOnly(owned, req.ReportOnly)
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
-			ReportOnly:          clampWireReportOnly(owned, req.ReportOnly),
-			ReportMd:            clampWireReportMd(owned, req.ReportMd),
+			ReportOnly:          reportOnly,
+			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			ID:                  runID, WorkerID: pgUUID(wkr.ID),
 		})

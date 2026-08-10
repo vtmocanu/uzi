@@ -32,23 +32,35 @@ func TestClampWireReportOnly(t *testing.T) {
 }
 
 func TestClampWireReportMdNilYieldsInvalid(t *testing.T) {
-	if got := clampWireReportMd(issueRun(), nil); got.Valid {
+	if got := clampWireReportMd(issueRun(), nil, true); got.Valid {
 		t.Errorf("nil must land NULL, got %q", got.String)
 	}
 }
 
 func TestClampWireReportMdIssuePlainTextStored(t *testing.T) {
 	const s = "All checks passed. No code change required."
-	got := clampWireReportMd(issueRun(), strp(s))
+	got := clampWireReportMd(issueRun(), strp(s), true)
 	if !got.Valid || got.String != s {
 		t.Errorf("plain text: got valid=%v %q, want valid=true %q", got.Valid, got.String, s)
 	}
 }
 
+// report_md is stored ONLY on a report-only completion: with reportOnly=false it is
+// dropped even on an issue run with text present, keeping the column's invariant
+// (non-NULL only on a report_only run) true against an untrusted worker.
+func TestClampWireReportMdDroppedWhenNotReportOnly(t *testing.T) {
+	if got := clampWireReportMd(issueRun(), strp("findings"), false); got.Valid {
+		t.Errorf("reportOnly=false must drop report_md, got %q", got.String)
+	}
+}
+
+// A non-issue run can never reach reportOnly=true (clampWireReportOnly gates on kind),
+// so report_md is dropped end-to-end for every non-issue kind — the composed behavior.
 func TestClampWireReportMdDropsNonIssueKind(t *testing.T) {
 	for _, kind := range []string{"ci_fix", "self_improve", "judge", "chat"} {
 		run := store.Run{ID: uuid.New(), Kind: kind}
-		if got := clampWireReportMd(run, strp("findings")); got.Valid {
+		reportOnly := clampWireReportOnly(run, boolp(true))
+		if got := clampWireReportMd(run, strp("findings"), reportOnly); got.Valid {
 			t.Errorf("kind %q: report_md must be dropped, got %q", kind, got.String)
 		}
 	}
@@ -58,7 +70,7 @@ func TestClampWireReportMdStripsControlAndFormatChars(t *testing.T) {
 	// U+0007 BELL (Cc) and U+202E RIGHT-TO-LEFT OVERRIDE (Cf) must both be stripped;
 	// \n and \t must survive so multi-line markdown is preserved.
 	in := "line1\n\tline2\x07\u202emiddle"
-	got := clampWireReportMd(issueRun(), strp(in))
+	got := clampWireReportMd(issueRun(), strp(in), true)
 	if !got.Valid {
 		t.Fatalf("expected stored text, got NULL")
 	}
@@ -80,7 +92,7 @@ func TestClampWireReportMdScrubsSecrets(t *testing.T) {
 		"sk-ant-abcdef0123456789ABCDEF",
 	} {
 		in := "the token was " + secret + " during the run"
-		got := clampWireReportMd(issueRun(), strp(in))
+		got := clampWireReportMd(issueRun(), strp(in), true)
 		if !got.Valid {
 			t.Fatalf("expected stored text, got NULL")
 		}
@@ -95,7 +107,7 @@ func TestClampWireReportMdScrubsSecrets(t *testing.T) {
 
 func TestClampWireReportMdBoundsToCap(t *testing.T) {
 	in := strings.Repeat("a", ReviewSummaryMaxBytes+4096)
-	got := clampWireReportMd(issueRun(), strp(in))
+	got := clampWireReportMd(issueRun(), strp(in), true)
 	if !got.Valid {
 		t.Fatalf("expected stored text, got NULL")
 	}
@@ -112,7 +124,7 @@ func TestClampWireReportDefaultsForNormalCompletion(t *testing.T) {
 	if clampWireReportOnly(run, nil) {
 		t.Error("normal completion must be report_only=false")
 	}
-	if got := clampWireReportMd(run, nil); got.Valid {
+	if got := clampWireReportMd(run, nil, false); got.Valid {
 		t.Errorf("normal completion must be report_md NULL, got %q", got.String)
 	}
 }
