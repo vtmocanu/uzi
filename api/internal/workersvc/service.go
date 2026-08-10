@@ -1797,6 +1797,14 @@ const maxInflightLineLen = 300
 // itself), formatted as one compact coordinate line each. Best-effort — a query
 // failure yields nil and never fails the claim (mirrors the knownTargets posture in
 // assembleJudgeClaim).
+//
+// ListActiveRunsAll is a GLOBAL, all-repos LIMIT-500 window ordered by recency; the
+// same-repo filter runs in Go over that window. On a very busy multi-tenant fleet a
+// repo's in-flight runs could in principle be crowded out of the 500 newest rows and
+// silently drop from the avoid-set. That is acceptable here: this set is ADVISORY
+// context for the picker (D4), not a correctness gate — a missed entry only means the
+// picker might overlap, which the human MR review still catches. Reusing the existing
+// query is the deliberate trade for no new query and no migration (D5).
 func (s *Service) inflightTargets(ctx context.Context, run store.Run) []string {
 	rows, err := s.q.ListActiveRunsAll(ctx)
 	if err != nil {
