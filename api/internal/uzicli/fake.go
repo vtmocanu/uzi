@@ -173,9 +173,16 @@ type FakeClient struct {
 	EnabledSchedule     apitypes.ScheduleDTO
 	LastSchedEnabledID  string
 	LastSchedEnabledVal bool
-	LastDeletedSchedID  string
-	RunNowResult        apitypes.RunNowResponse
-	LastRunNowSchedID   string
+	// PatchSchedule capture (PRD #302): the id and the whole ScheduleRequest the edit
+	// verb assembled, so a test can assert the exact wire mapping — including that
+	// re-sent fields (max_issues/guidance) survive an unrelated edit and that Enabled
+	// is left nil so the pause flag is untouched.
+	PatchedSchedule    apitypes.ScheduleDTO
+	LastPatchSchedID   string
+	LastPatchSchedReq  apitypes.ScheduleRequest
+	LastDeletedSchedID string
+	RunNowResult       apitypes.RunNowResponse
+	LastRunNowSchedID  string
 
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
@@ -531,6 +538,15 @@ func (f *FakeClient) SetScheduleEnabled(_ context.Context, id string, enabled bo
 		return apitypes.ScheduleDTO{}, f.Err
 	}
 	return f.EnabledSchedule, nil
+}
+
+func (f *FakeClient) PatchSchedule(_ context.Context, id string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error) {
+	f.LastPatchSchedID = id
+	f.LastPatchSchedReq = req
+	if f.Err != nil {
+		return apitypes.ScheduleDTO{}, f.Err
+	}
+	return f.PatchedSchedule, nil
 }
 
 func (f *FakeClient) DeleteSchedule(_ context.Context, id string) error {

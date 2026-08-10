@@ -125,6 +125,7 @@ uzi run inputs <run-id>
 uzi schedule create --repo <repo-id> (--issue <iid> | --sweep [--label <l>]... | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--auto-approve[=false]] [--wait-on-limit]
 uzi schedule list
 uzi schedule get <schedule-id>
+uzi schedule edit <schedule-id> [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--auto-approve[=false]] [--wait-on-limit[=false]]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule run-now <schedule-id>
@@ -348,6 +349,14 @@ nothing a manual start cannot.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
   `NEXT`, `ON`); `--json` dumps the raw array.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
+- `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
+  its id and run history (unlike delete-and-recreate). Any flag you omit keeps its stored
+  value; editing config revives a terminal schedule (status returns to active — a recurring
+  one resumes, a fired one-shot needs a fresh future `--at`), but does NOT un-pause a paused
+  (enabled=false) schedule, which stays off until `resume`. Retime with `--cron` or `--at`
+  (switching timing accordingly), adjust `--tz`, and — scoped to the target — `--prompt`,
+  `--label`, `--guidance`/`--clear-guidance`, `--max-issues`/`--clear-max-issues`,
+  `--auto-approve`, `--wait-on-limit`. At least one field is required.
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence;

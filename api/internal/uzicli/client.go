@@ -251,6 +251,13 @@ type Client interface {
 	// the handler's pause/resume path (onlyEnabled), which flips the flag without
 	// re-validating or recomputing the schedule's config.
 	SetScheduleEnabled(ctx context.Context, id string, enabled bool) (apitypes.ScheduleDTO, error)
+	// PatchSchedule edits a schedule's mutable config: PATCH /api/schedules/{id} with a
+	// full ScheduleRequest (200 ScheduleDTO). Unlike SetScheduleEnabled's minimal body,
+	// this restates the whole config, so the caller MUST seed it from the fetched schedule
+	// (the server's mergeSchedule takes max_issues/guidance straight from the request —
+	// nil clears them — while keeping the rest on empty). Enabled is left nil here so the
+	// pause flag is untouched; a config PATCH re-activates a terminal/parked schedule.
+	PatchSchedule(ctx context.Context, id string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error)
 	// DeleteSchedule removes an owner-scoped schedule: DELETE /api/schedules/{id} (204).
 	// A foreign/absent id is a 404 (exit 4). Run history is preserved server-side (the
 	// runs.schedule_id FK is ON DELETE SET NULL), so this deletes the schedule only.
@@ -1054,6 +1061,14 @@ func (c *HTTPClient) SetScheduleEnabled(ctx context.Context, id string, enabled 
 	}{Enabled: enabled}
 	var out apitypes.ScheduleDTO
 	if err := c.patch(ctx, "/api/schedules/"+url.PathEscape(id), reqBody, &out); err != nil {
+		return apitypes.ScheduleDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) PatchSchedule(ctx context.Context, id string, req apitypes.ScheduleRequest) (apitypes.ScheduleDTO, error) {
+	var out apitypes.ScheduleDTO
+	if err := c.patch(ctx, "/api/schedules/"+url.PathEscape(id), req, &out); err != nil {
 		return apitypes.ScheduleDTO{}, err
 	}
 	return out, nil

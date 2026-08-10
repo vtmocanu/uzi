@@ -436,4 +436,201 @@ func TestScheduleDelete(t *testing.T) {
 	}
 }
 
+// editSweepFixture seeds a fully-populated sweep schedule under the given id, so the edit
+// tests can assert both the overlay of a changed flag and the survival of the untouched
+// config fields the server's mergeSchedule takes straight from the request.
+func editSweepFixture(id string) *uzicli.FakeClient {
+	cap5 := 5
+	return &uzicli.FakeClient{
+		ScheduleByID: map[string]apitypes.ScheduleDTO{
+			id: {
+				ID:          id,
+				Target:      "sweep",
+				Labels:      []string{"bug", "p1"},
+				Timing:      "recurring",
+				CronExpr:    "0 9 * * 1",
+				Timezone:    "Europe/Bucharest",
+				AutoApprove: true,
+				WaitOnLimit: true,
+				Enabled:     true,
+				Status:      "active",
+				MaxIssues:   &cap5,
+				Guidance:    sptr("keep the diff small"),
+			},
+		},
+		PatchedSchedule: apitypes.ScheduleDTO{ID: id, Target: "sweep", Timing: "recurring", CronExpr: "0 4 * * 2", Enabled: true},
+	}
+}
+
+// TestScheduleEditFlagMapping: each overlay flag lands in the patched request.
+func TestScheduleEditFlagMapping(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e",
+		"--cron", "0 4 * * 2", "--tz", "UTC", "--label", "flaky", "--max-issues", "7",
+		"--guidance", "add a failing test first", "--auto-approve=false", "--wait-on-limit=false")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	if fc.LastPatchSchedID != "sch_e" {
+		t.Errorf("patched id = %q, want sch_e", fc.LastPatchSchedID)
+	}
+	req := fc.LastPatchSchedReq
+	if req.Timing != "recurring" || req.CronExpr != "0 4 * * 2" || req.RunAt != nil {
+		t.Errorf("timing=%q cron=%q run_at=%v, want recurring + new cron + nil run_at", req.Timing, req.CronExpr, req.RunAt)
+	}
+	if req.Timezone != "UTC" {
+		t.Errorf("tz = %q, want UTC", req.Timezone)
+	}
+	if strings.Join(req.Labels, ",") != "flaky" {
+		t.Errorf("labels = %v, want [flaky]", req.Labels)
+	}
+	if req.MaxIssues == nil || *req.MaxIssues != 7 {
+		t.Errorf("max_issues = %v, want 7", req.MaxIssues)
+	}
+	if req.Guidance == nil || *req.Guidance != "add a failing test first" {
+		t.Errorf("guidance = %v, want \"add a failing test first\"", req.Guidance)
+	}
+	if req.AutoApprove == nil || *req.AutoApprove {
+		t.Errorf("auto_approve = %v, want a non-nil false", req.AutoApprove)
+	}
+	if req.WaitOnLimit == nil || *req.WaitOnLimit {
+		t.Errorf("wait_on_limit = %v, want a non-nil false", req.WaitOnLimit)
+	}
+	if req.Enabled != nil {
+		t.Errorf("enabled = %v, want nil (config edit never touches the pause flag)", req.Enabled)
+	}
+}
+
+// TestScheduleEditAtSwitchesTiming: --at flips a recurring schedule to once, sets
+// run_at, and clears the cron.
+func TestScheduleEditAtSwitchesTiming(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	req := fc.LastPatchSchedReq
+	if req.Timing != "once" || req.RunAt == nil || req.CronExpr != "" {
+		t.Errorf("timing=%q run_at=%v cron=%q, want once + a time + empty cron", req.Timing, req.RunAt, req.CronExpr)
+	}
+}
+
+// TestScheduleEditSurvivesUntouched (load-bearing): a --cron-only edit re-sends every
+// untouched config field the server's mergeSchedule would otherwise wipe — max_issues,
+// guidance — and keeps labels/tz, while leaving Enabled nil so the pause flag is untouched.
+func TestScheduleEditSurvivesUntouched(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	req := fc.LastPatchSchedReq
+	if req.CronExpr != "0 4 * * 2" {
+		t.Errorf("cron = %q, want the new value 0 4 * * 2", req.CronExpr)
+	}
+	if req.MaxIssues == nil || *req.MaxIssues != 5 {
+		t.Errorf("max_issues = %v, want the original 5 (re-sent, not wiped)", req.MaxIssues)
+	}
+	if req.Guidance == nil || *req.Guidance != "keep the diff small" {
+		t.Errorf("guidance = %v, want the original text (re-sent, not wiped)", req.Guidance)
+	}
+	if strings.Join(req.Labels, ",") != "bug,p1" {
+		t.Errorf("labels = %v, want the original [bug p1]", req.Labels)
+	}
+	if req.Timezone != "Europe/Bucharest" {
+		t.Errorf("tz = %q, want the original Europe/Bucharest", req.Timezone)
+	}
+	if req.Enabled != nil {
+		t.Errorf("enabled = %v, want nil (pause flag untouched)", req.Enabled)
+	}
+}
+
+// TestScheduleEditClearGuidance: --clear-guidance nils guidance; without it, guidance is
+// preserved from the fetched schedule.
+func TestScheduleEditClearGuidance(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	if _, _, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--clear-guidance"); code != uzicli.ExitOK {
+		t.Fatalf("clear exit = %d, want 0", code)
+	}
+	if req := fc.LastPatchSchedReq; req.Guidance != nil {
+		t.Errorf("guidance = %v, want nil after --clear-guidance", req.Guidance)
+	}
+
+	fc2 := editSweepFixture("sch_e")
+	if _, _, code := runCLI(t, fakeEnv(fc2), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2"); code != uzicli.ExitOK {
+		t.Fatalf("keep exit = %d, want 0", code)
+	}
+	if req := fc2.LastPatchSchedReq; req.Guidance == nil || *req.Guidance != "keep the diff small" {
+		t.Errorf("guidance = %v, want preserved without --clear-guidance", req.Guidance)
+	}
+}
+
+// TestScheduleEditClearMaxIssues: --clear-max-issues nils the cap (unlimited); without it,
+// the cap is preserved.
+func TestScheduleEditClearMaxIssues(t *testing.T) {
+	fc := editSweepFixture("sch_e")
+	if _, _, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_e", "--clear-max-issues"); code != uzicli.ExitOK {
+		t.Fatalf("clear exit = %d, want 0", code)
+	}
+	if req := fc.LastPatchSchedReq; req.MaxIssues != nil {
+		t.Errorf("max_issues = %v, want nil after --clear-max-issues", req.MaxIssues)
+	}
+
+	fc2 := editSweepFixture("sch_e")
+	if _, _, code := runCLI(t, fakeEnv(fc2), "schedule", "edit", "sch_e", "--cron", "0 4 * * 2"); code != uzicli.ExitOK {
+		t.Fatalf("keep exit = %d, want 0", code)
+	}
+	if req := fc2.LastPatchSchedReq; req.MaxIssues == nil || *req.MaxIssues != 5 {
+		t.Errorf("max_issues = %v, want preserved 5 without --clear-max-issues", req.MaxIssues)
+	}
+}
+
+// TestScheduleEditUsageErrors: conflicts, wrong-target scoping, and a no-op edit are all
+// usage errors (exit 2) with no PATCH sent.
+func TestScheduleEditUsageErrors(t *testing.T) {
+	cap5 := 5
+	promptSched := map[string]apitypes.ScheduleDTO{
+		"sch_p": {ID: "sch_p", Target: "prompt", Prompt: "do a thing", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true},
+	}
+	sweepSched := map[string]apitypes.ScheduleDTO{
+		"sch_e": {ID: "sch_e", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, MaxIssues: &cap5, Guidance: sptr("x")},
+	}
+	cases := []struct {
+		name string
+		byID map[string]apitypes.ScheduleDTO
+		args []string
+	}{
+		{"guidance+clear-guidance", sweepSched, []string{"edit", "sch_e", "--guidance", "y", "--clear-guidance"}},
+		{"max-issues+clear-max-issues", sweepSched, []string{"edit", "sch_e", "--max-issues", "3", "--clear-max-issues"}},
+		{"cron+at", sweepSched, []string{"edit", "sch_e", "--cron", "0 4 * * 2", "--at", "2026-08-08T09:00:00Z"}},
+		{"no-op", sweepSched, []string{"edit", "sch_e"}},
+		{"label on prompt target", promptSched, []string{"edit", "sch_p", "--label", "bug"}},
+		{"guidance on prompt target", promptSched, []string{"edit", "sch_p", "--guidance", "steer"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{ScheduleByID: tc.byID}
+			_, errOut, code := runCLI(t, fakeEnv(fc), append([]string{"schedule"}, tc.args...)...)
+			if code != uzicli.ExitUsage {
+				t.Fatalf("exit = %d, want %d; stderr=%q", code, uzicli.ExitUsage, errOut)
+			}
+			if fc.LastPatchSchedID != "" {
+				t.Errorf("patch should not have been called, got id %q", fc.LastPatchSchedID)
+			}
+		})
+	}
+}
+
+// TestScheduleEditNotFound: an unknown id is exit 4 and no PATCH is sent.
+func TestScheduleEditNotFound(t *testing.T) {
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{}}
+	_, _, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "nope", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitNotFound)
+	}
+	if fc.LastPatchSchedID != "" {
+		t.Errorf("patch should not have been called, got id %q", fc.LastPatchSchedID)
+	}
+}
+
 func ptrInt64(n int64) *int64 { return &n }

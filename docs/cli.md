@@ -172,9 +172,11 @@ A few worth knowing:
   ignored there); pass `--wait-on-limit=false` to fail on limit instead. A
   `--sweep` target defaults `--max-issues 10`, the cap on issues started per
   fire, oldest issue first (must be positive; `0` or negative is rejected);
-  raise it with `--max-issues <n>`. The CLI has no `schedule update`, so a
-  sweep created from it always carries a cap — an unlimited sweep is reachable
-  only by blanking the field in the web modal. `--guidance <text>` attaches
+  raise it with `--max-issues <n>`, or drop the cap entirely with
+  `schedule edit <schedule-id> --clear-max-issues` (same pattern for
+  `--clear-guidance`) — both are nullable fields, and clearing one from the
+  CLI no longer requires the web modal; `create` itself still defaults
+  `--max-issues 10`. `--guidance <text>` attaches
   optional owner steering ("always add a failing test first") to an `--issue`
   or `--sweep` target only (a `--prompt` target rejects it, since a prompt
   already carries its own text), injected into the run instruction as a
@@ -183,7 +185,16 @@ A few worth knowing:
   large issue body plus guidance would otherwise push the composed instruction
   over its size limit. Both `--max-issues` and `--wait-on-limit`'s new default
   apply at create time only — existing schedules keep their stored values.
-  `schedule list`/`get` read them, `pause`/`resume` flip firing without
+  `schedule list`/`get` read them, `edit <schedule-id>` changes a schedule's
+  mutable config in place — retime with `--cron`/`--at`, adjust `--tz`, or,
+  scoped to the existing target, `--prompt`/`--label`/`--guidance`
+  (`--clear-guidance`)/`--max-issues` (`--clear-max-issues`)/`--auto-approve`/
+  `--wait-on-limit` (no `--model`, out of scope) — without churning the id or
+  run history the way delete-and-recreate would; any field you omit keeps its
+  stored value, and editing config revives a terminal schedule (its status
+  returns to active — a recurring one resumes, a fired one-shot needs a fresh
+  future `--at`) but does not un-pause a paused schedule, while `pause`/`resume`
+  flip firing without
   deleting, `run-now` fires one immediately without disturbing its cadence,
   and `delete` removes it (run history is preserved).
 - **`review show <id>`** (formerly `run review <id>`, still around as a
