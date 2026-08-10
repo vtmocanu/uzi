@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-10
+
 ### Added
 
 - **A run can now fact-check a claim against its forge instead of the repo's own
@@ -47,6 +49,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   name. The builtin `lead` prompt now says a subagent (still running or already
   returned) cannot be reached by role name and needs no reply — it reports to
   `main` itself. (from judge recommendations)
+
+### Fixed
+
+- **Worker provisioning now retries a transient devbox toolchain install instead
+  of failing the worker.** A network-phrase classifier (`classifyDevboxError`)
+  tells a transient install failure (a momentary network blip while installing
+  the toolchain) from a real one and retries it with backoff, so a worker no
+  longer fails to come up over a blip it could have ridden out. (#290)
 
 ## [0.25.0] - 2026-08-10
 
