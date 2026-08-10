@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-08-10
+
 ### Added
 
 - **A failed pipeline on your own agent MR branch can now fix itself, opt-in
@@ -66,9 +68,27 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   claim, so it reaches every worker immediately even though the prompt code
   that renders it only takes effect for newly provisioned workers. No
   migration. (#297)
+- **The Runs list now shows which Anthropic token each run used.** A per-run
+  credential badge on the Runs list and run views names the token a run drew
+  from, so it is clear at a glance whether a run used your own token or a shared
+  admin one. (#295)
+- **uzi's Slack bot now renders Markdown as Slack mrkdwn.** Bot DMs and
+  notifications (judge summaries, chat replies) convert Markdown to Slack's
+  `mrkdwn` formatting instead of posting raw Markdown, so bold, links, lists and
+  code render natively in Slack. (#292)
+- **The judge's review now renders as formatted Markdown in the web run-review
+  panel.** The run view renders the judge's verdict and recommendations as
+  Markdown instead of escaped plain text. (#294)
 
 ### Changed
 
+- **Report and review text sanitization now share one implementation.** The
+  duplicated `sanitizeReportText` / `sanitizeReviewText` sanitizers were
+  consolidated into `api/internal/termsafe`, removing the silent-drift risk
+  between the two paths. (#298)
+- The bundled `uzi` CLI skill doc gained schedule-sweep guidance: the PRDLESS
+  gate, `--max-issues` / `--guidance` flags, and a no-local-edit notice.
+  (145c87b2)
 - **`task deadcode` no longer reds on a component whose toolchain the change
   never touched.** `deadcode:web`/`deadcode:agent` now delegate to
   `scripts/deadcode-knip.sh`, which loud-SKIPs (exit 0) when the component's
