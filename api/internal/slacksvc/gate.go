@@ -248,7 +248,16 @@ func truncateForSlackSection(s string) string {
 	if len(r) <= maxSlackSectionRunes {
 		return s
 	}
-	return string(r[:maxSlackSectionRunes]) + "\n…"
+	kept := string(r[:maxSlackSectionRunes])
+	// The rune slice may land INSIDE an emitted <https://…|label>, leaving a
+	// trailing "<" with no matching ">" — an unbalanced open that re-opens Slack's
+	// <url|label> grammar and the exact injection PRD #292 closes. If the last "<"
+	// in the kept region has no ">" after it, drop from that "<" onward. A "<" with
+	// a ">" after it is a complete token and is left intact.
+	if i := strings.LastIndexByte(kept, '<'); i >= 0 && !strings.ContainsRune(kept[i:], '>') {
+		kept = kept[:i]
+	}
+	return kept + "\n…"
 }
 
 // planThreadBlocks renders the plan into the run's DM thread at the approval gate
