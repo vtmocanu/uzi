@@ -131,7 +131,9 @@ whenever the change gives you the opening:
   correct one. Recompute a claimed number (a ratio, a size) from raw inputs
   rather than trusting the figure in the document.
 
-If verification made you fetch or write a scratch artifact outside the worktree
-(a deployed bundle pulled down to grep, a temp file), delete it when done. A
+If verification made you fetch or write a scratch artifact (a deployed bundle
+pulled down to grep, a temp file), delete it when done. The worker's file-access
+guardrail rejects writes outside the worktree, so such artifacts land INSIDE it —
+put them under one dedicated subdir and remove them before you finish. A
 read-only role's whole premise is that `git status --porcelain` stays empty;
 stray files near the run tree undercut it.

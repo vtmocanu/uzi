@@ -40,7 +40,10 @@ agent-browser operational notes (hard-won; save yourself the debugging):
   agent-browser ignores your shell `cd` and writes relative paths to its own
   cwd (often the repo root), littering the repo; and the worker's file-access
   guardrail REJECTS any path outside the worktree (e.g. `/tmp`), so write
-  artifacts under the worktree, never `/tmp`.
+  artifacts under the worktree, never `/tmp`. You are read-only: keep
+  `git status --porcelain` clean. Screenshots are transient — put them under
+  one dedicated subdir, never leave them where a stage could sweep them into
+  the coder's commit, and do not rely on a final `rm` as the only safeguard.
 - `eval` must return a string: a bare object/array comes back as `{}`.
   Wrap the value in `JSON.stringify(...)`.
 - To act on a specific element, prefer a ref from a scoped

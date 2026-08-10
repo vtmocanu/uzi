@@ -6,6 +6,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- Read-only validator agents keep the run worktree clean. The builtin `web-ux`
+  and `fact-checker` prompts now direct transient scratch artifacts (screenshots,
+  pulled-down bundles) so a clean delivery never hinges on a final `rm`, and
+  `fact-checker` no longer tells the worker to write outside the worktree, which
+  the file-access guardrail rejects. (from judge recommendations)
+
 ## [0.25.0] - 2026-08-10
 
 ### Added
