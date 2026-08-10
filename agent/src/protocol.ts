@@ -1103,6 +1103,20 @@ export interface StateRequest {
    *  the wire. Issue runs only; the server re-gates on `runs.kind` and validates
    *  the path, dropping it rather than failing the report. */
   prd_done_path?: string;
+  /** issue #279: a report-only/evidence completion — the run's deliverable was a report,
+   *  command output, or verification result with NO code change, so the worker records the
+   *  findings and opens NO merge request. Sent (true) on the `completed` report of such a
+   *  run, alongside `report_md`. Additive + optional and OMITTED ENTIRELY on an ordinary
+   *  push+MR completion — never `false` — so an old worker's payload and a new worker's
+   *  normal completion stay the same shape on the wire. Issue runs only; the server re-gates
+   *  on `runs.kind`. */
+  report_only?: boolean;
+  /** issue #279: the lead's short findings summary from signal_done, persisted as the
+   *  report body on a report-only completion (worker→api). Sent alongside `report_only`.
+   *  The worker clamps length (REPORT_MD_MAX_LEN) for transport hygiene ONLY — the api is
+   *  the authoritative control and validates/scrubs/clamps it. Additive + optional and
+   *  OMITTED ENTIRELY when the lead declared no summary. */
+  report_md?: string;
   /** failed carries a human-readable reason. */
   failure_reason?: string;
   /** implement⇄review loop counter, reported on running reports (M4). The

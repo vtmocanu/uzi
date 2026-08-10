@@ -202,6 +202,19 @@ export function runnerWith(
   });
 }
 
+/**
+ * issue #279: the UNDECLARED zero-diff guard fails an ISSUE run whose agent committed
+ * NOTHING (a confirmed-empty diff, changedFiles → []). The fake executors/queries in
+ * these tests drive a run to completion WITHOUT writing to the runner clone, so a real
+ * diff is empty and would now trip the guard. A test modelling a run that COMMITTED work
+ * calls this to make the diff non-empty, exactly as a real committing run would produce.
+ * (StubExecutor commits a real file, so its tests exercise the REAL changedFiles and do
+ * not need this.)
+ */
+export function simulateCommittedWork(files: string[] = ["src/impl.ts"]): void {
+  git.changedFiles = (async () => files) as typeof git.changedFiles;
+}
+
 export const gitlabClaim = (iid: number, overrides = {}) =>
   makeClaim({
     issue_iid: iid,

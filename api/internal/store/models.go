@@ -330,6 +330,8 @@ type Run struct {
 	BudgetWallSeconds     pgtype.Int4        `json:"budget_wall_seconds"`
 	ScheduleID            pgtype.UUID        `json:"schedule_id"`
 	LimitDeadSecretID     pgtype.UUID        `json:"limit_dead_secret_id"`
+	ReportOnly            bool               `json:"report_only"`
+	ReportMd              pgtype.Text        `json:"report_md"`
 }
 
 type RunMessage struct {
