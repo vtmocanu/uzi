@@ -108,6 +108,11 @@ export interface RunContext {
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
   memory?: MemoryEntry[];
+  /** Issue #297: work already in flight on the same repo at claim time, carried only
+   *  on a self_improve run so the picker avoids overlapping a recommendation with an
+   *  active run's work. Absent/empty ⇒ no block injected. UNTRUSTED-content advisory
+   *  data — rendered nonce-fenced, never as instructions. */
+  inflightTargets?: string[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when

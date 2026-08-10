@@ -37,6 +37,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   dependency discovery itself hit its scan cap, the note also warns that
   components beyond the cap were never checked, so a capped run does not read as
   fully verified. (#293)
+- **The self-improvement picker now sees what uzi is already working on, and is
+  told to avoid picking the same fix twice.** At claim time, a `self_improve`
+  run is handed a list of every other active run on the connected repo — keyed
+  on run status, not on a branch, so a run that hasn't pushed a branch or
+  opened an MR yet still counts — and the worker prompt renders it in its own
+  untrusted, nonce-fenced block with a directive to skip a recommendation that
+  overlaps and record the skip in the run feed. It's advisory (an LLM picker
+  choosing over a rendered list, not a hard block) and computed fresh per
+  claim, so it reaches every worker immediately even though the prompt code
+  that renders it only takes effect for newly provisioned workers. No
+  migration. (#297)
 
 ### Changed
 

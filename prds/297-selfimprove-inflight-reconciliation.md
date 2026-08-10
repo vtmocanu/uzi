@@ -1,7 +1,9 @@
 # PRD #297: Self-improvement picker skips work already in progress or done
 
-**Status**: Draft (2026-08-10; two code-verified reviews folded in — the precedent, the
-threading model, and the M3 file path below are the corrected versions)
+**Status**: In progress (2026-08-10) — M1, M2, and M4 shipped; M3 deferred to a
+follow-up (D2 unresolved, no merge-time key). Two code-verified reviews folded in
+earlier — the precedent, the threading model, and the M3 file path above are the
+corrected versions.
 
 **Priority**: Medium
 
@@ -95,7 +97,7 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
 
 ## Milestones
 
-- [ ] **M1 — Assemble the in-flight avoid-set at CLAIM TIME (api).** In the claim path
+- [x] **M1 — Assemble the in-flight avoid-set at CLAIM TIME (api).** In the claim path
       (`assembleClaim`, gated on `kind=='self_improve'`, mirroring the judge path's
       `assembleJudgeClaim`), build a list of coordinates for active runs and attach it
       as a new additive-optional claim-response field (`inflight_targets`, name TBD).
@@ -106,7 +108,7 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
       statuses `queued`/`claimed`/`running`/`awaiting_approval`/`awaiting_input`. Cap
       the list. No migration.
 
-- [ ] **M2 — Worker directive: render the list nonce-fenced, instruct the picker to
+- [x] **M2 — Worker directive: render the list nonce-fenced, instruct the picker to
       skip in-flight work (agent).** The self_improve picker directive lives in
       `agent/src/prompt.ts` — `SelfImprovePlanPromptInput` and
       `buildSelfImprovePlanPrompt` ("pick exactly ONE top improvement, keep the
@@ -117,7 +119,10 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
       instruct: do not pick an improvement whose fix is already in flight; if the top
       candidate overlaps, pick the next and record the skip + reason in the run feed.
 
-- [ ] **M3 — (additive, gated on D2) "recently landed" work.** Extend the avoid-set to
+- [ ] **M3 — (additive, gated on D2) "recently landed" work.** *(Deferred to a
+      follow-up — no merge-time key exists (D2 unresolved); the motivating incident
+      was purely in-flight (branch=null), which M1/M2 fully cover. No migration
+      added.)* Extend the avoid-set to
       work that just merged. **This half has no clean timestamp**: there is no
       `merged_at` column on `runs` (only `mr_state`, edge-triggered, `00029`;
       `finished_at`, which is MR-*open* time not merge time; and `updated_at`, written
@@ -126,7 +131,7 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
       migration). Only build M3 once D2 is decided; the in-flight M1/M2 alone already
       fix the motivating bug (which was issue-level, `branch=null`).
 
-- [ ] **M4 — Tests + docs.** Logic test with an in-package fake store (given an active
+- [x] **M4 — Tests + docs.** Logic test with an in-package fake store (given an active
       run on issue N, the assembled avoid-set contains N's coordinates; given a rec that
       overlaps, the field is populated) — this needs no live DB. **Any new SQL M3 adds
       gets a `*LiveDB` test** run via `./e2e/run-store-it.sh` (a green `sqlc generate`
@@ -136,6 +141,10 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
       its own untrusted fence, separate from the recommendation fence. Update
       `docs/self-improvement.md` (including the residual advisory-not-enforced risk and
       the worker-rollout caveat), CHANGELOG, and tick this PRD.
+      *(Done: `api/internal/workersvc/inflight_targets_test.go`,
+      `api/internal/workersvc/service_test.go`, and `agent/test/prompt.test.ts` cover
+      the fake-store avoid-set assembly and the untrusted-fence render. M3 was
+      deferred, so it added no new SQL — no `*LiveDB` test was needed.)*
 
 ## Decisions to make in the plan
 
@@ -147,6 +156,7 @@ reconciliation makes the overlap *visible to the picker*; the picker decides.
   `mr_state='merged'` + `updated_at` as an approximate window key (state the skew), or
   add a merge-time column. Also verify `runs.mr_state` is actually written to
   `'merged'` for in-scope runs before relying on it.
+  *Resolution: left unresolved this round — M3 is deferred to a follow-up along with D2.*
 - **D3 — coordinate shape the picker sees.** Issue iid + title + frozen milestone
   titles (all already on the `ListActiveRunsAll` row, so milestone-level overlap — the
   #293 case — is reachable without a new fetch). Decide whether to also extract a PRD
