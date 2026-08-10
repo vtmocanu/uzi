@@ -6,6 +6,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **`fd` and `yq` are now baked into the default worker toolchain.** Agents in
+  any repo can reach for `fd` (fast file finder) and `yq` (YAML processor,
+  mikefarah/yq) without hitting a `command not found` exit 127 — the same
+  general-purpose CLI class as the already-baked `jq`/`file`/`openssl`/
+  `coreutils`. (from judge recommendations)
+
 ### Changed
 
 - Read-only validator agents keep the run worktree clean. The builtin `web-ux`
