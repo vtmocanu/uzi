@@ -95,6 +95,16 @@ type BoardPref struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CiAutofixAttempt struct {
+	RepoID         uuid.UUID          `json:"repo_id"`
+	Ref            string             `json:"ref"`
+	AttemptCount   int32              `json:"attempt_count"`
+	LastSignature  pgtype.Text        `json:"last_signature"`
+	LastPipelineID pgtype.Int8        `json:"last_pipeline_id"`
+	HaltNotified   bool               `json:"halt_notified"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CliAuthRequest struct {
 	ID            uuid.UUID          `json:"id"`
 	CodeChallenge string             `json:"code_challenge"`

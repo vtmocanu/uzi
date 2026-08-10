@@ -409,6 +409,8 @@ var inventoryQueryFiles = []string{
 	"agent_memory.sql",
 	"user_vaults.sql",
 	"settings.sql",
+	// PRD #71 M4 — the ci-autofix loop guard
+	"ci_autofix.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -754,6 +756,37 @@ var queryInventory = []queryPin{
 			"prd_label != autopilot_label TOCTOU. A lock that is never taken under contention is a " +
 			"lock nothing has tested — and like the vault's ON CONFLICT, it is a property no fake " +
 			"can exhibit, because a fake has no transactions"},
+
+	// ── ci_autofix.sql — the ci-autofix loop guard (PRD #71 M4) ────────────────────────
+	// All seven are pinned by one live test, TestCIAutofixLiveDB, verified green against
+	// a throwaway Postgres 17 on 2026-08-10 (the whole internal/store LiveDB suite ran
+	// clean at that tip). M4 builds these primitives; the M6 poller detector is their
+	// production caller and does not exist yet, so the live test IS the only executor
+	// today — that is deliberate, not a gap.
+	{"ListCIAutofixCandidateRefs", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call. Discriminating in BOTH directions on every gate: one eligible ref (u1's " +
+			"agent/issue-1) survives while each of the default-branch guard, the mr_iid guard, a " +
+			"green (non-failed) pipeline, kind-awareness (a self_improve run on an agent branch), the " +
+			"owner opt-out and the missing-token case is separately excluded — so dropping any one " +
+			"predicate admits a neighbour and the len==1 check fires. Also pins the DISTINCT-ON " +
+			"newest-run pick (an older no-mr_iid run on the same branch loses to the newer one, " +
+			"asserted via mr_iid==101)"},
+	{"GetCIAutofixAttempt", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: asserts ErrNoRows on a never-attempted ref and reads back count/signature/" +
+			"pipeline/halt after each ledger transition below"},
+	{"UpsertCIAutofixAttempt", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: first proceed INSERTs count=1, a second proceed increments to 2 and overwrites " +
+			"last_signature/last_pipeline_id (sig-A/9001 → sig-B/9010) — the insert-then-increment " +
+			"and the EXCLUDED overwrite both asserted"},
+	{"RecordCIAutofixPipeline", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: the silent path moves last_pipeline_id to 9020 while attempt_count STAYS at 2 " +
+			"(never advances), and on a never-attempted ref inserts a row at the default count=0"},
+	{"SetCIAutofixHaltNotified", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: sets halt_notified true and stamps last_pipeline_id=9030, read back"},
+	{"DeleteCIAutofixAttempt", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: reset-on-green returns 1 for a present row and 0 for an absent one (the no-op case)"},
+	{"DeleteCIAutofixAttemptsNotIn", "ci_autofix.sql", "TestCIAutofixLiveDB",
+		"direct call: seeds three refs, keeps one, asserts exactly 2 evicted and the kept ref survives"},
 
 	{"TouchCLIToken", "cli_tokens.sql", unassertedPin,
 		"EXECUTES on every accepted Bearer request in the CLI live-DB suite " +

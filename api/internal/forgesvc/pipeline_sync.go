@@ -104,6 +104,18 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 		}); err != nil {
 			return err
 		}
+		// PRD #71 M4: evict ci-autofix ledger rows for refs that left the watch set,
+		// with the SAME keep-set — so a reused agent/issue-N branch never inherits a
+		// stale attempt count. Best-effort: a failure here must not stall the tick or
+		// undo the pipeline-cache eviction that already committed above.
+		if n, err := s.q.DeleteCIAutofixAttemptsNotIn(ctx, store.DeleteCIAutofixAttemptsNotInParams{
+			RepoID:   repoID,
+			KeepRefs: keep,
+		}); err != nil {
+			slog.Warn("forgesvc: ci_autofix ledger reconcile eviction failed", "repo", repoID, "error", err)
+		} else if n > 0 {
+			slog.Debug("forgesvc: ci_autofix ledger rows evicted", "repo", repoID, "rows", n)
+		}
 	}
 	return nil
 }
@@ -156,6 +168,23 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 	// the observed pipeline concluded, stamp the run's verdict. A cheap column update
 	// inside the sync — no worker involvement, no second loop.
 	s.maybeStampFixVerdict(ctx, repoID, ref, p)
+
+	// Reset-on-green (PRD #71 M4): a SUCCESS pipeline for this ref clears its
+	// ci-autofix attempt ledger so the next failure starts from a fresh count. It
+	// fires on ANY green pipeline for the ref, independent of whether a ci_fix run is
+	// stamped above — the ledger row only exists for refs that had auto attempts, so
+	// the delete is a cheap no-op otherwise. Best-effort; a failure must not stall the
+	// sync.
+	if pipelinestatus.IsSuccess(p.Status) {
+		if n, err := s.q.DeleteCIAutofixAttempt(ctx, store.DeleteCIAutofixAttemptParams{
+			RepoID: repoID,
+			Ref:    ref,
+		}); err != nil {
+			slog.Warn("forgesvc: ci_autofix ledger reset-on-green failed", "repo", repoID, "ref", ref, "error", err)
+		} else if n > 0 {
+			slog.Debug("forgesvc: ci_autofix ledger reset on green", "repo", repoID, "ref", ref, "rows", n)
+		}
+	}
 	return true
 }
 

@@ -61,12 +61,12 @@ const createCIFixRun = `-- name: CreateCIFixRun :one
 
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit
+    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve
 ) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     $1, $2::uuid, 'ci_fix', $3, $4,
-    $5, $6, $7, $8, $9
+    $5, $6, $7, $8, $9, $10
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, ci_config_paths
 `
@@ -81,6 +81,7 @@ type CreateCIFixRunParams struct {
 	FailureSnapshot  []byte      `json:"failure_snapshot"`
 	CiConfigPaths    []string    `json:"ci_config_paths"`
 	WaitOnLimit      bool        `json:"wait_on_limit"`
+	AutoApprove      bool        `json:"auto_approve"`
 }
 
 // CI-fix runs (PRD #6 Phase 2) ------------------------------------------------
@@ -96,6 +97,10 @@ type CreateCIFixRunParams struct {
 // override it. It parks like any other run (Decision 14) — same runner, same
 // executor, same expense — so excluding it would have meant paying for a guard to
 // NOT have the feature.
+// auto_approve (PRD #71 M4) is parametrized so the SAME query serves both paths:
+// the manual Fix-CI button passes false (the run parks at the plan gate like any
+// other), the poller's automatic ci_fix passes true (the worker resolves the plan
+// gate with an approve verdict, mirroring autopilot's Decision 2).
 func (q *Queries) CreateCIFixRun(ctx context.Context, arg CreateCIFixRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createCIFixRun,
 		arg.UserID,
@@ -107,6 +112,7 @@ func (q *Queries) CreateCIFixRun(ctx context.Context, arg CreateCIFixRunParams) 
 		arg.FailureSnapshot,
 		arg.CiConfigPaths,
 		arg.WaitOnLimit,
+		arg.AutoApprove,
 	)
 	var i Run
 	err := row.Scan(

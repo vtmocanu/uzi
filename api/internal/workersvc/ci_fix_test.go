@@ -47,6 +47,39 @@ func TestCreateCIFixRunSerializesSnapshot(t *testing.T) {
 	if len(snap.FailedJobs) != 1 || snap.FailedJobs[0].LogTail != "--- FAIL: TestFoo\n" {
 		t.Fatalf("snapshot did not round-trip: %+v", snap)
 	}
+	// PRD #71 M4: the manual Fix-CI path parks at the plan gate.
+	if fs.ciFixRunParams.AutoApprove {
+		t.Fatalf("manual CreateCIFixRun must pass auto_approve=false, got %+v", fs.ciFixRunParams)
+	}
+}
+
+func TestCreateAutoCIFixRunApproves(t *testing.T) {
+	// PRD #71 M4: the automatic sibling threads auto_approve=true through the SAME
+	// query so the worker resolves the plan gate itself.
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}}
+	svc := New(fs, newBox(t), testParams())
+
+	run, err := svc.CreateAutoCIFixRun(context.Background(), user, repo, "agent/issue-7", "Fix CI: agent/issue-7", "desc", sampleSnapshot(), []string{".gitlab-ci.yml"})
+	if err != nil {
+		t.Fatalf("CreateAutoCIFixRun: %v", err)
+	}
+	if run.Kind != RunKindCIFix {
+		t.Fatalf("expected a ci_fix run, got kind %q", run.Kind)
+	}
+	if fs.ciFixRunParams == nil || !fs.ciFixRunParams.AutoApprove {
+		t.Fatalf("automatic CreateAutoCIFixRun must pass auto_approve=true, got %+v", fs.ciFixRunParams)
+	}
+}
+
+func TestCreateAutoCIFixRunRunsSameGuards(t *testing.T) {
+	// The auto path must hit the same cross-kind same-branch exclusion as the manual
+	// one, so the M6 detector gets ErrBranchInUse to swallow on a race.
+	fs := &fakeStore{activeBranchRuns: 1}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateAutoCIFixRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", "t", "d", sampleSnapshot(), nil); err != ErrBranchInUse {
+		t.Fatalf("err = %v, want ErrBranchInUse", err)
+	}
 }
 
 func TestCreateCIFixRunRefusesBranchInUse(t *testing.T) {

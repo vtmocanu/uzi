@@ -121,7 +121,33 @@ func claimPipelineFromSnapshot(raw []byte) *ClaimPipeline {
 // is NULL for ci_fix). snapshot is serialized to failure_snapshot jsonb.
 // ciConfigPaths is the guard's watch set (PRD #71 M2), persisted onto the run so the
 // claim delivers it to the worker; nil/empty is fine (the column is NULL).
+//
+// This is the MANUAL Fix-CI path: it delegates to createCIFixRun with
+// autoApprove=false, so the run parks at the plan gate like any other. Its exported
+// signature is unchanged (the handler calls it verbatim); the automatic sibling is
+// CreateAutoCIFixRun.
 func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string) (store.Run, error) {
+	return s.createCIFixRun(ctx, userID, repoID, ref, title, description, snapshot, ciConfigPaths, false)
+}
+
+// CreateAutoCIFixRun is the AUTOMATIC sibling of CreateCIFixRun, called by the M6
+// poller detector when the ci-autofix loop guard proceeds on a failing agent MR
+// branch. It is identical to CreateCIFixRun except it passes autoApprove=true, so
+// the worker resolves the plan gate with an approve verdict instead of parking the
+// run at awaiting_approval (PRD #71 M4, mirroring autopilot's Decision 2). It runs
+// the SAME guards — the one-active-ci_fix-per-ref index and the cross-kind
+// same-branch exclusion — so the detector gets ErrActiveFixExists / ErrBranchInUse
+// to swallow on a race with the manual Fix-CI button.
+func (s *Service) CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string) (store.Run, error) {
+	return s.createCIFixRun(ctx, userID, repoID, ref, title, description, snapshot, ciConfigPaths, true)
+}
+
+// createCIFixRun is the shared body of the manual and automatic ci_fix create
+// paths. autoApprove is the ONLY difference between them — it becomes
+// runs.auto_approve, which the worker reads to skip (true) or keep (false) the human
+// plan gate. Everything else — repo-ownership check, the guards, the snapshot
+// serialization and the queued notify — is identical, so the two paths cannot drift.
+func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string, autoApprove bool) (store.Run, error) {
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
@@ -160,6 +186,9 @@ func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		// PRD #35: the OWNER's default. A ci_fix run is created by the poller with no
 		// user in the loop, so there is no per-run request to honour.
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
+		// PRD #71 M4: false on the manual path (parks at the plan gate), true on the
+		// automatic path (worker approves the plan gate itself).
+		AutoApprove: autoApprove,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

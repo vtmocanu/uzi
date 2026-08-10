@@ -261,6 +261,13 @@ type fakeStore struct {
 	stampParams    []store.FindCIFixStampTargetParams
 	stamps         []store.StampFixVerdictParams
 
+	// CI-autofix loop guard (PRD #71 M4) scripting + capture. autofixDeletes records
+	// reset-on-green calls (autofixDeleteRows is what each returns); autofixEvicts
+	// records reconcile-eviction calls.
+	autofixDeletes    []store.DeleteCIAutofixAttemptParams
+	autofixDeleteRows int64
+	autofixEvicts     []store.DeleteCIAutofixAttemptsNotInParams
+
 	// Filed→Done sync (PRD #98 M6) scripting + capture. The EDGE SEMANTICS are NOT
 	// modelled here — a fake replaying a snapshot as events would test the model rather
 	// than the mechanism — so once-only / Undo-sticks / not-overwritten live in the
@@ -330,6 +337,14 @@ func (s *fakeStore) FindCIFixStampTarget(_ context.Context, arg store.FindCIFixS
 func (s *fakeStore) StampFixVerdict(_ context.Context, arg store.StampFixVerdictParams) (int64, error) {
 	s.stamps = append(s.stamps, arg)
 	return 1, nil
+}
+func (s *fakeStore) DeleteCIAutofixAttempt(_ context.Context, arg store.DeleteCIAutofixAttemptParams) (int64, error) {
+	s.autofixDeletes = append(s.autofixDeletes, arg)
+	return s.autofixDeleteRows, nil
+}
+func (s *fakeStore) DeleteCIAutofixAttemptsNotIn(_ context.Context, arg store.DeleteCIAutofixAttemptsNotInParams) (int64, error) {
+	s.autofixEvicts = append(s.autofixEvicts, arg)
+	return 0, nil
 }
 func (s *fakeStore) ListFiledIssueCloseEdges(_ context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error) {
 	s.closeEdgeArgs = append(s.closeEdgeArgs, arg)

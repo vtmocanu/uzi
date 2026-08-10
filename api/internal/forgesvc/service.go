@@ -104,6 +104,10 @@ type IssueStore interface {
 	// CI-fix verification (PRD #6): stamp a fix run's verdict from its post-fix pipeline.
 	FindCIFixStampTarget(ctx context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error)
 	StampFixVerdict(ctx context.Context, arg store.StampFixVerdictParams) (int64, error)
+	// CI-autofix loop guard (PRD #71 M4): reset the attempt ledger on a green
+	// pipeline, and evict ledger rows for refs that left the watch set on reconcile.
+	DeleteCIAutofixAttempt(ctx context.Context, arg store.DeleteCIAutofixAttemptParams) (int64, error)
+	DeleteCIAutofixAttemptsNotIn(ctx context.Context, arg store.DeleteCIAutofixAttemptsNotInParams) (int64, error)
 	// Filed→Done sync (PRD #98 M6): the open→closed edge over the freshly-synced issue
 	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
 	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
