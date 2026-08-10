@@ -72,14 +72,14 @@ type repoSlug struct {
 // SSRF guard lives in config). No network call happens here — the version gate
 // runs in VerifyToken, so a bad version surfaces to the user rather than as a
 // generic "could not initialize forge client".
-func newForgejo(baseURL, token string, timeout time.Duration) (*forgejo, error) {
+func newForgejo(baseURL, token string, timeout time.Duration) *forgejo {
 	return &forgejo{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		token:   token,
 		client:  timeoutClient(timeout),
 		redact:  newRedactor(token),
 		slugs:   map[int64]repoSlug{},
-	}, nil
+	}
 }
 
 // newClient builds a per-call gitea client bound to ctx. SetGiteaVersion("")
@@ -828,7 +828,7 @@ func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID 
 	// call ERRORS on exactly the label events we need. See forgejoTimelineEntry.
 	var out []LabelEvent
 	for page := 1; ; page++ {
-		raw, _, err := f.rawGet(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/timeline?page=%d&limit=%d",
+		raw, err := f.rawGet(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/timeline?page=%d&limit=%d",
 			url.PathEscape(slug.owner), url.PathEscape(slug.repo), issueIID, page, forgejoPerPage))
 		if err != nil {
 			return nil, err // already redacted by rawGet
@@ -930,7 +930,7 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	var matchedScopes []string
 	matches := 0
 	for page := 1; ; page++ {
-		raw, _, err := f.rawGet(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
+		raw, err := f.rawGet(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
 			url.PathEscape(u.UserName), page, forgejoPerPage))
 		if err != nil {
 			return TokenInfo{}, err // already redacted by rawGet
@@ -982,28 +982,24 @@ type forgejoAccessToken struct {
 // both D5/M4). It returns the body and status. Every error is routed through the
 // PAT redactor, including a non-2xx body, so a hostile forge echoing the token in
 // an error cannot leak it (test #12).
-func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, int, error) {
+func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
 	if err != nil {
-		return nil, 0, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
+		return nil, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
 	}
 	req.Header.Set("Authorization", "token "+f.token)
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, 0, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
+		return nil, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
+		return nil, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
 	}
 	if resp.StatusCode/100 != 2 {
-		return body, resp.StatusCode, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
+		return body, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
 	}
-	return body, resp.StatusCode, nil
+	return body, nil
 }
 
-// errForgejoNotImplemented still backs the pipeline stubs in forgejo_pipelines.go
-// (LatestPipeline, LatestMRPipeline, ListPipelineJobs, JobLogTail), which M5 fills.
-// It carries no secret.
-var errForgejoNotImplemented = fmt.Errorf("forgejo: method not implemented yet")

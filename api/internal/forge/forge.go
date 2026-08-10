@@ -470,7 +470,7 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 	case TypeGitLab:
 		return newGitLab(baseURL, token, timeout)
 	case TypeForgejo:
-		return newForgejo(baseURL, token, timeout)
+		return newForgejo(baseURL, token, timeout), nil
 	case TypeGitHub:
 		return newGitHub(baseURL, token, timeout)
 	default:
