@@ -6,6 +6,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **A run can now finish report-only, instead of being forced to open an empty
+  merge request.** When an issue run's deliverable is a report, command output,
+  or a verification result with no code change to land, the lead calls
+  `signal_done` with `report_only: true`; the worker records the findings
+  summary and transcript and opens no merge request. An issue run that reaches
+  `signal_done` with nothing committed and no `report_only` declared now fails
+  with an actionable message instead of opening an empty MR. The run view and
+  `uzi run get` show a neutral "report only" marker in place of the MR chip and
+  render the findings summary as escaped plain text — it is untrusted
+  worker-authored text, server-scrubbed on the way in and never passed through
+  a markdown renderer. (#279)
+
 ## [0.26.0] - 2026-08-10
 
 ### Added
