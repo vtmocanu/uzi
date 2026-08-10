@@ -45,6 +45,7 @@ import { promisify } from "node:util";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { withRetry, classifyDevboxError, DEVBOX_RETRY_SCHEDULE } from "./forge-retry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -83,6 +84,9 @@ export interface ProvisionDeps {
   run?: (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) => Promise<RunResult>;
   /** Source env to derive the SCRUBBED subprocess env from (default process.env). */
   processEnv?: NodeJS.ProcessEnv;
+  /** Injectable sleep for the devbox-install retry backoff (tests record delays
+   *  and resolve immediately); default = real setTimeout-based sleep. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ProvisionResult {
@@ -189,7 +193,13 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
   const env = buildProvisionEnv(source, input.homeDir);
 
   try {
-    await run("devbox", ["install"], { cwd: input.runDir, env });
+    await withRetry(() => run("devbox", ["install"], { cwd: input.runDir, env }), {
+      classify: classifyDevboxError,
+      schedule: DEVBOX_RETRY_SCHEDULE,
+      sleep: deps.sleep,
+      log: deps.log,
+      logMessage: "transient devbox install error; retrying",
+    });
   } catch (err) {
     throw new Error(`tool provisioning failed (devbox install): ${errMessage(err)}`);
   }

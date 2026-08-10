@@ -122,4 +122,86 @@ describe("provisionTools", () => {
       /tool provisioning failed \(devbox install\)/,
     );
   });
+
+  it("retries a TRANSIENT devbox install error and succeeds (recording sleep, no real wait)", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let installCalls = 0;
+    const run = async (_cmd: string, args: string[]): Promise<RunResult> => {
+      if (args[0] === "install") {
+        installCalls++;
+        if (installCalls <= 2) {
+          throw new Error("curl: (28) Timeout was reached while fetching nixpkgs metadata from api.github.com");
+        }
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "shellenv") return { stdout: 'export PATH="/nix/bin:$PATH"\n', stderr: "" };
+      return { stdout: "", stderr: "" };
+    };
+
+    const res = await provisionTools(
+      { packages: ["kubectl@1.31"], runDir: path.join(tmp, "run"), homeDir: "/data/agent-home" },
+      { log: nullLogger(), run, sleep, processEnv: { PATH: "/usr/bin" } },
+    );
+
+    assert.strictEqual(installCalls, 3);
+    assert.deepStrictEqual(delays, [1000, 4000]);
+    assert.strictEqual(res.toolEnv.PATH, "/nix/bin:/usr/bin");
+  });
+
+  it("does NOT retry a deterministic (permanent) devbox install error", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let installCalls = 0;
+    const run = async (_cmd: string, args: string[]): Promise<RunResult> => {
+      if (args[0] === "install") {
+        installCalls++;
+        throw new Error("error: package 'nonesuch' not found");
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await assert.rejects(
+      provisionTools(
+        { packages: ["nonesuch"], runDir: path.join(tmp, "run"), homeDir: "/data/agent-home" },
+        { log: nullLogger(), run, sleep, processEnv: { PATH: "/usr/bin" } },
+      ),
+      /tool provisioning failed \(devbox install\)/,
+    );
+    assert.strictEqual(installCalls, 1);
+    assert.deepStrictEqual(delays, []);
+  });
+
+  it("does NOT retry a worker-timeout SIGTERM kill (would give 4×10min otherwise)", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let installCalls = 0;
+    const run = async (_cmd: string, args: string[]): Promise<RunResult> => {
+      if (args[0] === "install") {
+        installCalls++;
+        const e = new Error("Command failed: devbox install");
+        (e as unknown as { killed: boolean }).killed = true;
+        (e as unknown as { signal: string }).signal = "SIGTERM";
+        (e as unknown as { code: null }).code = null;
+        throw e;
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await assert.rejects(
+      provisionTools(
+        { packages: ["kubectl@1.31"], runDir: path.join(tmp, "run"), homeDir: "/data/agent-home" },
+        { log: nullLogger(), run, sleep, processEnv: { PATH: "/usr/bin" } },
+      ),
+      /tool provisioning failed \(devbox install\)/,
+    );
+    assert.strictEqual(installCalls, 1);
+    assert.deepStrictEqual(delays, []);
+  });
 });
