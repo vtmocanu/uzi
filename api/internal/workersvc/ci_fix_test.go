@@ -27,7 +27,7 @@ func TestCreateCIFixRunSerializesSnapshot(t *testing.T) {
 	fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}}
 	svc := New(fs, newBox(t), testParams())
 
-	run, err := svc.CreateCIFixRun(context.Background(), user, repo, "main", "Fix CI: main", "desc", sampleSnapshot())
+	run, err := svc.CreateCIFixRun(context.Background(), user, repo, "main", "Fix CI: main", "desc", sampleSnapshot(), []string{".gitlab-ci.yml"})
 	if err != nil {
 		t.Fatalf("CreateCIFixRun: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestCreateCIFixRunSerializesSnapshot(t *testing.T) {
 func TestCreateCIFixRunRefusesBranchInUse(t *testing.T) {
 	fs := &fakeStore{activeBranchRuns: 1} // an active run already occupies the ref's worktree
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", "t", "d", sampleSnapshot()); err != ErrBranchInUse {
+	if _, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), "agent/issue-9", "t", "d", sampleSnapshot(), nil); err != ErrBranchInUse {
 		t.Fatalf("err = %v, want ErrBranchInUse", err)
 	}
 }
@@ -60,7 +60,7 @@ func TestCreateCIFixRunRefusesBranchInUse(t *testing.T) {
 func TestCreateCIFixRunMapsDuplicateToActiveFixExists(t *testing.T) {
 	fs := &fakeStore{ciFixRunErr: &pgconn.PgError{Code: "23505"}}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), "main", "t", "d", sampleSnapshot()); err != ErrActiveFixExists {
+	if _, err := svc.CreateCIFixRun(context.Background(), uuid.New(), uuid.New(), "main", "t", "d", sampleSnapshot(), nil); err != ErrActiveFixExists {
 		t.Fatalf("err = %v, want ErrActiveFixExists", err)
 	}
 }

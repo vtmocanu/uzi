@@ -1758,6 +1758,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			SkillsMaxPerRun:        s.p.SkillsMaxPerRun,
 			ToolPackages:           toolPackages,
 			RepoDevboxOptIn:        rc.RepoDevboxOptIn,
+			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
+			CIConfigPaths: run.CiConfigPaths,
 		},
 	}, nil
 }

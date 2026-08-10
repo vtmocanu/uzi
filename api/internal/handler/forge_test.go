@@ -27,7 +27,10 @@ func (f *fakeUserForge) UserExists(context.Context, string) (bool, error) {
 func (f *fakeUserForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return forge.BotIdentity{}, nil
 }
-func (f *fakeUserForge) ListProjects(context.Context) ([]forge.Project, error)    { return nil, nil }
+func (f *fakeUserForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
+func (f *fakeUserForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
 func (f *fakeUserForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
 func (f *fakeUserForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
 func (f *fakeUserForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {

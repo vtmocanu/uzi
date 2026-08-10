@@ -102,6 +102,9 @@ func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return forge.BotIdentity{}, nil
 }
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
+func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
 func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) {
 	return nil, nil
 }

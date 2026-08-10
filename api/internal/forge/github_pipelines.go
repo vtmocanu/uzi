@@ -146,6 +146,13 @@ func (g *github) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	return g.redact.string(string(data)), nil
 }
 
+// ProjectCIConfigPath returns the empty string: GitHub Actions has no
+// ci_config_path override, so callers get the driver's default. Runtime auto-fix
+// parity is GitLab-only (PRD #71 Out-of-Scope); this satisfies the interface.
+func (g *github) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
+
 // fetchJobLog GETs the pre-signed blob URL under the three D5/H5 transport guards:
 //
 //	(a) NO Authorization header — the pre-signed URL must not receive the PAT, and

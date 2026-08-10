@@ -490,6 +490,17 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	return g.redact.string(string(data)), nil
 }
 
+// ProjectCIConfigPath returns the project's configured ci_config_path (empty means
+// the GitLab default, .gitlab-ci.yml). GitLab: GET /projects/:id. The value is a
+// repo-relative path/glob, never a secret; any error is PAT-redacted like the rest.
+func (g *gitLab) ProjectCIConfigPath(ctx context.Context, projectID int64) (string, error) {
+	p, _, err := g.client.Projects.GetProject(int(projectID), nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return "", g.redact.error(fmt.Errorf("gitlab: get project: %w", err))
+	}
+	return p.CIConfigPath, nil
+}
+
 // toPipeline maps a client-go PipelineInfo (the list-endpoint shape returned by
 // both ListProjectPipelines and ListMergeRequestPipelines) to the neutral domain
 // type. Nil timestamps yield the zero time, which the cache stores as NULL.

@@ -15,12 +15,12 @@
 -- NOT have the feature.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_id, pipeline_ref, failure_snapshot, wait_on_limit
+    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit
 ) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
-    @pipeline_id, @pipeline_ref, @failure_snapshot, @wait_on_limit
+    @pipeline_id, @pipeline_ref, @failure_snapshot, @ci_config_paths, @wait_on_limit
 )
 RETURNING *;
 

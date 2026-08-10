@@ -104,7 +104,7 @@ func claimPipelineFromSnapshot(raw []byte) *ClaimPipeline {
 	}
 	jobs := make([]ClaimFailedJob, 0, len(snap.FailedJobs))
 	for _, j := range snap.FailedJobs {
-		jobs = append(jobs, ClaimFailedJob{Name: j.Name, Stage: j.Stage, WebURL: j.WebURL, LogTail: j.LogTail})
+		jobs = append(jobs, ClaimFailedJob(j))
 	}
 	return &ClaimPipeline{ID: snap.PipelineID, Ref: snap.Ref, SHA: snap.SHA, WebURL: snap.WebURL, FailedJobs: jobs}
 }
@@ -119,7 +119,9 @@ func claimPipelineFromSnapshot(raw []byte) *ClaimPipeline {
 //
 // title/description are the synthesized human summary stored on the run (issue_iid
 // is NULL for ci_fix). snapshot is serialized to failure_snapshot jsonb.
-func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot) (store.Run, error) {
+// ciConfigPaths is the guard's watch set (PRD #71 M2), persisted onto the run so the
+// claim delivers it to the worker; nil/empty is fine (the column is NULL).
+func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string) (store.Run, error) {
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
@@ -154,6 +156,7 @@ func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		PipelineID:       pgtype.Int8{Int64: snapshot.PipelineID, Valid: true},
 		PipelineRef:      pgtype.Text{String: ref, Valid: true},
 		FailureSnapshot:  snapJSON,
+		CiConfigPaths:    ciConfigPaths,
 		// PRD #35: the OWNER's default. A ci_fix run is created by the poller with no
 		// user in the loop, so there is no per-run request to honour.
 		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
