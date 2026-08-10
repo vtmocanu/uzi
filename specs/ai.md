@@ -19580,3 +19580,42 @@ the source, without ever exposing the forge token or coordinates to the model.
 - **The recurring `install_worker_tool: glab` recommendation is by design, not a regression.**
   It comes from a missing-executable trace scan, and `glab` is permanently denied
   (`toolprofile/toolprofile.go`), so it keeps firing after this ships — expected recurrence.
+
+## 510. Issue #280 — a seeded plan gets a DETERMINISTIC bright-line recon-target screen at the sole create-time choke point, because it skips the plan gate entirely
+
+Extends the PRD #209 seeded-plan feature (design record `prds/done/209-seeded-plan-runs.md`;
+full rationale `adr/0280-seeded-plan-safety-screen.md`). A run seeded via
+`uzi run create --plan-file` sets `runs.plan_source='seeded'`, which the server folds into
+`PlanApproved` (the `run.PlanSource == planSourceSeeded` disjunct at
+`api/internal/workersvc/service.go`, alongside auto-approve and consumed human-approval — the
+gate-bypass primitive of §436) so the worker skips **both** the planning turn and the approval
+gate (`agent/src/sdk-executor.ts` `preApproved` path). The only thing formerly between a
+prohibited seeded plan and implementation was the lead agent's own discretion — model-dependent,
+not a control.
+
+- **Deterministic bright-line screen, at the one create choke point.** New leaf package
+  `api/internal/planpolicy` (`Screen(plan) (category, matched)`, sibling to `secretscrub` — a
+  small dependency-free content check) runs inside the shared `createRun` on the seeded path
+  only, on the **secret-scrubbed** body, **after** the empty-check and **before** the run is
+  persisted. A match ⇒ new sentinel `workersvc.ErrPlanUnsafe` ⇒ HTTP 422
+  (`handler/workers.go` `writeStartRunError`), whose message names the matched category (a fixed
+  planpolicy string, never plan text or a secret) and redirects the caller to the ordinary gated
+  flow. The run is never created.
+- **Why a create-time REJECT, not the alternatives.** A reject is a control; forcing the gate on
+  a match merely relocates the discretion, and an LLM classifier is exactly the model-dependent
+  backstop the issue criticizes. Screens **only** seeded plans — an issue-planned run is
+  unscreened and still human-gated, so the screen adds no false-positive surface to the ordinary
+  path. Scrubbed-first so a redacted secret cannot mask a target.
+- **The bright-line targets.** Cloud instance-metadata endpoints (`169.254.169.254` /
+  `metadata.google.internal`), the default kube-apiserver ClusterIP (`10.96.0.1`), and the in-pod
+  service-account token mount (both `/run/...` and `/var/run/...` forms) — endpoints with no
+  legitimate reason to appear in a repository code-change plan. Deliberately EXCLUDES
+  `kubernetes.default.svc` and cloud credential file paths (e.g. `.aws/credentials`) to avoid
+  false positives.
+- **Accepted residual: a text denylist is trivially obfuscation-defeated.** This is
+  defense-in-depth complementing worker network-egress enforcement
+  (`adr/0285-worker-egress-tier-trust-model.md`), NOT a substitute. Consequence of the bright-line
+  literals: the metadata-IP / ClusterIP strings legitimately appear in this repo's own egress
+  netpol manifests (`deploy/chart/templates/worker-fqdn-egress.yaml`, `deploy/values/*.yaml`), so
+  a seeded plan that edits that feature is refused the ungated fast-path **by design** and falls
+  back to the ordinary gated flow.
