@@ -37,6 +37,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/planpolicy"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/pushbroker"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
@@ -110,6 +111,16 @@ var (
 	// armed. Rejecting at create time closes that entry path; the plan_source='agent'
 	// write in SetRunAwaitingApproval closes every other one.
 	ErrPlanEmpty = errors.New("seeded plan is empty")
+	// ErrPlanUnsafe rejects a create-time SEEDED plan whose text names a
+	// bright-line infrastructure-reconnaissance target (cloud instance metadata
+	// endpoint, the kube-apiserver ClusterIP, or the in-pod service-account token
+	// mount) → 422 (issue #280). Deterministic defense-in-depth: a seeded plan
+	// skips the approval gate (plan_source='seeded' sets plan_approved), so this
+	// is the one automated control between such a plan and implementation. The
+	// matched category is wrapped into the returned error for the 422 message.
+	// It runs only on SEEDED plans; an ordinary issue-planned run is never
+	// screened (it still goes through the human approval gate unchanged).
+	ErrPlanUnsafe = errors.New("seeded plan names a prohibited target")
 	// ErrInvalidPlannedCommit rejects a create-time --planned-commit that is not a
 	// plausible git commit sha (PRD #209 M4) → 400. The compare in the worker is
 	// prefix-tolerant with no floor, so a 1-2 char value would spuriously match almost
@@ -3513,6 +3524,14 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		scrubbed := secretscrub.Scrub(seed.PlanMD)
 		if strings.TrimSpace(scrubbed) == "" {
 			return store.Run{}, ErrPlanEmpty
+		}
+		// issue #280: bright-line safety screen. A seeded plan skips the approval
+		// gate, so screen the scrubbed body for prohibited infrastructure-recon
+		// targets and REJECT at create — the run is never persisted. Runs after the
+		// scrub so a redacted secret can't mask a target, and only on the seeded
+		// path (this whole block is `if seed != nil`); ordinary runs are untouched.
+		if target, unsafe := planpolicy.Screen(scrubbed); unsafe {
+			return store.Run{}, fmt.Errorf("%w: %s", ErrPlanUnsafe, target)
 		}
 		planMD = pgText(scrubbed)
 		planSource = planSourceSeeded
