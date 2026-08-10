@@ -2519,6 +2519,15 @@ type StateRequest struct {
 	// later forge write against the issue description, so it is gated on the run's
 	// kind and validated before it is stored — see clampWirePRDDonePath.
 	PrdDonePath *string `json:"prd_done_path"`
+	// ReportOnly and ReportMd carry issue #279's report-only/evidence completion. A run
+	// whose deliverable is a report/command-output/verification result with NO code change
+	// completes with report_only=true and its findings in report_md, and the worker opens
+	// NO merge request. Both are DECLARATIONS by an untrusted worker on the terminal
+	// `completed` report: kind-gated (issue runs only) and, for report_md, control-char
+	// stripped + secret-scrubbed + length-bounded server-side before storage — see
+	// clampWireReportMd / clampWireReportOnly. Absent on a normal MR completion.
+	ReportOnly *bool   `json:"report_only"`
+	ReportMd   *string `json:"report_md"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
 	// a slice, because the three states differ: absent (nil) = this report says
@@ -2654,10 +2663,17 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// unconditionally on every terminal transition, D4), so only the completed side is
 		// passed here.
 		completedIDs, _ := progressParams(owned.Kind, owned.MilestonesFrozen, req.MilestonesCompleted, nil)
+		// report_md is the deliverable of a report-only completion, so it is stored ONLY
+		// when report_only was accepted — this keeps the column's invariant (non-NULL only
+		// on a report_only run) true even against an untrusted worker that sends report_md
+		// alone. clampWireReportOnly is the issue-run gate report_md then inherits.
+		reportOnly := clampWireReportOnly(owned, req.ReportOnly)
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
+			ReportOnly:          reportOnly,
+			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			ID:                  runID, WorkerID: pgUUID(wkr.ID),
 		})

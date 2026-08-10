@@ -15,6 +15,7 @@ import {
   gitlabClaim,
   installHarness,
   runnerWith,
+  simulateCommittedWork,
 } from "./runner-harness.js";
 
 installHarness();
@@ -167,6 +168,9 @@ describe("RunRunner — base-commit staleness guard (PRD #209 M4)", () => {
   // still implement. The default behaviour (Open Question 3).
   it("mismatch without --require-base: warns and still implements", async () => {
     const { gitlab } = fakeGitlab();
+    // The capturing executor commits nothing; model committed work so the warn-only run
+    // completes rather than tripping the issue-run zero-diff guard (issue #279).
+    simulateCommittedWork();
     const seen: RunContext[] = [];
     const planned = mismatchOf(originHead());
     const claim = seededClaim(92, {

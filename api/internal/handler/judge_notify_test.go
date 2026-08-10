@@ -191,3 +191,52 @@ func TestReviewSlackFactsChipsAndCount(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewSummaryPreviewPreservesNewlines pins PRD #292 M4: the summary preview now
+// keeps its newlines (so the Slack blockquote/list structure survives when rendered as
+// mrkdwn), stays secret-scrubbed, and still honors the 600-rune cap.
+func TestReviewSummaryPreviewPreservesNewlines(t *testing.T) {
+	const secret = "sk-ant-api03-DEADBEEFsecretkeyvalue" // ScrubSecrets redacts this Anthropic-family token
+	multi := "**Summary line**\n- point one\n- leaked " + secret + "\n> quoted"
+	got := reviewSummaryPreview(multi)
+	if !strings.Contains(got, "\n") {
+		t.Errorf("preview dropped newlines: %q", got)
+	}
+	if strings.Contains(got, secret) {
+		t.Errorf("preview leaked a secret: %q", got)
+	}
+	// The multi-line structure (bold line, bullets, blockquote) survives verbatim except
+	// for the scrubbed secret.
+	if !strings.Contains(got, "**Summary line**") || !strings.Contains(got, "- point one") || !strings.Contains(got, "> quoted") {
+		t.Errorf("preview lost markdown structure: %q", got)
+	}
+
+	// The 600-rune cap still applies to the multi-line text, appending the ellipsis.
+	long := strings.Repeat("a\n", 700) // 1400 runes, well over the cap
+	capped := reviewSummaryPreview(long)
+	runes := []rune(capped)
+	if len(runes) != reviewSummaryPreviewMaxRunes+1 || runes[len(runes)-1] != '…' {
+		t.Errorf("capped preview = %d runes, want %d + ellipsis", len(runes), reviewSummaryPreviewMaxRunes)
+	}
+
+	if reviewSummaryPreview("   \n  \n ") != "" {
+		t.Errorf("whitespace-only preview should be empty")
+	}
+}
+
+// TestReviewNotificationBodyCollapsesNewlines pins Decision 7 / SC4: even when the
+// summary is multi-line (as it now is), the web-inbox one-liner collapses its
+// whitespace/newlines to single spaces so Payload["body"] carries no newline.
+func TestReviewNotificationBodyCollapsesNewlines(t *testing.T) {
+	multi := "line1\nline2\n\n  line3"
+	body := reviewNotificationBody("ok", 1, multi)
+	if strings.Contains(body, "\n") {
+		t.Errorf("inbox body kept a newline: %q", body)
+	}
+	if !strings.Contains(body, "verdict: ok") || !strings.Contains(body, "1 recommendation") {
+		t.Errorf("inbox body missing verdict/count: %q", body)
+	}
+	if !strings.Contains(body, "line1 line2 line3") {
+		t.Errorf("inbox body did not collapse the multi-line summary to spaces: %q", body)
+	}
+}

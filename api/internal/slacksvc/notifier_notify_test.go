@@ -148,6 +148,120 @@ func TestNotificationBlocksOmitsEmptyBodyFactsAndLink(t *testing.T) {
 	}
 }
 
+// TestNotificationBlocksRendersMrkdwnAndBlockquotes: a judge-style multi-line markdown
+// body is translated by SlackMrkdwn (PRD #292 M4) — `**x**` → `*x*`, `- a` → `• a` — and,
+// having NO code fence, every rendered line is blockquote-prefixed.
+func TestNotificationBlocksRendersMrkdwnAndBlockquotes(t *testing.T) {
+	ev := notifyEvent{
+		emoji: "🔎",
+		title: "review ready",
+		body:  "**Re-seeded work.**\n- point a\n- point b",
+	}
+	blocks, _ := notificationBlocks(ev)
+	_, section := blockSummary(blocks)
+
+	if strings.Contains(section, "**Re-seeded work.**") {
+		t.Fatalf("bold not translated to mrkdwn: %q", section)
+	}
+	if !strings.Contains(section, "> *Re-seeded work.*") {
+		t.Fatalf("want the bold line rendered and blockquoted: %q", section)
+	}
+	if !strings.Contains(section, "> • point a") || !strings.Contains(section, "> • point b") {
+		t.Fatalf("bullets not rendered as blockquoted • items: %q", section)
+	}
+}
+
+// TestNotificationBlocksFencedBodyIsPlainSection: a body containing a ```fenced``` block
+// is emitted as a PLAIN section (PRD #292 Decision 6) — the fence's interior lines are
+// NOT `> `-prefixed, because a blockquote prefix corrupts Slack's code rendering.
+func TestNotificationBlocksFencedBodyIsPlainSection(t *testing.T) {
+	ev := notifyEvent{
+		emoji: "🔎",
+		title: "review ready",
+		body:  "Here is code:\n```\ncode line one\ncode line two\n```",
+	}
+	blocks, _ := notificationBlocks(ev)
+	_, section := blockSummary(blocks)
+
+	if !strings.Contains(section, "```") {
+		t.Fatalf("fence delimiters missing from rendered body: %q", section)
+	}
+	// No line is blockquote-prefixed: neither the fenced interior nor the intro line.
+	if strings.Contains(section, "\n> ") || strings.HasPrefix(strings.TrimPrefix(section, "🔎 *review ready*"), "> ") {
+		t.Fatalf("fenced body must not be blockquoted: %q", section)
+	}
+	if !strings.Contains(section, "code line one") || !strings.Contains(section, "code line two") {
+		t.Fatalf("fenced content missing: %q", section)
+	}
+}
+
+// TestNotificationBlocksLiteralBackticksInProseStillBlockquoted: a body with a literal
+// ``` run in PROSE (not a fenced code block) IS still blockquoted — the fence carve-out
+// keys on the AST (SlackMrkdwnBlock reporting a real code block), not a substring scan of
+// the output, so prose backticks don't wrongly suppress the blockquote (PRD #292 Decision 6).
+func TestNotificationBlocksLiteralBackticksInProseStillBlockquoted(t *testing.T) {
+	ev := notifyEvent{emoji: "🔎", title: "review ready", body: "see the ``` marker in text"}
+	blocks, _ := notificationBlocks(ev)
+	_, section := blockSummary(blocks)
+
+	if !strings.Contains(section, "> see the ``` marker in text") {
+		t.Fatalf("prose with a literal ``` must still be blockquoted, got: %q", section)
+	}
+}
+
+// TestSlackMrkdwnBlockReportsCodeBlock pins the AST-based fence signal: a real fenced
+// block reports true; the SAME ``` characters appearing only as inline prose report false.
+func TestSlackMrkdwnBlockReportsCodeBlock(t *testing.T) {
+	if _, has := SlackMrkdwnBlock("```\ncode\n```"); !has {
+		t.Error("a real fenced code block must report hasCodeBlock=true")
+	}
+	if _, has := SlackMrkdwnBlock("see the ``` marker in text"); has {
+		t.Error("a literal ``` in prose must report hasCodeBlock=false")
+	}
+	if _, has := SlackMrkdwnBlock("just prose"); has {
+		t.Error("plain prose must report hasCodeBlock=false")
+	}
+}
+
+// TestNotificationBlocksInjectedMentionInert: an injected <@U123> in the untrusted body
+// stays inert — SlackMrkdwn escapes it so it can never render as a live mention.
+func TestNotificationBlocksInjectedMentionInert(t *testing.T) {
+	ev := notifyEvent{emoji: "🔎", title: "review ready", body: "ping <@U123> please"}
+	blocks, _ := notificationBlocks(ev)
+	_, section := blockSummary(blocks)
+
+	if strings.Contains(section, "<@U123>") {
+		t.Fatalf("injected mention not escaped: %q", section)
+	}
+	if !strings.Contains(section, "&lt;@U123&gt;") {
+		t.Fatalf("want the escaped mention in %q", section)
+	}
+}
+
+// TestNotificationBlocksServerProseUnchanged: the three non-judge producers that share
+// notificationBlocks post FIXED server prose carrying no markdown, so routing them
+// through SlackMrkdwn is a safe superset — the rendered body equals the input (just
+// blockquoted), unchanged from before M4.
+func TestNotificationBlocksServerProseUnchanged(t *testing.T) {
+	fixed := []string{
+		// selfimprove started (engine.go)
+		"A self-improvement run has started on the uzi repo. It will open or extend one merge request; review its plan in the run view.",
+		// selfimprove skipped (engine.go)
+		"A self-improvement run is still in progress, so this cycle was skipped. It will retry once the current run finishes.",
+		// schedule paused (scheduler.go), a representative rendered reason
+		"A scheduled run was paused because the repo was disconnected. Reconnect the repo or update the schedule to resume it.",
+	}
+	for _, body := range fixed {
+		blocks, _ := notificationBlocks(notifyEvent{emoji: "🔧", title: "notice", body: body})
+		_, section := blockSummary(blocks)
+		// No markdown and no &<> in these strings, so SlackMrkdwn returns them verbatim;
+		// the body is a single line, so it is blockquoted as "> " + body.
+		if !strings.Contains(section, "> "+body) {
+			t.Fatalf("server prose body changed by render: got %q, want it to contain %q", section, "> "+body)
+		}
+	}
+}
+
 func TestPublishNotificationNeverBlocks(t *testing.T) {
 	n := NewNotifier(&fakeNotifStore{}, &fakePoster{}, fixedBase, nil)
 	// Overfill the queue: with nothing draining, PublishNotification must still

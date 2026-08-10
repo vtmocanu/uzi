@@ -20,6 +20,7 @@ import {
   planWithMilestonesThenDoneQuery,
   resultOk,
   runner,
+  simulateCommittedWork,
   waitDead,
 } from "./runner-harness.js";
 
@@ -28,6 +29,9 @@ installHarness();
 describe("RunRunner — plan gate + steering end to end", () => {
   it("halts at awaiting_approval, resumes on approve, then completes with an MR", async () => {
     const { gitlab, calls } = fakeGitlab();
+    // The fake SDK query commits nothing to the clone; model committed work so the
+    // issue-run zero-diff guard does not fail this happy path (issue #279).
+    simulateCommittedWork();
     const claim = gitlabClaim(21);
     api.setInputs(claim.run_id, [input("approve_plan")]);
     await runner(
@@ -506,6 +510,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
 
   it("reaps the agent tree BEFORE the PAT-bearing push (B1 ordering)", async () => {
     const { gitlab } = fakeGitlab();
+    // The inline executor commits nothing; model committed work so the run reaches the
+    // push (the issue-run zero-diff guard would otherwise fail it — issue #279).
+    simulateCommittedWork();
     const events: string[] = [];
     const exec: Executor = {
       run: async (ctx) => ({ branch: ctx.branch }),
@@ -586,6 +593,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
     };
     const claim = gitlabClaim(32);
     api.setInputs(claim.run_id, [input("approve_plan")]);
+    // The fake query commits nothing; model committed work so the run completes past the
+    // issue-run zero-diff guard (issue #279).
+    simulateCommittedWork();
     const exec = new SdkExecutor(nullLogger(), homeDir, { queryFn, spawn });
     try {
       await runner(exec, gitlab).execute(claim);

@@ -274,3 +274,23 @@ body {
 .docs-prose th {
   @apply font-semibold text-fg;
 }
+
+/* Scoped wrapper for UNTRUSTED judge markdown (summary_md / rationale_md) rendered
+   through the shared <Markdown> (.docs-prose) inside the compact run-review panel.
+   Two jobs: (1) give the panel a text-sm base .docs-prose lacks, and (2) defend the
+   compact card against an untrusted heading — .docs-prose h1/h2 render at
+   text-3xl / bordered text-xl, which would blow out the card. Placed AFTER the whole
+   .docs-prose rule set: the heading override uses :is(...) so it matches .docs-prose h1
+   at the same specificity (0,1,1) and wins by source order. Do not edit .docs-prose. */
+.judge-prose {
+  @apply text-sm;
+}
+.judge-prose > :first-child {
+  @apply mt-0;
+}
+.judge-prose :is(h1, h2, h3, h4) {
+  @apply my-2 border-0 pb-0 text-base font-semibold text-fg;
+}
+.judge-prose p {
+  @apply my-2 leading-6;
+}

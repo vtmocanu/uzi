@@ -30,6 +30,12 @@ export const ASK_USER_TOOL = "ask_user";
 export const REPORT_PROGRESS_TOOL = "report_progress";
 export const CHECKPOINT_TOOL = "checkpoint";
 
+/** issue #279: transport-hygiene cap on the `summary` captured from signal_done and
+ *  forwarded as `report_md` on a report-only completion. HYGIENE ONLY — the api is the
+ *  authoritative control (it will also scrub+clamp); this just keeps a garbage payload
+ *  from ballooning worker memory before it is reported. */
+export const REPORT_MD_MAX_LEN = 32_768;
+
 const SUBMIT_PLAN_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SUBMIT_PLAN_TOOL}`;
 const SIGNAL_DONE_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SIGNAL_DONE_TOOL}`;
 const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
@@ -55,6 +61,16 @@ export interface ScannedSignals {
    *  re-checked server-side (progressParams). Present only when signal_done carried a
    *  non-empty, parseable id list. */
   milestonesCompleted?: string[];
+  /** issue #279: the `summary` a signal_done call carried, clamped to REPORT_MD_MAX_LEN.
+   *  MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as `prdDonePath` — a subagent
+   *  frame never reaches the content loop. Persisted as `report_md` on a report-only
+   *  completion. Present only when signal_done carried a string `summary`. */
+  summary?: string;
+  /** issue #279: true when a signal_done call declared `report_only: true`. MAIN-THREAD-ONLY,
+   *  behind the same isSubagentFrame guard as `prdDonePath`. Signals an evidence/report-only
+   *  run that completes with NO push/MR. Present only when signal_done carried `report_only:
+   *  true`; absent otherwise so a plain signal_done still scans to exactly `{ done: true }`. */
+  reportOnly?: boolean;
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -101,6 +117,11 @@ export interface SignalServerOptions {
    *  the same discriminator as `progress` — a non-issue run has no milestone boundary to
    *  checkpoint at, so the tool is invisible to the model there rather than present. */
   checkpoint?: boolean;
+  /** issue #279: expose `report_only` on signal_done. Issue runs only — gated on the same
+   *  isIssueRun discriminator as prdDonePath/milestones. A `ci_fix` run already has its own
+   *  `not_code` no-MR terminal path and a `self_improve`/`prompt` run is never report-only,
+   *  so the parameter is invisible to the model there rather than present-and-inert. */
+  reportOnly?: boolean;
 }
 
 /**
@@ -146,6 +167,21 @@ export function buildSignalMcpServer(
           "you ACTUALLY FINISHED this run (e.g. [\"m1\", \"m2\"]). List only what you truly " +
           "completed — omit any milestone you deliberately left undone, and omit the field " +
           "entirely on a run with no milestones.",
+      );
+  }
+  // issue #279: on an issue run the lead can declare the run REPORT-ONLY — its deliverable
+  // is a report/command-output/verification result with no code change to land, so the
+  // worker records the findings and opens no merge request. Gated on the SAME issue-run
+  // discriminator as prd_done_path/milestones (opts.reportOnly), invisible to the model on
+  // a non-issue run rather than present-and-dropped.
+  if (opts.reportOnly) {
+    doneShape["report_only"] = z
+      .boolean()
+      .optional()
+      .describe(
+        "Set true ONLY when the run's deliverable is a report, command output, or a " +
+          "verification result with NO code change to land, so the worker records the findings " +
+          "and opens no merge request. Omit it (or set false) when a code change was committed.",
       );
   }
   // PRD #122 M1. Built the same way as doneShape: a Record mutated only when the
@@ -237,13 +273,13 @@ export function buildSignalMcpServer(
       ),
       tool(
         SIGNAL_DONE_TOOL,
-        "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then pushes the branch and opens the merge request; you never push.",
+        "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then finalizes the run — pushing the branch and opening the merge request, UNLESS you set report_only, in which case it records your summary and transcript and opens no merge request; you never push.",
         doneShape,
         async () => ({
           content: [
             {
               type: "text",
-              text: "Completion recorded. The worker will push the branch and open the merge request. End your turn.",
+              text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
             },
           ],
         }),
@@ -557,6 +593,17 @@ export function scanSignals(message: unknown): ScannedSignals {
       // never affect `done` — a malformed declaration still means the run finished.
       const completed = parseProgressIds(input?.["milestones_completed"]);
       if (completed.length > 0) out.milestonesCompleted = completed;
+      // issue #279. Extracted HERE, in the same signal_done branch and therefore behind the
+      // same main-thread guard as prd_done_path above: `summary` is persisted as report_md and
+      // `report_only` drives a NO-push/NO-MR terminal path, so a subagent frame must never be
+      // able to declare either. Both are set ONLY when present (omitted-not-undefined) so a
+      // plain signal_done still scans to exactly `{ done: true }`, and neither ever affects
+      // `done` — a malformed declaration still means the run finished. The summary clamp is
+      // transport hygiene only; the api is the authoritative control (it also scrubs+clamps).
+      const summary = input?.["summary"];
+      if (typeof summary === "string")
+        out.summary = summary.slice(0, REPORT_MD_MAX_LEN);
+      if (input?.["report_only"] === true) out.reportOnly = true;
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's

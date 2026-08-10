@@ -164,6 +164,66 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailReportOnly pins `uzi run get`'s report-only surfaces (issue #279):
+// the REPORT_ONLY row that explains the empty MR column, and the scrubbed report_md
+// printed below the table on its own lines.
+//
+// report_md is UNTRUSTED worker/model text, so it goes through sanitizeTTY exactly like
+// the judge summary — and DELIBERATELY not through cellText: it is multi-line findings
+// printed off the table rail, so the newlines must SURVIVE (a table cell would fold
+// them). That is the discriminating assertion here, the mirror image of the credential
+// row's: sanitizeTTY strips the escape and the bidi override but SPARES "\n".
+func TestRenderRunDetailReportOnly(t *testing.T) {
+	// An escape (would repaint the terminal) and a bidi override (would visually reorder
+	// the text) must be stripped; the two content lines and the newline between them must
+	// survive, because the findings are rendered as multi-line prose, not a table cell.
+	md := "safe findings\nsecond line\x1b\u202e"
+	reportRun := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "completed",
+		IssueTitle: "audit the queries", ForgeType: "gitlab", Health: "ok",
+		ReportOnly: true, ReportMd: &md,
+	}
+	out := renderDetail(t, reportRun)
+
+	// The row that explains why the MR column reads "-".
+	if !strings.Contains(out, "REPORT_ONLY") || !strings.Contains(out, "yes") {
+		t.Errorf("a report-only run must render a REPORT_ONLY yes row, got:\n%s", out)
+	}
+	// The findings block: its label plus the scrubbed text.
+	if !strings.Contains(out, "findings:") {
+		t.Errorf("a report-only run must label its findings block, got:\n%s", out)
+	}
+	// sanitizeTTY strips the escape and the bidi override …
+	for _, bad := range []string{"\x1b", "\u202e"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hostile report_md reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	// … and SPARES the newline, so the two lines survive as distinct lines. This is the
+	// probe that proves report_md is rendered off the table rail (sanitizeTTY), not through
+	// cellText, which would fold "\n" to a space.
+	if !strings.Contains(out, "safe findings\nsecond line") {
+		t.Errorf("the multi-line findings were folded or dropped, got:\n%q", out)
+	}
+
+	// A normal completion renders neither the row nor the findings block.
+	normal := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	if out := renderDetail(t, normal); strings.Contains(out, "REPORT_ONLY") || strings.Contains(out, "findings:") {
+		t.Errorf("a normal completion must render no report-only surfaces, got:\n%s", out)
+	}
+
+	// A report-only run whose summary is empty renders the row but no empty findings block
+	// — the same guard the judge summary carries (an empty SummaryMd prints nothing).
+	empty := ""
+	rowOnly := apitypes.RunDTO{
+		ID: "run-3", Kind: "issue", Status: "completed", Health: "ok",
+		ReportOnly: true, ReportMd: &empty,
+	}
+	if out := renderDetail(t, rowOnly); !strings.Contains(out, "REPORT_ONLY") || strings.Contains(out, "findings:") {
+		t.Errorf("a report-only run with an empty summary must render the row but no findings block, got:\n%s", out)
+	}
+}
+
 // ---- PRD #122 M5: milestone progress + effective budget --------------------
 
 // milestoneRun is the fixture the milestone tests start from: a three-milestone frozen

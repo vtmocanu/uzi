@@ -12,6 +12,7 @@ import {
   gitlabClaim,
   installHarness,
   runner,
+  simulateCommittedWork,
 } from "./runner-harness.js";
 
 installHarness();
@@ -342,6 +343,9 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
   it("the MR description carries the repo-agents marker only when the run used repo agents", async () => {
     // A fake executor that reports which roster the implement phase ran with — the
     // stub does not, so the marker is driven directly here (the SDK executor sets it).
+    // These inline executors commit nothing; model committed work so both runs reach the
+    // push+MR past the issue-run zero-diff guard (issue #279).
+    simulateCommittedWork();
     const repoExec: Executor = {
       run: async (ctx) => ({
         branch: ctx.branch,

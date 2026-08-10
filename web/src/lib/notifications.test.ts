@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   groupNotifications,
   JUDGE_GROUP_WINDOW_MS,
+  notificationBody,
   notificationLink,
   type GroupableNotification,
 } from "./notifications";
@@ -35,6 +36,26 @@ describe("notificationLink (Decision 4: kind-conditional, NOT a URL edit)", () =
     expect(notificationLink("judge_review", null)).toBeNull();
     expect(notificationLink("run_failed", undefined)).toBeNull();
     expect(notificationLink("judge_review", "")).toBeNull();
+  });
+});
+
+describe("notificationBody (PRD #292 Decision 7: inbox row stays a collapsed one-liner)", () => {
+  // The inbox reads ONLY payload.body — never payload.summary. Since M4 the judge's
+  // payload.summary is MULTI-LINE (it feeds the Slack blockquote), while payload.body is
+  // the collapsed one-liner reviewNotificationBody built. The inbox must show that
+  // one-liner verbatim and must NOT fall back to the multi-line summary (SC4).
+  it("returns the one-line payload.body verbatim, never the multi-line summary", () => {
+    const payload = {
+      body: "verdict: ok — 1 recommendation: a b c",
+      summary: "line1\nline2\nline3",
+    };
+    const body = notificationBody(payload);
+    expect(body).toBe("verdict: ok — 1 recommendation: a b c");
+    expect(body).not.toContain("\n");
+  });
+
+  it("returns empty string when body is absent (never reaches for summary)", () => {
+    expect(notificationBody({ summary: "line1\nline2" })).toBe("");
   });
 });
 

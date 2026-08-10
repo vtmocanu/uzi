@@ -1085,6 +1085,16 @@ export interface Run {
   pipeline_ref: string | null;
   pipeline_web_url: string | null;
   fix_verdict: FixVerdict | null;
+  /** issue #279: true when this completed run is a report-only / evidence run that
+   *  intentionally opened no merge request; its deliverable is report_md + the transcript.
+   *  Rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH the
+   *  detail and list reads, like fix_verdict/plan_md. OPTIONAL only for rollout-skew — a
+   *  pre-#279 api omits it, and a truthy guard treats absent as false. */
+  report_only?: boolean;
+  /** issue #279: the run's persisted findings summary, server-scrubbed. Non-null only on a
+   *  report_only completion; rides the same embed (rendered only on the detail run view).
+   *  UNTRUSTED — render as escaped plain text, never <Markdown>. */
+  report_md?: string | null;
   plan_md: string | null;
   /** PRD #209: where plan_md came from — `"agent"` for a normal run whose worker wrote
    *  the plan at the gate, `"seeded"` for a run created WITH a user-authored plan that

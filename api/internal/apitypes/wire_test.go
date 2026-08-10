@@ -83,7 +83,12 @@ var runDTOKeys = []string{
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	// PRD #209: plan_md's provenance ("agent"|"seeded"), NOT NULL so always on the wire.
 	"plan_source",
-	"pipeline_ref", "pipeline_web_url", "fix_verdict", "claimed_at", "started_at",
+	"pipeline_ref", "pipeline_web_url", "fix_verdict",
+	// issue #279: a completed run that opened NO merge request (report-only/evidence
+	// completion) and its persisted findings summary. report_only is NOT NULL so always
+	// on the wire; report_md is null unless report_only.
+	"report_only", "report_md",
+	"claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a

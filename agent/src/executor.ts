@@ -265,6 +265,12 @@ export interface ExecutorResult {
    *  silent cap does not read as full coverage. ISSUE RUNS ONLY, OMITTED (never `false`)
    *  when discovery saw the whole tree. StubExecutor never sets it. */
   gatesDiscoveryTruncated?: boolean;
+  /** issue #279: the lead declared this a report-only/evidence run on signal_done; the
+   *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
+  reportOnly?: boolean;
+  /** issue #279: the one-line/short findings summary from signal_done, persisted as
+   *  report_md on a report-only completion. Issue runs only. */
+  summary?: string;
 }
 
 /**

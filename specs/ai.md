@@ -11396,6 +11396,34 @@ the file went and the api decides what to do with it.
   closed domain like `stop_kind`, so a CHECK could only restate the grammar in a second,
   drifting place.
 
+- **Issue #279 — a REPORT-ONLY / evidence completion reuses this same declaration + gate
+  machinery.** See [ADR-0279](../adr/0279-report-only-completion.md).
+  - **The lead completes a run report-only via `signal_done` (issue runs only):** the
+    worker sets `report_only:true`, its findings `summary` becomes `report_md`, and it
+    opens NO merge request — an early return *before* fetch-back, mirroring the ci_fix
+    `not_code` completion (`agent/src/runner.ts`). This closes the "evidence run has no
+    terminal path but the empty MR" gap: a verification run that produces zero code
+    changes no longer opens an empty MR.
+  - **`report_only` is on the `signal_done` schema for issue runs only** — same
+    `isIssueRun` gate as `prd_done_path`, and extracted at the same main-thread
+    `signal_done` point — then **re-gated server-side** (`clampWireReportOnly`: issue
+    kind, drop-and-warn, never error, like `clampWirePRDDonePath`).
+  - **An UNDECLARED issue run whose diff is CONFIRMED-empty (`git.changedFiles` → `[]`)
+    is FAILED with an actionable reason** — NOT auto-converted to report-only (that would
+    launder a "forgot to commit" bug) and NOT an empty MR. A `null` (diff-*failure*)
+    keeps the push path (fail-open). Issue-kind only.
+  - **Persistence (migration `00114`):** `runs.report_only` (bool, NOT NULL default
+    false) + `runs.report_md` (text). `report_md` is stored ONLY when `report_only` was
+    accepted, and is control-stripped + 8 KB-bounded + secret-scrubbed server-side
+    (untrusted worker text; mirrors the `run_reviews.summary_md` ingest). `RunDTO`
+    exposes both; web shows a neutral "report only" chip + a Findings panel rendering
+    `report_md` as ESCAPED PLAIN TEXT (never Markdown); CLI `uzi run get` prints a
+    `REPORT_ONLY` row + the scrubbed `report_md`.
+  - **Accepted edge:** a DECLARED `report_only` that also committed code discards that
+    commit (no inverse guard, mirrors `not_code`; the early return precedes fetch-back,
+    and the lead prompt frames `report_only` as "no code change"). Full edge list in the
+    ADR.
+
 ## 386. M5 — the post-merge patch is EDGE-triggered, BOUND to the run's queue-time issue snapshot, and deliberately not `mr_watch`
 
 The one forge write this PRD performs, and the only mechanical control over what the

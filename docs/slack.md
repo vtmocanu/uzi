@@ -224,6 +224,25 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   When the run recovers, the `⚠️ <flag>` context element drops off on its own
   and nudging stops — no action needed.
 
+## Markdown rendering
+
+The bodies an agent or model writes — chat answers, judge/self-improvement
+summaries, plan gate bodies, and clarification questions — are rendered from
+CommonMark into Slack's own mrkdwn dialect (`SlackMrkdwn`,
+`api/internal/slacksvc/mrkdwn.go`), not just escaped: **bold**, _italic_,
+headings, bullets, numbered lists, ~~strikethrough~~, code spans/fences, and
+blockquotes show up formatted, and an `[label](https://…)` link becomes a
+clickable Slack link — only for `https://`; any other scheme prints as plain
+escaped text, no link. Tables, images, and raw HTML degrade to escaped plain
+text rather than breaking the message.
+
+This is injection-safe on the same terms as the older whole-blob escape it
+replaces: all text is still `&<>`-escaped, so a mention like `<@U123>` or an
+attempted `<https://evil|Open>` inside model-authored text stays inert rather
+than becoming a live Slack mention or link. The status/repo/title/link chrome
+around these bodies is unaffected — it's still per-field escaped, not run
+through this renderer, since it carries uzi's own trusted markup.
+
 ## Chatting from Slack
 
 Send the uzi bot a **top-level DM** (not a thread reply) and it opens a

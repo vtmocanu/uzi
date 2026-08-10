@@ -1126,6 +1126,14 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.StopKind != nil && *r.StopKind != "" {
 		rows = append(rows, []string{"STOP_KIND", sanitizeTTY(*r.StopKind)})
 	}
+	// issue #279: a report-only completion opened no MR on purpose, so the `MR -` above
+	// would otherwise read as a run that never produced its deliverable. Emitted only when
+	// set (a server-controlled bool, false on every normal completion), like STOP_KIND.
+	// The scrubbed report_md itself is printed below the table, off the rail — see the
+	// tail of this function.
+	if r.ReportOnly {
+		rows = append(rows, []string{"REPORT_ONLY", "yes"})
+	}
 	// Milestone progress + effective budget (PRD #122 M5), the CLI twin of the web's
 	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
@@ -1173,7 +1181,22 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	rows = append(rows, limitWaitRows(r, time.Now())...)
-	return p.Table(nil, rows)
+	if err := p.Table(nil, rows); err != nil {
+		return err
+	}
+	// issue #279: the report-only run's actual deliverable is report_md — the lead's
+	// server-scrubbed findings. It is UNTRUSTED worker/model text and is multi-line, so it
+	// prints on its own lines below the table (a table cell would fold the newlines),
+	// through sanitizeTTY exactly like the judge summary. Guarded so a normal completion
+	// and a report_only run with an empty summary print nothing.
+	if r.ReportOnly && r.ReportMd != nil {
+		if s := sanitizeTTY(strings.TrimSpace(*r.ReportMd)); s != "" {
+			p.Println()
+			p.Println("findings:")
+			p.Println(s)
+		}
+	}
+	return nil
 }
 
 // limitWaitRows is the usage-limit park block of `uzi run get` (PRD #35), split out

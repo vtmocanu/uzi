@@ -927,6 +927,30 @@ export class RunRunner {
         return;
       }
 
+      // issue #279: a DECLARED report-only run — the lead's deliverable is a report,
+      // command output, or verification result with NO code change to land, so the run
+      // completes with its findings and NO push/MR (mirroring the ci_fix not_code path
+      // above). killAgentTree was already called at the security boundary above, so we do
+      // NOT double-call it here (the not_code block's second call is a redundancy — not
+      // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
+      if (result.reportOnly) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "report-only run: recording findings; no branch pushed and no merge request opened",
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "completed",
+          report_only: true,
+          report_md: result.summary,
+        });
+        runLog.info("run completed report-only (no MR)", { run_id: runId });
+        return;
+      }
+
       // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
       // worker now fetches the agent branch BACK into its own bare (single-branch
       // refspec, file://+pack transport, protocol.file.allow pinned — the six B2
@@ -941,6 +965,37 @@ export class RunRunner {
         result.branch,
         runId,
       );
+
+      // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
+      // already returned above, so reaching here on an issue run with a confirmed-empty diff
+      // is the ambiguous "forgot to commit / should have set report_only" case — a
+      // committed-nothing issue run must not open an empty MR.
+      if ((claim.kind ?? "issue") === "issue") {
+        const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
+        // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
+        // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
+        // report_only already returned above, so reaching here undeclared+empty is the
+        // ambiguous case; fail with an actionable reason instead of opening an empty MR.
+        if (changedForGuard !== null && changedForGuard.length === 0) {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "no changes were committed and report_only was not set; failing",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
+          });
+          runLog.info("run failed: signal_done with empty diff and no report_only", {
+            run_id: runId,
+          });
+          return;
+        }
+      }
 
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
       // repo, the worker itself runs the test suites and flags any guard-critical
