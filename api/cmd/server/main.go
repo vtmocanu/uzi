@@ -421,6 +421,11 @@ func run() error {
 	// through notifier with Slack == nil (inbox-only — no double-DM), and sits in
 	// the MultiBroadcaster so it covers worker-reported AND sweep-driven failures
 	// uniformly. PublishState never blocks; a drain goroutine (below) does the work.
+	// CI-autofix landed notification (PRD #71 M6): when a ci_fix run's fix pipeline
+	// goes green on a ref that had an auto-fix ledger, forgesvc lands an inbox row for
+	// the owner. Nil-safe; wired here so the sync's reset-on-green path can reach it.
+	svc.SetNotifier(notifier)
+
 	failNotifier := notifysvc.NewRunFailureNotifier(q, notifier, slog.Default())
 	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier, failNotifier})
 
@@ -446,6 +451,13 @@ func run() error {
 	// cache (default branch + watched run branches). CI_WATCH_MAX_REFS=0 disables it
 	// (and the badges + Fix CI), preserving today's behaviour.
 	engine.SetPipelineWatch(cfg.CIWatchRunWindow, cfg.CIWatchMaxRefs)
+	// CI-autofix (PRD #71 M6): the poller's post-pipeline-sync detector turns an
+	// eligible failing agent-MR branch into an automatic ci_fix run (or one halt
+	// comment), through the same workersvc create path the manual "Fix CI" button uses
+	// and the M4 loop-guard ledger. Wired unconditionally — the instance kill-switch is
+	// simply NOT wiring it; per-user ci_autofix_enabled (default-OFF) and the
+	// pipelineMaxRefs>0 gate control activation. notifier lands the inbox rows.
+	engine.SetCIAutoFix(poller.NewCIAutoFix(q, wsvc, notifier, cfg.CIFixMaxJobs, cfg.CIFixLogTailBytes, cfg.CIAutofixMaxAttempts, cfg.CIAutofixConfigPaths))
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes

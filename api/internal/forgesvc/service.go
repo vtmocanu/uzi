@@ -16,6 +16,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -134,6 +135,19 @@ type Service struct {
 	box     *secretbox.Box
 	timeout time.Duration
 	labels  LabelConfig
+
+	// notifier lands the "your auto-fix landed" inbox row on the reset-on-green path
+	// (PRD #71 M6). Optional (nil-safe): set via SetNotifier, unset means the landed
+	// notification is skipped — every other pipeline-sync behaviour is unaffected.
+	notifier LandedNotifier
+}
+
+// LandedNotifier lands an inbox notification when a ci_fix run's fix pipeline goes
+// green (PRD #71 M6). *notifysvc.Service satisfies it. Kept as an interface so the
+// sync's core has no hard dependency on notifysvc and the pipeline-sync tests need
+// no notifier.
+type LandedNotifier interface {
+	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
@@ -142,6 +156,11 @@ type Service struct {
 func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
 	return &Service{q: q, box: box, timeout: timeout, labels: labels}
 }
+
+// SetNotifier wires the landed-notification collaborator (PRD #71 M6). Call once at
+// startup, before the poller runs. A nil notifier (the default) disables the landed
+// inbox row; the rest of the sync is unchanged.
+func (s *Service) SetNotifier(n LandedNotifier) { s.notifier = n }
 
 // prdLabel resolves the configured PRD label for the sync filters, falling back
 // to the compiled-in default when unconfigured or on a settings read error (the

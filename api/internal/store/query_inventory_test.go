@@ -787,6 +787,14 @@ var queryInventory = []queryPin{
 		"direct call: reset-on-green returns 1 for a present row and 0 for an absent one (the no-op case)"},
 	{"DeleteCIAutofixAttemptsNotIn", "ci_autofix.sql", "TestCIAutofixLiveDB",
 		"direct call: seeds three refs, keeps one, asserts exactly 2 evicted and the kept ref survives"},
+	{"GetActiveCIFixTargetForRef", "ci_autofix.sql", unpinnedPin,
+		"Arrived in PRD #71 M6 for the detector's active-run swallow cap. No live-DB test in " +
+			"internal/store executes it yet: its only production caller is the M6 poller detector " +
+			"(internal/poller/ci_autofix.go), which is exercised by unit tests against a fake store " +
+			"(poller is not in inventoryPackages, and has no live-DB test). The `status NOT IN " +
+			"(completed,failed,cancelled)` active-set predicate and the pipeline_ref scoping are " +
+			"therefore unpinned against the real schema — a live pin belongs with a future M-b " +
+			"integration test, recorded here rather than left silent"},
 
 	{"TouchCLIToken", "cli_tokens.sql", unassertedPin,
 		"EXECUTES on every accepted Bearer request in the CLI live-DB suite " +

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/pipelinestatus"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -166,8 +167,9 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 
 	// "uzi verifies it's work" (PRD #6): if this ref is a ci_fix run's fix branch and
 	// the observed pipeline concluded, stamp the run's verdict. A cheap column update
-	// inside the sync — no worker involvement, no second loop.
-	s.maybeStampFixVerdict(ctx, repoID, ref, p)
+	// inside the sync — no worker involvement, no second loop. Returns the run it
+	// stamped VERIFIED (green), so the reset-on-green path below can notify its owner.
+	verifiedTarget, verified := s.maybeStampFixVerdict(ctx, repoID, ref, p)
 
 	// Reset-on-green (PRD #71 M4): a SUCCESS pipeline for this ref clears its
 	// ci-autofix attempt ledger so the next failure starts from a fresh count. It
@@ -183,6 +185,13 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 			slog.Warn("forgesvc: ci_autofix ledger reset-on-green failed", "repo", repoID, "ref", ref, "error", err)
 		} else if n > 0 {
 			slog.Debug("forgesvc: ci_autofix ledger reset on green", "repo", repoID, "ref", ref, "rows", n)
+			// Landed notification (PRD #71 M6): the ref HAD an auto-fix ledger (n>0, i.e.
+			// uzi's automation attempted a fix here) AND this green pipeline verified a
+			// ci_fix run — tell the owner the fix landed. Nil-safe + best-effort; inbox
+			// only (Slack nil) since the run notifier already covers run outcomes.
+			if verified {
+				s.notifyAutofixLanded(ctx, verifiedTarget, ref, p)
+			}
 		}
 	}
 	return true
@@ -200,7 +209,12 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 // here never stamped a re-failed Forgejo fix); cancelled/skipped/in-flight leave the
 // run unverified (NULL). All errors are contained: verification is best-effort and
 // must not stall the sync.
-func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, ref string, p forge.Pipeline) {
+//
+// It returns the stamped run and whether the stamp was VERIFIED (a terminal PASS),
+// so the reset-on-green caller can land a "your auto-fix landed" notification for
+// the run's owner. A false second return (fix_failed, no target, or an error) means
+// the caller notifies nobody.
+func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, ref string, p forge.Pipeline) (store.Run, bool) {
 	var verdict string
 	switch {
 	case pipelinestatus.IsSuccess(p.Status):
@@ -208,7 +222,7 @@ func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, re
 	case pipelinestatus.IsFailed(p.Status):
 		verdict = "fix_failed"
 	default:
-		return // not a terminal pass/fail — nothing to stamp yet
+		return store.Run{}, false // not a terminal pass/fail — nothing to stamp yet
 	}
 	target, err := s.q.FindCIFixStampTarget(ctx, store.FindCIFixStampTargetParams{
 		RepoID:             repoID,
@@ -219,14 +233,34 @@ func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, re
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Warn("forgesvc: find ci_fix stamp target", "repo", repoID, "ref", ref, "error", err)
 		}
-		return // no ci_fix run awaiting verification on this ref
+		return store.Run{}, false // no ci_fix run awaiting verification on this ref
 	}
 	if _, err := s.q.StampFixVerdict(ctx, store.StampFixVerdictParams{
 		ID:         target.ID,
 		FixVerdict: pgtype.Text{String: verdict, Valid: true},
 	}); err != nil {
 		slog.Warn("forgesvc: stamp fix verdict", "run", target.ID, "verdict", verdict, "error", err)
-		return
+		return store.Run{}, false
 	}
 	slog.Info("forgesvc: ci_fix verified", "run", target.ID, "ref", ref, "verdict", verdict, "pipeline", p.ID)
+	return target, verdict == "verified"
+}
+
+// notifyAutofixLanded lands the ci_autofix_landed inbox row for the verified fix
+// run's owner (PRD #71 M6). Best-effort and nil-safe; Slack is nil (inbox-only) —
+// the run notifier already DMs run outcomes, so a Slack DM here would double up.
+func (s *Service) notifyAutofixLanded(ctx context.Context, target store.Run, ref string, p forge.Pipeline) {
+	if s.notifier == nil {
+		return
+	}
+	runID := target.ID
+	if _, err := s.notifier.Notify(ctx, notifysvc.Notification{
+		UserID:  target.UserID,
+		Kind:    "ci_autofix_landed",
+		Payload: map[string]any{"ref": ref, "pipeline_web_url": p.WebURL},
+		RunID:   &runID,
+		Slack:   nil,
+	}); err != nil {
+		slog.Warn("forgesvc: ci_autofix landed notify", "run", target.ID, "ref", ref, "error", err)
+	}
 }

@@ -57,6 +57,14 @@ type Engine struct {
 	// so a poller built without SetPipelineWatch behaves exactly as before PRD #6.
 	pipelineWindow  time.Duration
 	pipelineMaxRefs int
+
+	// ciAutoFix runs the post-pipeline-sync CI-autofix detection (PRD #71 M6) as a
+	// sibling of the autopilot detector. Optional (nil-safe): nil disables detection —
+	// the instance kill-switch — so tests and any deployment without CI-autofix wiring
+	// keep the plain sync behaviour. Set via SetCIAutoFix. It also fires only when the
+	// pipeline watch is on (pipelineMaxRefs > 0), since it reads the pipeline cache the
+	// same tick populates.
+	ciAutoFix *CIAutoFix
 }
 
 // repoState is one repo's in-memory sync state. marks holds a SEPARATE
@@ -96,6 +104,12 @@ func New(svc *forgesvc.Service, q *store.Queries, interval time.Duration, reconc
 // startup, before Run. A nil detector (the default) disables autopilot: the sync
 // still runs, no runs are auto-created and no autopilot comments are posted.
 func (e *Engine) SetAutopilot(a *Autopilot) { e.autopilot = a }
+
+// SetCIAutoFix wires the post-pipeline-sync CI-autofix detector (PRD #71 M6). Call
+// once at startup, before Run. A nil detector (the default) disables CI-autofix: the
+// sync still runs, no automatic ci_fix runs are created and no autofix comments are
+// posted. NOT wiring it is the instance kill-switch, exactly like SetAutopilot.
+func (e *Engine) SetCIAutoFix(d *CIAutoFix) { e.ciAutoFix = d }
 
 // SetPipelineWatch wires the PRD #6 pipeline-status sync into each tick. Call once
 // at startup, before Run. maxRefs <= 0 (the default when unset, or an operator's
@@ -299,5 +313,16 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// inside; nothing surfaces here.
 	if e.autopilot != nil {
 		e.autopilot.detect(ctx, r, f)
+	}
+
+	// CI-autofix detection (PRD #71 M6): also post-sync, a sibling of the autopilot
+	// detector, reading the pipeline-status cache the SyncPipelines step above just
+	// wrote. Gated on the pipeline watch being on (pipelineMaxRefs > 0) — with no fresh
+	// pipeline cache there are no candidates and the ledger would read stale — and on the
+	// detector being wired (the instance kill-switch). It turns an eligible failing agent
+	// MR branch into an automatic ci_fix run (or one halt comment). All per-candidate
+	// errors are handled inside; nothing surfaces here.
+	if e.pipelineMaxRefs > 0 && e.ciAutoFix != nil {
+		e.ciAutoFix.detect(ctx, r, f)
 	}
 }

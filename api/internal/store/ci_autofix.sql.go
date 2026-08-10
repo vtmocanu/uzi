@@ -55,6 +55,29 @@ func (q *Queries) DeleteCIAutofixAttemptsNotIn(ctx context.Context, arg DeleteCI
 	return result.RowsAffected(), nil
 }
 
+const getActiveCIFixTargetForRef = `-- name: GetActiveCIFixTargetForRef :one
+SELECT pipeline_id FROM runs
+WHERE repo_id = $1::uuid AND kind = 'ci_fix' AND pipeline_ref = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at DESC LIMIT 1
+`
+
+type GetActiveCIFixTargetForRefParams struct {
+	RepoID uuid.UUID   `json:"repo_id"`
+	Ref    pgtype.Text `json:"ref"`
+}
+
+// The target (failing) pipeline id of the ACTIVE ci_fix run on a ref, for the M-b
+// swallow cap: while a fix run is in flight, the detector records last_pipeline_id
+// only UP TO this id, so the fix's own result pipeline is still evaluated as
+// attempt N+1 (not skipped by dedup). No row = no active fix on this ref.
+func (q *Queries) GetActiveCIFixTargetForRef(ctx context.Context, arg GetActiveCIFixTargetForRefParams) (pgtype.Int8, error) {
+	row := q.db.QueryRow(ctx, getActiveCIFixTargetForRef, arg.RepoID, arg.Ref)
+	var pipeline_id pgtype.Int8
+	err := row.Scan(&pipeline_id)
+	return pipeline_id, err
+}
+
 const getCIAutofixAttempt = `-- name: GetCIAutofixAttempt :one
 SELECT repo_id, ref, attempt_count, last_signature, last_pipeline_id, halt_notified, updated_at
 FROM ci_autofix_attempts

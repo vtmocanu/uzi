@@ -106,6 +106,16 @@ SET halt_notified    = true,
     updated_at       = now()
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
+-- name: GetActiveCIFixTargetForRef :one
+-- The target (failing) pipeline id of the ACTIVE ci_fix run on a ref, for the M-b
+-- swallow cap: while a fix run is in flight, the detector records last_pipeline_id
+-- only UP TO this id, so the fix's own result pipeline is still evaluated as
+-- attempt N+1 (not skipped by dedup). No row = no active fix on this ref.
+SELECT pipeline_id FROM runs
+WHERE repo_id = @repo_id::uuid AND kind = 'ci_fix' AND pipeline_ref = @ref
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at DESC LIMIT 1;
+
 -- name: DeleteCIAutofixAttempt :execrows
 -- Reset-on-green (single ref): a SUCCESS pipeline for the ref clears its ledger so
 -- the next failure starts from a fresh count. A no-op (0 rows) when the ref never
