@@ -674,3 +674,44 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     assert.equal(idleReportDelta, 0, "a pure-idle checkpoint emits no running report");
   });
 });
+
+describe("RunRunner — report_only after a checkpoint is refused (issue #299)", () => {
+  // This pins the SAME-WORKER leg of the union guard: a run that publishes a checkpoint
+  // mid-run (lastPublishedTip advances on the confirmed publish) and THEN declares
+  // report_only must FAIL, because a report-only completion opens no branch/MR and would
+  // orphan the published refs/uzi-checkpoints/<branch>. hasCheckpointRef is NOT stubbed
+  // here (the fixture bare carries no mirrored checkpoint ref — the publish went through
+  // the client spy), so the guard trips on lastPublishedTip alone.
+  it("fails a report_only completion after this worker published a checkpoint", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(67);
+    const events: string[] = [];
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        commitInClone(ctx.worktreePath, "NEW.txt");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch, reportOnly: true, summary: "verified after milestone m1" };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    assert.ok(events.includes("publish"), "the mid-run checkpoint published (sanity)");
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    )!.body;
+    assert.match(failed.failure_reason ?? "", /report_only/);
+    assert.match(failed.failure_reason ?? "", /checkpoint/);
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    );
+    assert.strictEqual(completed, undefined, "the run FAILED, it did not complete report-only");
+    assert.strictEqual(calls.length, 0, "no MR opened after the guarded report-only run");
+  });
+});

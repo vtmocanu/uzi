@@ -388,6 +388,50 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(fs.existsSync(worktreeDirFor(22)), false);
   });
 
+  // issue #299: a report-only completion opens NO branch/MR, so if this run already
+  // published committed work to a checkpoint ref on origin, completing report-only would
+  // orphan it. This pins the cross-worker leg of the union guard: hasCheckpointRef true
+  // (origin carries a checkpoint a prior attempt landed, mirrored into the bare) while
+  // this worker published nothing itself. It must FAIL with an actionable reason, opening
+  // NEITHER a push NOR an MR — mirroring the undeclared-empty-diff FAIL path.
+  it("fails a report-only run that published a checkpoint (orphan guard), opening NO MR (issue #299)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    // A checkpoint ref for this run's branch already exists on origin (mirrored into the
+    // bare) — this worker did not publish it, so lastPublishedTip stays undefined and the
+    // guard must key on hasCheckpointRef.
+    git.hasCheckpointRef = (async () => true) as typeof git.hasCheckpointRef;
+    const exec: Executor = {
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        reportOnly: true,
+        summary: "verified: no code change needed",
+      }),
+    };
+    const claim = gitlabClaim(23);
+    await runner(exec, gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    )!.body;
+    assert.match(failed.failure_reason ?? "", /report_only/);
+    assert.match(failed.failure_reason ?? "", /checkpoint/);
+    assert.ok(
+      !("report_only" in failed) || failed.report_only !== true,
+      "the run FAILED — it is not a report-only completion",
+    );
+    assert.strictEqual(calls.length, 0, "no MR opened on the guarded report-only run");
+    assert.strictEqual(pushed, false, "no branch pushed on the guarded report-only run");
+    assert.strictEqual(fs.existsSync(worktreeDirFor(23)), false);
+  });
+
   // issue #279 GAP1: the undeclared-empty-diff guard is ISSUE-ONLY. A NON-issue kind
   // (here a scheduled `prompt` run) whose diff is a CONFIRMED-empty [] — the exact input
   // that fails an issue run above — must NOT trip the guard: it still pushes and opens
