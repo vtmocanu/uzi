@@ -114,6 +114,22 @@ export function Settings() {
     }
   };
 
+  const [ciAutofixBusy, setCiAutofixBusy] = useState(false);
+  const [ciAutofixError, setCiAutofixError] = useState("");
+
+  const toggleCIAutofix = async (enabled: boolean) => {
+    setCiAutofixError("");
+    setCiAutofixBusy(true);
+    try {
+      await api.setCIAutofixEnabled(enabled);
+      await refresh();
+    } catch (err) {
+      setCiAutofixError(err instanceof ApiError ? err.message : "Failed to update CI autofix");
+    } finally {
+      setCiAutofixBusy(false);
+    }
+  };
+
   // Worker model: "" = inherit. savedModel is the persisted value, so Save is
   // only offered when the picker differs from what is stored.
   const [defaultModel, setDefaultModel] = useState("");
@@ -376,6 +392,30 @@ export function Settings() {
             </p>
           </Field>
         )}
+      </Card>
+
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Automatic CI fixes</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            With this on, when a pipeline fails on one of your agent merge-request branches, uzi spends
+            your <strong className="text-fg">own Anthropic tokens</strong> to attempt a fix automatically.
+            Off by default.
+          </p>
+        </div>
+
+        {ciAutofixError && <Alert message={ciAutofixError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={user?.ci_autofix_enabled ?? false}
+            disabled={ciAutofixBusy}
+            onChange={(e) => toggleCIAutofix(e.target.checked)}
+          />
+          <span className="text-fg">Automatically fix my failed CI pipelines</span>
+        </label>
       </Card>
 
       <Card className="space-y-5">

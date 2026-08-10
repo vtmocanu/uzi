@@ -58,6 +58,7 @@ export const mockAdmin: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  ci_autofix_enabled: false,
   wait_on_limit: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
@@ -75,6 +76,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: true,
     judge_enabled: true,
+    ci_autofix_enabled: false,
     // PRD #35: the demo's one opted-IN user, and it is the autopilot user on purpose.
     // An autopilot run has no start affordance at all, so this default is the ONLY
     // way its opt-in can ever be expressed — pairing the two is what makes the
@@ -93,6 +95,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    ci_autofix_enabled: false,
     wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
@@ -107,6 +110,7 @@ export const mockUsers: User[] = [
     is_active: false,
     autopilot_enabled: false,
     judge_enabled: false,
+    ci_autofix_enabled: false,
     wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
@@ -123,6 +127,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    ci_autofix_enabled: false,
     wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
@@ -137,6 +142,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    ci_autofix_enabled: false,
     wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,

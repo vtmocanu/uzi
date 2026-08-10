@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled",
+		"autopilot_enabled", "judge_enabled", "ci_autofix_enabled",
 		// PRD #35 Decision 7: the per-user DEFAULT for the usage-limit park. A default,
 		// not a policy — every run carries its own, stamped at creation.
 		"wait_on_limit",

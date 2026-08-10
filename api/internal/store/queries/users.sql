@@ -67,6 +67,14 @@ RETURNING *;
 UPDATE users SET judge_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserCIAutofixEnabled :one
+-- Flip a user's automatic CI-fix opt-in (PRD #71). Per-user consent to spend the
+-- user's own Anthropic tokens auto-fixing failed pipelines on their agent MR
+-- branches; default false. The caller passes the target id: the session user for
+-- PUT /api/me/ci-autofix, or an admin-chosen id (from the path) for the admin toggle.
+UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeAnthropicSecret :one
 -- Point a user's JUDGE lane at one of their own Anthropic credentials, or clear the
 -- binding back to their default (PRD #104 M4, D1). Per-user, not per-worker: which

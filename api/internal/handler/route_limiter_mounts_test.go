@@ -324,12 +324,16 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/workers/hosted", limHosted},
 	{"PUT", "/api/admin/selfimprove", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
+	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},
 	{"PUT", "/api/agent-templates/allocations", noLimiter},
 	{"PUT", "/api/agent-templates/{id}", noLimiter},
 	{"PUT", "/api/agent-templates/{id}/skills", noLimiter},
 	{"PUT", "/api/forge/connections/{id}", limForge},
 	{"PUT", "/api/me/autopilot", noLimiter},
+	// PRD #71: a single boolean UPDATE on the caller's own users row, spends no
+	// Anthropic token at toggle time — noLimiter, matching /me/autopilot beside it.
+	{"PUT", "/api/me/ci-autofix", noLimiter},
 	// PRD #35 Decision 7. noLimiter, and the choice is deliberate rather than
 	// inherited from the neighbours: this is a single boolean UPDATE on the caller's
 	// own users row. It spends no Anthropic token, makes no forge call, sends no DM,
