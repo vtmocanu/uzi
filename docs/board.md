@@ -156,11 +156,12 @@ behind a **`Show N more · N left`** button at the bottom of the column.
 Each click reveals one more page (up to 50) of cards, and an expanded
 column scrolls internally instead of growing the page. **Collapse** puts
 it back to the cap. The cap applies to every column, including **Closed**.
-Past a couple of pages of hidden remainder, the button is replaced by a
-nudge to search instead of paging through everything.
+Past a couple of pages of hidden remainder, a nudge suggests searching
+instead of paging through everything (the **Show more** button stays, so
+you can still page if you prefer).
 
-A card dragged past the cap, or moved there by a run, always reveals
-itself — a card can never disappear behind a cap it was just moved into.
+A card you drag or move (with the keyboard) past the cap always reveals
+itself — a card can never disappear behind a cap you just moved it into.
 
 The **Per lane** control in the toolbar sets the cap (5 / 10 / 20, default
 **10**). Like **Sort** and **Hide empty**, it's remembered per board, on

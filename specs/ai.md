@@ -19987,8 +19987,10 @@ filters — instant view state, not a sync setting a poll-cycle away.
   cap because they hide identically).
 - **One ordered pipeline: membership → search → sort → cap.** `visibleCards` and the `matchesQuery`
   predicate (`boardCards.ts`; title, `#iid`, label, case-insensitive) narrow `renderCards`; the
-  `cardsByColumn` memo then runs `sortCards` and the per-lane slice. The sort AND the cap both live
-  inside that memo — it is the real seam, not a step between grouping and render.
+  `cardsByColumn` memo then runs `sortCards`. The sort lives inside that memo; the per-lane cap is a
+  render-only prefix slice (`cards.slice(0, render)`) applied AFTER the memo, so `cardsByColumn` stays
+  FULL — the reorder anchors (`canMoveUp/Down`, `moveCard`) read the whole lane, and only the render
+  is bounded. That fullness is load-bearing, not incidental.
 - **Search lifts the caps rather than fighting them (Decision 5).** A query starts a matched lane at
   one page and pages from there through the same `shownCount` model, so a 400-match search never
   dumps 400 cards. While a query is active empty lanes drop (the query acts as `hideEmpty` for its
@@ -20010,6 +20012,10 @@ filters — instant view state, not a sync setting a poll-cycle away.
   payload card excluded by membership is unfindable — searching a non-member `#iid` returns nothing.
   Search narrows what is ON the board; it does not widen membership. Reads as a bug, so `docs/board.md`
   states it and points at the existing "Issues" control as the widen path.
-- **Sticky toolbar (M3).** The search field and existing controls pin with plain `sticky top-0`: the
-  app shell scrolls the window with no `overflow` ancestor on `<main>`, so a board-local scroll region
-  (which would fight the lanes' own `overflow-x-auto`) was the fallback, not the default.
+- **Sticky toolbar (M3).** The search field and existing controls pin via `sticky top-[49px] z-10
+  bg-ink lg:top-0`: the app shell scrolls the window with no `overflow` ancestor on `<main>`, so window
+  sticky holds and a board-local scroll region (which would fight the lanes' own `overflow-x-auto`) was
+  the fallback, not the default. `bg-ink` (the page-background token, `ink: token("bg")`) is an opaque
+  backing so cards scroll cleanly under the bar; the `top-[49px]` offset (dropped to `0` at `lg`) clears
+  the mobile shell's own 49px `sticky top-0 z-20` bar, below which this bar's `z-10` sits. A browser
+  pass caught the original transparent `bg-bg` (not a real class) and confirmed the fix.
