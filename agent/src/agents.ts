@@ -58,11 +58,13 @@ import { qualifiedSkillName } from "./skills-plugin.js";
 // plan gate and its done→MR handoff are the lead's alone: a subagent (coder,
 // reviewer, …) — buggy or prompt-injected — must never reach them and end the
 // loop with a partial, unreviewed tree. This is DEFENSE-IN-DEPTH: it should stop
-// the tool_use from ever being made, but whether disallowedTools wins over a
-// custom template's explicit `tools` allowlist is unproven from the SDK types, so
-// the load-bearing guarantee is the main-thread-only signal scan in signals.ts
-// (scanSignals ignores a subagent-borne signal even if the SDK let the call
-// through). Keep both.
+// the tool_use from ever being made. A PRD #158 M0 spike (2026-08-10) MEASURED
+// that a server-level disallowedTools entry does override a subagent's explicit
+// `tools` allowlist on the pinned SDK, so this deny is effective — but that ran on
+// one claude CLI build, and the load-bearing guarantee stays the main-thread-only
+// signal scan in signals.ts (scanSignals ignores a subagent-borne signal even if
+// the SDK ever let the call through), because it holds regardless of SDK gating.
+// Keep both.
 const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 
 // PRD #90: save_memory is the LEAD's alone (OQ-B — one writer, clean provenance).

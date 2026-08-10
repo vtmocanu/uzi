@@ -500,9 +500,11 @@ function isSubagentFrame(msg: Record<string, unknown>): boolean {
  * partial, unreviewed tree to the worker's push+MR). This worker-side scan is the
  * LOAD-BEARING guarantee for that: it holds regardless of the SDK's tool gating.
  * The server-level `mcp__uzi` denial on every subagent (agents.ts) is an
- * additional layer that SHOULD stop the tool_use from ever being made, but whether
- * disallowedTools wins over a custom template's explicit `tools` allowlist is
- * unproven from the SDK types — so do not treat this scan as redundant to it.
+ * additional layer that stops the tool_use from ever being made — a PRD #158 M0
+ * spike (2026-08-10) measured that disallowedTools does override a custom
+ * template's explicit `tools` allowlist on the pinned SDK. But that ran on one
+ * claude CLI build, and this scan holds regardless of the SDK's tool gating, so do
+ * not treat it as redundant to that layer.
  */
 export function scanSignals(message: unknown): ScannedSignals {
   const msg = asRecord(message);
@@ -559,9 +561,10 @@ export function scanSignals(message: unknown): ScannedSignals {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's
       // branch: a subagent must not be able to ask the user. agents.ts denies the
-      // whole mcp__uzi prefix, but this file states outright that whether
-      // disallowedTools beats a custom template's explicit `tools` allowlist is
-      // unproven — and a prompt-injected subagent reaching ask_user would post
+      // whole mcp__uzi prefix, and a PRD #158 M0 spike (2026-08-10) measured that
+      // this deny does override a template's explicit `tools` allowlist on the pinned
+      // SDK — but this main-thread scan is the guarantee independent of SDK gating,
+      // and a prompt-injected subagent reaching ask_user would post
       // attacker-chosen text into the owner's Slack DM under uzi's bot identity. That
       // is a phishing primitive, not merely a spurious park.
       const parsed = parseQuestions(asRecord(block["input"])?.["questions"]);

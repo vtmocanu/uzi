@@ -1,7 +1,7 @@
 # PRD #158: Forge read tools — let a run check a claim against the forge instead of against the repo's copy of it
 
 **GitLab Issue**: [#158](https://gitlab.example.com/vtmocanu/uzi/-/issues/158)
-**Status**: Draft (created 2026-07-27; **substantially revised the same day** after an adversarial architect review found the first draft not implementable).
+**Status**: Draft (created 2026-07-27; **substantially revised the same day** after an adversarial architect review found the first draft not implementable). **M0 spike completed 2026-08-10 — PASS; see the M0 milestone and the Decision Log.**
 **Priority**: Medium
 
 *What the review changed, because the corrections are the useful part: the draft built the
@@ -152,14 +152,30 @@ three verbs by itself: an issue body saying "see #131 and !77" makes the model w
 
 ## Implementation Milestones
 
-- [ ] **M0 — SPIKE: prove a run-lane subagent can call an in-process MCP tool at all.**
+- [x] **M0 — SPIKE: prove a run-lane subagent can call an in-process MCP tool at all.**
   **Nothing below works if this is false, and it is currently unproven.** Both existing
   run-lane servers are denied to every subagent, the live DB has zero `mcp__*` rows in
-  `tool_use`, and the repo states its own uncertainty at `signals.ts:145-147`: whether
+  `tool_use`, and the repo stated its own uncertainty in `signals.ts` (`scanSignals`) and `agents.ts`: whether
   `disallowedTools` wins over a template's explicit `tools` allowlist is "unproven from the
   SDK types". Stand up a trivial non-denied server, give one subagent an allowlist entry for
   it, and observe a real call. Timebox it; a negative result reshapes the whole PRD and is
   worth knowing on day one rather than at M4.
+  **Result — 2026-08-10, PASS (measured, not inferred).** A standalone harness on the pinned SDK
+  (`@anthropic-ai/claude-agent-sdk@0.3.219`, driving `claude-sonnet-5`) reproduced the run-lane
+  shape: one subagent with `tools: ['mcp__probe__ping']` that server-denies a *different* server
+  (`disallowedTools: ['mcp__blocked']`, mirroring `agents.ts:151`), parent restricted to `tools:
+  ['Task']` so any call to the probe tool must originate in the subagent. The subagent **called the
+  in-process MCP tool** — the handler was invoked once, the call was attributed to the subagent via
+  `parent_tool_use_id` (parent never called it), and the returned token round-tripped into the final
+  result. A second scenario put the same tool in BOTH the allowlist and a server-level deny
+  (`disallowedTools: ['mcp__probe']`): invoked **0×**, so a server-level `disallowedTools` entry
+  **overrides** the `tools` allowlist — settling the "unproven from the SDK types" question the code
+  raised in `signals.ts` (`scanSignals`) and `agents.ts` — empirically, from runtime behaviour (the
+  SDK *types* still do not prove it). Those comments now cite this result. Whether the runtime scan
+  in `signals.ts` is still needed given deny-wins is an implementation-time call — it may guard a path
+  this harness did not exercise — so this PRD records only that the precedence itself is now measured.
+  **Caveat:** the harness used the local `claude` CLI (2.1.226); the resolution runs inside the CLI, so
+  M6's acceptance run reconfirms it on the worker image's claude-code build.
 
 - [ ] **M1 — Run-scoped forge read endpoints on the API, with the truncation contract.**
   Worker-authenticated routes that resolve the run and derive its project **from the run
@@ -247,7 +263,7 @@ three verbs by itself: an issue body saying "see #131 and !77" makes the model w
 
 | Risk | Mitigation |
 |---|---|
-| **M0 is false** — subagents cannot call in-process MCP tools | Spike first. A negative result reshapes the PRD; finding out at M5 wastes the whole build |
+| **M0 is false** — subagents cannot call in-process MCP tools | **RESOLVED 2026-08-10: M0 measured TRUE** (see the M0 milestone). Spike first. A negative result reshapes the PRD; finding out at M5 wastes the whole build |
 | **Ships dead on existing installs** | M3's migration/admin-reset, not prose. This is the draft's "feature ships unused" risk actually materialising |
 | **Enumeration**, incl. actor graphs via label events (accepted, owner decision) | Server-derived project scope; real driver pagination (M2); **per-run call budget across all verbs** — the per-call cap does not bound `list_issues` → N× `get_issue` |
 | **Forge API load** | Genuinely unmitigated until M2 widens `ListIssuesOptions`; today every list is a full-project fetch and no worker route is rate-limited |
@@ -272,11 +288,15 @@ the fact.
 
 ## Open questions
 
-1. **Can a run-lane subagent call a non-denied in-process MCP tool?** M0. Unproven from the SDK
-   types by the repo's own admission; no instance exists to observe.
-2. **Can the `fact-checker`'s existing `WebFetch` already reach the forge?** If yes, a cheaper
-   partial fix may exist and the Problem section overstates. Untested — needs an
-   agent-container egress check.
+1. **RESOLVED (2026-08-10) — yes.** M0 measured it directly (see the M0 milestone): a run-lane
+   subagent calls a non-denied in-process MCP tool in its `tools` allowlist, and a server-level
+   `disallowedTools` entry overrides that allowlist. The design's foundational interaction holds.
+2. **RESOLVED (2026-08-10) — no cheaper fix.** Unauthenticated access to the *private* forge is a
+   wall: the issue REST API returns `404` and the issue web page `302`-redirects to
+   `/users/sign_in`. The `fact-checker`'s `WebFetch` carries no credential, so even where the worker
+   can reach `gitlab.example.com` (it is on the standard-tier FQDN allowlist for authenticated
+   git), the fetch gets a login page, not issue content. The worker-mediated read path is required,
+   not over-built; the Problem section stands.
 3. **Where does a real `list_issues` payload cross the 900 KiB tombstone threshold?** Sets the
    cap. Unmodelled.
 4. **Is there a shared redaction helper the handler layer can apply?** Per-method redaction
@@ -324,3 +344,16 @@ like a failure.
   itself calls unproven.
 - **2026-07-27 (revision) — a stopping rule for the verb set.** The set was chosen by what the
   driver exposes; without a rule it grows on contact with the first issue body citing another.
+- **2026-08-10 — M0 spike done, PASS.** Measured on the pinned SDK
+  (`@anthropic-ai/claude-agent-sdk@0.3.219` + local `claude` CLI 2.1.226, model `claude-sonnet-5`):
+  a run-lane subagent calls a non-denied in-process MCP tool in its `tools` allowlist (attributed via
+  `parent_tool_use_id`, parent restricted to `tools: ['Task']`). The design's load-bearing
+  interaction is real. Reconfirm on the worker's claude-code build at M6.
+- **2026-08-10 — precedence resolved: server-level deny beats the `tools` allowlist.** The same tool
+  in both `tools` and `disallowedTools: ['mcp__probe']` was invoked 0×. So the `agents.ts:151`
+  denylist is authoritative, and the "unproven from the SDK types" hedge at `signals.ts:504` /
+  `agents.ts:61` now has an empirical answer. Whether that makes the `signals.ts` runtime scan
+  redundant is left to implementation — it may guard a path the harness did not exercise.
+- **2026-08-10 — Open Q2 resolved: unauthenticated `WebFetch` cannot read the private forge.** Issue
+  API `404`, web page `302 → /users/sign_in`. No cheaper partial fix exists; the worker-mediated read
+  path stands.
