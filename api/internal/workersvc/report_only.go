@@ -2,13 +2,12 @@ package workersvc
 
 import (
 	"log/slog"
-	"strings"
-	"unicode"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // clampWireReportOnly gates the worker's report_only declaration to issue runs
@@ -47,33 +46,12 @@ func clampWireReportMd(run store.Run, p *string, reportOnly bool) pgtype.Text {
 		slog.Warn("dropping report_md: report_only not set", "run_id", run.ID, "kind", run.Kind)
 		return pgtype.Text{}
 	}
-	// Order matters: sanitize (strip + cap) THEN scrub — mirroring judge_worker.go's
-	// ScrubSecrets(sanitizeReviewText(...)), so the scrubber sees whole runes and the
+	// Order matters: sanitize (strip + cap) THEN scrub — mirroring judge_worker.go:
+	// ScrubSecrets(termsafe.SanitizeBounded(...)), so the scrubber sees whole runes and the
 	// cap is applied to structural text before redaction rewrites it.
-	s := secretscrub.Scrub(sanitizeReportText(*p, ReviewSummaryMaxBytes))
+	s := secretscrub.Scrub(termsafe.SanitizeBounded(*p, ReviewSummaryMaxBytes))
 	if s == "" {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: s, Valid: true}
-}
-
-// sanitizeReportText mirrors handler.sanitizeReviewText (judge_worker.go:495) — it
-// cannot be reused across packages (handler imports workersvc, not the reverse), so it
-// is duplicated here with the same semantics: trim, drop control + Unicode Cf format
-// chars (except \n and \t so multi-line markdown survives), byte-bound after each whole
-// rune (never splitting a multi-byte rune), then trim again. Keep the two bodies
-// identical — if you change one, change both.
-func sanitizeReportText(s string, max int) string {
-	s = strings.TrimSpace(s)
-	var b strings.Builder
-	for _, r := range s {
-		if (unicode.IsControl(r) || unicode.In(r, unicode.Cf)) && r != '\n' && r != '\t' {
-			continue
-		}
-		b.WriteRune(r)
-		if b.Len() >= max {
-			break
-		}
-	}
-	return strings.TrimSpace(b.String())
 }

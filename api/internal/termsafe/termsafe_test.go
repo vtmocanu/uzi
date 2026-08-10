@@ -279,6 +279,81 @@ func TestUnsafeIsTheDisjointPair(t *testing.T) {
 	}
 }
 
+// TestSanitizeBounded pins the persist-time guard for untrusted flowing markdown. The
+// cases are named after the property each defends: the \n/\t exception that keeps this
+// separate from the single-line scrubbers, the Cf strip that is the Trojan-Source fix,
+// the whole-rune byte bound, the trim-again, and the U+FFFD substitution it shares with
+// SanitizeTTY.
+func TestSanitizeBounded(t *testing.T) {
+	const big = 1 << 20 // a cap far above any case's length, so it never truncates
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"newline-preserved", "line one\nline two", big, "line one\nline two"},
+		{"tab-preserved", "col\tsep", big, "col\tsep"},
+		{"esc-stripped", "a\x1bb", big, "ab"},
+		{"bel-stripped", "a\x07b", big, "ab"},
+		{"bidi-override-stripped", "safe\u202egnp.exe", big, "safegnp.exe"},
+		{"zero-width-stripped", "a\u200bb", big, "ab"},
+		{"leading-trailing-trimmed", "  hi  ", big, "hi"},
+		// Trim-again: a Cf sits between the edge whitespace and the content, so the leading
+		// TrimSpace (which runs before the strip, and Cf is not White_Space) cannot reach the
+		// spaces. The strip removes the Cf, then the final TrimSpace cleans the exposed edges.
+		{"trim-again-after-cf-strip", "\u200b  hi  \u200b", big, "hi"},
+		{"empty", "", big, ""},
+		{"whitespace-only", "   \n\t  ", big, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SanitizeBounded(tc.in, tc.max); got != tc.want {
+				t.Fatalf("SanitizeBounded(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+		})
+	}
+
+	// The byte bound is checked AFTER each WHOLE rune is written, so a multi-byte rune is
+	// never split at the cut. When max lands mid-rune the loop includes the rune that
+	// crosses it and then stops, so the output is a whole number of runes, valid UTF-8, and
+	// overshoots max by at most one rune (never truncates inside one — the "max..max+3
+	// bytes" bound the sibling scrubbers document). It must NOT split, which a byte cut
+	// would, yielding invalid UTF-8.
+	t.Run("multibyte-rune-not-split", func(t *testing.T) {
+		const r = "日" // 3 bytes in UTF-8
+		if len(r) != 3 {
+			t.Fatalf("fixture assumption broke: %q is %d bytes", r, len(r))
+		}
+		in := strings.Repeat(r, 8) // 24 bytes
+		const max = 10             // lands mid-rune: byte 10 is inside the 4th rune (bytes 9..11)
+		got := SanitizeBounded(in, max)
+		if !utf8.ValidString(got) {
+			t.Fatalf("output %q is not valid UTF-8 — a rune was split at the byte bound", got)
+		}
+		if len(got)%len(r) != 0 {
+			t.Fatalf("output %q is %d bytes, not a whole number of 3-byte runes", got, len(got))
+		}
+		// It stopped at the first whole-rune boundary at or past max (12 bytes = 4 runes),
+		// having neither split the crossing rune nor kept the whole input.
+		if want := strings.Repeat(r, 4); got != want {
+			t.Fatalf("output %q, want %q (whole runes through the one that crosses max)", got, want)
+		}
+		if len(got) >= len(in) {
+			t.Fatalf("output %q was not bounded: %d bytes >= input %d", got, len(got), len(in))
+		}
+	})
+
+	// Invalid UTF-8 decodes to U+FFFD as the range loop walks the string, matching
+	// SanitizeTTY's documented behaviour; the replacement char is present in the output.
+	t.Run("invalid-utf8-becomes-fffd", func(t *testing.T) {
+		got := SanitizeBounded("a\xffb", big)
+		if !strings.ContainsRune(got, '�') {
+			t.Fatalf("SanitizeBounded(%q) = %q, want a U+FFFD replacement char", "a\xffb", got)
+		}
+	})
+}
+
 // FuzzValidateAgreesWithCellText extends the biconditional past the two enumerable
 // corpora above to arbitrary BYTE strings — the axis neither reaches, because a rune loop
 // can only build well-formed UTF-8 and a named corpus can only hold what someone wrote

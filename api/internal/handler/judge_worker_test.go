@@ -97,7 +97,7 @@ func TestValidateAndScrubReviewCapsAndStripsControl(t *testing.T) {
 //
 // Both scrubbers on this path are exercised here, because they are different functions with
 // different whitespace postures and only one of them carries the filename:
-// sanitizeReviewText for Summary/Rationale (keeps \n and \t), sanitizeSelfReported for
+// termsafe.SanitizeBounded for Summary/Rationale (keeps \n and \t), sanitizeSelfReported for
 // Target and Model (single-line, keeps neither). Corpus mirrored from
 // TestSanitizeTTYStripsControlAndFormatChars (api/cmd/uzi/tui_render_test.go:61).
 func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
@@ -153,7 +153,7 @@ func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
 	}
 	// The whitespace posture is per-function and must not drift: the MARKDOWN field keeps
 	// \n and \t (its sink is whitespace-pre-wrap), which is the whole reason
-	// sanitizeReviewText is separate from the single-line sanitizeSelfReported.
+	// termsafe.SanitizeBounded is separate from the single-line sanitizeSelfReported.
 	if !strings.Contains(sub.Recommendations[0].RationaleMd, "\n") ||
 		!strings.Contains(sub.Recommendations[0].RationaleMd, "\t") {
 		t.Errorf("rationale lost its newline/tab: %q", sub.Recommendations[0].RationaleMd)
