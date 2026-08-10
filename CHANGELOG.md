@@ -6,6 +6,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **A failed pipeline on your own agent MR branch can now fix itself, opt-in
+  and off by default.** With the new **Automatic CI fixes** toggle
+  (Settings, or forced per-user from Admin → Users), a failing pipeline on a
+  branch one of your issue runs pushed to auto-queues the existing `ci_fix`
+  run, auto-approved — `main`, the default branch, and non-MR refs are never
+  touched. A loop guard caps it at `CI_AUTOFIX_MAX_ATTEMPTS` (2) automatic
+  attempts per branch and halts early if a retry's failure signature doesn't
+  change, posting one issue comment and an in-app notification either way
+  and resetting only once the branch goes green; the manual **Fix CI**
+  button remains the escape hatch. A code/test fix pushes automatically, but
+  a fix that edits the CI config itself (`.gitlab-ci.yml`, `.gitlab/**`, or
+  the project's configured `ci_config_path`) parks for human approval, with
+  a fail-closed worker-side backstop that refuses to push an auto-approved
+  fix touching those paths. Validated on GitLab; the CI-config-path lookup
+  is a GitLab-only stub on Forgejo/GitHub for now. (PRD #71)
+
 ## [0.26.0] - 2026-08-10
 
 ### Added

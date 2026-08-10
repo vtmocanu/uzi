@@ -137,12 +137,21 @@ the agent's forge tool server, neither configurable.
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.
 
+On top of the manual button, a per-user opt-in can queue that same `ci_fix`
+run **automatically** when one of a user's own agent MR branches goes red —
+see [Automatic CI fixes](./ci-autofix.md) for the feature and its loop
+guard. It's off for every user until they opt in in Settings (or an admin
+force-enables them from Admin → Users), so the two `CI_AUTOFIX_*` vars
+below have no effect on an instance where nobody has opted in yet.
+
 | Var | Default | Notes |
 |---|---|---|
 | `CI_WATCH_MAX_REFS` | `20` | Max agent run branches watched per repo per tick (newest first). **Set to `0` to disable the pipeline sync entirely** — no CI badges, no Fix CI — reproducing pre-PRD-6 behaviour bit-for-bit for operators who want CI awareness off. Hitting the cap is logged, never silent. |
 | `CI_WATCH_RUN_WINDOW` | `336h` (14 days) | How long a **finished** run's branch keeps being watched for CI after it completes (a non-terminal run is watched regardless). Go duration syntax only (`h`/`m`/`s`, no `d`), so 14 days is written `336h`; a literal `14d` is unparseable and silently falls back to the default. Long enough to cover review cycles, bounded so dead branches age out of the cache. |
 | `CI_FIX_MAX_JOBS` | `10` | Max failed jobs a Fix CI snapshot captures from the failed pipeline. Bounds the snapshot (jobs × tail) frozen onto the `ci_fix` run at queue time. |
 | `CI_FIX_LOG_TAIL_BYTES` | `32768` (32 KiB) | Bytes captured from the **end** of each failed job's trace (a failure concludes its log). Tails are treated as untrusted evidence and pass a PAT + known-token redaction pass before they are stored. |
+| `CI_AUTOFIX_MAX_ATTEMPTS` | `2` | Max automatic CI-fix attempts per agent MR branch before uzi halts and stops retrying automatically (the manual Fix CI button still works). A no-progress halt (unchanged failure signature) can stop it earlier. See [Automatic CI fixes](./ci-autofix.md). |
+| `CI_AUTOFIX_CONFIG_PATHS` | `.gitlab-ci.yml,.gitlab/**,**/*.gitlab-ci.yml` | Comma-separated protected CI-config path globs. An auto-approved CI-fix whose diff touches one of these (or the project's own configured `ci_config_path`, fetched server-side) is refused at push time and must be human-approved instead. |
 
 **Verification caveat**: `verified` means "the fix MR's latest pipeline passed". A merge-result failure that only surfaces on `main` (a semantic conflict) is caught only if the project runs [merged-results pipelines](https://docs.gitlab.com/ee/ci/pipelines/merged_results_pipelines.html) — a GitLab-config concern, not a uzi setting.
 

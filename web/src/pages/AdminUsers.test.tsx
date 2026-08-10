@@ -51,15 +51,19 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
     render(<AdminUsers />);
 
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    // Cells: 0 Email, 1 Name, 2 Role, 3 Status, 4 Judge, 5 CI autofix, 6 Last
+    // login, 7 Action. Scope to the Judge cell so the CI-autofix column's own
+    // On/Off badge and Enable/Disable button (PRD #71 M1) don't collide.
+    const judgeCell = () => within(within(row).getAllByRole("cell")[4]);
     // Off state + an Enable action.
-    expect(within(row).getByText("Off")).toBeTruthy();
-    fireEvent.click(within(row).getByText("Enable"));
+    expect(judgeCell().getByText("Off")).toBeTruthy();
+    fireEvent.click(judgeCell().getByText("Enable"));
 
     // The flag is set on the TARGET's own id (never the actor's, never the body).
     expect(mockApi.setUserJudgeEnabled).toHaveBeenCalledWith("u2", true);
-    await waitFor(() => expect(within(row).getByText("On")).toBeTruthy());
+    await waitFor(() => expect(judgeCell().getByText("On")).toBeTruthy());
     // The action flips to Disable once enabled.
-    expect(within(row).getByText("Disable")).toBeTruthy();
+    expect(judgeCell().getByText("Disable")).toBeTruthy();
   });
 
   it("toggles a judge-enabled user off", async () => {
@@ -68,9 +72,12 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
 
     render(<AdminUsers />);
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
-    fireEvent.click(within(row).getByText("Disable"));
+    // Judge is cell index 4; scope to it so the CI-autofix column's own
+    // Off/Enable (PRD #71 M1) doesn't match a bare within(row) text query.
+    const judgeCell = () => within(within(row).getAllByRole("cell")[4]);
+    fireEvent.click(judgeCell().getByText("Disable"));
     expect(mockApi.setUserJudgeEnabled).toHaveBeenCalledWith("u2", false);
-    await waitFor(() => expect(within(row).getByText("Off")).toBeTruthy());
+    await waitFor(() => expect(judgeCell().getByText("Off")).toBeTruthy());
   });
 });
 

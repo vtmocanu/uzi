@@ -19580,3 +19580,180 @@ the source, without ever exposing the forge token or coordinates to the model.
 - **The recurring `install_worker_tool: glab` recommendation is by design, not a regression.**
   It comes from a missing-executable trace scan, and `glab` is permanently denied
   (`toolprofile/toolprofile.go`), so it keeps firing after this ships — expected recurrence.
+
+---
+
+# PRD #71 — Automatic CI-fix for failed pipelines (opt-in, loop-guarded)
+
+Serves human Feature #71 — the autopilot sibling for CI failures: turns PRD #6's *manual*
+Fix CI button into an opt-in automatic trigger, supplying the spend controls + notification
+story PRD #6 deferred, without weakening any of the four `main`-never-touched guardrail
+layers. Extends PRD #6 (manual `ci_fix` machinery, pipeline watch, verdict stamping) and
+reuses the PRD #19 autopilot detector pattern. Section numbers continue past PRD #158's
+§509. Full rationale + Decision Log (incl. rejected alternatives, the 2026-07-17 user-locked
+decisions, and the drift-review fact-check): `prds/done/71-ci-autofix.md`.
+
+## 510. PRD #71 — the trigger is a poller post-sync `CIAutoFix` detector, optional-wired, gated on the pipeline watch
+
+Serves human: "opt-in automatic CI-fix on agent MR branches, never main"; best-practice
+(detection must never ride the shared `forgesvc` paths that manual refresh / `CreateIssue`
+also reach — those must never spawn runs).
+
+- **Sibling of the PRD #19 autopilot detector** (`api/internal/poller/ci_autofix.go`): runs
+  each tick **after** the pipeline-status sync, on the freshly-refreshed `pipeline_statuses`
+  cache — the same "detect only in the poller" placement as §98. Nil-optional-wired via
+  `engine.SetCIAutoFix(...)` in `api/cmd/server/main.go`; **not wiring it is the instance
+  kill-switch** (the autopilot nil pattern), and it can only run where the pipeline watch is
+  on (`CI_WATCH_MAX_REFS>0`), since it reads that cache.
+- **Global `app_settings.ci_autofix_enabled` (full judge parity) deliberately deferred** —
+  the optional-wiring is the instance switch, per-user opt-in is the consent gate; a global
+  KV kill-switch is a documented follow-up (Decision Log Q4), not shipped.
+
+## 511. PRD #71 — durable `ci_autofix_attempts` ledger: the `autopilot_triggers` analogue, keyed `(repo_id, ref)`
+
+Serves human: "max 2 automatic attempts + early stop when the failure hasn't changed"; the
+loop-guard state must be trustworthy across churn.
+
+- **Dedicated ledger** (migration `00116_ci_autofix_attempts`, PK `(repo_id, ref)`): the
+  direct analogue of §98's `autopilot_triggers`. It **outlives both the run rows and the
+  evictable `pipeline_statuses` cache** — durable guard state must not ride an evictable row
+  (the lesson `autopilot_triggers` exists for). Rejected: deriving the count as `COUNT(ci_fix
+  runs on ref)` (couples the guard to run retention) or reusing `pipeline_statuses` (a pure
+  forge cache, upserted/evicted every tick).
+- Columns: `attempt_count` (AUTO attempts only — the manual button never writes here),
+  `last_signature` (the failure signature the last attempt targeted), `last_pipeline_id`
+  (dedup marker), `halt_notified` (comment-once latch).
+- **Cap `CI_AUTOFIX_MAX_ATTEMPTS` (default 2) counts AUTO attempts only.** The detector gates
+  on **`attempt_count`, never row-existence** — a row can exist with count 0 (a swallow/dedup
+  record) without blocking a first attempt.
+- **`halt_notified` is a one-comment-per-episode latch RESET on each proceed**, so the
+  no-progress halt and the cap halt each get their own comment rather than the second being
+  swallowed as "already notified."
+
+## 512. PRD #71 — `FailureSignature`: SHA-256 over normalized failure fingerprint, biased toward "same"
+
+Serves human: "early stop when the failure hasn't changed"; best-practice (over-matching is
+the cheaper error under a cap of 2).
+
+- **`workersvc.FailureSignature(snapshot)`** (`api/internal/workersvc/ci_fix_snapshot.go`) =
+  SHA-256 over a canonical string: the **sorted `failed-job|stage` list**, then per job a
+  normalized fingerprint of the last log-tail lines.
+- **Aggressive normalization** (one documented function) strips volatile tokens that differ
+  run-to-run without meaning a different failure — ANSI escapes, timestamps, durations, digit
+  runs, hex/pointer addresses, absolute paths (`/builds`|`/tmp`) → placeholders; lowercase;
+  collapse whitespace — then compares for exact equality.
+- **Deliberately biased toward "same":** a false no-progress halt costs one early attempt (the
+  manual button remains), whereas under-normalizing wastes the 2nd attempt anyway — so
+  over-matching is the cheaper error, and the cap of 2 bounds both directions.
+- **Snapshot builder shared by handler + poller.** `BuildFailureSnapshot`/`scrubKnownTokens`
+  were moved out of `handler` into `workersvc` (`ci_fix_snapshot.go`); `FailureSignature`
+  sits beside them. Handler's manual path produces a byte-identical snapshot; the poller
+  detector calls the same builder — one redaction/size-cap discipline, inherited from PRD #6.
+
+## 513. PRD #71 — two-layer code-vs-CI-config enforcement (the agent's self-classification is not trusted)
+
+Serves human: "code fixes push automatically; a fix that edits CI config passes the approval
+gate (human-approved before it pushes)"; best-practice (CI log tails are the most
+attacker-influenceable text uzi feeds an agent, so a UX declaration cannot be load-bearing).
+
+- **Layer 1 — agent-declared plan routing (UX):** `buildCIFixPlanPrompt`
+  (`agent/src/prompt.ts`) gains a `CI_CONFIG_MARKER` first-line sentinel (mirrors the existing
+  `NOT_CODE_MARKER`) + a shared `isCIConfigPlan(planMd)` helper. `runner.gatePlan`
+  (`agent/src/runner.ts`) parses the marker from the `planMd` it already holds; for a
+  CI-config-classified `ci_fix` plan it does **not** take the auto-approve short-circuit — it
+  parks at `awaiting_approval`. Call-site form: `effectiveAutoApprove = auto_approve &&
+  !forceGate`. Classification travels via a `humanApproved` closure variable rather than
+  through `executor.ts`/`RunResult` (which carries no plan text), keeping the prompt and the
+  gate independently shippable.
+- **Layer 2 — load-bearing fail-closed worker push guard (security backstop):**
+  `agent/src/ci-config-guard.ts` — a **dotfile-safe regex** matcher (NOT a glob dependency:
+  the default protected paths are all leading-dot files a stock glob misses by default, a
+  fail-open trap). Before a `ci_fix` push, **iff the run was auto-approved (`!humanApproved`)
+  AND the diff touches a protected CI-config path OR the diff can't be computed
+  (`changedFiles === null`)** → refuse to push, fail closed (mark failed + comment + notify).
+  A human-approved run is never blocked (a human is in the loop, exactly as in the manual
+  flow). Note the divergence from self-improve, which treats a null diff as informational and
+  still pushes — the security guard must fail closed on null.
+- **Protected-path set is server-produced and includes the real pipeline file (Decision (d)):**
+  = `CI_AUTOFIX_CONFIG_PATHS` defaults (`.gitlab-ci.yml,.gitlab/**,**/*.gitlab-ci.yml`) ∪ the
+  project's server-fetched `ci_config_path`. GitLab lets a project point its pipeline at an
+  arbitrary file, so static globs alone are not a true boundary — the **server owns it**
+  (consistent with every other cap). Delivered as `ClaimConfig.CIConfigPaths`, persisted on
+  `runs.ci_config_paths` at run-creation (migration `00115_run_ci_config_paths`). Fetched via
+  a new forge read `ProjectCIConfigPath(ctx, projectID)` — compile-time mandatory across all
+  three drivers (`gitlab.go`/`forgejo.go`/`github.go`) + the test fakes, but a **server-side
+  claim-assembly read**, NOT a PRD #158 worker forge route (opposite, agent-facing trust
+  direction). Residual (documented): `include: local:` YAML templates pulled into the pipeline
+  are not scanned in MVP.
+
+## 514. PRD #71 — the requeue-while-parked fix: parking a run clears `auto_approve`
+
+Serves human: "a CI-config fix must be human-approved before it pushes" — a parked auto run
+must not be able to skip the gate via a worker-restart requeue (non-obvious).
+
+- **`SetRunAwaitingApproval` clears `auto_approve = false` when a run parks** — symmetric with
+  the existing seeded `plan_source='agent'` decouple. Without it, a parked auto `ci_fix` run
+  resumed after a worker restart would still read `auto_approve=true` and bypass the gate on
+  requeue.
+- With the clear, a parked auto `ci_fix` run **requires genuine human approval on resume**.
+  The worker's `ciFixHumanApproved` derives from `auto_approve !== true` on a pre-approved
+  resume, so a resumed-with-approval run is correctly treated as human-approved and pushes.
+
+## 515. PRD #71 — the loop-guard sequence and reset-on-green
+
+Serves human: "loop-guarded — never loops; on giving up, comment + notify + stop, manual Fix
+CI button remains."
+
+- **Per candidate ref (newest failed pipeline), in order:**
+  1. **Dedup on `last_pipeline_id`** — same pipeline id already evaluated → skip.
+  2. **Active `ci_fix` run in flight** (the `uq_runs_one_active_ci_fix` index) → **swallow**,
+     recording `last_pipeline_id` only up to `min(pipeline_id, active-run target)`
+     (`RecordCIAutofixPipeline`, the M-b cap): it must not advance past the active run's target
+     or attempt #2 and its halt comment would silently drop once the run terminates.
+  3. **Halt** if `attempt_count >= cap` OR (`attempt_count>=1` AND `signature==last_signature`):
+     the prior attempt is already terminal (`fix_verdict=fix_failed`); post one issue comment
+     (per-reason, via the latch) + notify, record, do NOT re-queue.
+  4. **Proceed** otherwise: fetch `ci_config_path`, build snapshot + signature, comment
+     "auto-fix started" + notify, `CreateAutoCIFixRun(...)`, upsert `{count+1, last_signature,
+     last_pipeline_id}` and reset the latch.
+- **`CreateAutoCIFixRun`** parallels `CreateCIFixRun` but sets `auto_approve=true` (an explicit
+  param — the manual `ci_fix.sql` INSERT does not parametrize `auto_approve`, defaulting
+  false); shares the same one-active-fix index + cross-kind branch guards + typed errors
+  (`ErrActiveFixExists`/`ErrBranchInUse`), which the detector swallows exactly as autopilot
+  does.
+- **Candidate selection is run-kind-aware:** `ListCIAutofixCandidateRefs` selects only
+  `ci_fix`-eligible agent MR refs (owner opted-in + Anthropic token present, `mr_iid` set),
+  excluding the default branch and protected refs, and never matches a
+  `chat`/`judge`/`self_improve`/`prompt` run sharing the ref space (the `runs` table carries
+  six kinds).
+- **Reset-on-green:** a `success` pipeline deletes the ledger row (`DeleteCIAutofixAttempt`,
+  in `forgesvc/pipeline_sync.go`) + a landed notification. Ledger eviction of a departed ref
+  happens on the reconcile tick, so a reused `agent/issue-N` branch does not inherit a stale
+  `count=2`. A human pushing fresh broken code does NOT reset the count (prevents an infinite
+  auto-loop on repeated human breakage).
+
+## 516. PRD #71 — notifications: in-app + issue comment on the backing issue; Slack deliberately not wired
+
+Serves human: "on giving up, uzi comments + notifies"; the notification story PRD #6 required.
+
+- Events **start** and **halt**: a PRD #46 `notifysvc` in-app notification + a `CreateIssueNote`
+  comment on the **backing `agent/issue-N` issue** (every auto candidate has one — no new
+  `CreateMergeRequestNote`). Event **landed** (verified green): in-app only.
+- **Slack deliberately NOT wired:** the existing run-failure notifier already DMs the last
+  attempt's owner, so wiring Slack here would double-notify; in-app + issue comment carry the
+  auto-fix lifecycle.
+
+## 517. PRD #71 — scope, opt-in, and cross-forge posture
+
+Serves human: "opt-in per-user default OFF, admin can force-toggle; agent-owned MR branches
+only; never main/protected."
+
+- **Per-user `ci_autofix_enabled`, default OFF** (migration `00114_user_ci_autofix_enabled`,
+  mirrors the judge/autopilot boolean): self-service PUT + an **admin force-toggle** (judge
+  parity). Surfaced on the user DTO and web `Settings.tsx` / `AdminUsers.tsx`.
+- **MR-branch pipelines only** (`refs/merge-requests/*` of `agent/issue-N` branches); `main`,
+  default, and protected branches are **never** auto-touched — a fix lands on the MR branch
+  and a human still merges (the primary directive). The four `main`-untouched guardrail layers
+  are unchanged.
+- **GitLab-first:** the detector is forge-neutral by construction but validated on GitLab only;
+  Forgejo/GitHub `ProjectCIConfigPath` are stubs (compile-time present, runtime GitLab-only).
