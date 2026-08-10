@@ -100,7 +100,7 @@ that one layer changes.
   PATCH's **replace** semantics (Decision 4) the model round-trips create → GET →
   patch → GET, and an absent/null model on a config PATCH clears to inherit.
 
-- [ ] **M3 — Fire-time freeze & claim precedence (worker unchanged).** `schedsvc`
+- [x] **M3 — Fire-time freeze & claim precedence (worker unchanged).** `schedsvc`
   freezes the schedule's model onto each run it fires (all targets); at claim
   assembly the run's model overrides the per-user Worker-model default
   (`run.Model ?? GetUserDefaultModel`, `service.go:1631`), delivered on the

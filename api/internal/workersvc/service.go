@@ -1630,10 +1630,21 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// The run owner's per-user default model overrides the lead template's model
 	// on the worker (PRD #17 Decision 6). NULL ⇒ nil ⇒ omitted from the payload,
-	// so the worker falls back to the lead template's model.
+	// so the worker falls back to the lead template's model. PRD #300 layers a
+	// per-schedule freeze on top of this (see the run.Model override just below).
 	defaultModel, err := s.q.GetUserDefaultModel(ctx, run.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("default model lookup: %w", err)
+	}
+	// PRD #300: a schedule can freeze a per-run model onto the run at fire time
+	// (runs.model). When present it takes precedence over the owner's per-user Worker
+	// default for THIS run's DefaultModel, and is delivered on the SAME default_model
+	// claim field the worker already consumes — so the worker is unchanged (Decision 7)
+	// and a subagent template's own model: pin, carried separately on each agent, still
+	// wins. NULL run.model = inherit = today's behaviour (byte-identical for every
+	// non-scheduled run and every schedule without a model).
+	if run.Model.Valid {
+		defaultModel = run.Model
 	}
 
 	// Skills (PRD #16): the per-run union of every skill allocated to any template
