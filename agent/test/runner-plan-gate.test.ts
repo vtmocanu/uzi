@@ -5,6 +5,7 @@ import { spawnDetached } from "../src/sdk-spawn.js";
 import { nullLogger } from "./helpers.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, STUB_ASK_SENTINEL, type Executor } from "../src/executor.js";
 import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
+import { CI_CONFIG_MARKER } from "../src/prompt.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import {
   api,
@@ -635,6 +636,60 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.ok(failed, "cancelled run reports failed");
     assert.match(failed!.body.failure_reason ?? "", /run cancelled/);
     assert.strictEqual(calls.length, 0, "no MR on cancel");
+  });
+});
+
+// PRD #71 M5: the CI-config gate override at the gatePlan call site. An auto_approve
+// ci_fix run whose plan is CI-config-classified (CI_CONFIG_MARKER first line) must NOT
+// take the auto-approve short-circuit — it parks for human review; a code-plan ci_fix
+// run keeps the short-circuit. The executor here returns `not_code` after the gate to
+// isolate the gate decision from the (separately unit-tested) push guard.
+describe("RunRunner — CI-config ci_fix gate override (PRD #71 M5)", () => {
+  const ciFixExec = (plan: string): Executor => ({
+    run: async (ctx) => {
+      await ctx.gatePlan!(plan);
+      // Skip the push/MR entirely so this test observes only the gate decision.
+      return { branch: ctx.branch, fixVerdict: "not_code" };
+    },
+  });
+
+  it("PARKS an auto_approve ci_fix run whose plan is CI-config-classified", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(70, { kind: "ci_fix", auto_approve: true });
+    // The park needs a human verdict to resume; supply one so the run terminates.
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(
+      ciFixExec(`${CI_CONFIG_MARKER}\nEdit .gitlab-ci.yml to add the missing job`),
+      gitlab,
+    ).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      statuses.includes("awaiting_approval"),
+      "a CI-config plan must park even on an auto-triggered ci_fix run",
+    );
+  });
+
+  it("SHORT-CIRCUITS an auto_approve ci_fix run whose plan is code-only (no marker)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(71, { kind: "ci_fix", auto_approve: true });
+    // No inputs: a short-circuited run resolves the gate itself. If it parked it
+    // would hang until the (disabled) timeout, so a park would surface as a hang.
+    await runner(
+      ciFixExec("# PLAN\n- fix the failing unit test in src/foo.ts"),
+      gitlab,
+    ).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "a code-plan ci_fix run keeps the auto-approve short-circuit",
+    );
+    assert.equal(statuses.at(-1), "completed", "and runs to completion unattended");
   });
 });
 
