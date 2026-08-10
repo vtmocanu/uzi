@@ -267,6 +267,11 @@ func TestOnlyEnabled(t *testing.T) {
 	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, Target: "issue"}) {
 		t.Fatalf("enabled + a config field is NOT onlyEnabled")
 	}
+	// enabled + model is a config PATCH, not enabled-only: it must NOT short-circuit, or
+	// the model would be silently dropped (PRD #300 M2).
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, Model: sptr("fable")}) {
+		t.Fatalf("enabled + model is NOT onlyEnabled (else the model is dropped)")
+	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
 	}
@@ -388,5 +393,136 @@ func TestScheduleDTOGuidance(t *testing.T) {
 	base.Guidance = pgtype.Text{String: "", Valid: true}
 	if dto := h.scheduleDTO(base, ""); dto.Guidance != nil {
 		t.Fatalf("empty guidance must map to nil, got %v", dto.Guidance)
+	}
+}
+
+// TestValidateScheduleConfigModel pins PRD #300 M2 model validation: it uses the shared
+// agenttmpl.ValidateModel gate, applies to EVERY target (unlike guidance, which is rejected
+// on prompt), a malformed token is a 400 with a "model:" message, and a blank/whitespace
+// value normalizes to nil (inherit).
+func TestValidateScheduleConfigModel(t *testing.T) {
+	// A valid alias is accepted and normalized (trimmed) on issue.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "issue", IssueIID: i64(7), Model: sptr("  fable  "), Timing: "recurring", CronExpr: "0 2 * * *",
+	}, fixedNow); status != 0 || n.Model == nil || *n.Model != "fable" {
+		t.Fatalf("valid alias: status=%d model=%v, want status 0 and normalized \"fable\"", status, n.Model)
+	}
+
+	// A valid custom ID (a full model identifier) is accepted.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "sweep", Model: sptr("us.anthropic.claude-opus-4-1-20250805-v1:0"), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow); status != 0 || n.Model == nil || *n.Model != "us.anthropic.claude-opus-4-1-20250805-v1:0" {
+		t.Fatalf("valid custom ID: status=%d model=%v, want status 0 and preserved value", status, n.Model)
+	}
+
+	// Model applies to EVERY target — prompt/sweep/issue all accept it (NOT target-scoped
+	// like guidance, which is rejected on prompt).
+	for _, tc := range []struct {
+		name string
+		req  apitypes.ScheduleRequest
+	}{
+		{"prompt", apitypes.ScheduleRequest{Target: "prompt", Prompt: "do the thing", Model: sptr("fable"), Timing: "recurring", CronExpr: "0 9 * * 1"}},
+		{"sweep", apitypes.ScheduleRequest{Target: "sweep", Model: sptr("fable"), Timing: "recurring", CronExpr: "0 9 * * 1"}},
+		{"issue", apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Model: sptr("fable"), Timing: "recurring", CronExpr: "0 2 * * *"}},
+	} {
+		if n, status, _ := validateScheduleConfig(tc.req, fixedNow); status != 0 || n.Model == nil || *n.Model != "fable" {
+			t.Fatalf("model on %s target: status=%d model=%v, want status 0 and \"fable\" (model is not target-scoped)", tc.name, status, n.Model)
+		}
+	}
+
+	// A malformed token (interior whitespace) → 400 with a "model:" message.
+	if _, status, msg := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "issue", IssueIID: i64(7), Model: sptr("two words"), Timing: "recurring", CronExpr: "0 2 * * *",
+	}, fixedNow); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
+		t.Fatalf("malformed model: status=%d msg=%q, want 400 and a \"model:\" message", status, msg)
+	}
+
+	// A model over the length cap → 400 with a "model:" message.
+	tooLong := strings.Repeat("m", 101)
+	if _, status, msg := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "sweep", Model: sptr(tooLong), Timing: "recurring", CronExpr: "0 9 * * 1",
+	}, fixedNow); status != http.StatusBadRequest || !strings.HasPrefix(msg, "model:") {
+		t.Fatalf("oversize model: status=%d msg=%q, want 400 and a \"model:\" message", status, msg)
+	}
+
+	// A blank/whitespace model normalizes to nil (inherit), status 0.
+	if n, status, _ := validateScheduleConfig(apitypes.ScheduleRequest{
+		Target: "issue", IssueIID: i64(7), Model: sptr("   \n\t "), Timing: "recurring", CronExpr: "0 2 * * *",
+	}, fixedNow); status != 0 || n.Model != nil {
+		t.Fatalf("blank model: status=%d model=%v, want status 0 and nil model", status, n.Model)
+	}
+}
+
+// TestMergeScheduleModelClears pins PRD #300 M2's replace-semantics for model, mirroring
+// guidance/max_issues: a config PATCH with Model=nil CLEARS a stored model, and a new value
+// replaces it.
+func TestMergeScheduleModelClears(t *testing.T) {
+	cur := store.RunSchedule{
+		Target:   "issue",
+		IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		Timing:   "recurring",
+		CronExpr: pgtype.Text{String: "0 2 * * *", Valid: true},
+		Timezone: "UTC",
+		Model:    pgtype.Text{String: "old-model", Valid: true},
+	}
+
+	// A config PATCH that omits model (nil) must CLEAR it — replace, not keep.
+	cleared := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *"})
+	if cleared.Model != nil {
+		t.Fatalf("merged model = %v, want nil (a config PATCH replaces the whole row; nil clears to inherit)", cleared.Model)
+	}
+
+	// A config PATCH that sets model takes the request value.
+	set := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *", Model: sptr("fable")})
+	if set.Model == nil || *set.Model != "fable" {
+		t.Fatalf("merged model = %v, want \"fable\"", set.Model)
+	}
+}
+
+// TestModelColumn pins the store-column mapping: a non-blank value on ANY target is Valid
+// (model is NOT target-scoped); a nil or blank pointer yields SQL NULL.
+func TestModelColumn(t *testing.T) {
+	if c := modelColumn(apitypes.ScheduleRequest{Target: "issue", Model: sptr("fable")}); !c.Valid || c.String != "fable" {
+		t.Fatalf("issue model column = %+v, want Valid \"fable\"", c)
+	}
+	if c := modelColumn(apitypes.ScheduleRequest{Target: "sweep", Model: sptr("fable")}); !c.Valid || c.String != "fable" {
+		t.Fatalf("sweep model column = %+v, want Valid \"fable\"", c)
+	}
+	// Model is not target-scoped — a prompt target (and any other) persists the value too.
+	if c := modelColumn(apitypes.ScheduleRequest{Target: "prompt", Model: sptr("fable")}); !c.Valid || c.String != "fable" {
+		t.Fatalf("prompt model column = %+v, want Valid \"fable\" (model is not target-scoped)", c)
+	}
+	if c := modelColumn(apitypes.ScheduleRequest{Target: "issue", Model: nil}); c.Valid {
+		t.Fatalf("nil model must be SQL NULL, got %+v", c)
+	}
+	if c := modelColumn(apitypes.ScheduleRequest{Target: "issue", Model: sptr("  ")}); c.Valid {
+		t.Fatalf("blank model must be SQL NULL, got %+v", c)
+	}
+}
+
+// TestScheduleDTOModel pins that scheduleDTO round-trips a stored model value into the DTO
+// pointer, and maps a NULL/empty stored value to nil.
+func TestScheduleDTOModel(t *testing.T) {
+	h := &Handler{}
+	base := store.RunSchedule{
+		Target:   "issue",
+		IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		Timing:   "once",
+		Timezone: "UTC",
+	}
+
+	base.Model = pgtype.Text{String: "fable", Valid: true}
+	if dto := h.scheduleDTO(base, ""); dto.Model == nil || *dto.Model != "fable" {
+		t.Fatalf("DTO model = %v, want the stored value \"fable\"", dto.Model)
+	}
+
+	base.Model = pgtype.Text{}
+	if dto := h.scheduleDTO(base, ""); dto.Model != nil {
+		t.Fatalf("NULL model must map to nil, got %v", dto.Model)
+	}
+
+	base.Model = pgtype.Text{String: "", Valid: true}
+	if dto := h.scheduleDTO(base, ""); dto.Model != nil {
+		t.Fatalf("empty model must map to nil, got %v", dto.Model)
 	}
 }
