@@ -17,6 +17,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `coder` and `lead` prompts now note that the worker shell's working directory
   is not reliable across separate Bash calls, and to use absolute paths (or `cd`
   from the worktree root fresh each command). (from judge recommendations)
+- The lead stops wasting messages trying to reach its own subagents by role
+  name. The builtin `lead` prompt now says a subagent (still running or already
+  returned) cannot be reached by role name and needs no reply — it reports to
+  `main` itself. (from judge recommendations)
 
 ## [0.25.0] - 2026-08-10
 
