@@ -50,15 +50,6 @@ type CIAutofixNotifier interface {
 	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
-// ciAutofixNotifyPayload is the small jsonb the inbox renders for a ci_autofix_*
-// notification. Reason is set only on the halted kind.
-type ciAutofixNotifyPayload struct {
-	Ref            string `json:"ref"`
-	PipelineWebURL string `json:"pipeline_web_url"`
-	IssueIID       int64  `json:"issue_iid"`
-	Reason         string `json:"reason,omitempty"`
-}
-
 // CIAutoFix is the poller's post-pipeline-sync CI-autofix detector (PRD #71 M6),
 // the sibling of the autopilot detector. It is stateless and safe for concurrent
 // use across the per-repo sync goroutines: it only reads its injected collaborators
@@ -168,8 +159,16 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 	})
 	switch {
 	case err == nil:
+		// A ci_fix run always carries a non-null pipeline_id (runs_kind_shape CHECK), so
+		// target.Valid is effectively always true here. Defensive: on an unexpected NULL,
+		// do NOT record cand.PipelineID — advancing last_pipeline_id to the fix's own
+		// candidate pipeline could dedup the fix's OWN result pipeline away. Leave the
+		// ledger unmoved (re-evaluated next tick, still swallowed while the run is live).
+		if !target.Valid {
+			return
+		}
 		recordID := cand.PipelineID
-		if target.Valid && target.Int64 < recordID {
+		if target.Int64 < recordID {
 			recordID = target.Int64
 		}
 		d.recordPipeline(ctx, r, ref, recordID)
@@ -203,9 +202,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 	noProgress := count >= 1 && lastSigValid && lastSig == sig
 	capped := count >= d.maxAttempts
 	if capped || noProgress {
-		reason := "the last fix made no progress (same failure)"
+		// Cap takes precedence over no-progress: at the budget's end we will not retry
+		// on ANY failure, so the message must say the limit was reached, not "no progress".
+		reason := haltNoProgress
 		if capped {
-			reason = fmt.Sprintf("reached the %d-attempt limit", d.maxAttempts)
+			reason = haltCap
 		}
 		if !haltNotified {
 			// RECORD-THEN-COMMENT: latch halt_notified FIRST (it also stamps this
@@ -220,11 +221,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 				return
 			}
 			// The issue comment is the primary outward halt signal (best-effort).
-			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, count, cand.MrIid)); err != nil {
+			if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
 				// Already PAT-redacted by the driver; the latch is set, so the comment is lost, not retried.
 				slog.Warn("poller: ci-autofix halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 			}
-			d.notifyHalt(ctx, cand, iid, reason)
+			d.notifyHalt(ctx, cand, iid, haltReasonPayload(reason, d.maxAttempts))
 		} else {
 			// Already notified: silently move last_pipeline_id past this pipeline so it
 			// is not re-evaluated. No second comment.
@@ -303,7 +304,7 @@ func (d *CIAutoFix) notifyStarted(ctx context.Context, cand store.ListCIAutofixC
 	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  cand.UserID,
 		Kind:    "ci_autofix_started",
-		Payload: ciAutofixNotifyPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid},
+		Payload: notifysvc.CIAutofixPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid},
 		RunID:   &runID,
 		Slack:   nil,
 	}); err != nil {
@@ -321,7 +322,7 @@ func (d *CIAutoFix) notifyHalt(ctx context.Context, cand store.ListCIAutofixCand
 	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  cand.UserID,
 		Kind:    "ci_autofix_halted",
-		Payload: ciAutofixNotifyPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid, Reason: reason},
+		Payload: notifysvc.CIAutofixPayload{Ref: cand.Ref.String, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid, Reason: reason},
 		RunID:   nil,
 		Slack:   nil,
 	}); err != nil {
@@ -358,19 +359,46 @@ func startCommentBody(ref, pipelineWebURL string) string {
 		ref, pipelineWebURL)
 }
 
-func haltCommentBody(reason string, count int, mrIid pgtype.Int8) string {
-	attempts := "attempt"
-	if count != 1 {
-		attempts = "attempts"
-	}
+// haltReason distinguishes the two halt episodes so the outward comment and the
+// inbox reason can each be truthful. They are NOT interchangeable: a cap halt is
+// final for this branch, a no-progress halt below the cap is not — a different
+// failure on the same branch can still be auto-fixed.
+type haltReason int
+
+const (
+	haltCap        haltReason = iota // count >= maxAttempts: the attempt budget is spent.
+	haltNoProgress                   // count >= 1 and the signature did not change: this failure is stuck.
+)
+
+// haltCommentBody is the user-facing forge comment for a halt. Two truthful bodies:
+// the cap body says uzi will not retry this branch automatically; the no-progress
+// body says only THIS failure is stuck and a different one may still be auto-fixed.
+// User-facing, so no em dashes, and both name the manual "Fix CI" button.
+func haltCommentBody(reason haltReason, maxAttempts int, mrIid pgtype.Int8) string {
 	mrRef := ""
 	if mrIid.Valid {
 		mrRef = fmt.Sprintf(" on merge request !%d", mrIid.Int64)
 	}
+	if reason == haltCap {
+		return fmt.Sprintf(
+			"**Automatic CI fix stopped.**\n\n"+
+				"uzi has reached the automatic CI fix attempt limit (%d) for this branch%s and will not retry automatically. "+
+				"Use the \"Fix CI\" button in uzi to retry manually.",
+			maxAttempts, mrRef)
+	}
 	return fmt.Sprintf(
 		"**Automatic CI fix stopped.**\n\n"+
-			"uzi tried to fix this branch's failing pipeline%s automatically but stopped: %s. "+
-			"It made %d %s.\n\n"+
-			"Nothing else will happen automatically. If you still want a fix, use the \"Fix CI\" button in uzi to start one manually.",
-		mrRef, reason, count, attempts)
+			"uzi stopped the automatic CI fix for this branch%s because the last attempt did not change the failure signature. "+
+			"A different failure on this branch may still be auto-fixed (up to the %d-attempt limit), and you can use the \"Fix CI\" button in uzi to retry this one manually.",
+		mrRef, maxAttempts)
+}
+
+// haltReasonPayload is the inbox notification's `reason` field: a short, DISTINCT
+// phrase per halt kind (the SPA renders it verbatim). Kept separate from the fuller
+// forge comment body so the two can evolve independently.
+func haltReasonPayload(reason haltReason, maxAttempts int) string {
+	if reason == haltCap {
+		return fmt.Sprintf("reached the %d-attempt limit", maxAttempts)
+	}
+	return "the last attempt did not change the failure signature"
 }

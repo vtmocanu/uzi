@@ -94,6 +94,19 @@ type SlackRender struct {
 	Facts []string
 }
 
+// CIAutofixPayload is the jsonb the inbox renders for every ci_autofix_* notification
+// kind (started / halted from the poller, landed from forgesvc). It lives here — the
+// one package all three producers already import — so all three kinds carry one shape
+// instead of drifting between a typed poller struct and a forgesvc map. Optional
+// fields are omitempty: landed carries no issue iid or reason, started carries no
+// reason, so only halted sets Reason and only the poller kinds set IssueIID.
+type CIAutofixPayload struct {
+	Ref            string `json:"ref"`
+	PipelineWebURL string `json:"pipeline_web_url"`
+	IssueIID       int64  `json:"issue_iid,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+}
+
 // Notification is the input to Notify: a user to notify, a kind + jsonb payload
 // for the inbox render, optional run/review anchors (both ON DELETE CASCADE at the
 // table), and an optional Slack rendering. Payload is marshaled to jsonb; a nil

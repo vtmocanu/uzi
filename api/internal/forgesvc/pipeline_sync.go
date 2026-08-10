@@ -257,7 +257,7 @@ func (s *Service) notifyAutofixLanded(ctx context.Context, target store.Run, ref
 	if _, err := s.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  target.UserID,
 		Kind:    "ci_autofix_landed",
-		Payload: map[string]any{"ref": ref, "pipeline_web_url": p.WebURL},
+		Payload: notifysvc.CIAutofixPayload{Ref: ref, PipelineWebURL: p.WebURL},
 		RunID:   &runID,
 		Slack:   nil,
 	}); err != nil {

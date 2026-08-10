@@ -2,6 +2,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,6 +81,7 @@ func (s *cfStore) UpsertCIAutofixAttempt(_ context.Context, arg store.UpsertCIAu
 	cur.AttemptCount++ // INSERT count=1 or increment
 	cur.LastSignature = arg.LastSignature
 	cur.LastPipelineID = arg.LastPipelineID
+	cur.HaltNotified = false // mirror the SQL ON CONFLICT: a proceed resets the halt latch
 	s.attempts[arg.Ref] = cur
 	if s.ops != nil {
 		*s.ops = append(*s.ops, "upsert")
@@ -168,7 +170,7 @@ type cfNotifyCall struct {
 	kind    string
 	userID  uuid.UUID
 	runID   *uuid.UUID
-	payload ciAutofixNotifyPayload
+	payload notifysvc.CIAutofixPayload
 }
 
 type cfNotifier struct {
@@ -178,7 +180,7 @@ type cfNotifier struct {
 }
 
 func (n *cfNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
-	p, _ := note.Payload.(ciAutofixNotifyPayload)
+	p, _ := note.Payload.(notifysvc.CIAutofixPayload)
 	n.calls = append(n.calls, cfNotifyCall{note.Kind, note.UserID, note.RunID, p})
 	if n.ops != nil {
 		*n.ops = append(*n.ops, "notify")
@@ -379,7 +381,7 @@ func TestCIAutofixCapHalts(t *testing.T) {
 	if len(st.haltSets) != 1 || st.haltSets[0].LastPipelineID.Int64 != 9010 {
 		t.Fatalf("expected SetCIAutofixHaltNotified stamping 9010, got %+v", st.haltSets)
 	}
-	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "reached the 2-attempt limit") {
+	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "attempt limit (2)") {
 		t.Fatalf("expected one cap-halt comment, got %+v", f.notes)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" || notifier.calls[0].runID != nil {
@@ -421,7 +423,7 @@ func TestCIAutofixNoProgressHalts(t *testing.T) {
 	if len(st.haltSets) != 1 {
 		t.Fatalf("expected one SetCIAutofixHaltNotified, got %d", len(st.haltSets))
 	}
-	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "made no progress") {
+	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "did not change the failure signature") {
 		t.Fatalf("expected one no-progress comment, got %+v", f.notes)
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" {
@@ -501,6 +503,163 @@ func TestCIAutofixCreateRaceSwallows(t *testing.T) {
 	}
 	if len(st.records) != 1 || st.records[0].LastPipelineID.Int64 != 9001 {
 		t.Fatalf("expected a silent RecordCIAutofixPipeline of 9001, got %+v", st.records)
+	}
+}
+
+func TestCIAutofixBranchInUseSwallows(t *testing.T) {
+	// CreateAutoCIFixRun loses the race to an issue run on the same branch
+	// (ErrBranchInUse): swallow exactly like ErrActiveFixExists — no comment, counter
+	// not advanced, a silent RecordCIAutofixPipeline only.
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}}
+	runs := &cfRuns{err: workersvc.ErrBranchInUse}
+	notifier := &cfNotifier{}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
+	}
+	if len(st.upserts) != 0 {
+		t.Fatalf("a swallowed create must not advance the counter, upserts=%d", len(st.upserts))
+	}
+	if len(f.notes) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("a swallowed create must not comment/notify: notes=%d notifs=%d", len(f.notes), len(notifier.calls))
+	}
+	if len(st.records) != 1 || st.records[0].LastPipelineID.Int64 != 9001 {
+		t.Fatalf("expected a silent RecordCIAutofixPipeline of 9001, got %+v", st.records)
+	}
+}
+
+func TestCIAutofixUnparseableRefSkipped(t *testing.T) {
+	// The candidate query only yields agent/issue-N branches, but the detector guards
+	// against a ref it cannot attribute to an issue: skip it entirely, with no forge or
+	// store writes (not even a GetCIAutofixAttempt-driven record).
+	cand := cfCand(9001)
+	cand.Ref = pgtype.Text{String: "feature/not-an-issue", Valid: true}
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cand}}
+	runs := &cfRuns{}
+	notifier := &cfNotifier{}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+
+	if len(runs.calls) != 0 || len(st.upserts) != 0 || len(st.records) != 0 || len(st.haltSets) != 0 || len(f.notes) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("unparseable ref must be skipped with no writes: runs=%d upserts=%d records=%d halts=%d notes=%d notifs=%d",
+			len(runs.calls), len(st.upserts), len(st.records), len(st.haltSets), len(f.notes), len(notifier.calls))
+	}
+}
+
+func TestCIAutofixHaltLatchWriteFailsNoComment(t *testing.T) {
+	// RECORD-THEN-COMMENT: the latch write must precede the comment. If
+	// SetCIAutofixHaltNotified fails, NO comment (and no notification) is posted — a
+	// comment without the latch could re-post every tick.
+	st := &cfStore{
+		candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9010)},
+		attempts: map[string]store.CiAutofixAttempt{
+			cfRef: {Ref: cfRef, AttemptCount: 2, LastPipelineID: pgtype.Int8{Int64: 9001, Valid: true}},
+		},
+		haltSetErr: errors.New("latch write failed"),
+	}
+	runs := &cfRuns{}
+	notifier := &cfNotifier{}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom"}
+
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f)
+
+	if len(f.notes) != 0 {
+		t.Fatalf("a failed latch write must post NO comment, got %+v", f.notes)
+	}
+	if len(notifier.calls) != 0 {
+		t.Fatalf("a failed latch write must not notify, got %+v", notifier.calls)
+	}
+	if len(runs.calls) != 0 {
+		t.Fatalf("a halt must not start a run, got %d", len(runs.calls))
+	}
+}
+
+func TestCIAutofixLatchResetsOnProceed(t *testing.T) {
+	// Fix-1 regression: a no-progress halt below the cap comments once and latches, a
+	// following DIFFERENT-signature proceed resets the latch, and the later cap halt
+	// then posts its own DISTINCT message — the no-progress halt must not permanently
+	// suppress the real cap comment.
+	ctx := context.Background()
+
+	// sigA: the first (stuck) failure's signature.
+	fA := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "panic: boom\nexit 1"}
+	snapA, err := workersvc.BuildFailureSnapshot(ctx, fA, 42,
+		store.PipelineStatus{PipelineID: 9001, Ref: cfRef, Sha: "deadbeef", WebUrl: "x"}, 5, 4096)
+	if err != nil {
+		t.Fatalf("snapshot A: %v", err)
+	}
+	sigA := workersvc.FailureSignature(snapA)
+
+	// One auto attempt already spent on sigA, not yet halt-notified.
+	st := &cfStore{
+		attempts: map[string]store.CiAutofixAttempt{
+			cfRef: {
+				Ref:            cfRef,
+				AttemptCount:   1,
+				LastSignature:  pgtype.Text{String: sigA, Valid: true},
+				LastPipelineID: pgtype.Int8{Int64: 9001, Valid: true},
+			},
+		},
+	}
+	runs := &cfRuns{}
+	notifier := &cfNotifier{}
+	d := newCF(st, runs, notifier)
+
+	// Step A: the SAME signature on a new pipeline (count 1 < cap 2) → no-progress halt.
+	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9010)}
+	d.detect(ctx, cfRepoRow(), fA)
+
+	if len(st.haltSets) != 1 {
+		t.Fatalf("step A: expected one halt latch, got %d", len(st.haltSets))
+	}
+	if len(fA.notes) != 1 || !strings.Contains(fA.notes[0].body, "did not change the failure signature") {
+		t.Fatalf("step A: expected one no-progress comment, got %+v", fA.notes)
+	}
+	if !st.attempts[cfRef].HaltNotified {
+		t.Fatalf("step A: expected the halt latch to be set")
+	}
+
+	// Step B: a DIFFERENT failure signature → PROCEED. The proceed must reset the latch.
+	fB := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "error: totally different\nexit 2"}
+	snapB, err := workersvc.BuildFailureSnapshot(ctx, fB, 42,
+		store.PipelineStatus{PipelineID: 9020, Ref: cfRef, Sha: "deadbeef", WebUrl: "x"}, 5, 4096)
+	if err != nil {
+		t.Fatalf("snapshot B: %v", err)
+	}
+	if workersvc.FailureSignature(snapB) == sigA {
+		t.Fatalf("test needs two distinct signatures; both hashed to %s", sigA)
+	}
+	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9020)}
+	d.detect(ctx, cfRepoRow(), fB)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("step B: expected one proceed/run, got %d", len(runs.calls))
+	}
+	if st.attempts[cfRef].HaltNotified {
+		t.Fatalf("step B: a proceed must reset the halt latch")
+	}
+	if len(fB.notes) != 1 || !strings.Contains(fB.notes[0].body, "Automatic CI fix started") {
+		t.Fatalf("step B: expected one start comment, got %+v", fB.notes)
+	}
+
+	// Step C: now at the cap (count == 2) → cap halt must post its DISTINCT cap message,
+	// NOT be suppressed by the earlier no-progress latch.
+	fC := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "error: totally different\nexit 2"}
+	st.candidates = []store.ListCIAutofixCandidateRefsRow{cfCand(9030)}
+	d.detect(ctx, cfRepoRow(), fC)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("step C: cap halt must not start a run, got %d", len(runs.calls))
+	}
+	if len(st.haltSets) != 2 {
+		t.Fatalf("step C: expected the cap halt to latch again (2 total), got %d", len(st.haltSets))
+	}
+	if len(fC.notes) != 1 || !strings.Contains(fC.notes[0].body, "attempt limit (2)") {
+		t.Fatalf("step C: expected one cap-halt comment (not suppressed), got %+v", fC.notes)
 	}
 }
 

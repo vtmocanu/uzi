@@ -72,13 +72,17 @@ WHERE repo_id = @repo_id::uuid AND ref = @ref;
 -- this ledger). The first proceed INSERTs count = 1; every subsequent proceed
 -- increments. last_signature / last_pipeline_id are overwritten with the attempt's
 -- current target so the detector can detect no-progress (same signature twice) on
--- the next tick.
+-- the next tick. halt_notified is RESET to false on every proceed (INSERT defaults
+-- it false): the latch is "one comment per halt-episode between attempts", so once a
+-- proceed advances the counter a later cap/no-progress halt can comment again — a
+-- no-progress halt below the cap must not permanently suppress the real cap comment.
 INSERT INTO ci_autofix_attempts (repo_id, ref, attempt_count, last_signature, last_pipeline_id)
 VALUES (@repo_id::uuid, @ref, 1, @last_signature, @last_pipeline_id)
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count    = ci_autofix_attempts.attempt_count + 1,
     last_signature   = EXCLUDED.last_signature,
     last_pipeline_id = EXCLUDED.last_pipeline_id,
+    halt_notified    = false,
     updated_at       = now();
 
 -- name: RecordCIAutofixPipeline :exec
