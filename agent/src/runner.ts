@@ -1097,6 +1097,7 @@ export class RunRunner {
               result.agentSelection,
               selfImproveSection,
               promptGuardSection,
+              result.gatesUnverified,
             ),
           }),
         { log: runLog },
@@ -1990,6 +1991,7 @@ function mrDescription(
   agentSelection?: { source: AgentSource; agents: string[] },
   selfImproveSection?: string,
   promptGuardSection?: string,
+  gatesUnverified?: string[],
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -2044,15 +2046,27 @@ function mrDescription(
       footer,
     ].join("\n");
   }
-  return [
+  const body = [
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
     ...repoMarker,
-    "",
-    "---",
-    footer,
-  ].join("\n");
+  ];
+  const gatesSection = gatesUnverifiedMrSection(gatesUnverified);
+  if (gatesSection) body.push("", gatesSection);
+  body.push("", "---", footer);
+  return body.join("\n");
+}
+
+/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
+ *  component's deps installed. Dir names arrive already clamped (safeDirLabel). */
+function gatesUnverifiedMrSection(dirs?: string[]): string {
+  if (!dirs || dirs.length === 0) return "";
+  const list = dirs.map((d) => `\`${d}\``).join(", ");
+  return (
+    `> ⚠️ **Quality gates unverified.** JS dependencies did not install in: ${list}. ` +
+    "Gates that need them (e.g. `vitest`, `knip`) could not run on this change — treat those gates as unverified, not passing."
+  );
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

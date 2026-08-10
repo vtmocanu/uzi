@@ -1327,6 +1327,18 @@ export class SdkExecutor implements Executor {
       if (isIssueRun && declaredMilestonesCompleted !== undefined) {
         result.milestonesCompleted = declaredMilestonesCompleted;
       }
+      // Issue #293 M2: carry the dirs whose deps did not install so the MR can be
+      // annotated honestly (a component whose deps are absent could not have run its
+      // gates). Reuses the js_deps `ok` signal, which is corroborated against the
+      // filesystem so a false "deps ready" cannot be minted. Dir names are clamped
+      // with safeDirLabel (repo-controlled text). OMITTED-not-undefined, issue-run
+      // only, same convention as prdDonePath/milestonesCompleted above.
+      const gatesUnverified = depsResults
+        .filter((r) => !r.ok)
+        .map((r) => safeDirLabel(r.dir));
+      if (isIssueRun && gatesUnverified.length > 0) {
+        result.gatesUnverified = gatesUnverified;
+      }
       return result;
     } finally {
       this.disarmWall(state);
