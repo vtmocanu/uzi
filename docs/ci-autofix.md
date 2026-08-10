@@ -78,11 +78,14 @@ notifications.
 
 ## Forge support
 
-Validated on GitLab. On Forgejo and GitHub the toggle and loop guard work
-the same way, but the extra step of reading the project's own configured CI
-config path (used to widen the protected-path guard above) isn't
-implemented there yet — those forges have no equivalent per-project setting
-today.
+Validated on GitLab only. The toggle, the detector, and the loop guard are
+forge-neutral by construction, so they are expected to behave the same on
+Forgejo and GitHub, but automatic CI-fix has not been validated end-to-end on
+those forges yet — treat it as GitLab-first. In addition, the step that reads
+the project's own configured CI config path (used to widen the protected-path
+guard above) is stubbed on Forgejo and GitHub: they have no equivalent
+per-project setting today, so the guard there falls back to the default
+protected-path globs.
 
 ## Good to know
 
