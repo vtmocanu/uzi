@@ -39,6 +39,7 @@ import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import {
   installJsDeps,
+  DETAIL_NO_LOCKFILE,
   type JsDepsInstall,
   type JsDepsResult,
 } from "./js-deps.js";
@@ -218,6 +219,12 @@ interface TurnResult {
    *  Latched (last-wins/latch within the turn, like `done`): once seen it stays set, and
    *  the loop reaps + fetches the committed milestone work back durably before continuing. */
   checkpoint?: boolean;
+  /** issue #279: the `summary` the lead passed to signal_done this turn, if any. Last-wins
+   *  within the turn (like prdDonePath); persisted as report_md on a report-only completion. */
+  summary?: string;
+  /** issue #279: true when the lead declared `report_only: true` on signal_done this turn.
+   *  Latched (like `done`): the run completes with NO push/MR. Issue runs only. */
+  reportOnly?: boolean;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -580,6 +587,9 @@ export class SdkExecutor implements Executor {
         // PRD #122 M6: the checkpoint tool, gated on the same isIssueRun discriminator —
         // a non-issue run has no milestone boundary to checkpoint at.
         checkpoint: isIssueRun,
+        // issue #279: report_only on signal_done, gated on the same isIssueRun discriminator —
+        // a non-issue run (ci_fix/self_improve/prompt) has its own terminal paths.
+        reportOnly: isIssueRun,
       }),
     };
     if (this.client) {
@@ -878,6 +888,8 @@ export class SdkExecutor implements Executor {
             // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
+            // Issue #297: the in-flight avoid-set, rendered in its own untrusted fence.
+            inflightTargets: ctx.inflightTargets,
             // Issue #105: see above — the fixed self_improve branch's prior cycles.
             priorWork: ctx.priorWork,
             // See above. The fixed self_improve branch is routinely seeded off a previous
@@ -1140,6 +1152,11 @@ export class SdkExecutor implements Executor {
       // turn's signal_done declaration must survive the `break` below to reach the
       // completed report.
       let declaredMilestonesCompleted: string[] | undefined;
+      // issue #279: hoisted for the same reason as declaredPrdPath — the terminating turn's
+      // signal_done report_only/summary declaration must survive the `break` below to reach
+      // the final ExecutorResult (and thence the runner's report-only completion path).
+      let declaredReportOnly = false;
+      let declaredSummary: string | undefined;
       for (;;) {
         iteration++;
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
@@ -1216,6 +1233,9 @@ export class SdkExecutor implements Executor {
             // any run with no approved breakdown, which makes the note additive-absent.
             milestones: frozenMilestones,
             progress: latestProgress,
+            // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
+            // gated on the same isIssueRun discriminator the signal_done schema uses.
+            reportOnly: isIssueRun,
           }),
           state,
           idleMs,
@@ -1226,6 +1246,11 @@ export class SdkExecutor implements Executor {
         // survives the terminating turn's `break` into the completed report.
         if (turn.milestonesCompleted !== undefined)
           declaredMilestonesCompleted = turn.milestonesCompleted;
+        // issue #279: latch report_only true (like done) and take the last-wins summary
+        // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
+        // the final ExecutorResult after the break below.
+        if (turn.reportOnly) declaredReportOnly = true;
+        if (turn.summary !== undefined) declaredSummary = turn.summary;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -1326,6 +1351,47 @@ export class SdkExecutor implements Executor {
       // completion, so a non-issue run — which has no frozen list — never carries them.
       if (isIssueRun && declaredMilestonesCompleted !== undefined) {
         result.milestonesCompleted = declaredMilestonesCompleted;
+      }
+      // Issue #293 M2: carry the dirs whose deps did not install so the MR can be
+      // annotated honestly (a component whose deps are absent could not have run its
+      // gates). Reuses the js_deps `ok` signal, which is corroborated against the
+      // filesystem so a false "deps ready" cannot be minted. Dir names are clamped
+      // with safeDirLabel (repo-controlled text). OMITTED-not-undefined, issue-run
+      // only, same convention as prdDonePath/milestonesCompleted above.
+      //
+      // EXCLUDE by the specific deliberate-skip REASON, not by `manager`: a dir with a
+      // package.json but NO recognized lockfile is `{manager:"none", ok:false,
+      // detail:DETAIL_NO_LOCKFILE}` — uzi refuses to guess a package manager, so it was
+      // never installed rather than failed, and annotating it would cry wolf on a fine
+      // delivery. But `manager:"none"` has a SECOND producer: the belt-to-braces
+      // `discovery failed` record (`{dir:".", manager:"none", ok:false}`, js-deps.ts),
+      // which IS a genuine total failure that must annotate. Keying the exclusion on
+      // `manager !== "none"` dropped both and turned that failure into a false green
+      // (latent today: discovery is non-throwing, so the record is unreachable until a
+      // refactor makes it throw — fixed here so it stays honest if that day comes).
+      // Everything else with ok:false (a real manager that failed/was cancelled, or the
+      // discovery failure) annotates.
+      const gatesUnverified = depsResults
+        .filter((r) => !r.ok && r.detail !== DETAIL_NO_LOCKFILE)
+        .map((r) => safeDirLabel(r.dir));
+      if (isIssueRun && gatesUnverified.length > 0) {
+        result.gatesUnverified = gatesUnverified;
+      }
+      // Issue #293 M2 / review F1: discovery can stop at MAX_PROJECT_DIRS / MAX_SCAN_DIRS
+      // (depsTruncated), leaving components past the cap NEVER scanned and so ABSENT from
+      // depsResults — their gates could not have run either, but gatesUnverified cannot
+      // name them. Carry the flag so the MR annotation says coverage was capped; a silent
+      // cap reading as full coverage is the exact lie this PRD exists to remove.
+      if (isIssueRun && depsTruncated) {
+        result.gatesDiscoveryTruncated = true;
+      }
+      // issue #279: forward the report-only declaration + captured summary on `issue` runs
+      // only, with the SAME OMITTED-not-undefined discipline as prdDonePath above — the keys
+      // are absent unless the lead actually declared them, so an ordinary push+MR completion
+      // is byte-identical to before and every existing deepStrictEqual on this result holds.
+      if (isIssueRun && declaredReportOnly) result.reportOnly = true;
+      if (isIssueRun && declaredSummary !== undefined) {
+        result.summary = declaredSummary;
       }
       return result;
     } finally {
@@ -1710,6 +1776,11 @@ export class SdkExecutor implements Executor {
         // about to reconcile at completion.
         if (sig.milestonesCompleted !== undefined)
           result.milestonesCompleted = sig.milestonesCompleted;
+        // issue #279: the summary is last-wins within the turn (like prdDonePath), and
+        // report_only latches true (like `done`) — once the lead declares the run
+        // report-only it stays report-only through the terminating turn's break.
+        if (sig.summary !== undefined) result.summary = sig.summary;
+        if (sig.reportOnly) result.reportOnly = true;
         // PRD #88: accumulate across the turn rather than last-wins. A lead told to
         // batch its questions into one call normally makes exactly one, but if it
         // makes two we must ask both — dropping the earlier one would park the run on

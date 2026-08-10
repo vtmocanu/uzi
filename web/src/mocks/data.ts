@@ -447,7 +447,12 @@ export const mockReviews: MockReview[] = [
     target_run_id: "run-done",
     verdict: "issues",
     summary_md:
-      "The run delivered the feature and opened an MR, but the agent lost time to a missing worker tool and re-ran the same search three times before finding the handler.",
+      "The run **delivered the feature** and opened an MR, but it lost time on two avoidable things:\n\n" +
+      "- a missing worker tool (`shellcheck`) forced a fallback\n" +
+      "- the same search re-ran three times before finding the handler\n\n" +
+      "The failing lookup that cost the most time:\n\n" +
+      "```sh\ngrep -rn 'handleReview' api/internal/handler\n```\n\n" +
+      "See the [run timeline](https://gitlab.example.com/vtmocanu/uzi/-/issues/71) for the full trace.",
     judge_model: "haiku",
     status: "complete",
     created_at: minsAgo(6),
@@ -458,7 +463,11 @@ export const mockReviews: MockReview[] = [
         category: "install_worker_tool",
         target: "shellcheck",
         rationale_md:
-          "The agent tried `shellcheck` twice and hit `command not found`; installing it in the worker image would save the fallback.",
+          "The agent tried **`shellcheck`** twice and hit `command not found`:\n\n" +
+          "- first on the pre-commit hook\n" +
+          "- then on the manual lint pass\n\n" +
+          "```sh\nshellcheck scripts/*.sh\n```\n\n" +
+          "Installing it in the worker image would save the fallback. See the [worker image spec](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/judge.md).",
         confidence: "high",
         created_at: minsAgo(6),
       },
@@ -2340,6 +2349,72 @@ export const mockRuns: Run[] = [
     finished_at: minsAgo(184),
     created_at: minsAgo(225),
     updated_at: minsAgo(184),
+  },
+  {
+    // run-report-only: a COMPLETED issue run that intentionally opened NO merge request
+    // (issue #279). Its deliverable is report_md — the lead's server-scrubbed findings —
+    // not a code change, so branch and mr_iid are null. This is the fixture that exercises
+    // the "report only" hero chip, the RunCompletedLine deliverable clause, and the
+    // Findings panel. report_md is UNTRUSTED text rendered as escaped plain text, so the
+    // fixture leans on ordinary prose; the injection-payload case is a unit test, not a
+    // hostile demo fixture.
+    id: "run-report-only",
+    repo_id: "repo-uzi",
+    issue_iid: 44,
+    issue_title: "Audit: are any queries missing the tenant scope?",
+    issue_description: "Investigate and report; no code change expected.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    report_only: true,
+    report_md:
+      "Reviewed all 63 queries in queries/*.sql. Every tenant-scoped read filters on " +
+      "owner_id or joins through a row that does; no unscoped read reaches a tenant table.\n\n" +
+      "Two admin-only reports (AdminListRuns, admin rate-limits) read across tenants by " +
+      "design and are gated at the handler. No code change required.",
+    status: "completed",
+    requeue_count: 0,
+    iteration_count: 3,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: null,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: SAMPLE_PLAN(),
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    milestones: null,
+    milestones_completed: null,
+    milestones_in_progress: null,
+    milestones_candidate: null,
+    budget_max_iterations: null,
+    budget_wall_seconds: null,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    anthropic_select_reason: "pinned",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(70),
+    started_at: minsAgo(69),
+    finished_at: minsAgo(58),
+    created_at: minsAgo(75),
+    updated_at: minsAgo(58),
   },
   {
     // run-unjudged: the NEVER-JUDGED fixture (PRD #119 follow-up). Terminal and

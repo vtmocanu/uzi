@@ -320,8 +320,13 @@ var notifyFactMarkupStripper = strings.NewReplacer("*", "", "`", "", "_", "")
 //     chips, verdict emoji) built from closed enums/ints, so they are ScrubSecrets'd but
 //     NOT EscapeMrkdwn'd — escaping would break the intended markup.
 //   - body is UNTRUSTED model/forge free text carrying no trusted markup of its own, so it
-//     is whole-blob EscapeMrkdwn'd (the documented exception, exactly like planThreadBlocks)
-//     after ScrubSecrets, then bounded to Slack's section limit and blockquote-prefixed.
+//     is whole-blob rendered by SlackMrkdwn (CommonMark→mrkdwn, PRD #292; SlackMrkdwn OWNS
+//     its &<>-escaping and REPLACES EscapeMrkdwn — never nested) after ScrubSecrets, then
+//     bounded to Slack's section limit. It is blockquote-prefixed line-by-line UNLESS the
+//     render emitted a fenced/indented code block (reported by SlackMrkdwnBlock from the AST
+//     walk, not a substring scan): a fenced body is emitted as a PLAIN section instead (PRD
+//     #292 Decision 6), because a `> ` prefix injected into a fence's interior lines corrupts
+//     Slack's code rendering.
 //   - the deep link keeps its raw <url|label> markup (operator-set base, http(s)-validated),
 //     ScrubSecrets'd as a no-op-on-clean last line of defense.
 //
@@ -343,13 +348,21 @@ func notificationBlocks(ev notifyEvent) (blocks []slack.Block, fallback string) 
 	}
 
 	if body := strings.TrimSpace(ev.body); body != "" {
-		escapedBody := truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(body)))
-		// Prefix EVERY line, not just the first, so a future multi-line Body stays fully
-		// quoted — Slack's `>` quotes only the line it leads, so lines 2+ would otherwise
-		// escape the blockquote.
-		quoted := "> " + strings.ReplaceAll(escapedBody, "\n", "\n> ")
+		markdown, hasCodeBlock := SlackMrkdwnBlock(ScrubSecrets(body))
+		rendered := truncateForSlackSection(markdown)
+		text := rendered
+		if !hasCodeBlock {
+			// No fenced code: blockquote every line, not just the first — Slack's `>`
+			// quotes only the line it leads, so lines 2+ of a multi-line body would
+			// otherwise escape the blockquote. A fenced body is emitted as a plain
+			// section instead (PRD #292 Decision 6) — the `> ` prefix would corrupt the
+			// fence's interior lines and break Slack's code rendering. hasCodeBlock comes
+			// from the AST walk, so a literal ``` in PROSE (a Text node, not a fence) is
+			// correctly still blockquoted.
+			text = "> " + strings.ReplaceAll(rendered, "\n", "\n> ")
+		}
 		blocks = append(blocks, slack.NewSectionBlock(
-			slack.NewTextBlockObject(slack.MarkdownType, quoted, false, false), nil, nil))
+			slack.NewTextBlockObject(slack.MarkdownType, text, false, false), nil, nil))
 	}
 
 	if url := strings.TrimSpace(ev.link); url != "" {
@@ -369,7 +382,11 @@ func notificationFallback(ev notifyEvent) string {
 		s += " — " + EscapeMrkdwn(notifyFactMarkupStripper.Replace(strings.Join(ev.facts, ", ")))
 	}
 	if body := strings.TrimSpace(ev.body); body != "" {
-		s += " — " + EscapeMrkdwn(boundReason(body))
+		// ev.body can now be MULTI-LINE (the judge summary preserves newlines for the
+		// Slack blockquote). Collapse its whitespace/newlines to single spaces so the
+		// OS-notification preview stays a clean one-liner, then bound + escape it exactly
+		// as before (still escaped, still from the same field — just flattened).
+		s += " — " + EscapeMrkdwn(boundReason(strings.Join(strings.Fields(body), " ")))
 	}
 	return ScrubSecrets(s)
 }

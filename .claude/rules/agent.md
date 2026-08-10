@@ -11,7 +11,7 @@ Loaded when you touch `agent/`. The repo-wide map is the root `CLAUDE.md`.
 ```sh
 task gate:agent                            # deps-check + lint + deadcode + typecheck + test
 task lint:agent                            # the lint slot alone (oxlint; NOT ratcheted)
-task deadcode:agent                        # the dead-code slot alone (knip) — exports tier is `warn`, see below
+task deadcode:agent                        # the dead-code slot alone (knip) — exports tier is `warn`, see below; a missing knip loud-SKIPs (exit 0) here, exit 2 in CI (UZI_DEADCODE_AGENT_REQUIRED=1)
 task test:agent                            # node --test via tsx
 task typecheck:agent
 cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts   # single file — no target

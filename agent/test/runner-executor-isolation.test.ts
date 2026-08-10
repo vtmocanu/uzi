@@ -16,6 +16,7 @@ import {
   installHarness,
   runnerWith,
   secretRecordingLogger,
+  simulateCommittedWork,
   type Deferred,
 } from "./runner-harness.js";
 
@@ -24,6 +25,9 @@ installHarness();
 describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => {
   it("two concurrent runs each reap ONLY their own subprocess set; a sibling is untouched", async () => {
     const { gitlab } = fakeGitlab();
+    // Both runs model committed work: the FakeReapExecutor writes nothing to the clone, so
+    // the issue-run zero-diff guard would otherwise fail them (issue #279).
+    simulateCommittedWork();
     const claimA = gitlabClaim(51);
     const claimB = gitlabClaim(52);
     const pidsByRun: Record<string, number[]> = {
@@ -233,6 +237,9 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
       };
       return { executor, homeDir: runHome };
     };
+    // The inline executor writes only to HOME, not the clone, so model committed work
+    // to clear the issue-run zero-diff guard (issue #279).
+    simulateCommittedWork();
     const claim = gitlabClaim(57);
     try {
       await runnerWith(factory, gitlab).execute(claim);

@@ -325,6 +325,8 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		PlanSource:       r.PlanSource,
 		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
+		ReportOnly:       r.ReportOnly,
+		ReportMd:         textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
 		ClaimedAt:        timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
 		StartedAt:        timePtr(r.StartedAt.Valid, r.StartedAt.Time),
 		FinishedAt:       timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
@@ -832,6 +834,13 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is too large to run")
 	case errors.Is(err, workersvc.ErrPlanEmpty):
 		httpx.Error(w, http.StatusUnprocessableEntity, "seeded plan is empty")
+	case errors.Is(err, workersvc.ErrPlanUnsafe):
+		// issue #280: a seeded plan naming a bright-line recon target is refused
+		// the ungated seeded fast-path. err.Error() carries the matched category
+		// (a fixed planpolicy string, never plan text or a secret). Redirect to
+		// the ordinary run flow, where the plan is reviewed at the approval gate.
+		httpx.Error(w, http.StatusUnprocessableEntity, err.Error()+
+			"; create it as an ordinary run so the plan is reviewed at the approval gate")
 	case errors.Is(err, workersvc.ErrInvalidPlannedCommit):
 		httpx.Error(w, http.StatusBadRequest, "planned_commit must be a hex commit sha of 7-64 characters")
 	case errors.Is(err, workersvc.ErrInvalidSelection):

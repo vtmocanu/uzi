@@ -682,6 +682,8 @@ export class RunRunner {
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
         repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
         memory,
+        // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
+        inflightTargets: claim.inflight_targets,
         config: claim.config,
         // Preflighted above: the claim's id, or undefined when its transcript is not
         // on this worker (issue #105).
@@ -949,6 +951,68 @@ export class RunRunner {
         return;
       }
 
+      // issue #279: a DECLARED report-only run — the lead's deliverable is a report,
+      // command output, or verification result with NO code change to land, so the run
+      // completes with its findings and NO push/MR (mirroring the ci_fix not_code path
+      // above). killAgentTree was already called at the security boundary above, so we do
+      // NOT double-call it here (the not_code block's second call is a redundancy — not
+      // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
+      if (result.reportOnly) {
+        // issue #299: a report-only completion opens NO branch and NO MR, so if this run
+        // ALREADY published committed work to a checkpoint ref on origin
+        // (refs/uzi-checkpoints/<branch>), completing report-only would leave that ref
+        // orphaned — un-landed, with nothing to supersede it. ADR-0279 documented this as
+        // an accepted edge resting on the convention "a genuine zero-code run never
+        // checkpoints"; enforce that convention here instead. Detection is the UNION of
+        // two signals, each covering a gap the other has:
+        //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
+        //     on a landed publish), which may not yet be mirrored into the bare's local ref.
+        //   - hasCheckpointRef: origin's checkpoint ref, mirrored into the bare at
+        //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
+        // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
+        // so it still completes report-only below. Refuse loudly, mirroring the
+        // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
+        const publishedCheckpoint =
+          lastPublishedTip !== undefined ||
+          (await this.git.hasCheckpointRef(barePath, runnerClone.branch));
+        if (publishedCheckpoint) {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
+              runnerClone.branch +
+              ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+          });
+          runLog.info("run failed: report_only declared after a checkpoint was published", {
+            run_id: runId,
+          });
+          return;
+        }
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "report-only run: recording findings; no branch pushed and no merge request opened",
+          },
+        });
+        await batcher.close();
+        await reportState({
+          status: "completed",
+          report_only: true,
+          report_md: result.summary,
+        });
+        runLog.info("run completed report-only (no MR)", { run_id: runId });
+        return;
+      }
+
       // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
       // worker now fetches the agent branch BACK into its own bare (single-branch
       // refspec, file://+pack transport, protocol.file.allow pinned — the six B2
@@ -963,6 +1027,37 @@ export class RunRunner {
         result.branch,
         runId,
       );
+
+      // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
+      // already returned above, so reaching here on an issue run with a confirmed-empty diff
+      // is the ambiguous "forgot to commit / should have set report_only" case — a
+      // committed-nothing issue run must not open an empty MR.
+      if ((claim.kind ?? "issue") === "issue") {
+        const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
+        // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
+        // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
+        // report_only already returned above, so reaching here undeclared+empty is the
+        // ambiguous case; fail with an actionable reason instead of opening an empty MR.
+        if (changedForGuard !== null && changedForGuard.length === 0) {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "no changes were committed and report_only was not set; failing",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called but no changes were committed, and report_only was not set. If this run's deliverable is a report or command output with no code change, call signal_done with report_only: true.",
+          });
+          runLog.info("run failed: signal_done with empty diff and no report_only", {
+            run_id: runId,
+          });
+          return;
+        }
+      }
 
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
       // repo, the worker itself runs the test suites and flags any guard-critical
@@ -1151,6 +1246,8 @@ export class RunRunner {
               result.agentSelection,
               selfImproveSection,
               promptGuardSection,
+              result.gatesUnverified,
+              result.gatesDiscoveryTruncated,
             ),
           }),
         { log: runLog },
@@ -2044,6 +2141,8 @@ function mrDescription(
   agentSelection?: { source: AgentSource; agents: string[] },
   selfImproveSection?: string,
   promptGuardSection?: string,
+  gatesUnverified?: string[],
+  gatesDiscoveryTruncated?: boolean,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -2098,15 +2197,39 @@ function mrDescription(
       footer,
     ].join("\n");
   }
-  return [
+  const body = [
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
     ...repoMarker,
-    "",
-    "---",
-    footer,
-  ].join("\n");
+  ];
+  const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
+  if (gatesSection) body.push("", gatesSection);
+  body.push("", "---", footer);
+  return body.join("\n");
+}
+
+/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
+ *  component's deps installed AND discovery saw the whole tree. Dir names arrive already
+ *  clamped (safeDirLabel). The truncation caveat (review F1) fires even when `dirs` is
+ *  empty: a capped discovery means components it never reached could be unverified too,
+ *  which named dirs alone cannot say. */
+function gatesUnverifiedMrSection(dirs?: string[], discoveryTruncated?: boolean): string {
+  const named = dirs ?? [];
+  if (named.length === 0 && !discoveryTruncated) return "";
+  const parts: string[] = [];
+  if (named.length > 0) {
+    const list = named.map((d) => `\`${d}\``).join(", ");
+    parts.push(
+      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
+    );
+  }
+  if (discoveryTruncated) {
+    parts.push(
+      "Dependency discovery stopped at its scan cap, so components beyond it were never checked and their gates may also be unverified.",
+    );
+  }
+  return `> ⚠️ **Quality gates unverified.** ${parts.join(" ")}`;
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

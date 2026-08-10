@@ -1871,6 +1871,58 @@ describe("SdkExecutor signal_done milestones_completed (PRD #265 M1)", () => {
   });
 });
 
+// issue #279: the lead declares a report-only run + its summary on signal_done. The
+// executor owns the run-kind gate and getting both values out of the TERMINATING turn
+// (the one `break` would otherwise discard), OMITTED-not-undefined on the result.
+describe("SdkExecutor signal_done report_only + summary (issue #279)", () => {
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { result, turns, probe };
+  }
+
+  it("carries report_only + summary off the TERMINATING turn into the result (issue run)", async () => {
+    const { result } = await runDeclaring({ report_only: true, summary: "verified: no code change needed" });
+    assert.strictEqual(result.reportOnly, true);
+    assert.strictEqual(result.summary, "verified: no code change needed");
+  });
+
+  it("omits both fields when the lead declares neither (additive-absent)", async () => {
+    const { result } = await runDeclaring({});
+    assert.ok(!("reportOnly" in result) || result.reportOnly === undefined);
+    assert.ok(!("summary" in result) || result.summary === undefined);
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", async () => {
+    const { result } = await runDeclaring({ report_only: true, summary: "s" }, {});
+    assert.strictEqual(result.reportOnly, true);
+    assert.strictEqual(result.summary, "s");
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never puts report_only/summary on the result, even when declared`, async () => {
+      const { result } = await runDeclaring({ report_only: true, summary: "s" }, { kind });
+      assert.strictEqual(result.reportOnly, undefined, `${kind} must not forward report_only`);
+      assert.strictEqual(result.summary, undefined, `${kind} must not forward summary`);
+    });
+
+    it(`a ${kind} run is not even OFFERED the report_only parameter`, async () => {
+      const { turns } = await runDeclaring({}, { kind });
+      const shape = doneToolShapeOf(turns[0]!.options);
+      assert.ok(!("report_only" in shape), `${kind}: the schema must not expose report_only`);
+    });
+  }
+
+  it("an issue run IS offered the report_only parameter", async () => {
+    const { turns } = await runDeclaring({}, { kind: "issue" });
+    assert.ok("report_only" in doneToolShapeOf(turns[0]!.options));
+  });
+});
+
 /** The signal server's signal_done zod shape, read off a turn's options. */
 function doneToolShapeOf(o: SdkOptions): Record<string, unknown> {
   const server = (o.mcpServers as Record<string, unknown>)["uzi"] as { instance?: unknown };
@@ -2387,6 +2439,100 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
       "an empty result must be reported, not silently swallowed",
     );
   });
+});
+
+// Issue #293 M2 — the run carries the dirs whose deps did NOT install onto
+// ExecutorResult.gatesUnverified, so the MR can be annotated honestly. Population
+// only (rendering is covered in runner-push-mr.test.ts). Issue-run only, OMITTED
+// (never []/undefined) when everything installed, and a `manager:"none"` no-lockfile
+// dir is a deliberate non-install, not a failure, so it is EXCLUDED.
+describe("SdkExecutor gatesUnverified population (issue #293 M2)", () => {
+  async function runWith(results: JsDepsResult[], overrides: Partial<RunContext> = {}, truncated = false) {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({ results, truncated });
+    const probe = makeCtx(overrides);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    return result;
+  }
+
+  it("carries only the genuine install failures, dir names unchanged by the clamp", async () => {
+    const result = await runWith([
+      { dir: "web", manager: "npm", ok: false, detail: "install failed" },
+      { dir: "agent", manager: "npm", ok: true, detail: "ok" },
+    ]);
+    assert.deepStrictEqual(result.gatesUnverified, ["web"]);
+  });
+
+  it("EXCLUDES a manager:\"none\" no-lockfile dir — that was never installed, not failed (review fix)", async () => {
+    // A dir with a package.json but no recognized lockfile is {manager:"none", ok:false}:
+    // uzi refused to guess a package manager, so it was deliberately never installed.
+    // Annotating it would cry wolf on a fine delivery. Only the real npm failure is carried.
+    const result = await runWith([
+      { dir: "examples/foo", manager: "none", ok: false, detail: "package.json but no recognized lockfile — not installed" },
+      { dir: "web", manager: "npm", ok: false, detail: "install failed" },
+    ]);
+    assert.deepStrictEqual(result.gatesUnverified, ["web"]);
+    assert.ok(
+      !(result.gatesUnverified ?? []).includes("examples/foo"),
+      "a no-lockfile dir must never appear in gatesUnverified",
+    );
+  });
+
+  it("a manager:\"none\" dir ALONE yields no gatesUnverified at all", async () => {
+    const result = await runWith([
+      { dir: "examples/foo", manager: "none", ok: false, detail: "package.json but no recognized lockfile — not installed" },
+    ]);
+    assert.ok(!("gatesUnverified" in result) || result.gatesUnverified === undefined);
+  });
+
+  it("INCLUDES a manager:\"none\" GENUINE discovery failure (review F2)", async () => {
+    // The belt-to-braces `discovery failed` record shares the {manager:"none", ok:false}
+    // shape with the deliberate no-lockfile skip but means the OPPOSITE: a total failure
+    // where nothing was scanned or installed. Keying the exclusion on `manager` dropped it
+    // and hid a false green; keying on the specific no-lockfile REASON keeps it.
+    const result = await runWith([
+      { dir: ".", manager: "none", ok: false, detail: "discovery failed: boom" },
+    ]);
+    assert.strictEqual((result.gatesUnverified ?? []).length, 1, "a genuine discovery failure must annotate");
+  });
+
+  it("sets gatesDiscoveryTruncated when discovery was capped, even with every dir ok (review F1)", async () => {
+    const result = await runWith(
+      [{ dir: "web", manager: "npm", ok: true, detail: "ok" }],
+      {},
+      true,
+    );
+    assert.strictEqual(result.gatesDiscoveryTruncated, true);
+  });
+
+  it("omits gatesDiscoveryTruncated when discovery saw the whole tree", async () => {
+    const result = await runWith([{ dir: "web", manager: "npm", ok: true, detail: "ok" }]);
+    assert.ok(!("gatesDiscoveryTruncated" in result) || result.gatesDiscoveryTruncated === undefined);
+  });
+
+  it("omits the field when every dir installed (additive-absent, never [])", async () => {
+    const result = await runWith([
+      { dir: "web", manager: "npm", ok: true, detail: "ok" },
+      { dir: "agent", manager: "npm", ok: true, detail: "ok" },
+    ]);
+    assert.strictEqual(result.gatesUnverified, undefined);
+    assert.ok(!("gatesUnverified" in result) || result.gatesUnverified === undefined);
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never carries gatesUnverified/gatesDiscoveryTruncated, even with a failed+truncated install (issue-run only)`, async () => {
+      const result = await runWith(
+        [{ dir: "web", manager: "npm", ok: false, detail: "install failed" }],
+        { kind },
+        true,
+      );
+      assert.strictEqual(result.gatesUnverified, undefined, `${kind} must not carry gatesUnverified`);
+      assert.strictEqual(result.gatesDiscoveryTruncated, undefined, `${kind} must not carry gatesDiscoveryTruncated`);
+    });
+  }
 });
 
 // ── PRD #35 Decision 6b: a resume past an approval that already happened ──────

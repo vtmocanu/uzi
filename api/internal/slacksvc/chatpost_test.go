@@ -244,7 +244,8 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 	if len(fp.updateBlocks) != 1 {
 		t.Fatalf("want one resolved turn, got %+v", fp.updateBlocks)
 	}
-	// The untrusted answer sits inside the section block, whole-blob escaped/scrubbed.
+	// The untrusted answer sits inside the section block, rendered by SlackMrkdwn
+	// (which owns its own escaping) and scrubbed.
 	body := fp.updateBlocks[0].sectionText
 	if strings.Contains(body, "<@U123>") {
 		t.Errorf("a raw Slack mention must be neutralized in the section: %q", body)
@@ -255,9 +256,72 @@ func TestChatAnswerIsScrubbedAndInert(t *testing.T) {
 	if strings.Contains(body, "glpat-ABCDEF1234567890abcd") { //gitleaks:allow // fake PAT fixture: asserts the credential-shaped string was scrubbed, never a real secret
 		t.Errorf("a credential-shaped string must be scrubbed: %q", body)
 	}
-	// The fallback is built from the same escaped body, so it is inert there too.
+	// The fallback is built from the escaped twin, so it is inert there too.
 	if strings.Contains(fp.updateBlocks[0].fallback, "<@U123>") {
 		t.Errorf("the fallback must carry the escaped (inert) body: %q", fp.updateBlocks[0].fallback)
+	}
+}
+
+// TestChatFallbackStaysEscapedNotRendered pins PRD #292 §6: the block body is RENDERED by
+// SlackMrkdwn (a legit https link becomes a live <url|label>), but the OS-notification
+// fallback stays ESCAPED (EscapeMrkdwn) — literal markdown, no live link — because Slack
+// parses fallbackText for mrkdwn and mentions even when the blocks render.
+func TestChatFallbackStaysEscapedNotRendered(t *testing.T) {
+	runID := uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID,
+		frame("user_message", `{"text":"give me a link"}`),
+		frame("text", `{"text":"see [docs](https://ok.example) and **bold**"}`),
+		frame("status", `{"event":"result"}`),
+	)
+
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("want one resolved turn, got %+v", fp.updateBlocks)
+	}
+	section := fp.updateBlocks[0].sectionText
+	if !strings.Contains(section, "<https://ok.example|docs>") {
+		t.Errorf("the section must render the https link as a live <url|label>: %q", section)
+	}
+	if !strings.Contains(section, "*bold*") {
+		t.Errorf("the section must render **bold** as *bold*: %q", section)
+	}
+	fallback := fp.updateBlocks[0].fallback
+	if strings.Contains(fallback, "<https://ok.example|docs>") {
+		t.Errorf("the fallback must NOT carry a live rendered link (§6): %q", fallback)
+	}
+	if !strings.Contains(fallback, "[docs](https://ok.example)") {
+		t.Errorf("the fallback must keep the link markdown literal/escaped, not rendered: %q", fallback)
+	}
+	if !strings.Contains(fallback, "**bold**") {
+		t.Errorf("the fallback must keep **bold** literal, not rendered to *bold*: %q", fallback)
+	}
+}
+
+// renderChatBody routes the untrusted model answer through SlackMrkdwn (PRD #292 M2):
+// CommonMark bold/lists/https-links are RENDERED into Slack mrkdwn, while an injected
+// mention or masquerading link stays inert because SlackMrkdwn owns its own escaping.
+func TestRenderChatBodyRendersMarkdown(t *testing.T) {
+	if got := renderChatBody("**bold**"); got != "*bold*" {
+		t.Errorf("**bold** must render as *bold*, got %q", got)
+	}
+	if got := renderChatBody("- a\n- b"); got != "• a\n• b" {
+		t.Errorf("a markdown list must render as • bullets, got %q", got)
+	}
+	if got := renderChatBody("[label](https://x)"); got != "<https://x|label>" {
+		t.Errorf("an https link must render as <url|label>, got %q", got)
+	}
+	// Injected Slack markup stays inert (escaped, no live mention/link).
+	got := renderChatBody("ping <@U123> see <https://evil|Open>")
+	if strings.Contains(got, "<@U123>") || !strings.Contains(got, "&lt;@U123&gt;") {
+		t.Errorf("an injected mention must be escaped inert, got %q", got)
+	}
+	if strings.Contains(got, "<https://evil|Open>") {
+		t.Errorf("a masquerading link must not render as a live <url|label>, got %q", got)
+	}
+	if renderChatBody("   ") != "" {
+		t.Error("whitespace-only input must return empty")
 	}
 }
 

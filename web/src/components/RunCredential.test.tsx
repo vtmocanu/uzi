@@ -229,6 +229,86 @@ describe("RunCredential links only where there is something to do", () => {
 });
 
 
+// --- PRD #295: the compact variant for the Runs list ---------------------------
+
+// The dot is the ONLY aria-hidden element the Badge renders (ui.tsx), and it is
+// present iff the tone is non-neutral — the same signal the full chip carries with a
+// link. Reading it directly is how "neutral shows no dot" is told apart from
+// "non-neutral shows one", which the text cannot see.
+function hasDot(container: HTMLElement): boolean {
+  return container.querySelector('span[aria-hidden="true"]') !== null;
+}
+
+describe("RunCredential compact variant (PRD #295)", () => {
+  // auto is a calm pick: neutral tone → no dot, and no link because there is nothing
+  // to act on, exactly as the full chip's "link iff non-neutral" rule.
+  it("auto renders neutral: no dot and not a link", () => {
+    const { container } = render(
+      <RunCredential run={cred({ reason: "auto", headroom: 62 })} variant="compact" />,
+    );
+    expect(screen.getByText(/console-key/)).toBeTruthy();
+    expect(hasDot(container)).toBe(false);
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  // best_of_pool is info: the pool is nearly exhausted, worth a look — the tone dot
+  // carries that signal. The compact badge lives inside the Runs-list row <Link>, so it
+  // must NOT introduce a nested anchor: dot yes, link never (the blocking-bug guard).
+  it("best_of_pool renders info: a dot, and is NOT a link", () => {
+    const { container } = render(
+      <RunCredential run={cred({ reason: "best_of_pool", headroom: 8 })} variant="compact" />,
+    );
+    expect(hasDot(container)).toBe(true);
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  // pool_empty is warning: the worker is on auto and the pool is empty — a dot signals
+  // it, but again no inner link (it would nest inside the row <Link>).
+  it("pool_empty renders warning: a dot, and is NOT a link", () => {
+    const { container } = render(
+      <RunCredential run={cred({ reason: "pool_empty" })} variant="compact" />,
+    );
+    expect(hasDot(container)).toBe(true);
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  // A deleted credential (id null, label kept) still names the account and marks it
+  // gone, same as the full chip.
+  it("marks a deleted credential", () => {
+    render(
+      <RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} variant="compact" />,
+    );
+    expect(screen.getByText(/retired-key/)).toBeTruthy();
+    expect(screen.getByText(/\(deleted\)/)).toBeTruthy();
+  });
+
+  // The compact badge is NEVER a link, on any tone — it is embedded inside the row
+  // <Link> and a nested <a> is illegal HTML. This is the direct guard for the blocking
+  // nested-anchor bug the earlier compact path introduced. The full run-detail chip,
+  // which is not inside a row link, keeps its /settings link (asserted separately).
+  it.each(["best_of_pool", "pool_empty", "pool_stale", "open_failed"])(
+    "compact never renders a link, even on the non-neutral %s state",
+    (reason) => {
+      const { container } = render(
+        <RunCredential run={cred({ reason })} variant="compact" />,
+      );
+      expect(screen.getByText(/console-key/)).toBeTruthy();
+      // The dot still signals the state; there is simply no anchor.
+      expect(hasDot(container)).toBe(true);
+      expect(container.querySelector("a")).toBeNull();
+    },
+  );
+
+  // No label: a run claimed before PRD #111 M1, or not yet claimed, renders nothing —
+  // no placeholder badge on the row.
+  it("renders nothing when there is no label", () => {
+    const { container } = render(
+      <RunCredential run={cred({ id: null, label: null, reason: "auto" })} variant="compact" />,
+    );
+    expect(container.textContent).toBe("");
+  });
+});
+
 // --- the chip's STRUCTURE, which the text assertions above cannot see -------------
 
 describe("RunCredential chip structure (web-ux F19/F20/F21)", () => {

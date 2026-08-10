@@ -108,6 +108,11 @@ export interface RunContext {
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
   memory?: MemoryEntry[];
+  /** Issue #297: work already in flight on the same repo at claim time, carried only
+   *  on a self_improve run so the picker avoids overlapping a recommendation with an
+   *  active run's work. Absent/empty ⇒ no block injected. UNTRUSTED-content advisory
+   *  data — rendered nonce-fenced, never as instructions. */
+  inflightTargets?: string[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when
@@ -252,6 +257,25 @@ export interface ExecutorResult {
    *  when no mid-run progress was reported. Absent when the lead declared nothing, which
    *  is the common case. StubExecutor never sets it. */
   milestonesCompleted?: string[];
+  /** Issue #293 M2 (gate honesty): component dirs whose JS dependencies did NOT
+   *  install this run, so the gates that need them (e.g. `vitest`, `knip`) could not
+   *  have run. Rendered as an "unverified gates" annotation on the issue-run MR body
+   *  (ANNOTATE posture — never blocks). Dir names are already charset/length-clamped
+   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when every
+   *  dir installed, which is the common case. StubExecutor never sets it. */
+  gatesUnverified?: string[];
+  /** Issue #293 M2 (review F1): true when dependency DISCOVERY was truncated at its scan
+   *  cap, so components past the cap were never examined and cannot appear in
+   *  gatesUnverified. Adds a "coverage was capped" caveat to the same MR annotation so a
+   *  silent cap does not read as full coverage. ISSUE RUNS ONLY, OMITTED (never `false`)
+   *  when discovery saw the whole tree. StubExecutor never sets it. */
+  gatesDiscoveryTruncated?: boolean;
+  /** issue #279: the lead declared this a report-only/evidence run on signal_done; the
+   *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
+  reportOnly?: boolean;
+  /** issue #279: the one-line/short findings summary from signal_done, persisted as
+   *  report_md on a report-only completion. Issue runs only. */
+  summary?: string;
 }
 
 /**

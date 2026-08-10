@@ -131,14 +131,21 @@ type RunDTO struct {
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
-	PipelineRef    *string    `json:"pipeline_ref"`
-	PipelineWebURL *string    `json:"pipeline_web_url"`
-	FixVerdict     *string    `json:"fix_verdict"`
-	ClaimedAt      *time.Time `json:"claimed_at"`
-	StartedAt      *time.Time `json:"started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	PipelineRef    *string `json:"pipeline_ref"`
+	PipelineWebURL *string `json:"pipeline_web_url"`
+	FixVerdict     *string `json:"fix_verdict"`
+	// ReportOnly marks a completed run that intentionally opened NO merge request
+	// (issue #279): its deliverable was a report/command-output/verification result,
+	// not a code change. False for a normal MR completion and every pre-feature run
+	// (the column is NOT NULL DEFAULT false). ReportMd is the lead's persisted findings
+	// summary, already scrubbed server-side; nil unless report_only.
+	ReportOnly bool       `json:"report_only"`
+	ReportMd   *string    `json:"report_md"`
+	ClaimedAt  *time.Time `json:"claimed_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
 	// detected in the clone's .claude/agents/: null when no worker ever reported
 	// (a pre-feature run), `[]` when detection ran and found none. The plan gate

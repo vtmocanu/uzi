@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RunsList } from "./RunsList";
-import { api, type RunListItem } from "../lib/api";
+import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // Keep the real module (isTerminalRun etc.) and mock only the network + auth so the
@@ -16,6 +16,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       adminListRuns: vi.fn(),
       adminListWorkers: vi.fn(),
+      // PRD #295: RunsList.load() now fetches the viewer's secrets to compute the
+      // ">1 Anthropic token" gate. Default to no tokens so every pre-#295 test keeps
+      // its no-badge expectation; the #295 cases override it per test. vi.clearAllMocks
+      // in afterEach clears call history but not this implementation (same as
+      // getJudgeStats above).
+      listSecrets: vi.fn().mockResolvedValue({ secrets: [] }),
       // Defined but never expected to fire. PRD #98 Decision 7 removed the aggregate strip
       // from this page, and the strip's fetch went with it — see the removal test below,
       // which can only assert that against a mock that EXISTS.
@@ -434,5 +440,165 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
     fireEvent.click(screen.getByText(/Show past runs/));
     await waitFor(() => expect(screen.getByText("Never started")).toBeTruthy());
     expect(screen.queryByText(/\bran\b/)).toBeNull();
+  });
+});
+
+// PRD #295: the compact credential badge on the Runs list, gated on the viewer
+// holding more than one Anthropic token.
+function aSecret(over: Partial<SecretMeta> = {}): SecretMeta {
+  return {
+    id: "sec-1",
+    kind: "anthropic_token",
+    label: "default",
+    is_default: true,
+    auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+// A run whose claim recorded a credential — the badge's visible text is the label.
+function aCredentialedRun(over: Partial<RunListItem> = {}): RunListItem {
+  return aRun({
+    id: "cred",
+    issue_title: "Billed run",
+    status: "running",
+    anthropic_secret_id: "sec-x",
+    anthropic_secret_label: "console-key",
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: 62,
+    ...over,
+  });
+}
+
+describe("RunsList — credential badge gate (PRD #295)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  // 0 and 1 token: nothing to say (every run billed the one token), so no badge.
+  // 2+: the badge names which token each run billed.
+  it.each([
+    [0, false],
+    [1, false],
+    [2, true],
+  ])("with %i anthropic tokens the personal badge shown=%s", async (count, shown) => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: Array.from({ length: count }, (_, i) => aSecret({ id: `sec-${i}`, is_default: i === 0 })),
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun()] });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
+    if (shown) {
+      expect(screen.getByText("console-key")).toBeTruthy();
+    } else {
+      expect(screen.queryByText("console-key")).toBeNull();
+    }
+  });
+
+  // A run with no recorded credential label renders no badge, at any token count. The
+  // compact badge wraps its label in a `max-w-[12rem]` span (the truncation clamp,
+  // web-ux F20), which is unique to this badge — so its absence is the tell that
+  // RunCredential self-hid, replacing the old sr-only hint id the compact path no
+  // longer emits.
+  it("shows no badge for a run with no credential label, even with two tokens", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aSecret({ id: "sec-0" }), aSecret({ id: "sec-1", is_default: false })],
+    });
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "bare", issue_title: "Pre-#111 run", status: "running", anthropic_secret_label: null })],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Pre-#111 run")).toBeTruthy());
+    expect(container.querySelector('span.max-w-\\[12rem\\]')).toBeNull();
+  });
+
+  // The blocking-bug guard: the entire row is a <Link to="/runs/:id">, so the compact
+  // badge must never introduce a nested <a> — not even on a non-neutral (pool_empty)
+  // credential, which the old compact path wrapped in an inner <Link to="/settings">.
+  it("a personal non-neutral credential row contains no nested /settings anchor", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aSecret({ id: "sec-0" }), aSecret({ id: "sec-1", is_default: false })],
+    });
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aCredentialedRun({
+          id: "warn",
+          issue_title: "Pool-empty run",
+          anthropic_secret_label: "nearly-spent",
+          anthropic_select_reason: "pool_empty",
+          anthropic_headroom_pct: null,
+        }),
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Pool-empty run")).toBeTruthy());
+    // The badge renders with its label…
+    expect(screen.getByText("nearly-spent")).toBeTruthy();
+    // …but there is no /settings anchor anywhere — the row's own /runs/:id link stands
+    // alone, with no nested <a> inside it.
+    expect(container.querySelector('a[href="/settings"]')).toBeNull();
+  });
+
+  // The admin factory list shows every run's credential (an admin auditing spend
+  // wants provenance) regardless of the admin's own token count — here zero — and the
+  // badge never links: it lives inside the row <Link>, so an inner /settings anchor
+  // would be a nested <a> (Decision 2 also noted it would point the admin at their own
+  // settings for another user's token). pool_empty is non-neutral, yet still no link.
+  it("admin factory rows render the credential badge but do not link it", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aCredentialedRun({
+          id: "other",
+          issue_title: "Other's run",
+          owner_email: "other@uzi.test",
+          anthropic_secret_id: "sec-y",
+          anthropic_secret_label: "their-key",
+          anthropic_select_reason: "pool_empty",
+          anthropic_headroom_pct: null,
+        }),
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Other's run")).toBeTruthy());
+    // The badge renders (admin still sees provenance despite holding zero tokens).
+    expect(screen.getByText("their-key")).toBeTruthy();
+    // …but its /settings link is stripped. The row's own /runs/:id link is unaffected.
+    expect(container.querySelector('a[href="/settings"]')).toBeNull();
   });
 });

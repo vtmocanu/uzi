@@ -152,6 +152,45 @@ func SanitizeTTY(s string) string {
 	}, s)
 }
 
+// SanitizeBounded is the persist-time guard for untrusted FLOWING markdown — the worker's
+// report_md and the judge's summary_md / recommendation rationale. It trims, strips the
+// Unsafe runes but SPARES \n and \t so multi-line markdown survives, applies a byte bound
+// AFTER each WHOLE rune (so a multi-byte rune is never split at the cut), then trims again.
+//
+// The skip predicate keeps \n and \t and drops everything else Unsafe classifies; because
+// \n and \t are themselves control characters (Cc), the two explicit exceptions are what
+// let markdown structure through while terminal escapes and bidi overrides do not.
+//
+// The Cf strip is Trojan-Source defense (issue #124 / CVE-2021-42574): judge/worker output
+// is LLM-derived text shaped by whatever the run looked at, so a bidi override (U+202E and
+// its family) could otherwise make an approving sentence render inside a rejecting review,
+// or make a stored coordinate read as a different one. It consumes the accepted cost the
+// Cf strip carries: a ZWJ family emoji degrades into its component glyphs (the case Unsafe
+// documents), and ZWNJ (U+200C), orthographically required in some scripts, is dropped too
+// — knowingly, because letting a bidi override persist at rest is the worse of the two.
+//
+// The \n / \t exception is exactly why this is a SEPARATE function from the single-line
+// sanitizeSelfReported, whose sinks are identifiers where a newline is itself something to
+// drop. The trim runs AGAIN at the end because the leading TrimSpace happens BEFORE the
+// strip and Cf is not White_Space, so an edge format character shields adjacent whitespace
+// from the first trim; removing the Cf then leaves that whitespace to clean up.
+//
+// Invalid UTF-8 becomes U+FFFD (the range decode substitutes it), matching SanitizeTTY.
+func SanitizeBounded(s string, max int) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r != '\n' && r != '\t' && Unsafe(r) {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= max {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // CellText is SanitizeTTY plus the two folds a COLUMN needs, for text landing in a table
 // cell.
 //

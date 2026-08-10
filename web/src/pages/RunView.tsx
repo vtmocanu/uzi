@@ -707,21 +707,52 @@ export function RunView() {
                   {mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
+            ) : run.mr_iid != null ? (
+              <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState, run.forge_type)}>
+                {mrAbbrev(run.forge_type)}{" "}
+                <span className={mrState === "closed" ? "line-through" : undefined}>
+                  {mrRefSymbol(run.forge_type)}
+                  {run.mr_iid}
+                </span>
+                {mrChipSuffix(mrState)}
+              </Badge>
             ) : (
-              run.mr_iid != null && (
-                <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState, run.forge_type)}>
-                  {mrAbbrev(run.forge_type)}{" "}
-                  <span className={mrState === "closed" ? "line-through" : undefined}>
-                    {mrRefSymbol(run.forge_type)}
-                    {run.mr_iid}
-                  </span>
-                  {mrChipSuffix(mrState)}
+              // issue #279: a report-only run intentionally opened no MR — explain the
+              // empty slot with a neutral chip, the way ci_fix not_code does.
+              run.report_only && (
+                <Badge
+                  tone="neutral"
+                  title="This run's deliverable is a report; it intentionally opened no merge request."
+                >
+                  report only
                 </Badge>
               )
             )}
           </div>
         </div>
       )}
+
+      {/* issue #279: a report-only run's deliverable is report_md. Render it right
+          under the completed hero, above the retrospective.
+
+          report_md is UNTRUSTED worker/model-authored text. It is DELIBERATELY rendered
+          as escaped plain text (React's default + whitespace-pre-wrap), never through
+          <Markdown> — the ingest scrub does NOT cover markdown/link injection, exactly as
+          review.summary_md is rendered below. If this is ever switched to a markdown/HTML
+          renderer, add sanitization first. See lib/safeText.ts. */}
+      {run.status === "completed" &&
+        run.report_only &&
+        run.report_md != null &&
+        run.report_md.trim() !== "" && (
+          <Card className="space-y-2 p-4">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h2>
+            {/* Cap a long summary and scroll it, like SeededPlanPanel, so the Activity feed
+                below stays reachable without a long page scroll. */}
+            <p className="max-h-96 overflow-auto whitespace-pre-wrap text-sm text-muted">
+              {stripUnsafeChars(run.report_md)}
+            </p>
+          </Card>
+        )}
 
       {terminal && run.status !== "completed" && (
         <div
@@ -1326,12 +1357,24 @@ export function RunCompletedLine({
   return (
     <p className="mt-0.5 text-xs text-muted">
       {duration && <>Ran for {duration}. </>}
-      {run.branch && (
+      {/* issue #279: a report-only run has no branch and no MR — name the deliverable so the
+          hero is not a silently-empty "Run completed". It is mutually exclusive with the
+          branch/MR clause (a report_only completion pushes neither), so this branch guards
+          against a contradictory "Branch … Report only" line, and only promises "findings
+          below" when there is actually a report_md to render below. */}
+      {run.report_only ? (
         <>
-          Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
-          {run.mr_iid != null &&
-            ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+          Report only — no merge request
+          {run.report_md != null && run.report_md.trim() !== "" ? "; findings below" : ""}.
         </>
+      ) : (
+        run.branch && (
+          <>
+            Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
+            {run.mr_iid != null &&
+              ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+          </>
+        )
       )}
     </p>
   );
@@ -1764,21 +1807,30 @@ export function JudgePanel({ run }: { run: Run }) {
         )
       ) : (
         <>
-          {/* summary_md, each target and each rationale_md below are UNTRUSTED judge/worker
-              output. They are DELIBERATELY rendered as escaped plain text (React's default +
-              whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
-              markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
-              (ScrubSecrets + control-strip) does NOT cover markdown/link injection.
-              Issue #124: escaping is not sufficient on its own either. TWO scrubbers run at
-              the review POST, not one — `sanitizeReviewText` (handler/judge_worker.go:381)
-              for summary/rationale, `sanitizeSelfReported` (handler/worker_protocol.go:44)
-              for `target` — and both were `IsControl`-only, so Cf bidi overrides were
-              persisted and reorder what a human reads. Both now strip Cf as well, but rows
-              written before that still render through here, which is why the renderer-side
-              strip is not redundant. See lib/safeText.ts for why it sits at the render site
-              and not at the API boundary (`target` is a coordinate the page posts back). */}
+          {/* summary_md and rationale_md below are UNTRUSTED judge/worker output. They now
+              render through the SAME hardened <Markdown> component that plan_md uses on this
+              page (see the plan_md sites above and components/Markdown.tsx), so this surface
+              is no worse than the already-shipped plan_md one. That component is hardened for
+              exactly this untrusted case: NO rehype-raw, so raw HTML (e.g. <script>, <img
+              onerror>) stays inert text; react-markdown's urlTransform plus our own
+              schemeIsDangerous strip javascript:/data:/file: URLs; links are forced external
+              (target="_blank" rel="noopener noreferrer"); images are size-capped.
+              stripUnsafeChars is STILL applied to the source FIRST and is NOT redundant: it
+              performs the issue #124 Cf/bidi-override strip at the render site. Markdown
+              syntax chars (`*`/`` ` ``/`#`/`-`/`[]()`) are not control chars, so stripping
+              first preserves them while removing bidi overrides. Rows written before the
+              ingest-side Cf strip landed still arrive carrying bidi overrides, which is why
+              the render-site strip stays. See lib/safeText.ts for why the strip lives at the
+              render site and not at the API boundary.
+              rec.target (the <code> coordinate just below) DELIBERATELY stays inert escaped
+              plaintext — it is a coordinate the page posts back, not prose, and must NOT
+              become a markdown/link sink.
+              If a markdown/HTML renderer is ever swapped in here, do NOT add rehype-raw or
+              relax schemeIsDangerous. */}
           {review.summary_md.trim() !== "" && (
-            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(review.summary_md)}</p>
+            <div className="judge-prose">
+              <Markdown content={stripUnsafeChars(review.summary_md)} />
+            </div>
           )}
 
           {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
@@ -1812,9 +1864,9 @@ export function JudgePanel({ run }: { run: Run }) {
                       </span>
                     </div>
                     {rec.rationale_md.trim() !== "" && (
-                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">
-                        {stripUnsafeChars(rec.rationale_md)}
-                      </p>
+                      <div className="judge-prose mt-1.5">
+                        <Markdown content={stripUnsafeChars(rec.rationale_md)} />
+                      </div>
                     )}
                     {/* A settled disposition (done/dismissed) hides the create-issue
                         affordance (File / draft) but NOT an already-filed link: a rec that

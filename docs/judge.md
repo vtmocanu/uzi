@@ -276,5 +276,11 @@ Firefox (Safari shows the plain uzi mark, without the live dot).
   run page.
 - **Untrusted text, rendered safely**: every free-text field the judge
   produces is validated, length-capped, and secret-scrubbed before it's
-  stored, and the run page renders it as plain escaped text, never as
-  markdown or HTML.
+  stored. The run page renders the judge's `summary_md` and each
+  recommendation's `rationale_md` through the shared hardened markdown
+  renderer (the same one `plan_md` uses): no `rehype-raw`, so raw HTML stays
+  inert text; dangerous URL schemes (`javascript:`/`data:`/`file:`) are
+  stripped; links are forced external; images are size-capped. The
+  bidi/control-char strip still runs at the render site first. The `target`
+  coordinate stays inert escaped plaintext — it is data the page posts back,
+  not prose.

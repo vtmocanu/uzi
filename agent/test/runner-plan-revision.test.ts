@@ -13,6 +13,7 @@ import {
   input,
   installHarness,
   runner,
+  simulateCommittedWork,
   type PlanVerdictKind,
 } from "./runner-harness.js";
 
@@ -50,6 +51,7 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
 
   it("returns a revise verdict for a fresh round, then completes on the round-2 approve", async () => {
     const { gitlab, calls } = fakeGitlab();
+    simulateCommittedWork(); // inline executor commits nothing; clear the zero-diff guard (issue #279)
     const claim = gitlabClaim(80);
     const seen: PlanVerdictKind[] = [];
     const reviseExec: Executor = {
@@ -143,6 +145,7 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
   // notice) and PASSES once the bump moves to the re-report.
   it("approve during the revision turn is discarded (mid-revision window)", async () => {
     const { gitlab, calls } = fakeGitlab();
+    simulateCommittedWork(); // inline executor commits nothing; clear the zero-diff guard (issue #279)
     const claim = gitlabClaim(83);
     const seen: PlanVerdictKind[] = [];
 
@@ -223,6 +226,7 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
 
   it("discards an approve batched with a revise (written against the pre-feedback plan) and notes it on the feed", async () => {
     const { gitlab } = fakeGitlab();
+    simulateCommittedWork(); // inline executor commits nothing; clear the zero-diff guard (issue #279)
     const claim = gitlabClaim(81);
     const reviseExec: Executor = {
       run: async (ctx) => {

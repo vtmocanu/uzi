@@ -1133,6 +1133,15 @@ UPDATE runs SET
     -- reported by one worker in one payload, so they must not persist under
     -- different conventions.
     prd_done_path      = @prd_done_path,
+    -- issue #279: the report-only marker and the lead's persisted findings.
+    -- Plain assignment for the same reason mr_web_url/prd_done_path above give:
+    -- the branch, the MR, the declared path AND this completion's report shape are
+    -- ONE fact reported by one worker in one payload, so they must not persist
+    -- under different conventions. report_only plain-assigns on every completed
+    -- transition (false for a normal MR completion — correct, it is the marker for
+    -- the no-MR case); report_md plain-assigns (nil→NULL) exactly like prd_done_path.
+    report_only        = @report_only,
+    report_md          = @report_md,
     -- PRD #265 M1: reconcile the milestone tracker at completion. The lead declares on
     -- signal_done which frozen milestones it finished; the server UNIONs them here so a
     -- run that never emitted a mid-run `report_progress` still lands a truthful tracker.

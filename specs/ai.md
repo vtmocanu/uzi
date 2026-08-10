@@ -11396,6 +11396,46 @@ the file went and the api decides what to do with it.
   closed domain like `stop_kind`, so a CHECK could only restate the grammar in a second,
   drifting place.
 
+- **Issue #279 — a REPORT-ONLY / evidence completion reuses this same declaration + gate
+  machinery.** See [ADR-0279](../adr/0279-report-only-completion.md).
+  - **The lead completes a run report-only via `signal_done` (issue runs only):** the
+    worker sets `report_only:true`, its findings `summary` becomes `report_md`, and it
+    opens NO merge request — an early return *before* fetch-back, mirroring the ci_fix
+    `not_code` completion (`agent/src/runner.ts`). This closes the "evidence run has no
+    terminal path but the empty MR" gap: a verification run that produces zero code
+    changes no longer opens an empty MR.
+  - **`report_only` is on the `signal_done` schema for issue runs only** — same
+    `isIssueRun` gate as `prd_done_path`, and extracted at the same main-thread
+    `signal_done` point — then **re-gated server-side** (`clampWireReportOnly`: issue
+    kind, drop-and-warn, never error, like `clampWirePRDDonePath`).
+  - **An UNDECLARED issue run whose diff is CONFIRMED-empty (`git.changedFiles` → `[]`)
+    is FAILED with an actionable reason** — NOT auto-converted to report-only (that would
+    launder a "forgot to commit" bug) and NOT an empty MR. A `null` (diff-*failure*)
+    keeps the push path (fail-open). Issue-kind only.
+  - **Persistence (migration `00114`):** `runs.report_only` (bool, NOT NULL default
+    false) + `runs.report_md` (text). `report_md` is stored ONLY when `report_only` was
+    accepted, and is control-stripped + 8 KB-bounded + secret-scrubbed server-side
+    (untrusted worker text; mirrors the `run_reviews.summary_md` ingest). `RunDTO`
+    exposes both; web shows a neutral "report only" chip + a Findings panel rendering
+    `report_md` as ESCAPED PLAIN TEXT (never Markdown); CLI `uzi run get` prints a
+    `REPORT_ONLY` row + the scrubbed `report_md`.
+  - **Accepted edge:** a DECLARED `report_only` that also committed code (locally, unpushed)
+    discards that commit (no inverse guard, mirrors `not_code`; the early return precedes
+    fetch-back, and the lead prompt frames `report_only` as "no code change"). Leaves NO
+    remote residue. Full edge list in the ADR.
+  - **Issue #299 — a `report_only` that CHECKPOINTED work is now REFUSED, not an accepted
+    edge.** The checkpoint publish (PRD #122 M8) lands a `refs/uzi-checkpoints/<branch>` ref
+    on origin; a report-only completion opens no branch/MR, so it would orphan that ref. The
+    `report_only` path in `agent/src/runner.ts` now FAILS with an actionable reason (mirrors
+    the undeclared-empty-diff FAIL) when the run published a checkpoint. Detection is the
+    UNION of `lastPublishedTip` (a checkpoint THIS worker confirmably landed mid-run — set
+    only on a landed publish) OR `git.hasCheckpointRef(barePath, branch)` (origin's checkpoint
+    ref, mirrored into the worker bare by `fetch()`, catching a PRIOR/cross-worker attempt's
+    publish). A genuine zero-code run trips neither and still completes report-only. NO
+    checkpoint-ref deletion capability was added (the push broker is non-forced-push-only; a
+    delete-ref RPC would be a new trust-boundary crossing) — refusing loudly is the
+    proportionate fix. See [ADR-0279](../adr/0279-report-only-completion.md).
+
 ## 386. M5 — the post-merge patch is EDGE-triggered, BOUND to the run's queue-time issue snapshot, and deliberately not `mr_watch`
 
 The one forge write this PRD performs, and the only mechanical control over what the
@@ -12324,6 +12364,89 @@ is entitled to make yet.
   `defaultCheckRunner` carries the same `execFile`+`timeout` defect under the uid split that §397
   avoided in `js-deps` (measured: the timeout kills from the worker uid, gets `EPERM`, and leaves the
   runner process alive past its cap).
+
+## 511. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
+
+Delivers what §401 recorded as deferred (M4 gate honesty), in the reduced form the repo can honestly
+sign: annotate the never-ran case rather than reconcile declared gates. Serves the same human contract
+as §400 (the judge's *command not found* signal) and §397/§399 (`js_deps` as the recorded completion
+signal). Numbered §511 (next above the §510 head) but homed here in the gate-honesty region, directly
+after §401's "M4 split out" note. Three milestones (M1/M2/M3) plus a rollout caveat; the PRD's larger
+three-state gate ledger stayed DEFERRED and the why is recorded below.
+
+- **M1 — the per-Bash `is_error` is a documented PASSTHROUGH boundary, not fixed in-repo.**
+  `mapUser` (`agent/src/sdk-messages.ts:160`) sets `is_error: block["is_error"] === true` — a pure
+  reflection of the flag the upstream Claude Code Bash tool stamped. The `tool_result` carries no exit
+  code (`{tool_use_id, content, is_error}` only, cf. §400), and the repo wires only PreToolUse hooks
+  (no PostToolUse), so uzi has no in-repo place to re-derive it. The spike concluded uzi does NOT own a
+  reliable fix: re-deriving `is_error` by scanning `content` for shell-failure markers would reintroduce
+  the exact `echo "foo: command not found"` false positive the server-side scanner (§400) was
+  engineered around (executable-position anchoring + `suppressResolved`). And the ONLY consumer of the
+  per-Bash flag is presentational (`web/src/components/RunEvent.tsx:731`, `rec["is_error"] === true`) —
+  the judge, the real retrospective honesty consumer, reads `tool_result` CONTENT server-side, never
+  this flag. Decision: leave it a passthrough, document the boundary, pin it with tests
+  (`agent/test/sdk-messages.test.ts` — an upstream `true` passes through; an upstream `false`/absent over
+  failure-shaped content stays `false`). **`isErrorResult` (`agent/src/sdk-messages.ts:268`) is a
+  SEPARATE classifier** — the whole-turn run-abort test (`subtype !== "success" || is_error`) — and was
+  deliberately NOT touched.
+- **M2 — honest completion annotation is driven by `js_deps`, ANNOTATE posture (Decision D2, never
+  blocks).** At the completion handoff (`agent/src/sdk-executor.ts` ~1330), `result.gatesUnverified`
+  (`ExecutorResult.gatesUnverified`, `agent/src/executor.ts:261`) is populated from
+  `depsResults.filter(r => !r.ok && r.detail !== DETAIL_NO_LOCKFILE).map(safeDirLabel)` — ISSUE-run
+  only, OMITTED-not-`[]`/undefined when every dir installed (same convention as `milestonesCompleted`).
+  The exclusion is keyed on the specific deliberate-skip REASON (`DETAIL_NO_LOCKFILE`, a named export
+  from `js-deps.ts`), NOT on `manager !== "none"` (review F2). A `package.json` with no recognized
+  lockfile is `{manager:"none", ok:false, detail:DETAIL_NO_LOCKFILE}` (deliberately NOT installed — uzi
+  refuses to guess a manager, §397), and annotating it would cry wolf on a fine delivery. But
+  `manager:"none"` has a SECOND producer: the belt-to-braces `discovery failed` record
+  (`{dir:".", manager:"none", ok:false}`), which IS a genuine total failure that must annotate. Keying
+  the exclusion on `manager` dropped BOTH and turned that failure into a false green (latent: discovery
+  is non-throwing today, so the record is unreachable until a refactor makes it throw — fixed here so it
+  stays honest if that day comes). A genuine install failure carries a real manager (npm/pnpm/yarn/bun)
+  with `ok:false` and still annotates. Discovery TRUNCATION is carried alongside as
+  `gatesDiscoveryTruncated` (review F1): a capped discovery (`depsTruncated`, at MAX_PROJECT_DIRS /
+  MAX_SCAN_DIRS) never examined components past the cap, so they cannot appear in the list; the
+  annotation adds a "coverage was capped" caveat (fired even when no named dir failed) rather than
+  letting the cap read as full coverage — the exact silent-cap lie this PRD exists to remove.
+  `runner.ts`'s `mrDescription` threads both to
+  `gatesUnverifiedMrSection` (`agent/src/runner.ts`), which renders a `⚠️ **Quality gates unverified**`
+  blockquote on the ISSUE-run MR branch — byte-identical to before when empty. Reuses the `js_deps`
+  `ok` signal because it is corroborated against the filesystem (§397), so a repo forcing exit 0 cannot
+  mint a false "deps ready".
+- **M2 — why the larger reconciliation was DEFERRED.** The PRD's declared-gate reconciliation /
+  three-state ledger / pre-scan plumbing did NOT ship. The *command not found* pre-scan
+  (`scanCommandNotFound`, `api/internal/workersvc/judge.go:207`) is server-side and RETROSPECTIVE —
+  consumed only by the judge, NOT available at the lead worker's completion handoff — and no
+  per-command gate-execution ledger exists in the worker. `js_deps` is the repo's own recorded
+  completion signal (§399/§400) and covers the motivating never-ran case: deps absent ⇒ vitest/knip
+  could not have run. Anything richer awaits a structured `gates` field at the plan gate (a product
+  question, per §401), so M2 annotates the one thing the worker can prove.
+- **M3 — cross-component graceful-skip (Decision D3).** `deadcode:web`/`deadcode:agent`
+  (`Taskfile.yml`) now route through `scripts/deadcode-knip.sh <component>` instead of a bare
+  `npm run knip` (the `dir:` was dropped; the wrapper cd's into the component itself). It resolves
+  `<dir>/node_modules/.bin/knip`: present ⇒ `exec npm run knip` (delegation-to-package-script and
+  no-`npx` invariants preserved — npx would fetch over the network, a gate may not); absent ⇒ loud SKIP
+  banner + `exit 0`, so the umbrella `task deadcode` no longer reds on a sibling whose toolchain was
+  never installed. CI arms `UZI_DEADCODE_{WEB,AGENT}_REQUIRED=1` (`.gitlab-ci.yml`, on the
+  `validate:web`/`validate:agent` jobs that always `npm ci` knip), turning a missing knip into `exit 2`
+  there — a skip in CI means the image regressed and must not look like a pass. Follows the
+  `lint:formula`/`lint:shell`/`lint:yaml` fail-open-locally-required-in-CI precedent exactly
+  (`scripts/deadcode-knip.sh` is modelled on `scripts/lint-formula.sh`). The component arg is charset-
+  clamped (`case *[!a-z]*` ⇒ exit 2) before it is uppercased into the required-var name read via `eval`.
+  **The wrapper resolves the repo root from its OWN location (`$0`), deliberately NOT `git rev-parse
+  --show-toplevel`** the way `lint-formula.sh` does: `deadcode:web` runs inside `validate:web`'s
+  `node:22-alpine` CI image, which ships NO git, so a `git rev-parse` here fails and reds the very gate
+  it exists to keep honest — caught in CI (pipeline 20725) on the first push and fixed to a git-free
+  `CDPATH='' cd -- "$(dirname -- "$0")/.."`. Do not "correct" it back to `git` to match lint-formula.
+  **Rejected alternatives, recorded so they are not re-proposed:** scope-to-touched (violates the
+  `{{.CLI_ARGS}}` ban); prewarm knip into every component (per-repo `node_modules`, defeated by the
+  seed-once PVC).
+- **ROLLOUT CAVEAT (the #201-class fact).** M1/M2 are agent-code changes (`agent/src/*`) that ship in
+  the worker IMAGE, so they reach only newly provisioned / re-provisioned workers (same deploy lag §401
+  M5 names: merge → `v*` tag → Harbor → ArgoCD). M3 is Taskfile/CI/script and takes effect immediately
+  in CI and in any fresh checkout. So the honest-annotation behaviour and the graceful-skip behaviour
+  land on DIFFERENT clocks.
+
 ## 402. The INV-5 ceiling gates R2 only, and two claims in §391-§392 were false when written or falsified since
 
 Three separate corrections, filed together because one landing (#148 + #151) is what disproved all
@@ -13305,6 +13428,17 @@ token, `info` where it still picked one but the news is worth reading, neutral o
 three fallbacks are amber, `best_of_pool` is info — its own hint says the pool is nearly exhausted —
 and everything else is neutral. Tone and link are ONE predicate (link iff the tone is not neutral)
 so they cannot drift.
+
+**PRD #295 — the same credential, COMPACT, on the Runs list.** A `variant="compact"` path on
+`RunCredential` renders the run's credential as a row badge (label + non-neutral tone dot +
+`(deleted)`, mode/reason on `title`/sr-only, no inline prose) reusing `describeCredential` verbatim —
+so tone/link/deleted match the full run-view chip by construction. It is gated on the viewer holding
+**more than one** Anthropic token (new `anthropicTokenCount` helper beside `hasAnthropicToken` in
+`web/src/lib/hasToken.ts`; the existing predicate is ≥1, this one is >1); a single-token user sees
+nothing, because every run billed the one token. On the admin factory list the badge shows
+**unconditionally but non-linked** (a new `linkable` prop, default true): the credential is another
+user's, so `RunCredential`'s link to the viewer's own `/settings` would be a dead end. Purely a UI
+extension — the four `anthropic_*` fields already ride the list DTOs, so no server/SQL/DTO change.
 
 ## 427. PRD #111 — what "auto" does NOT mean, the six live-eligibility states, and what this PRD leaves unmet
 
@@ -19593,7 +19727,7 @@ reuses the PRD #19 autopilot detector pattern. Section numbers continue past PRD
 §509. Full rationale + Decision Log (incl. rejected alternatives, the 2026-07-17 user-locked
 decisions, and the drift-review fact-check): `prds/done/71-ci-autofix.md`.
 
-## 510. PRD #71 — the trigger is a poller post-sync `CIAutoFix` detector, optional-wired, gated on the pipeline watch
+## 512. PRD #71 — the trigger is a poller post-sync `CIAutoFix` detector, optional-wired, gated on the pipeline watch
 
 Serves human: "opt-in automatic CI-fix on agent MR branches, never main"; best-practice
 (detection must never ride the shared `forgesvc` paths that manual refresh / `CreateIssue`
@@ -19609,12 +19743,12 @@ also reach — those must never spawn runs).
   the optional-wiring is the instance switch, per-user opt-in is the consent gate; a global
   KV kill-switch is a documented follow-up (Decision Log Q4), not shipped.
 
-## 511. PRD #71 — durable `ci_autofix_attempts` ledger: the `autopilot_triggers` analogue, keyed `(repo_id, ref)`
+## 513. PRD #71 — durable `ci_autofix_attempts` ledger: the `autopilot_triggers` analogue, keyed `(repo_id, ref)`
 
 Serves human: "max 2 automatic attempts + early stop when the failure hasn't changed"; the
 loop-guard state must be trustworthy across churn.
 
-- **Dedicated ledger** (migration `00116_ci_autofix_attempts`, PK `(repo_id, ref)`): the
+- **Dedicated ledger** (migration `00117_ci_autofix_attempts`, PK `(repo_id, ref)`): the
   direct analogue of §98's `autopilot_triggers`. It **outlives both the run rows and the
   evictable `pipeline_statuses` cache** — durable guard state must not ride an evictable row
   (the lesson `autopilot_triggers` exists for). Rejected: deriving the count as `COUNT(ci_fix
@@ -19630,7 +19764,7 @@ loop-guard state must be trustworthy across churn.
   no-progress halt and the cap halt each get their own comment rather than the second being
   swallowed as "already notified."
 
-## 512. PRD #71 — `FailureSignature`: SHA-256 over normalized failure fingerprint, biased toward "same"
+## 514. PRD #71 — `FailureSignature`: SHA-256 over normalized failure fingerprint, biased toward "same"
 
 Serves human: "early stop when the failure hasn't changed"; best-practice (over-matching is
 the cheaper error under a cap of 2).
@@ -19650,7 +19784,7 @@ the cheaper error under a cap of 2).
   sits beside them. Handler's manual path produces a byte-identical snapshot; the poller
   detector calls the same builder — one redaction/size-cap discipline, inherited from PRD #6.
 
-## 513. PRD #71 — two-layer code-vs-CI-config enforcement (the agent's self-classification is not trusted)
+## 515. PRD #71 — two-layer code-vs-CI-config enforcement (the agent's self-classification is not trusted)
 
 Serves human: "code fixes push automatically; a fix that edits CI config passes the approval
 gate (human-approved before it pushes)"; best-practice (CI log tails are the most
@@ -19679,14 +19813,14 @@ attacker-influenceable text uzi feeds an agent, so a UX declaration cannot be lo
   project's server-fetched `ci_config_path`. GitLab lets a project point its pipeline at an
   arbitrary file, so static globs alone are not a true boundary — the **server owns it**
   (consistent with every other cap). Delivered as `ClaimConfig.CIConfigPaths`, persisted on
-  `runs.ci_config_paths` at run-creation (migration `00115_run_ci_config_paths`). Fetched via
+  `runs.ci_config_paths` at run-creation (migration `00116_run_ci_config_paths`). Fetched via
   a new forge read `ProjectCIConfigPath(ctx, projectID)` — compile-time mandatory across all
   three drivers (`gitlab.go`/`forgejo.go`/`github.go`) + the test fakes, but a **server-side
   claim-assembly read**, NOT a PRD #158 worker forge route (opposite, agent-facing trust
   direction). Residual (documented): `include: local:` YAML templates pulled into the pipeline
   are not scanned in MVP.
 
-## 514. PRD #71 — the requeue-while-parked fix: parking a run clears `auto_approve`
+## 516. PRD #71 — the requeue-while-parked fix: parking a run clears `auto_approve`
 
 Serves human: "a CI-config fix must be human-approved before it pushes" — a parked auto run
 must not be able to skip the gate via a worker-restart requeue (non-obvious).
@@ -19699,7 +19833,7 @@ must not be able to skip the gate via a worker-restart requeue (non-obvious).
   The worker's `ciFixHumanApproved` derives from `auto_approve !== true` on a pre-approved
   resume, so a resumed-with-approval run is correctly treated as human-approved and pushes.
 
-## 515. PRD #71 — the loop-guard sequence and reset-on-green
+## 517. PRD #71 — the loop-guard sequence and reset-on-green
 
 Serves human: "loop-guarded — never loops; on giving up, comment + notify + stop, manual Fix
 CI button remains."
@@ -19732,7 +19866,7 @@ CI button remains."
   `count=2`. A human pushing fresh broken code does NOT reset the count (prevents an infinite
   auto-loop on repeated human breakage).
 
-## 516. PRD #71 — notifications: in-app + issue comment on the backing issue; Slack deliberately not wired
+## 518. PRD #71 — notifications: in-app + issue comment on the backing issue; Slack deliberately not wired
 
 Serves human: "on giving up, uzi comments + notifies"; the notification story PRD #6 required.
 
@@ -19743,12 +19877,12 @@ Serves human: "on giving up, uzi comments + notifies"; the notification story PR
   attempt's owner, so wiring Slack here would double-notify; in-app + issue comment carry the
   auto-fix lifecycle.
 
-## 517. PRD #71 — scope, opt-in, and cross-forge posture
+## 519. PRD #71 — scope, opt-in, and cross-forge posture
 
 Serves human: "opt-in per-user default OFF, admin can force-toggle; agent-owned MR branches
 only; never main/protected."
 
-- **Per-user `ci_autofix_enabled`, default OFF** (migration `00114_user_ci_autofix_enabled`,
+- **Per-user `ci_autofix_enabled`, default OFF** (migration `00115_user_ci_autofix_enabled`,
   mirrors the judge/autopilot boolean): self-service PUT + an **admin force-toggle** (judge
   parity). Surfaced on the user DTO and web `Settings.tsx` / `AdminUsers.tsx`.
 - **MR-branch pipelines only** (`refs/merge-requests/*` of `agent/issue-N` branches); `main`,
@@ -19757,3 +19891,79 @@ only; never main/protected."
   are unchanged.
 - **GitLab-first:** the detector is forge-neutral by construction but validated on GitLab only;
   Forgejo/GitHub `ProjectCIConfigPath` are stubs (compile-time present, runtime GitLab-only).
+## 510. Issue #280 — a seeded plan gets a DETERMINISTIC bright-line recon-target screen at the sole create-time choke point, because it skips the plan gate entirely
+
+Extends the PRD #209 seeded-plan feature (design record `prds/done/209-seeded-plan-runs.md`;
+full rationale `adr/0280-seeded-plan-safety-screen.md`). A run seeded via
+`uzi run create --plan-file` sets `runs.plan_source='seeded'`, which the server folds into
+`PlanApproved` (the `run.PlanSource == planSourceSeeded` disjunct at
+`api/internal/workersvc/service.go`, alongside auto-approve and consumed human-approval — the
+gate-bypass primitive of §436) so the worker skips **both** the planning turn and the approval
+gate (`agent/src/sdk-executor.ts` `preApproved` path). The only thing formerly between a
+prohibited seeded plan and implementation was the lead agent's own discretion — model-dependent,
+not a control.
+
+- **Deterministic bright-line screen, at the one create choke point.** New leaf package
+  `api/internal/planpolicy` (`Screen(plan) (category, matched)`, sibling to `secretscrub` — a
+  small dependency-free content check) runs inside the shared `createRun` on the seeded path
+  only, on the **secret-scrubbed** body, **after** the empty-check and **before** the run is
+  persisted. A match ⇒ new sentinel `workersvc.ErrPlanUnsafe` ⇒ HTTP 422
+  (`handler/workers.go` `writeStartRunError`), whose message names the matched category (a fixed
+  planpolicy string, never plan text or a secret) and redirects the caller to the ordinary gated
+  flow. The run is never created.
+- **Why a create-time REJECT, not the alternatives.** A reject is a control; forcing the gate on
+  a match merely relocates the discretion, and an LLM classifier is exactly the model-dependent
+  backstop the issue criticizes. Screens **only** seeded plans — an issue-planned run is
+  unscreened and still human-gated, so the screen adds no false-positive surface to the ordinary
+  path. Scrubbed-first so a redacted secret cannot mask a target.
+- **The bright-line targets.** Cloud instance-metadata endpoints (`169.254.169.254` /
+  `metadata.google.internal`), the default kube-apiserver ClusterIP (`10.96.0.1`), and the in-pod
+  service-account token mount (both `/run/...` and `/var/run/...` forms) — endpoints with no
+  legitimate reason to appear in a repository code-change plan. Deliberately EXCLUDES
+  `kubernetes.default.svc` and cloud credential file paths (e.g. `.aws/credentials`) to avoid
+  false positives.
+- **Accepted residual: a text denylist is trivially obfuscation-defeated.** This is
+  defense-in-depth complementing worker network-egress enforcement
+  (`adr/0285-worker-egress-tier-trust-model.md`), NOT a substitute. Consequence of the bright-line
+  literals: the metadata-IP / ClusterIP strings legitimately appear in this repo's own egress
+  netpol manifests (`deploy/chart/templates/worker-fqdn-egress.yaml`, `deploy/values/*.yaml`), so
+  a seeded plan that edits that feature is refused the ungated fast-path **by design** and falls
+  back to the ordinary gated flow.
+
+## 511. Issue #297 — the self_improve picker gets a claim-time, status-keyed in-flight avoid-set (advisory, nonce-fenced untrusted), so it stops picking work an active run is already doing
+
+Design record `prds/297-selfimprove-inflight-reconciliation.md`. A self-improvement pick is free
+text with no issue coordinate, so it escapes the one-active-run index that hard-dedupes real issue
+runs. The motivating 2026-08-10 near-miss: a run with `branch=null` was actively working PRD #293
+M3 — invisible to any branch/MR-keyed dedup — and the picker was free to re-pick it. This makes
+that overlap VISIBLE to the LLM picker at claim time; the picker decides.
+
+- **Claim-time assembly, api side.** `api/internal/workersvc/service.go` `inflightTargets` +
+  a `run.Kind == RunKindSelfImprove` block at the end of `assembleClaim` (just before it returns
+  the payload). It reuses the existing `ListActiveRunsAll` store query (all non-terminal runs, all
+  repos, excludes chat/judge, `LIMIT 500`, `ORDER BY created_at DESC`), filters IN GO to the same
+  `RepoID` and excludes the run itself, and `formatInflightLine` emits one compact coordinate per
+  active run (issue iid + title + `kind`/`status` + frozen milestone titles via `DecodeMilestones`;
+  issue-less kinds lead with `<kind> run`). Best-effort: a query error `slog.Warn`s and returns nil,
+  never failing the claim (mirrors the `knownTargets` posture in `assembleJudgeClaim`). Capped at
+  `maxInflightTargets` (30, newest-first); each line trimmed to `maxInflightLineLen` (300) on a
+  UTF-8 rune boundary so an untrusted multibyte title is never sliced mid-rune.
+- **Wire — additive, omitempty, self_improve-only.** New `ClaimPayload.InflightTargets []string`
+  (`claim.go`, `json:"inflight_targets,omitempty"`) and `inflight_targets?: string[]` on
+  `ClaimResponse` (`agent/src/protocol.ts`). An empty set never reaches the wire and an older worker
+  ignores the field — no coordinated deploy, no `runs` schema change (computed at CLAIM time, not
+  create time). This mirrors the `known_improve_uzi_targets` precedent (issue #232, §487/§103):
+  additive-optional avoid-set carried on the claim, not a persisted column.
+- **Render, agent side — trusted PROVENANCE is not trusted CONTENT.** `agent/src/prompt.ts`
+  `buildSelfImprovePlanPrompt` renders the list in its OWN nonce-fenced UNTRUSTED block
+  (`<inflight_work_NONCE>`, via `inflightFrame`), distinct from the recommendations fence — the
+  content is issue/milestone titles anyone who can file an issue can shape. A TRUSTED directive
+  OUTSIDE the fence tells the picker to skip an improvement whose fix is already in flight and
+  record the skip.
+- **Advisory, not a hard block; status-driven not branch-driven.** Keyed on run STATUS (any
+  non-terminal run counts), because the near-miss run had `branch=null` — a branch/MR key would
+  have missed it. Residual risk documented: the picker can still overlap because a free-text pick
+  has no coordinate to hard-test, so this raises visibility, not a guarantee.
+- **Deferred: the recently-landed half.** Work that JUST merged is not surfaced — `runs` carries
+  no merge-time key (no `merged_at`), and the in-flight half alone fixes the motivating bug. Left
+  for a follow-up if a merge-time signal is added.

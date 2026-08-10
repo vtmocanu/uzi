@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -21,6 +20,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -333,9 +333,13 @@ func recommendationCategoryChips(recs []workersvc.ReviewRecommendation) []string
 	return chips
 }
 
-// reviewNotificationBody renders the one-line summary shown in the inbox row and the
-// Slack DM: the verdict, how many recommendations came with it, and (when present) the
-// scrubbed summary preview.
+// reviewNotificationBody renders the one-line summary shown in the web inbox row
+// (Payload["body"]): the verdict, how many recommendations came with it, and (when
+// present) the scrubbed summary preview. The summary preview is now MULTI-LINE (PRD #292
+// M4 preserves its newlines for the Slack blockquote), so its whitespace/newlines are
+// collapsed to single spaces HERE, at the append, to keep the inbox row a one-liner
+// (Decision 7 / SC4). The web inbox reads only payload.body — never payload.summary — so
+// the multi-line summary never reaches it.
 func reviewNotificationBody(verdict string, recCount int, summary string) string {
 	line := "verdict: " + verdict
 	if recCount == 1 {
@@ -344,7 +348,7 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 		line += fmt.Sprintf(" — %d recommendations", recCount)
 	}
 	if summary != "" {
-		line += ": " + summary
+		line += ": " + strings.Join(strings.Fields(summary), " ")
 	}
 	return line
 }
@@ -356,21 +360,25 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 // longer preview. The run page still holds the full text.
 const reviewSummaryPreviewMaxRunes = 600
 
-// reviewSummaryPreview renders the judge's summary for the notification: whitespace
-// (incl. newlines) collapsed to a single space, secret-scrubbed (belt and suspenders —
-// it is already scrubbed at ingest, but the producer contract re-scrubs every free
-// field copied onto the verbatim payload path), then rune-capped. Scrub before the cap
-// so a redaction marker can't be split.
+// reviewSummaryPreview renders the judge's summary for the notification: trimmed but
+// with its NEWLINES PRESERVED (PRD #292 M4), secret-scrubbed (belt and suspenders — it
+// is already scrubbed at ingest, but the producer contract re-scrubs every free field
+// copied onto the verbatim payload path), then rune-capped. Newlines are kept so the
+// Slack blockquote/list structure survives when the body is rendered as mrkdwn (the
+// output feeds SlackRender.Body); the web inbox one-liner collapses them itself in
+// reviewNotificationBody (Decision 7). Scrub the FULL text before the cap so no secret
+// byte can survive the cut regardless of where it lands — the cap may split a redaction
+// marker, but a split marker leaks nothing; only unscrubbed secret bytes would.
 func reviewSummaryPreview(summaryMd string) string {
-	oneLine := slacksvc.ScrubSecrets(strings.Join(strings.Fields(summaryMd), " "))
-	if oneLine == "" {
+	text := slacksvc.ScrubSecrets(strings.TrimSpace(summaryMd))
+	if text == "" {
 		return ""
 	}
-	runes := []rune(oneLine)
+	runes := []rune(text)
 	if len(runes) > reviewSummaryPreviewMaxRunes {
 		return string(runes[:reviewSummaryPreviewMaxRunes]) + "…"
 	}
-	return oneLine
+	return text
 }
 
 // recommendationCategories is the list of recommendation category enums (closed set,
@@ -426,7 +434,7 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 	sub := workersvc.ReviewSubmission{
 		Verdict:    req.Verdict,
 		Status:     status,
-		SummaryMd:  slacksvc.ScrubSecrets(sanitizeReviewText(req.Summary, workersvc.ReviewSummaryMaxBytes)),
+		SummaryMd:  slacksvc.ScrubSecrets(termsafe.SanitizeBounded(req.Summary, workersvc.ReviewSummaryMaxBytes)),
 		JudgeModel: slacksvc.ScrubSecrets(sanitizeSelfReported(req.Model, workersvc.ReviewModelMaxBytes)),
 	}
 	for _, rec := range req.Recommendations {
@@ -446,69 +454,9 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 			// the cap is a formality here, but keeping it makes the byte bound hold no matter
 			// which order a future edit reshuffles these into.
 			Target:      canonicalizeTarget(slacksvc.ScrubSecrets(sanitizeSelfReported(rec.Target, workersvc.ReviewTargetMaxBytes)), workersvc.ReviewTargetMaxBytes),
-			RationaleMd: slacksvc.ScrubSecrets(sanitizeReviewText(rec.Rationale, workersvc.ReviewRationaleMaxBytes)),
+			RationaleMd: slacksvc.ScrubSecrets(termsafe.SanitizeBounded(rec.Rationale, workersvc.ReviewRationaleMaxBytes)),
 			Confidence:  rec.Confidence,
 		})
 	}
 	return sub, nil
-}
-
-// sanitizeReviewText bounds an untrusted multi-line markdown field: trim, cap to max
-// bytes, and drop control AND format characters EXCEPT newline and tab (so the markdown
-// structure survives while terminal escapes and bidi overrides do not). The byte check
-// runs after each whole rune is written, so it never splits a multi-byte rune.
-//
-// The Cf half is issue #124 at the SOURCE. Cc and Cf are disjoint, so IsControl alone
-// never saw U+202E RIGHT-TO-LEFT OVERRIDE and the zero-width family — and judge output
-// is LLM-derived text influenced by whatever the run looked at, so an approving sentence
-// could be made to render inside a rejecting review. Trojan Source (CVE-2021-42574) in
-// the review surface. Same predicate as sanitizeTTY (api/cmd/uzi/run.go:524), which has
-// long applied it on the CLI's own render path, and as the single-line
-// sanitizeSelfReported (handler/worker_protocol.go:44).
-//
-// THE \n / \t EXCEPTION IS KEPT, and it is the whole reason this stays a separate
-// function from sanitizeSelfReported: this sink is `whitespace-pre-wrap` markdown, so
-// dropping them would reflow every multi-line review. sanitizeTTY makes the same
-// exception for the same reason.
-//
-// ACCEPTED COSTS — two of them, and they are different KINDS of cost, so both are on the
-// record rather than only the cheap one:
-//
-//   - U+200D ZERO WIDTH JOINER goes, so an emoji family sequence in judge prose degrades
-//     into its component emoji. Cosmetic.
-//   - U+200C ZERO WIDTH NON-JOINER goes too, and that is NOT cosmetic: it is
-//     orthographically required in Persian and several Indic scripts, where removing it
-//     joins two words that must stay separate and changes what the text says. A
-//     correctness cost in those scripts, accepted knowingly.
-//
-// Both are at rest, irreversible, and apply only to rows written from here on. Carving
-// ZWNJ out would reopen a zero-width hole, and sanitizeTTY (api/cmd/uzi/run.go) has
-// shipped with exactly this cost for a long time. The alternative — letting a bidi
-// override persist so a review can lie about which file it names — is worse.
-//
-// AND THIS CLOSED A CONTENT-SUPPRESSION VECTOR, not only a rendering one. Before the Cf
-// strip these characters passed the filter and CONSUMED CAP BUDGET: a ZWSP is 3 bytes, so
-// 85 of them exhaust the whole 255-byte `target` cap. A judge could store a recommendation
-// whose target was nothing but invisible characters — and target is a coordinate, so
-// several such rows collapse toward indistinguishable strings and conflate under
-// (category, target) dedup and disposition keying. That needed no bidi at all.
-func sanitizeReviewText(s string, max int) string {
-	s = strings.TrimSpace(s)
-	var b strings.Builder
-	for _, r := range s {
-		if (unicode.IsControl(r) || unicode.In(r, unicode.Cf)) && r != '\n' && r != '\t' {
-			continue
-		}
-		b.WriteRune(r)
-		if b.Len() >= max {
-			break
-		}
-	}
-	// Trim again: TrimSpace above runs BEFORE the strip and Cf is not White_Space, so an
-	// edge format character shields the adjacent whitespace from it. See the fuller note on
-	// sanitizeSelfReported (handler/worker_protocol.go), where it is load-bearing because
-	// that function guards a coordinate. Here it is tidiness — the sink is pre-wrap markdown
-	// — but leaving the two functions inconsistent is how the next reader concludes one of
-	// them is wrong.
-	return strings.TrimSpace(b.String())
 }

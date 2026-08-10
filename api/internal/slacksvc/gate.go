@@ -248,23 +248,33 @@ func truncateForSlackSection(s string) string {
 	if len(r) <= maxSlackSectionRunes {
 		return s
 	}
-	return string(r[:maxSlackSectionRunes]) + "\n…"
+	kept := string(r[:maxSlackSectionRunes])
+	// The rune slice may land INSIDE an emitted <https://…|label>, leaving a
+	// trailing "<" with no matching ">" — an unbalanced open that re-opens Slack's
+	// <url|label> grammar and the exact injection PRD #292 closes. If the last "<"
+	// in the kept region has no ">" after it, drop from that "<" onward. A "<" with
+	// a ">" after it is a complete token and is left intact.
+	if i := strings.LastIndexByte(kept, '<'); i >= 0 && !strings.ContainsRune(kept[i:], '>') {
+		kept = kept[:i]
+	}
+	return kept + "\n…"
 }
 
 // planThreadBlocks renders the plan into the run's DM thread at the approval gate
 // (PRD #41 Decision 10 — Slack gate parity). Pipeline: ScrubSecrets (credential
-// defense in depth) → EscapeMrkdwn of the WHOLE blob → truncate → deep link appended
+// defense in depth) → SlackMrkdwn RENDERS the WHOLE blob → truncate → deep link appended
 // as a SEPARATE trusted block.
 //
-// The whole-blob EscapeMrkdwn is the DOCUMENTED EXCEPTION to EscapeMrkdwn's per-field
-// rule (see redact.go): that rule exists so escaping never breaks trusted <url|label>
-// markup interpolated beside an untrusted field — but the plan blob carries NO trusted
-// markup of its own, so escaping it wholesale is exactly right and neutralizes any
-// <, >, &, <@Uxxx> mention, or spoofed <https://evil|Open> link a hostile plan embeds.
-// The one trusted element, the "full plan in uzi" deep link, is added in its own block
-// OUTSIDE the truncated region so it is never split or displaced by an over-long plan.
+// SlackMrkdwn renders the untrusted plan CommonMark into real Slack mrkdwn — headings
+// and bold become *bold*, list items become • bullets, and an https link authored in the
+// plan becomes a live <url|label> — while owning its own &<>-escaping (PRD #292 Decision
+// 2). It is injection-safe: any <, >, &, a <@Uxxx> mention, or a spoofed <https://evil|Open>
+// link a hostile plan embeds is escaped inert, so only markdown the plan itself authored
+// renders. The plan blob carries NO trusted markup of its own; the one trusted element,
+// the "full plan in uzi" deep link, is added in its own block OUTSIDE the truncated region
+// so it is never split or displaced by an over-long plan.
 func planThreadBlocks(runID uuid.UUID, planMD, base string) []slack.Block {
-	body := truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(planMD)))
+	body := truncateForSlackSection(SlackMrkdwn(ScrubSecrets(planMD)))
 	blocks := []slack.Block{
 		slack.NewSectionBlock(
 			slack.NewTextBlockObject(slack.MarkdownType, body, false, false), nil, nil),

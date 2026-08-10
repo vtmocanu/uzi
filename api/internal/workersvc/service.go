@@ -37,6 +37,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/planpolicy"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/pushbroker"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
@@ -110,6 +111,16 @@ var (
 	// armed. Rejecting at create time closes that entry path; the plan_source='agent'
 	// write in SetRunAwaitingApproval closes every other one.
 	ErrPlanEmpty = errors.New("seeded plan is empty")
+	// ErrPlanUnsafe rejects a create-time SEEDED plan whose text names a
+	// bright-line infrastructure-reconnaissance target (cloud instance metadata
+	// endpoint, the kube-apiserver ClusterIP, or the in-pod service-account token
+	// mount) → 422 (issue #280). Deterministic defense-in-depth: a seeded plan
+	// skips the approval gate (plan_source='seeded' sets plan_approved), so this
+	// is the one automated control between such a plan and implementation. The
+	// matched category is wrapped into the returned error for the 422 message.
+	// It runs only on SEEDED plans; an ordinary issue-planned run is never
+	// screened (it still goes through the human approval gate unchanged).
+	ErrPlanUnsafe = errors.New("seeded plan names a prohibited target")
 	// ErrInvalidPlannedCommit rejects a create-time --planned-commit that is not a
 	// plausible git commit sha (PRD #209 M4) → 400. The compare in the worker is
 	// prefix-tolerant with no floor, so a 1-2 char value would spuriously match almost
@@ -1667,7 +1678,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
-	return &ClaimPayload{
+	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,
@@ -1765,7 +1776,105 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
 			CIConfigPaths: run.CiConfigPaths,
 		},
-	}, nil
+	}
+
+	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
+	// a recommendation whose fix another active run is already doing. Best-effort and
+	// self_improve-only; every other kind's claim stays byte-identical to today's.
+	if run.Kind == RunKindSelfImprove {
+		payload.InflightTargets = s.inflightTargets(ctx, run)
+	}
+
+	return payload, nil
+}
+
+// maxInflightTargets caps the self_improve in-flight avoid-set handed to the picker
+// (issue #297): newest-first (ListActiveRunsAll is ORDER BY created_at DESC), so the
+// most recently started runs win the cap. Advisory context, not a hard block.
+const maxInflightTargets = 30
+
+// maxInflightLineLen bounds one assembled in-flight coordinate line (issue #297): the
+// titles are untrusted issue/milestone text of unbounded length, so a single line is
+// trimmed to keep the avoid-set compact on the wire.
+const maxInflightLineLen = 300
+
+// inflightTargets builds the self_improve in-flight avoid-set at claim time (issue
+// #297): every non-terminal run on the SAME repo (excluding this self_improve run
+// itself), formatted as one compact coordinate line each. Best-effort — a query
+// failure yields nil and never fails the claim (mirrors the knownTargets posture in
+// assembleJudgeClaim).
+//
+// ListActiveRunsAll is a GLOBAL, all-repos LIMIT-500 window ordered by recency; the
+// same-repo filter runs in Go over that window. On a very busy multi-tenant fleet a
+// repo's in-flight runs could in principle be crowded out of the 500 newest rows and
+// silently drop from the avoid-set. That is acceptable here: this set is ADVISORY
+// context for the picker (D4), not a correctness gate — a missed entry only means the
+// picker might overlap, which the human MR review still catches. Reusing the existing
+// query is the deliberate trade for no new query and no migration (D5).
+func (s *Service) inflightTargets(ctx context.Context, run store.Run) []string {
+	rows, err := s.q.ListActiveRunsAll(ctx)
+	if err != nil {
+		slog.Warn("self_improve claim: list active runs for in-flight set", "run", run.ID.String(), "error", err)
+		return nil
+	}
+	var out []string
+	for _, row := range rows {
+		r := row.Run
+		if r.ID == run.ID || r.RepoID != run.RepoID {
+			continue // exclude self and other repos
+		}
+		out = append(out, formatInflightLine(r))
+		if len(out) >= maxInflightTargets {
+			break
+		}
+	}
+	return out
+}
+
+// formatInflightLine renders one active run as a single compact coordinate line for the
+// self_improve in-flight avoid-set (issue #297). Shape:
+//
+//	issue #<iid> "<title>" (kind=<kind>, status=<status>) — milestones: <id> "<title>"; ...
+//
+// An issue-less kind (self_improve/ci_fix has a NULL issue_iid) drops the "#<iid>" and
+// leads with "<kind> run" instead. The milestone tail is omitted when MilestonesFrozen is
+// empty or fails to decode. The whole line is trimmed to maxInflightLineLen. All text is
+// untrusted repo content — the worker renders it nonce-fenced, never as instructions.
+func formatInflightLine(r store.Run) string {
+	var b strings.Builder
+	if r.IssueIid.Valid {
+		fmt.Fprintf(&b, "issue #%d", r.IssueIid.Int64)
+		if r.IssueTitle != "" {
+			fmt.Fprintf(&b, " %q", r.IssueTitle)
+		}
+	} else {
+		fmt.Fprintf(&b, "%s run", r.Kind)
+	}
+	fmt.Fprintf(&b, " (kind=%s, status=%s)", r.Kind, r.Status)
+
+	// MilestonesFrozen is data a prior write left behind, not an invariant of this read:
+	// a decode error just omits the milestone tail (best-effort, matching the claim path).
+	if ms, err := DecodeMilestones(r.MilestonesFrozen); err == nil && len(ms) > 0 {
+		b.WriteString(" — milestones:")
+		for i, m := range ms {
+			if i > 0 {
+				b.WriteByte(';')
+			}
+			fmt.Fprintf(&b, " %s %q", m.ID, m.Title)
+		}
+	}
+
+	line := b.String()
+	if len(line) > maxInflightLineLen {
+		// Trim back to a rune boundary so an untrusted multibyte title is never sliced
+		// mid-rune into invalid UTF-8.
+		cut := maxInflightLineLen
+		for cut > 0 && !utf8.RuneStart(line[cut]) {
+			cut--
+		}
+		line = line[:cut]
+	}
+	return line
 }
 
 // errToolPackagesRejected marks a claim whose grandfathered tool packages fell out
@@ -2514,6 +2623,15 @@ type StateRequest struct {
 	// later forge write against the issue description, so it is gated on the run's
 	// kind and validated before it is stored — see clampWirePRDDonePath.
 	PrdDonePath *string `json:"prd_done_path"`
+	// ReportOnly and ReportMd carry issue #279's report-only/evidence completion. A run
+	// whose deliverable is a report/command-output/verification result with NO code change
+	// completes with report_only=true and its findings in report_md, and the worker opens
+	// NO merge request. Both are DECLARATIONS by an untrusted worker on the terminal
+	// `completed` report: kind-gated (issue runs only) and, for report_md, control-char
+	// stripped + secret-scrubbed + length-bounded server-side before storage — see
+	// clampWireReportMd / clampWireReportOnly. Absent on a normal MR completion.
+	ReportOnly *bool   `json:"report_only"`
+	ReportMd   *string `json:"report_md"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
 	// a slice, because the three states differ: absent (nil) = this report says
@@ -2649,10 +2767,17 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// unconditionally on every terminal transition, D4), so only the completed side is
 		// passed here.
 		completedIDs, _ := progressParams(owned.Kind, owned.MilestonesFrozen, req.MilestonesCompleted, nil)
+		// report_md is the deliverable of a report-only completion, so it is stored ONLY
+		// when report_only was accepted — this keeps the column's invariant (non-NULL only
+		// on a report_only run) true even against an untrusted worker that sends report_md
+		// alone. clampWireReportOnly is the issue-run gate report_md then inherits.
+		reportOnly := clampWireReportOnly(owned, req.ReportOnly)
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:          clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath:         clampWirePRDDonePath(owned, req.PrdDonePath),
+			ReportOnly:          reportOnly,
+			ReportMd:            clampWireReportMd(owned, req.ReportMd, reportOnly),
 			MilestonesCompleted: completedIDs,
 			ID:                  runID, WorkerID: pgUUID(wkr.ID),
 		})
@@ -3519,6 +3644,14 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		scrubbed := secretscrub.Scrub(seed.PlanMD)
 		if strings.TrimSpace(scrubbed) == "" {
 			return store.Run{}, ErrPlanEmpty
+		}
+		// issue #280: bright-line safety screen. A seeded plan skips the approval
+		// gate, so screen the scrubbed body for prohibited infrastructure-recon
+		// targets and REJECT at create — the run is never persisted. Runs after the
+		// scrub so a redacted secret can't mask a target, and only on the seeded
+		// path (this whole block is `if seed != nil`); ordinary runs are untouched.
+		if target, unsafe := planpolicy.Screen(scrubbed); unsafe {
+			return store.Run{}, fmt.Errorf("%w: %s", ErrPlanUnsafe, target)
 		}
 		planMD = pgText(scrubbed)
 		planSource = planSourceSeeded

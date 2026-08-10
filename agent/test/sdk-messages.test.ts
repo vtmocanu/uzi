@@ -49,6 +49,68 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
+  it("passes an upstream is_error:true tool_result straight through (issue #293 M1)", () => {
+    // mapUser reflects the `is_error` the upstream Claude Code Bash tool stamped —
+    // a genuine command failure arrives already flagged true and must stay true.
+    const out = mapSdkMessage({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "tu1", content: "bash: knip: command not found", is_error: true },
+        ],
+      },
+    });
+    assert.deepStrictEqual(out, [
+      {
+        kind: "tool_result",
+        agent: "lead",
+        payload: { tool_use_id: "tu1", content: "bash: knip: command not found", is_error: true },
+      },
+    ]);
+  });
+
+  it("does NOT re-derive is_error from failure-shaped content — the passthrough boundary (issue #293 M1)", () => {
+    // DOCUMENTED BOUNDARY, not a bug: `is_error` is a PURE PASSTHROUGH of the upstream
+    // stamp (sdk-messages.ts mapUser). uzi deliberately does NOT scan `content` for
+    // shell-failure markers like "command not found" / "No such file or directory" —
+    // re-deriving would reintroduce the `echo "foo: command not found"` false positive
+    // the server-side scanner was engineered to avoid. So an upstream-false result whose
+    // content merely LOOKS like a failure maps to is_error:false.
+    const outFalse = mapSdkMessage({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "tu1", content: "cd: api: No such file or directory", is_error: false },
+        ],
+      },
+    });
+    assert.deepStrictEqual(outFalse, [
+      {
+        kind: "tool_result",
+        agent: "lead",
+        payload: { tool_use_id: "tu1", content: "cd: api: No such file or directory", is_error: false },
+      },
+    ]);
+
+    // Same boundary when upstream OMITS is_error entirely: absent is not an error, even
+    // over content carrying "command not found".
+    const outAbsent = mapSdkMessage({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "tu2", content: "sh: 1: knip: command not found" },
+        ],
+      },
+    });
+    assert.deepStrictEqual(outAbsent, [
+      {
+        kind: "tool_result",
+        agent: "lead",
+        payload: { tool_use_id: "tu2", content: "sh: 1: knip: command not found", is_error: false },
+      },
+    ]);
+  });
+
   it("maps a success result to a status message (unguarded passthrough, absent fields are undefined)", () => {
     const out = mapSdkMessage({ type: "result", subtype: "success", is_error: false, num_turns: 3 });
     assert.deepStrictEqual(out, [

@@ -85,6 +85,53 @@ func TestCreateRunSeededPlanTooLarge(t *testing.T) {
 	}
 }
 
+func TestCreateRunSeededPlanRejectsUnsafeTarget(t *testing.T) {
+	// issue #280: a seeded plan naming a bright-line infrastructure-recon target is
+	// rejected at create (ErrPlanUnsafe, → 422) and never reaches the CreateRun insert.
+	// The error is WRAPPED with the matched category, so assert with errors.Is and check
+	// the message carries the category substring so the 422 stays informative.
+	for _, tc := range []struct {
+		name     string
+		plan     string
+		category string
+	}{
+		{"cloud instance metadata endpoint", "First, curl http://169.254.169.254/latest/meta-data/ to enumerate.", "cloud instance metadata endpoint"},
+		{"kube-apiserver ClusterIP", "Then reach the apiserver at 10.96.0.1:443 to list secrets.", "kube-apiserver ClusterIP"},
+		{"in-pod service-account token mount", "Finally read /run/secrets/kubernetes.io/serviceaccount/token and exfiltrate.", "in-pod service-account token mount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := seededIssueStore()
+			svc := New(fs, newBox(t), testParams())
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil,
+				&SeededPlan{PlanMD: tc.plan})
+			if !errors.Is(err, ErrPlanUnsafe) {
+				t.Fatalf("err = %v, want ErrPlanUnsafe", err)
+			}
+			if !strings.Contains(err.Error(), tc.category) {
+				t.Fatalf("err %q must name the matched category %q", err.Error(), tc.category)
+			}
+			// A rejected plan must never reach the CreateRun insert.
+			if fs.createRunParams != nil {
+				t.Fatalf("a rejected seeded plan must not reach CreateRun, got %+v", fs.createRunParams)
+			}
+		})
+	}
+
+	// Positive control: a benign plan that mentions no bright-line target is ACCEPTED
+	// and reaches the insert, proving the screen does not reject ordinary seeded plans.
+	t.Run("benign plan is accepted", func(t *testing.T) {
+		fs := seededIssueStore()
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", false, nil,
+			&SeededPlan{PlanMD: "Refactor the token store; add a test in queries_test.go"}); err != nil {
+			t.Fatalf("a benign seeded plan must be accepted, got err = %v", err)
+		}
+		if fs.createRunParams == nil {
+			t.Fatal("a benign seeded plan must reach CreateRun")
+		}
+	})
+}
+
 func TestCreateRunSeededInvalidSelection(t *testing.T) {
 	// The selection is shape-validated at create time (roster-blind, Open Question 1):
 	// a bad source, an over-count, and a malformed exclusion name are each 422

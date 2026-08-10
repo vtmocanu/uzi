@@ -23,6 +23,62 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   a fail-closed worker-side backstop that refuses to push an auto-approved
   fix touching those paths. Validated on GitLab; the CI-config-path lookup
   is a GitLab-only stub on Forgejo/GitHub for now. (PRD #71)
+- **A run can now finish report-only, instead of being forced to open an empty
+  merge request.** When an issue run's deliverable is a report, command output,
+  or a verification result with no code change to land, the lead calls
+  `signal_done` with `report_only: true`; the worker records the findings
+  summary and transcript and opens no merge request. An issue run that reaches
+  `signal_done` with nothing committed and no `report_only` declared now fails
+  with an actionable message instead of opening an empty MR. The run view and
+  `uzi run get` show a neutral "report only" marker in place of the MR chip and
+  render the findings summary as escaped plain text — it is untrusted
+  worker-authored text, server-scrubbed on the way in and never passed through
+  a markdown renderer. (#279) Symmetrically, a `report_only` completion that had
+  already published committed work to a checkpoint ref
+  (`refs/uzi-checkpoints/<branch>`) on origin now fails with an actionable
+  message rather than completing and orphaning that ref. (#299)
+- **A seeded plan naming a bright-line infrastructure-reconnaissance target is
+  now refused before the run is created.** A seeded run (`uzi run create
+  --plan-file`) skips both the planning turn and the human approval gate, so a
+  new deterministic screen (`api/internal/planpolicy`) checks the scrubbed plan
+  text for cloud instance metadata endpoints, the default kube-apiserver
+  ClusterIP, and the in-pod service-account token mount, and rejects a match
+  with a 422 that redirects the caller to the ordinary, gated run flow. Plain
+  issue-planned runs are unaffected. See
+  [ADR-280](adr/0280-seeded-plan-safety-screen.md). (#280)
+- **A green-looking issue-run MR no longer implies gates that never ran.** When
+  a component's JS dependencies fail to install, the run now carries the dirs
+  whose `js_deps` check came back `ok:false` (excluding a `package.json` with
+  no lockfile, which uzi deliberately never installs rather than guesses a
+  package manager for) and renders a "⚠️ Quality gates unverified" note on the
+  MR body naming them — an ANNOTATE-only signal that never blocks a merge. If
+  dependency discovery itself hit its scan cap, the note also warns that
+  components beyond the cap were never checked, so a capped run does not read as
+  fully verified. (#293)
+- **The self-improvement picker now sees what uzi is already working on, and is
+  told to avoid picking the same fix twice.** At claim time, a `self_improve`
+  run is handed a list of every other active run on the connected repo — keyed
+  on run status, not on a branch, so a run that hasn't pushed a branch or
+  opened an MR yet still counts — and the worker prompt renders it in its own
+  untrusted, nonce-fenced block with a directive to skip a recommendation that
+  overlaps and record the skip in the run feed. It's advisory (an LLM picker
+  choosing over a rendered list, not a hard block) and computed fresh per
+  claim, so it reaches every worker immediately even though the prompt code
+  that renders it only takes effect for newly provisioned workers. No
+  migration. (#297)
+
+### Changed
+
+- **`task deadcode` no longer reds on a component whose toolchain the change
+  never touched.** `deadcode:web`/`deadcode:agent` now delegate to
+  `scripts/deadcode-knip.sh`, which loud-SKIPs (exit 0) when the component's
+  knip binary is absent instead of failing closed, so the umbrella
+  `task deadcode`/`task gate` stays green for a contributor who only installed
+  one component's deps. CI arms `UZI_DEADCODE_WEB_REQUIRED=1` /
+  `UZI_DEADCODE_AGENT_REQUIRED=1` on `validate:web`/`validate:agent` (which
+  always `npm ci` knip), turning the same missing-knip case into exit 2 there
+  — a skipped and a passing gate must never look alike, the same shape as
+  `lint:formula`/`lint:shell`/`lint:yaml`. (#293)
 
 ## [0.26.0] - 2026-08-10
 

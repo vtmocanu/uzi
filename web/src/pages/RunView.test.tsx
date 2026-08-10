@@ -8,6 +8,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import {
   PlanPanel,
   SeededPlanPanel,
@@ -20,8 +21,10 @@ import {
   RunFailureReason,
   HealthFlag,
   LimitWaitPanel,
+  RunView,
   derivePlanRevision,
 } from "./RunView";
+import { useRunStream } from "../lib/useRunStream";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
 // and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
@@ -61,6 +64,14 @@ vi.mock("../lib/api", async (importOriginal) => {
   };
 });
 const mockApi = vi.mocked(api);
+
+// issue #279: the report-only surfaces (hero chip + Findings panel) live inline in the
+// RunView PAGE, not in an exported sub-component, so those cases render the whole page.
+// useRunStream is the page's only data source; mock it so a test can hand it a run
+// directly (the real hook opens a websocket). useRunStream is used ONLY by RunView, so
+// this mock does not touch the sub-component tests above.
+vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
+const mockUseRunStream = vi.mocked(useRunStream);
 
 afterEach(() => {
   cleanup();
@@ -470,6 +481,128 @@ describe("RunCompletedLine — the worker-supplied branch carries no format char
   });
 });
 
+describe("RunCompletedLine — report-only deliverable (issue #279)", () => {
+  it("names the report-only deliverable and points to findings when report_md is present", () => {
+    const { container } = render(
+      <RunCompletedLine
+        run={run({ report_only: true, branch: null, mr_iid: null, report_md: "All checks passed." })}
+        duration="3m"
+      />,
+    );
+    expect(container.textContent).toContain("Ran for 3m");
+    expect(container.textContent).toContain("Report only — no merge request; findings below.");
+  });
+
+  it("does not promise findings below when report_md is empty (no dangling pointer)", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ report_only: true, branch: null, mr_iid: null })} duration="3m" />,
+    );
+    expect(container.textContent).toContain("Report only — no merge request.");
+    expect(container.textContent).not.toContain("findings below");
+  });
+
+  it("suppresses the branch clause on a report-only run (mutually exclusive)", () => {
+    // Defensive: a report_only completion pushes no branch, but the clause must not render a
+    // contradictory "Branch … Report only" line even if a branch value somehow rode along.
+    const { container } = render(
+      <RunCompletedLine run={run({ report_only: true, branch: "agent/issue-9", mr_iid: null })} duration="3m" />,
+    );
+    expect(container.textContent).toContain("Report only — no merge request");
+    expect(container.textContent).not.toContain("Branch");
+  });
+
+  it("does not name a report-only deliverable for a normal completion", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42 })} duration="3m" mrState="merged" />,
+    );
+    expect(container.textContent).not.toContain("Report only");
+  });
+});
+
+// issue #279: the completed-hero "report only" chip and the Findings panel are inline in
+// the RunView page. These render the whole page (useRunStream mocked) and assert the
+// UNTRUSTED report_md is escaped plain text, never a live markup sink.
+describe("RunView report-only surfaces (issue #279)", () => {
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    // JudgePanel fetches its own review on mount; a null review settles it into the
+    // never-judged empty state, which is irrelevant to these assertions.
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders the 'report only' chip, the deliverable line, and the escaped findings", async () => {
+    const { container } = renderPage({
+      status: "completed",
+      report_only: true,
+      report_md: "No unscoped queries found. Two admin reports read cross-tenant by design.",
+      branch: null,
+      mr_iid: null,
+      mr_web_url: null,
+      started_at: "2026-01-01T00:00:00Z",
+      finished_at: "2026-01-01T00:03:00Z",
+    });
+    expect(await screen.findByText("report only")).toBeTruthy();
+    expect(container.textContent).toContain("Report only — no merge request; findings below.");
+    expect(screen.getByText("Findings")).toBeTruthy();
+    expect(
+      screen.getByText("No unscoped queries found. Two admin reports read cross-tenant by design."),
+    ).toBeTruthy();
+  });
+
+  it("renders an HTML/markdown payload in report_md as literal text, never as markup", async () => {
+    const payload = '<img src=x onerror="alert(1)"> [pwn](javascript:alert(1))';
+    const { container } = renderPage({
+      status: "completed",
+      report_only: true,
+      report_md: payload,
+      branch: null,
+      mr_iid: null,
+      mr_web_url: null,
+    });
+    // The payload is present verbatim as text …
+    expect(await screen.findByText(payload)).toBeTruthy();
+    // … and nothing in the rendered tree became a live sink from it.
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector('a[href^="javascript"]')).toBeNull();
+  });
+
+  it("shows the MR button and no report-only chip for a normal completion", async () => {
+    const mrUrl = "https://gitlab.example.com/g/p/-/merge_requests/42";
+    const { container } = renderPage({
+      status: "completed",
+      report_only: false,
+      branch: "agent/issue-87",
+      mr_iid: 42,
+      mr_state: "merged",
+      mr_web_url: mrUrl,
+    });
+    // The MR link is the run's deliverable; its label is split across nodes + an icon,
+    // so anchor on the href and the concatenated text.
+    const link = await waitFor(() => {
+      const a = container.querySelector(`a[href="${mrUrl}"]`);
+      if (!a) throw new Error("MR link not rendered yet");
+      return a;
+    });
+    expect(link.textContent).toContain("Open merge request");
+    expect(screen.queryByText("report only")).toBeNull();
+    expect(screen.queryByText("Findings")).toBeNull();
+  });
+});
+
 describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
     const { container } = render(
@@ -535,9 +668,11 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(mockApi.getRunReview).toHaveBeenCalledWith("r1");
   });
 
-  it("renders review free text as escaped text, never HTML", async () => {
-    // A rationale containing markup must appear as literal characters (React escapes
-    // it) — proving no dangerouslySetInnerHTML / markdown parsing on judge output.
+  it("renders review markdown as elements while keeping raw HTML inert", async () => {
+    // summary_md now renders through the shared hardened <Markdown> (same as plan_md):
+    // markdown syntax becomes real elements, but raw HTML stays INERT text because the
+    // pipeline carries NO rehype-raw. So `**not bold**` is a <strong>, while the
+    // <img onerror> string never becomes an <img> node (nothing to fire onerror on).
     mockApi.getRunReview.mockResolvedValue({
       pending_judge: null,
       review: review({
@@ -549,13 +684,126 @@ describe("JudgePanel (PRD #46 M4)", () => {
       <JudgePanel run={run({ status: "completed" })} />,
     );
 
-    expect(
-      await screen.findByText(
-        /<img src=x onerror=alert\(1\)> \*\*not bold\*\*/,
-      ),
-    ).toBeTruthy();
-    // The markup did not become a real element.
+    // The bold markdown became a real <strong>.
+    const strong = await waitFor(() => {
+      const el = container.querySelector("strong");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(strong.textContent).toBe("not bold");
+    // The raw HTML did NOT become a real element / active script.
     expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("script")).toBeNull();
+    // The <img ...> markup survives as inert text on the page.
+    expect(container.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  it("renders summary_md and rationale_md markdown as elements (bold/list/code/link)", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "**bold** and `code`\n\n- bullet\n\n[label](https://example.com)",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "**why** and `cmd`\n\n- reason\n\n[docs](https://example.com)",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+
+    // Both surfaces (summary + the one rationale) render markdown elements.
+    const strongs = [...container.querySelectorAll("strong")].map((s) => s.textContent);
+    expect(strongs).toContain("bold");
+    expect(strongs).toContain("why");
+    const codes = [...container.querySelectorAll("code")].map((c) => c.textContent);
+    expect(codes).toContain("code");
+    expect(codes).toContain("cmd");
+    const items = [...container.querySelectorAll("li")].map((li) => (li.textContent ?? "").trim());
+    expect(items).toContain("bullet");
+    expect(items).toContain("reason");
+    // Links are real anchors, forced external.
+    const links = [...container.querySelectorAll("a")].filter(
+      (a) => a.getAttribute("href") === "https://example.com",
+    );
+    expect(links.length).toBe(2);
+    for (const a of links) {
+      expect(a.getAttribute("target")).toBe("_blank");
+      expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+  });
+
+  it("neutralizes dangerous URL schemes in judge markdown links", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "[x](javascript:alert(1)) and [y](data:text/html,evil)",
+        recommendations: [],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+    // No active link carries a dangerous scheme — urlTransform + schemeIsDangerous strip it.
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(container.querySelector('a[href^="data:"]')).toBeNull();
+  });
+
+  it("keeps raw <script>/<img onerror> in summary_md AND rationale_md inert", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "<script>alert(1)</script> and <img src=x onerror=alert(1)>",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "<script>alert(2)</script> and <img src=y onerror=alert(2)>",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+    // No rehype-raw: neither surface produces a live script or image node.
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("renders nothing for empty/whitespace summary_md and rationale_md", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "   ",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // The panel still renders (positive anchor) but the .trim() guards suppress the
+    // empty markdown surfaces entirely — no empty prose box on either field.
+    await screen.findByText("Issues found");
+    expect(container.querySelector(".judge-prose")).toBeNull();
   });
 
   // Issue #124. React escaping (pinned above) does not touch Unicode format characters,

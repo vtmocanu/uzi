@@ -143,6 +143,16 @@ type ClaimPayload struct {
 	// Inert data rendered nonce-fenced by the agent — never instructions.
 	KnownImproveUziTargets []string `json:"known_improve_uzi_targets,omitempty"`
 
+	// InflightTargets is a best-effort list of work already IN FLIGHT on the same repo
+	// at claim time (issue #297), attached only to a self_improve claim so the picker
+	// avoids selecting a recommendation whose fix another active run is already doing.
+	// Each entry is one compact coordinate line (issue iid + title + kind/status +
+	// frozen milestone titles). UNTRUSTED CONTENT — the titles are issue/milestone text
+	// anyone who can file an issue can influence — rendered nonce-fenced by the agent,
+	// never as instructions. omitempty: an empty set (nothing in flight) is normal and
+	// must not appear on the wire; an older worker ignores it.
+	InflightTargets []string `json:"inflight_targets,omitempty"`
+
 	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
 	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted

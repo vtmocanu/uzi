@@ -155,6 +155,31 @@ func TestProposalCardScrubsAndBounds(t *testing.T) {
 	}
 }
 
+// The proposal card's description field shares renderChatBody (PRD #292 M2), so a
+// markdown description is RENDERED into Slack mrkdwn on the card — bold becomes *bold*,
+// a list becomes • bullets — while an injected mention stays inert (SlackMrkdwn owns its
+// escaping). The chrome title stays on cardField/EscapeMrkdwn (Decision 2), untouched.
+func TestProposalCardRendersDescriptionMarkdown(t *testing.T) {
+	runID, propID := uuid.New(), uuid.New()
+	fp := &fakePoster{}
+	n := NewNotifier(chatMsgStore(runID), fp, fixedBase, nil)
+
+	feed(n, runID, frame("proposal",
+		`{"id":"`+propID.String()+`","title":"Add retries",`+
+			`"description":"**do** this\n\n- one\n- two","repo_path":"grp/repo"}`))
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one card, got %+v", fp.blocks)
+	}
+	body := fp.blocks[0].sectionText
+	if !strings.Contains(body, "*do*") {
+		t.Errorf("**do** in the description must render as *do*, got %q", body)
+	}
+	if !strings.Contains(body, "• one") || !strings.Contains(body, "• two") {
+		t.Errorf("a markdown list in the description must render as • bullets, got %q", body)
+	}
+}
+
 // Create files the issue via the ownership-scoped service and edits the card to the
 // created issue; a SECOND press (already resolved) gets the already-handled edit and
 // files nothing more (claim-first → exactly one issue).

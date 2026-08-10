@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { SecretMeta } from "./api";
-import { hasAnthropicToken as hasToken } from "./hasToken";
+import { anthropicTokenCount, hasAnthropicToken as hasToken } from "./hasToken";
 
 function secret(over: Partial<SecretMeta> = {}): SecretMeta {
   return {
@@ -60,5 +60,38 @@ describe("hasToken (Dashboard / Board / IssueView gates)", () => {
 
   it("ignores secrets of another kind", () => {
     expect(hasToken([secret({ kind: "openai_token" })])).toBe(false);
+  });
+});
+
+// PRD #295: the Runs-list credential badge gates on ">1 Anthropic token", so the
+// count is the shared, tested predicate rather than an inlined `.length > 1` at the
+// call site. The `> 1` comparison lives in RunsList; this asserts the count itself.
+describe("anthropicTokenCount (Runs-list credential-badge gate)", () => {
+  it("is 0 for a token-less user", () => {
+    expect(anthropicTokenCount([])).toBe(0);
+  });
+
+  it("is 1 for the single-token user (badge stays hidden — nothing to say)", () => {
+    expect(anthropicTokenCount([secret()])).toBe(1);
+  });
+
+  it("counts every anthropic token for a multi-token user", () => {
+    expect(
+      anthropicTokenCount([
+        secret(),
+        secret({ id: "sec-2", label: "console", is_default: false }),
+      ]),
+    ).toBe(2);
+  });
+
+  // The gate must count only anthropic tokens: a user with one anthropic token and
+  // some other secret kind is still a single-token user and must see no badge.
+  it("ignores secrets of another kind", () => {
+    expect(
+      anthropicTokenCount([
+        secret(),
+        secret({ id: "sec-oai", kind: "openai_token" }),
+      ]),
+    ).toBe(1);
   });
 });
