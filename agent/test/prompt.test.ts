@@ -12,6 +12,8 @@ import {
   buildPlanPrompt,
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
+  CI_CONFIG_MARKER,
+  isCIConfigPlan,
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
   PRD_LIFECYCLE_APPEND,
@@ -641,9 +643,11 @@ describe("buildCIFixPlanPrompt", () => {
     assert.ok(injectionIdx > fenceOpenIdx && injectionIdx < fenceCloseIdx, "log content sits inside the fence");
   });
 
-  it("links the failing pipeline and offers both a fix plan and a not_code verdict", () => {
+  it("links the failing pipeline and offers a fix plan, a ci_config verdict, and a not_code verdict", () => {
     assert.match(prompt, /https:\/\/gl\/p\/-\/pipelines\/4200/);
     assert.match(prompt, new RegExp(NOT_CODE_MARKER));
+    // PRD #71 M3: the CI-config-edit option is present alongside the not_code one.
+    assert.match(prompt, new RegExp(CI_CONFIG_MARKER));
     assert.match(prompt, /submit_plan/);
   });
 
@@ -709,6 +713,23 @@ describe("isNotCodePlan", () => {
     // A fix plan that merely mentions the phrase later is NOT a not_code verdict.
     assert.equal(isNotCodePlan("## Fix\n- restore the nil guard\n\nnot a not_code case"), false);
     assert.equal(isNotCodePlan(""), false);
+  });
+});
+
+describe("isCIConfigPlan (PRD #71 M3)", () => {
+  it("detects the marker only as the first non-blank line", () => {
+    assert.equal(isCIConfigPlan(`${CI_CONFIG_MARKER}\n...diagnosis`), true);
+    assert.equal(isCIConfigPlan(`\n\n  ${CI_CONFIG_MARKER}  \nthe plan`), true);
+    // A code-only fix plan is not a ci_config verdict.
+    assert.equal(isCIConfigPlan("# Fix\n- restore the nil guard"), false);
+    assert.equal(isCIConfigPlan(""), false);
+  });
+
+  it("does not cross-classify with the not_code marker", () => {
+    // The two markers are distinct: a not_code plan is NOT a ci_config plan and
+    // vice versa.
+    assert.equal(isCIConfigPlan(`${NOT_CODE_MARKER}\nflaky runner`), false);
+    assert.equal(isNotCodePlan(`${CI_CONFIG_MARKER}\nedit .gitlab-ci.yml`), false);
   });
 });
 
