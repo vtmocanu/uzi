@@ -42,8 +42,21 @@ var mrkdwnParser = goldmark.New(
 //
 // Empty or whitespace-only input returns "".
 func SlackMrkdwn(s string) string {
+	out, _ := SlackMrkdwnBlock(s)
+	return out
+}
+
+// SlackMrkdwnBlock is SlackMrkdwn plus a signal reporting whether the render emitted
+// a fenced/indented code block. A caller that blockquotes the body line-by-line needs
+// this: Slack's per-line "> " prefix injected into a fenced block's interior lines
+// breaks code rendering, so such a body must be emitted as a plain section instead
+// (PRD #292 Decision 6). The signal comes from the AST walk (a real CodeBlock/
+// FencedCodeBlock node was rendered), NOT from scanning the output for a ``` run — a
+// literal ``` in PROSE is a Text node, escaped-but-not-fenced, and must not be
+// mistaken for a code fence.
+func SlackMrkdwnBlock(s string) (rendered string, hasCodeBlock bool) {
 	if strings.TrimSpace(s) == "" {
-		return ""
+		return "", false
 	}
 	src := []byte(s)
 	w := &mrkdwnWalker{src: src, atLineStart: true}
@@ -52,7 +65,7 @@ func SlackMrkdwn(s string) string {
 	// The walk leaves the builder with a trailing newline after the final block;
 	// trim it (and any trailing quote padding) so single-line inputs round-trip
 	// cleanly (e.g. "# H" -> "*H*", not "*H*\n").
-	return strings.TrimRight(w.sb.String(), "\n ")
+	return strings.TrimRight(w.sb.String(), "\n "), w.sawCodeBlock
 }
 
 // escapeMrkdwnText is the single &<>-escaping primitive the walker routes ALL
@@ -91,6 +104,10 @@ type mrkdwnWalker struct {
 	sb          strings.Builder
 	quoteDepth  int
 	atLineStart bool
+	// sawCodeBlock records that a fenced/indented code block was rendered, so a caller
+	// (notificationBlocks) can decide NOT to blockquote a body whose fence the per-line
+	// "> " prefix would corrupt (PRD #292 Decision 6).
+	sawCodeBlock bool
 }
 
 // out writes a chunk that contains no newline, emitting the blockquote prefix first
@@ -234,12 +251,14 @@ func (w *mrkdwnWalker) visit(n ast.Node, entering bool) (ast.WalkStatus, error) 
 
 	case *ast.FencedCodeBlock:
 		if entering {
+			w.sawCodeBlock = true
 			w.emitCodeBlock(node)
 		}
 		return ast.WalkSkipChildren, nil
 
 	case *ast.CodeBlock:
 		if entering {
+			w.sawCodeBlock = true
 			w.emitCodeBlock(node)
 		}
 		return ast.WalkSkipChildren, nil

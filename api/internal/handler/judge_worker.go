@@ -333,9 +333,13 @@ func recommendationCategoryChips(recs []workersvc.ReviewRecommendation) []string
 	return chips
 }
 
-// reviewNotificationBody renders the one-line summary shown in the inbox row and the
-// Slack DM: the verdict, how many recommendations came with it, and (when present) the
-// scrubbed summary preview.
+// reviewNotificationBody renders the one-line summary shown in the web inbox row
+// (Payload["body"]): the verdict, how many recommendations came with it, and (when
+// present) the scrubbed summary preview. The summary preview is now MULTI-LINE (PRD #292
+// M4 preserves its newlines for the Slack blockquote), so its whitespace/newlines are
+// collapsed to single spaces HERE, at the append, to keep the inbox row a one-liner
+// (Decision 7 / SC4). The web inbox reads only payload.body — never payload.summary — so
+// the multi-line summary never reaches it.
 func reviewNotificationBody(verdict string, recCount int, summary string) string {
 	line := "verdict: " + verdict
 	if recCount == 1 {
@@ -344,7 +348,7 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 		line += fmt.Sprintf(" — %d recommendations", recCount)
 	}
 	if summary != "" {
-		line += ": " + summary
+		line += ": " + strings.Join(strings.Fields(summary), " ")
 	}
 	return line
 }
@@ -356,21 +360,25 @@ func reviewNotificationBody(verdict string, recCount int, summary string) string
 // longer preview. The run page still holds the full text.
 const reviewSummaryPreviewMaxRunes = 600
 
-// reviewSummaryPreview renders the judge's summary for the notification: whitespace
-// (incl. newlines) collapsed to a single space, secret-scrubbed (belt and suspenders —
-// it is already scrubbed at ingest, but the producer contract re-scrubs every free
-// field copied onto the verbatim payload path), then rune-capped. Scrub before the cap
-// so a redaction marker can't be split.
+// reviewSummaryPreview renders the judge's summary for the notification: trimmed but
+// with its NEWLINES PRESERVED (PRD #292 M4), secret-scrubbed (belt and suspenders — it
+// is already scrubbed at ingest, but the producer contract re-scrubs every free field
+// copied onto the verbatim payload path), then rune-capped. Newlines are kept so the
+// Slack blockquote/list structure survives when the body is rendered as mrkdwn (the
+// output feeds SlackRender.Body); the web inbox one-liner collapses them itself in
+// reviewNotificationBody (Decision 7). Scrub the FULL text before the cap so no secret
+// byte can survive the cut regardless of where it lands — the cap may split a redaction
+// marker, but a split marker leaks nothing; only unscrubbed secret bytes would.
 func reviewSummaryPreview(summaryMd string) string {
-	oneLine := slacksvc.ScrubSecrets(strings.Join(strings.Fields(summaryMd), " "))
-	if oneLine == "" {
+	text := slacksvc.ScrubSecrets(strings.TrimSpace(summaryMd))
+	if text == "" {
 		return ""
 	}
-	runes := []rune(oneLine)
+	runes := []rune(text)
 	if len(runes) > reviewSummaryPreviewMaxRunes {
 		return string(runes[:reviewSummaryPreviewMaxRunes]) + "…"
 	}
-	return oneLine
+	return text
 }
 
 // recommendationCategories is the list of recommendation category enums (closed set,
