@@ -95,10 +95,28 @@ commit is not pushed — it is discarded when the runner clone is torn down. The
 inverse guard. This mirrors the `not_code` precedent, and the lead prompt frames report_only
 as "no code change to land"; documented here, not guarded.
 
-**Accepted edge — checkpoint/resume.** A `report_only` declared AFTER a mid-run checkpoint
-leaves the checkpoint refs published but un-landed (no branch, no MR — see
-[ADR-0122](0122-checkpoint-push-broker.md)). A genuine zero-code run never checkpoints, so
-this is noted as accepted rather than guarded.
+**Checkpoint/resume — now ENFORCED (issue #299), was an accepted edge.** A `report_only`
+declared AFTER a mid-run checkpoint would leave the checkpoint refs published but un-landed
+(no branch, no MR — see [ADR-0122](0122-checkpoint-push-broker.md)) — orphaned
+`refs/uzi-checkpoints/*` on origin. This ADR originally rested that on the convention "a
+genuine zero-code run never checkpoints" and left it unguarded. Issue #299 makes the
+convention an enforced check at completion time: the `report_only` path in
+`agent/src/runner.ts` now FAILS with an actionable reason (mirroring the undeclared-empty-diff
+FAIL above) when the run published a checkpoint, so a report-only completion can no longer
+orphan one. Detection is the UNION of two worker-side signals — `lastPublishedTip` (a
+checkpoint THIS worker confirmably landed mid-run) OR `git.hasCheckpointRef` (origin's
+`refs/uzi-checkpoints/<branch>`, mirrored into the worker bare at fetch time, catching a
+checkpoint a PRIOR/cross-worker attempt landed). A genuine zero-code run trips neither
+(it never invokes the checkpoint callback — the "never checkpoints" convention above — so
+nothing is ever published) and still completes report-only. No
+checkpoint-ref *deletion* capability was added: the push broker only ever does a non-forced
+push, and refusing loudly (converting a silent remote orphan into an actionable terminal) is
+proportionate where a delete-ref RPC would be a new worker→api→forge trust-boundary
+capability. Deliberately CONSERVATIVE: because `hasCheckpointRef` keys on the branch name and
+nothing prunes `refs/uzi-checkpoints/<branch>` when a run's MR lands, the rare
+branch-reuse-with-a-lingering-ref case can refuse a genuinely-empty report-only run — but the
+ref it names is itself orphaned residue an operator should see, so erring toward surfacing it
+is the intended direction.
 
 **`report_md` rides the shared `RunDTO` embed.** `RunListItemDTO` embeds `RunDTO`
 (`api/internal/apitypes/run.go`), so `report_only`/`report_md` appear on the runs LIST as

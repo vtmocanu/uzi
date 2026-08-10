@@ -18,7 +18,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `uzi run get` show a neutral "report only" marker in place of the MR chip and
   render the findings summary as escaped plain text — it is untrusted
   worker-authored text, server-scrubbed on the way in and never passed through
-  a markdown renderer. (#279)
+  a markdown renderer. (#279) Symmetrically, a `report_only` completion that had
+  already published committed work to a checkpoint ref
+  (`refs/uzi-checkpoints/<branch>`) on origin now fails with an actionable
+  message rather than completing and orphaning that ref. (#299)
 - **A seeded plan naming a bright-line infrastructure-reconnaissance target is
   now refused before the run is created.** A seeded run (`uzi run create
   --plan-file`) skips both the planning turn and the human approval gate, so a

@@ -820,6 +820,17 @@ export class GitCache {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
   }
 
+  /** issue #299: true when origin's brokered checkpoint ref for `branch` is present in
+   *  the worker bare — i.e. some attempt of this run published committed work to
+   *  `refs/uzi-checkpoints/<branch>`. `fetch()` mirrors those refs into the bare
+   *  best-effort on every fetch, so this catches a checkpoint any PRIOR/cross-worker
+   *  attempt landed; the runner pairs it with its own `lastPublishedTip` to also catch a
+   *  checkpoint THIS worker published mid-run (not yet mirrored locally). The report-only
+   *  completion guard uses the union to refuse orphaning a published checkpoint. */
+  async hasCheckpointRef(barePath: string, branch: string): Promise<boolean> {
+    return this.refExists(barePath, `refs/uzi-checkpoints/${branch}`);
+  }
+
   /** True when `ancestorRef` is an ancestor of (or equal to) `descendantRef` — i.e.
    *  `descendantRef` strictly descends from it (PRD #218 M2). Exit 0 = ancestor, 1 =
    *  not; any other failure (a missing ref) answers false, so a broken candidate never

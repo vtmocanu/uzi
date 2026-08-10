@@ -936,6 +936,44 @@ export class RunRunner {
       // NOT double-call it here (the not_code block's second call is a redundancy — not
       // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
       if (result.reportOnly) {
+        // issue #299: a report-only completion opens NO branch and NO MR, so if this run
+        // ALREADY published committed work to a checkpoint ref on origin
+        // (refs/uzi-checkpoints/<branch>), completing report-only would leave that ref
+        // orphaned — un-landed, with nothing to supersede it. ADR-0279 documented this as
+        // an accepted edge resting on the convention "a genuine zero-code run never
+        // checkpoints"; enforce that convention here instead. Detection is the UNION of
+        // two signals, each covering a gap the other has:
+        //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
+        //     on a landed publish), which may not yet be mirrored into the bare's local ref.
+        //   - hasCheckpointRef: origin's checkpoint ref, mirrored into the bare at
+        //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
+        // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
+        // so it still completes report-only below. Refuse loudly, mirroring the
+        // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
+        const publishedCheckpoint =
+          lastPublishedTip !== undefined ||
+          (await this.git.hasCheckpointRef(barePath, runnerClone.branch));
+        if (publishedCheckpoint) {
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+            },
+          });
+          await batcher.close();
+          await reportState({
+            status: "failed",
+            failure_reason:
+              "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
+              runnerClone.branch +
+              ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+          });
+          runLog.info("run failed: report_only declared after a checkpoint was published", {
+            run_id: runId,
+          });
+          return;
+        }
         batcher.emit({
           kind: "status",
           agent: "worker",
