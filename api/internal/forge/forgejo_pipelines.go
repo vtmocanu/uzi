@@ -181,6 +181,13 @@ func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxByt
 	return f.redact.string(string(data)), nil
 }
 
+// ProjectCIConfigPath returns the empty string: Gitea/Forgejo Actions has no
+// ci_config_path override, so callers get the driver's default. Runtime auto-fix
+// parity is GitLab-only (PRD #71 Out-of-Scope); this satisfies the interface.
+func (f *forgejo) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
+
 // toForgejoPipeline maps a gitea Actions workflow run to the neutral Pipeline.
 // Status is the raw Actions run-status enum, passed through for M8's merged map (see
 // the file header). Forgejo Actions has no created-vs-updated split, so StartedAt /

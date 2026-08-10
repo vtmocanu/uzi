@@ -95,6 +95,16 @@ type BoardPref struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CiAutofixAttempt struct {
+	RepoID         uuid.UUID          `json:"repo_id"`
+	Ref            string             `json:"ref"`
+	AttemptCount   int32              `json:"attempt_count"`
+	LastSignature  pgtype.Text        `json:"last_signature"`
+	LastPipelineID pgtype.Int8        `json:"last_pipeline_id"`
+	HaltNotified   bool               `json:"halt_notified"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CliAuthRequest struct {
 	ID            uuid.UUID          `json:"id"`
 	CodeChallenge string             `json:"code_challenge"`
@@ -332,6 +342,7 @@ type Run struct {
 	LimitDeadSecretID     pgtype.UUID        `json:"limit_dead_secret_id"`
 	ReportOnly            bool               `json:"report_only"`
 	ReportMd              pgtype.Text        `json:"report_md"`
+	CiConfigPaths         []string           `json:"ci_config_paths"`
 }
 
 type RunMessage struct {
@@ -472,6 +483,7 @@ type User struct {
 	JudgeEnabled           bool               `json:"judge_enabled"`
 	JudgeAnthropicSecretID pgtype.UUID        `json:"judge_anthropic_secret_id"`
 	WaitOnLimit            bool               `json:"wait_on_limit"`
+	CiAutofixEnabled       bool               `json:"ci_autofix_enabled"`
 }
 
 type UserSecret struct {

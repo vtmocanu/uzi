@@ -390,6 +390,11 @@ export interface ClaimConfig {
    *  provisioning (today's behavior). The server resolves this; the worker only
    *  installs it (in a secret-scrubbed subprocess). */
   tool_packages?: string[];
+  /** PRD #71 M5: server-produced protected CI-config paths (globs) for THIS ci_fix
+   *  run — the static CI_AUTOFIX_CONFIG_PATHS defaults unioned with the project's
+   *  configured ci_config_path. The pre-push guard refuses an AUTO-approved ci_fix
+   *  diff that touches any of these. omitted/empty for non-ci_fix runs. */
+  ci_config_paths?: string[];
   /** Repo devbox.json packages opt-in (PRD #18 M5): whether the worker may union
    *  the repo's own devbox.json packages (packages-only) into the provisioned set.
    *  Delivered from M3 but always false until M5 wires the per-repo toggle. */

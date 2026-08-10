@@ -460,6 +460,12 @@ type Forge interface {
 	// the returned tail is NOT itself a secret-safe log scrubber for arbitrary
 	// third-party tokens — see the snapshot scrubber in the ci-fix handler.
 	JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error)
+	// ProjectCIConfigPath returns the project's configured CI config path (GitLab
+	// ci_config_path); empty string means the driver's default (.gitlab-ci.yml). It
+	// carries no secret material — a project's ci_config_path is a repo-relative
+	// glob, not a token — and any driver error is PAT-redacted like every other
+	// method. Used by the PRD #71 auto-fix guard to know which paths a fix may touch.
+	ProjectCIConfigPath(ctx context.Context, projectID int64) (string, error)
 }
 
 // New constructs a driver for the given forge type. baseURL must already be

@@ -48,6 +48,9 @@ func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, [
 	return nil
 }
 func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
+func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
 func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
 	return nil, nil
 }

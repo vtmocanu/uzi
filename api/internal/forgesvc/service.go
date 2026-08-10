@@ -16,6 +16,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -104,6 +105,10 @@ type IssueStore interface {
 	// CI-fix verification (PRD #6): stamp a fix run's verdict from its post-fix pipeline.
 	FindCIFixStampTarget(ctx context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error)
 	StampFixVerdict(ctx context.Context, arg store.StampFixVerdictParams) (int64, error)
+	// CI-autofix loop guard (PRD #71 M4): reset the attempt ledger on a green
+	// pipeline, and evict ledger rows for refs that left the watch set on reconcile.
+	DeleteCIAutofixAttempt(ctx context.Context, arg store.DeleteCIAutofixAttemptParams) (int64, error)
+	DeleteCIAutofixAttemptsNotIn(ctx context.Context, arg store.DeleteCIAutofixAttemptsNotInParams) (int64, error)
 	// Filed→Done sync (PRD #98 M6): the open→closed edge over the freshly-synced issue
 	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
 	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
@@ -130,6 +135,19 @@ type Service struct {
 	box     *secretbox.Box
 	timeout time.Duration
 	labels  LabelConfig
+
+	// notifier lands the "your auto-fix landed" inbox row on the reset-on-green path
+	// (PRD #71 M6). Optional (nil-safe): set via SetNotifier, unset means the landed
+	// notification is skipped — every other pipeline-sync behaviour is unaffected.
+	notifier LandedNotifier
+}
+
+// LandedNotifier lands an inbox notification when a ci_fix run's fix pipeline goes
+// green (PRD #71 M6). *notifysvc.Service satisfies it. Kept as an interface so the
+// sync's core has no hard dependency on notifysvc and the pipeline-sync tests need
+// no notifier.
+type LandedNotifier interface {
+	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
@@ -138,6 +156,11 @@ type Service struct {
 func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
 	return &Service{q: q, box: box, timeout: timeout, labels: labels}
 }
+
+// SetNotifier wires the landed-notification collaborator (PRD #71 M6). Call once at
+// startup, before the poller runs. A nil notifier (the default) disables the landed
+// inbox row; the rest of the sync is unchanged.
+func (s *Service) SetNotifier(n LandedNotifier) { s.notifier = n }
 
 // prdLabel resolves the configured PRD label for the sync filters, falling back
 // to the compiled-in default when unconfigured or on a settings read error (the

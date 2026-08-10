@@ -168,7 +168,10 @@ func (f *apForge) CreateIssueNote(_ context.Context, _, iid int64, body string) 
 func (f *apForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return forge.BotIdentity{}, nil
 }
-func (f *apForge) ListProjects(context.Context) ([]forge.Project, error)    { return nil, nil }
+func (f *apForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
+func (f *apForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", nil
+}
 func (f *apForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
 func (f *apForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
 func (f *apForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {

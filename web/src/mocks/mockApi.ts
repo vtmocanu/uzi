@@ -1489,6 +1489,21 @@ export const mockApi = {
     return delay({ user: { ...u } });
   },
 
+  // ── CI-autofix opt-in (PRD #71) ──────────────────────────────────────────────
+  // Own-user (session identity, never a body id, mirroring the server).
+  setCIAutofixEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.ci_autofix_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+  // Admin per-user toggle: target from the id argument (the path on the server).
+  setUserCIAutofixEnabled: async (id: string, enabled: boolean) => {
+    const u = users.find((x) => x.id === id);
+    if (!u) throw new ApiError(404, "user not found");
+    u.ci_autofix_enabled = enabled;
+    return delay({ user: { ...u } });
+  },
+
   // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
   // Own view filters to the session user; { all: true } shows everyone but only
   // for an admin (else 403, like the server). `unread` is always the caller's own

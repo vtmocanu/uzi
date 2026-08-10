@@ -24,6 +24,10 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
+  // ci_autofix_enabled is the per-user opt-in to automatic CI fixes (PRD #71).
+  // Default false; the user toggles their own from Settings, an admin can force any
+  // user's.
+  ci_autofix_enabled: boolean;
   /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
    *  inherits it, including the three kinds with no start affordance at all
    *  (autopilot, ci_fix, self_improve), which is why the default exists rather than
@@ -2102,6 +2106,10 @@ const realApi = {
   // admin (route-gated); target is the path id, never the body. Returns the user.
   setUserJudgeEnabled: (id: string, enabled: boolean) =>
     request<{ user: User }>("PUT", `/admin/users/${id}/judge`, { enabled }),
+  // Admin per-user CI-autofix toggle (PRD #71): force any user's opt-in. Actor is
+  // admin (route-gated); target is the path id, never the body. Returns the user.
+  setUserCIAutofixEnabled: (id: string, enabled: boolean) =>
+    request<{ user: User }>("PUT", `/admin/users/${id}/ci-autofix`, { enabled }),
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
     request<SettingsResponse>("PUT", "/admin/settings", { settings }),
@@ -2122,6 +2130,10 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —
+  // the body carries no user id. Returns the updated user.
+  setCIAutofixEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/ci-autofix", { enabled }),
   /**
    * PRD #35: flip the current user's DEFAULT for the usage-limit park. Returns the
    * updated user.

@@ -59,6 +59,7 @@ func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job
 	return nil, nil
 }
 func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
+func (f *fakeForge) ProjectCIConfigPath(context.Context, int64) (string, error)    { return "", nil }
 
 // Unused-by-checker methods.
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }

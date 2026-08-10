@@ -342,6 +342,13 @@ type Config struct {
 	// size (jobs × tail) frozen onto a ci_fix run at queue time.
 	CIFixMaxJobs      int
 	CIFixLogTailBytes int
+	// CIAutofixMaxAttempts caps how many times the server-side auto-fix guard (PRD
+	// #71) will re-queue a ci_fix for the same recurring failure before it stops
+	// retrying. CIAutofixConfigPaths is the guard's watch set: the CI-config glob
+	// patterns a change must touch for a fix to count as a CI-config edit (unioned at
+	// queue time with the project's own ci_config_path). Defaulted below when unset.
+	CIAutofixMaxAttempts int
+	CIAutofixConfigPaths []string
 
 	// Slack integration ENV overlay (PRD #25). When set, each wins over its DB
 	// app_settings row (enforced in the settings cache) and the webui field renders
@@ -758,6 +765,11 @@ func Load() (Config, error) {
 	cfg.CIWatchMaxRefs = parseNonNegInt("CI_WATCH_MAX_REFS", 20)
 	cfg.CIFixMaxJobs = parseInt("CI_FIX_MAX_JOBS", 10)
 	cfg.CIFixLogTailBytes = parseInt("CI_FIX_LOG_TAIL_BYTES", 32768)
+	cfg.CIAutofixMaxAttempts = parseInt("CI_AUTOFIX_MAX_ATTEMPTS", 2)
+	cfg.CIAutofixConfigPaths = parseCommaList(os.Getenv("CI_AUTOFIX_CONFIG_PATHS"))
+	if len(cfg.CIAutofixConfigPaths) == 0 {
+		cfg.CIAutofixConfigPaths = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml"}
+	}
 
 	// Slack ENV overlay (PRD #25). The tokens are passed through verbatim (their
 	// live validity is surfaced by slacksvc when it connects, not at boot); the

@@ -51,6 +51,8 @@ import {
   type CheckRunner,
 } from "./self-improve.js";
 import { installJsDeps } from "./js-deps.js";
+import { isCIConfigPlan } from "./prompt.js";
+import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -649,6 +651,15 @@ export class RunRunner {
         });
       }
 
+      // PRD #71 M5: did a HUMAN approve this ci_fix plan? On a PRE-APPROVED RESUME the gate
+      // does not run this execution, so derive from durable claim state. The server CLEARS
+      // auto_approve the moment a run PARKS at the plan gate (SetRunAwaitingApproval,
+      // symmetric with the seeded plan_source='agent' decouple), so a resumed run still
+      // carrying auto_approve=true was AUTO-approved WITHOUT ever parking (no human), while
+      // auto_approve=false means either a manual run or an auto run that parked and was
+      // human-approved. A fresh run's gate closure overwrites this precisely.
+      let ciFixHumanApproved = (claim.auto_approve ?? false) !== true;
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -712,8 +723,14 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: (planMd, milestones) =>
-          this.gatePlan(
+        gatePlan: async (planMd, milestones) => {
+          // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
+          // short-circuit — it parks for human review even on an auto-triggered run. We
+          // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
+          // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
+          const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
+          const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate;
+          const verdict = await this.gatePlan(
             runId,
             planMd,
             milestones,
@@ -721,9 +738,14 @@ export class RunRunner {
             steering,
             reportState,
             runLog,
-            claim.auto_approve ?? false,
+            effectiveAutoApprove,
             repoAgents,
-          ),
+          );
+          // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
+          // (not the auto short-circuit). Read by the pre-push guard below.
+          ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
+          return verdict;
+        },
         // PRD #88 clarification park: surface the question, post awaiting_input, and
         // return the answer the steering channel resolves. An autopilot claim
         // short-circuits to a sentinel answer (see askUser) — such a run never parks.
@@ -1126,6 +1148,38 @@ export class RunRunner {
         promptGuardSection = guardCriticalMrSection(
           changed === null ? null : flagGuardPaths(changed),
         );
+      }
+
+      // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
+      // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
+      // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
+      // and was approved) is never blocked — a human was in the loop, as in the manual flow.
+      if (claim.kind === "ci_fix" && !ciFixHumanApproved) {
+        // Capture the narrowed bare path in a const the SAME way the push block does
+        // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
+        const pushBarePathForGuard = barePath;
+        // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
+        // server), fall back to the static defaults so the backstop cannot fail OPEN.
+        // This floor covers the static defaults only; the server-produced set additionally
+        // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
+        const ciConfigPaths = claim.config?.ci_config_paths?.length
+          ? claim.config.ci_config_paths
+          : DEFAULT_CI_CONFIG_PATHS;
+        const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
+        const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
+        if (changed === null || (flagged && flagged.length > 0)) {
+          const reason =
+            changed === null
+              ? "auto CI-fix push refused: could not compute the diff to verify it does not edit CI config (failing closed)"
+              : `auto CI-fix push refused: an auto-approved fix may not edit CI config (${flagged!.join(", ")}); a CI-config fix needs human approval`;
+          batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
+          runLog.warn("ci-fix: CI-config push guard refused push", { run_id: runId, reason });
+          // Fail the run CLOSED — no push, no MR. Throwing here lands on the method's
+          // generic catch (the `else` at ~:1203), which reports status:"failed" with this
+          // reason and does NOT re-queue (unlike LimitReached/shutdown). Same terminal
+          // convention the push/MR failures use.
+          throw new Error(reason);
+        }
       }
 
       // The agent signalled done. The WORKER now performs the authenticated push

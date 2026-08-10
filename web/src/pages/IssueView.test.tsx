@@ -34,6 +34,7 @@ const user = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  ci_autofix_enabled: false,
   wait_on_limit: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,

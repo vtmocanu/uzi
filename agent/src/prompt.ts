@@ -1104,6 +1104,24 @@ export function isNotCodePlan(planMd: string): boolean {
   return firstLine === NOT_CODE_MARKER;
 }
 
+/** CI_CONFIG_MARKER is the exact first line the lead's plan must carry when the
+ *  fix EDITS the CI/pipeline configuration itself (e.g. `.gitlab-ci.yml`) rather
+ *  than product code. runner.gatePlan (M5) parses it to REFUSE the auto_approve
+ *  short-circuit for such a plan — a CI-config fix parks at awaiting_approval and
+ *  must be human-approved before it pushes, even on an auto-triggered ci_fix run.
+ *  A stable literal (not model-freeform) so detection is exact. */
+export const CI_CONFIG_MARKER = "VERDICT: ci_config";
+
+/** isCIConfigPlan reports whether an approved ci_fix plan edits the CI config
+ *  (its first non-blank line is exactly CI_CONFIG_MARKER). */
+export function isCIConfigPlan(planMd: string): boolean {
+  const firstLine = planMd
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  return firstLine === CI_CONFIG_MARKER;
+}
+
 // sanitizeJobField neutralizes a job name/stage that is interpolated into prompt
 // PROSE (outside the untrusted fence): backticks and newlines are collapsed to
 // spaces so an attacker-chosen `.gitlab-ci.yml` job name cannot break out of the
@@ -1211,8 +1229,13 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
     depsProvisionPlanNote(),
     "",
     "Then call `submit_plan` with ONE of:",
-    "  1. A root-cause analysis and a concrete plan to fix the code, OR",
-    `  2. If the failure is NOT a code problem (a flaky test, an infra/runner/`,
+    "  1. A root-cause analysis and a concrete plan to fix the CODE, OR",
+    `  2. If the fix must edit the CI/pipeline configuration itself (e.g.`,
+    `     \`.gitlab-ci.yml\` or the project's pipeline definition) rather than product`,
+    `     code, a plan whose FIRST line is exactly \`${CI_CONFIG_MARKER}\` followed by`,
+    `     your plan. We usually fix the code; a CI-config edit is the reviewed`,
+    `     exception and needs human approval before it pushes. OR`,
+    `  3. If the failure is NOT a code problem (a flaky test, an infra/runner/`,
     `     secret/network issue that a code change cannot fix), a plan whose FIRST`,
     `     line is exactly \`${NOT_CODE_MARKER}\` followed by your diagnosis.`,
     "",

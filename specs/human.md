@@ -445,6 +445,15 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
 - `uzi login` works on a password-only stack AND an OIDC-backed instance with no IdP configuration change. [Success Criterion 2]
 - Admin gets read-only verbs over the CLI; every admin write stays a webui action. [user override, PRD #64 Decision 5]
 
+## Feature #71 — Automatic CI-fix for failed pipelines
+
+Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
+
+- Opt-in per-user automatic CI-fix, default OFF (mirrors judge/autopilot); admin can force-toggle. [user 2026-07-17]
+- Fires only on agent-owned MR-branch pipelines (`agent/issue-N`); `main`/protected branches are never auto-touched — a fix still lands on the MR branch and a human still merges (primary directive). [user 2026-07-17]
+- Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
+- "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
+
 ## Feature #72 — PRD lifecycle inside the run
 
 Tracked as GitLab issue vtmocanu/uzi#72; PRD at `prds/done/72-prd-lifecycle-in-run.md`.

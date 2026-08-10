@@ -954,7 +954,7 @@ func TestPollerCreatedRunsInheritTheOwnerWaitOnLimitDefault(t *testing.T) {
 	t.Run("ci_fix", func(t *testing.T) {
 		fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}, userByID: optedIn}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateCIFixRun(context.Background(), owner, uuid.New(), "main", "t", "d", sampleSnapshot()); err != nil {
+		if _, err := svc.CreateCIFixRun(context.Background(), owner, uuid.New(), "main", "t", "d", sampleSnapshot(), nil); err != nil {
 			t.Fatalf("CreateCIFixRun: %v", err)
 		}
 		if fs.ciFixRunParams == nil || !fs.ciFixRunParams.WaitOnLimit {

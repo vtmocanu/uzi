@@ -9,6 +9,7 @@ export function AdminUsers() {
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [judgeBusyId, setJudgeBusyId] = useState<string | null>(null);
+  const [ciAutofixBusyId, setCiAutofixBusyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -55,6 +56,22 @@ export function AdminUsers() {
     }
   };
 
+  // Admin per-user CI-autofix toggle (PRD #71): force any user's opt-in on or off.
+  // The server sets the flag on the TARGET's own account, so the auto-fix still only
+  // ever spends that user's tokens — this is the "force-disable per user" control.
+  const toggleCIAutofix = async (u: User) => {
+    setError("");
+    setCiAutofixBusyId(u.id);
+    try {
+      const { user } = await api.setUserCIAutofixEnabled(u.id, !u.ci_autofix_enabled);
+      setUsers((prev) => prev.map((x) => (x.id === user.id ? user : x)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setCiAutofixBusyId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -76,6 +93,9 @@ export function AdminUsers() {
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="px-4 py-3 font-medium" title="Run-judge opt-in: reviews this user's finished runs on their Anthropic token">
                     Judge
+                  </th>
+                  <th className="px-4 py-3 font-medium" title="CI-autofix opt-in: auto-fixes this user's failed pipelines on their Anthropic token">
+                    CI autofix
                   </th>
                   <th className="px-4 py-3 font-medium">Last login</th>
                   <th className="px-4 py-3 text-right font-medium">Action</th>
@@ -108,6 +128,21 @@ export function AdminUsers() {
                           onClick={() => toggleJudge(u)}
                         >
                           {u.judge_enabled ? "Disable" : "Enable"}
+                        </Button>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <Badge tone={u.ci_autofix_enabled ? "ok" : "neutral"} dot>
+                          {u.ci_autofix_enabled ? "On" : "Off"}
+                        </Badge>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={ciAutofixBusyId === u.id}
+                          onClick={() => toggleCIAutofix(u)}
+                        >
+                          {u.ci_autofix_enabled ? "Disable" : "Enable"}
                         </Button>
                       </div>
                     </td>

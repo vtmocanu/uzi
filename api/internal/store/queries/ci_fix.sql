@@ -13,14 +13,18 @@
 -- override it. It parks like any other run (Decision 14) — same runner, same
 -- executor, same expense — so excluding it would have meant paying for a guard to
 -- NOT have the feature.
+-- auto_approve (PRD #71 M4) is parametrized so the SAME query serves both paths:
+-- the manual Fix-CI button passes false (the run parks at the plan gate like any
+-- other), the poller's automatic ci_fix passes true (the worker resolves the plan
+-- gate with an approve verdict, mirroring autopilot's Decision 2).
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_id, pipeline_ref, failure_snapshot, wait_on_limit
+    pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve
 ) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
-    @pipeline_id, @pipeline_ref, @failure_snapshot, @wait_on_limit
+    @pipeline_id, @pipeline_ref, @failure_snapshot, @ci_config_paths, @wait_on_limit, @auto_approve
 )
 RETURNING *;
 

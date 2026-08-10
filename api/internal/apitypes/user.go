@@ -26,6 +26,10 @@ type UserDTO struct {
 	// Decision 7). Default false; the user toggles their own from Settings, and an
 	// admin can force-toggle any user's from the admin users surface.
 	JudgeEnabled bool `json:"judge_enabled"`
+	// CIAutofixEnabled is the user's per-user opt-in to automatic CI fixes (PRD
+	// #71). Default false; the user toggles their own from Settings, and an admin
+	// can force-toggle any user's from the admin users surface.
+	CIAutofixEnabled bool `json:"ci_autofix_enabled"`
 	// Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4, D1),
 	// independent of what their runs spend. Both null ⇒ unbound ⇒ their default
 	// token, which is every user's state until they choose otherwise. The label

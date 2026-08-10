@@ -330,6 +330,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		AutopilotEnabled: u.AutopilotEnabled,
 		WaitOnLimit:      u.WaitOnLimit,
 		JudgeEnabled:     u.JudgeEnabled,
+		CIAutofixEnabled: u.CiAutofixEnabled,
 		CreatedAt:        u.CreatedAt.Time,
 		// The judge binding's id; the LABEL is filled in only by the routes that
 		// resolved it (PUT /api/me/judge), since a bare users row carries no join to
@@ -699,6 +700,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens judging their finished runs. Session-scoped identity
 			// (never the body), like autopilot.
 			r.Put("/me/judge", h.SetJudgeEnabled)
+			// Current-user CI-autofix opt-in (PRD #71): per-user consent to spend the
+			// caller's own tokens auto-fixing failed pipelines on their agent MR
+			// branches. Session-scoped identity (never the body), like autopilot.
+			r.Put("/me/ci-autofix", h.SetCIAutofixEnabled)
 			// Current-user usage-limit park default (PRD #35 Decision 7): whether a NEW
 			// run parks rather than fails when this user's Anthropic window is exhausted.
 			// Cookie-only with its two neighbours, and for the same reason: it is consent
@@ -917,6 +922,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
 				// RequireAdmin, target from the path, never the body (audit H3).
 				r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)
+				// Admin per-user CI-autofix toggle (PRD #71): actor authorized by
+				// RequireAdmin, target from the path, never the body.
+				r.Put("/users/{id}/ci-autofix", h.SetUserCIAutofixEnabled)
 				r.Put("/settings", h.UpdateSettings)
 				// PUT sets the enabling admin (session, never the body) as the run owner and
 				// requires a repo the admin owns.

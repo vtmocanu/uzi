@@ -294,6 +294,11 @@ type ClaimConfig struct {
 	// packages into the provisioned set (PRD #18 M5). Delivered from M3 but always
 	// false until M5 wires the per-repo trust toggle.
 	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
+	// CIConfigPaths is the ci_fix run's guard watch set (PRD #71 M2): the CI-config
+	// glob patterns a fix may touch, resolved server-side at queue time. omitempty is
+	// REQUIRED — a non-ci_fix run's runs.ci_config_paths column is NULL, so the field
+	// is nil and omitted, keeping every issue/chat claim byte-identical to pre-M2.
+	CIConfigPaths []string `json:"ci_config_paths,omitempty"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding
