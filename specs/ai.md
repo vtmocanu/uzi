@@ -13306,6 +13306,17 @@ three fallbacks are amber, `best_of_pool` is info — its own hint says the pool
 and everything else is neutral. Tone and link are ONE predicate (link iff the tone is not neutral)
 so they cannot drift.
 
+**PRD #295 — the same credential, COMPACT, on the Runs list.** A `variant="compact"` path on
+`RunCredential` renders the run's credential as a row badge (label + non-neutral tone dot +
+`(deleted)`, mode/reason on `title`/sr-only, no inline prose) reusing `describeCredential` verbatim —
+so tone/link/deleted match the full run-view chip by construction. It is gated on the viewer holding
+**more than one** Anthropic token (new `anthropicTokenCount` helper beside `hasAnthropicToken` in
+`web/src/lib/hasToken.ts`; the existing predicate is ≥1, this one is >1); a single-token user sees
+nothing, because every run billed the one token. On the admin factory list the badge shows
+**unconditionally but non-linked** (a new `linkable` prop, default true): the credential is another
+user's, so `RunCredential`'s link to the viewer's own `/settings` would be a dead end. Purely a UI
+extension — the four `anthropic_*` fields already ride the list DTOs, so no server/SQL/DTO change.
+
 ## 427. PRD #111 — what "auto" does NOT mean, the six live-eligibility states, and what this PRD leaves unmet
 
 🔴 **The fallback spends the owner default, and the owner default NEVER consults `auto_eligible`.**

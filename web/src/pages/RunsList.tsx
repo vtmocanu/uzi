@@ -22,8 +22,10 @@ import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
+import { RunCredential } from "../components/RunCredential";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
+import { anthropicTokenCount } from "../lib/hasToken";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -44,6 +46,8 @@ function RunRow({
   now,
   showOwner,
   waitingForVault = false,
+  showCredential = false,
+  credentialLinkable = true,
 }: {
   run: RunListItem;
   // now (issue #256 M3): a Date.now()-style clock, ticked by useNow in the parent, so
@@ -54,6 +58,14 @@ function RunRow({
   // vault is locked, so it will not claim until they unlock — surfaced as a distinct
   // amber state instead of a bare "queued" pill.
   waitingForVault?: boolean;
+  // showCredential (PRD #295): render the compact credential badge in the pill
+  // cluster. Gated off by default; the caller decides (personal list: viewer holds
+  // >1 token; admin factory list: always). RunCredential itself self-hides on a run
+  // with no label, so a mixed list needs no per-row guard beyond this flag.
+  showCredential?: boolean;
+  // credentialLinkable (PRD #295 D2): false on the admin list, where the credential
+  // is another user's and the badge's /settings link would point at the admin's own.
+  credentialLinkable?: boolean;
 }) {
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
@@ -115,7 +127,7 @@ function RunRow({
             )}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {run.auto_approve && (
             <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
               autopilot
@@ -141,6 +153,12 @@ function RunRow({
                   absent entirely on an unjudged run. */}
               <JudgeRunBadge run={run} />
               <StatusPill status={pillStatus} />
+              {/* PRD #295: which Anthropic token this run's claim billed. Gated by
+                  the caller (personal list: viewer holds >1 token) and self-hiding
+                  on a run with no recorded label. */}
+              {showCredential && (
+                <RunCredential run={run} variant="compact" linkable={credentialLinkable} />
+              )}
             </>
           )}
         </div>
@@ -162,15 +180,20 @@ export function RunsList() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [showPast, setShowPast] = useState(false);
+  // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
+  // computed once from the viewer's secrets. A single-token user sees no badge.
+  const [tokenCount, setTokenCount] = useState(0);
 
   const load = useCallback(async () => {
     setError("");
     try {
-      const [{ runs }, admin] = await Promise.all([
+      const [{ runs }, { secrets }, admin] = await Promise.all([
         api.listRuns(),
+        api.listSecrets(),
         isAdmin ? Promise.all([api.adminListRuns(), api.adminListWorkers()]) : Promise.resolve(null),
       ]);
       setRuns(runs);
+      setTokenCount(anthropicTokenCount(secrets));
       if (admin) {
         setAdminRuns(admin[0].runs);
         setAdminWorkers(admin[1].workers);
@@ -226,6 +249,7 @@ export function RunsList() {
                         run={r}
                         now={now}
                         waitingForVault={!vaultUnlocked && r.status === "queued"}
+                        showCredential={tokenCount > 1}
                       />
                     ))}
                   </ul>
@@ -246,7 +270,7 @@ export function RunsList() {
                   {showPast && (
                     <ul className="space-y-2">
                       {past.map((r) => (
-                        <RunRow key={r.id} run={r} now={now} />
+                        <RunRow key={r.id} run={r} now={now} showCredential={tokenCount > 1} />
                       ))}
                     </ul>
                   )}
@@ -274,6 +298,13 @@ export function RunsList() {
                     run={r}
                     now={now}
                     showOwner
+                    // PRD #295 D2: the admin factory list shows every run's credential
+                    // (an admin auditing spend wants provenance), unconditionally — the
+                    // >1-token gate is the personal viewer's, not this cross-user list's.
+                    // Non-linked, because the label is another user's and the badge's
+                    // /settings link points at the admin's own settings.
+                    showCredential
+                    credentialLinkable={false}
                     // Only the current admin's OWN queued rows can show the vault state —
                     // another owner's vault status is unknown here (PRD #32), so theirs
                     // render as plain "queued".

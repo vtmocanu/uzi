@@ -32,6 +32,8 @@ import { Badge } from "./ui";
 
 export function RunCredential({
   run,
+  variant = "full",
+  linkable = true,
 }: {
   run: Pick<
     Run,
@@ -40,6 +42,16 @@ export function RunCredential({
     | "anthropic_select_reason"
     | "anthropic_headroom_pct"
   >;
+  // variant "compact" (PRD #295) is the Runs-list rendering: label + a tone dot
+  // (non-neutral only) + `(deleted)`, with mode/hint moved into the title so the
+  // row stays scannable. "full" is the run-detail sentence chip and stays the
+  // default so RunView/AgentDetail/Agents are untouched.
+  variant?: "full" | "compact";
+  // linkable=false suppresses the /settings link even in a non-neutral state.
+  // The admin factory list (PRD #295 Decision 2) shows ANOTHER user's credential,
+  // whose fix lives on that user's settings, not the viewing admin's — so the
+  // badge renders but never links. Default true preserves the personal behaviour.
+  linkable?: boolean;
 }) {
   const label = run.anthropic_secret_label;
   if (!label) return null;
@@ -53,43 +65,71 @@ export function RunCredential({
   const { mode, hint, tone, linked, deleted } = describeCredential(run);
   const hintId = `run-credential-hint-${run.anthropic_secret_id ?? "gone"}`;
 
-  const chip = (
-    <Badge
-      tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
-      // web-ux F20: this badge carries sentence-length reasons —
-      // `default (auto: the chosen token would not open)` measured 389px against a
-      // 375px viewport and overflowed the document. The em dash is not the cause; a
-      // pill that cannot wrap is.
-      wrap
-      // web-ux F21: the explanation is DESCRIBED, never the accessible NAME. An
-      // aria-label here would replace the visible text, so a voice-control user saying
-      // "click token default" would match nothing — WCAG 2.5.3 Label in Name. The
-      // sr-only span below is the same pattern this file's sibling uses for D6_HINT.
-      aria-describedby={hintId}
-      title={
-        deleted
-          ? `${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
-          : hint
-      }
-    >
-      {/* web-ux F19, second attempt, and the first one is why this is QUOTES rather
+  const chip =
+    variant === "compact" ? (
+      // PRD #295: the Runs-list rendering. The tone dot carries the "worth a look"
+      // signal the full chip carries with a link, the label answers "which account",
+      // and the mode + hint move into the title so the row does not grow a
+      // sentence-length pill. The sr-only hint span and aria-describedby are the same
+      // web-ux F21 pattern as the full chip — the explanation is DESCRIBED, never the
+      // accessible NAME.
+      <Badge
+        tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
+        // dot only where the state is non-neutral, matching the full chip's
+        // "link iff non-neutral" rule: a calm auto/pinned pick stays quiet.
+        dot={tone !== "neutral"}
+        aria-describedby={hintId}
+        title={
+          deleted
+            ? `${mode ? mode + " — " : ""}${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
+            : mode
+              ? `${mode} — ${hint}`
+              : hint
+        }
+      >
+        {safe}
+        {deleted && " (deleted)"}
+        <span id={hintId} className="sr-only">
+          {hint}
+        </span>
+      </Badge>
+    ) : (
+      <Badge
+        tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
+        // web-ux F20: this badge carries sentence-length reasons —
+        // `default (auto: the chosen token would not open)` measured 389px against a
+        // 375px viewport and overflowed the document. The em dash is not the cause; a
+        // pill that cannot wrap is.
+        wrap
+        // web-ux F21: the explanation is DESCRIBED, never the accessible NAME. An
+        // aria-label here would replace the visible text, so a voice-control user saying
+        // "click token default" would match nothing — WCAG 2.5.3 Label in Name. The
+        // sr-only span below is the same pattern this file's sibling uses for D6_HINT.
+        aria-describedby={hintId}
+        title={
+          deleted
+            ? `${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
+            : hint
+        }
+      >
+        {/* web-ux F19, second attempt, and the first one is why this is QUOTES rather
           than weight. `token default — default` is the exact input D20 named as its
           motivating case: the same word twice, first a NAME and then a MODE, with
           nothing marking which is which. Bolding the label was measured at 3x zoom and
           the one weight step (600 vs 500) at 11px in muted grey is not perceptible at
           actual size — the markup changed and the meaning did not.
-          
+
           Quotes do the work at any size and any contrast, and they are unambiguous
           about WHICH token is a name. The weight stays because it costs nothing and
           helps where it is visible. */}
-      token “<span className="font-semibold">{safe}</span>”
-      {deleted && " (deleted)"}
-      {mode && ` — ${mode}`}
-      <span id={hintId} className="sr-only">
-        {hint}
-      </span>
-    </Badge>
-  );
+        token “<span className="font-semibold">{safe}</span>”
+        {deleted && " (deleted)"}
+        {mode && ` — ${mode}`}
+        <span id={hintId} className="sr-only">
+          {hint}
+        </span>
+      </Badge>
+    );
 
   // Only a non-neutral state is a link, and it is ONE rule so the two cannot drift:
   // link iff the tone is not neutral. PRD #104 M5 already ships the per-token meters
@@ -99,12 +139,17 @@ export function RunCredential({
   // a link is a dead end dressed as an action; on a deleted credential there is
   // nothing left to look at.
   //
+  // `linkable` additionally strips the link on the admin factory list (PRD #295 D2),
+  // where the credential belongs to another user and this link would point the admin
+  // at their OWN settings — a dead end. Default true keeps the personal behaviour.
+  //
   // The USER'S OWN settings page, deliberately not /admin/rate-limits: that route is
   // admin-only and would 403 for exactly the person reading their own run.
-  if (!linked) return chip;
-  return (
+  return linked && linkable ? (
     <Link to="/settings" className="no-underline">
       {chip}
     </Link>
+  ) : (
+    chip
   );
 }
