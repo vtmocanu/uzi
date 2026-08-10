@@ -61,9 +61,13 @@ case "$DIR" in
 esac
 
 # Run from the repo root so a relative component dir means the same thing from any
-# caller's directory (same as lint-formula.sh).
-ROOT="$(git rev-parse --show-toplevel)" || {
-  echo "deadcode-knip: not inside a git work tree (git rev-parse --show-toplevel failed)" >&2
+# caller's directory. Resolved from THIS SCRIPT'S OWN LOCATION, deliberately NOT via
+# `git rev-parse --show-toplevel` (which lint-formula.sh uses): this wrapper runs inside
+# validate:web's `node:22-alpine` CI image, which ships NO git, so a `git rev-parse` here
+# fails and reds the very gate it exists to keep honest (PRD #293 M3; caught in CI
+# 2026-08-10, pipeline 20725). The script lives in scripts/, so its parent is the root.
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)" || {
+  echo "deadcode-knip: cannot resolve repo root from script location ($0)" >&2
   exit 2
 }
 cd "$ROOT" || exit 2
