@@ -1764,21 +1764,30 @@ export function JudgePanel({ run }: { run: Run }) {
         )
       ) : (
         <>
-          {/* summary_md, each target and each rationale_md below are UNTRUSTED judge/worker
-              output. They are DELIBERATELY rendered as escaped plain text (React's default +
-              whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
-              markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
-              (ScrubSecrets + control-strip) does NOT cover markdown/link injection.
-              Issue #124: escaping is not sufficient on its own either. TWO scrubbers run at
-              the review POST, not one — `sanitizeReviewText` (handler/judge_worker.go:381)
-              for summary/rationale, `sanitizeSelfReported` (handler/worker_protocol.go:44)
-              for `target` — and both were `IsControl`-only, so Cf bidi overrides were
-              persisted and reorder what a human reads. Both now strip Cf as well, but rows
-              written before that still render through here, which is why the renderer-side
-              strip is not redundant. See lib/safeText.ts for why it sits at the render site
-              and not at the API boundary (`target` is a coordinate the page posts back). */}
+          {/* summary_md and rationale_md below are UNTRUSTED judge/worker output. They now
+              render through the SAME hardened <Markdown> component that plan_md uses on this
+              page (see the plan_md sites above and components/Markdown.tsx), so this surface
+              is no worse than the already-shipped plan_md one. That component is hardened for
+              exactly this untrusted case: NO rehype-raw, so raw HTML (e.g. <script>, <img
+              onerror>) stays inert text; react-markdown's urlTransform plus our own
+              schemeIsDangerous strip javascript:/data:/file: URLs; links are forced external
+              (target="_blank" rel="noopener noreferrer"); images are size-capped.
+              stripUnsafeChars is STILL applied to the source FIRST and is NOT redundant: it
+              performs the issue #124 Cf/bidi-override strip at the render site. Markdown
+              syntax chars (`*`/`` ` ``/`#`/`-`/`[]()`) are not control chars, so stripping
+              first preserves them while removing bidi overrides. Rows written before the
+              ingest-side Cf strip landed still arrive carrying bidi overrides, which is why
+              the render-site strip stays. See lib/safeText.ts for why the strip lives at the
+              render site and not at the API boundary.
+              rec.target (the <code> coordinate just below) DELIBERATELY stays inert escaped
+              plaintext — it is a coordinate the page posts back, not prose, and must NOT
+              become a markdown/link sink.
+              If a markdown/HTML renderer is ever swapped in here, do NOT add rehype-raw or
+              relax schemeIsDangerous. */}
           {review.summary_md.trim() !== "" && (
-            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(review.summary_md)}</p>
+            <div className="judge-prose">
+              <Markdown content={stripUnsafeChars(review.summary_md)} />
+            </div>
           )}
 
           {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
@@ -1812,9 +1821,9 @@ export function JudgePanel({ run }: { run: Run }) {
                       </span>
                     </div>
                     {rec.rationale_md.trim() !== "" && (
-                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">
-                        {stripUnsafeChars(rec.rationale_md)}
-                      </p>
+                      <div className="judge-prose mt-1.5">
+                        <Markdown content={stripUnsafeChars(rec.rationale_md)} />
+                      </div>
                     )}
                     {/* A settled disposition (done/dismissed) hides the create-issue
                         affordance (File / draft) but NOT an already-filed link: a rec that

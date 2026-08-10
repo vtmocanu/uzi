@@ -1,7 +1,7 @@
 # PRD #294: Render judge review markdown in the web run-review panel
 
 **GitLab Issue**: [vtmocanu/uzi#294](https://gitlab.example.com/vtmocanu/uzi/-/issues/294)
-**Status**: Draft
+**Status**: Done
 **Priority**: Medium
 **Created**: 2026-08-10
 **Depends on**: none
@@ -117,12 +117,12 @@ not a second markdown pipeline.
 
 ## Milestones
 
-- [ ] **M1 — Summary + rationale render as markdown.** Both sites in `RunView.tsx` route
+- [x] **M1 — Summary + rationale render as markdown.** Both sites in `RunView.tsx` route
   through `<Markdown>` with `stripUnsafeChars` applied first; empty-string guards retained;
   panel vertical rhythm preserved. Update the `1767-1779` comment to the new posture,
   **keeping** the note that `rec.target` (`:1804-1808`) stays inert plaintext (the comment
   covers three fields; only two change).
-- [ ] **M2 — Tests.** Two parts, because one existing test pins the OLD behaviour and will
+- [x] **M2 — Tests.** Two parts, because one existing test pins the OLD behaviour and will
   go red under M1: `RunView.test.tsx:538-559` ("renders review free text as escaped text,
   never HTML") asserts the literal `**not bold**` survives — once markdown renders it
   becomes `<strong>`, so that assertion must be **rewritten** to the new posture (its
@@ -132,10 +132,10 @@ not a second markdown pipeline.
   stays inert, (d) an empty field renders nothing, (e) the #124 bidi-strip test
   (`RunView.test.tsx:566`) still passes. Reuse the assertion style the existing `plan_md`
   markdown tests use. **M1 alone leaves `task gate:web` red; M1+M2 land together.**
-- [ ] **M3 — Docs.** `docs/judge.md` (and any run-review UX note) reflects that the panel
+- [x] **M3 — Docs.** `docs/judge.md` (and any run-review UX note) reflects that the panel
   now renders the judge's markdown; note the shared hardened renderer so the security
   posture is discoverable.
-- [ ] **M4 — Gate green.** `task gate:web` passes (oxlint, knip, check-docs, typecheck,
+- [x] **M4 — Gate green.** `task gate:web` passes (oxlint, knip, check-docs, typecheck,
   vitest). No new knip unused-export warnings from the change.
 
 ## Success criteria
