@@ -107,7 +107,8 @@ orphan one. Detection is the UNION of two worker-side signals — `lastPublished
 checkpoint THIS worker confirmably landed mid-run) OR `git.hasCheckpointRef` (origin's
 `refs/uzi-checkpoints/<branch>`, mirrored into the worker bare at fetch time, catching a
 checkpoint a PRIOR/cross-worker attempt landed). A genuine zero-code run trips neither
-(nothing committed ⇒ no pack ⇒ no publish) and still completes report-only. No
+(it never invokes the checkpoint callback — the "never checkpoints" convention above — so
+nothing is ever published) and still completes report-only. No
 checkpoint-ref *deletion* capability was added: the push broker only ever does a non-forced
 push, and refusing loudly (converting a silent remote orphan into an actionable terminal) is
 proportionate where a delete-ref RPC would be a new worker→api→forge trust-boundary
