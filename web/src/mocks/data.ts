@@ -441,7 +441,12 @@ export const mockReviews: MockReview[] = [
     target_run_id: "run-done",
     verdict: "issues",
     summary_md:
-      "The run delivered the feature and opened an MR, but the agent lost time to a missing worker tool and re-ran the same search three times before finding the handler.",
+      "The run **delivered the feature** and opened an MR, but it lost time on two avoidable things:\n\n" +
+      "- a missing worker tool (`shellcheck`) forced a fallback\n" +
+      "- the same search re-ran three times before finding the handler\n\n" +
+      "The failing lookup that cost the most time:\n\n" +
+      "```sh\ngrep -rn 'handleReview' api/internal/handler\n```\n\n" +
+      "See the [run timeline](https://gitlab.example.com/vtmocanu/uzi/-/issues/71) for the full trace.",
     judge_model: "haiku",
     status: "complete",
     created_at: minsAgo(6),
@@ -452,7 +457,11 @@ export const mockReviews: MockReview[] = [
         category: "install_worker_tool",
         target: "shellcheck",
         rationale_md:
-          "The agent tried `shellcheck` twice and hit `command not found`; installing it in the worker image would save the fallback.",
+          "The agent tried **`shellcheck`** twice and hit `command not found`:\n\n" +
+          "- first on the pre-commit hook\n" +
+          "- then on the manual lint pass\n\n" +
+          "```sh\nshellcheck scripts/*.sh\n```\n\n" +
+          "Installing it in the worker image would save the fallback. See the [worker image spec](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/judge.md).",
         confidence: "high",
         created_at: minsAgo(6),
       },

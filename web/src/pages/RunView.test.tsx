@@ -668,9 +668,11 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(mockApi.getRunReview).toHaveBeenCalledWith("r1");
   });
 
-  it("renders review free text as escaped text, never HTML", async () => {
-    // A rationale containing markup must appear as literal characters (React escapes
-    // it) — proving no dangerouslySetInnerHTML / markdown parsing on judge output.
+  it("renders review markdown as elements while keeping raw HTML inert", async () => {
+    // summary_md now renders through the shared hardened <Markdown> (same as plan_md):
+    // markdown syntax becomes real elements, but raw HTML stays INERT text because the
+    // pipeline carries NO rehype-raw. So `**not bold**` is a <strong>, while the
+    // <img onerror> string never becomes an <img> node (nothing to fire onerror on).
     mockApi.getRunReview.mockResolvedValue({
       pending_judge: null,
       review: review({
@@ -682,13 +684,126 @@ describe("JudgePanel (PRD #46 M4)", () => {
       <JudgePanel run={run({ status: "completed" })} />,
     );
 
-    expect(
-      await screen.findByText(
-        /<img src=x onerror=alert\(1\)> \*\*not bold\*\*/,
-      ),
-    ).toBeTruthy();
-    // The markup did not become a real element.
+    // The bold markdown became a real <strong>.
+    const strong = await waitFor(() => {
+      const el = container.querySelector("strong");
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(strong.textContent).toBe("not bold");
+    // The raw HTML did NOT become a real element / active script.
     expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("script")).toBeNull();
+    // The <img ...> markup survives as inert text on the page.
+    expect(container.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  it("renders summary_md and rationale_md markdown as elements (bold/list/code/link)", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "**bold** and `code`\n\n- bullet\n\n[label](https://example.com)",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "**why** and `cmd`\n\n- reason\n\n[docs](https://example.com)",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+
+    // Both surfaces (summary + the one rationale) render markdown elements.
+    const strongs = [...container.querySelectorAll("strong")].map((s) => s.textContent);
+    expect(strongs).toContain("bold");
+    expect(strongs).toContain("why");
+    const codes = [...container.querySelectorAll("code")].map((c) => c.textContent);
+    expect(codes).toContain("code");
+    expect(codes).toContain("cmd");
+    const items = [...container.querySelectorAll("li")].map((li) => (li.textContent ?? "").trim());
+    expect(items).toContain("bullet");
+    expect(items).toContain("reason");
+    // Links are real anchors, forced external.
+    const links = [...container.querySelectorAll("a")].filter(
+      (a) => a.getAttribute("href") === "https://example.com",
+    );
+    expect(links.length).toBe(2);
+    for (const a of links) {
+      expect(a.getAttribute("target")).toBe("_blank");
+      expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+  });
+
+  it("neutralizes dangerous URL schemes in judge markdown links", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "[x](javascript:alert(1)) and [y](data:text/html,evil)",
+        recommendations: [],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+    // No active link carries a dangerous scheme — urlTransform + schemeIsDangerous strip it.
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(container.querySelector('a[href^="data:"]')).toBeNull();
+  });
+
+  it("keeps raw <script>/<img onerror> in summary_md AND rationale_md inert", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "<script>alert(1)</script> and <img src=x onerror=alert(1)>",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "<script>alert(2)</script> and <img src=y onerror=alert(2)>",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByText("Issues found");
+    // No rehype-raw: neither surface produces a live script or image node.
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("renders nothing for empty/whitespace summary_md and rationale_md", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        summary_md: "   ",
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: "shellcheck",
+            rationale_md: "",
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // The panel still renders (positive anchor) but the .trim() guards suppress the
+    // empty markdown surfaces entirely — no empty prose box on either field.
+    await screen.findByText("Issues found");
+    expect(container.querySelector(".judge-prose")).toBeNull();
   });
 
   // Issue #124. React escaping (pinned above) does not touch Unicode format characters,

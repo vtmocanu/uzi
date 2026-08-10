@@ -88,7 +88,7 @@ func TestClampWireReportMdStripsControlAndFormatChars(t *testing.T) {
 func TestClampWireReportMdScrubsSecrets(t *testing.T) {
 	// Fabricated secret-shaped strings, never a real credential.
 	for _, secret := range []string{
-		"glpat-ABCDEFGHIJKLMNOPQRST",
+		"glpat-ABCDEFGHIJKLMNOPQRST", //gitleaks:allow fabricated GitLab PAT fixture — asserts report_md secret scrubbing (#279), never a real credential
 		"sk-ant-abcdef0123456789ABCDEF",
 	} {
 		in := "the token was " + secret + " during the run"

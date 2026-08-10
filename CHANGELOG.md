@@ -19,6 +19,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   render the findings summary as escaped plain text — it is untrusted
   worker-authored text, server-scrubbed on the way in and never passed through
   a markdown renderer. (#279)
+- **A seeded plan naming a bright-line infrastructure-reconnaissance target is
+  now refused before the run is created.** A seeded run (`uzi run create
+  --plan-file`) skips both the planning turn and the human approval gate, so a
+  new deterministic screen (`api/internal/planpolicy`) checks the scrubbed plan
+  text for cloud instance metadata endpoints, the default kube-apiserver
+  ClusterIP, and the in-pod service-account token mount, and rejects a match
+  with a 422 that redirects the caller to the ordinary, gated run flow. Plain
+  issue-planned runs are unaffected. See
+  [ADR-280](adr/0280-seeded-plan-safety-screen.md). (#280)
 
 ## [0.26.0] - 2026-08-10
 
