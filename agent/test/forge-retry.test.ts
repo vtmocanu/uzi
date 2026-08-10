@@ -2,8 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   classifyForgeError,
+  classifyDevboxError,
   withForgeRetry,
+  withRetry,
   FORGE_RETRY_SCHEDULE,
+  DEVBOX_RETRY_SCHEDULE,
 } from "../src/forge-retry.js";
 import { ForgeError } from "../src/forge.js";
 import { DEFAULT_TERMINAL_RETRY_SCHEDULE } from "../src/client.js";
@@ -134,5 +137,167 @@ describe("withForgeRetry", () => {
     );
     assert.strictEqual(attempts, FORGE_RETRY_SCHEDULE.length + 1);
     assert.deepStrictEqual(delays, FORGE_RETRY_SCHEDULE);
+  });
+});
+
+// Discriminating classifier table for the devbox `devbox install` hop. Same
+// exhaustive-exercise style as classifyForgeError: each case is asserted and the
+// whole table is asserted fully exercised so a silently dropped row is caught.
+// Permanent-first, fail-closed precedence is the load-bearing invariant.
+describe("classifyDevboxError", () => {
+  const cases: Array<{ name: string; err: unknown; want: "transient" | "permanent" }> = [
+    // curl timeout on nixpkgs metadata ⇒ retry (Error message match)
+    {
+      name: "curl (28) timeout fetching nixpkgs metadata",
+      err: new Error("curl: (28) Timeout was reached while fetching nixpkgs metadata"),
+      want: "transient",
+    },
+    // stderr-only network error ⇒ retry (proves stderr is inspected)
+    {
+      name: "curl (6) could not resolve host (on stderr, generic message)",
+      err: {
+        stderr: "curl: (6) Could not resolve host: api.github.com",
+        message: "Command failed: devbox install",
+      },
+      want: "transient",
+    },
+    // 5xx from the binary cache ⇒ retry
+    {
+      name: "503 from cache.nixos.org",
+      err: new Error("503 Service Unavailable from cache.nixos.org"),
+      want: "transient",
+    },
+    // unknown package ⇒ deterministic, no retry
+    {
+      name: "unknown package",
+      err: new Error("error: package 'nonesuch' not found"),
+      want: "permanent",
+    },
+    // package name containing `ssl` ⇒ permanent (the fail-closed hazard: `ssl`
+    // substring must NOT trigger a transient match)
+    {
+      name: "package 'openssl' not found (ssl substring is not a network phrase)",
+      err: new Error("error: package 'openssl' not found"),
+      want: "permanent",
+    },
+    // deterministic openssl configure error ⇒ permanent (the old `SSL.*` over-match
+    // is gone; `openssl configure error` is NOT a network condition)
+    {
+      name: "openssl configure error (deterministic, not a network SSL failure)",
+      err: new Error("error: openssl configure error: missing header"),
+      want: "permanent",
+    },
+    // openssl-connector unfree license ⇒ permanent (package name, not a network phrase)
+    {
+      name: "package 'openssl-connector' unfree license (ssl+connect substrings)",
+      err: new Error("error: package 'openssl-connector' has an unfree license"),
+      want: "permanent",
+    },
+    // manifest line ref ending in :503: ⇒ permanent (bare 503 must NOT trigger transient)
+    {
+      name: "devbox.json:503:12 syntax error (503 line ref is not an HTTP 5xx)",
+      err: new Error("error: syntax error at devbox.json:503:12"),
+      want: "permanent",
+    },
+    // nix eval file:line ref default.nix:502:15 ⇒ permanent (bare 502 must NOT trigger)
+    {
+      name: "default.nix:502:15 nix eval file:line ref (502 line ref is not an HTTP 5xx)",
+      err: new Error(
+        "error: attribute 'foo' at /nix/store/x/default.nix:502:15 called without required argument",
+      ),
+      want: "permanent",
+    },
+    // genuine HTTP 5xx from the cache via curl ⇒ transient (HTTP-context-anchored 503)
+    {
+      name: "curl (22) returned error: 503 Service Unavailable (genuine HTTP 5xx)",
+      err: new Error("curl: (22) The requested URL returned error: 503 Service Unavailable"),
+      want: "transient",
+    },
+    // genuine nix cache 5xx (HTTP error 503) ⇒ transient
+    {
+      name: "unable to download narinfo: HTTP error 503 (genuine cache 5xx)",
+      err: new Error(
+        "error: unable to download 'https://cache.nixos.org/nar/xxx.narinfo': HTTP error 503",
+      ),
+      want: "transient",
+    },
+    // malformed manifest / parse error ⇒ deterministic, no retry
+    {
+      name: "malformed manifest parse error",
+      err: new Error("error: syntax error, unexpected '}' at devbox.json:12"),
+      want: "permanent",
+    },
+    // worker-timeout SIGTERM kill ⇒ permanent (hung install, never retried)
+    {
+      name: "worker-timeout SIGTERM kill",
+      err: { killed: true, signal: "SIGTERM", code: null, message: "Command failed: devbox install" },
+      want: "permanent",
+    },
+    // kill precedence: SIGTERM kill WITH a transient-looking stderr ⇒ still
+    // permanent, because the kill check runs FIRST
+    {
+      name: "SIGTERM kill with transient curl (28) stderr (kill check wins)",
+      err: {
+        killed: true,
+        signal: "SIGTERM",
+        code: null,
+        stderr: "curl: (28) Timeout was reached",
+        message: "Command failed: devbox install",
+      },
+      want: "permanent",
+    },
+  ];
+
+  const exercised = new Set<string>();
+  for (const c of cases) {
+    it(`classifies ${c.name} as ${c.want}`, () => {
+      assert.strictEqual(classifyDevboxError(c.err), c.want);
+      exercised.add(c.name);
+    });
+  }
+
+  it("exercised every discriminating case in the table", () => {
+    assert.strictEqual(exercised.size, cases.length);
+  });
+});
+
+describe("withRetry (generic)", () => {
+  it("retries a transient error then succeeds, sleeping the devbox schedule prefix", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts < 3) throw new Error("curl: (28) Timeout was reached");
+      return "ok";
+    };
+    const result = await withRetry(fn, {
+      classify: classifyDevboxError,
+      schedule: DEVBOX_RETRY_SCHEDULE,
+      sleep,
+    });
+    assert.strictEqual(result, "ok");
+    assert.strictEqual(attempts, 3);
+    assert.deepStrictEqual(delays, [1_000, 4_000]);
+  });
+
+  it("fails fast on a permanent error (sleep never called)", async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      throw new Error("error: package 'nonesuch' not found");
+    };
+    await assert.rejects(
+      withRetry(fn, { classify: classifyDevboxError, schedule: DEVBOX_RETRY_SCHEDULE, sleep }),
+      /package 'nonesuch' not found/,
+    );
+    assert.strictEqual(attempts, 1);
+    assert.deepStrictEqual(delays, []);
   });
 });
