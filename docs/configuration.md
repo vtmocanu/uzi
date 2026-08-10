@@ -128,9 +128,10 @@ Nothing about this is required. A board that keeps `Upcoming` keeps working exac
 See [Forge read tools](forge-read-tools.md) for the user-facing feature: a
 run's `fact-checker` subagent reading its own project's forge (issues,
 merge requests, pipelines, label history) live, instead of trusting the
-repo's own restatement. There is no env var for it — the per-run call
-budget (40 calls) and the response caps (50 list rows, 32 KiB per issue
-description) are fixed constants in the API handler, not configurable.
+repo's own restatement. There is no env var for it — the response caps
+(50 list rows, 32 KiB per issue description) are fixed constants in the API
+handler and the per-session call budget (40 calls) is a fixed constant in
+the agent's forge tool server, neither configurable.
 
 ## CI status integration (PRD #6)
 

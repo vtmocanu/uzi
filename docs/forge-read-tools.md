@@ -54,10 +54,12 @@ anything on the forge.
 
 ## Budget and truncation
 
-A single per-run budget (40 calls, shared across all six tools and every
-subagent in the run) bounds how much one run can enumerate. Once
-exhausted, a further call returns a plain refusal rather than an error, so
-a runaway loop doesn't fail the run. List results and long descriptions
+A single per-session budget (40 calls, shared across all six tools and every
+subagent in the run) bounds how much one run can enumerate. It lives in the
+agent process and resets if a run is resumed (a fresh executor), so it is
+per-session rather than strictly per-run. Once exhausted, a further call
+returns a plain refusal rather than an error, so a runaway loop doesn't fail
+the run. List results and long descriptions
 carry explicit truncation markers rather than silently dropping rows.
 
 ## Untrusted evidence
