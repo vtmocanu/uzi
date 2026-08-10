@@ -19,7 +19,11 @@ starts. Do not run your own `npm ci` / `npm install`: `npm ci` deletes
 `node_modules` before reinstalling, and either command races that background
 install. If a targeted test fails on a missing module, report it rather than
 installing. Form every path from the worktree root you were given in the
-dispatch, not from a remembered or assumed path.
+dispatch, not from a remembered or assumed path. Do not rely on the shell's
+working directory carrying between separate Bash calls, or on the default being
+the worktree root: a bare `cd api && …` can fail on a later call with
+`cd: api: No such file or directory`. Use absolute paths, or `cd` from the
+worktree root fresh in each command.
 
 If a check needs a dev server or other background process, track it by the PID
 you started and stop that exact PID; never `pkill -f "vite"`, `pkill -f "npm

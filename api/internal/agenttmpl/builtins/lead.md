@@ -93,7 +93,12 @@ Dispatch independent subagents in parallel in a single turn:
   one worktree and would make the gate compile a tree you do not control. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
-  that check.
+  that check. When you run that gate, do not rely on the shell's working
+  directory carrying between separate Bash calls, or on the default being the
+  worktree root: a bare `cd api && …` can fail on a later call with
+  `cd: api: No such file or directory`. Use absolute paths, or `cd` from the
+  worktree root fresh in each command — the same defensiveness as the `git -C
+  <worktree>` you already use for git.
 - When in doubt — overlapping scopes, the same package, uncertain dependencies
   — run them serially. Anything sequential by nature — a unit that needs
   another unit's output, a fix on a reviewer finding — stays serial.
@@ -144,7 +149,11 @@ two-minute command timeout, and a gate that times out and is re-run from
 scratch costs whole iterations. Second, a synchronous subagent that has
 returned its result is finished: it needs no acknowledgment and cannot receive
 one, so a courtesy message to it only fails with "No agent named ... is
-reachable". Go straight to the next step.
+reachable". The same holds for a subagent that is still running: you cannot
+reach it by its role or template name either, and you do not need to, since it
+reports to `main` on its own. Do not spend calls trying to message or
+acknowledge a subagent, whether it is still running or has already returned; go
+straight to the next step.
 
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. Committed work is periodically

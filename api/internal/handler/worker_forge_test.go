@@ -93,7 +93,7 @@ func forgeMockHandler(t *testing.T, routes map[string]http.HandlerFunc) (*Handle
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	sealed, err := box.Seal([]byte("glpat-fake-forge-token-abcdef123456"))
+	sealed, err := box.Seal([]byte("glpat-fake-forge-token-abcdef123456")) //gitleaks:allow fake fixture PAT (literal "fake"), sealed into a throwaway test secretbox; never a real credential
 	if err != nil {
 		t.Fatalf("seal token: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestWorkerForgeListIssueLabelEventsTruncatesAt50(t *testing.T) {
 	for i := 0; i < 51; i++ {
 		events = append(events, map[string]any{
 			"id": 500 + i, "action": "add", "created_at": "2026-07-04T09:00:00Z",
-			"user": map[string]any{"id": 42, "username": "carol"},
+			"user":  map[string]any{"id": 42, "username": "carol"},
 			"label": map[string]any{"id": 9, "name": "autopilot"},
 		})
 	}

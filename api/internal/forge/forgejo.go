@@ -1002,4 +1002,3 @@ func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, error) {
 	}
 	return body, nil
 }
-
