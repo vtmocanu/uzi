@@ -482,12 +482,33 @@ describe("RunCompletedLine — the worker-supplied branch carries no format char
 });
 
 describe("RunCompletedLine — report-only deliverable (issue #279)", () => {
-  it("names the report-only deliverable when the run opened no MR", () => {
+  it("names the report-only deliverable and points to findings when report_md is present", () => {
     const { container } = render(
-      <RunCompletedLine run={run({ report_only: true, branch: null, mr_iid: null })} duration="3m" />,
+      <RunCompletedLine
+        run={run({ report_only: true, branch: null, mr_iid: null, report_md: "All checks passed." })}
+        duration="3m"
+      />,
     );
     expect(container.textContent).toContain("Ran for 3m");
     expect(container.textContent).toContain("Report only — no merge request; findings below.");
+  });
+
+  it("does not promise findings below when report_md is empty (no dangling pointer)", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ report_only: true, branch: null, mr_iid: null })} duration="3m" />,
+    );
+    expect(container.textContent).toContain("Report only — no merge request.");
+    expect(container.textContent).not.toContain("findings below");
+  });
+
+  it("suppresses the branch clause on a report-only run (mutually exclusive)", () => {
+    // Defensive: a report_only completion pushes no branch, but the clause must not render a
+    // contradictory "Branch … Report only" line even if a branch value somehow rode along.
+    const { container } = render(
+      <RunCompletedLine run={run({ report_only: true, branch: "agent/issue-9", mr_iid: null })} duration="3m" />,
+    );
+    expect(container.textContent).toContain("Report only — no merge request");
+    expect(container.textContent).not.toContain("Branch");
   });
 
   it("does not name a report-only deliverable for a normal completion", () => {

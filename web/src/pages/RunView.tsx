@@ -746,7 +746,11 @@ export function RunView() {
         run.report_md.trim() !== "" && (
           <Card className="space-y-2 p-4">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h2>
-            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(run.report_md)}</p>
+            {/* Cap a long summary and scroll it, like SeededPlanPanel, so the Activity feed
+                below stays reachable without a long page scroll. */}
+            <p className="max-h-96 overflow-auto whitespace-pre-wrap text-sm text-muted">
+              {stripUnsafeChars(run.report_md)}
+            </p>
           </Card>
         )}
 
@@ -1353,16 +1357,25 @@ export function RunCompletedLine({
   return (
     <p className="mt-0.5 text-xs text-muted">
       {duration && <>Ran for {duration}. </>}
-      {run.branch && (
+      {/* issue #279: a report-only run has no branch and no MR — name the deliverable so the
+          hero is not a silently-empty "Run completed". It is mutually exclusive with the
+          branch/MR clause (a report_only completion pushes neither), so this branch guards
+          against a contradictory "Branch … Report only" line, and only promises "findings
+          below" when there is actually a report_md to render below. */}
+      {run.report_only ? (
         <>
-          Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
-          {run.mr_iid != null &&
-            ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+          Report only — no merge request
+          {run.report_md != null && run.report_md.trim() !== "" ? "; findings below" : ""}.
         </>
+      ) : (
+        run.branch && (
+          <>
+            Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
+            {run.mr_iid != null &&
+              ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+          </>
+        )
       )}
-      {/* issue #279: a report-only run has no branch and no MR — name the deliverable
-          so the hero is not a silently-empty "Run completed". */}
-      {run.report_only && <>Report only — no merge request; findings below.</>}
     </p>
   );
 }
