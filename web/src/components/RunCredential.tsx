@@ -33,7 +33,6 @@ import { Badge } from "./ui";
 export function RunCredential({
   run,
   variant = "full",
-  linkable = true,
 }: {
   run: Pick<
     Run,
@@ -45,13 +44,8 @@ export function RunCredential({
   // variant "compact" (PRD #295) is the Runs-list rendering: label + a tone dot
   // (non-neutral only) + `(deleted)`, with mode/hint moved into the title so the
   // row stays scannable. "full" is the run-detail sentence chip and stays the
-  // default so RunView/AgentDetail/Agents are untouched.
+  // default so RunView (the only page that renders this component) is untouched.
   variant?: "full" | "compact";
-  // linkable=false suppresses the /settings link even in a non-neutral state.
-  // The admin factory list (PRD #295 Decision 2) shows ANOTHER user's credential,
-  // whose fix lives on that user's settings, not the viewing admin's — so the
-  // badge renders but never links. Default true preserves the personal behaviour.
-  linkable?: boolean;
 }) {
   const label = run.anthropic_secret_label;
   if (!label) return null;
@@ -67,31 +61,34 @@ export function RunCredential({
 
   const chip =
     variant === "compact" ? (
-      // PRD #295: the Runs-list rendering. The tone dot carries the "worth a look"
-      // signal the full chip carries with a link, the label answers "which account",
-      // and the mode + hint move into the title so the row does not grow a
-      // sentence-length pill. The sr-only hint span and aria-describedby are the same
-      // web-ux F21 pattern as the full chip — the explanation is DESCRIBED, never the
-      // accessible NAME.
+      // PRD #295: the Runs-list rendering, embedded inside the row's own <Link>. The
+      // tone dot carries the "worth a look" signal the full chip carries with a link,
+      // and the label answers "which account". Everything else — mode, hint, the full
+      // (untruncated) label — lives in the title, NOT in a visible pill or an sr-only
+      // span: the sr-only hint would fold a whole sentence into every row link's
+      // accessible name, and a nested <a> is illegal HTML inside the row <Link>. So the
+      // compact badge is deliberately a bare Badge with no aria-describedby and no
+      // inner link; the direct /settings link and the described hint stay on the full
+      // run-detail chip, which is not inside a row link.
       <Badge
         tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
         // dot only where the state is non-neutral, matching the full chip's
         // "link iff non-neutral" rule: a calm auto/pinned pick stays quiet.
         dot={tone !== "neutral"}
-        aria-describedby={hintId}
         title={
           deleted
-            ? `${mode ? mode + " — " : ""}${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
-            : mode
-              ? `${mode} — ${hint}`
-              : hint
+            ? `token “${safe}”${mode ? " — " + mode : ""} — ${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
+            : `token “${safe}”${mode ? " — " + mode : ""} — ${hint}`
         }
       >
-        {safe}
+        {/* web-ux F20 (compact): the server allows a 64-char label, and the Badge is
+            whitespace-nowrap with no width cap, so a long unbroken label pushes the
+            document past a 375px viewport. Clamp the LABEL child rather than adding
+            `wrap` (a 64-char token has no break opportunity to wrap on); `truncate`
+            keeps the full text in the DOM so screen readers still read it, and the
+            title carries the full label for mouse users. */}
+        <span className="max-w-[12rem] truncate">{safe}</span>
         {deleted && " (deleted)"}
-        <span id={hintId} className="sr-only">
-          {hint}
-        </span>
       </Badge>
     ) : (
       <Badge
@@ -131,21 +128,20 @@ export function RunCredential({
       </Badge>
     );
 
-  // Only a non-neutral state is a link, and it is ONE rule so the two cannot drift:
-  // link iff the tone is not neutral. PRD #104 M5 already ships the per-token meters
-  // and eligibility chips on Settings → Anthropic tokens, so this points at them
-  // rather than rebuilding a meter in the run header — but only where the user has
-  // something to DO there. On an ordinary `auto` or `pinned` run nothing is wrong and
-  // a link is a dead end dressed as an action; on a deleted credential there is
-  // nothing left to look at.
-  //
-  // `linkable` additionally strips the link on the admin factory list (PRD #295 D2),
-  // where the credential belongs to another user and this link would point the admin
-  // at their OWN settings — a dead end. Default true keeps the personal behaviour.
+  // The COMPACT badge never links: it is embedded inside the Runs-list row <Link>, so
+  // an inner <a> would be a nested anchor (illegal HTML), and the tone dot + title
+  // already carry the "worth a look" signal. Only the FULL run-detail chip links, and
+  // only where there is something to do — link iff the tone is not neutral, one rule so
+  // the two cannot drift. PRD #104 M5 already ships the per-token meters and
+  // eligibility chips on Settings → Anthropic tokens, so this points at them rather
+  // than rebuilding a meter in the run header — but only where the user has something
+  // to DO there. On an ordinary `auto` or `pinned` run nothing is wrong and a link is a
+  // dead end dressed as an action; on a deleted credential there is nothing left to
+  // look at.
   //
   // The USER'S OWN settings page, deliberately not /admin/rate-limits: that route is
   // admin-only and would 403 for exactly the person reading their own run.
-  return linked && linkable ? (
+  return variant === "full" && linked ? (
     <Link to="/settings" className="no-underline">
       {chip}
     </Link>

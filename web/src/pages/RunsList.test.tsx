@@ -506,8 +506,11 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     }
   });
 
-  // A run with no recorded credential label renders no badge, at any token count —
-  // the sr-only hint span RunCredential emits is the tell, and it is absent.
+  // A run with no recorded credential label renders no badge, at any token count. The
+  // compact badge wraps its label in a `max-w-[12rem]` span (the truncation clamp,
+  // web-ux F20), which is unique to this badge — so its absence is the tell that
+  // RunCredential self-hid, replacing the old sr-only hint id the compact path no
+  // longer emits.
   it("shows no badge for a run with no credential label, even with two tokens", async () => {
     mockApi.listSecrets.mockResolvedValue({
       secrets: [aSecret({ id: "sec-0" }), aSecret({ id: "sec-1", is_default: false })],
@@ -523,14 +526,47 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     );
 
     await waitFor(() => expect(screen.getByText("Pre-#111 run")).toBeTruthy());
-    expect(container.querySelector('[id^="run-credential-hint"]')).toBeNull();
+    expect(container.querySelector('span.max-w-\\[12rem\\]')).toBeNull();
+  });
+
+  // The blocking-bug guard: the entire row is a <Link to="/runs/:id">, so the compact
+  // badge must never introduce a nested <a> — not even on a non-neutral (pool_empty)
+  // credential, which the old compact path wrapped in an inner <Link to="/settings">.
+  it("a personal non-neutral credential row contains no nested /settings anchor", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [aSecret({ id: "sec-0" }), aSecret({ id: "sec-1", is_default: false })],
+    });
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aCredentialedRun({
+          id: "warn",
+          issue_title: "Pool-empty run",
+          anthropic_secret_label: "nearly-spent",
+          anthropic_select_reason: "pool_empty",
+          anthropic_headroom_pct: null,
+        }),
+      ],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Pool-empty run")).toBeTruthy());
+    // The badge renders with its label…
+    expect(screen.getByText("nearly-spent")).toBeTruthy();
+    // …but there is no /settings anchor anywhere — the row's own /runs/:id link stands
+    // alone, with no nested <a> inside it.
+    expect(container.querySelector('a[href="/settings"]')).toBeNull();
   });
 
   // The admin factory list shows every run's credential (an admin auditing spend
-  // wants provenance) regardless of the admin's own token count — here zero — but the
-  // badge never links, because it points at the admin's own /settings for another
-  // user's token (Decision 2). pool_empty is non-neutral, so on the personal list it
-  // WOULD link; here it must not.
+  // wants provenance) regardless of the admin's own token count — here zero — and the
+  // badge never links: it lives inside the row <Link>, so an inner /settings anchor
+  // would be a nested <a> (Decision 2 also noted it would point the admin at their own
+  // settings for another user's token). pool_empty is non-neutral, yet still no link.
   it("admin factory rows render the credential badge but do not link it", async () => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: true, email: "me@uzi.test" },

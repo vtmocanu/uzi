@@ -47,7 +47,6 @@ function RunRow({
   showOwner,
   waitingForVault = false,
   showCredential = false,
-  credentialLinkable = true,
 }: {
   run: RunListItem;
   // now (issue #256 M3): a Date.now()-style clock, ticked by useNow in the parent, so
@@ -61,11 +60,10 @@ function RunRow({
   // showCredential (PRD #295): render the compact credential badge in the pill
   // cluster. Gated off by default; the caller decides (personal list: viewer holds
   // >1 token; admin factory list: always). RunCredential itself self-hides on a run
-  // with no label, so a mixed list needs no per-row guard beyond this flag.
+  // with no label, so a mixed list needs no per-row guard beyond this flag. The
+  // compact badge is inherently non-linked (it lives inside this row's own <Link>),
+  // so there is no linkable flag to thread through.
   showCredential?: boolean;
-  // credentialLinkable (PRD #295 D2): false on the admin list, where the credential
-  // is another user's and the badge's /settings link would point at the admin's own.
-  credentialLinkable?: boolean;
 }) {
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
@@ -156,9 +154,7 @@ function RunRow({
               {/* PRD #295: which Anthropic token this run's claim billed. Gated by
                   the caller (personal list: viewer holds >1 token) and self-hiding
                   on a run with no recorded label. */}
-              {showCredential && (
-                <RunCredential run={run} variant="compact" linkable={credentialLinkable} />
-              )}
+              {showCredential && <RunCredential run={run} variant="compact" />}
             </>
           )}
         </div>
@@ -189,7 +185,10 @@ export function RunsList() {
     try {
       const [{ runs }, { secrets }, admin] = await Promise.all([
         api.listRuns(),
-        api.listSecrets(),
+        // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
+        // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint failure
+        // must not blank the whole Runs page. Fall back to no tokens → no badge.
+        api.listSecrets().catch(() => ({ secrets: [] })),
         isAdmin ? Promise.all([api.adminListRuns(), api.adminListWorkers()]) : Promise.resolve(null),
       ]);
       setRuns(runs);
@@ -301,10 +300,10 @@ export function RunsList() {
                     // PRD #295 D2: the admin factory list shows every run's credential
                     // (an admin auditing spend wants provenance), unconditionally — the
                     // >1-token gate is the personal viewer's, not this cross-user list's.
-                    // Non-linked, because the label is another user's and the badge's
-                    // /settings link points at the admin's own settings.
+                    // The compact badge is inherently non-linked (it renders inside the
+                    // row <Link>), so it never points the admin at their own /settings for
+                    // another user's token — no linkable=false is needed.
                     showCredential
-                    credentialLinkable={false}
                     // Only the current admin's OWN queued rows can show the vault state —
                     // another owner's vault status is unknown here (PRD #32), so theirs
                     // render as plain "queued".

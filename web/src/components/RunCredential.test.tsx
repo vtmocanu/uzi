@@ -251,28 +251,25 @@ describe("RunCredential compact variant (PRD #295)", () => {
     expect(container.querySelector("a")).toBeNull();
   });
 
-  // best_of_pool is info: the pool is nearly exhausted, worth a look — a dot, and a
-  // link to Settings → Anthropic tokens.
-  it("best_of_pool renders info: a dot, and links to /settings", () => {
+  // best_of_pool is info: the pool is nearly exhausted, worth a look — the tone dot
+  // carries that signal. The compact badge lives inside the Runs-list row <Link>, so it
+  // must NOT introduce a nested anchor: dot yes, link never (the blocking-bug guard).
+  it("best_of_pool renders info: a dot, and is NOT a link", () => {
     const { container } = render(
       <RunCredential run={cred({ reason: "best_of_pool", headroom: 8 })} variant="compact" />,
     );
     expect(hasDot(container)).toBe(true);
-    const link = container.querySelector("a");
-    expect(link).not.toBeNull();
-    expect(link?.getAttribute("href")).toBe("/settings");
+    expect(container.querySelector("a")).toBeNull();
   });
 
-  // pool_empty is warning: the worker is on auto and the pool is empty — a dot, and a
-  // link to the page that fixes it.
-  it("pool_empty renders warning: a dot, and links to /settings", () => {
+  // pool_empty is warning: the worker is on auto and the pool is empty — a dot signals
+  // it, but again no inner link (it would nest inside the row <Link>).
+  it("pool_empty renders warning: a dot, and is NOT a link", () => {
     const { container } = render(
       <RunCredential run={cred({ reason: "pool_empty" })} variant="compact" />,
     );
     expect(hasDot(container)).toBe(true);
-    const link = container.querySelector("a");
-    expect(link).not.toBeNull();
-    expect(link?.getAttribute("href")).toBe("/settings");
+    expect(container.querySelector("a")).toBeNull();
   });
 
   // A deleted credential (id null, label kept) still names the account and marks it
@@ -285,17 +282,22 @@ describe("RunCredential compact variant (PRD #295)", () => {
     expect(screen.getByText(/\(deleted\)/)).toBeTruthy();
   });
 
-  // linkable=false is the admin factory list (D2): the credential is another user's,
-  // so the badge renders on a non-neutral state but the /settings link is suppressed.
-  it("linkable=false renders the badge but no link, even on a non-neutral state", () => {
-    const { container } = render(
-      <RunCredential run={cred({ reason: "pool_empty" })} variant="compact" linkable={false} />,
-    );
-    expect(screen.getByText(/console-key/)).toBeTruthy();
-    // The dot still signals the state; only the link is gone.
-    expect(hasDot(container)).toBe(true);
-    expect(container.querySelector("a")).toBeNull();
-  });
+  // The compact badge is NEVER a link, on any tone — it is embedded inside the row
+  // <Link> and a nested <a> is illegal HTML. This is the direct guard for the blocking
+  // nested-anchor bug the earlier compact path introduced. The full run-detail chip,
+  // which is not inside a row link, keeps its /settings link (asserted separately).
+  it.each(["best_of_pool", "pool_empty", "pool_stale", "open_failed"])(
+    "compact never renders a link, even on the non-neutral %s state",
+    (reason) => {
+      const { container } = render(
+        <RunCredential run={cred({ reason })} variant="compact" />,
+      );
+      expect(screen.getByText(/console-key/)).toBeTruthy();
+      // The dot still signals the state; there is simply no anchor.
+      expect(hasDot(container)).toBe(true);
+      expect(container.querySelector("a")).toBeNull();
+    },
+  );
 
   // No label: a run claimed before PRD #111 M1, or not yet claimed, renders nothing —
   // no placeholder badge on the row.
