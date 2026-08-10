@@ -1,7 +1,8 @@
 # PRD #304: Board search + per-lane show-more paging
 
 **GitLab Issue**: [#304](https://gitlab.example.com/vtmocanu/uzi/-/issues/304)
-**Status**: Draft (created 2026-08-10)
+**Status**: Complete (2026-08-10) — all seven milestones implemented, tested
+(1940 web tests green), and documented in `docs/board.md`.
 **Priority**: Medium
 **Labels**: `PRD`, `Night` (nightly 02:00 sweep)
 **Related**: PRD #102 (the kanban board and its render/freeze split — `payloadCards` vs `renderCards`, Decision 7b — which this PRD must not break). PRD #196 (board membership `primary ∪ extras` and the render-time `visibleCards` filter this search filters *after*). The `hideEmpty` and `sortMode` view preferences (`web/src/pages/Board.tsx`) are the persistence pattern the new per-lane default copies.
@@ -55,7 +56,7 @@ line.
 
 ## Milestones
 
-- [ ] **M1 — Per-lane cap + paged `Show more`.** A pure, unit-tested helper (the
+- [x] **M1 — Per-lane cap + paged `Show more`.** A pure, unit-tested helper (the
   `boardColumns.ts`/`runBadge.ts` discipline: logic out of the DOM) computes, per
   lane, how many cards to render given `(matchCount, shownCount, cap, page)` and
   whether a `Show more` / `Collapse` affordance is offered and with what counts.
@@ -70,7 +71,7 @@ line.
   The cap applies to **every** lane including `Closed` (Decision 8); the live
   drag-reveal path is unaffected.
 
-- [ ] **M2 — Board search (render-only filter).** A pure predicate
+- [x] **M2 — Board search (render-only filter).** A pure predicate
   `matchesQuery(card, q)` over title, `#iid`, and labels (case-insensitive), applied
   to `renderCards` **after** `visibleCards` (membership) and **before** the
   `cardsByColumn` memo — which is where `sortCards` runs (`Board.tsx:762`), so search
@@ -83,7 +84,7 @@ line.
   `N/M`; and a board-level result count renders. `payloadCards` is untouched (freeze
   safety).
 
-- [ ] **M3 — Sticky toolbar.** The search field and existing controls (Sort, Issues,
+- [x] **M3 — Sticky toolbar.** The search field and existing controls (Sort, Issues,
   Hide empty, Create, Columns, Refresh) — which live in `PageHeader`'s `actions`
   **inside `Board.tsx`** (`:928`), so this milestone edits that file — pin to the top
   while a long lane scrolls. **Verify plain `sticky top-0` first**: the app shell
@@ -93,14 +94,14 @@ line.
   shell already has a sticky `z-20` top bar, so the new bar needs a top offset and a
   z-order below it. Confirm the pin holds in a browser before this milestone is done.
 
-- [ ] **M4 — Per-lane default preference.** A `Per lane` control persists to
+- [x] **M4 — Per-lane default preference.** A `Per lane` control persists to
   `prefs` as `uzi.board.${repoId}.perLane` (default **10**), mirroring `hideEmpty`
   and `sortMode` exactly — including the `useEffect` re-read on `repoId` change,
   because the route swaps `:id` without remounting (the trap those two document and
   that has been fixed in this file once already). Changing it re-baselines every
   lane's `shownCount`. A hand-edited or missing value falls back to 10.
 
-- [ ] **M5 — Accessibility & keyboard.** `/` focuses search (when not already in an
+- [x] **M5 — Accessibility & keyboard.** `/` focuses search (when not already in an
   input), `Esc` clears and blurs. Search input labeled; `Show more`/`Collapse`
   buttons carry counts in their accessible names. The board-level result count is
   announced through the **existing** always-mounted `sr-only role=status` live region
@@ -110,7 +111,7 @@ line.
   and race the auto-move toasts. Highlight uses a real `<mark>` (or token styling),
   never color alone. Reduced-motion respected on the expander chevron.
 
-- [ ] **M6 — Component tests.** The paging helper and `matchesQuery` predicate are
+- [x] **M6 — Component tests.** The paging helper and `matchesQuery` predicate are
   unit-tested in M1/M2; this milestone is the `Board.test.tsx` component layer:
   show-more reveals a page and Collapse resets; search filters, highlights (title and
   chip), drops empty lanes, and shows `N/M`; the per-lane pref persists and re-reads
@@ -121,7 +122,7 @@ line.
   `reorderBoard` calls). Follow the negative-assertion discipline
   (`.claude/rules/web.md`) for any copy the tests assert absent.
 
-- [ ] **M7 — Docs.** `docs/board.md` (audience: user) documents search, the
+- [x] **M7 — Docs.** `docs/board.md` (audience: user) documents search, the
   per-lane cap + `Show more`, and the per-lane default; the board's own on-screen
   description copy is updated if the controls change how a user should read it. Grep
   the old description string across the tree per the copy-change rule.

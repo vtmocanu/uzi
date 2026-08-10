@@ -19967,3 +19967,49 @@ that overlap VISIBLE to the LLM picker at claim time; the picker decides.
 - **Deferred: the recently-landed half.** Work that JUST merged is not surfaced — `runs` carries
   no merge-time key (no `merged_at`), and the in-flight half alone fixes the motivating bug. Left
   for a follow-up if a merge-time signal is added.
+
+## 520. PRD #304 — board search + per-lane show-more paging are RENDER-ONLY view state on `renderCards`, with the freeze set left unfiltered
+
+Design record `prds/done/304-board-search-and-paged-lanes.md`. Both additions live entirely in `web/`
+(`Board.tsx` plus the pure helpers `boardCards.ts`/`boardColumns.ts`): **no API, DTO, sqlc, or DB
+change**. The board payload already carries every card (PRD #102/#196 Decision 12), so search and
+the per-lane cap filter/slice the render path exactly where membership (`visibleCards`, PRD #196)
+filters — instant view state, not a sync setting a poll-cycle away.
+
+- **Freeze safety is the load-bearing rule, not a footnote (extends §442 / PRD #102 Decision 7b).**
+  Search and the per-lane cap filter and slice `renderCards` only; `payloadCards` — the unfiltered
+  set that drives the drag/keyboard reorder freeze — stays untouched. Filtering it would NULL the
+  board position of every card a query or cap hid, relocating them on the owner's other tab. The cap
+  is a RENDER-only slice: `cardsByColumn` stays FULL, so the reorder anchors (`moveCard`,
+  `canMoveUp/Down`, append-to-end drop) still see the whole lane, and a card moved or dropped past
+  the cap auto-reveals its lane rather than vanishing. `Board.test.tsx` asserts the freeze uses the
+  unfiltered payload while BOTH a cap and a search hide cards (the guard, extended from search to the
+  cap because they hide identically).
+- **One ordered pipeline: membership → search → sort → cap.** `visibleCards` and the `matchesQuery`
+  predicate (`boardCards.ts`; title, `#iid`, label, case-insensitive) narrow `renderCards`; the
+  `cardsByColumn` memo then runs `sortCards` and the per-lane slice. The sort AND the cap both live
+  inside that memo — it is the real seam, not a step between grouping and render.
+- **Search lifts the caps rather than fighting them (Decision 5).** A query starts a matched lane at
+  one page and pages from there through the same `shownCount` model, so a 400-match search never
+  dumps 400 cards. While a query is active empty lanes drop (the query acts as `hideEmpty` for its
+  duration, still composing with the live-drag reveal via `boardColumns.ts` `dragActive`), capped
+  lanes show `N/M`, and a board-level result count renders through the EXISTING `sr-only role=status`
+  live region (debounced, last-writer-wins — it is the single-string channel `pushToast` shares).
+- **Paged reveal, never "show all" (Decision 3).** A page is 50; the expander advances `shownCount`
+  by one page and an expanded lane scrolls within a bounded height, so a 900-deep lane never lands
+  hundreds of nodes in the DOM at once. Past two pages of remainder the lane nudges toward search
+  instead of a "show all" that would rebuild the wall. Virtualization (react-window / IO sentinel) is
+  deferred behind the same `shownCount` affordance — an implementation swap, not a UX change.
+- **Per-lane default (10) is a per-browser, per-repo VIEW preference**, stored in `prefs` as
+  `uzi.board.${repoId}.perLane` beside `hideEmpty`/`sortMode` (§87/§88/§443) — density, not
+  admin/server policy. It re-reads on `repoId` change via `useEffect` (the route swaps `:id` without
+  remounting — the §88 trap); a missing/hand-edited value falls back to 10. The cap applies to
+  **every** lane INCLUDING `Closed` (Decision 8): Closed accumulates forever and is the deepest lane,
+  and it is the safest to cap (not a drop target, outside the freeze), still ordered by iid.
+- **Search is scoped to board members, deliberately (Decision 9).** It filters `renderCards`, so a
+  payload card excluded by membership is unfindable — searching a non-member `#iid` returns nothing.
+  Search narrows what is ON the board; it does not widen membership. Reads as a bug, so `docs/board.md`
+  states it and points at the existing "Issues" control as the widen path.
+- **Sticky toolbar (M3).** The search field and existing controls pin with plain `sticky top-0`: the
+  app shell scrolls the window with no `overflow` ancestor on `<main>`, so a board-local scroll region
+  (which would fight the lanes' own `overflow-x-auto`) was the fallback, not the default.

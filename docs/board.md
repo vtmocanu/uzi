@@ -128,6 +128,46 @@ Two consequences worth knowing:
   anything, so an issue that reopens after that comes back at the bottom of its
   column. Reopened before then, it returns to the place it used to hold.
 
+## Search
+
+The toolbar's search field filters cards across every column at once, by
+title, `#iid`, or label — case-insensitive, with the matched text
+highlighted. Press **`/`** anywhere on the board to jump into it; **`Esc`**
+clears the query.
+
+While a query is active: a column with no matches drops out entirely, a
+capped column showing only some of its matches gets an `N/M` count (see
+[Per-lane paging](#per-lane-paging) below), and a board-level **`N
+results`** line appears above the columns. Clear the query and everything
+comes back.
+
+**Search only finds board members.** It filters the same set the board
+already renders — the `primary ∪ extras` membership described in
+[Which issues show up](#which-issues-show-up) — so an issue that exists on
+GitLab but isn't a member of *this* board won't turn up, even searched by
+its exact `#iid`. That's deliberate: search narrows what's already on the
+board, it doesn't widen membership. Use the **Issues** control to bring an
+issue onto the board first if you need it to be findable.
+
+## Per-lane paging
+
+A column with more cards than its cap renders only the cap; the rest sit
+behind a **`Show N more · N left`** button at the bottom of the column.
+Each click reveals one more page (up to 50) of cards, and an expanded
+column scrolls internally instead of growing the page. **Collapse** puts
+it back to the cap. The cap applies to every column, including **Closed**.
+Past a couple of pages of hidden remainder, the button is replaced by a
+nudge to search instead of paging through everything.
+
+A card dragged past the cap, or moved there by a run, always reveals
+itself — a card can never disappear behind a cap it was just moved into.
+
+The **Per lane** control in the toolbar sets the cap (5 / 10 / 20, default
+**10**). Like **Sort** and **Hide empty**, it's remembered per board, on
+this browser, and re-baselines every column when you change it. While a
+search is active the cap lifts: a matching column opens at a full page and
+pages from there instead of starting at the cap.
+
 ## Automatic moves
 
 Starting a run moves its issue for you: **Start run** puts the card in **In
