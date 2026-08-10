@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildSignalMcpServer, isSignalToolName, scanSignals } from "../src/signals.js";
+import { buildSignalMcpServer, isSignalToolName, REPORT_MD_MAX_LEN, scanSignals } from "../src/signals.js";
 
 // The plan/done signals are observed from the SDK message stream, so a scripted
 // tool_use proves them with no live session.
@@ -208,6 +208,65 @@ describe("scanSignals milestones_completed on signal_done (PRD #265 M1)", () => 
   });
 });
 
+describe("scanSignals report_only + summary on signal_done (issue #279)", () => {
+  const DONE = "mcp__uzi__signal_done";
+
+  it("extracts report_only + summary alongside done", () => {
+    assert.deepStrictEqual(
+      scanSignals(toolUse(DONE, { report_only: true, summary: "verified: no code change needed" })),
+      { done: true, reportOnly: true, summary: "verified: no code change needed" },
+    );
+  });
+
+  it("still scans a plain signal_done to exactly { done: true } (existing deepStrictEqual holds)", () => {
+    const r = scanSignals(toolUse(DONE, {})) as Record<string, unknown>;
+    assert.deepStrictEqual(r, { done: true });
+    assert.ok(!("reportOnly" in r), "reportOnly absent, not undefined-valued");
+    assert.ok(!("summary" in r), "summary absent, not undefined-valued");
+  });
+
+  it("clamps summary to REPORT_MD_MAX_LEN", () => {
+    const big = "x".repeat(REPORT_MD_MAX_LEN + 5000);
+    const r = scanSignals(toolUse(DONE, { summary: big })) as { done?: boolean; summary?: string };
+    assert.strictEqual(r.done, true);
+    assert.strictEqual(r.summary?.length, REPORT_MD_MAX_LEN);
+  });
+
+  it("captures summary without report_only, and report_only only when strictly true", () => {
+    // summary alone (a normal completion may still carry a one-liner).
+    const s = scanSignals(toolUse(DONE, { summary: "did the thing" })) as Record<string, unknown>;
+    assert.deepStrictEqual(s, { done: true, summary: "did the thing" });
+    // report_only must be strictly `true` — a truthy-but-not-true value is not report-only.
+    for (const notTrue of [1, "true", {}, ["x"]]) {
+      const r = scanSignals(toolUse(DONE, { report_only: notTrue })) as Record<string, unknown>;
+      assert.strictEqual(r["done"], true, `done survives report_only=${JSON.stringify(notTrue)}`);
+      assert.ok(!("reportOnly" in r), `report_only=${JSON.stringify(notTrue)} must not latch`);
+    }
+  });
+
+  it("ignores a non-string summary and still reports done", () => {
+    for (const bad of [42, null, {}, ["s"], true]) {
+      const r = scanSignals(toolUse(DONE, { summary: bad })) as Record<string, unknown>;
+      assert.strictEqual(r["done"], true, `done must survive summary ${JSON.stringify(bad)}`);
+      assert.ok(!("summary" in r), `non-string summary ${JSON.stringify(bad)} must not be captured`);
+    }
+  });
+
+  it("IGNORES a subagent-borne report_only/summary entirely (main-thread guard covers the new fields)", () => {
+    // report_only drives a NO-MR terminal path, so a prompt-injected subagent must never
+    // reach it — the same guarantee that keeps a subagent from latching done/prd_done_path.
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, { report_only: true, summary: "x" })), {});
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { report_only: true, summary: "x" }, { subagent_type: "coder" })),
+      {},
+    );
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { report_only: true, summary: "x" }, { parent_tool_use_id: "toolu_x" })),
+      {},
+    );
+  });
+});
+
 describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
   // Gating the SCHEMA is the strongest layer available: on a non-issue run the
   // model never sees the parameter, rather than seeing it and having the value
@@ -245,6 +304,18 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     }
     const enabled = doneToolShape(buildSignalMcpServer({ milestones: true }));
     assert.ok("milestones_completed" in enabled, `expected milestones_completed; got ${Object.keys(enabled).join(", ")}`);
+    assert.ok("summary" in enabled);
+  });
+
+  it("gates signal_done report_only on the issue-run discriminator (issue #279)", () => {
+    // Invisible to the model on a non-issue run, exposed only when reportOnly is enabled.
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({}), buildSignalMcpServer({ reportOnly: false })]) {
+      const shape = doneToolShape(server);
+      assert.ok(!("report_only" in shape), `report_only must be absent; got ${Object.keys(shape).join(", ")}`);
+      assert.ok("summary" in shape, "the pre-existing summary param is unchanged");
+    }
+    const enabled = doneToolShape(buildSignalMcpServer({ reportOnly: true }));
+    assert.ok("report_only" in enabled, `expected report_only; got ${Object.keys(enabled).join(", ")}`);
     assert.ok("summary" in enabled);
   });
 });

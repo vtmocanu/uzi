@@ -218,6 +218,12 @@ interface TurnResult {
    *  Latched (last-wins/latch within the turn, like `done`): once seen it stays set, and
    *  the loop reaps + fetches the committed milestone work back durably before continuing. */
   checkpoint?: boolean;
+  /** issue #279: the `summary` the lead passed to signal_done this turn, if any. Last-wins
+   *  within the turn (like prdDonePath); persisted as report_md on a report-only completion. */
+  summary?: string;
+  /** issue #279: true when the lead declared `report_only: true` on signal_done this turn.
+   *  Latched (like `done`): the run completes with NO push/MR. Issue runs only. */
+  reportOnly?: boolean;
 }
 
 /** PRD #88 feed notices for a question that could NOT be put to a human. Both are
@@ -580,6 +586,9 @@ export class SdkExecutor implements Executor {
         // PRD #122 M6: the checkpoint tool, gated on the same isIssueRun discriminator —
         // a non-issue run has no milestone boundary to checkpoint at.
         checkpoint: isIssueRun,
+        // issue #279: report_only on signal_done, gated on the same isIssueRun discriminator —
+        // a non-issue run (ci_fix/self_improve/prompt) has its own terminal paths.
+        reportOnly: isIssueRun,
       }),
     };
     if (this.client) {
@@ -1140,6 +1149,11 @@ export class SdkExecutor implements Executor {
       // turn's signal_done declaration must survive the `break` below to reach the
       // completed report.
       let declaredMilestonesCompleted: string[] | undefined;
+      // issue #279: hoisted for the same reason as declaredPrdPath — the terminating turn's
+      // signal_done report_only/summary declaration must survive the `break` below to reach
+      // the final ExecutorResult (and thence the runner's report-only completion path).
+      let declaredReportOnly = false;
+      let declaredSummary: string | undefined;
       for (;;) {
         iteration++;
         // PRD #122 M2: report the iteration (carrying the latest milestone progress) and
@@ -1216,6 +1230,9 @@ export class SdkExecutor implements Executor {
             // any run with no approved breakdown, which makes the note additive-absent.
             milestones: frozenMilestones,
             progress: latestProgress,
+            // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
+            // gated on the same isIssueRun discriminator the signal_done schema uses.
+            reportOnly: isIssueRun,
           }),
           state,
           idleMs,
@@ -1226,6 +1243,11 @@ export class SdkExecutor implements Executor {
         // survives the terminating turn's `break` into the completed report.
         if (turn.milestonesCompleted !== undefined)
           declaredMilestonesCompleted = turn.milestonesCompleted;
+        // issue #279: latch report_only true (like done) and take the last-wins summary
+        // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
+        // the final ExecutorResult after the break below.
+        if (turn.reportOnly) declaredReportOnly = true;
+        if (turn.summary !== undefined) declaredSummary = turn.summary;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -1326,6 +1348,14 @@ export class SdkExecutor implements Executor {
       // completion, so a non-issue run — which has no frozen list — never carries them.
       if (isIssueRun && declaredMilestonesCompleted !== undefined) {
         result.milestonesCompleted = declaredMilestonesCompleted;
+      }
+      // issue #279: forward the report-only declaration + captured summary on `issue` runs
+      // only, with the SAME OMITTED-not-undefined discipline as prdDonePath above — the keys
+      // are absent unless the lead actually declared them, so an ordinary push+MR completion
+      // is byte-identical to before and every existing deepStrictEqual on this result holds.
+      if (isIssueRun && declaredReportOnly) result.reportOnly = true;
+      if (isIssueRun && declaredSummary !== undefined) {
+        result.summary = declaredSummary;
       }
       return result;
     } finally {
@@ -1710,6 +1740,11 @@ export class SdkExecutor implements Executor {
         // about to reconcile at completion.
         if (sig.milestonesCompleted !== undefined)
           result.milestonesCompleted = sig.milestonesCompleted;
+        // issue #279: the summary is last-wins within the turn (like prdDonePath), and
+        // report_only latches true (like `done`) — once the lead declares the run
+        // report-only it stays report-only through the terminating turn's break.
+        if (sig.summary !== undefined) result.summary = sig.summary;
+        if (sig.reportOnly) result.reportOnly = true;
         // PRD #88: accumulate across the turn rather than last-wins. A lead told to
         // batch its questions into one call normally makes exactly one, but if it
         // makes two we must ask both — dropping the earlier one would park the run on

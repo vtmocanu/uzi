@@ -331,4 +331,60 @@ describe("RunRunner — worker-performed push + MR", () => {
       "secrets should be redacted in place",
     );
   });
+
+  // issue #279: a DECLARED report-only run completes with its findings and opens NO
+  // merge request — the ci_fix not_code precedent, for an issue run's evidence deliverable.
+  it("completes report-only with report_md and opens NEITHER a push NOR an MR (issue #279)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    let pushed = false;
+    git.pushBranch = (async () => {
+      pushed = true;
+    }) as typeof git.pushBranch;
+    const summary = "verified: config already correct; no code change needed";
+    const exec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch, reportOnly: true, summary }),
+    };
+    const claim = gitlabClaim(21);
+    await runner(exec, gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
+    assert.strictEqual(completed.report_only, true);
+    assert.strictEqual(completed.report_md, summary);
+    assert.ok(
+      !("mr_iid" in completed) || completed.mr_iid === undefined,
+      "no MR iid on a report-only completion",
+    );
+    assert.strictEqual(calls.length, 0, "no MR opened on a report-only run");
+    assert.strictEqual(pushed, false, "no branch pushed on a report-only run");
+    assert.strictEqual(fs.existsSync(worktreeDirFor(21)), false);
+  });
+
+  // issue #279: an issue run that signalled done but committed NOTHING and did NOT set
+  // report_only is the ambiguous "forgot to commit / should have set report_only" case —
+  // it must fail with an actionable reason rather than open an empty MR.
+  it("fails an issue run with an empty diff and no report_only, opening NO MR (issue #279)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    // A confirmed-empty diff (changedFiles returns [], not null). The StubExecutor still
+    // creates a real branch so fetchAgentBranch succeeds; the guard keys on the diff.
+    git.changedFiles = (async () => []) as typeof git.changedFiles;
+    const claim = gitlabClaim(22);
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    )!.body;
+    assert.match(failed.failure_reason ?? "", /report_only was not set/);
+    assert.strictEqual(calls.length, 0, "no MR on an empty-diff issue run");
+    assert.strictEqual(fs.existsSync(worktreeDirFor(22)), false);
+  });
 });

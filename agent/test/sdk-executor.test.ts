@@ -1871,6 +1871,58 @@ describe("SdkExecutor signal_done milestones_completed (PRD #265 M1)", () => {
   });
 });
 
+// issue #279: the lead declares a report-only run + its summary on signal_done. The
+// executor owns the run-kind gate and getting both values out of the TERMINATING turn
+// (the one `break` would otherwise discard), OMITTED-not-undefined on the result.
+describe("SdkExecutor signal_done report_only + summary (issue #279)", () => {
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { result, turns, probe };
+  }
+
+  it("carries report_only + summary off the TERMINATING turn into the result (issue run)", async () => {
+    const { result } = await runDeclaring({ report_only: true, summary: "verified: no code change needed" });
+    assert.strictEqual(result.reportOnly, true);
+    assert.strictEqual(result.summary, "verified: no code change needed");
+  });
+
+  it("omits both fields when the lead declares neither (additive-absent)", async () => {
+    const { result } = await runDeclaring({});
+    assert.ok(!("reportOnly" in result) || result.reportOnly === undefined);
+    assert.ok(!("summary" in result) || result.summary === undefined);
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", async () => {
+    const { result } = await runDeclaring({ report_only: true, summary: "s" }, {});
+    assert.strictEqual(result.reportOnly, true);
+    assert.strictEqual(result.summary, "s");
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never puts report_only/summary on the result, even when declared`, async () => {
+      const { result } = await runDeclaring({ report_only: true, summary: "s" }, { kind });
+      assert.strictEqual(result.reportOnly, undefined, `${kind} must not forward report_only`);
+      assert.strictEqual(result.summary, undefined, `${kind} must not forward summary`);
+    });
+
+    it(`a ${kind} run is not even OFFERED the report_only parameter`, async () => {
+      const { turns } = await runDeclaring({}, { kind });
+      const shape = doneToolShapeOf(turns[0]!.options);
+      assert.ok(!("report_only" in shape), `${kind}: the schema must not expose report_only`);
+    });
+  }
+
+  it("an issue run IS offered the report_only parameter", async () => {
+    const { turns } = await runDeclaring({}, { kind: "issue" });
+    assert.ok("report_only" in doneToolShapeOf(turns[0]!.options));
+  });
+});
+
 /** The signal server's signal_done zod shape, read off a turn's options. */
 function doneToolShapeOf(o: SdkOptions): Record<string, unknown> {
   const server = (o.mcpServers as Record<string, unknown>)["uzi"] as { instance?: unknown };
