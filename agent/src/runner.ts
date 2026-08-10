@@ -671,6 +671,8 @@ export class RunRunner {
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
         repoClaudemdEnabled: claim.repo.claudemd_enabled ?? false,
         memory,
+        // Issue #297: the self_improve in-flight avoid-set (best-effort; absent ⇒ empty).
+        inflightTargets: claim.inflight_targets,
         config: claim.config,
         // Preflighted above: the claim's id, or undefined when its transcript is not
         // on this worker (issue #105).

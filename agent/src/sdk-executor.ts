@@ -878,6 +878,8 @@ export class SdkExecutor implements Executor {
             // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
+            // Issue #297: the in-flight avoid-set, rendered in its own untrusted fence.
+            inflightTargets: ctx.inflightTargets,
             // Issue #105: see above — the fixed self_improve branch's prior cycles.
             priorWork: ctx.priorWork,
             // See above. The fixed self_improve branch is routinely seeded off a previous

@@ -506,6 +506,14 @@ export interface ClaimResponse {
    *  history. UNTRUSTED-posture data (it is the user's own prior targets, but the judge
    *  runs toolless over untrusted traces): rendered nonce-fenced, never as instructions. */
   known_improve_uzi_targets?: string[];
+  /** Best-effort list of work already IN FLIGHT on the same repo at claim time
+   *  (issue #297), delivered ONLY on a self_improve claim so the picker skips a
+   *  recommendation whose fix another active run is already doing. Each entry is one
+   *  compact coordinate line (issue iid + title + kind/status + frozen milestone
+   *  titles). Absent/empty when nothing overlapping is in flight. UNTRUSTED CONTENT —
+   *  the titles are issue/milestone text anyone who can file an issue can influence —
+   *  rendered nonce-fenced by the worker, never as instructions. */
+  inflight_targets?: string[];
   /** The plan already captured for this run (PRD #35 Decision 6b). The server has
    *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
    *  nothing read it. A resumed run whose plan was already approved replays THIS
