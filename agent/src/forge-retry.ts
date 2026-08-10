@@ -114,11 +114,15 @@ export function classifyForgeError(err: unknown): "transient" | "permanent" {
 
 /**
  * TRANSIENT patterns for a devbox/nix/curl `devbox install` failure. These are
- * deliberately NETWORK PHRASES, not bare tokens (mirroring ADR-0284's
- * `Could not read from remote repository` note): matching a bare `ssl`/`tls`
- * token would mis-read a deterministic error like `package 'openssl' not found`
- * as transient. Each entry is scoped so only a genuine network/timeout condition
- * hits. Case-insensitive.
+ * deliberately NETWORK-SCOPED PHRASES, not bare tokens (mirroring ADR-0284's
+ * `Could not read from remote repository` note): a bare `ssl`/`tls` token or a
+ * bare `50[023]` number would mis-read a deterministic error as transient — a
+ * package name like `openssl` (`package 'openssl-connector' has an unfree
+ * license`) or a nix eval file:line ref like `default.nix:503:12` must NOT be
+ * read transient. So the SSL/HTTP-5xx entries are anchored to their network
+ * context (`SSL handshake`, `returned error: 503`, `HTTP error 503`, `service
+ * unavailable`) rather than the bare token. Each entry is scoped so only a
+ * genuine network/timeout condition hits. Case-insensitive.
  */
 const DEVBOX_TRANSIENT_PATTERNS: RegExp[] = [
   /curl:\s*\(28\)/i, // operation timed out
@@ -135,10 +139,14 @@ const DEVBOX_TRANSIENT_PATTERNS: RegExp[] = [
   /connection timed out/i,
   /network is unreachable/i,
   /TLS handshake/i,
-  /SSL.*(error|handshake|connect)/i,
+  /SSL handshake/i,
+  /SSL connect error/i,
+  /SSL_ERROR_SYSCALL/i,
+  /returned error:\s*50[023]\b/i, // curl: (22) The requested URL returned error: 503
+  /HTTP(?:\/[\d.]+)?\s*(?:error\s*)?50[023]\b/i, // nix "HTTP error 503" / "HTTP/1.1 503"
+  /service unavailable/i,
   /bad gateway/i,
   /gateway time-?out/i,
-  /\b50[023]\b/, // 500 / 502 / 503 from a binary cache or github
 ];
 
 /**

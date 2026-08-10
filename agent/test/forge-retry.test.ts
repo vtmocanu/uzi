@@ -180,6 +180,47 @@ describe("classifyDevboxError", () => {
       err: new Error("error: package 'openssl' not found"),
       want: "permanent",
     },
+    // deterministic openssl configure error ⇒ permanent (the old `SSL.*` over-match
+    // is gone; `openssl configure error` is NOT a network condition)
+    {
+      name: "openssl configure error (deterministic, not a network SSL failure)",
+      err: new Error("error: openssl configure error: missing header"),
+      want: "permanent",
+    },
+    // openssl-connector unfree license ⇒ permanent (package name, not a network phrase)
+    {
+      name: "package 'openssl-connector' unfree license (ssl+connect substrings)",
+      err: new Error("error: package 'openssl-connector' has an unfree license"),
+      want: "permanent",
+    },
+    // manifest line ref ending in :503: ⇒ permanent (bare 503 must NOT trigger transient)
+    {
+      name: "devbox.json:503:12 syntax error (503 line ref is not an HTTP 5xx)",
+      err: new Error("error: syntax error at devbox.json:503:12"),
+      want: "permanent",
+    },
+    // nix eval file:line ref default.nix:502:15 ⇒ permanent (bare 502 must NOT trigger)
+    {
+      name: "default.nix:502:15 nix eval file:line ref (502 line ref is not an HTTP 5xx)",
+      err: new Error(
+        "error: attribute 'foo' at /nix/store/x/default.nix:502:15 called without required argument",
+      ),
+      want: "permanent",
+    },
+    // genuine HTTP 5xx from the cache via curl ⇒ transient (HTTP-context-anchored 503)
+    {
+      name: "curl (22) returned error: 503 Service Unavailable (genuine HTTP 5xx)",
+      err: new Error("curl: (22) The requested URL returned error: 503 Service Unavailable"),
+      want: "transient",
+    },
+    // genuine nix cache 5xx (HTTP error 503) ⇒ transient
+    {
+      name: "unable to download narinfo: HTTP error 503 (genuine cache 5xx)",
+      err: new Error(
+        "error: unable to download 'https://cache.nixos.org/nar/xxx.narinfo': HTTP error 503",
+      ),
+      want: "transient",
+    },
     // malformed manifest / parse error ⇒ deterministic, no retry
     {
       name: "malformed manifest parse error",
