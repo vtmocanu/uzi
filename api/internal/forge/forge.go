@@ -344,6 +344,15 @@ type ListIssuesOptions struct {
 	// open-only — without it that fetch would pull the entire closed history on
 	// every reconcile purely to discard it.
 	State IssueState
+	// Limit optionally caps the number of issues returned. Limit == 0 means NO CAP:
+	// the driver paginates internally and returns the COMPLETE set, preserving the
+	// interface's "return complete result sets" contract for every current caller,
+	// all of which leave this zero. A positive Limit tells the driver to stop once
+	// that many issues have been collected (truncating a page as needed), so the
+	// worker forge read (PRD #158) can bound a list without the driver having to walk
+	// the whole project. It is a soft ceiling on count only — it does not change
+	// filtering, ordering, or the shape of any returned issue.
+	Limit int
 }
 
 // Forge is the driver contract. Every method takes a context and surfaces
@@ -362,7 +371,10 @@ type Forge interface {
 	EnsureLabels(ctx context.Context, projectID int64, labels []Label) error
 	// ListIssues returns issues matching opts. State defaults to StateAll (the
 	// zero value), which is what every pre-M6 caller relies on; each driver
-	// translates it into its own request vocabulary.
+	// translates it into its own request vocabulary. opts.Limit optionally caps the
+	// number of issues returned — zero (the default) means no cap and the complete
+	// set is returned as ever, a positive value stops pagination once that many are
+	// collected.
 	ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error)
 	// GetIssue returns one issue by its project-scoped IID. Its Description is
 	// populated (the run-create path snapshots it), unlike the cached list rows.
@@ -458,7 +470,7 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 	case TypeGitLab:
 		return newGitLab(baseURL, token, timeout)
 	case TypeForgejo:
-		return newForgejo(baseURL, token, timeout)
+		return newForgejo(baseURL, token, timeout), nil
 	case TypeGitHub:
 		return newGitHub(baseURL, token, timeout)
 	default:

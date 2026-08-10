@@ -493,6 +493,10 @@ func (f *persistFakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwne
 	return f.run, f.runErr
 }
 
+func (f *persistFakeStore) GetRunForgeConnForWorker(context.Context, store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error) {
+	return store.GetRunForgeConnForWorkerRow{}, nil
+}
+
 func (f *persistFakeStore) InsertRunMessage(_ context.Context, arg store.InsertRunMessageParams) (int64, error) {
 	if f.poisonSeq != 0 && arg.Seq >= f.poisonSeq {
 		return 0, f.insertErr

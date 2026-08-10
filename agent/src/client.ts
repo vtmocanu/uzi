@@ -25,6 +25,12 @@ import {
   type SaveMemoryRequest,
   type MemoryEntry,
   type MemoryListResponse,
+  type IssueDTO,
+  type IssueListDTO,
+  type LabelEventListDTO,
+  type MergeRequestDTO,
+  type JobListDTO,
+  type LatestPipelineDTO,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -328,6 +334,70 @@ export class WorkerClient {
   async getMemory(runId: string): Promise<MemoryEntry[]> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/memory`)) as MemoryListResponse;
     return res.memories ?? [];
+  }
+
+  // ── Forge read surface (PRD #158) ──────────────────────────────────────────
+  // Six worker-mediated, run-scoped forge READ endpoints the run-lane forge MCP
+  // server calls. The agent holds NO credential — the API reads the forge on the
+  // run's behalf, authed by the join token and scoped by {runId} in the path. All
+  // GET, no body. Returned DTOs are UNTRUSTED — the forge server nonce-fences them.
+  // A run with no repository is 409; an unknown run/item is 404 (mapped to
+  // non-fatal tool text by forge-tools.ts).
+
+  /** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). */
+  async getForgeIssue(runId: string, iid: number): Promise<IssueDTO> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/issues/${encodeURIComponent(String(iid))}`,
+    )) as IssueDTO;
+  }
+
+  /** A bounded list of issues (GET /worker/runs/:id/forge/issues?state=&labels=&updated_after=).
+   *  All filters optional: `labels` is comma-joined; `updatedAfter` is RFC3339. */
+  async listForgeIssues(
+    runId: string,
+    opts: { state?: "opened" | "closed"; labels?: string[]; updatedAfter?: string },
+  ): Promise<IssueListDTO> {
+    const params = new URLSearchParams();
+    if (opts.state) params.set("state", opts.state);
+    if (opts.labels && opts.labels.length > 0) params.set("labels", opts.labels.join(","));
+    if (opts.updatedAfter) params.set("updated_after", opts.updatedAfter);
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/issues${q}`,
+    )) as IssueListDTO;
+  }
+
+  /** An issue's label add/remove events (GET /worker/runs/:id/forge/issues/:iid/label-events). */
+  async listForgeIssueLabelEvents(runId: string, iid: number): Promise<LabelEventListDTO> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/issues/${encodeURIComponent(String(iid))}/label-events`,
+    )) as LabelEventListDTO;
+  }
+
+  /** One merge request's state (GET /worker/runs/:id/forge/merge-requests/:iid). */
+  async getForgeMergeRequest(runId: string, iid: number): Promise<MergeRequestDTO> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/merge-requests/${encodeURIComponent(String(iid))}`,
+    )) as MergeRequestDTO;
+  }
+
+  /** A pipeline's jobs (GET /worker/runs/:id/forge/pipelines/:pipelineId/jobs). */
+  async getForgePipelineJobs(runId: string, pipelineId: number): Promise<JobListDTO> {
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/pipelines/${encodeURIComponent(String(pipelineId))}/jobs`,
+    )) as JobListDTO;
+  }
+
+  /** The latest pipeline for exactly one selector (GET /worker/runs/:id/forge/
+   *  latest-pipeline?ref=... OR ?mr_iid=...). `pipeline` is null when none matches. */
+  async getForgeLatestPipeline(runId: string, sel: { ref?: string; mrIid?: number }): Promise<LatestPipelineDTO> {
+    const params = new URLSearchParams();
+    if (sel.ref !== undefined) params.set("ref", sel.ref);
+    else if (sel.mrIid !== undefined) params.set("mr_iid", String(sel.mrIid));
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/forge/latest-pipeline${q}`,
+    )) as LatestPipelineDTO;
   }
 
   /** A 4xx body mentioning "terminal": the server already finalized the run, so the

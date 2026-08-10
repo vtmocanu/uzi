@@ -19525,3 +19525,58 @@ and `prds/216-worker-load-balancing.md`.
   by `api/internal/store/claim_fleet_placement_integration_test.go`; the real-fleet poll-timing
   observation (two binaries polling on their own cadence, the pre-change pile-up control) is owed
   by M5 and unmet — ADR-0216 is **Proposed**, not a fully-validated outcome.
+
+## 509. PRD #158 — forge read tools: a run-scoped, worker-mediated, read-only `forge` MCP server the agent reaches WITHOUT holding a credential
+
+Design record: `prds/158-forge-read-tools.md`. Gives the fact-checker subagent structured
+read access to the run's own forge (issues, MRs, pipelines) so it can verify claims against
+the source, without ever exposing the forge token or coordinates to the model.
+
+- **Worker-mediated, run-scoped, read-only — the `saveMemory` worker-auth precedent (SC1/SC3).**
+  A per-executor in-process MCP server named `forge` (`agent/src/forge-tools.ts`, exported
+  `FORGE_SERVER_NAME`) exposes exactly six read tools — `get_issue`, `list_issues`,
+  `list_issue_label_events`, `get_merge_request`, `get_pipeline_jobs`, `latest_pipeline`. The
+  agent holds NO credential: each tool calls a uzi-API worker route
+  (`GET /runs/{id}/forge/...`, `api/internal/handler/worker_forge.go`, registered in the
+  worker-auth block of `handler.go` alongside `WorkerSaveMemory`). The route derives the run's
+  forge project SERVER-SIDE from the run record via the worker-scoped
+  `GetRunForgeConnForWorker` (`store/queries/runtime.sql`) and builds the Go driver with
+  `forgesvc.Service.ForgeForConnection` — the run id is the only thing the agent names.
+- **Credential/coordinate boundary is a HARD wall (SC3).** The response DTOs
+  (`api/internal/apitypes/forge.go`) deliberately drop `WebURL`, numeric forge project id,
+  base URL, and token. Every driver failure returns ONE fixed generic string via
+  `forgeDriverError` (a 502) — NEVER the driver's `err.Error()`, which embeds host +
+  `projects/<id>` and would slip past the PAT-only redactor; the real error is logged
+  server-side only. `resolveForgeRun` returns the same generic 502 on a driver-build failure
+  so the worker never sees an internal detail either.
+- **Reachability via the fact-checker allowlist + `RefreshPristineBuiltin`, NO migration.**
+  `api/internal/agenttmpl/builtins/fact-checker.md` lists the six `mcp__forge__*` tools by
+  EXACT name (SDK tool resolution is case-sensitive and fail-closed). `RefreshPristineBuiltin`
+  (`store/agent_templates_builtins.go`) re-applies the embedded tools list to pristine builtin
+  rows at boot (PRD #275), so no migration is needed — this CORRECTS the PRD's original "ships
+  dead without a migration" premise, which predated #275. The `forge` server is deliberately
+  NOT added to the `agents.ts` subagent server-deny list (which carries only
+  `SIGNAL_SERVER_DENY` + `MEMORY_SERVER_DENY`): a server-level `disallowedTools` entry overrides
+  a subagent's explicit `tools` allowlist and would lock the fact-checker out.
+- **Bounds and accepted residuals (SC2).** (a) `list_issues` bounds the UPSTREAM fetch via
+  `ListIssuesOptions.Limit` (`forge/forge.go`; `0` = no cap, preserving the complete-set
+  contract for existing callers autopilot/ci_fix), with early-exit added to all three drivers.
+  (b) List routes cap the RESPONSE at `MaxForgeListItems = 50` (fetch `+1` to set `truncated`
+  without a second round trip); an issue description caps at `MaxForgeBodyBytes = 32768`,
+  byte-safe, with `description_truncated`. (c) ACCEPTED RESIDUAL: `list_issue_label_events` and
+  `get_pipeline_jobs` truncate the RESPONSE to 50 but their driver methods take no upstream
+  `Limit` (shared with autopilot/ci_fix, which need complete sets), so they fetch the full
+  per-issue/per-pipeline set then cap — a bounded amplification (own-project, write-gated,
+  agent-side call budget), NOT the whole-project enumeration the feature bounds; a numeric
+  upstream cap on those two is a documented follow-up, not shipped. (d) The per-session call
+  budget `MAX_FORGE_CALLS_PER_RUN = 40` (forge-tools.ts) is AGENT-side, one counter shared
+  across all six tools of the single per-executor server; it RESETS on a run resume
+  (per-session, not strictly per-run) — accepted.
+- **Injection posture: forge payloads are attacker-influenceable prose (SC4).** Every tool's
+  text is wrapped in the nonce-fenced untrusted-evidence envelope (`wrapEvidence`,
+  `agent/src/tool-evidence.ts` — extracted from uzi-tools.ts, which now re-exports it, for
+  shared use) before reaching the model. Tests verify the fence construction survives a forged
+  closing tag; that the model HONORS the fence is inherited from PRD #39, not established here.
+- **The recurring `install_worker_tool: glab` recommendation is by design, not a regression.**
+  It comes from a missing-executable trace scan, and `glab` is permanently denied
+  (`toolprofile/toolprofile.go`), so it keeps firing after this ships — expected recurrence.

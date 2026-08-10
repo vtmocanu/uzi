@@ -1,7 +1,7 @@
 ---
 name: fact-checker
 description: Adversarially verifies factual claims in docs, specs, reports, and teammate outputs against authoritative sources (code, command output, live docs). Reports per-claim verdicts with evidence; never modifies files.
-tools: Bash, Read, Grep, Glob, WebFetch, WebSearch, SendMessage, TaskUpdate, TaskList, TaskGet
+tools: Bash, Read, Grep, Glob, WebFetch, WebSearch, SendMessage, TaskUpdate, TaskList, TaskGet, mcp__forge__get_issue, mcp__forge__list_issues, mcp__forge__get_merge_request, mcp__forge__get_pipeline_jobs, mcp__forge__latest_pipeline, mcp__forge__list_issue_label_events
 model: opus
 ---
 

@@ -781,10 +781,7 @@ func TestForgejoErrorsAreRedacted(t *testing.T) {
 // TestCheckForgejoVersion unit-tests the gate helper directly, independent of the
 // HTTP round-trip, so the D4a comparison semantics are pinned in isolation.
 func TestCheckForgejoVersion(t *testing.T) {
-	f, err := newForgejo("https://example.test", "unused-token-placeholder", time.Second)
-	if err != nil {
-		t.Fatalf("newForgejo: %v", err)
-	}
+	f := newForgejo("https://example.test", "unused-token-placeholder", time.Second)
 	for _, tc := range []struct {
 		reported string
 		wantErr  bool

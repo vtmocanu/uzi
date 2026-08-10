@@ -88,6 +88,7 @@ import {
   RateLimitObserver,
 } from "./limit.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
+import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
@@ -583,6 +584,16 @@ export class SdkExecutor implements Executor {
     };
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
+        client: this.client,
+        runId: ctx.runId,
+        log: this.log,
+      }).server;
+      // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
+      // run-scoped, so the server needs only the client + runId — no RunContext
+      // change. Built once here and shared by the lead + every subagent (the
+      // fact-checker is granted these on the Go side); the per-run call budget is a
+      // single counter inside the server, genuinely per-session.
+      mcpServers[FORGE_SERVER_NAME] = buildForgeToolsServer({
         client: this.client,
         runId: ctx.runId,
         log: this.log,

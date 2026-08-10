@@ -811,6 +811,96 @@ export interface MemoryListResponse {
   memories?: MemoryEntry[];
 }
 
+// ── Forge read tools (PRD #158) ────────────────────────────────────────────────
+// Response shapes for the six worker-mediated forge READ endpoints the run-lane
+// forge MCP server (forge-tools.ts) calls via WorkerClient. Field names are EXACT
+// snake_case as the uzi API sends them (the API is built to this wire contract in
+// parallel). Every field is forge data — UNTRUSTED; the forge server nonce-fences it.
+
+/** One issue's detail (GET /worker/runs/:id/forge/issues/:iid). `description` may be
+ *  truncated by the API, flagged by `description_truncated`. */
+export interface IssueDTO {
+  iid: number;
+  title: string;
+  state: string;
+  labels: string[];
+  author: string;
+  updated_at: string;
+  description: string;
+  description_truncated: boolean;
+}
+
+/** A lightweight issue row in a list (no description). */
+export interface IssueSummary {
+  iid: number;
+  title: string;
+  state: string;
+  labels: string[];
+  author: string;
+  updated_at: string;
+}
+
+/** Response for GET /worker/runs/:id/forge/issues. `truncated` marks a capped list;
+ *  `returned` is the count actually included. */
+export interface IssueListDTO {
+  items: IssueSummary[];
+  truncated: boolean;
+  returned: number;
+}
+
+/** One label-add/remove event on an issue. */
+export interface LabelEventDTO {
+  id: number;
+  action: string;
+  label_name: string;
+  username: string;
+  created_at: string;
+}
+
+/** Response for GET /worker/runs/:id/forge/issues/:iid/label-events. */
+export interface LabelEventListDTO {
+  items: LabelEventDTO[];
+  truncated: boolean;
+  returned: number;
+}
+
+/** One merge request's state (GET /worker/runs/:id/forge/merge-requests/:iid). */
+export interface MergeRequestDTO {
+  iid: number;
+  state: string;
+}
+
+/** One CI job within a pipeline. */
+export interface JobDTO {
+  id: number;
+  name: string;
+  stage: string;
+  status: string;
+}
+
+/** Response for GET /worker/runs/:id/forge/pipelines/:pipelineId/jobs. */
+export interface JobListDTO {
+  items: JobDTO[];
+  truncated: boolean;
+  returned: number;
+}
+
+/** One pipeline's summary. */
+export interface PipelineDTO {
+  id: number;
+  ref: string;
+  sha: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Response for GET /worker/runs/:id/forge/latest-pipeline. `pipeline` is null when
+ *  no pipeline matches the ref/mr_iid selector. */
+export interface LatestPipelineDTO {
+  pipeline: PipelineDTO | null;
+}
+
 /** One appended message; the server is idempotent on (run_id, seq). */
 export interface OutgoingMessage {
   seq: number;

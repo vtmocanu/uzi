@@ -1,7 +1,7 @@
 # PRD #158: Forge read tools — let a run check a claim against the forge instead of against the repo's copy of it
 
 **GitLab Issue**: [#158](https://gitlab.example.com/vtmocanu/uzi/-/issues/158)
-**Status**: Draft (created 2026-07-27; **substantially revised the same day** after an adversarial architect review found the first draft not implementable). **M0 spike completed 2026-08-10 — PASS; see the M0 milestone and the Decision Log.**
+**Status**: Implemented on branch `agent/issue-158` (M0 spike PASS 2026-08-10; **M1–M5 built, tested, and reviewed 2026-08-10; M6 docs done**). The only remaining item is M6's live **acceptance run**, which cannot be performed from the implementation worktree — it is deferred to post-deploy, so this PRD stays here (not moved to `prds/done/`) until that run has happened and been cited. See the milestones and the Decision Log.
 **Priority**: Medium
 
 *What the review changed, because the corrections are the useful part: the draft built the
@@ -177,7 +177,12 @@ three verbs by itself: an issue body saying "see #131 and !77" makes the model w
   **Caveat:** the harness used the local `claude` CLI (2.1.226); the resolution runs inside the CLI, so
   M6's acceptance run reconfirms it on the worker image's claude-code build.
 
-- [ ] **M1 — Run-scoped forge read endpoints on the API, with the truncation contract.**
+- [x] **M1 — Run-scoped forge read endpoints on the API, with the truncation contract.**
+  **Done** (`api/internal/handler/worker_forge.go`, six GET routes in `mountWorkerRoutes`;
+  worker-scoped `GetRunForgeConnForWorker` in `runtime.sql`; authz mirrors `saveMemory` via
+  `ForgeConnForRun`; repoless run → 409; DTOs in `apitypes/forge.go` drop coordinates; fixed
+  generic error strings, never the driver `err.Error()`; truncation envelope + 32 KiB
+  description cap decided here as a wire contract).
   Worker-authenticated routes that resolve the run and derive its project **from the run
   record**. Authorization follows `saveMemory`, whose test is the precedent worth copying
   (`agent_memory_test.go:84` `TestWorkerSaveMemoryDerivesIdentityFromRunClaim`, and :148
@@ -193,7 +198,13 @@ three verbs by itself: an issue body saying "see #131 and !77" makes the model w
   rather than omitted.
   **Truncation is a wire contract decided here**, not retrofitted by M3.
 
-- [ ] **M2 — Widen the driver where the bounds require it, then the run-lane MCP server.**
+- [x] **M2 — Widen the driver where the bounds require it, then the run-lane MCP server.**
+  **Done.** `ListIssuesOptions.Limit` added (0 = no cap, preserving the complete-set contract
+  for existing callers) with early-exit in all three drivers (`gitlab.go`/`forgejo.go`/`github.go`)
+  — scoped to a stop-at-N cap rather than a full paging-cursor refactor. The RUN-lane `forge`
+  MCP server is `agent/src/forge-tools.ts` (name ≠ `uzi`, deliberately absent from the
+  `agents.ts` denylist), with new `WorkerClient` read methods; `wrapEvidence` lifted into the
+  shared `agent/src/tool-evidence.ts`. Wired in `sdk-executor.ts` beside the memory server.
   Two pieces the draft missed:
   1. **`ListIssuesOptions` is `{Labels, UpdatedAfter}` and nothing else** (`forge.go:285-292`),
      and the interface contract says implementations "paginate internally and return complete
@@ -208,39 +219,57 @@ three verbs by itself: an issue body saying "see #131 and !77" makes the model w
   a shared module — a file this milestone creates.
   **M2 is not independently shippable**: without M3 it ships tools no subagent can reach.
 
-- [ ] **M3 — Make the capability REACHABLE (was M5, and it is the milestone the feature lives
+- [x] **M3 — Make the capability REACHABLE (was M5, and it is the milestone the feature lives
   or dies on).** Prose guidance is the smallest part.
-  1. **The `fact-checker` tool allowlist has no `mcp__*` entry**
-     (`builtins/fact-checker.md:4`). A non-empty list is an explicit allowlist honoured
-     verbatim (`agents.ts:104-110`), so today it *cannot* call the tools. Note `coder` and
-     `lead` have NULL tools and inherit everything — so without this the lead would silently
-     get forge access and the fact-checker would not, which is precisely backwards.
-  2. **Editing the builtin does not propagate.** The startup reconciler is
-     `ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING`
-     (`agent_templates.sql:67-74`) — "never overwrite an existing row (admin edits survive
-     restarts)". The live DB confirms `fact-checker` still carries the old list. **On every
-     existing install the feature ships dead** without a migration or a documented admin reset
-     (`agent_templates.go:395-434`).
-  3. Then the role guidance, including the reproducibility caveat.
+  1. **The `fact-checker` tool allowlist had no `mcp__*` entry** (`builtins/fact-checker.md:4`).
+     A non-empty list is an explicit allowlist honoured verbatim (`agents.ts`), and SDK tool
+     resolution is case-sensitive/fail-closed — so `coder`/`lead` (NULL tools) inherit forge
+     access while the fact-checker would not, precisely backwards. **Done:** the six exact
+     `mcp__forge__*` names are now appended to that allowlist.
+  2. **CORRECTED (the original premise was stale, pre-PRD #275): editing the builtin DOES
+     propagate — no migration needed.** The insert reconciler is indeed
+     `ON CONFLICT ... DO NOTHING`, but a *separate* boot statement, `RefreshPristineBuiltin`
+     (`store/agent_templates_builtins.go`; SQL `agent_templates.sql`), re-applies the embedded
+     `(description, model, tools, prompt_body)` to **pristine** builtin rows
+     (`scope='builtin' AND customized=false`, guarded `IS DISTINCT FROM`) at every startup.
+     Migration `00112` backfills `customized=true` only where `updated_at > created_at`, so a
+     never-admin-edited `fact-checker` row is pristine and self-heals the new tools list on the
+     next boot. So the feature does **not** ship dead on a pristine install. Only an
+     admin-customized (`customized=true`) row stays drifted, and the existing admin **Reset**
+     (`handler/agent_templates.go` `ResetAgentTemplate`, web `AgentTemplateEditor.tsx`) is the
+     documented fallback for it.
+  3. Role guidance / reproducibility caveat: documented on the new `docs/forge-read-tools.md`
+     page (M6).
 
-- [ ] **M4 — Injection and truncation posture, measured not asserted.** Forge payloads are
-  attacker-influencable prose. Run a hostile corpus through the real handlers as issue #157
-  did for directory names, and record what is verified (fence construction, tag-forgery
-  resistance, truncation surfaced) separately from what is not (that the model honours the
-  fence — inherited from the existing `wrapEvidence` call sites, not established here).
+- [x] **M4 — Injection and truncation posture, measured not asserted.** Forge payloads are
+  attacker-influencable prose. **Done:** the agent test suite feeds a forged
+  `</uzi_evidence_…>` closer plus "IGNORE ALL PREVIOUS INSTRUCTIONS" through the real tool
+  handlers and asserts the payload stays enclosed by the real random-nonce fence (tag-forgery
+  resistance), and the Go suite asserts truncation is surfaced (`truncated`/`description_truncated`)
+  and byte-safe. Recorded separately: fence *construction* is **verified**; that the model
+  *honours* the fence is **inherited** from the existing `wrapEvidence` call sites (PRD #39),
+  not established here.
 
-- [ ] **M5 — Tests.** Go handler tests for project derivation (a **body-supplied** project id
-  must be ignored, not honoured), the repoless 409, the result cap, error redaction. Agent-side
-  unit tests over the handlers including failure paths (a failed lookup must not read as "no
-  issues").
+- [x] **M5 — Tests.** **Done.** Go: `handler/worker_forge_test.go`, `workersvc/forge_conn_test.go`,
+  `forge/gitlab_limit_test.go` — project derivation (there is no project-id parameter to honour;
+  the load-bearing 409-before-404 ordering is pinned), repoless 409, list cap at 50/51,
+  byte-safe 32 KiB description cap, SC-3 error-redaction (a driver error embedding host +
+  `projects/<id>` yields the fixed 502 body with no coordinate leak), `ErrNoPipeline`→200
+  `{"pipeline":null}`, and the `Limit==0` complete-set regression. Agent: `test/forge-tools.test.ts`
+  — non-fatal error mapping (a 404/502 must not read as "no issues"), the per-session budget
+  shared across all six tools, and the injection-fence construction. All mutation-verified.
 
-- [ ] **M6 — Docs and an acceptance run.** **The docs page does not exist and must be
-  created**: `docs/chat.md` never lists the chat tools, `docs/configuration.md:230` names
-  `propose_issue` only in a rate-limit table, and `docs/worker-tools.md` is about devbox CLI
-  tools entirely. Also correct `docs/chat.md:36-37,41-42` if anything lands in the chat lane —
-  it currently says the chat agent has "no network tools". Then a real run whose fact-checker
-  verifies a claim against the forge and cites what it read. Per the archive convention, this
-  PRD moves to `prds/done/` only after that run has happened.
+- [ ] **M6 — Docs and an acceptance run.** **Docs DONE:** `docs/forge-read-tools.md` created
+  (the run-lane read tools, which agents reach them, the credential/coordinate boundary, the
+  caps and per-session budget, the untrusted-evidence fence); mentions added to
+  `docs/agent-templates.md` and `docs/repo-agents.md`; a no-env-var note in
+  `docs/configuration.md`. Nothing landed in the chat lane, so `docs/chat.md`'s "no network
+  tools" line is left correct. `check-docs.mjs`: 0 errors. **Recurrence decision made** (see
+  the Decision Log): the `install_worker_tool: glab` recs recur by design and that is not a
+  regression. **STILL OPEN — the live acceptance run:** a real run whose fact-checker verifies
+  a claim against the forge and cites what it read. It cannot be run from the implementation
+  worktree, so it is deferred to post-deploy; per the archive convention this PRD moves to
+  `prds/done/` only after that run has happened.
 
 ## Success Criteria
 
@@ -357,3 +386,34 @@ like a failure.
 - **2026-08-10 — Open Q2 resolved: unauthenticated `WebFetch` cannot read the private forge.** Issue
   API `404`, web page `302 → /users/sign_in`. No cheaper partial fix exists; the worker-mediated read
   path stands.
+- **2026-08-10 (implementation) — M3 "ships dead without a migration" premise corrected.** It
+  predated PRD #275: `RefreshPristineBuiltin` re-applies the embedded builtin body (incl. the
+  `tools` allowlist) to pristine rows at every boot, so the fact-checker allowlist edit
+  self-heals a pristine install with **no migration**. Only an admin-customized row stays
+  drifted; the existing admin Reset is its documented fallback. The design shipped with just the
+  template edit.
+- **2026-08-10 (implementation) — error strings are FIXED and coordinate-free, not driver
+  passthrough.** The go-gitlab/forgejo/github SDK errors embed the request URL (host +
+  `projects/<id>`) and `forge/redact.go` scrubs only the PAT, so returning `err.Error()` (the
+  owner-facing `GetIssueDetail` precedent) would leak both to the agent. The worker handlers
+  return fixed generic bodies and log the real (PAT-redacted) error server-side. This is the one
+  blocking review finding, folded before the core landed; it re-opens original open-Q4, which the
+  handler resolves by writing the mapper rather than reusing a shared redactor.
+- **2026-08-10 (implementation) — accepted residual: `list_issue_label_events` and
+  `get_pipeline_jobs` bound the RESPONSE, not the upstream fetch.** Only `list_issues` got a
+  driver-side `Limit` (whole-project enumeration was the vector the recs raised). Those two use
+  driver methods with no `Limit` (shared with autopilot/ci_fix, which need complete sets), so
+  they fetch the full per-issue / per-pipeline set then cap to 50 — a bounded amplification
+  (own-project + write-gated + the agent-side 40-call session budget), not enumeration. A
+  numeric upstream cap on those two is a follow-up, deliberately not taken here to avoid a
+  signature change rippling into out-of-scope callers.
+- **2026-08-10 (implementation) — recurrence of `install_worker_tool: glab` accepted as
+  expected-by-design** (resolving "The originating recommendations will keep firing" above). The
+  rec is a missing-executable trace scan and `glab` is permanently denied (`toolprofile.go`), so
+  both recs recur verbatim after this ships; that is not an implementation failure and the
+  acceptance run should not be read as one. Suppressing the scan for denylisted binaries is a
+  separate, unowned change.
+- **2026-08-10 (implementation) — the per-session call budget resets on resume.** It is an
+  agent-side counter in the single per-executor `forge` server (shared by lead + all subagents);
+  a run *resume* builds a fresh executor and a fresh counter. Accepted as per-session rather than
+  strictly per-run; the model, not the agent code, is the untrusted party the counter bounds.

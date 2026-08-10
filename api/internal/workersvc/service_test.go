@@ -521,6 +521,9 @@ func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailed
 func (f *fakeStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
 	return f.runOwned, f.runOwnedErr
 }
+func (f *fakeStore) GetRunForgeConnForWorker(context.Context, store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error) {
+	return store.GetRunForgeConnForWorkerRow{}, nil
+}
 func (f *fakeStore) CountAgentMemoryForRun(context.Context, pgtype.UUID) (int64, error) {
 	return f.memRunCount, nil
 }

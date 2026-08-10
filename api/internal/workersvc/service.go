@@ -188,6 +188,12 @@ var (
 	ErrMemoryTooLarge = errors.New("agent memory title or body too large")
 	ErrMemoryWriteCap = errors.New("per-run agent memory write cap reached")
 	ErrMemoryEmpty    = errors.New("agent memory title and body must be non-empty")
+
+	// ErrForgeNoRepo rejects a forge read on a repo-less run (runs.repo_id is
+	// nullable — a chat/self-improve run has no repo, hence no forge connection to
+	// read from) → 409 (PRD #158 M1). Distinct from ErrRunNotOwned (404): the run
+	// exists and is held by this worker, it just has nothing to read against.
+	ErrForgeNoRepo = errors.New("run has no repo for forge read")
 )
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
@@ -246,6 +252,11 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	// GetRunForgeConnForWorker returns the forge connection facts for a run the
+	// worker holds (PRD #158 M1): forge_project_id + the connection. Worker-scoped
+	// by construction (its predicate carries r.worker_id), so a run the worker does
+	// not hold — or a repo-less run — returns pgx.ErrNoRows.
+	GetRunForgeConnForWorker(ctx context.Context, arg store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
@@ -2979,6 +2990,51 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		return store.Run{}, err
 	}
 	return run, nil
+}
+
+// ForgeConn is the connection facts a worker-authenticated forge read needs to build
+// a driver (PRD #158 M1): the decrypted-at-the-handler token ciphertext plus the
+// numeric project id the driver methods require. It carries NO plaintext secret and
+// is never serialised to the worker — the DTOs the handlers build deliberately drop
+// the project id, base url and token.
+type ForgeConn struct {
+	ForgeType       string
+	BaseUrl         string
+	TokenCiphertext []byte
+	ForgeProjectID  int64
+}
+
+// ForgeConnForRun authorizes a worker's forge read against a run it holds and returns
+// the connection facts to read with (PRD #158 M1). The authz mirrors SaveMemory: the
+// (repo, connection) are derived from the OWNED run — never from the request — so a
+// worker cannot read another tenant's forge. A run the worker does not hold is
+// ErrRunNotOwned (→ 404); a repo-less run (chat/self-improve) is ErrForgeNoRepo (→
+// 409). The repo_id check runs off the owned run FIRST, before the connection query,
+// because that query INNER-JOINs repos and so cannot itself tell "not owned" apart
+// from "no repo" — both are no-rows.
+func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ForgeConn, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return ForgeConn{}, err
+	}
+	if !run.RepoID.Valid {
+		return ForgeConn{}, ErrForgeNoRepo
+	}
+	row, err := s.q.GetRunForgeConnForWorker(ctx, store.GetRunForgeConnForWorkerParams{RunID: runID, WorkerID: pgUUID(wkr.ID)})
+	if err != nil {
+		// The worker owns the run and it has a repo, so a no-rows here is a race (the
+		// claim dropped between the two reads); treat it as not-owned rather than a 500.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ForgeConn{}, ErrRunNotOwned
+		}
+		return ForgeConn{}, err
+	}
+	return ForgeConn{
+		ForgeType:       row.ForgeType,
+		BaseUrl:         row.BaseUrl,
+		TokenCiphertext: row.TokenCiphertext,
+		ForgeProjectID:  row.ForgeProjectID,
+	}, nil
 }
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is

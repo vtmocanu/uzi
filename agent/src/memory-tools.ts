@@ -32,6 +32,7 @@ import { RequestError } from "./client.js";
 import type { MemoryBasis } from "./protocol.js";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
+import { asText, type ToolTextResult } from "./tool-evidence.js";
 
 /** The in-process MCP server name; the tool surfaces as `mcp__memory__save_memory`
  *  (a SECOND server alongside the run lane's `uzi` signal server, disjoint keys). */
@@ -128,15 +129,6 @@ const CONFIG_CLAIM_RE = new RegExp(
 export function memoryToolNames(): string[] {
   return [`mcp__${MEMORY_SERVER_NAME}__${SAVE_MEMORY_TOOL}`];
 }
-
-/** The MCP text result shape a tool handler returns. The index signature keeps it
- *  assignable to the SDK's CallToolResult (an open record). Mirrors uzi-tools.ts. */
-export interface ToolTextResult {
-  content: { type: "text"; text: string }[];
-  isError?: boolean;
-  [key: string]: unknown;
-}
-const asText = (t: string, isError = false): ToolTextResult => ({ content: [{ type: "text", text: t }], isError });
 
 /**
  * Format a caught error into model-facing guidance (never a raw stack), NON-FATAL:
