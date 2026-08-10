@@ -18,6 +18,7 @@ import {
   gitlabClaim,
   installHarness,
   runner,
+  simulateCommittedWork,
   worktreeDirFor,
 } from "./runner-harness.js";
 
@@ -79,6 +80,72 @@ describe("RunRunner — worker-performed push + MR", () => {
     );
     assert.ok(log.includes("uzi stub: work on issue #7"));
     assert.strictEqual(fs.existsSync(worktreeDirFor(7)), false);
+  });
+
+  it("annotates the MR body with the unverified gates when a component's deps did not install (issue #293 M2)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(7);
+    simulateCommittedWork(); // a real diff, so #279's empty-diff guard does not suppress the MR
+    // An executor that delivers work but reports web's JS deps did not install, so
+    // web's gates (vitest/knip) could not have run — the honest annotation posture.
+    const exec: Executor = {
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "own", agents: ["coder", "reviewer"] },
+        gatesUnverified: ["web"],
+      }),
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    assert.strictEqual(calls.length, 1);
+    const body = JSON.parse(calls[0]!.body ?? "{}");
+    assert.match(body.description, /Closes #7/);
+    assert.match(body.description, /Quality gates unverified/);
+    assert.match(body.description, /`web`/, "the unverified component dir must be named in the MR body");
+  });
+
+  it("annotates the MR body with a discovery-truncation caveat even when no named dir failed (issue #293 M2, review F1)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(7);
+    simulateCommittedWork(); // a real diff, so #279's empty-diff guard does not suppress the MR
+    // Every reached dir installed, but discovery hit its scan cap: components past the cap
+    // were never examined, so gatesUnverified names none of them. The caveat must still fire
+    // so the capped coverage does not read as full coverage.
+    const exec: Executor = {
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "own", agents: ["coder", "reviewer"] },
+        gatesDiscoveryTruncated: true,
+      }),
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    assert.strictEqual(calls.length, 1);
+    const body = JSON.parse(calls[0]!.body ?? "{}");
+    assert.match(body.description, /Quality gates unverified/);
+    assert.match(body.description, /scan cap/, "the truncation caveat must be present");
+  });
+
+  it("a normal run's MR body carries NO unverified-gates annotation (issue #293 M2)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(7);
+    simulateCommittedWork(); // a real diff, so #279's empty-diff guard does not suppress the MR
+    // A done result with gatesUnverified absent — every component installed, the common case.
+    const exec: Executor = {
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "own", agents: ["coder", "reviewer"] },
+      }),
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    assert.strictEqual(calls.length, 1);
+    const body = JSON.parse(calls[0]!.body ?? "{}");
+    assert.match(body.description, /Closes #7/);
+    assert.ok(
+      !body.description.includes("Quality gates unverified"),
+      "a fully-installed run must not carry the unverified-gates annotation",
+    );
   });
 
   it("routes a forgejo claim to the Forgejo client and persists the PR web url (PRD #65 D9/D8)", async () => {

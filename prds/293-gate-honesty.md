@@ -1,7 +1,7 @@
 # PRD #293: Gate honesty — a run must not red a gate it never touched, green a gate it never ran, or read a failed shell command as success
 
 **GitLab Issue**: [vtmocanu/uzi#293](https://gitlab.example.com/vtmocanu/uzi/-/issues/293)
-**Status**: Draft (reviewed 2026-08-10; two independent code-verified reviews folded in — the M1 seam, M2 source, and M3 option analysis below are the corrected versions)
+**Status**: Partially implemented on branch `agent/issue-293` (2026-08-10) — M1 (documented boundary + passthrough test), M3 (graceful-skip), M4 (tests) and M5 (docs) are done; M2 shipped as annotate-on-`js_deps` (the approved narrowed scope), with declared-gate reconciliation deferred, so this PRD stays open. See **Delivery status** below. (Originally: Draft, reviewed 2026-08-10; two independent code-verified reviews folded in.)
 **Priority**: Medium (recurring run-quality tax; one member seen in 3 runs, two at `confidence: medium`)
 **Created**: 2026-08-10
 **Related**: `agent/src/sdk-messages.ts`, `agent/src/sdk-executor.ts`, `agent/src/toolchain-preflight.ts`, `agent/src/signals.ts`, `Taskfile.yml` (`gate:*` / `deadcode:*` targets, and the `{{.CLI_ARGS}}` ban), `.claude/rules/agent.md`
@@ -86,7 +86,7 @@ pre-scan and command-absence, not by M1's flag; M1 only informs M2's secondary
 
 ## Milestones
 
-- [ ] **M1 — Bash tool-result error classification (a spike, then a fix if uzi owns it).**
+- [x] **M1 — Bash tool-result error classification (a spike, then a fix if uzi owns it).**
       First reproduce and locate: determine whether the `is_error:false` on a failed
       command originates in uzi's ingestion (`mapUser`, `sdk-messages.ts:160`) or is stamped
       upstream by the Claude Code Bash tool (the current evidence says upstream, since
@@ -109,7 +109,7 @@ pre-scan and command-absence, not by M1's flag; M1 only informs M2's secondary
       build the declared-gate extraction (from the Taskfile targets) and the "what ran"
       ledger. It does not live in `signals.ts` (schema only) or `toolchain-preflight.ts`
       (boot only).
-- [ ] **M3 — Cross-component gate: graceful skip that is surfaced honestly.** An umbrella
+- [x] **M3 — Cross-component gate: graceful skip that is surfaced honestly.** An umbrella
       gate must not red on a sibling component whose toolchain is absent when the change
       touched none of that component's files. Preferred mechanism (Decision D3):
       **graceful-skip with an honest surface**, following the existing precedent
@@ -124,15 +124,56 @@ pre-scan and command-absence, not by M1's flag; M1 only informs M2's secondary
       (not the baked `/opt/uzi-toolchain`), collides with the documented `npm ci`/`install`
       host-rewrite of `/opt/homebrew/bin/agent-browser` (`.claude/rules/agent.md`), and is
       defeated on already-seeded workers by the seed-nix-once PVC behavior.
-- [ ] **M4 — Tests** covering the surfaces that landed: a failed command classified as an
+- [x] **M4 — Tests** covering the surfaces that landed: a failed command classified as an
       error if M1 fixed it in-repo (else a test asserting the documented upstream boundary);
       `signal_done` blocking/annotating on an unrun or failed declared gate (M2); and an
       umbrella gate loud-skipping rather than red-ing on an absent sibling toolchain (M3).
       Follow the repo's `node --test` / Go test conventions per `.claude/rules/agent.md`.
-- [ ] **M5 — Docs + CHANGELOG.** Record the completion-gate posture and the
+- [x] **M5 — Docs + CHANGELOG.** Record the completion-gate posture and the
       graceful-skip surface where the relevant rule files already document gate reading
       (`.claude/rules/agent.md` / `.claude/rules/go.md` as applicable), and add a CHANGELOG
       `[Unreleased]` entry.
+
+## Delivery status (branch `agent/issue-293`, 2026-08-10)
+
+What actually shipped, where it diverges from the milestone text above:
+
+- **M1 — done as a documented boundary (no in-repo `is_error` flip).** The spike confirmed
+  uzi does not own the value: `mapUser` (`agent/src/sdk-messages.ts:160`) is a pure
+  passthrough of the SDK-stamped flag, the `tool_result` carries no exit code, and only a
+  PreToolUse hook is wired (no PostToolUse). Re-deriving from content would reintroduce the
+  `echo "…command not found"` false positive the server-side scanner (`judge.go`
+  `scanCommandNotFound`, specs/ai.md §400) is engineered around, and the only consumer of
+  the per-Bash flag is presentational (`web/src/components/RunEvent.tsx:731`). Decision:
+  leave it a passthrough, document the boundary (specs/ai.md), pin it with a test
+  (`agent/test/sdk-messages.test.ts`). `isErrorResult` deliberately untouched. This is
+  success-criterion 1's documented-boundary branch.
+- **M2 — shipped as annotate-on-`js_deps`; declared-gate reconciliation DEFERRED (box left
+  unchecked).** `ExecutorResult.gatesUnverified` is populated at the completion handoff from
+  `depsResults.filter(r => !r.ok && r.manager !== "none")` (issue-run only, omitted-not-`[]`,
+  `safeDirLabel`-clamped) and rendered as a "⚠️ Quality gates unverified" note on the
+  issue-run MR body (`agent/src/runner.ts`), ANNOTATE posture (never blocks; byte-identical
+  when empty). This meets success-criterion 2 for the motivating never-ran case (deps absent
+  ⇒ vitest/knip could not run). **Not built** (hence the box stays unchecked): the Taskfile
+  declared-gate extraction, the per-command "what ran" ledger, and pre-scan plumbing — the
+  command-not-found pre-scan is server-side/retrospective (`api/internal/workersvc/judge.go`,
+  judge-only) and not available at the lead worker's completion, and no execution ledger
+  exists; `js_deps` is the repo's own recorded completion signal (specs/ai.md §399/§400). A
+  follow-up can build the full three-state reconciliation on top of this annotation.
+- **M3 — done.** `deadcode:web`/`deadcode:agent` route through `scripts/deadcode-knip.sh`:
+  knip present ⇒ `npm run knip`; absent ⇒ loud SKIP + exit 0, with CI arming
+  `UZI_DEADCODE_{WEB,AGENT}_REQUIRED=1` (`.gitlab-ci.yml`) ⇒ exit 2 (the `lint:formula`
+  precedent). Rejected alternatives recorded in specs/ai.md.
+- **M4 — done.** Tests pin the M1 boundary, the M2 population (including the `manager:"none"`
+  exclusion) and the MR rendering (`agent/test/{sdk-messages,sdk-executor,runner-push-mr}.test.ts`).
+  No bespoke shell test for the wrapper — its sibling gate-scripts (`lint-formula.sh`,
+  `lint-shell.sh`) have none and are validated by CI.
+- **M5 — done.** specs/ai.md decision section, CHANGELOG `[Unreleased]`, and
+  `.claude/rules/{agent,web}.md` gate-cheat-sheet notes.
+
+**Rollout caveat (#201-class):** the M1/M2 agent-code changes ship in the worker image, so
+they reach only newly provisioned/re-provisioned workers; the M3 Taskfile/CI change takes
+effect immediately in CI and any fresh checkout.
 
 ## Decisions to make in the plan
 

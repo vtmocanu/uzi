@@ -28,6 +28,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   with a 422 that redirects the caller to the ordinary, gated run flow. Plain
   issue-planned runs are unaffected. See
   [ADR-280](adr/0280-seeded-plan-safety-screen.md). (#280)
+- **A green-looking issue-run MR no longer implies gates that never ran.** When
+  a component's JS dependencies fail to install, the run now carries the dirs
+  whose `js_deps` check came back `ok:false` (excluding a `package.json` with
+  no lockfile, which uzi deliberately never installs rather than guesses a
+  package manager for) and renders a "⚠️ Quality gates unverified" note on the
+  MR body naming them — an ANNOTATE-only signal that never blocks a merge. If
+  dependency discovery itself hit its scan cap, the note also warns that
+  components beyond the cap were never checked, so a capped run does not read as
+  fully verified. (#293)
 - **The self-improvement picker now sees what uzi is already working on, and is
   told to avoid picking the same fix twice.** At claim time, a `self_improve`
   run is handed a list of every other active run on the connected repo — keyed
@@ -39,6 +48,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   claim, so it reaches every worker immediately even though the prompt code
   that renders it only takes effect for newly provisioned workers. No
   migration. (#297)
+
+### Changed
+
+- **`task deadcode` no longer reds on a component whose toolchain the change
+  never touched.** `deadcode:web`/`deadcode:agent` now delegate to
+  `scripts/deadcode-knip.sh`, which loud-SKIPs (exit 0) when the component's
+  knip binary is absent instead of failing closed, so the umbrella
+  `task deadcode`/`task gate` stays green for a contributor who only installed
+  one component's deps. CI arms `UZI_DEADCODE_WEB_REQUIRED=1` /
+  `UZI_DEADCODE_AGENT_REQUIRED=1` on `validate:web`/`validate:agent` (which
+  always `npm ci` knip), turning the same missing-knip case into exit 2 there
+  — a skipped and a passing gate must never look alike, the same shape as
+  `lint:formula`/`lint:shell`/`lint:yaml`. (#293)
 
 ## [0.26.0] - 2026-08-10
 

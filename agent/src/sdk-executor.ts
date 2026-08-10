@@ -39,6 +39,7 @@ import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import {
   installJsDeps,
+  DETAIL_NO_LOCKFILE,
   type JsDepsInstall,
   type JsDepsResult,
 } from "./js-deps.js";
@@ -1350,6 +1351,39 @@ export class SdkExecutor implements Executor {
       // completion, so a non-issue run — which has no frozen list — never carries them.
       if (isIssueRun && declaredMilestonesCompleted !== undefined) {
         result.milestonesCompleted = declaredMilestonesCompleted;
+      }
+      // Issue #293 M2: carry the dirs whose deps did not install so the MR can be
+      // annotated honestly (a component whose deps are absent could not have run its
+      // gates). Reuses the js_deps `ok` signal, which is corroborated against the
+      // filesystem so a false "deps ready" cannot be minted. Dir names are clamped
+      // with safeDirLabel (repo-controlled text). OMITTED-not-undefined, issue-run
+      // only, same convention as prdDonePath/milestonesCompleted above.
+      //
+      // EXCLUDE by the specific deliberate-skip REASON, not by `manager`: a dir with a
+      // package.json but NO recognized lockfile is `{manager:"none", ok:false,
+      // detail:DETAIL_NO_LOCKFILE}` — uzi refuses to guess a package manager, so it was
+      // never installed rather than failed, and annotating it would cry wolf on a fine
+      // delivery. But `manager:"none"` has a SECOND producer: the belt-to-braces
+      // `discovery failed` record (`{dir:".", manager:"none", ok:false}`, js-deps.ts),
+      // which IS a genuine total failure that must annotate. Keying the exclusion on
+      // `manager !== "none"` dropped both and turned that failure into a false green
+      // (latent today: discovery is non-throwing, so the record is unreachable until a
+      // refactor makes it throw — fixed here so it stays honest if that day comes).
+      // Everything else with ok:false (a real manager that failed/was cancelled, or the
+      // discovery failure) annotates.
+      const gatesUnverified = depsResults
+        .filter((r) => !r.ok && r.detail !== DETAIL_NO_LOCKFILE)
+        .map((r) => safeDirLabel(r.dir));
+      if (isIssueRun && gatesUnverified.length > 0) {
+        result.gatesUnverified = gatesUnverified;
+      }
+      // Issue #293 M2 / review F1: discovery can stop at MAX_PROJECT_DIRS / MAX_SCAN_DIRS
+      // (depsTruncated), leaving components past the cap NEVER scanned and so ABSENT from
+      // depsResults — their gates could not have run either, but gatesUnverified cannot
+      // name them. Carry the flag so the MR annotation says coverage was capped; a silent
+      // cap reading as full coverage is the exact lie this PRD exists to remove.
+      if (isIssueRun && depsTruncated) {
+        result.gatesDiscoveryTruncated = true;
       }
       // issue #279: forward the report-only declaration + captured summary on `issue` runs
       // only, with the SAME OMITTED-not-undefined discipline as prdDonePath above — the keys

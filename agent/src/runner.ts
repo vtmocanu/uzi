@@ -1154,6 +1154,8 @@ export class RunRunner {
               result.agentSelection,
               selfImproveSection,
               promptGuardSection,
+              result.gatesUnverified,
+              result.gatesDiscoveryTruncated,
             ),
           }),
         { log: runLog },
@@ -2047,6 +2049,8 @@ function mrDescription(
   agentSelection?: { source: AgentSource; agents: string[] },
   selfImproveSection?: string,
   promptGuardSection?: string,
+  gatesUnverified?: string[],
+  gatesDiscoveryTruncated?: boolean,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -2101,15 +2105,39 @@ function mrDescription(
       footer,
     ].join("\n");
   }
-  return [
+  const body = [
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
     ...repoMarker,
-    "",
-    "---",
-    footer,
-  ].join("\n");
+  ];
+  const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
+  if (gatesSection) body.push("", gatesSection);
+  body.push("", "---", footer);
+  return body.join("\n");
+}
+
+/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
+ *  component's deps installed AND discovery saw the whole tree. Dir names arrive already
+ *  clamped (safeDirLabel). The truncation caveat (review F1) fires even when `dirs` is
+ *  empty: a capped discovery means components it never reached could be unverified too,
+ *  which named dirs alone cannot say. */
+function gatesUnverifiedMrSection(dirs?: string[], discoveryTruncated?: boolean): string {
+  const named = dirs ?? [];
+  if (named.length === 0 && !discoveryTruncated) return "";
+  const parts: string[] = [];
+  if (named.length > 0) {
+    const list = named.map((d) => `\`${d}\``).join(", ");
+    parts.push(
+      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
+    );
+  }
+  if (discoveryTruncated) {
+    parts.push(
+      "Dependency discovery stopped at its scan cap, so components beyond it were never checked and their gates may also be unverified.",
+    );
+  }
+  return `> ⚠️ **Quality gates unverified.** ${parts.join(" ")}`;
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

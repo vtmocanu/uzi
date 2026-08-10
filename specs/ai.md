@@ -12352,6 +12352,89 @@ is entitled to make yet.
   `defaultCheckRunner` carries the same `execFile`+`timeout` defect under the uid split that §397
   avoided in `js-deps` (measured: the timeout kills from the worker uid, gets `EPERM`, and leaves the
   runner process alive past its cap).
+
+## 511. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
+
+Delivers what §401 recorded as deferred (M4 gate honesty), in the reduced form the repo can honestly
+sign: annotate the never-ran case rather than reconcile declared gates. Serves the same human contract
+as §400 (the judge's *command not found* signal) and §397/§399 (`js_deps` as the recorded completion
+signal). Numbered §511 (next above the §510 head) but homed here in the gate-honesty region, directly
+after §401's "M4 split out" note. Three milestones (M1/M2/M3) plus a rollout caveat; the PRD's larger
+three-state gate ledger stayed DEFERRED and the why is recorded below.
+
+- **M1 — the per-Bash `is_error` is a documented PASSTHROUGH boundary, not fixed in-repo.**
+  `mapUser` (`agent/src/sdk-messages.ts:160`) sets `is_error: block["is_error"] === true` — a pure
+  reflection of the flag the upstream Claude Code Bash tool stamped. The `tool_result` carries no exit
+  code (`{tool_use_id, content, is_error}` only, cf. §400), and the repo wires only PreToolUse hooks
+  (no PostToolUse), so uzi has no in-repo place to re-derive it. The spike concluded uzi does NOT own a
+  reliable fix: re-deriving `is_error` by scanning `content` for shell-failure markers would reintroduce
+  the exact `echo "foo: command not found"` false positive the server-side scanner (§400) was
+  engineered around (executable-position anchoring + `suppressResolved`). And the ONLY consumer of the
+  per-Bash flag is presentational (`web/src/components/RunEvent.tsx:731`, `rec["is_error"] === true`) —
+  the judge, the real retrospective honesty consumer, reads `tool_result` CONTENT server-side, never
+  this flag. Decision: leave it a passthrough, document the boundary, pin it with tests
+  (`agent/test/sdk-messages.test.ts` — an upstream `true` passes through; an upstream `false`/absent over
+  failure-shaped content stays `false`). **`isErrorResult` (`agent/src/sdk-messages.ts:268`) is a
+  SEPARATE classifier** — the whole-turn run-abort test (`subtype !== "success" || is_error`) — and was
+  deliberately NOT touched.
+- **M2 — honest completion annotation is driven by `js_deps`, ANNOTATE posture (Decision D2, never
+  blocks).** At the completion handoff (`agent/src/sdk-executor.ts` ~1330), `result.gatesUnverified`
+  (`ExecutorResult.gatesUnverified`, `agent/src/executor.ts:261`) is populated from
+  `depsResults.filter(r => !r.ok && r.detail !== DETAIL_NO_LOCKFILE).map(safeDirLabel)` — ISSUE-run
+  only, OMITTED-not-`[]`/undefined when every dir installed (same convention as `milestonesCompleted`).
+  The exclusion is keyed on the specific deliberate-skip REASON (`DETAIL_NO_LOCKFILE`, a named export
+  from `js-deps.ts`), NOT on `manager !== "none"` (review F2). A `package.json` with no recognized
+  lockfile is `{manager:"none", ok:false, detail:DETAIL_NO_LOCKFILE}` (deliberately NOT installed — uzi
+  refuses to guess a manager, §397), and annotating it would cry wolf on a fine delivery. But
+  `manager:"none"` has a SECOND producer: the belt-to-braces `discovery failed` record
+  (`{dir:".", manager:"none", ok:false}`), which IS a genuine total failure that must annotate. Keying
+  the exclusion on `manager` dropped BOTH and turned that failure into a false green (latent: discovery
+  is non-throwing today, so the record is unreachable until a refactor makes it throw — fixed here so it
+  stays honest if that day comes). A genuine install failure carries a real manager (npm/pnpm/yarn/bun)
+  with `ok:false` and still annotates. Discovery TRUNCATION is carried alongside as
+  `gatesDiscoveryTruncated` (review F1): a capped discovery (`depsTruncated`, at MAX_PROJECT_DIRS /
+  MAX_SCAN_DIRS) never examined components past the cap, so they cannot appear in the list; the
+  annotation adds a "coverage was capped" caveat (fired even when no named dir failed) rather than
+  letting the cap read as full coverage — the exact silent-cap lie this PRD exists to remove.
+  `runner.ts`'s `mrDescription` threads both to
+  `gatesUnverifiedMrSection` (`agent/src/runner.ts`), which renders a `⚠️ **Quality gates unverified**`
+  blockquote on the ISSUE-run MR branch — byte-identical to before when empty. Reuses the `js_deps`
+  `ok` signal because it is corroborated against the filesystem (§397), so a repo forcing exit 0 cannot
+  mint a false "deps ready".
+- **M2 — why the larger reconciliation was DEFERRED.** The PRD's declared-gate reconciliation /
+  three-state ledger / pre-scan plumbing did NOT ship. The *command not found* pre-scan
+  (`scanCommandNotFound`, `api/internal/workersvc/judge.go:207`) is server-side and RETROSPECTIVE —
+  consumed only by the judge, NOT available at the lead worker's completion handoff — and no
+  per-command gate-execution ledger exists in the worker. `js_deps` is the repo's own recorded
+  completion signal (§399/§400) and covers the motivating never-ran case: deps absent ⇒ vitest/knip
+  could not have run. Anything richer awaits a structured `gates` field at the plan gate (a product
+  question, per §401), so M2 annotates the one thing the worker can prove.
+- **M3 — cross-component graceful-skip (Decision D3).** `deadcode:web`/`deadcode:agent`
+  (`Taskfile.yml`) now route through `scripts/deadcode-knip.sh <component>` instead of a bare
+  `npm run knip` (the `dir:` was dropped; the wrapper cd's into the component itself). It resolves
+  `<dir>/node_modules/.bin/knip`: present ⇒ `exec npm run knip` (delegation-to-package-script and
+  no-`npx` invariants preserved — npx would fetch over the network, a gate may not); absent ⇒ loud SKIP
+  banner + `exit 0`, so the umbrella `task deadcode` no longer reds on a sibling whose toolchain was
+  never installed. CI arms `UZI_DEADCODE_{WEB,AGENT}_REQUIRED=1` (`.gitlab-ci.yml`, on the
+  `validate:web`/`validate:agent` jobs that always `npm ci` knip), turning a missing knip into `exit 2`
+  there — a skip in CI means the image regressed and must not look like a pass. Follows the
+  `lint:formula`/`lint:shell`/`lint:yaml` fail-open-locally-required-in-CI precedent exactly
+  (`scripts/deadcode-knip.sh` is modelled on `scripts/lint-formula.sh`). The component arg is charset-
+  clamped (`case *[!a-z]*` ⇒ exit 2) before it is uppercased into the required-var name read via `eval`.
+  **The wrapper resolves the repo root from its OWN location (`$0`), deliberately NOT `git rev-parse
+  --show-toplevel`** the way `lint-formula.sh` does: `deadcode:web` runs inside `validate:web`'s
+  `node:22-alpine` CI image, which ships NO git, so a `git rev-parse` here fails and reds the very gate
+  it exists to keep honest — caught in CI (pipeline 20725) on the first push and fixed to a git-free
+  `CDPATH='' cd -- "$(dirname -- "$0")/.."`. Do not "correct" it back to `git` to match lint-formula.
+  **Rejected alternatives, recorded so they are not re-proposed:** scope-to-touched (violates the
+  `{{.CLI_ARGS}}` ban); prewarm knip into every component (per-repo `node_modules`, defeated by the
+  seed-once PVC).
+- **ROLLOUT CAVEAT (the #201-class fact).** M1/M2 are agent-code changes (`agent/src/*`) that ship in
+  the worker IMAGE, so they reach only newly provisioned / re-provisioned workers (same deploy lag §401
+  M5 names: merge → `v*` tag → Harbor → ArgoCD). M3 is Taskfile/CI/script and takes effect immediately
+  in CI and in any fresh checkout. So the honest-annotation behaviour and the graceful-skip behaviour
+  land on DIFFERENT clocks.
+
 ## 402. The INV-5 ceiling gates R2 only, and two claims in §391-§392 were false when written or falsified since
 
 Three separate corrections, filed together because one landing (#148 + #151) is what disproved all

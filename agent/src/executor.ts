@@ -257,6 +257,19 @@ export interface ExecutorResult {
    *  when no mid-run progress was reported. Absent when the lead declared nothing, which
    *  is the common case. StubExecutor never sets it. */
   milestonesCompleted?: string[];
+  /** Issue #293 M2 (gate honesty): component dirs whose JS dependencies did NOT
+   *  install this run, so the gates that need them (e.g. `vitest`, `knip`) could not
+   *  have run. Rendered as an "unverified gates" annotation on the issue-run MR body
+   *  (ANNOTATE posture — never blocks). Dir names are already charset/length-clamped
+   *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when every
+   *  dir installed, which is the common case. StubExecutor never sets it. */
+  gatesUnverified?: string[];
+  /** Issue #293 M2 (review F1): true when dependency DISCOVERY was truncated at its scan
+   *  cap, so components past the cap were never examined and cannot appear in
+   *  gatesUnverified. Adds a "coverage was capped" caveat to the same MR annotation so a
+   *  silent cap does not read as full coverage. ISSUE RUNS ONLY, OMITTED (never `false`)
+   *  when discovery saw the whole tree. StubExecutor never sets it. */
+  gatesDiscoveryTruncated?: boolean;
   /** issue #279: the lead declared this a report-only/evidence run on signal_done; the
    *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
   reportOnly?: boolean;

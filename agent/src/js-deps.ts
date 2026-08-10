@@ -291,6 +291,15 @@ export interface InstallCommand {
  *  for cancellation and must not return it for an ordinary error. */
 export const DETAIL_CANCELLED = "cancelled";
 
+/** The `detail` of the ONE deliberate non-install: a dir with a package.json but no
+ *  recognized lockfile, which uzi never installs (it refuses to guess a manager). Gate
+ *  honesty (sdk-executor) keys its "unverified" exclusion on THIS exact reason, so it is
+ *  a named export shared with that consumer rather than a bare literal re-typed there —
+ *  otherwise a genuine install/discovery FAILURE that also carries `manager:"none"` (the
+ *  `discovery failed` record below) gets silently folded in with the deliberate skip and
+ *  the false-green it should annotate disappears. */
+export const DETAIL_NO_LOCKFILE = "package.json but no recognized lockfile — not installed";
+
 /**
  * The exec boundary. Injectable so tests drive the composition without spawning a real
  * package manager or touching a registry. Resolves — never rejects — in the default
@@ -437,7 +446,7 @@ export async function installJsDeps(
         dir: project.dir,
         manager: "none",
         ok: false,
-        detail: "package.json but no recognized lockfile — not installed",
+        detail: DETAIL_NO_LOCKFILE,
       });
       continue;
     }
