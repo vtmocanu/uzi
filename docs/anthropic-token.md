@@ -181,6 +181,12 @@ missing or unusable, or re-paste the token that would not open.
 A run whose token you later delete still names it, with **(deleted)** — the
 name is a snapshot taken when the run was claimed, so history stays readable.
 
+Once you hold **more than one token**, the **Runs** list also shows a compact
+version of this beside each run's status — the token's label, a small dot when
+the state is worth a look (info or amber), and the mode and reason on hover — so
+you can see which account paid across a batch of runs without opening each one.
+A single-token user's runs all billed the one token, so the list stays as it was.
+
 ## Pointing the judge at a token
 
 **Settings → Run judge** has a **Token the judge spends** picker (shown once
