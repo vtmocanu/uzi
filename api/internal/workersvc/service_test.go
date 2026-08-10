@@ -116,6 +116,10 @@ type fakeStore struct {
 	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
 	requeuedRun *uuid.UUID
 
+	// issue #297: the in-flight avoid-set source for a self_improve claim.
+	activeRunsAll    []store.ListActiveRunsAllRow
+	activeRunsAllErr error
+
 	// Ownership + messages + state.
 	runOwned    store.Run
 	runOwnedErr error
@@ -399,6 +403,13 @@ func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store
 func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRunClaimContextRow, error) {
 	f.claimCtxCalled = true
 	return f.claimCtx, f.claimCtxErr
+}
+
+// ListActiveRunsAll is the in-flight avoid-set source a self_improve claim reads
+// (issue #297). The zero value is an empty set, so every pre-#297 claim fixture — which
+// stages nothing here — takes the nil/empty path and never panics on the embedded Store.
+func (f *fakeStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAllRow, error) {
+	return f.activeRunsAll, f.activeRunsAllErr
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
 	sealedWith := f.anthropicSealedWith
