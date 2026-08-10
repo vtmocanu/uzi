@@ -1085,6 +1085,13 @@ export interface Run {
   pipeline_ref: string | null;
   pipeline_web_url: string | null;
   fix_verdict: FixVerdict | null;
+  /** issue #279: true when this completed run is a report-only / evidence run that
+   *  intentionally opened no merge request; its deliverable is report_md + the transcript.
+   *  Detail read only (absent on the runs list, like fix_verdict), so OPTIONAL. */
+  report_only?: boolean;
+  /** issue #279: the run's persisted findings summary, server-scrubbed. Present only on a
+   *  report_only completion; UNTRUSTED — render as escaped plain text, never <Markdown>. */
+  report_md?: string | null;
   plan_md: string | null;
   /** PRD #209: where plan_md came from — `"agent"` for a normal run whose worker wrote
    *  the plan at the gate, `"seeded"` for a run created WITH a user-authored plan that

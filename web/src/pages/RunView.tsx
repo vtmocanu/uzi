@@ -707,21 +707,48 @@ export function RunView() {
                   {mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
+            ) : run.mr_iid != null ? (
+              <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState, run.forge_type)}>
+                {mrAbbrev(run.forge_type)}{" "}
+                <span className={mrState === "closed" ? "line-through" : undefined}>
+                  {mrRefSymbol(run.forge_type)}
+                  {run.mr_iid}
+                </span>
+                {mrChipSuffix(mrState)}
+              </Badge>
             ) : (
-              run.mr_iid != null && (
-                <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState, run.forge_type)}>
-                  {mrAbbrev(run.forge_type)}{" "}
-                  <span className={mrState === "closed" ? "line-through" : undefined}>
-                    {mrRefSymbol(run.forge_type)}
-                    {run.mr_iid}
-                  </span>
-                  {mrChipSuffix(mrState)}
+              // issue #279: a report-only run intentionally opened no MR — explain the
+              // empty slot with a neutral chip, the way ci_fix not_code does.
+              run.report_only && (
+                <Badge
+                  tone="neutral"
+                  title="This run's deliverable is a report; it intentionally opened no merge request."
+                >
+                  report only
                 </Badge>
               )
             )}
           </div>
         </div>
       )}
+
+      {/* issue #279: a report-only run's deliverable is report_md. Render it right
+          under the completed hero, above the retrospective.
+
+          report_md is UNTRUSTED worker/model-authored text. It is DELIBERATELY rendered
+          as escaped plain text (React's default + whitespace-pre-wrap), never through
+          <Markdown> — the ingest scrub does NOT cover markdown/link injection, exactly as
+          review.summary_md is rendered below. If this is ever switched to a markdown/HTML
+          renderer, add sanitization first. See lib/safeText.ts. */}
+      {run.status === "completed" &&
+        run.report_only &&
+        run.report_md != null &&
+        run.report_md.trim() !== "" && (
+          <Card className="space-y-2 p-4">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h2>
+            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(run.report_md)}</p>
+          </Card>
+        )}
 
       {terminal && run.status !== "completed" && (
         <div
@@ -1333,6 +1360,9 @@ export function RunCompletedLine({
             ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
         </>
       )}
+      {/* issue #279: a report-only run has no branch and no MR — name the deliverable
+          so the hero is not a silently-empty "Run completed". */}
+      {run.report_only && <>Report only — no merge request; findings below.</>}
     </p>
   );
 }
