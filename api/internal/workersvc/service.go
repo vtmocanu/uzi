@@ -1678,7 +1678,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
-	return &ClaimPayload{
+	payload := &ClaimPayload{
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,
 		IssueIID:         issueIID,
@@ -1770,7 +1770,105 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ToolPackages:           toolPackages,
 			RepoDevboxOptIn:        rc.RepoDevboxOptIn,
 		},
-	}, nil
+	}
+
+	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
+	// a recommendation whose fix another active run is already doing. Best-effort and
+	// self_improve-only; every other kind's claim stays byte-identical to today's.
+	if run.Kind == RunKindSelfImprove {
+		payload.InflightTargets = s.inflightTargets(ctx, run)
+	}
+
+	return payload, nil
+}
+
+// maxInflightTargets caps the self_improve in-flight avoid-set handed to the picker
+// (issue #297): newest-first (ListActiveRunsAll is ORDER BY created_at DESC), so the
+// most recently started runs win the cap. Advisory context, not a hard block.
+const maxInflightTargets = 30
+
+// maxInflightLineLen bounds one assembled in-flight coordinate line (issue #297): the
+// titles are untrusted issue/milestone text of unbounded length, so a single line is
+// trimmed to keep the avoid-set compact on the wire.
+const maxInflightLineLen = 300
+
+// inflightTargets builds the self_improve in-flight avoid-set at claim time (issue
+// #297): every non-terminal run on the SAME repo (excluding this self_improve run
+// itself), formatted as one compact coordinate line each. Best-effort — a query
+// failure yields nil and never fails the claim (mirrors the knownTargets posture in
+// assembleJudgeClaim).
+//
+// ListActiveRunsAll is a GLOBAL, all-repos LIMIT-500 window ordered by recency; the
+// same-repo filter runs in Go over that window. On a very busy multi-tenant fleet a
+// repo's in-flight runs could in principle be crowded out of the 500 newest rows and
+// silently drop from the avoid-set. That is acceptable here: this set is ADVISORY
+// context for the picker (D4), not a correctness gate — a missed entry only means the
+// picker might overlap, which the human MR review still catches. Reusing the existing
+// query is the deliberate trade for no new query and no migration (D5).
+func (s *Service) inflightTargets(ctx context.Context, run store.Run) []string {
+	rows, err := s.q.ListActiveRunsAll(ctx)
+	if err != nil {
+		slog.Warn("self_improve claim: list active runs for in-flight set", "run", run.ID.String(), "error", err)
+		return nil
+	}
+	var out []string
+	for _, row := range rows {
+		r := row.Run
+		if r.ID == run.ID || r.RepoID != run.RepoID {
+			continue // exclude self and other repos
+		}
+		out = append(out, formatInflightLine(r))
+		if len(out) >= maxInflightTargets {
+			break
+		}
+	}
+	return out
+}
+
+// formatInflightLine renders one active run as a single compact coordinate line for the
+// self_improve in-flight avoid-set (issue #297). Shape:
+//
+//	issue #<iid> "<title>" (kind=<kind>, status=<status>) — milestones: <id> "<title>"; ...
+//
+// An issue-less kind (self_improve/ci_fix has a NULL issue_iid) drops the "#<iid>" and
+// leads with "<kind> run" instead. The milestone tail is omitted when MilestonesFrozen is
+// empty or fails to decode. The whole line is trimmed to maxInflightLineLen. All text is
+// untrusted repo content — the worker renders it nonce-fenced, never as instructions.
+func formatInflightLine(r store.Run) string {
+	var b strings.Builder
+	if r.IssueIid.Valid {
+		fmt.Fprintf(&b, "issue #%d", r.IssueIid.Int64)
+		if r.IssueTitle != "" {
+			fmt.Fprintf(&b, " %q", r.IssueTitle)
+		}
+	} else {
+		fmt.Fprintf(&b, "%s run", r.Kind)
+	}
+	fmt.Fprintf(&b, " (kind=%s, status=%s)", r.Kind, r.Status)
+
+	// MilestonesFrozen is data a prior write left behind, not an invariant of this read:
+	// a decode error just omits the milestone tail (best-effort, matching the claim path).
+	if ms, err := DecodeMilestones(r.MilestonesFrozen); err == nil && len(ms) > 0 {
+		b.WriteString(" — milestones:")
+		for i, m := range ms {
+			if i > 0 {
+				b.WriteByte(';')
+			}
+			fmt.Fprintf(&b, " %s %q", m.ID, m.Title)
+		}
+	}
+
+	line := b.String()
+	if len(line) > maxInflightLineLen {
+		// Trim back to a rune boundary so an untrusted multibyte title is never sliced
+		// mid-rune into invalid UTF-8.
+		cut := maxInflightLineLen
+		for cut > 0 && !utf8.RuneStart(line[cut]) {
+			cut--
+		}
+		line = line[:cut]
+	}
+	return line
 }
 
 // errToolPackagesRejected marks a claim whose grandfathered tool packages fell out
