@@ -93,7 +93,12 @@ Dispatch independent subagents in parallel in a single turn:
   one worktree and would make the gate compile a tree you do not control. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
-  that check.
+  that check. When you run that gate, do not rely on the shell's working
+  directory carrying between separate Bash calls, or on the default being the
+  worktree root: a bare `cd api && …` can fail on a later call with
+  `cd: api: No such file or directory`. Use absolute paths, or `cd` from the
+  worktree root fresh in each command — the same defensiveness as the `git -C
+  <worktree>` you already use for git.
 - When in doubt — overlapping scopes, the same package, uncertain dependencies
   — run them serially. Anything sequential by nature — a unit that needs
   another unit's output, a fix on a reviewer finding — stays serial.

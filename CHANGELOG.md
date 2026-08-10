@@ -13,6 +13,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   pulled-down bundles) so a clean delivery never hinges on a final `rm`, and
   `fact-checker` no longer tells the worker to write outside the worktree, which
   the file-access guardrail rejects. (from judge recommendations)
+- Worker agents stop stumbling on `cd api && …` gate commands. The builtin
+  `coder` and `lead` prompts now note that the worker shell's working directory
+  is not reliable across separate Bash calls, and to use absolute paths (or `cd`
+  from the worktree root fresh each command). (from judge recommendations)
 
 ## [0.25.0] - 2026-08-10
 
