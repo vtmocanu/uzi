@@ -49,6 +49,14 @@ by default unless you set a personal override in
 its persona and workflow; the primary-directive guardrails (never touch
 `main`, no `git push`, the plan gate) are enforced by the worker regardless.
 
+The builtin `fact-checker`'s `tools:` allowlist names six
+`mcp__forge__*` entries, so it alone can read the run's own forge (issues,
+merge requests, pipelines, label history) to check a claim against live
+state — see [Forge read tools](./forge-read-tools.md). A template with no
+`tools:` list inherits everything, forge tools included; a template with
+its own explicit allowlist gets forge access only if you add an
+`mcp__forge__*` entry to it yourself.
+
 ## Parallel dispatch
 
 The lead can dispatch more than one subagent in the same turn when their

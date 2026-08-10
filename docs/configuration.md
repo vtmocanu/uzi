@@ -123,6 +123,15 @@ Nothing about this is required. A board that keeps `Upcoming` keeps working exac
 - GitLab throttles how often it bumps an issue's `updated_at` to roughly once per ~60-second window, regardless of whether the triggering change is a label add or a label remove (verified against gitlab.example.com — see the PRD's Sync engine section for the full finding). Multiple edits landing inside the same throttle window collapse to a single bump, so only the latest of them is guaranteed to be caught incrementally; earlier ones in that window are caught by the next reconcile pass instead. `FORGE_POLL_INTERVAL`'s default (`60s`) is the same order of magnitude as the throttle window, so normal editing cadence is still caught incrementally almost all the time.
 - De-labeling, issue deletion, and any edit whose `updated_at` bump the incremental filter missed are only guaranteed to be visible within one `FORGE_RECONCILE_EVERY`-th poll (the full reconcile), because eviction — noticing a previously-cached issue is now absent from the forge's current set — is structurally impossible for an `updated_after`-filtered incremental query to do.
 
+### Forge read tools (PRD #158)
+
+See [Forge read tools](forge-read-tools.md) for the user-facing feature: a
+run's `fact-checker` subagent reading its own project's forge (issues,
+merge requests, pipelines, label history) live, instead of trusting the
+repo's own restatement. There is no env var for it — the per-run call
+budget (40 calls) and the response caps (50 list rows, 32 KiB per issue
+description) are fixed constants in the API handler, not configurable.
+
 ## CI status integration (PRD #6)
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.

@@ -40,7 +40,11 @@ Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 
 uzi parses the agent files itself; it never points Claude Code at the repo's
 `.claude/` directory. Each file's `name`, `description`, `tools`, and `model`
-frontmatter is honored. A repo agent's own hooks, settings, and slash commands
+frontmatter is honored — including a `tools:` entry naming one of the
+[forge read tools](./forge-read-tools.md) (`mcp__forge__*`), which a repo
+agent can grant itself the same way a template does. That surface is
+read-only and scoped to the run's own project regardless of which agent
+calls it. A repo agent's own hooks, settings, and slash commands
 are **never** loaded, and the primary-directive guardrails always apply: no repo
 agent can push to `main`, rewrite history, spawn nested agents, or schedule
 deferred work, whatever its file says.

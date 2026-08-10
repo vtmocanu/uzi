@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **A run can now fact-check a claim against its forge instead of the repo's own
+  restatement of it.** A run-lane subagent (the `fact-checker`) gets six
+  read-only forge lookups as in-process MCP tools — `get_issue`, `list_issues`,
+  `list_issue_label_events`, `get_merge_request`, `get_pipeline_jobs`, and
+  `latest_pipeline` — so verifying "what does issue #128 say?" or "did that MR
+  merge / did CI pass?" checks live issue/MR/CI/label state rather than the repo's
+  copy. The reads are worker-mediated and run-scoped: the agent never holds the
+  forge credential, the project is derived server-side from the run, payloads and
+  errors are coordinate-free, and forge prose reaches the model inside an
+  untrusted-evidence fence. Works for GitLab and Forgejo. (#158)
+
 ### Changed
 
 - Read-only validator agents keep the run worktree clean. The builtin `web-ux`
