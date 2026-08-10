@@ -56,7 +56,7 @@ const maxAdvertisedConcurrentRuns = 256
 // codebase's one answer to "unsafe in untrusted display text".
 //
 // NO whitespace exception here, deliberately, and that is the difference from
-// sanitizeReviewText (judge_worker.go:381) rather than an oversight: these are
+// termsafe.SanitizeBounded (which keeps \n and \t) rather than an oversight: these are
 // single-line identifiers — a worker version, a pod phase, a target — where a
 // newline is already something to drop.
 func sanitizeSelfReported(s string, max int) string {
@@ -150,7 +150,7 @@ func asciiLowerTarget(s string) string {
 // It runs AFTER sanitizeSelfReported + ScrubSecrets at ingest (judge_worker.go), so the
 // control/Cf strip and secret redaction have already run on this string.
 //
-// `max` mirrors sanitizeSelfReported/sanitizeReviewText's (s, max) shape and re-bounds to
+// `max` mirrors sanitizeSelfReported/termsafe.SanitizeBounded's (s, max) shape and re-bounds to
 // the caller's cap. Today's sole caller passes ReviewTargetMaxBytes, so unparam flags it —
 // suppressed below because the parameter is the byte-bound contract the plan requires and
 // keeps this uniform with the two sibling scrubbers it runs beside on the ingest path.
