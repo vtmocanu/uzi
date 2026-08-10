@@ -1652,6 +1652,47 @@ func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUs
 	return i, err
 }
 
+const getRunForgeConnForWorker = `-- name: GetRunForgeConnForWorker :one
+SELECT rp.forge_project_id,
+       c.forge_type, c.base_url, c.token_ciphertext
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id
+WHERE r.id = $1 AND r.worker_id = $2
+`
+
+type GetRunForgeConnForWorkerParams struct {
+	RunID    uuid.UUID   `json:"run_id"`
+	WorkerID pgtype.UUID `json:"worker_id"`
+}
+
+type GetRunForgeConnForWorkerRow struct {
+	ForgeProjectID  int64  `json:"forge_project_id"`
+	ForgeType       string `json:"forge_type"`
+	BaseUrl         string `json:"base_url"`
+	TokenCiphertext []byte `json:"token_ciphertext"`
+}
+
+// The forge connection facts a WORKER-authenticated run needs to build a driver and
+// read the run's forge (PRD #158 M1): the numeric project id plus the connection
+// (forge_type/base_url/token_ciphertext, decrypted by the service, never selected in
+// the clear). Modeled on GetRunMoveContext but stripped to the connection columns and
+// gated on the worker claim — the r.worker_id predicate makes a run the worker does
+// not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
+// repo-less run has no repos row and returns no row too; the service checks repo_id
+// off the owned run FIRST so it can tell that apart and answer 409.
+func (q *Queries) GetRunForgeConnForWorker(ctx context.Context, arg GetRunForgeConnForWorkerParams) (GetRunForgeConnForWorkerRow, error) {
+	row := q.db.QueryRow(ctx, getRunForgeConnForWorker, arg.RunID, arg.WorkerID)
+	var i GetRunForgeConnForWorkerRow
+	err := row.Scan(
+		&i.ForgeProjectID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.TokenCiphertext,
+	)
+	return i, err
+}
+
 const getRunMoveContext = `-- name: GetRunMoveContext :one
 
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,

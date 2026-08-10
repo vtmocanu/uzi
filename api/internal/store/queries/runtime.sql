@@ -1858,6 +1858,22 @@ JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
 WHERE r.id = @run_id;
 
+-- name: GetRunForgeConnForWorker :one
+-- The forge connection facts a WORKER-authenticated run needs to build a driver and
+-- read the run's forge (PRD #158 M1): the numeric project id plus the connection
+-- (forge_type/base_url/token_ciphertext, decrypted by the service, never selected in
+-- the clear). Modeled on GetRunMoveContext but stripped to the connection columns and
+-- gated on the worker claim — the r.worker_id predicate makes a run the worker does
+-- not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
+-- repo-less run has no repos row and returns no row too; the service checks repo_id
+-- off the owned run FIRST so it can tell that apart and answer 409.
+SELECT rp.forge_project_id,
+       c.forge_type, c.base_url, c.token_ciphertext
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id
+WHERE r.id = @run_id AND r.worker_id = @worker_id;
+
 -- name: ClaimAutopilotTerminalComment :execrows
 -- Atomically claim the single terminal issue comment for an autopilot run (PRD #19
 -- M5, Decision 6 record-then-comment). Records the marker FIRST; the caller posts

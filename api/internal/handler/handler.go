@@ -1240,6 +1240,18 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/memory", h.WorkerSaveMemory)
 		r.Get("/runs/{id}/memory", h.WorkerListMemory)
 
+		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ
+		// ONLY. Every route derives the (repo, connection, project id) from the OWNED
+		// run — never from the request — builds a driver, and returns a coordinate-free
+		// DTO (no WebURL, no forge project id/base url/token; driver errors are mapped
+		// to fixed generic messages so the SDK's embedded URL never reaches the agent).
+		r.Get("/runs/{id}/forge/issues/{iid}", h.WorkerForgeGetIssue)
+		r.Get("/runs/{id}/forge/issues", h.WorkerForgeListIssues)
+		r.Get("/runs/{id}/forge/issues/{iid}/label-events", h.WorkerForgeListIssueLabelEvents)
+		r.Get("/runs/{id}/forge/merge-requests/{iid}", h.WorkerForgeGetMergeRequest)
+		r.Get("/runs/{id}/forge/pipelines/{pipeline_id}/jobs", h.WorkerForgePipelineJobs)
+		r.Get("/runs/{id}/forge/latest-pipeline", h.WorkerForgeLatestPipeline)
+
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.

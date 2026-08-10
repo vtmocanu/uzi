@@ -314,6 +314,11 @@ func (g *github) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 				continue
 			}
 			out = append(out, toGitHubIssue(i))
+			// opts.Limit == 0 is the no-cap default (every pre-#158 caller); a positive
+			// Limit stops as soon as that many issues are collected, truncating this page.
+			if opts.Limit > 0 && len(out) >= opts.Limit {
+				return out, nil
+			}
 		}
 		if resp.NextPage == 0 {
 			break
