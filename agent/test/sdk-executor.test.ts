@@ -2395,12 +2395,12 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
 // (never []/undefined) when everything installed, and a `manager:"none"` no-lockfile
 // dir is a deliberate non-install, not a failure, so it is EXCLUDED.
 describe("SdkExecutor gatesUnverified population (issue #293 M2)", () => {
-  async function runWith(results: JsDepsResult[], overrides: Partial<RunContext> = {}) {
+  async function runWith(results: JsDepsResult[], overrides: Partial<RunContext> = {}, truncated = false) {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
-    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({ results, truncated: false });
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({ results, truncated });
     const probe = makeCtx(overrides);
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
     return result;
@@ -2436,6 +2436,31 @@ describe("SdkExecutor gatesUnverified population (issue #293 M2)", () => {
     assert.ok(!("gatesUnverified" in result) || result.gatesUnverified === undefined);
   });
 
+  it("INCLUDES a manager:\"none\" GENUINE discovery failure (review F2)", async () => {
+    // The belt-to-braces `discovery failed` record shares the {manager:"none", ok:false}
+    // shape with the deliberate no-lockfile skip but means the OPPOSITE: a total failure
+    // where nothing was scanned or installed. Keying the exclusion on `manager` dropped it
+    // and hid a false green; keying on the specific no-lockfile REASON keeps it.
+    const result = await runWith([
+      { dir: ".", manager: "none", ok: false, detail: "discovery failed: boom" },
+    ]);
+    assert.strictEqual((result.gatesUnverified ?? []).length, 1, "a genuine discovery failure must annotate");
+  });
+
+  it("sets gatesDiscoveryTruncated when discovery was capped, even with every dir ok (review F1)", async () => {
+    const result = await runWith(
+      [{ dir: "web", manager: "npm", ok: true, detail: "ok" }],
+      {},
+      true,
+    );
+    assert.strictEqual(result.gatesDiscoveryTruncated, true);
+  });
+
+  it("omits gatesDiscoveryTruncated when discovery saw the whole tree", async () => {
+    const result = await runWith([{ dir: "web", manager: "npm", ok: true, detail: "ok" }]);
+    assert.ok(!("gatesDiscoveryTruncated" in result) || result.gatesDiscoveryTruncated === undefined);
+  });
+
   it("omits the field when every dir installed (additive-absent, never [])", async () => {
     const result = await runWith([
       { dir: "web", manager: "npm", ok: true, detail: "ok" },
@@ -2446,12 +2471,14 @@ describe("SdkExecutor gatesUnverified population (issue #293 M2)", () => {
   });
 
   for (const kind of ["self_improve", "ci_fix"] as const) {
-    it(`a ${kind} run never carries gatesUnverified, even with a failed install (issue-run only)`, async () => {
+    it(`a ${kind} run never carries gatesUnverified/gatesDiscoveryTruncated, even with a failed+truncated install (issue-run only)`, async () => {
       const result = await runWith(
         [{ dir: "web", manager: "npm", ok: false, detail: "install failed" }],
         { kind },
+        true,
       );
       assert.strictEqual(result.gatesUnverified, undefined, `${kind} must not carry gatesUnverified`);
+      assert.strictEqual(result.gatesDiscoveryTruncated, undefined, `${kind} must not carry gatesDiscoveryTruncated`);
     });
   }
 });

@@ -22,8 +22,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   whose `js_deps` check came back `ok:false` (excluding a `package.json` with
   no lockfile, which uzi deliberately never installs rather than guesses a
   package manager for) and renders a "⚠️ Quality gates unverified" note on the
-  MR body naming them — an ANNOTATE-only signal that never blocks a merge.
-  (#293)
+  MR body naming them — an ANNOTATE-only signal that never blocks a merge. If
+  dependency discovery itself hit its scan cap, the note also warns that
+  components beyond the cap were never checked, so a capped run does not read as
+  fully verified. (#293)
 
 ### Changed
 

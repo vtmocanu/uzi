@@ -12352,13 +12352,23 @@ three-state gate ledger stayed DEFERRED and the why is recorded below.
 - **M2 — honest completion annotation is driven by `js_deps`, ANNOTATE posture (Decision D2, never
   blocks).** At the completion handoff (`agent/src/sdk-executor.ts` ~1330), `result.gatesUnverified`
   (`ExecutorResult.gatesUnverified`, `agent/src/executor.ts:261`) is populated from
-  `depsResults.filter(r => !r.ok && r.manager !== "none").map(safeDirLabel)` — ISSUE-run only,
-  OMITTED-not-`[]`/undefined when every dir installed (same convention as `milestonesCompleted`).
-  The `manager !== "none"` exclusion is load-bearing: a `package.json` with no recognized lockfile is
-  `{manager:"none", ok:false}` (deliberately NOT installed — uzi refuses to guess a manager, §397), and
-  annotating it would cry wolf on a fine delivery — the exact asymmetry `js-deps.ts` flagged for this
-  consumer to revisit. A genuine install failure carries a real manager (npm/pnpm/yarn/bun) with
-  `ok:false` and still annotates. `runner.ts`'s `mrDescription` threads it to
+  `depsResults.filter(r => !r.ok && r.detail !== DETAIL_NO_LOCKFILE).map(safeDirLabel)` — ISSUE-run
+  only, OMITTED-not-`[]`/undefined when every dir installed (same convention as `milestonesCompleted`).
+  The exclusion is keyed on the specific deliberate-skip REASON (`DETAIL_NO_LOCKFILE`, a named export
+  from `js-deps.ts`), NOT on `manager !== "none"` (review F2). A `package.json` with no recognized
+  lockfile is `{manager:"none", ok:false, detail:DETAIL_NO_LOCKFILE}` (deliberately NOT installed — uzi
+  refuses to guess a manager, §397), and annotating it would cry wolf on a fine delivery. But
+  `manager:"none"` has a SECOND producer: the belt-to-braces `discovery failed` record
+  (`{dir:".", manager:"none", ok:false}`), which IS a genuine total failure that must annotate. Keying
+  the exclusion on `manager` dropped BOTH and turned that failure into a false green (latent: discovery
+  is non-throwing today, so the record is unreachable until a refactor makes it throw — fixed here so it
+  stays honest if that day comes). A genuine install failure carries a real manager (npm/pnpm/yarn/bun)
+  with `ok:false` and still annotates. Discovery TRUNCATION is carried alongside as
+  `gatesDiscoveryTruncated` (review F1): a capped discovery (`depsTruncated`, at MAX_PROJECT_DIRS /
+  MAX_SCAN_DIRS) never examined components past the cap, so they cannot appear in the list; the
+  annotation adds a "coverage was capped" caveat (fired even when no named dir failed) rather than
+  letting the cap read as full coverage — the exact silent-cap lie this PRD exists to remove.
+  `runner.ts`'s `mrDescription` threads both to
   `gatesUnverifiedMrSection` (`agent/src/runner.ts`), which renders a `⚠️ **Quality gates unverified**`
   blockquote on the ISSUE-run MR branch — byte-identical to before when empty. Reuses the `js_deps`
   `ok` signal because it is corroborated against the filesystem (§397), so a repo forcing exit 0 cannot
@@ -12383,6 +12393,11 @@ three-state gate ledger stayed DEFERRED and the why is recorded below.
   `lint:formula`/`lint:shell`/`lint:yaml` fail-open-locally-required-in-CI precedent exactly
   (`scripts/deadcode-knip.sh` is modelled on `scripts/lint-formula.sh`). The component arg is charset-
   clamped (`case *[!a-z]*` ⇒ exit 2) before it is uppercased into the required-var name read via `eval`.
+  **The wrapper resolves the repo root from its OWN location (`$0`), deliberately NOT `git rev-parse
+  --show-toplevel`** the way `lint-formula.sh` does: `deadcode:web` runs inside `validate:web`'s
+  `node:22-alpine` CI image, which ships NO git, so a `git rev-parse` here fails and reds the very gate
+  it exists to keep honest — caught in CI (pipeline 20725) on the first push and fixed to a git-free
+  `CDPATH='' cd -- "$(dirname -- "$0")/.."`. Do not "correct" it back to `git` to match lint-formula.
   **Rejected alternatives, recorded so they are not re-proposed:** scope-to-touched (violates the
   `{{.CLI_ARGS}}` ban); prewarm knip into every component (per-repo `node_modules`, defeated by the
   seed-once PVC).

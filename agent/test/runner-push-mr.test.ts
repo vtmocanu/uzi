@@ -102,6 +102,27 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.match(body.description, /`web`/, "the unverified component dir must be named in the MR body");
   });
 
+  it("annotates the MR body with a discovery-truncation caveat even when no named dir failed (issue #293 M2, review F1)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(7);
+    // Every reached dir installed, but discovery hit its scan cap: components past the cap
+    // were never examined, so gatesUnverified names none of them. The caveat must still fire
+    // so the capped coverage does not read as full coverage.
+    const exec: Executor = {
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "own", agents: ["coder", "reviewer"] },
+        gatesDiscoveryTruncated: true,
+      }),
+    };
+    await runner(exec, gitlab).execute(claim);
+
+    assert.strictEqual(calls.length, 1);
+    const body = JSON.parse(calls[0]!.body ?? "{}");
+    assert.match(body.description, /Quality gates unverified/);
+    assert.match(body.description, /scan cap/, "the truncation caveat must be present");
+  });
+
   it("a normal run's MR body carries NO unverified-gates annotation (issue #293 M2)", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(7);

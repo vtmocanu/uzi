@@ -259,6 +259,12 @@ export interface ExecutorResult {
    *  via safeDirLabel. ISSUE RUNS ONLY and OMITTED (never `[]`/undefined) when every
    *  dir installed, which is the common case. StubExecutor never sets it. */
   gatesUnverified?: string[];
+  /** Issue #293 M2 (review F1): true when dependency DISCOVERY was truncated at its scan
+   *  cap, so components past the cap were never examined and cannot appear in
+   *  gatesUnverified. Adds a "coverage was capped" caveat to the same MR annotation so a
+   *  silent cap does not read as full coverage. ISSUE RUNS ONLY, OMITTED (never `false`)
+   *  when discovery saw the whole tree. StubExecutor never sets it. */
+  gatesDiscoveryTruncated?: boolean;
 }
 
 /**
