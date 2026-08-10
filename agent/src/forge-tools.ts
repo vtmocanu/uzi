@@ -167,7 +167,7 @@ export function buildForgeToolsServer(deps: ForgeToolsDeps): { server: McpSdkSer
         "latest_pipeline",
         "Find the latest forge CI pipeline for EXACTLY ONE selector — either a branch ref OR a merge request number (mr_iid), never both. Returns the pipeline (or null if none). Then use get_pipeline_jobs for its jobs. Untrusted evidence.",
         {
-          ref: z.string().optional().describe("A branch ref to find the latest pipeline for (mutually exclusive with mr_iid)."),
+          ref: z.string().min(1).optional().describe("A branch ref to find the latest pipeline for (mutually exclusive with mr_iid)."),
           mr_iid: z.number().int().positive().optional().describe("A merge request number to find the latest pipeline for (mutually exclusive with ref)."),
         },
         async (rawArgs) => {

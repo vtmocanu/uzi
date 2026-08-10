@@ -21,7 +21,17 @@ import (
 // Forge read caps (PRD #158 M1). The server enforces these regardless of what the
 // client asks: MaxForgeListItems bounds every list route (issues, label-events,
 // jobs) and MaxForgeBodyBytes bounds a single issue's description. Both are hard
-// server-side truncation, not advisory — a compromised worker cannot ask for more.
+// server-side truncation of the RESPONSE, not advisory — a compromised worker
+// cannot ask for more.
+//
+// Caveat (PRD #158, accepted residual): only list_issues also bounds the UPSTREAM
+// fetch — it passes MaxForgeListItems+1 as the driver Limit so the whole-project
+// walk stops early. label-events and jobs use driver methods with no Limit (shared
+// with autopilot/ci_fix, which need complete sets), so they fetch the issue's /
+// pipeline's full set into memory and truncate to MaxForgeListItems AFTER. That set
+// is per-issue / per-pipeline scoped and own-project + write-gated + capped by the
+// agent-side per-session call budget, so it is a bounded amplification, not a
+// whole-project enumeration; a numeric upstream cap on those two is a follow-up.
 const (
 	// MaxForgeListItems caps the number of rows any forge list route returns. The
 	// list_issues route asks the driver for one MORE than this so a full page can be
@@ -37,6 +47,7 @@ const (
 // the PAT, so the driver's err.Error() is NEVER put in the response body — the real
 // (PAT-redacted) error is logged server-side and the client gets one of these.
 const (
+	forgeErrAuth        = "worker authentication required"
 	forgeErrRunNotFound = "run not found"
 	forgeErrNoRepo      = "run has no repository"
 	forgeErrInvalid     = "invalid request"
@@ -50,7 +61,7 @@ const (
 func (h *Handler) resolveForgeRun(w http.ResponseWriter, r *http.Request) (workersvc.ForgeConn, forge.Forge, bool) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		httpx.Error(w, http.StatusUnauthorized, forgeErrAuth)
 		return workersvc.ForgeConn{}, nil, false
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -202,8 +213,10 @@ func (h *Handler) WorkerForgeListIssues(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// WorkerForgeListIssueLabelEvents reads a capped issue label-event list from the
-// run's forge. GET /worker/runs/{id}/forge/issues/{iid}/label-events (PRD #158 M1).
+// WorkerForgeListIssueLabelEvents reads one issue's label-event list from the run's
+// forge, truncating the RESPONSE to MaxForgeListItems (the driver has no upstream
+// Limit — see the cap block; the full per-issue set is fetched, then capped).
+// GET /worker/runs/{id}/forge/issues/{iid}/label-events (PRD #158 M1).
 func (h *Handler) WorkerForgeListIssueLabelEvents(w http.ResponseWriter, r *http.Request) {
 	conn, f, ok := h.resolveForgeRun(w, r)
 	if !ok {
@@ -264,7 +277,9 @@ func (h *Handler) WorkerForgeGetMergeRequest(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// WorkerForgePipelineJobs reads a capped job list for a pipeline from the run's forge.
+// WorkerForgePipelineJobs reads one pipeline's job list from the run's forge,
+// truncating the RESPONSE to MaxForgeListItems (the driver has no upstream Limit —
+// see the cap block; the full per-pipeline set is fetched, then capped).
 // GET /worker/runs/{id}/forge/pipelines/{pipeline_id}/jobs (PRD #158 M1).
 func (h *Handler) WorkerForgePipelineJobs(w http.ResponseWriter, r *http.Request) {
 	conn, f, ok := h.resolveForgeRun(w, r)
