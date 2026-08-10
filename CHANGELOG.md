@@ -18,6 +18,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   forge credential, the project is derived server-side from the run, payloads and
   errors are coordinate-free, and forge prose reaches the model inside an
   untrusted-evidence fence. Works for GitLab and Forgejo. (#158)
+- **"Send to uzi" Auto-mode orchestration in the CLI skill.** The bundled
+  `uzi-cli` skill now documents an interactive orchestration recipe: on "send to
+  uzi" / "ship to uzi" it asks once how much to automate (Auto, Supervised, Seed &
+  ship, Custom), then in Auto drives a PRD issue through a gated run, a
+  skill-reviewed plan approval, MR review and merge via the forge's own
+  `glab`/`gh`/`tea`, and local post-merge CI fixing. The merge and CI fixing are
+  done by the local session, never by uzi, so `main` stays untouched. Vocabulary
+  split so "seed to uzi" now names only the `--plan-file` path.
 - **`fd` and `yq` are now baked into the default worker toolchain.** Agents in
   any repo can reach for `fd` (fast file finder) and `yq` (YAML processor,
   mikefarah/yq) without hitting a `command not found` exit 127 — the same

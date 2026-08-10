@@ -12,9 +12,11 @@ part where uzi plans it again. Hand over a written plan and the worker goes
 straight to implementing it: no planning turn, no approval gate. The human
 checkpoint moves from the plan to the merge request.
 
-This is what people mean by **seed it to uzi** / **ship it to uzi** / **send it
-to uzi**: author the plan locally and run `uzi run create --plan-file <path>`,
-which bypasses uzi's own planning turn *and* the approval gate.
+This is what people mean by **seed it to uzi**: author the plan locally and run
+`uzi run create --plan-file <path>`, which bypasses uzi's own planning turn *and*
+the approval gate. ("Ship it to uzi" and "send it to uzi" name the broader
+hands-off flow that drives an issue all the way to a merged MR; seeding is one
+mode of it.)
 
 A run started with no `--plan-file` is completely unaffected: same planning
 turn, same gate, same everything.
