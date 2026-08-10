@@ -31,11 +31,11 @@ Decision 12), so both features filter the *render* path exactly like `visibleCar
 does, and are instant rather than a poll-cycle away.
 
 1. **Per-lane cap + paged reveal.** Each lane shows a configurable default (**10**)
-   cards, then a `Show 50 more · N left` expander that reveals **one page (50) at a
-   time** — never the whole pile into the DOM. An expanded lane scrolls internally
-   (bounded height) so it cannot grow the page to hundreds of rows tall; a quiet
-   `Collapse` returns it to the default. Past two pages of remainder, a nudge points
-   at search instead of a "show all" that would rebuild the wall.
+   cards, then a `Show N more · N left` expander that reveals **one page (up to 50)
+   at a time** — never the whole pile into the DOM. An expanded lane scrolls
+   internally (bounded height) so it cannot grow the page to hundreds of rows tall; a
+   quiet `Collapse` returns it to the default. Past two pages of remainder, a nudge
+   points at search instead of a "show all" that would rebuild the wall.
 
 2. **Board search.** A live, client-side filter over the already-loaded cards
    (title, `#iid`, label), matched case-insensitively across every lane, with the
@@ -59,26 +59,39 @@ line.
   `boardColumns.ts`/`runBadge.ts` discipline: logic out of the DOM) computes, per
   lane, how many cards to render given `(matchCount, shownCount, cap, page)` and
   whether a `Show more` / `Collapse` affordance is offered and with what counts.
-  `Board.tsx` renders `cap` (default 10) cards then a `Show 50 more · N left`
-  expander that advances `shownCount` by `page`; an expanded lane gets a bounded
-  `max-height` internal scroll; a `Collapse` resets to `cap`. The `Closed` lane and
-  the drag-reveal path are unaffected.
+  `Board.tsx` renders `cap` (default 10) cards then a `Show N more · N left` expander
+  (a page is 50) that advances `shownCount` by `page`; an expanded lane gets a
+  bounded `max-height` internal scroll; a `Collapse` resets to `cap`. Past two pages
+  of remainder the lane shows a *search-instead* nudge rather than a "show all".
+  **`cardsByColumn` stays FULL — the cap is a render-only slice**, so the reorder
+  anchors (`moveCard`, `canMoveUp/Down`, the append-to-end lane drop) still see the
+  whole lane; a card moved or dropped **past the cap auto-reveals** its lane (bumps
+  `shownCount` to include it) so it can never land in the hidden window and vanish.
+  The cap applies to **every** lane including `Closed` (Decision 8); the live
+  drag-reveal path is unaffected.
 
 - [ ] **M2 — Board search (render-only filter).** A pure predicate
-  `matchesQuery(card, q)` over title, `#iid`, and labels (case-insensitive),
-  applied to `renderCards` **after** `visibleCards`/sort and **before**
-  `cardsByColumn`, so search composes with membership and sort. Matched substring
-  highlighted in the card title and label chips. While a query is active: caps lift
-  (start at one page, still paged), empty lanes drop, capped lanes show `N/M`, and a
-  board-level result count renders. `payloadCards` is untouched (freeze safety).
+  `matchesQuery(card, q)` over title, `#iid`, and labels (case-insensitive), applied
+  to `renderCards` **after** `visibleCards` (membership) and **before** the
+  `cardsByColumn` memo — which is where `sortCards` runs (`Board.tsx:762`), so search
+  narrows the set the memo then sorts and slices (Decision 6 names the full seam).
+  Matched substring highlighted in **both** the card title and any matching label
+  chip (threaded through `chipLabels`/`hoistLabels`/`boundedChips`). While a query is
+  active: caps lift (start at one page, still paged); **empty lanes drop — the query
+  acts as `hideEmpty` for its duration, composing with `visibleColumns` while a live
+  drag still reveals lanes** (`boardColumns.ts` `dragActive`); capped lanes show
+  `N/M`; and a board-level result count renders. `payloadCards` is untouched (freeze
+  safety).
 
-- [ ] **M3 — Sticky toolbar + scroll region.** The search field and existing
-  controls (Sort, Issues, Hide empty, Create, Columns, Refresh) pin to the top of
-  the board's scroll container. **Verify against the real app shell** — the mock
-  scrolls the window; the app renders the board inside its layout, and `position:
-  sticky` fails silently under an `overflow` ancestor. The change is likely: give
-  the board its own scroll region and pin the bar to it. Confirm the pin holds in a
-  browser before this milestone is done.
+- [ ] **M3 — Sticky toolbar.** The search field and existing controls (Sort, Issues,
+  Hide empty, Create, Columns, Refresh) — which live in `PageHeader`'s `actions`
+  **inside `Board.tsx`** (`:928`), so this milestone edits that file — pin to the top
+  while a long lane scrolls. **Verify plain `sticky top-0` first**: the app shell
+  scrolls the *window* with no `overflow` ancestor on `<main>` (`AppShell.tsx`), so
+  plain sticky is expected to work and a board-local scroll region is the invasive
+  fallback (it also interacts with the lanes' own `overflow-x-auto`). On mobile the
+  shell already has a sticky `z-20` top bar, so the new bar needs a top offset and a
+  z-order below it. Confirm the pin holds in a browser before this milestone is done.
 
 - [ ] **M4 — Per-lane default preference.** A `Per lane` control persists to
   `prefs` as `uzi.board.${repoId}.perLane` (default **10**), mirroring `hideEmpty`
@@ -90,20 +103,23 @@ line.
 - [ ] **M5 — Accessibility & keyboard.** `/` focuses search (when not already in an
   input), `Esc` clears and blurs. Search input labeled; `Show more`/`Collapse`
   buttons carry counts in their accessible names. The board-level result count is
-  announced through the **existing** always-mounted `sr-only role=status` live
-  region (the S5 region in `Board.tsx`), not a new one. Highlight uses a real
-  `<mark>` (or token styling), never color alone. Reduced-motion respected on the
-  expander chevron.
+  announced through the **existing** always-mounted `sr-only role=status` live region
+  (the S5 region in `Board.tsx`), not a new one — but **debounced and
+  last-writer-wins**, because that region is the single-string channel `pushToast`
+  also feeds (`Board.tsx:339`), so a per-keystroke count would spam assistive tech
+  and race the auto-move toasts. Highlight uses a real `<mark>` (or token styling),
+  never color alone. Reduced-motion respected on the expander chevron.
 
-- [ ] **M6 — Tests.** Unit: the M1 paging helper (cap/page/collapse edges,
-  `Show N more` counts, the "fewer than a page remain" case) and the M2
-  `matchesQuery` predicate (title/iid/label hits and misses, case-insensitivity).
-  Component (`Board.test.tsx`): show-more reveals a page and Collapse resets; search
-  filters, highlights, drops empty lanes, and shows `N/M`; the per-lane pref
-  persists and re-reads on repo change; **the reorder freeze still uses the
-  unfiltered payload while a search hides cards** (the Decision 7b guard). Follow the
-  negative-assertion discipline (`.claude/rules/web.md`) for any copy the tests
-  assert absent.
+- [ ] **M6 — Component tests.** The paging helper and `matchesQuery` predicate are
+  unit-tested in M1/M2; this milestone is the `Board.test.tsx` component layer:
+  show-more reveals a page and Collapse resets; search filters, highlights (title and
+  chip), drops empty lanes, and shows `N/M`; the per-lane pref persists and re-reads
+  on repo change; and **the reorder freeze still uses the unfiltered payload while a
+  CAP or a search hides cards** — the Decision 7b guard, extended to the cap because
+  the cap hides cards from the render set exactly as search does (there is unit
+  precedent in `boardOrder.test.ts`, and `Board.test.tsx` already asserts on
+  `reorderBoard` calls). Follow the negative-assertion discipline
+  (`.claude/rules/web.md`) for any copy the tests assert absent.
 
 - [ ] **M7 — Docs.** `docs/board.md` (audience: user) documents search, the
   per-lane cap + `Show more`, and the per-lane default; the board's own on-screen
@@ -118,9 +134,10 @@ line.
    a poll-cycle delay, and need no server change.
 
 2. **Freeze safety is the first rule, not a footnote.** Search and cap filter and
-   slice `renderCards` only. `payloadCards` stays unfiltered because it drives the
-   reorder freeze (PRD #102 Decision 7b) — filtering it would NULL the position of
-   every hidden card. M6 asserts this directly.
+   slice `renderCards` only; `cardsByColumn` stays full and the cap is a render-only
+   slice over it. `payloadCards` stays unfiltered because it drives the reorder
+   freeze (PRD #102 Decision 7b) — filtering it would NULL the position of every
+   hidden card. M6 asserts this for both the cap and search hiding cards.
 
 3. **Paged reveal + internal scroll, not "show all".** The expander advances by a
    fixed page (50) and an expanded lane scrolls within a bounded height. A single
@@ -138,16 +155,32 @@ line.
    page and pages from there, so a 400-match search never dumps 400 cards either.
    Caps and search compose through one `shownCount` model, not two competing ones.
 
-6. **Sort → filter → cap is one ordered pipeline.** `visibleCards` (membership) →
-   search predicate → `sortCards` → per-lane cap slice. Search changes *which* cards
-   a lane holds; sort orders them; the cap slices the ordered result. Keeping the
-   order fixed is what makes all three predictable together.
+6. **One ordered pipeline: membership → search → sort → cap.** `visibleCards`
+   (membership) and the search predicate narrow `renderCards`; then the
+   `cardsByColumn` memo (`Board.tsx:762`) runs `sortCards` and the per-lane cap
+   slices the ordered result. Search changes *which* cards a lane holds, sort orders
+   them, the cap slices — the sort and the slice both live inside that memo, which is
+   the real seam (an earlier draft mis-placed the sort between `renderCards` and
+   grouping). Keeping the order fixed is what makes all three predictable together.
 
 7. **Virtualization is deferred, not designed out.** Paged reveal + internal scroll
    covers expected lane sizes without a windowing dependency. If a lane routinely
    sits expanded past a few hundred cards, revisit with windowed rendering
    (react-window or an IntersectionObserver sentinel) behind the same `shownCount`
    affordance — an implementation swap, not a UX change. Recorded as a risk below.
+
+8. **The cap applies to every lane, including `Closed`.** `Closed` accumulates
+   forever and is typically the deepest lane, so exempting it would rebuild the wall
+   this PRD removes; it is also the safest lane to cap — not a drop target and
+   outside the freeze. It gets the same default + `Show more`, ordered by iid like
+   today (the Closed-lane sort at `Board.tsx:781`).
+
+9. **Search is scoped to board members — a known, documented surprise.** Search
+   filters `renderCards`, so a payload card excluded by membership (`visibleCards`)
+   is unfindable: searching an existing `#iid` that is not a board member returns
+   nothing. This is deliberate — search narrows what is on the board, it does not
+   widen membership — but it reads as a bug, so `docs/board.md` states it. The
+   existing "Issues" control is the widen-membership path.
 
 ## Risks & Mitigations
 
@@ -181,9 +214,11 @@ line.
 
 ## Success Criteria
 
-1. A lane with more than the per-lane default shows exactly the default, then
-   `Show 50 more · N left`; clicking reveals up to 50 more; an expanded lane scrolls
-   internally rather than growing the page; `Collapse` returns it to the default.
+1. A lane with more than the per-lane default (including `Closed`) shows exactly the
+   default, then `Show N more · N left`; clicking reveals up to a page (50) more; an
+   expanded lane scrolls internally rather than growing the page; `Collapse` returns
+   it to the default; a card moved or dropped past the cap auto-reveals rather than
+   vanishing.
 2. Typing in search filters every lane to cards matching title, `#iid`, or label
    (case-insensitive), highlights the match, shows `N/M` on capped lanes, drops
    empty lanes, and shows a board-level result count; clearing restores the board.
@@ -202,15 +237,15 @@ line.
 ## Parallelization Notes
 
 Nearly all milestones edit the one file (`Board.tsx`) plus its sibling lib/tests, so
-the graph is mostly sequential. The one clean parallel split is **M1 (cap/paging)**
-and **M2 (search)**: their pure helpers (`boardColumns.ts` paging helper,
-`boardCards.ts` `matchesQuery`) are independent files with independent unit tests
-and can be built and tested in parallel, then integrated into `Board.tsx` together.
-M3 (sticky) is independent of both. M4/M5/M6/M7 depend on M1+M2 landing in
-`Board.tsx` and are sequential after the integration.
+the graph is mostly sequential. The one clean parallel split is the **pure helpers**:
+M1's paging helper (`boardColumns.ts`) and M2's `matchesQuery` (`boardCards.ts`) are
+independent files with independent unit tests, built and tested in parallel. Their
+`Board.tsx` integration — plus M3's sticky toolbar, which **also** edits `Board.tsx`
+(the controls live in `PageHeader` actions) — is one serialized phase, not parallel.
+M4/M5/M6/M7 follow the integration.
 
 | Phase | Milestones | Depends on | Touches |
 |---|---|---|---|
-| 1 (parallel) | M1 helper, M2 predicate, M3 sticky | — | `boardColumns.ts`, `boardCards.ts`, board layout/CSS |
-| 2 (integrate) | M1+M2 wired into `Board.tsx` | Phase 1 | `Board.tsx` |
+| 1 (parallel) | M1 helper, M2 predicate | — | `boardColumns.ts`, `boardCards.ts` |
+| 2 (integrate, serial) | M1+M2 wired in, M3 sticky | Phase 1 | `Board.tsx` |
 | 3 (sequential) | M4 pref, M5 a11y, M6 tests, M7 docs | Phase 2 | `Board.tsx`, `Board.test.tsx`, `docs/board.md` |
