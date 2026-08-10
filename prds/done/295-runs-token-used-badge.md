@@ -1,7 +1,7 @@
 # PRD #295: Show which token a run used, on the Runs list
 
 **GitLab Issue**: [vtmocanu/uzi#295](https://gitlab.example.com/vtmocanu/uzi/-/issues/295)
-**Status**: Draft
+**Status**: Complete (shipped on `agent/issue-295`)
 **Priority**: Medium
 **Created**: 2026-08-10
 **Depends on**: none
@@ -134,40 +134,51 @@ which is the same trust posture as the worker names and owner emails already sho
    row belongs to *another* user, while `RunCredential`'s link points at the viewer's own
    `/settings` — a dead end for someone else's token. So on `showOwner` rows the compact
    badge renders (an admin auditing spend wants provenance) but is **non-linked** regardless
-   of tone. This needs a `linkable` prop (default true) on the compact path, set false where
-   `RunRow` is rendered with `showOwner`. The personal-list gate (viewer has >1 token) is
-   applied on the personal list; on the admin list the badge shows whenever a label exists
-   (an admin with one token still audits others' multi-token spend).
+   of tone. The personal-list gate (viewer has >1 token) is applied on the personal list; on
+   the admin list the badge shows whenever a label exists (an admin with one token still
+   audits others' multi-token spend).
+
+   **As shipped (refined in review):** the compact badge is **never** a link at all — on the
+   personal list *or* the admin list. It is always embedded inside the run row's own
+   `<Link to="/runs/:id">`, so an inner `<Link to="/settings">` would be a nested `<a>`
+   (invalid HTML, a competing tab stop). A live-browser review caught this on the personal
+   list. The planned `linkable` prop was therefore **removed**: compact returns a bare
+   `<Badge>`, and only the **full** run-detail chip links (iff non-neutral, unchanged). This
+   satisfies Decision 2 by construction (nothing on the list links to the wrong `/settings`)
+   and makes success criterion 5 hold everywhere, not just on admin rows. The tone dot +
+   hover `title` carry the "worth a look" signal on the list; the actionable `/settings` link
+   stays on the run-detail full chip, which is not inside a row link.
 3. **Gate is ">1 Anthropic token", computed from `listSecrets`.** Not from a run field and
    not from `hasAnthropicToken` (which is "≥1"). One new tested helper,
    `anthropicTokenCount`, keeps the threshold in a single place.
 
 ## Milestones
 
-- [ ] **M1 — Compact credential rendering.** Add `variant?: "full" | "compact"` (default
-  `"full"`) and `linkable?: boolean` (default `true`) to `RunCredential`; compact renders
-  label + tone dot (non-neutral only) + `(deleted)` marker, mode/hint in `title`, sr-only
-  hint preserved, link suppressed when `linkable === false`. `describeCredential` reused
-  unchanged. `RunView`/`AgentDetail`/`Agents` unaffected (default variant). Add
-  `anthropicTokenCount(secrets)` to `web/src/lib/hasToken.ts`.
-- [ ] **M2 — Wire into the Runs list behind the gate.** `RunsList.load()` fetches
-  `api.listSecrets()`; personal rows render the compact badge when `count > 1`; admin rows
-  render it non-linked whenever a label exists. Badge sits in the `RunsList.tsx:118` badge
-  container, which gains `flex-wrap` so the added chip wraps rather than overflowing on
-  narrow viewports (it does not wrap today).
-- [ ] **M3 — Tests.** vitest covering: gate hidden at 0 and 1 token, shown at ≥2; a row
-  with no label renders no badge at any count; tone/`(deleted)`/link derived from
-  `select_reason` + `anthropic_secret_id` (one case per: `auto` neutral non-linked,
-  `best_of_pool` info linked, `pool_empty` warning linked, deleted marker); admin rows
-  render the badge non-linked; `anthropicTokenCount` unit test. **M2 alone leaves the suite
-  short of these; M2+M3 land together.**
-- [ ] **M4 — Docs + mock.** Note the list badge where token selection/credentials are
-  documented (e.g. the anthropic-tokens/run-credential doc if one exists; otherwise a short
-  line on the Runs surface). Enrich the mock (`web/src/mocks/data.ts` / `mockApi`) so the
-  mock user has two Anthropic tokens and a couple of run list items carry
-  `anthropic_secret_label`/`select_reason`, enabling the mock-mode visual check.
-- [ ] **M5 — Gate green.** `task gate:web` passes (oxlint, knip, check-docs, typecheck,
-  vitest); no new knip unused-export warnings; no server/Go change introduced.
+- [x] **M1 — Compact credential rendering.** Added `variant?: "full" | "compact"` (default
+  `"full"`) to `RunCredential`; compact renders label + tone dot (non-neutral only) +
+  `(deleted)` marker, with mode/hint (and the full label) in `title`. `describeCredential`
+  reused unchanged. Only `RunView` renders `RunCredential`, and it is unaffected (default
+  variant). Added `anthropicTokenCount(secrets)` to `web/src/lib/hasToken.ts`. **Note:** the
+  planned `linkable` prop was removed in review — see Decision 2 (as shipped): the compact
+  badge is inherently non-linked (it lives inside the row `<Link>`), and its label is clamped
+  `max-w-[12rem] truncate` (no in-badge `sr-only`/`aria-describedby`, so the row link's
+  accessible name stays concise).
+- [x] **M2 — Wire into the Runs list behind the gate.** `RunsList.load()` fetches
+  `api.listSecrets()` (best-effort `.catch`); personal active + past rows render the compact
+  badge when `count > 1`; admin factory rows render it (non-linked, always). Badge sits in
+  the row's right-side badge container, which gained `flex-wrap` so the added chip wraps
+  rather than overflowing on narrow viewports.
+- [x] **M3 — Tests.** vitest covering: gate hidden at 0 and 1 token, shown at ≥2; a row
+  with no label renders no badge at any count; tone/`(deleted)` derived from `select_reason`
+  + `anthropic_secret_id`; the compact badge is **never** a link (regression guard for the
+  nested-anchor fix, per reason via `it.each`); the full variant still links for non-neutral;
+  admin rows render the badge non-linked; `anthropicTokenCount` unit test.
+- [x] **M4 — Docs + mock.** Noted the list badge in `docs/anthropic-token.md`. The mock
+  already seeds the mock user with five Anthropic tokens and run rows carrying
+  `anthropic_secret_label`/`select_reason` across neutral/info/warning/deleted states, so the
+  mock-mode visual check works with no fixture change (verified in-browser).
+- [x] **M5 — Gate green.** `task gate:web` passes (oxlint, knip, check-docs, typecheck,
+  vitest 1897/1897); no new knip unused-export warnings; no server/Go change introduced.
 
 ## Success criteria
 
