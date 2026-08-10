@@ -235,9 +235,10 @@ func TestNotifierNonParkedStatusPostsNoQuestion(t *testing.T) {
 }
 
 // Question text is model-authored from repo/issue content, so it reaches Slack through
-// the plan gate's pipeline: secrets scrubbed, the whole untrusted blob mrkdwn-escaped
-// (no live mention, no spoofed link), and the one trusted element — the deep link — in
-// its OWN block, so it can neither be escaped nor truncated away.
+// the plan gate's pipeline: secrets scrubbed, the whole untrusted blob rendered by
+// SlackMrkdwn (which owns its escaping, so no live mention and no spoofed link survive),
+// and the one trusted element — the deep link — in its OWN block, so it can neither be
+// escaped nor truncated away.
 func TestQuestionThreadBlocksEscapesAndScrubs(t *testing.T) {
 	runID := uuid.New()
 	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
@@ -264,6 +265,28 @@ func TestQuestionThreadBlocksEscapesAndScrubs(t *testing.T) {
 	ctxText := contextTexts(blocks)
 	if !strings.Contains(ctxText, "<https://uzi.example/runs/"+runID.String()+"|") {
 		t.Fatalf("the deep link must survive as trusted markup in its own block: %q", ctxText)
+	}
+}
+
+// The question blob is now RENDERED by SlackMrkdwn (PRD #292 M5): a markdown bold
+// becomes *bold*, a list becomes • bullets, and an https link becomes <url|label>.
+func TestQuestionThreadBlocksRendersMarkdown(t *testing.T) {
+	runID := uuid.New()
+	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
+		Question: "**pick** one:\n\n- alpha\n- beta\n\nsee [docs](https://x)",
+	}}}
+
+	blocks := questionThreadBlocks(runID, p, "https://uzi.example")
+	_, section := blockSummary(blocks)
+
+	if !strings.Contains(section, "*pick*") {
+		t.Errorf("**pick** must render as *pick*, got %q", section)
+	}
+	if !strings.Contains(section, "• alpha") || !strings.Contains(section, "• beta") {
+		t.Errorf("a markdown list must render as • bullets, got %q", section)
+	}
+	if !strings.Contains(section, "<https://x|docs>") {
+		t.Errorf("an https link must render as <url|label>, got %q", section)
 	}
 }
 

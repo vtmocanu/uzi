@@ -1,7 +1,7 @@
 # PRD #292: Slack styling — render Markdown as Slack mrkdwn across bot DMs
 
 **GitLab Issue**: [vtmocanu/uzi#292](https://gitlab.example.com/vtmocanu/uzi/-/issues/292)
-**Status**: Draft (architect-reviewed 2026-08-10; all BLOCKER/MAJOR findings folded in)
+**Status**: Complete (delivered 2026-08-10, commits `b4f6f3c1`..`445d376a`; architect-reviewed, all BLOCKER/MAJOR findings folded in)
 **Priority**: Medium (high-visibility: it affects every model-authored DM)
 **Created**: 2026-08-10
 **Depends on**: PRD #268 (Slack DM UX — done; migrated the DMs to Block Kit and is the PRD whose "model markdown renders" assumption this corrects), PRD #191 (Slack conversational surface — done)
@@ -57,7 +57,9 @@ It touches `& < >` and nothing else — by design, to neutralize injected `<@men
 `**` → `*`, `*italic*` → `_italic_`, `#` → bold, `[l](u)` → `<u|l>`, `- ` → `• `, or `~~` →
 `~`. So CommonMark passes through untranslated and Slack renders the source characters.
 
-The three UNTRUSTED model-body render sites, all at `b94f5244`:
+The UNTRUSTED model-body render sites, all at `b94f5244` (this table lists three; a **fourth**
+peer — the clarification-question body `questionThreadBlocks` `question.go:146` — was found
+during implementation and is also in scope, see Decision 4 correction):
 
 | Path | Site | Body |
 |---|---|---|
@@ -130,8 +132,12 @@ contract is expressed per AST node:
    BLOCKER B1.)
 4. **Reuse the existing primitives, do not re-implement them.** Text-node escaping calls the
    same `slackutilsx.EscapeMessage` that `EscapeMrkdwn` wraps (so the two escaping notions
-   cannot drift); scheme validation reuses/aligns with `isHTTPSURL` (`notifier.go:1242`),
-   case-insensitive. Name this shared invariant in the design.
+   cannot drift); scheme validation aligns with `isHTTPSURL` (`notifier.go:1242`).
+   **Correction (as-built):** `isHTTPSURL` is CASE-SENSITIVE at HEAD (`strings.HasPrefix(u,
+   "https://")`) and guards TRUSTED forge URLs, so the renderer does NOT modify or call it;
+   it does its own case-insensitive scheme check (`hasHTTPSScheme`, `EqualFold`) on the
+   untrusted destination, keeping the two paths independent while enforcing the same
+   https-only rule.
 5. **Robust on malformed / pre-truncated input.** The judge caps `summaryMd` to 600 runes
    *before* the renderer sees it (`reviewSummaryPreview` → `notificationBlocks`), so the
    renderer must degrade an unterminated `[label](htt` or an unclosed `**` to literal
@@ -161,7 +167,7 @@ contract is expressed per AST node:
 
 ## Milestones
 
-- [ ] **M1 — Injection-safe CommonMark→Slack-mrkdwn renderer (goldmark).** A single
+- [x] **M1 — Injection-safe CommonMark→Slack-mrkdwn renderer (goldmark).** A single
   exported function in `api/internal/slacksvc` (e.g. `SlackMrkdwn(s string) string`) built
   as a custom goldmark `NodeRenderer` with the GFM (strikethrough/table) extension enabled,
   performing every conversion above and subsuming `EscapeMrkdwn`'s escaping for untrusted
@@ -172,17 +178,31 @@ contract is expressed per AST node:
   unbalanced `**` and unterminated `[l](htt` (pre-truncated input); `**` inside a code span
   (stays literal); nested/adjacent emphasis; a cap landing mid-construct. `task gate:api`
   green.
-- [ ] **M2 — Chat surface uses the renderer.** `renderChatBody` (`chatpost.go:352`) routes
+  <br>**Delivered** (`api/internal/slacksvc/mrkdwn.go`, commit `b4f6f3c1`): implemented as an
+  `ast.Walk` over the goldmark AST (equivalent to a NodeRenderer for our single-pass needs),
+  with **only** the Strikethrough + Table extensions enabled — deliberately NOT the full
+  `extension.GFM`, which also bundles Linkify (would autolink bare URLs into live markup) and
+  TaskList. Code content has its backticks zero-width-space-neutralised so a `` ``` `` run in
+  code cannot break out of the code context. Also made `truncateForSlackSection` (gate.go)
+  link-safe — it now drops a trailing unbalanced `<` so a cut inside an emitted `<url|label>`
+  cannot re-open injection.
+- [x] **M2 — Chat surface uses the renderer.** `renderChatBody` (`chatpost.go:352`) routes
   through `SlackMrkdwn`; this single change covers the chat per-turn answer **and** the two
   chat cards (proposal chatactions.go:405, run-request :547) that share the helper. Chat
   notifier/card tests updated; add cases asserting `**x**` → `*x*`, bullets/links render,
   and an injected mention stays inert. Tests updated.
-- [ ] **M3 — Plan/gate body uses the renderer.** `planThreadBlocks` (`gate.go:266`) routes
+  <br>**Delivered** (commit `171fb0a4`). Note: the chat OS-notification **fallback** is kept
+  ESCAPED, not rendered — a sibling `renderChatFallbackText` feeds `flushChatTurn`'s fallback
+  in parallel with the rendered body, so a model https link becomes a live `<url|label>` only
+  in the block, never in the notification preview (safety contract §6). Test:
+  `TestChatFallbackStaysEscapedNotRendered`.
+- [x] **M3 — Plan/gate body uses the renderer.** `planThreadBlocks` (`gate.go:266`) routes
   through `SlackMrkdwn`; the plan renders real headings/bullets/bold. The trusted per-field
   and template escapes in `chatactions.go` (`cardField` :438, `chatResolvedBlocks` :468) and
   the assembled-chrome truncation sites (:415/:551) are **left on `EscapeMrkdwn`** — they
   carry intentional chrome markup and are not untrusted blobs (Decision 2/4). Tests updated.
-- [ ] **M4 — Judge notification + shared `notificationBlocks` + newline fix (the tricky
+  <br>**Delivered** (commit `171fb0a4`).
+- [x] **M4 — Judge notification + shared `notificationBlocks` + newline fix (the tricky
   one).** `notificationBlocks` body (`notifier.go:346`) routes through `SlackMrkdwn`; this
   block is **shared by four producers** (judge, selfimprove started, selfimprove skipped,
   schedule-paused) — the other three post server-authored prose today, so the renderer is a
@@ -194,11 +214,25 @@ contract is expressed per AST node:
   `notificationBlocks` prefixes every line with `> `, which — once newlines are preserved and
   fences pass through — would inject `> ` into a fenced block's inner lines and break code
   rendering (Decision 6). `fallbackText` discipline unchanged. Tests updated.
-- [ ] **M5 — Docs + acceptance smoke.** `docs/slack.md` describes what markdown the bot
+  <br>**Delivered** (commit `445d376a`). Decision 6 is resolved via an **AST signal**, not a
+  substring scan: the renderer exposes `SlackMrkdwnBlock(s) (string, bool)` reporting whether
+  a real fenced/indented code block was emitted, and `notificationBlocks` skips the `> `
+  blockquote only when that is true — so a literal `` ``` `` appearing in *prose* (a Text
+  node, not a fence) is still correctly blockquoted. The OS-notification fallback is flattened
+  to one line and stays escaped.
+- [x] **M5 (added) — Clarification-question body uses the renderer.** `questionThreadBlocks`
+  (`question.go:146`) was found to be a **fourth** untrusted model-body site on the identical
+  `truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(...)))` pipeline (the root-cause table
+  above enumerated three; this peer was missed). It now routes `questionBody(p)` through
+  `SlackMrkdwn` so clarification questions render like the other surfaces. Delivered with
+  M2/M3 (commit `171fb0a4`); `question_test.go` updated.
+- [x] **M6 — Docs + acceptance smoke.** `docs/slack.md` describes what markdown the bot
   translates and the safety contract; `ARCHITECTURE.md` §"Slack integration" notes the
-  renderer as the untrusted-model-body path. `web/scripts/check-docs.mjs` green. Given the
-  Socket-Mode/live-first convention, a live-or-fixture DM acceptance step (eyeball a chat
-  answer, a judge DM, and a plan DM rendering correctly) closes the loop.
+  renderer as the untrusted-model-body path. `web/scripts/check-docs.mjs` green. Acceptance
+  is **fixture-based**: a live Socket-Mode DM is not reachable from the run environment, so
+  each surface is validated by its render + injection unit tests (chat, judge/notification,
+  plan, and question) asserting `**x**`→`*x*`, bullets/https-links render, and injected
+  mentions/links stay inert — `task gate:api` and `task gate:web` green.
 
 ## Success criteria
 
@@ -249,14 +283,21 @@ contract is expressed per AST node:
   — the renderer must degrade unclosed/half constructs to literal escaped text (a parser
   does this for free). Section-level `truncateForSlackSection` must additionally not leave a
   dangling unsafe token; render-then-truncate where feasible (safety contract §5).
-- **Decision 4 — Scope is the three untrusted model-body paths, not "all DMs".** Status
+- **Decision 4 — Scope is the untrusted model-body paths, not "all DMs".** Status
   roots, facts, milestone counters, deep links, and gate/question/card *chrome* are built
   from fixed strings and closed enums that intentionally carry mrkdwn and are already correct
   (#268). Touching them risks regressing intentional markup for no gain.
+  **Correction (as-built):** the untrusted model-body paths turned out to be **four**, not
+  three — the clarification-question body (`questionThreadBlocks`, `question.go:146`) is a
+  peer of chat/plan/notification and is now in scope (added M5). The *chrome* exclusions above
+  are unchanged.
 - **Decision 5 — https-only links (product-owner decision, 2026-08-10).** Only `https`
   destinations become `<url|label>`; every other scheme degrades to escaped text. Matches
   the repo's untrusted-URL precedent (`isHTTPSURL` notifier.go:1242; `FORGE_ALLOWED_BASE_URLS`
-  https-only SSRF guard). Reuse `isHTTPSURL`, case-insensitive.
+  https-only SSRF guard). **Correction (as-built):** the renderer does NOT reuse the shared
+  `isHTTPSURL` (case-sensitive, guards trusted forge URLs); it applies its own
+  case-insensitive `hasHTTPSScheme` to the untrusted destination and percent-encodes any
+  `< > |`/whitespace in the accepted URL.
 - **Decision 6 — Blockquote/fence collision in `notificationBlocks`.** Once M4 preserves
   newlines and fences pass through, the `> `-per-line prefix (`notifier.go:347-350`) would
   corrupt a fenced block. Resolve by not blockquoting a body that contains a code fence (or
