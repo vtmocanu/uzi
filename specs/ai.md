@@ -19619,3 +19619,41 @@ not a control.
   netpol manifests (`deploy/chart/templates/worker-fqdn-egress.yaml`, `deploy/values/*.yaml`), so
   a seeded plan that edits that feature is refused the ungated fast-path **by design** and falls
   back to the ordinary gated flow.
+
+## 511. Issue #297 — the self_improve picker gets a claim-time, status-keyed in-flight avoid-set (advisory, nonce-fenced untrusted), so it stops picking work an active run is already doing
+
+Design record `prds/297-selfimprove-inflight-reconciliation.md`. A self-improvement pick is free
+text with no issue coordinate, so it escapes the one-active-run index that hard-dedupes real issue
+runs. The motivating 2026-08-10 near-miss: a run with `branch=null` was actively working PRD #293
+M3 — invisible to any branch/MR-keyed dedup — and the picker was free to re-pick it. This makes
+that overlap VISIBLE to the LLM picker at claim time; the picker decides.
+
+- **Claim-time assembly, api side.** `api/internal/workersvc/service.go` `inflightTargets` +
+  a `run.Kind == RunKindSelfImprove` block at the end of `assembleClaim` (just before it returns
+  the payload). It reuses the existing `ListActiveRunsAll` store query (all non-terminal runs, all
+  repos, excludes chat/judge, `LIMIT 500`, `ORDER BY created_at DESC`), filters IN GO to the same
+  `RepoID` and excludes the run itself, and `formatInflightLine` emits one compact coordinate per
+  active run (issue iid + title + `kind`/`status` + frozen milestone titles via `DecodeMilestones`;
+  issue-less kinds lead with `<kind> run`). Best-effort: a query error `slog.Warn`s and returns nil,
+  never failing the claim (mirrors the `knownTargets` posture in `assembleJudgeClaim`). Capped at
+  `maxInflightTargets` (30, newest-first); each line trimmed to `maxInflightLineLen` (300) on a
+  UTF-8 rune boundary so an untrusted multibyte title is never sliced mid-rune.
+- **Wire — additive, omitempty, self_improve-only.** New `ClaimPayload.InflightTargets []string`
+  (`claim.go`, `json:"inflight_targets,omitempty"`) and `inflight_targets?: string[]` on
+  `ClaimResponse` (`agent/src/protocol.ts`). An empty set never reaches the wire and an older worker
+  ignores the field — no coordinated deploy, no `runs` schema change (computed at CLAIM time, not
+  create time). This mirrors the `known_improve_uzi_targets` precedent (issue #232, §487/§103):
+  additive-optional avoid-set carried on the claim, not a persisted column.
+- **Render, agent side — trusted PROVENANCE is not trusted CONTENT.** `agent/src/prompt.ts`
+  `buildSelfImprovePlanPrompt` renders the list in its OWN nonce-fenced UNTRUSTED block
+  (`<inflight_work_NONCE>`, via `inflightFrame`), distinct from the recommendations fence — the
+  content is issue/milestone titles anyone who can file an issue can shape. A TRUSTED directive
+  OUTSIDE the fence tells the picker to skip an improvement whose fix is already in flight and
+  record the skip.
+- **Advisory, not a hard block; status-driven not branch-driven.** Keyed on run STATUS (any
+  non-terminal run counts), because the near-miss run had `branch=null` — a branch/MR key would
+  have missed it. Residual risk documented: the picker can still overlap because a free-text pick
+  has no coordinate to hard-test, so this raises visibility, not a guarantee.
+- **Deferred: the recently-landed half.** Work that JUST merged is not surfaced — `runs` carries
+  no merge-time key (no `merged_at`), and the in-flight half alone fixes the motivating bug. Left
+  for a follow-up if a merge-time signal is added.

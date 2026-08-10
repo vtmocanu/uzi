@@ -47,6 +47,18 @@ is skipped (with an inbox note) rather than spending nothing silently.
 - The run's planning prompt gets the accumulated unaddressed "improve uzi"
   recommendations plus the repo itself, and is instructed to pick **one** top
   thing rather than a list.
+- For a self-improvement run specifically, the picker is also shown a list of
+  work already in flight on the connected repo — every other active run,
+  keyed on run **status** rather than on a branch, so a run that hasn't pushed
+  a branch or opened an MR yet still shows up — and is directed to avoid
+  picking an improvement whose fix overlaps with it. This is **advisory, not
+  enforced**: the picker is an LLM weighing a rendered list, and while it
+  reduces duplicate picks, it does not guarantee against one. The in-flight
+  list is assembled fresh at claim time, so the check reaches every worker
+  immediately; the prompt code that *renders* the list ships with the worker
+  image, so it only takes effect for newly provisioned workers until the
+  fleet rolls — an older worker simply ignores the extra data, no breakage,
+  just no benefit yet.
 - Changes land on a **fixed branch** (`uzi/self-improve`). An already-open
   self-improvement MR is extended rather than replaced, so everything from
   every cycle is tested together in one MR.
