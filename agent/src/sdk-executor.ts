@@ -1333,8 +1333,15 @@ export class SdkExecutor implements Executor {
       // filesystem so a false "deps ready" cannot be minted. Dir names are clamped
       // with safeDirLabel (repo-controlled text). OMITTED-not-undefined, issue-run
       // only, same convention as prdDonePath/milestonesCompleted above.
+      //
+      // `manager !== "none"` excludes the deliberate non-install: a dir that has a
+      // package.json but NO recognized lockfile is `{manager:"none", ok:false}` —
+      // uzi refuses to guess a package manager, so it was never installed rather than
+      // failed. Annotating it would cry wolf on a fine delivery, the asymmetry
+      // js-deps.ts flagged for this consumer to revisit. A genuine install FAILURE
+      // carries a real manager (npm/pnpm/yarn/bun) with ok:false and still annotates.
       const gatesUnverified = depsResults
-        .filter((r) => !r.ok)
+        .filter((r) => !r.ok && r.manager !== "none")
         .map((r) => safeDirLabel(r.dir));
       if (isIssueRun && gatesUnverified.length > 0) {
         result.gatesUnverified = gatesUnverified;

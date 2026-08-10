@@ -48,6 +48,18 @@ if [ -z "$DIR" ]; then
   exit 2
 fi
 
+# Restrict the component to lowercase ASCII letters (web, agent, ...) BEFORE it is
+# uppercased into a variable name and read via `eval` below. Defense in depth: the
+# only callers pass fixed literals, but this makes the `eval` on the derived name
+# safe by construction rather than by caller invariant — a name with shell-active
+# characters can never reach the eval. Fail CLOSED (exit 2), never a silent skip.
+case "$DIR" in
+  *[!a-z]*)
+    echo "deadcode-knip: component must be lowercase ASCII letters only: '$DIR'" >&2
+    exit 2
+    ;;
+esac
+
 # Run from the repo root so a relative component dir means the same thing from any
 # caller's directory (same as lint-formula.sh).
 ROOT="$(git rev-parse --show-toplevel)" || {
