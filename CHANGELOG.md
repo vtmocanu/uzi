@@ -6,6 +6,44 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-10
+
+### Added
+
+- **A run that hits a transient forge failure now retries instead of dying, and
+  a run that fails for good raises a failure inbox notification.** Pushes and
+  merge-request creates that fail for a transient reason (network blips, forge
+  5xx) are retried on a bounded backoff (five attempts, 1/2/4/8/16s) rather than
+  failing the run on the first error; a run that still cannot publish its work
+  surfaces as a failure notification (Slack inbox badge) instead of quietly
+  ending. The retry and publish paths stay credential-free — the worker holds
+  the PAT, the agent never sees it. (#284)
+
+- **Queued runs now spread across idle workers instead of piling onto one.**
+  Fleet-aware claiming: while a queued run is still fresh (younger than
+  `WORKER_SPREAD_GRACE`, default 3× the worker poll interval), a worker already
+  running something defers it to a live, strictly-less-loaded peer that has a
+  free slot, rather than taking a second run while that peer sits idle. Resume
+  affinity is checked first and always wins, and past the grace window the run
+  is claimable by any eligible worker, so a run is never stranded waiting for a
+  peer that isn't there. The run-health signal now also distinguishes a
+  saturated fleet from an idle queue. (#216)
+
+### Changed
+
+- **The built-in `lead` agent template now runs a per-unit, commit-anchored
+  review lane, overlaps the quality gate with review, and splits work along
+  seams.** Internal template tuning refreshed from accumulated judge
+  recommendations; run guardrails are unchanged. (#215)
+
+### Security
+
+- **Hosted-worker deploy hardening: the CloudNativePG subchart is fetched from
+  the ghcr.io OCI registry, and github.com is dropped from the restricted worker
+  egress allowlist.** With the CNPG chart pulled via ghcr.io, the
+  standard/restricted worker's FQDN allowlist no longer needs github.com,
+  tightening the default-deny egress floor. (#285)
+
 ## [0.24.0] - 2026-08-09
 
 ### Added
