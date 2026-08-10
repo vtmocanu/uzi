@@ -1506,17 +1506,25 @@ tasks:
 
   deadcode:web:
     desc: knip over web - unused files, exports, deps (see web/knip.jsonc for staging)
-    dir: web
     cmds:
-      # DELEGATES TO package.json's `knip` SCRIPT, as this file's header requires of
-      # every npm target. That script is a BARE `knip` on purpose: every flag lives
-      # in `web/knip.jsonc`, so there is nothing here for a rewrite to drop
-      # silently, and `web/package.json` (a documented three-way contention point
-      # across this PRD's milestones) carries the smallest possible line.
+      # DELEGATES TO package.json's `knip` SCRIPT (via the wrapper), as this file's
+      # header requires of every npm target. That script is a BARE `knip` on
+      # purpose: every flag lives in `web/knip.jsonc`, so there is nothing here for
+      # a rewrite to drop silently, and `web/package.json` (a documented three-way
+      # contention point across this PRD's milestones) carries the smallest possible
+      # line.
       #
       # NEVER A BARE `npx knip`: npx fetches from the network when the dep is
       # missing, which a gate may not do. `npm run` puts node_modules/.bin on PATH
       # and fails closed with `command not found`.
+      #
+      # 🔴 A MISSING knip NOW LOUD-SKIPS INSTEAD OF FAILING CLOSED (PRD #293 M3),
+      # mirroring lint:formula. The wrapper cd's into web/ itself (hence no `dir:`
+      # here) and, if web/node_modules/.bin/knip is absent, prints a loud SKIP
+      # banner and exits 0 -- so the umbrella `task deadcode` no longer reds on a
+      # sibling whose toolchain you never installed. CI arms it with
+      # UZI_DEADCODE_WEB_REQUIRED=1 (see .gitlab-ci.yml), which turns a missing knip
+      # into exit 2, so a skip in CI (image regressed) can never look like a pass.
       #
       # 🔴 WHAT GATES AND WHAT DOES NOT, because a green here does NOT mean "no
       # unused exports". `web/knip.jsonc` stages `exports`/`types` and the rest of
@@ -1532,7 +1540,7 @@ tasks:
       # `export` keywords, and with --allow-remove-files deletes files). Nothing in
       # the gate may be a fixing variant - the same rule that makes the format slot
       # `fmt-check` rather than `fmt`.
-      - npm run knip
+      - ./scripts/deadcode-knip.sh web
 
   check-docs:web:
     desc: docs frontmatter + relative-link lint
@@ -1620,10 +1628,12 @@ tasks:
 
   deadcode:agent:
     desc: knip over agent - unused files, exports, deps (see agent/knip.jsonc for staging)
-    dir: agent
     cmds:
-      # Same delegation, same bans, same staging - read deadcode:web's comment
-      # before editing either. Two differences specific to this package:
+      # Same delegation, same bans, same staging, same loud-SKIP-on-missing-knip
+      # wrapper (PRD #293 M3: exit 0 locally, UZI_DEADCODE_AGENT_REQUIRED=1 -> exit
+      # 2 in CI) - read deadcode:web's comment before editing either, including why
+      # the wrapper cd's into the component so there is no `dir:` here. Two
+      # differences specific to this package:
       #
       #   - the debt is LARGER: 53 warn-tier findings as of 2026-08-02 (35 exports +
       #     18 exported types) against web's 22.
@@ -1631,7 +1641,7 @@ tasks:
       #     PATH at runtime rather than by an import. `agent/knip.jsonc` states why;
       #     deleting that line makes knip demand the removal of a dependency the
       #     worker image genuinely needs.
-      - npm run knip
+      - ./scripts/deadcode-knip.sh agent
 
   typecheck:agent:
     desc: tsc --noEmit over agent
