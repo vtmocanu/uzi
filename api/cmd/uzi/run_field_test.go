@@ -20,9 +20,16 @@ func fieldFake() *uzicli.FakeClient {
 				Status:       "completed",
 				MrWebURL:     sptr("https://example.com/mr/7"),
 				MrState:      nil, // a null field
+				Model:        sptr("fable"),
 				WaitOnLimit:  true,
 				RequeueCount: 3,
 				Milestones:   []apitypes.Milestone{{ID: "m1", Title: "one"}},
+			},
+			// A run whose schedule left the model unset — model freezes as null.
+			"r2": {
+				ID:     "r2",
+				Status: "completed",
+				Model:  nil, // a null field
 			},
 		},
 	}
@@ -74,6 +81,33 @@ func TestRunGetFieldNullIsEmptyLine(t *testing.T) {
 	}
 	if stdout != "\n" {
 		t.Errorf("a null field must print a single empty line, got %q", stdout)
+	}
+}
+
+// The frozen per-schedule run model (PRD #300 M1) is a top-level scalar on RunDTO, so
+// `--field model` exposes it raw with no CLI change — this pins that read surface.
+func TestRunGetFieldModelRaw(t *testing.T) {
+	stdout, _, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r1", "--field", "model")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if stdout != "fable\n" {
+		t.Errorf("stdout = %q, want raw \"fable\\n\" (unquoted, one line)", stdout)
+	}
+	if strings.Contains(stdout, `"`) {
+		t.Errorf("model must be unquoted, got %q", stdout)
+	}
+}
+
+// A run whose model was never overridden freezes as null — `--field model` prints a
+// single empty line, mirroring the mr_state null-field contract.
+func TestRunGetFieldModelNullIsEmptyLine(t *testing.T) {
+	stdout, _, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r2", "--field", "model")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if stdout != "\n" {
+		t.Errorf("a null model must print a single empty line, got %q", stdout)
 	}
 }
 

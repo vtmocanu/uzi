@@ -24,6 +24,7 @@ function run(over: Partial<Run> = {}): Run {
     auto_approve: false,
     worker_id: null,
     branch: "ci-fix/pipeline-4200",
+    model: null,
     mr_iid: 7,
     mr_state: null,
     failure_reason: null,

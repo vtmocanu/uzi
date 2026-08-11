@@ -340,8 +340,8 @@ WHERE status = 'online'
 -- omitted param silently opts OUT of the fail-on-divergence behaviour — the exact
 -- go-build-green trap the block above describes. planned_base_commit is nullable
 -- (sqlc.narg): a run with no planned commit stores NULL and the worker proceeds silently.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match)
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one

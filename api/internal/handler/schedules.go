@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
@@ -77,6 +78,24 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time) (apityp
 	}
 	if n.Guidance != nil && len(*n.Guidance) > MaxGuidanceBytes {
 		return n, http.StatusUnprocessableEntity, "guidance is too large"
+	}
+
+	// model (PRD #300): validated with the shared Decision-4 gate (agenttmpl.ValidateModel),
+	// the same single-token/≤100-char rule the per-user Worker model, the judge model, and
+	// template models use. Applies to EVERY target (a run's model is orthogonal to what it
+	// works on), so it is validated here, above the per-target switch, and rejected in no
+	// case arm. A blank/whitespace value means inherit — normalized to nil so a cleared
+	// control clears the stored model; a malformed token is a 400.
+	if n.Model != nil {
+		normalized, err := agenttmpl.ValidateModel(*n.Model)
+		if err != nil {
+			return n, http.StatusBadRequest, "model: " + err.Error()
+		}
+		if normalized == "" {
+			n.Model = nil
+		} else {
+			n.Model = &normalized
+		}
 	}
 
 	switch n.Target {
@@ -179,6 +198,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		Enabled:     *m.Enabled,
 		MaxIssues:   maxIssuesColumn(m),
 		Guidance:    guidanceColumn(m),
+		Model:       modelColumn(m),
 	})
 	if err != nil {
 		slog.Error("create run schedule", "error", err)
@@ -273,6 +293,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			WaitOnLimit: *m.WaitOnLimit,
 			MaxIssues:   maxIssuesColumn(m),
 			Guidance:    guidanceColumn(m),
+			Model:       modelColumn(m),
 			ID:          id,
 			UserID:      user.ID,
 		})
@@ -446,7 +467,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
 		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil &&
-		req.Guidance == nil
+		req.Guidance == nil && req.Model == nil
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -527,6 +548,12 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// validateScheduleConfig normalizes to nil) must reach the DB as NULL. A seed-and-keep
 	// would make an explicit clear indistinguishable from "omitted".
 	m.Guidance = req.Guidance
+	// model (PRD #300) takes the request value DIRECTLY, same replace-semantics as
+	// max_issues/guidance above: the config PATCH rewrites the whole row (enabled-only is
+	// short-circuited by onlyEnabled), so a `model: null` (or a cleared control) must reach
+	// the DB as NULL = inherit. A seed-and-keep would make an explicit clear indistinguishable
+	// from omitted.
+	m.Model = req.Model
 	return m
 }
 
@@ -571,6 +598,17 @@ func maxIssuesColumn(m apitypes.ScheduleRequest) pgtype.Int4 {
 func guidanceColumn(m apitypes.ScheduleRequest) pgtype.Text {
 	if (m.Target == "issue" || m.Target == "sweep") && m.Guidance != nil && strings.TrimSpace(*m.Guidance) != "" {
 		return pgtype.Text{String: *m.Guidance, Valid: true}
+	}
+	return pgtype.Text{}
+}
+
+// modelColumn maps the request's *string model to the nullable store column (PRD #300).
+// Unlike maxIssuesColumn/guidanceColumn it is NOT target-scoped — a per-schedule model
+// applies to every target. validateScheduleConfig already normalized a blank to nil and
+// rejected a malformed token, so a nil pointer here is SQL NULL = inherit.
+func modelColumn(m apitypes.ScheduleRequest) pgtype.Text {
+	if m.Model != nil && strings.TrimSpace(*m.Model) != "" {
+		return pgtype.Text{String: *m.Model, Valid: true}
 	}
 	return pgtype.Text{}
 }
@@ -652,6 +690,10 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	if s.Guidance.Valid && s.Guidance.String != "" {
 		v := s.Guidance.String
 		dto.Guidance = &v
+	}
+	if s.Model.Valid && s.Model.String != "" {
+		v := s.Model.String
+		dto.Model = &v
 	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {

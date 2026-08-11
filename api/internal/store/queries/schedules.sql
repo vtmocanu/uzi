@@ -9,11 +9,11 @@
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, guidance
+    auto_approve, wait_on_limit, enabled, max_issues, guidance, model
 ) VALUES (
     @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
-    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance')
+    @auto_approve, @wait_on_limit, @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model')
 )
 RETURNING *;
 
@@ -56,6 +56,7 @@ SET target        = @target,
     wait_on_limit = @wait_on_limit,
     max_issues    = sqlc.narg('max_issues'),
     guidance      = sqlc.narg('guidance'),
+    model         = sqlc.narg('model'),
     status        = 'active',
     updated_at    = now()
 WHERE id = @id AND user_id = @user_id
@@ -146,8 +147,8 @@ WHERE schedule_id = @schedule_id
 -- straight from the schedule (the owner set them there), so unlike the engine runs
 -- this path does not fall back to the owner's default.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model
 ) VALUES (
-    @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit
+    @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('model')
 )
 RETURNING *;
