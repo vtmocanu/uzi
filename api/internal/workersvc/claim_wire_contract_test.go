@@ -129,6 +129,14 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			SkillsMaxPerRun:        32,
 			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
 			RepoDevboxOptIn:        false,                          // M5 wires the toggle; false until then
+			// PRD #305 M3: OverrideSubagentModel is deliberately LEFT at its zero value
+			// here, unlike the other flags in this fixture. It carries omitempty, so an off
+			// run omits the key and its claim is byte-identical to today's wire — the exact
+			// property this shared golden must keep for the un-upgraded worker (and the
+			// TS-side contract test that parses this same file). The flag-on delivery and
+			// the flag-off omit-from-the-wire are proven in the dedicated service_test.go
+			// tests (TestClaimDeliversOverrideSubagentModelWhenFrozenOn /
+			// TestClaimOmitsOverrideSubagentModelWhenFrozenOff), not by mutating this golden.
 		},
 	}
 }

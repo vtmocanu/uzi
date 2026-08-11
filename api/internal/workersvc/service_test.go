@@ -1036,6 +1036,47 @@ func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
 	}
 }
 
+// PRD #305 M3: the flag frozen onto the run at fire time (runs.override_subagent_model,
+// M1) is delivered on the claim config as OverrideSubagentModel. Flag ON → the config
+// field is true, so the worker knows to apply the run model to every subagent (the
+// behavior itself is M4, worker-side). Read straight off the run row.
+func TestClaimDeliversOverrideSubagentModelWhenFrozenOn(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	fs.claimRun.OverrideSubagentModel = true
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if !payload.Config.OverrideSubagentModel {
+		t.Fatalf("frozen override_subagent_model=true must ride the claim config; got %+v", payload.Config)
+	}
+}
+
+// PRD #305 M3: with the flag off (the default on the run row) the config field is false
+// AND omitted from the marshaled claim JSON — omitempty keeps an off run's claim
+// byte-identical to today's wire, so an un-upgraded worker sees the same shape it does
+// now. Mirrors TestClaimOmitsDefaultModelWhenOwnerHasNone's omit-on-the-wire check.
+func TestClaimOmitsOverrideSubagentModelWhenFrozenOff(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+	// claimRun.OverrideSubagentModel left zero ⇒ the run did not opt in.
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.OverrideSubagentModel {
+		t.Fatalf("an off run must deliver override_subagent_model=false; got %+v", payload.Config)
+	}
+	b, err := json.Marshal(payload.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if strings.Contains(string(b), "override_subagent_model") {
+		t.Fatalf("an off run's override_subagent_model must be omitted from the wire; got %s", b)
+	}
+}
+
 // PRD #300: the override fires regardless of whether the owner has a per-user default —
 // a frozen runs.model with the owner default left NULL still lands on Config.DefaultModel.
 func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {

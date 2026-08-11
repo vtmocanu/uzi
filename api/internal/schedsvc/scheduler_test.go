@@ -495,6 +495,10 @@ func TestTickPromptScheduleCreatesPromptRun(t *testing.T) {
 	s.Prompt = pgtype.Text{String: "Summarize open issues and file a report\nmore detail here", Valid: true}
 	s.AutoApprove = false
 	s.WaitOnLimit = true
+	// PRD #305 M1/M3: the schedule's "apply model also to agents" opt-in must be read
+	// off the right RunSchedule field by scheduleOverrideSubagentModel and threaded onto
+	// the fired run's create seam — assert it lands on the captured prompt call.
+	s.OverrideSubagentModel = true
 	h.st.due = []store.RunSchedule{s}
 
 	h.sched.Boot(context.Background())
@@ -505,6 +509,9 @@ func TestTickPromptScheduleCreatesPromptRun(t *testing.T) {
 	p := h.runs.prompts[0]
 	if p.userID != h.owner || p.repoID != h.repoID || p.scheduleID != s.ID {
 		t.Fatalf("prompt call ids = %+v, want owner/repo/schedule", p)
+	}
+	if !p.overrideSubagentModel {
+		t.Fatalf("schedule OverrideSubagentModel=true must thread onto the prompt run; got %+v", p)
 	}
 	if p.prompt != s.Prompt.String {
 		t.Fatalf("prompt body = %q, want the full prompt text", p.prompt)

@@ -1780,10 +1780,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
 			DefaultModel:           textPtr(defaultModel),
-			SkillMaxBytes:          s.p.SkillMaxBytes,
-			SkillsMaxPerRun:        s.p.SkillsMaxPerRun,
-			ToolPackages:           toolPackages,
-			RepoDevboxOptIn:        rc.RepoDevboxOptIn,
+			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
+			// straight off the run row — not re-derived from the schedule. false for every
+			// run that did not opt in, so omitempty keeps its claim byte-identical to today.
+			OverrideSubagentModel: run.OverrideSubagentModel,
+			SkillMaxBytes:         s.p.SkillMaxBytes,
+			SkillsMaxPerRun:       s.p.SkillsMaxPerRun,
+			ToolPackages:          toolPackages,
+			RepoDevboxOptIn:       rc.RepoDevboxOptIn,
 			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
 			CIConfigPaths: run.CiConfigPaths,
 		},

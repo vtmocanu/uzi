@@ -278,6 +278,13 @@ type ClaimConfig struct {
 	QuestionMax            int     `json:"question_max"`
 	QuestionTimeoutSeconds int     `json:"question_timeout_seconds"`
 	DefaultModel           *string `json:"default_model,omitempty"`
+	// OverrideSubagentModel, when true, tells the worker to apply the run's resolved
+	// model (DefaultModel / the lead model) to EVERY subagent, overriding each
+	// template's own model: pin — across both the own roster and the cloned repo's
+	// roster (PRD #305). Frozen onto the run at fire time (runs.override_subagent_model).
+	// omitempty: false is omitted so an off run's claim is byte-identical to today's
+	// wire; an un-upgraded worker ignores the field and degrades safely to pins-win.
+	OverrideSubagentModel bool `json:"override_subagent_model,omitempty"`
 	// SkillMaxBytes and SkillsMaxPerRun are the skill caps the server configured,
 	// delivered so the worker enforces the same limits (no hardcoded drift): the
 	// worker applies SkillMaxBytes to repo-borne skills and re-enforces
