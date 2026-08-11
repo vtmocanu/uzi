@@ -44,6 +44,7 @@ import {
   type JsDepsResult,
 } from "./js-deps.js";
 import {
+  applySubagentModelOverride,
   assembleAgents,
   planTurnSubagents,
   selectSubagents,
@@ -500,6 +501,23 @@ export class SdkExecutor implements Executor {
       survivorNames,
       prepared.repoSurvivorNames,
     );
+    // Model precedence (PRD #17 Decision 6): the run owner's per-user default
+    // model wins over the lead template's model for the main thread. Set the key
+    // ONLY when a model is resolved — `model: undefined` must stay omitted (never
+    // an explicit key), so an unset model falls back to the SDK/account default.
+    // Computed HERE (before the plan-turn copy at planTurnSubagents) so the PRD #305
+    // own-roster override below can run against the same value the lead uses.
+    const leadModel = resolveLeadModel(
+      ctx.config?.default_model,
+      assembled.leadModel,
+    );
+    // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
+    // copies them and before the own-source implement path reuses them, so both the plan
+    // turn and an own-source implement follow the lead model. The repo roster is built
+    // later and overridden where it is built. Off/no-model = pins win (byte-identical).
+    if (ctx.config?.override_subagent_model && leadModel) {
+      applySubagentModelOverride(assembled.subagents, leadModel);
+    }
     // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
     // choice only takes effect after the plan is approved. #203 additionally
     // strips the file-write tools from each of them, and DROPS any whose declared
@@ -676,14 +694,8 @@ export class SdkExecutor implements Executor {
       // stream (the live-partial channel is M5, not M3).
       includePartialMessages: false,
     };
-    // Model precedence (PRD #17 Decision 6): the run owner's per-user default
-    // model wins over the lead template's model for the main thread. Set the key
-    // ONLY when a model is resolved — `model: undefined` must stay omitted (never
-    // an explicit key), so an unset model falls back to the SDK/account default.
-    const leadModel = resolveLeadModel(
-      ctx.config?.default_model,
-      assembled.leadModel,
-    );
+    // `leadModel` is computed above (before the plan-turn copy) so the PRD #305
+    // own-roster override can use it; here it only drives the top-level lead model.
     if (leadModel) baseOptions.model = leadModel;
 
     // PRD #122 M2: the wall budget the run STARTED with, kept so the loop can scale the
@@ -1096,6 +1108,14 @@ export class SdkExecutor implements Executor {
         survivorNames,
         prepared.repoSurvivorNames,
       );
+      // PRD #305: repo-source defs are freshly built from repo files here and were NOT
+      // touched by the own-roster override above; apply it so the flag covers the repo
+      // roster (the primary case: an auto-approved scheduled run resolves to the repo
+      // roster). Own-source defs were copied by reference from the already-overridden
+      // assembled.subagents, so this repeat is idempotent for them.
+      if (ctx.config?.override_subagent_model && leadModel) {
+        applySubagentModelOverride(selectedSubagents, leadModel);
+      }
       const selectedNames = Object.keys(selectedSubagents);
       // PRD #266 M1: the implement roster's own capability map. Derived from
       // `selectedSubagents` — NOT the plan-turn `subagentCanWrite` built off

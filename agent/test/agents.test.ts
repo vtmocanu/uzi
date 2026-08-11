@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  applySubagentModelOverride,
   assembleAgents,
   LEAD_NAME_RE,
   planTurnSubagents,
@@ -493,5 +494,62 @@ describe("subagentWriteCapabilities (PRD #266 M1)", () => {
     // only `tools` (still absent → inherit-all → true), but the roster line MUST be
     // fed the pre-strip map, which this milestone's executor does.
     assert.strictEqual(planned.coder?.tools, undefined, "plan turn left inherit-all intact");
+  });
+});
+
+describe("applySubagentModelOverride (PRD #305 M4)", () => {
+  // Decision 7: calibrate on a PINNED subagent. `reviewer` pins "opus"; the run
+  // model is "fable". An unpinned subagent already inherits the run model, so a
+  // test on one would pass with or without the flag and prove nothing.
+  it("own roster: overwrites every subagent's model with the run model, pin included", () => {
+    const { subagents } = assembleAgents([lead, coder, reviewer]);
+    // Precondition: reviewer really does carry its own pin before the override.
+    assert.strictEqual(subagents.reviewer?.model, "opus", "reviewer pins opus pre-override");
+
+    applySubagentModelOverride(subagents, "fable");
+
+    assert.strictEqual(subagents.reviewer?.model, "fable", "pinned reviewer overridden to run model");
+    for (const [name, def] of Object.entries(subagents)) {
+      assert.strictEqual(def.model, "fable", `${name} carries the run model`);
+    }
+  });
+
+  it("own roster: WITHOUT the override the pin is preserved (byte-identical control)", () => {
+    const { subagents } = assembleAgents([lead, coder, reviewer]);
+    // No call to applySubagentModelOverride: today's behavior, pin wins.
+    assert.strictEqual(subagents.reviewer?.model, "opus", "pin preserved when flag is off");
+  });
+
+  it("repo roster: overwrites a repo template's pin with the run model", () => {
+    const repoCoder: AgentTemplate = {
+      name: "coder",
+      description: "repo coder",
+      prompt_body: "REPO CODER",
+    };
+    const repoAuditor: AgentTemplate = {
+      name: "auditor",
+      description: "repo auditor",
+      prompt_body: "audit",
+      model: "opus",
+    };
+    const subagents = subagentsFromTemplates([repoCoder, repoAuditor], new Set());
+    assert.strictEqual(subagents.auditor?.model, "opus", "repo auditor pins opus pre-override");
+
+    applySubagentModelOverride(subagents, "fable");
+
+    for (const [name, def] of Object.entries(subagents)) {
+      assert.strictEqual(def.model, "fable", `repo ${name} carries the run model`);
+    }
+  });
+
+  it("repo roster: WITHOUT the override the pin is preserved", () => {
+    const repoAuditor: AgentTemplate = {
+      name: "auditor",
+      description: "repo auditor",
+      prompt_body: "audit",
+      model: "opus",
+    };
+    const subagents = subagentsFromTemplates([repoAuditor], new Set());
+    assert.strictEqual(subagents.auditor?.model, "opus", "repo pin preserved when flag is off");
   });
 });

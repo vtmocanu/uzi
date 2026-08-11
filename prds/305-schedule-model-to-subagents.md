@@ -123,15 +123,25 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
   the freeze/deliver wiring proven by a workersvc unit test (flag off → config field
   false/absent, byte-identical to today; flag on → true).
 
-- [ ] **M4 — Worker-side subagent override (the behavior).** In the agent, when the
+- [x] **M4 — Worker-side subagent override (the behavior).** In the agent, when the
   delivered `override_subagent_model` is set and a run model resolves (the lead
-  model / `baseOptions.model`), `toDefinition` sets every subagent's `def.model` to
-  that model instead of the template pin — so it applies to **both** the own roster
+  model / `baseOptions.model`), every subagent's `model` is set to that model
+  instead of the template pin — so it applies to **both** the own roster
   (`assembleAgents`) and the repo roster (`subagentsFromTemplates`). Unit tests on
   **both** rosters, each **calibrated on a PINNED subagent** (an unpinned one passes
   with or without the flag — Decision 7): flag off → pins preserved byte-identical;
   flag on → every subagent carries the run model, pin overridden. `agent/` unit
   tests (`agents.test.ts`, `sdk-executor.test.ts`).
+  - Landed as a post-build helper `applySubagentModelOverride` in `agent/src/agents.ts`
+    applied to BOTH rosters by the executor, rather than a branch inside
+    `toDefinition`: the own roster is assembled and plan-turn-copied before the run
+    model resolves, so `toDefinition` cannot see the run model (the own-source copy at
+    `planTurnSubagents` happens before `leadModel` is computed). The `leadModel`
+    computation was hoisted to right after `assembleAgents` so the own roster is
+    overridden before that copy; the repo roster is overridden where it is freshly
+    built after `selectSubagents`. Still one mechanism covering both rosters
+    (Decision 2). Claim field `override_subagent_model` added to `ClaimConfig`
+    (`agent/src/protocol.ts`). `task gate:agent` green.
 
 - [ ] **M5 — Web (schedule modal + run-detail read).** ScheduleModal gains a
   checkbox **"Apply model also to agents"** directly under the Model field, **always
