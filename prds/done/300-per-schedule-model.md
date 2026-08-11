@@ -1,7 +1,7 @@
 # PRD #300: Per-schedule model override for scheduled runs
 
 **GitLab Issue**: [#300](https://gitlab.example.com/vtmocanu/uzi/-/issues/300)
-**Status**: Draft (created 2026-08-10)
+**Status**: Done (2026-08-11) — implemented on branch agent/issue-300 (M1–M7)
 **Priority**: Medium
 **Related**: PRD #17 (per-user `default_model` + the shared `agenttmpl.ValidateModel` gate this PRD reuses — `api/internal/agenttmpl/model.go:27`). PRD #69 (per-user judge model — the same "layer a nullable model override above a lower default" pattern, one layer up). PRD #241 (run schedules — the `ScheduleRequest`/`ScheduleDTO`/`schedsvc` surface this extends). PRD #274 (scheduled sweep guidance + `MaxIssues` — the "present, even to clear" tri-state pointer semantics this PRD copies for the new field). PRD #46 (self-improvement — the scheduled scan → auto-approved run → open-MR terminal that the motivating "bingo" scenario reuses wholesale). PRD #302 (the general `uzi schedule edit` CLI verb, split out of this PRD's M5; this PRD ships only `create --model` plus read-only exposure of the frozen run model).
 
@@ -77,7 +77,7 @@ that one layer changes.
 
 ## Milestones
 
-- [ ] **M1 — Schema, DTO & shared-insert threading.** Goose migration adds
+- [x] **M1 — Schema, DTO & shared-insert threading.** Goose migration adds
   nullable `model` to `run_schedules` and nullable `model` to `runs`. The model
   threads onto the created run through the run-insert seams the fire paths use:
   the dedicated `CreatePromptRun` INSERT (`queries/schedules.sql`, `RETURNING *`)
@@ -91,7 +91,7 @@ that one layer changes.
   committed. `ScheduleRequest`/`ScheduleDTO` (`api/internal/apitypes/schedule.go`)
   gain `Model *string`.
 
-- [ ] **M2 — Validation, API round-trip & the `onlyEnabled` fix.** The schedule
+- [x] **M2 — Validation, API round-trip & the `onlyEnabled` fix.** The schedule
   handler (`api/internal/handler/schedules.go`) validates `model` via
   `agenttmpl.ValidateModel` on create and patch; a malformed token is rejected
   with a clear 400. `Model` is added to the `onlyEnabled` field enumeration
@@ -111,23 +111,23 @@ that one layer changes.
   assertion is **worker-side** (`resolveLeadModel`, `agent/src/sdk-executor.ts`)
   and is tested there, not in workersvc where `claim.go:322` only copies the pin.
 
-- [ ] **M4 — Web (schedule modal + run-detail read).** The schedule create/edit
+- [x] **M4 — Web (schedule modal + run-detail read).** The schedule create/edit
   modal gains a model control matching Settings → Worker model (Inherit default,
   curated aliases, custom ID); editing shows the stored value, clearing returns to
   Inherit. The run detail view shows the frozen `runs.model`. `mockApi.ts`
   schedule mocks carry the new field.
 
-- [ ] **M5 — CLI.** `uzi schedule create --model` and `--json` output carry
+- [x] **M5 — CLI.** `uzi schedule create --model` and `--json` output carry
   `model`; `uzi run get` surfaces the frozen run model (`--field model` /
   `--json`). (`api/cmd/uzi/schedule.go`, run-get plumbing.) The general
   `schedule edit --model` verb is PRD #302, not here.
 
-- [ ] **M6 — Live-DB sweep.** The store round-trip and precedence run through the
+- [x] **M6 — Live-DB sweep.** The store round-trip and precedence run through the
   live-DB harness (`./e2e/run-store-it.sh`) — the toolchain-boundary check the repo
   requires for any new/edited query, since `sqlc generate` being green is not
   evidence the query runs. (Unit proofs live in M2/M3, not duplicated here.)
 
-- [ ] **M7 — Docs & specs.** `docs/worker-model.md`'s precedence section documents
+- [x] **M7 — Docs & specs.** `docs/worker-model.md`'s precedence section documents
   the schedule layer (it governs the lead **and unpinned subagents**, the same lane
   as the per-user default today); a `specs/ai.md` decision records the precedence,
   the freeze-onto-run choice, and the worker-unchanged property.

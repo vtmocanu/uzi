@@ -19967,3 +19967,50 @@ that overlap VISIBLE to the LLM picker at claim time; the picker decides.
 - **Deferred: the recently-landed half.** Work that JUST merged is not surfaced — `runs` carries
   no merge-time key (no `merged_at`), and the in-flight half alone fixes the motivating bug. Left
   for a follow-up if a merge-time signal is added.
+
+## 520. PRD #300 — per-schedule model override: a schedule freezes a model onto each run it fires, which overrides the per-user Worker model at claim (worker unchanged)
+
+Design record `prds/done/300-per-schedule-model.md`.
+
+- **Storage & freeze (Decision 1).** A nullable `run_schedules.model` (owner-set) and a nullable
+  `runs.model` (frozen onto each run at fire time), both `text`, migration
+  `00118_schedule_run_model.sql`; NULL = inherit = pre-#300 behaviour, no backfill. The scheduler
+  stamps the schedule's model onto the run through the run-insert seams — `CreatePromptRun`
+  (prompt) and the shared `createRun` via `CreateScheduledRun`/`CreateScheduledAutopilotRun`
+  (issue/sweep). The scheduler derives the value with `scheduleModel` (`api/internal/schedsvc/scheduler.go`,
+  nil when the schedule's model is NULL); the shared `createRun` (`api/internal/workersvc/service.go`)
+  takes it as a param that its non-scheduled callers (`CreateRun`, `CreateAutopilotRun`) pass nil, so
+  only a scheduled run stamps a value; `CreatePromptRun` (`api/internal/workersvc/prompt.go`) is
+  scheduler-only. The run stays self-describing and immune to later schedule edits/deletion, and
+  the hot claim path stays a single-row read (no run→schedule join).
+- **Precedence (Decision 2), highest→lowest:** a subagent template's own `model:` pin (unchanged,
+  `claim.go` `agentsFromTemplates` — carried per-agent, bypasses `resolveLeadModel`) → the schedule's
+  frozen `runs.model` → the owner's per-user Worker model (`GetUserDefaultModel`) → the `lead`
+  template model → SDK/account default. Implemented at claim assembly by
+  `if run.Model.Valid { defaultModel = run.Model }` in `assembleClaim`
+  (`api/internal/workersvc/service.go` ~1646): the frozen model is delivered on the EXISTING
+  `default_model` claim field.
+- **Worker unchanged (Decision 7).** No `agent/` change: the schedule model rides
+  `ClaimConfig.default_model`, which the worker already resolves via `resolveLeadModel` (§413).
+  Because `resolveLeadModel` returns `configModel || templateModel`, the frozen model already sits
+  above the lead-template model and below subagent pins (which take the separate per-agent `a.Model`
+  path), so the stated precedence holds with no worker code change — and an un-upgraded agent image
+  honours a schedule model the moment the api starts sending it.
+- **Validation (Decision 3).** Reuses the shared `agenttmpl.ValidateModel` gate (no new validator;
+  §413's single-token / ≤100-char / blank-means-inherit rule), applied on schedule create AND config
+  patch, above the per-target switch (model is orthogonal to target, so it applies to
+  prompt/issue/sweep alike). `ValidateModel` was tightened this run to also reject Unicode **Cf**
+  format chars (bidi overrides, zero-width): the frozen model is echoed onto the admin cross-owner
+  Agents-status surface (`RunDTO.Model`), so a reordered/zero-width token would be a spoofing vector;
+  the web `modelFieldWarning` mirrors this for the model field only.
+- **Replace-semantics on patch (Decision 4).** `mergeSchedule` takes the request model directly
+  (`m.Model = req.Model`), nil = clear-to-inherit, matching `max_issues`/`guidance`; `req.Model == nil`
+  was added to `onlyEnabled` so an `{enabled, model}` patch is not misrouted to the enabled-only
+  short-circuit.
+- **Surfaces.** DTO `Model` on `ScheduleRequest`/`ScheduleDTO`/`RunDTO`; the web schedule modal reuses
+  the shared `ModelSelect` (all targets) and shows the frozen `runs.model` on the run detail as a
+  status-independent badge (visible on failed runs too, per the risk-mitigation intent); CLI
+  `uzi schedule create --model` + `uzi run get --field model` (auto-derived from `RunDTO`).
+- **Verification.** workersvc precedence unit matrix (override / no-override byte-identical /
+  subagent-pin-survives) plus live-DB round-trip & freeze under `./e2e/run-store-it.sh`
+  (`TestScheduleModelRoundTripLiveDB`, `TestRunScheduleModelRoundTripLiveDB`, `TestRunModelFrozenLiveDB`).
