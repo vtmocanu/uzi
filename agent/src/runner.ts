@@ -2064,8 +2064,11 @@ export class RunRunner {
         // one existing transition that clears open_question_id (its consumed-answer
         // guard already passes: ConsumeRunInputs stamps consumed_at in the same
         // RETURNING statement that handed us this answer). Shared by the implement-phase
-        // park too, where it is a harmless idempotent running -> running. NOT emitted on
-        // cancel/timeout (timeout throws before settle; cancel is guarded out here).
+        // park too: there this same awaiting_input -> running is the one the loop's next
+        // reportIteration would otherwise perform, so it is harmless (and equally relies
+        // on the consumed-answer guard — it is NOT a running -> running no-op, because the
+        // awaiting_input park report is awaited and persisted before settle runs). NOT
+        // emitted on cancel/timeout (timeout throws before settle; cancel is guarded out).
         void reportState({ status: "running" }).catch((e) =>
           runLog.warn("could not report running after clarification", {
             error: errMessage(e),
