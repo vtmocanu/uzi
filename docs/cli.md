@@ -15,12 +15,22 @@ manage workers and repos, and (read-only) admin state. Built for humans
 ## 1. Install
 
 ```sh
+brew tap vtmocanu/tap git@gitlab.example.com:vtmocanu/homebrew-tap.git
+brew trust --tap vtmocanu/tap   # one-time: Homebrew 6+ requires trusting third-party taps
 brew install vtmocanu/tap/uzi-cli
 uzi version
 ```
 
+The tap lives on **gitlab.example.com**, not GitHub, so the `vtmocanu/tap`
+shorthand cannot be used on its own: Homebrew resolves a bare `user/repo` tap
+name to `github.com/user/homebrew-repo`, so you must add the tap once with its
+explicit GitLab remote (the SSH URL above). After that one-time `brew tap`,
+`brew install vtmocanu/tap/uzi-cli` uses the recorded remote. `brew trust` is
+also a one-time step: Homebrew 6+ refuses to load formulae from a third-party
+tap until it is trusted.
+
 The formula builds from source (`vtmocanu/uzi` is a private repo), so you need
-**group-read on `vtmocanu/uzi`** — unlike a public tap, `brew install` clones
+**group-read on `vtmocanu/uzi`**: unlike a public tap, `brew install` clones
 the product repo over git-over-SSH using your own key.
 
 On first run the CLI also drops a Claude Code skill at
