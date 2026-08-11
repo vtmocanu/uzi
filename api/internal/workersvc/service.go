@@ -3542,7 +3542,9 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// scheduler use their own methods below and pass false.
 	// nil model: a non-scheduled human run inherits the owner's per-user Worker default
 	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, nil, seed)
+	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
+	// so it stays in the default lane where subagent pins win.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, true, waitOnLimit, nil, false, seed)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -3553,8 +3555,8 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // (e.g. a `bug` swept in) is NOT waived here — it still needs a prds/*.md link or
 // PRDLESS, exactly as before M4. This keeps PRD #196's invariant that the only path the
 // eligibility change widened is a human click; a scheduled sweep is not that click.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, seed *SeededPlan) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, model, seed)
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, false, waitOnLimit, model, overrideSubagentModel, seed)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -3578,7 +3580,9 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// allowLinkWaiver=false: autopilot is unattended, so PRD #196's PRD-link waiver
 	// never applies — a link-less autopilot run is still refused unless PRDLESS
 	// (allowWithoutPRD) exempts it, exactly as before M4.
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil, nil)
+	// false overrideSubagentModel (PRD #305): label-poller autopilot is not a schedule
+	// fire and carries no per-run opt-in, so subagent pins win (default lane).
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, false, nil, nil, false, nil)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
@@ -3591,8 +3595,8 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 // scheduler seam cannot change label-driven autopilot. allowLinkWaiver=false and seed=nil
 // for the same reasons as CreateAutopilotRun: a scheduled sweep is unattended, so PRD
 // #196's PRD-link waiver never applies, and autopilot never seeds its plan.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, model, nil /*seed*/)
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true /*autoApprove*/, allowWithoutPRD, false /*allowLinkWaiver*/, waitOnLimit, model, overrideSubagentModel, nil /*seed*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -3621,7 +3625,7 @@ type SeededPlan struct {
 	RequireBase bool
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, model *string, seed *SeededPlan) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD, allowLinkWaiver bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *SeededPlan) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -3807,6 +3811,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 		// NULL → the run inherits the owner's per-user Worker default at claim assembly.
 		Model: pgTextPtr(model),
+		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
+		// run at fire time. false for every non-scheduled caller (interactive,
+		// label-poller autopilot) → the default lane where subagent pins win. M1 stores
+		// it only; claim delivery (M3) and worker behaviour (M4) are separate milestones.
+		OverrideSubagentModel: overrideSubagentModel,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

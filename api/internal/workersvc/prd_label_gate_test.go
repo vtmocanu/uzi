@@ -299,7 +299,7 @@ func TestWaiverNeverStartsAScheduledRunLinkLess(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{prdLabel: "PRD", eligibleLabels: []string{"bug"}, waivesPRDLink: true})
 
-	if _, err := svc.CreateScheduledRun(context.Background(), user, repo, 4, "desc", false, nil, nil, nil); err != ErrNoPRDLink {
+	if _, err := svc.CreateScheduledRun(context.Background(), user, repo, 4, "desc", false, nil, nil, false, nil); err != ErrNoPRDLink {
 		t.Fatalf("err = %v, want ErrNoPRDLink — a scheduled sweep must not get the interactive PRD-link waiver", err)
 	}
 	if fs.createRunParams != nil {

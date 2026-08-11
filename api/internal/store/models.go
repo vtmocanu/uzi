@@ -344,6 +344,7 @@ type Run struct {
 	ReportMd              pgtype.Text        `json:"report_md"`
 	CiConfigPaths         []string           `json:"ci_config_paths"`
 	Model                 pgtype.Text        `json:"model"`
+	OverrideSubagentModel bool               `json:"override_subagent_model"`
 }
 
 type RunMessage struct {
@@ -372,28 +373,29 @@ type RunReview struct {
 }
 
 type RunSchedule struct {
-	ID          uuid.UUID          `json:"id"`
-	UserID      uuid.UUID          `json:"user_id"`
-	RepoID      uuid.UUID          `json:"repo_id"`
-	Target      string             `json:"target"`
-	IssueIid    pgtype.Int8        `json:"issue_iid"`
-	Labels      []byte             `json:"labels"`
-	Prompt      pgtype.Text        `json:"prompt"`
-	Timing      string             `json:"timing"`
-	CronExpr    pgtype.Text        `json:"cron_expr"`
-	RunAt       pgtype.Timestamptz `json:"run_at"`
-	Timezone    string             `json:"timezone"`
-	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
-	LastFiredAt pgtype.Timestamptz `json:"last_fired_at"`
-	AutoApprove bool               `json:"auto_approve"`
-	WaitOnLimit bool               `json:"wait_on_limit"`
-	Enabled     bool               `json:"enabled"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	MaxIssues   pgtype.Int4        `json:"max_issues"`
-	Guidance    pgtype.Text        `json:"guidance"`
-	Model       pgtype.Text        `json:"model"`
+	ID                    uuid.UUID          `json:"id"`
+	UserID                uuid.UUID          `json:"user_id"`
+	RepoID                uuid.UUID          `json:"repo_id"`
+	Target                string             `json:"target"`
+	IssueIid              pgtype.Int8        `json:"issue_iid"`
+	Labels                []byte             `json:"labels"`
+	Prompt                pgtype.Text        `json:"prompt"`
+	Timing                string             `json:"timing"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	RunAt                 pgtype.Timestamptz `json:"run_at"`
+	Timezone              string             `json:"timezone"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	LastFiredAt           pgtype.Timestamptz `json:"last_fired_at"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	Enabled               bool               `json:"enabled"`
+	Status                string             `json:"status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	Guidance              pgtype.Text        `json:"guidance"`
+	Model                 pgtype.Text        `json:"model"`
+	OverrideSubagentModel bool               `json:"override_subagent_model"`
 }
 
 type RunUsage struct {
