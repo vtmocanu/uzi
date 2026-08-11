@@ -6,6 +6,25 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-11
+
+### Added
+
+- **`make` is baked into every worker image.** Agents can now run
+  Makefile-driven builds and test targets out of the box, with no per-repo
+  devbox provisioning. It ships through the pinned devbox-global toolchain (GNU
+  make 4.4.1) alongside go/gcc/jq, so it is version-pinned and covered by the
+  image build guard. (2c92dac2, 347df966)
+
+### Fixed
+
+- **CLI install docs now include the tap step.** The README quick-start and
+  `docs/cli.md` were missing the one-time `brew tap vtmocanu/tap
+  git@gitlab.example.com:vtmocanu/homebrew-tap.git` and `brew trust --tap
+  vtmocanu/tap` commands, so a fresh install could not resolve the GitLab-hosted
+  tap from the `vtmocanu/tap` shorthand (which Homebrew otherwise reads as a
+  GitHub tap).
+
 ## [0.28.0] - 2026-08-11
 
 ### Added
