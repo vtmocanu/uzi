@@ -2056,6 +2056,22 @@ export class RunRunner {
     // half of the same invariant — no resolved id is left behind anywhere.
     const settle = (v: AnswerVerdict): AnswerVerdict => {
       this.openQuestionIds.delete(runId);
+      if (v.kind === "answer") {
+        // PRD #307: a plan-phase clarification resumes into more PLANNING turns, so
+        // neither onSessionId (latched once per run) nor reportIteration (implement
+        // loop only) fires again — the run would stay stuck at awaiting_input. Emit a
+        // `running` report on the answer so the server runs SetRunRunning, which is the
+        // one existing transition that clears open_question_id (its consumed-answer
+        // guard already passes: ConsumeRunInputs stamps consumed_at in the same
+        // RETURNING statement that handed us this answer). Shared by the implement-phase
+        // park too, where it is a harmless idempotent running -> running. NOT emitted on
+        // cancel/timeout (timeout throws before settle; cancel is guarded out here).
+        void reportState({ status: "running" }).catch((e) =>
+          runLog.warn("could not report running after clarification", {
+            error: errMessage(e),
+          }),
+        );
+      }
       return v;
     };
 
