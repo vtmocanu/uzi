@@ -15,9 +15,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   suppresses the false "install this tool" recommendation. Genuinely absent tools are
   still reported.
 - **Worker tool provisioning no longer trips a devbox "legacy format" warning.** The
-  synthesized per-run `devbox.json` is now written in devbox's current object form
-  (package name to version) rather than the deprecated package array, so
-  `devbox install` runs cleanly.
+  synthesized per-run `devbox.json` now pins every unversioned package to `@latest` (for
+  example `go` becomes `go@latest`), which is what actually clears the warning (devbox
+  keys it on unversioned packages), so `devbox install` runs cleanly. Already
+  version-pinned packages are left unchanged.
 
 ## [0.29.0] - 2026-08-11
 

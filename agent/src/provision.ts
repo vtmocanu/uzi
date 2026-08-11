@@ -188,19 +188,17 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
   // Packages-only manifest, synthesized OUTSIDE the clone (Decision 3): no
   // init_hook/scripts, no repo input — just the resolved, validated package list.
   //
-  // Written in devbox's OBJECT form (name -> version, "" when unpinned), NOT the bare
-  // `["go", "kubectl@1.31"]` array: the array is the deprecated shape devbox 0.17.5 warns
-  // on ("devbox.json … contains packages in legacy format. Please run devbox update",
-  // judge rec run c926fa20), and `devbox update` migrates array -> object exactly this way
-  // (["go@latest","hello"] -> {"go":"latest","hello":""}). The strings are already
-  // shape-validated `name` / `name@version` (repo-tools.ts PKG_RE) and merged so base
-  // names are unique, so splitting on the first `@` cannot collide keys.
-  const packages: Record<string, string> = {};
-  for (const pkg of input.packages) {
-    const at = pkg.indexOf("@");
-    if (at === -1) packages[pkg] = "";
-    else packages[pkg.slice(0, at)] = pkg.slice(at + 1);
-  }
+  // Pin any UNVERSIONED package to `@latest`. devbox 0.17.5's "devbox.json … contains
+  // packages in legacy format. Please run devbox update" warning (judge rec run c926fa20)
+  // is keyed on unversioned packages — `HasDeprecatedPackages` → `pkg.IsLegacy()` =
+  // `!strings.Contains(Raw, "@")` — NOT on the array-vs-object shape. Verified on devbox
+  // 0.17.2: an all-versioned array does not warn, while an object carrying an empty-string
+  // version still does; `devbox update`'s own remedy is `Raw + "@latest"`. So a bare `go`
+  // becomes `go@latest` (the same latest resolution it would get unversioned) while
+  // `kubectl@1.31` is left as-is. The array form is kept (no name->version object), which
+  // sidesteps any key-collision question. The strings are shape-validated `name` /
+  // `name@version` (repo-tools.ts PKG_RE), so `includes("@")` reliably tells the two apart.
+  const packages = input.packages.map((pkg) => (pkg.includes("@") ? pkg : `${pkg}@latest`));
   const manifest = JSON.stringify({ packages }, null, 2) + "\n";
   await fs.writeFile(path.join(input.runDir, "devbox.json"), manifest, "utf8");
 
