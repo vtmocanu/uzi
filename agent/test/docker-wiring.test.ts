@@ -146,13 +146,21 @@ describe("resolveDockerWiring readiness wait (PRD #83 M2)", () => {
   });
 
   it("degrades to unwired after the readiness timeout when an expected daemon never comes up", async () => {
+    // Drive a deterministic fake clock (paired sleep advances it) so the probe count is
+    // exact and time-independent — this is the one readiness test that must actually reach
+    // the deadline, so a real clock made it race CI CPU contention (1 probe, not many).
+    // With readyIntervalMs 5 / readyTimeoutMs 30 the loop probes at t = 0,5,10,15,20,25,30
+    // (7 probes), then remaining <= 0 and it degrades.
+    let t = 0;
+    const now = (): number => t;
+    const sleep = async (ms: number): Promise<void> => { t += ms; };
     let calls = 0;
     const w = await resolveDockerWiring(
       { DOCKER_HOST: "tcp://dind:2375" },
-      { probe: async () => { calls++; return false; }, readyIntervalMs: 5, readyTimeoutMs: 30 },
+      { probe: async () => { calls++; return false; }, readyIntervalMs: 5, readyTimeoutMs: 30, sleep, now },
     );
     assert.deepStrictEqual(w, {}, "timeout ⇒ degrade to unwired");
-    assert.ok(calls >= 2, `expected multiple probe attempts before the timeout, got ${calls}`);
+    assert.strictEqual(calls, 7, `expected exactly 7 probes across the fake-clock budget, got ${calls}`);
   });
 
   it("RETRIES through a probe EACCES (the 0660→0666 socket-perm handoff window) until wired", async () => {

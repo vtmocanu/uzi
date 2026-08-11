@@ -70,6 +70,9 @@ export interface ResolveDockerWiringOptions {
   readyTimeoutMs?: number;
   /** Injectable sleep (tests drive the wait with no real delay). */
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock (ms epoch). Paired with `sleep` so tests drive the readiness
+   *  deadline deterministically instead of racing real wall time. Default = Date.now. */
+  now?: () => number;
 }
 
 /** True when the operator EXPECTS a sidecar: DOCKER_HOST (k8s) or UZI_DIND_SOCKET (compose
@@ -104,10 +107,11 @@ export async function resolveDockerWiring(
   const probe = opts.probe ?? defaultProbe;
   const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
   const sleep = opts.sleep ?? realSleep;
+  const now = opts.now ?? Date.now;
   const readyIntervalMs = opts.readyIntervalMs ?? DEFAULT_READY_INTERVAL_MS;
   // Only an EXPECTED sidecar gets a wait budget; otherwise the deadline is now (one probe).
   const readyTimeoutMs = resolved.expected ? (opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS) : 0;
-  const deadline = Date.now() + readyTimeoutMs;
+  const deadline = now() + readyTimeoutMs;
   for (;;) {
     let reachable = false;
     try {
@@ -118,7 +122,7 @@ export async function resolveDockerWiring(
       reachable = false;
     }
     if (reachable) return { dockerHost: resolved.host };
-    const remaining = deadline - Date.now();
+    const remaining = deadline - now();
     if (remaining <= 0) return {}; // not expected ⇒ deadline≈now ⇒ exactly one probe, no wait
     await sleep(Math.min(readyIntervalMs, remaining));
   }
