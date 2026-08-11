@@ -33,7 +33,17 @@ operational config (`values/dev-cluster.yaml`) can change on `main` without
 cutting a new chart release — that path is proven: the M6 Infisical-scope fix
 reached the running deploy through it, with no chart release. Wiring lives in
 `argo-apps` `apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`, delivered by MR !294
-(**merged 2026-07-16**; first live deploy = uzi `0.2.0`). The
+(**merged 2026-07-16**; first live deploy = uzi `0.2.0`).
+
+**dev-cluster auto-tracks the chart version** (changed 2026-08-11). The OCI-chart
+source's `targetRevision` is a **bounded semver range `0.*`**, not an exact pin, so
+ArgoCD resolves the newest published `0.x` chart from Harbor on each reconcile: a
+`v0.Y.Z` release deploys with **no `targetRevision` bump** — step 3 below is gone
+for this cluster. The `0.*` bound keeps a future major (`1.0.0`) a deliberate human
+change, and uzi's plain `vX.Y.Z` tags carry no prereleases (a `-0` suffix in the
+range would be needed to include any). This is a **dev-cluster** choice: a future
+stage/prod cluster should keep the exact-version pin so its deploy stays an
+explicit, reviewable git change (PRD #52 Decision 3). The
 api is a **hard singleton** (`replicas: 1` + `Recreate`) — see `ARCHITECTURE.md`
 for why (poller/sweeper/Slack in-memory state + goose boot migration with no
 advisory lock).
@@ -51,12 +61,27 @@ atomically, it does not ship a half-version.
 
 ## Release procedure
 
-Cutting a release is three steps; only the tag push publishes anything. Steps 1 and 3
-(the chart-version bump and the ArgoCD `targetRevision` bump) can each land **two ways** —
-a **direct-to-`main` commit** or an **MR**. **Direct-to-`main` is the default and preferred
-at this early dev stage**; the MR way is there for when you want the change reviewed. Step 2
-(the tag) is identical either way. Both repos (`vtmocanu/uzi` and `argo-apps`) permit
-direct pushes to `main`.
+Cutting a release is **two steps** on dev-cluster (the third — the ArgoCD `targetRevision`
+bump — is gone now that this cluster auto-tracks `0.*`; it survives below only as the
+rollback/other-cluster note). Only the tag push publishes anything. Step 1 (the chart-version
+bump) can land **two ways** — a **direct-to-`main` commit** or an **MR**. **Direct-to-`main`
+is the default and preferred at this early dev stage**; the MR way is there for when you want
+the change reviewed. Step 2 (the tag) is identical either way. Both repos (`vtmocanu/uzi` and
+`argo-apps`) permit direct pushes to `main`.
+
+**Auto-tracking does not mean instant.** ArgoCD only notices the new chart on its next
+reconcile poll (default ~3 min) — and a **normal** refresh reuses the cached resolved
+version, so to deploy the moment the tag pipeline finishes publishing, force a **hard**
+refresh (it invalidates the manifest cache, re-resolving `0.*` against Harbor):
+
+```sh
+kubectl -n argocd annotate application uzi \
+  argocd.argoproj.io/refresh=hard --overwrite --context argo-cluster
+# equivalently, if you have the argocd CLI logged in: argocd app get uzi --hard-refresh
+```
+
+The Application is already `automated: {prune, selfHeal}`, so the hard refresh both
+re-resolves the version and triggers the sync; no separate `argocd app sync` is needed.
 
 Why direct-to-`main` is preferred here: it skips the separate MR pipeline, so you wait for
 the full gate **once** (the `main`-branch build) instead of twice (the MR gate, then the
@@ -153,21 +178,24 @@ bad tag.
    > included, despite the name) recovers the release with the tag left in
    > place.
 
-3. **Point ArgoCD at the new version (in `argo-apps`).**
-   Bump `targetRevision` in `apps/uzi/app.uzi.yaml` to the new chart version. ArgoCD
-   auto-syncs the uzi app to the new chart once the bump is on that repo's `main`. Deploy
-   is an explicit, reviewable git change (Decision 3), not latest-tracking. Land it the
-   same two ways as step 1:
+3. **~~Point ArgoCD at the new version~~ — no longer needed on dev-cluster.**
+   This cluster auto-tracks (`targetRevision: 0.*` in `apps/uzi/app.uzi.yaml`), so a
+   published `0.Y.Z` chart deploys on ArgoCD's next reconcile with no argo-repo change.
+   Force it immediately with the hard refresh shown under "Release procedure" above. The
+   manual bump survives only in two cases:
 
-   - **Direct to `main` (default).** Commit the `targetRevision` bump on
-     `argo-apps` `main` and push. That repo has no image build, so its only wait
-     is ArgoCD's reconcile — identical either way; direct-to-`main` just skips the MR
-     ceremony.
-   - **Via an MR (when you want the deploy bump reviewed).** MR → merge.
+   - **Rollback** (below) — pin `targetRevision` back to a known-good exact version.
+   - **A future stage/prod cluster**, if one keeps the exact-version pin (PRD #52 Decision
+     3: an explicit, reviewable deploy). There, the old flow applies verbatim — bump
+     `targetRevision` to the new chart version, direct-to-`main` (default) or via an MR,
+     and ArgoCD auto-syncs once the bump is on that repo's `main`.
 
-**Rollback = revert the argo `targetRevision` change** (step 3, direct commit or MR) to the
-previous version; ArgoCD re-syncs to the older, still-published chart. No image rebuild
-needed — old versions stay in Harbor.
+**Rollback** (auto-tracking changes this — a plain git revert no longer moves the deploy):
+pin `targetRevision` in `apps/uzi/app.uzi.yaml` from `0.*` **back to the last-good exact
+version** (e.g. `0.28.0`) and push; ArgoCD re-syncs to that older, still-published chart (no
+image rebuild — old versions stay in Harbor). Because `0.*` would otherwise re-advance to the
+bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
+setting `targetRevision` back to `0.*`.
 
 ## Platform-admin prerequisites (one-time)
 

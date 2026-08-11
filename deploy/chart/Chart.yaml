@@ -6,7 +6,8 @@ type: application
 # pipeline (.gitlab-ci.yml) publishes the images (api/web:<tag>) AND this chart
 # (oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>); ArgoCD deploys that
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
-# follows appVersion. Bump both (and the argo-apps targetRevision) per release.
+# follows appVersion. Bump both per release; dev-cluster's ArgoCD auto-tracks the chart
+# (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
 version: 0.28.0
 appVersion: "0.28.0"
 
