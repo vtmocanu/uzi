@@ -211,6 +211,181 @@ func TestListSweepCandidateIssuesMaxIssuesLiveDB(t *testing.T) {
 	}
 }
 
+// TestRunScheduleModelRoundTripLiveDB is the mandatory live-DB coverage for the PRD #300
+// per-schedule model override on run_schedules.model: a green `sqlc generate` does not
+// prove the new column round-trips through a real INSERT/UPDATE, so this exercises the
+// pgtype.Text param on both CreateRunSchedule and UpdateRunSchedule against real Postgres.
+func TestRunScheduleModelRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, userID, repoID := schedFixture(ctx, t)
+
+	// Create a valid prompt/once schedule carrying a model override.
+	sched, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "do the thing", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+		Model:       pgtype.Text{String: "fable", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("create schedule with model: %v", err)
+	}
+	if !sched.Model.Valid || sched.Model.String != "fable" {
+		t.Fatalf("created schedule model = {valid=%v string=%q}, want {true, fable}", sched.Model.Valid, sched.Model.String)
+	}
+
+	// Update clearing the model to NULL (inherit the owner default).
+	updated, err := q.UpdateRunSchedule(ctx, store.UpdateRunScheduleParams{
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "do the thing", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Model:       pgtype.Text{}, // NULL
+		ID:          sched.ID,
+		UserID:      userID,
+	})
+	if err != nil {
+		t.Fatalf("update schedule clearing model: %v", err)
+	}
+	if updated.Model.Valid {
+		t.Fatalf("after clear, schedule model = {valid=%v string=%q}, want NULL", updated.Model.Valid, updated.Model.String)
+	}
+
+	// A create with a NULL model stores NULL (inherit default), not a stray empty string.
+	inherit, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "another", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+		Model:       pgtype.Text{}, // NULL
+	})
+	if err != nil {
+		t.Fatalf("create schedule with NULL model: %v", err)
+	}
+	if inherit.Model.Valid {
+		t.Fatalf("NULL-model create stored model = {valid=%v string=%q}, want NULL", inherit.Model.Valid, inherit.Model.String)
+	}
+}
+
+// TestRunModelFrozenLiveDB proves runs.model (PRD #300) persists on BOTH insert paths —
+// CreatePromptRun (the scheduler's prompt-run insert) and CreateRun (the shared engine
+// insert) — and reads back via GetRunByID, the exact SELECT * row assembleClaim loads to
+// freeze the model onto a claimed run. A green `sqlc generate` does not prove the new
+// column survives a real round-trip, so this runs it against real Postgres.
+func TestRunModelFrozenLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, userID, repoID := schedFixture(ctx, t)
+
+	// runs.schedule_id has an FK to run_schedules, so a prompt run needs a real schedule.
+	sched, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "do the thing", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create schedule for prompt run: %v", err)
+	}
+
+	// CreatePromptRun with a model → GetRunByID reads it back.
+	promptRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		UserID:           userID,
+		RepoID:           repoID,
+		ScheduleID:       sched.ID,
+		IssueTitle:       "prompt run",
+		IssueDescription: "do the thing",
+		AutoApprove:      true,
+		WaitOnLimit:      false,
+		Model:            pgtype.Text{String: "fable", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("CreatePromptRun with model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, promptRun.ID); err != nil {
+		t.Fatalf("GetRunByID (prompt run): %v", err)
+	} else if !got.Model.Valid || got.Model.String != "fable" {
+		t.Fatalf("prompt run model = {valid=%v string=%q}, want {true, fable}", got.Model.Valid, got.Model.String)
+	}
+
+	// A second prompt schedule + run with a NULL model → GetRunByID reads NULL (inherit).
+	sched2, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "another", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create second schedule: %v", err)
+	}
+	nullRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		UserID:           userID,
+		RepoID:           repoID,
+		ScheduleID:       sched2.ID,
+		IssueTitle:       "prompt run 2",
+		IssueDescription: "another",
+		AutoApprove:      true,
+		WaitOnLimit:      false,
+		Model:            pgtype.Text{}, // NULL
+	})
+	if err != nil {
+		t.Fatalf("CreatePromptRun with NULL model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, nullRun.ID); err != nil {
+		t.Fatalf("GetRunByID (null prompt run): %v", err)
+	} else if got.Model.Valid {
+		t.Fatalf("null prompt run model = {valid=%v string=%q}, want NULL (inherit)", got.Model.Valid, got.Model.String)
+	}
+
+	// The shared engine insert (CreateRun) also freezes model → GetRunByID reads it back.
+	engineRun, err := q.CreateRun(ctx, store.CreateRunParams{
+		UserID:           userID,
+		RepoID:           repoID,
+		IssueIid:         pgtype.Int8{Int64: 4242, Valid: true},
+		IssueTitle:       "engine run",
+		IssueDescription: "an issue-driven run",
+		AutoApprove:      false,
+		WaitOnLimit:      false,
+		PlanSource:       "agent",
+		RequireBaseMatch: false,
+		Model:            pgtype.Text{String: "haiku", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("CreateRun with model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, engineRun.ID); err != nil {
+		t.Fatalf("GetRunByID (engine run): %v", err)
+	} else if !got.Model.Valid || got.Model.String != "haiku" {
+		t.Fatalf("engine run model = {valid=%v string=%q}, want {true, haiku}", got.Model.Valid, got.Model.String)
+	}
+}
+
 func containsSchedule(rows []store.RunSchedule, id uuid.UUID) bool {
 	for _, r := range rows {
 		if r.ID == id {

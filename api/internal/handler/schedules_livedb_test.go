@@ -303,6 +303,59 @@ func TestScheduleGuidanceRoundTripLiveDB(t *testing.T) {
 	}
 }
 
+// TestScheduleModelRoundTripLiveDB exercises the PRD #300 per-schedule model override
+// through the real store column (run_schedules.model, pgtype.Text). Unlike guidance
+// (issue/sweep-only), model is an ALL-TARGETS field, so this uses a PROMPT schedule to
+// prove the model persists exactly where guidance is rejected: a create persists the
+// model, a config PATCH resending it replaces it, a config PATCH OMITTING it clears it to
+// NULL (replace-semantics → inherit the owner default), and a malformed model is a 400
+// from the real handler's agenttmpl.ValidateModel.
+func TestScheduleModelRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	// Create a prompt schedule carrying a model override.
+	dto, code := f.createSchedule(t, f.owner.ID, f.repoID,
+		`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1","model":"fable"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", code)
+	}
+	if dto.Model == nil || *dto.Model != "fable" {
+		t.Fatalf("new prompt model = %v, want the stored value \"fable\"", dto.Model)
+	}
+	id := dto.ID
+
+	// patch issues a config PATCH and returns the decoded DTO plus the HTTP code, so a
+	// caller can assert either a successful replace or a rejection.
+	patch := func(body string) (apitypes.ScheduleDTO, int) {
+		req := userReq(http.MethodPatch, "/api/schedules/"+id, body, f.owner.ID, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		f.h.PatchSchedule(rec, req)
+		var out apitypes.ScheduleDTO
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+		}
+		return out, rec.Code
+	}
+
+	// A config PATCH resending the full prompt config with a new model persists it.
+	if got, gc := patch(`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1","model":"sonnet"}`); gc != http.StatusOK || got.Model == nil || *got.Model != "sonnet" {
+		t.Fatalf("after set patch, code=%d model=%v, want 200 and \"sonnet\"", gc, got.Model)
+	}
+
+	// A config PATCH omitting model clears it to NULL (inherit — replace-semantics).
+	if got, gc := patch(`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1"}`); gc != http.StatusOK || got.Model != nil {
+		t.Fatalf("after omit patch, code=%d model=%v, want 200 and nil (cleared to inherit)", gc, got.Model)
+	}
+
+	// A malformed model is rejected by the real handler's ValidateModel (400), not stored.
+	if _, gc := patch(`{"target":"prompt","prompt":"do the thing","timing":"recurring","cron_expr":"0 9 * * 1","model":"two words"}`); gc != http.StatusBadRequest {
+		t.Fatalf("malformed model patch code = %d, want 400", gc)
+	}
+}
+
 func TestScheduleOwnerIsolationLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newScheduleFixture(ctx, t)
