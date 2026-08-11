@@ -272,6 +272,12 @@ func TestOnlyEnabled(t *testing.T) {
 	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, Model: sptr("fable")}) {
 		t.Fatalf("enabled + model is NOT onlyEnabled (else the model is dropped)")
 	}
+	// enabled + override_subagent_model is a config PATCH, not enabled-only: it must NOT
+	// short-circuit, or the flag would be silently dropped (the same bug PRD #300 M2 fixed
+	// for model — PRD #305 M2).
+	if onlyEnabled(apitypes.ScheduleRequest{Enabled: &yes, OverrideSubagentModel: &yes}) {
+		t.Fatalf("enabled + override_subagent_model is NOT onlyEnabled (else the flag is dropped)")
+	}
 	if onlyEnabled(apitypes.ScheduleRequest{}) {
 		t.Fatalf("a patch with no enabled is not onlyEnabled")
 	}
@@ -524,5 +530,82 @@ func TestScheduleDTOModel(t *testing.T) {
 	base.Model = pgtype.Text{String: "", Valid: true}
 	if dto := h.scheduleDTO(base, ""); dto.Model != nil {
 		t.Fatalf("empty model must map to nil, got %v", dto.Model)
+	}
+}
+
+// bptr returns a *bool, the carrier for the override_subagent_model opt-in (PRD #305).
+func bptr(v bool) *bool { return &v }
+
+// TestOverrideSubagentModelColumn pins the store-column mapping for the PRD #305 opt-in: a
+// present true maps to true; nil (absent) and an explicit false both map to false. Unlike
+// modelColumn it is NOT target-scoped and there is no NULL — the column is bool NOT NULL
+// DEFAULT false (Decision 5).
+func TestOverrideSubagentModelColumn(t *testing.T) {
+	if !overrideSubagentModelColumn(apitypes.ScheduleRequest{Target: "issue", OverrideSubagentModel: bptr(true)}) {
+		t.Fatalf("present true must map to true")
+	}
+	if overrideSubagentModelColumn(apitypes.ScheduleRequest{Target: "issue", OverrideSubagentModel: bptr(false)}) {
+		t.Fatalf("explicit false must map to false")
+	}
+	if overrideSubagentModelColumn(apitypes.ScheduleRequest{Target: "issue", OverrideSubagentModel: nil}) {
+		t.Fatalf("nil (absent) must map to false (Decision 5: nil ≡ false)")
+	}
+	// Not target-scoped — a prompt/sweep target maps the same way.
+	if !overrideSubagentModelColumn(apitypes.ScheduleRequest{Target: "prompt", OverrideSubagentModel: bptr(true)}) {
+		t.Fatalf("prompt target must map true the same (not target-scoped)")
+	}
+}
+
+// TestMergeScheduleOverrideSubagentModel pins PRD #305 M2's replace-semantics for the flag,
+// mirroring model: a full-config PATCH that sets it round-trips to true, and a full-config
+// PATCH omitting it collapses to false (nil ≡ false, Decision 5) — the enabled-only sparse
+// PATCH is short-circuited by onlyEnabled before this merge, so the web always sends the
+// full config.
+func TestMergeScheduleOverrideSubagentModel(t *testing.T) {
+	cur := store.RunSchedule{
+		Target:                "issue",
+		IssueIid:              pgtype.Int8{Int64: 7, Valid: true},
+		Timing:                "recurring",
+		CronExpr:              pgtype.Text{String: "0 2 * * *", Valid: true},
+		Timezone:              "UTC",
+		OverrideSubagentModel: true,
+	}
+
+	// A full-config PATCH that sets the flag round-trips to true.
+	set := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *", OverrideSubagentModel: bptr(true)})
+	if c := overrideSubagentModelColumn(set); !c {
+		t.Fatalf("merged override_subagent_model column = %v, want true", c)
+	}
+
+	// A full-config PATCH that omits the flag collapses it to false (replace, not keep).
+	cleared := mergeSchedule(cur, apitypes.ScheduleRequest{Target: "issue", IssueIID: i64(7), Timing: "recurring", CronExpr: "0 2 * * *"})
+	if cleared.OverrideSubagentModel != nil {
+		t.Fatalf("merged override_subagent_model = %v, want nil (a config PATCH replaces the whole row)", cleared.OverrideSubagentModel)
+	}
+	if c := overrideSubagentModelColumn(cleared); c {
+		t.Fatalf("cleared override_subagent_model column = %v, want false (nil ≡ false)", c)
+	}
+}
+
+// TestScheduleDTOOverrideSubagentModel pins that scheduleDTO always populates the flag from
+// the stored bool column (never NULL, PRD #305): a stored true surfaces as *true, a stored
+// false as *false — the "create with the flag absent → GET returns false" default-off case.
+func TestScheduleDTOOverrideSubagentModel(t *testing.T) {
+	h := &Handler{}
+	base := store.RunSchedule{
+		Target:   "issue",
+		IssueIid: pgtype.Int8{Int64: 7, Valid: true},
+		Timing:   "once",
+		Timezone: "UTC",
+	}
+
+	base.OverrideSubagentModel = true
+	if dto := h.scheduleDTO(base, ""); dto.OverrideSubagentModel == nil || !*dto.OverrideSubagentModel {
+		t.Fatalf("DTO override_subagent_model = %v, want *true", dto.OverrideSubagentModel)
+	}
+
+	base.OverrideSubagentModel = false
+	if dto := h.scheduleDTO(base, ""); dto.OverrideSubagentModel == nil || *dto.OverrideSubagentModel {
+		t.Fatalf("DTO override_subagent_model = %v, want *false (default off is always set, never nil)", dto.OverrideSubagentModel)
 	}
 }
