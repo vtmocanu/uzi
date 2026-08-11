@@ -783,6 +783,9 @@ export interface Schedule {
   // stays the task); null = none. Issue and sweep targets only (null for prompt,
   // which already carries its own prompt text). Capped at 8192 bytes server-side.
   guidance: string | null;
+  // Per-schedule model override; null = inherit the owner's per-user Worker model.
+  // Applies to ALL targets (prompt/issue/sweep), unlike guidance which is issue/sweep-only.
+  model: string | null;
   enabled: boolean;
   status: ScheduleStatus;
   created_at: string;
@@ -812,6 +815,9 @@ export interface ScheduleInput {
   // Owner guidance for issue/sweep targets; explicit null/"" clears to none.
   // Omitted on the prompt target so the server never rejects it.
   guidance?: string | null;
+  // Model override for runs this schedule fires (all targets); explicit null/"" clears
+  // to inherit. Unlike guidance it is sent on every target.
+  model?: string | null;
   enabled?: boolean;
 }
 
@@ -1064,6 +1070,10 @@ export interface Run {
   auto_approve: boolean;
   worker_id: string | null;
   branch: string | null;
+  /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
+   *  null = the run inherited the owner's per-user Worker default. Applies to all
+   *  schedule targets (unlike guidance). */
+  model: string | null;
   mr_iid: number | null;
   /** Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
    *  null on runs created before it landed. Rendered directly through isHttpsUrl; a

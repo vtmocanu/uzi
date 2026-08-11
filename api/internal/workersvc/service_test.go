@@ -984,6 +984,96 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 	}
 }
 
+// scheduleModelStore builds a fakeStore whose claim will succeed, parameterised on
+// the frozen per-run model (runs.model, set by a schedule at fire time — PRD #300)
+// and the owner's per-user Worker default (GetUserDefaultModel). Both are pgtype.Text
+// so a zero value models NULL/inherit.
+func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeStore {
+	t.Helper()
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-SCHEDMODEL-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-SCHEDMODEL-abcdef1234567890"))
+	return &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 30, Valid: true}, Status: "claimed",
+			Model: runModel,
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:    sealedTok,
+		defaultModel: userDefault,
+	}
+}
+
+// PRD #300 Success Criterion 2: a schedule that froze a per-run model onto runs.model
+// beats the owner's per-user Worker default for THIS run's Config.DefaultModel. The
+// frozen model also must NOT disturb a subagent template's own model: pin — that pin
+// rides each agent independently (Config.DefaultModel is the LEAD default only, which
+// the worker's resolveLeadModel reads; pinned subagents bypass it), so claim assembly
+// only copies the pin through and the "pin wins over the schedule model" guarantee is
+// entirely worker-side and unchanged here.
+func TestClaimScheduleModelOverridesUserDefault(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgText("sonnet"))
+	fs.templates = []store.AgentTemplate{
+		{Name: "coder", Description: "writes code", PromptBody: "you code", Tools: []byte(`["Read","Edit"]`)},
+		{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgText("claude-opus-4-8")},
+	}
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.DefaultModel == nil || *payload.Config.DefaultModel != "fable" {
+		t.Fatalf("schedule model should beat the owner default; got %+v", payload.Config.DefaultModel)
+	}
+	// The subagent's own pin is orthogonal: the schedule model overrode only the LEAD
+	// default, not this agent's Model.
+	if payload.Agents[1].Model == nil || *payload.Agents[1].Model != "claude-opus-4-8" {
+		t.Fatalf("subagent pin must survive the schedule-model override; got %+v", payload.Agents[1].Model)
+	}
+}
+
+// PRD #300: the override fires regardless of whether the owner has a per-user default —
+// a frozen runs.model with the owner default left NULL still lands on Config.DefaultModel.
+func TestClaimScheduleModelOverridesEvenWithNoUserDefault(t *testing.T) {
+	fs := scheduleModelStore(t, pgText("fable"), pgtype.Text{})
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.DefaultModel == nil || *payload.Config.DefaultModel != "fable" {
+		t.Fatalf("schedule model should apply even without an owner default; got %+v", payload.Config.DefaultModel)
+	}
+}
+
+// PRD #300 Success Criterion 4 (regression): with runs.model NULL the schedule layer
+// changes nothing — Config.DefaultModel is the owner's per-user default exactly as
+// before #300, byte-identical on the wire.
+func TestClaimNoScheduleModelUsesUserDefault(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgText("sonnet"))
+
+	payload, err := New(fs, newBox(t), testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.DefaultModel == nil || *payload.Config.DefaultModel != "sonnet" {
+		t.Fatalf("owner default must ride when no schedule model is frozen; got %+v", payload.Config.DefaultModel)
+	}
+	// The no-override path must leave the serialised config carrying exactly the owner
+	// default — the schedule layer added nothing.
+	b, err := json.Marshal(payload.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(b), `"default_model":"sonnet"`) {
+		t.Fatalf("null run.model should leave the owner default untouched on the wire; got %s", b)
+	}
+}
+
 func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-DEFMODELERR-abcdef1234567890"))

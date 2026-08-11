@@ -44,6 +44,7 @@ func newScheduleCmd(env Env, gf *globalFlags) *cobra.Command {
 		newScheduleCreateCmd(env, gf),
 		newScheduleListCmd(env, gf),
 		newScheduleGetCmd(env, gf),
+		newScheduleEditCmd(env, gf),
 		newSchedulePauseCmd(env, gf),
 		newScheduleResumeCmd(env, gf),
 		newScheduleRunNowCmd(env, gf),
@@ -85,6 +86,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the PRD label)")
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
+	create.Flags().String("model", "", "model alias (opus/sonnet/haiku/fable) or a custom model ID for runs this schedule fires; empty inherits your Worker-model default (valid on all targets)")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
@@ -165,6 +167,14 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	if guidanceSet && (issueSet || sweep) {
 		guidance, _ := cmd.Flags().GetString("guidance")
 		req.Guidance = &guidance
+	}
+
+	// --model is valid on every target (a run's model is orthogonal to what it works on),
+	// so unlike --guidance/--max-issues it carries no target guard. Send it only when set so
+	// an unset flag stays absent (nil) rather than clearing.
+	if cmd.Flags().Changed("model") {
+		model, _ := cmd.Flags().GetString("model")
+		req.Model = &model
 	}
 
 	// Exactly one timing.
@@ -268,6 +278,196 @@ func newScheduleGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			return renderScheduleDetail(p, s)
 		},
 	}
+}
+
+func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
+	edit := &cobra.Command{
+		Use:   "edit <schedule-id>",
+		Short: "Edit a schedule's mutable config in place",
+		Long: "Edit the mutable configuration of an existing schedule WITHOUT churning its id\n" +
+			"or run history (unlike a delete-and-recreate). Any field you do not pass keeps its\n" +
+			"stored value, so you can change one thing without restating the rest. Editing config\n" +
+			"REVIVES a terminal schedule (status returns to active) — a recurring one resumes on\n" +
+			"its next fire, while a fired one-shot needs a fresh `--at` in the future. It does NOT\n" +
+			"un-pause: a paused schedule (enabled=false) stays paused after an edit; turning a\n" +
+			"schedule off or back on is `schedule pause`/`resume`, which this verb never touches.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			id := args[0]
+			s, err := c.GetSchedule(cmd.Context(), id)
+			if err != nil {
+				return err
+			}
+			req, err := buildScheduleEditRequest(cmd, s)
+			if err != nil {
+				return err
+			}
+			updated, err := c.PatchSchedule(cmd.Context(), id, req)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(updated)
+			}
+			if !gf.quiet {
+				p.Printf("updated %s · %s · next %s\n", updated.ID, scheduleWhen(updated), scheduleNext(updated, time.Now()))
+			}
+			return nil
+		},
+	}
+	edit.Flags().String("cron", "", "change to this recurring 5-field cron expression (switches timing to recurring)")
+	edit.Flags().String("at", "", "change to fire once at this RFC3339 time (switches timing to once)")
+	edit.Flags().String("tz", "", "change the IANA timezone the --cron expression is interpreted in")
+	edit.Flags().String("prompt", "", "change the ad-hoc prompt text (prompt-target schedules only)")
+	edit.Flags().StringArray("label", nil, "replace the sweep label selector (repeatable; sweep-target schedules only)")
+	edit.Flags().Bool("auto-approve", true, "set whether a fired run proceeds past the plan gate unattended")
+	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
+	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets only)")
+	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
+	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets only)")
+	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
+	return edit
+}
+
+// buildScheduleEditRequest builds a full ScheduleRequest for `schedule edit` from the
+// FETCHED schedule, then overlays only the flags the caller explicitly Changed().
+//
+// A typed rebuild from the DTO's config fields (rather than re-posting the raw DTO) is
+// deliberate: the PATCH endpoint decodes with DisallowUnknownFields, so the DTO's
+// response-only fields (id, status, created_at, updated_at, next_fire_at, last_fired_at,
+// next_fires, repo_id, repo_path) would be rejected as unknown → 400. It also compensates
+// for mergeSchedule, which is keep-on-empty for most fields but takes max_issues and
+// guidance STRAIGHT from the request (nil clears them) — so those two MUST be re-sent from
+// the fetched row, or a --cron-only edit would silently wipe them. Enabled is left nil so
+// a config edit never touches the pause flag (enable/disable is pause/resume's job).
+func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
+	req := apitypes.ScheduleRequest{
+		Target:    s.Target,
+		IssueIID:  s.IssueIID,
+		Labels:    s.Labels,
+		Prompt:    s.Prompt,
+		Timing:    s.Timing,
+		CronExpr:  s.CronExpr,
+		RunAt:     s.RunAt,
+		Timezone:  s.Timezone,
+		MaxIssues: s.MaxIssues,
+		Guidance:  s.Guidance,
+	}
+	// DTO carries these as plain bool; re-send as pointer copies (the config PATCH path
+	// always restates them). Enabled stays nil — see the doc comment.
+	autoApprove := s.AutoApprove
+	waitOnLimit := s.WaitOnLimit
+	req.AutoApprove = &autoApprove
+	req.WaitOnLimit = &waitOnLimit
+
+	f := cmd.Flags()
+	cronSet := f.Changed("cron")
+	atSet := f.Changed("at")
+	tzSet := f.Changed("tz")
+	promptSet := f.Changed("prompt")
+	labelSet := f.Changed("label")
+	autoSet := f.Changed("auto-approve")
+	waitSet := f.Changed("wait-on-limit")
+	guidanceSet := f.Changed("guidance")
+	maxIssuesSet := f.Changed("max-issues")
+	clearGuidance := f.Changed("clear-guidance")
+	clearMaxIssues := f.Changed("clear-max-issues")
+
+	// --cron and --at both restate TIMING; at most one may win.
+	if cronSet && atSet {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
+			"specify at most one timing: --cron <expr> (recurring) or --at <RFC3339> (once)")
+	}
+	// Target-scoped flags: reject an EXPLICIT set on the wrong target (mirrors create).
+	if promptSet && s.Target != schedTargetPrompt {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--prompt is only valid on a prompt-target schedule")
+	}
+	if labelSet && s.Target != schedTargetSweep {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--label is only valid on a sweep-target schedule")
+	}
+	if (guidanceSet || clearGuidance) && s.Target != schedTargetIssue && s.Target != schedTargetSweep {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--guidance/--clear-guidance are only valid on an issue or sweep target")
+	}
+	if (maxIssuesSet || clearMaxIssues) && s.Target != schedTargetSweep {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--max-issues/--clear-max-issues are only valid on a sweep target")
+	}
+	// Set-vs-clear conflicts: a field cannot be both changed and cleared in one edit.
+	if guidanceSet && clearGuidance {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--guidance and --clear-guidance are mutually exclusive")
+	}
+	if maxIssuesSet && clearMaxIssues {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--max-issues and --clear-max-issues are mutually exclusive")
+	}
+
+	changed := false
+	if cronSet {
+		cron, _ := f.GetString("cron")
+		req.Timing = schedTimingRecurring
+		req.CronExpr = cron
+		req.RunAt = nil
+		changed = true
+	}
+	if atSet {
+		atStr, _ := f.GetString("at")
+		runAt, err := parseAt(atStr)
+		if err != nil {
+			return apitypes.ScheduleRequest{}, err
+		}
+		req.Timing = schedTimingOnce
+		req.RunAt = &runAt
+		req.CronExpr = ""
+		changed = true
+	}
+	if tzSet {
+		tz, _ := f.GetString("tz")
+		req.Timezone = strings.TrimSpace(tz)
+		changed = true
+	}
+	if promptSet {
+		req.Prompt, _ = f.GetString("prompt")
+		changed = true
+	}
+	if labelSet {
+		req.Labels, _ = f.GetStringArray("label")
+		changed = true
+	}
+	if autoSet {
+		v, _ := f.GetBool("auto-approve")
+		req.AutoApprove = &v
+		changed = true
+	}
+	if waitSet {
+		v, _ := f.GetBool("wait-on-limit")
+		req.WaitOnLimit = &v
+		changed = true
+	}
+	if guidanceSet {
+		v, _ := f.GetString("guidance")
+		req.Guidance = &v
+		changed = true
+	}
+	if clearGuidance {
+		req.Guidance = nil
+		changed = true
+	}
+	if maxIssuesSet {
+		v, _ := f.GetInt("max-issues")
+		req.MaxIssues = &v
+		changed = true
+	}
+	if clearMaxIssues {
+		req.MaxIssues = nil
+		changed = true
+	}
+	if !changed {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "nothing to edit (pass at least one field to change)")
+	}
+	return req, nil
 }
 
 func newSchedulePauseCmd(env Env, gf *globalFlags) *cobra.Command {
@@ -472,6 +672,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		rows = append(rows, []string{"GUIDANCE", strOr(s.Guidance, "-")})
 	}
 	rows = append(rows,
+		[]string{"MODEL", strOr(s.Model, "-")},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
 		[]string{"ENABLED", boolStr(s.Enabled)},

@@ -15,12 +15,14 @@ unaffected.
 For your runs (the lead orchestrator, and any subagent whose own template
 leaves `model` unset), uzi resolves the model in this order:
 
-1. Your **Worker model** setting below, if set.
-2. The `lead` template's `model` (`opus` by default).
-3. Whatever the Claude Agent SDK/your Anthropic account defaults to.
+1. The **schedule's model**, if the run was started by a
+   [schedule](./scheduling.md) that pins one.
+2. Your **Worker model** setting below, if set.
+3. The `lead` template's `model` (`opus` by default).
+4. Whatever the Claude Agent SDK/your Anthropic account defaults to.
 
-A subagent with its own `model` override always uses that, regardless of
-your setting.
+A subagent with its own `model` override always uses that, regardless of the
+schedule model or your setting.
 
 ## Set your worker model
 
@@ -33,6 +35,20 @@ Leave it on **Inherit** (the default) to fall back to the `lead` template's
 model.
 
 ![Settings, Worker model, showing the model dropdown and Save model button](img/worker-model-settings.png)
+
+## Per-schedule model
+
+A [schedule](./scheduling.md) can run on its own model without changing your
+global Worker model — handy for a cheap recurring bot (e.g. a nightly
+"propose a feature" run on `fable`) while your interactive runs stay on your
+normal model.
+
+Set it in the schedule's create/edit form, in the **Model (optional)**
+control, or with `uzi schedule create --model <alias|id>`. Leaving it on
+Inherit uses your Worker model. The model a scheduled run actually used is
+shown on that run's detail page and by `uzi run get`. Same validation as the
+Worker model above (single token, at most 100 characters; blank means
+inherit).
 
 ## Good to know
 

@@ -75,6 +75,10 @@ type autopilotCall struct {
 	// value for CreateScheduledAutopilotRun (PRD #274 Decision 1a). A test proves the
 	// auto-approve scheduled path threads the schedule's wait_on_limit by reading it.
 	waitOnLimit *bool
+	// model is the schedule's per-schedule model override (PRD #300), captured so a later
+	// milestone (M3) can assert the frozen model was threaded onto the created run. nil for
+	// the poller-shaped CreateAutopilotRun (no per-run model).
+	model *string
 }
 
 type runCall struct {
@@ -88,12 +92,18 @@ type runCall struct {
 	// non-auto issue path to the waiver-free method — routing it through CreateRun
 	// instead would silently reopen the M4-review HIGH.
 	scheduled bool
+	// model is the schedule's per-schedule model override (PRD #300), captured for an M3
+	// assertion. nil for the interactive CreateRun (no per-schedule model).
+	model *string
 }
 
 type promptCall struct {
 	userID, repoID, scheduleID uuid.UUID
 	title, prompt              string
 	autoApprove, waitOnLimit   bool
+	// model is the schedule's per-schedule model override (PRD #300), captured for an M3
+	// assertion that the frozen model was threaded onto the prompt run.
+	model *string
 }
 
 type fakeRuns struct {
@@ -107,10 +117,11 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, false})
+	// nil model: the interactive CreateRun seam carries no per-schedule model (PRD #300).
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, false, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, _ *workersvc.SeededPlan) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, allowWithoutPRD bool, waitOnLimit *bool, model *string, _ *workersvc.SeededPlan) (store.Run, error) {
 	// The non-auto-approve scheduled path (PRD #196): recorded in the same `runs`
 	// bucket as CreateRun so the existing wait-on-limit / path-selection count
 	// assertions still observe it, but tagged scheduled=true so a test can prove the
@@ -118,34 +129,35 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true})
+	f.runs = append(f.runs, runCall{userID, repoID, issueIID, allowWithoutPRD, waitOnLimit, true, model})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	// nil waitOnLimit: the poller seam has no per-run choice (owner default). Kept so the
-	// interface stays satisfied even though the scheduler no longer calls it.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil})
+	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
+	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
+	// satisfied even though the scheduler no longer calls it.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, nil, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
-	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) so a test
-	// can prove the schedule's persisted wait_on_limit is threaded through.
+	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops) and the
+	// schedule's model (PRD #300) so a test can prove both are threaded through.
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit})
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, allowWithoutPRD, waitOnLimit, model})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool) (store.Run, error) {
+func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
-	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit})
+	f.prompts = append(f.prompts, promptCall{userID, repoID, scheduleID, title, prompt, autoApprove, waitOnLimit, model})
 	return store.Run{ID: uuid.New()}, nil
 }
 

@@ -654,6 +654,15 @@ export function RunView() {
                   for every claimed run, and the usage panel only appears once a run
                   has reported usage. */}
               <RunCredential run={run} />
+              {/* PRD #300: the per-schedule model this run froze at fire time, shown on
+                  EVERY status (not just completed) so a wrong/typo'd model is visible on a
+                  FAILED or stopped run too (Risks / SC6). null = inherited the owner's
+                  per-user Worker default. */}
+              {run.model && (
+                <Badge tone="neutral" title="Model this run was fired with (frozen by its schedule)">
+                  model {stripUnsafeChars(run.model)}
+                </Badge>
+              )}
             </div>
           </div>
         }

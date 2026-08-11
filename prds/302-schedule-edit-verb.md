@@ -1,7 +1,7 @@
 # PRD #302: `uzi schedule edit` verb (CLI patch for schedules)
 
 **GitLab Issue**: [#302](https://gitlab.example.com/vtmocanu/uzi/-/issues/302)
-**Status**: Draft (created 2026-08-10)
+**Status**: M1/M2/M4/M5 landed 2026-08-10; M3 (`--model`) deferred until PRD #300 adds `run_schedules.model` (Decision 4)
 **Priority**: Medium
 **Related**: PRD #241 (run schedules — the `PATCH /api/schedules/{id}` endpoint this verb finally exposes in full). PRD #274 (`MaxIssues`/`Guidance` — the nullable config fields whose replace-semantics dictate this verb's fetch-merge-send design). PRD #300 (per-schedule model — supplies the `model` field this verb's `--model` flag edits; the two are otherwise independent, see Decision 4). This verb is the general form of the CLI-parity gap #300's fable review surfaced.
 
@@ -51,14 +51,14 @@ client-side merge that compensates for the server's intentional replace.
 
 ## Milestones
 
-- [ ] **M1 — The `edit` verb (fetch-merge-send).** `uzi schedule edit <id>`
+- [x] **M1 — The `edit` verb (fetch-merge-send).** `uzi schedule edit <id>`
   reads the current schedule (`GET /api/schedules/{id}`), overlays the flags the
   caller passed, and PATCHes the full config. Flags mirror `create`'s mutable set:
   `--cron` / `--at`, `--tz`, `--prompt`, `--label` (repeatable), `--auto-approve[=false]`,
   `--wait-on-limit[=false]`, `--guidance`, `--max-issues`. An unpassed flag keeps
   the stored value. `--json` returns the updated `ScheduleDTO`.
 
-- [ ] **M2 — Clear affordances for the nullable fields.** Explicit clears
+- [x] **M2 — Clear affordances for the nullable fields.** Explicit clears
   distinct from "omit = keep", mirroring the API's tri-state: `--clear-guidance`,
   `--clear-max-issues` (and `--clear-model`, gated with M3). Passing both the set
   and clear form of one field is a usage error (exit 2).
@@ -70,13 +70,13 @@ client-side merge that compensates for the server's intentional replace.
   first — but M3 must not assume that ordering and should degrade cleanly if the
   field is not yet present.)
 
-- [ ] **M4 — Tests.** Unit: flag → request mapping; the survive-untouched
+- [x] **M4 — Tests.** Unit: flag → request mapping; the survive-untouched
   property (edit one field, assert the other config fields are unchanged in the
   sent body — the core guarantee); keep-vs-clear for each nullable field; the
   set+clear conflict. Integration: a create → edit → get round-trip that proves a
   single-field edit does not clear the others against a live server.
 
-- [ ] **M5 — Docs.** The embedded CLI skill source
+- [x] **M5 — Docs.** The embedded CLI skill source
   (`api/internal/uzicli/skill/SKILL.md`) documents the `edit` verb, its
   fetch-merge-send behavior, and the clear affordances (edit the embedded source,
   not the installed copy — it is overwritten on every `uzi` command). Command

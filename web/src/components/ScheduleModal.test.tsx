@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { ScheduleModal } from "./ScheduleModal";
-import { api } from "../lib/api";
+import { api, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -108,6 +108,72 @@ describe("keyboard: Escape closes the dialog", () => {
     );
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A recurring-sweep schedule fixture, submittable as-is (PRD #300 model round-trip).
+function schedFixture(over: Partial<Schedule> = {}): Schedule {
+  return {
+    id: "sch-1",
+    repo_id: "repo-uzi",
+    repo_path: "vtmocanu/uzi",
+    target: "sweep",
+    issue_iid: null,
+    labels: ["bug"],
+    prompt: "",
+    timing: "recurring",
+    cron_expr: "0 2 * * 1-5",
+    run_at: null,
+    timezone: "UTC",
+    next_fire_at: null,
+    last_fired_at: null,
+    auto_approve: true,
+    wait_on_limit: true,
+    max_issues: 10,
+    guidance: null,
+    model: "fable",
+    enabled: true,
+    status: "active",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    next_fires: [],
+    ...over,
+  };
+}
+
+describe("the per-schedule model control (PRD #300)", () => {
+  it("shows the frozen model when editing and flows a change into the submitted input", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture());
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ model: "fable" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    // The stored model prefills the shared ModelSelect (shown for every target).
+    const select = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(select.value).toBe("fable");
+
+    // Changing it to another alias flows into ScheduleInput.model on save.
+    fireEvent.change(select, { target: { value: "opus" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.model).toBe("opus");
+  });
+
+  it("clearing the control to Inherit sends explicit null (clear-to-inherit)", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ model: null }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture({ model: "fable" })} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    const select = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.model).toBeNull();
   });
 });
 
