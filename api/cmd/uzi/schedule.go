@@ -85,6 +85,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the PRD label)")
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
+	create.Flags().String("model", "", "model alias (opus/sonnet/haiku/fable) or a custom model ID for runs this schedule fires; empty inherits your Worker-model default (valid on all targets)")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
@@ -165,6 +166,14 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	if guidanceSet && (issueSet || sweep) {
 		guidance, _ := cmd.Flags().GetString("guidance")
 		req.Guidance = &guidance
+	}
+
+	// --model is valid on every target (a run's model is orthogonal to what it works on),
+	// so unlike --guidance/--max-issues it carries no target guard. Send it only when set so
+	// an unset flag stays absent (nil) rather than clearing.
+	if cmd.Flags().Changed("model") {
+		model, _ := cmd.Flags().GetString("model")
+		req.Model = &model
 	}
 
 	// Exactly one timing.
@@ -472,6 +481,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		rows = append(rows, []string{"GUIDANCE", strOr(s.Guidance, "-")})
 	}
 	rows = append(rows,
+		[]string{"MODEL", strOr(s.Model, "-")},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
 		[]string{"ENABLED", boolStr(s.Enabled)},

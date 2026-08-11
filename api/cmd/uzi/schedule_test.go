@@ -280,6 +280,75 @@ func TestScheduleGetDetailShowsGuidance(t *testing.T) {
 	}
 }
 
+// TestScheduleCreatePromptModel: --model is valid on EVERY target, so it must be
+// accepted on a prompt target (where --guidance would be rejected) and forwarded as a
+// non-nil *string. This proves --model is orthogonal to the target, not target-scoped.
+func TestScheduleCreatePromptModel(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_pm"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "uzi", "--prompt", "do a thing", "--model", "fable",
+		"--cron", "0 9 * * 1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (--model must be accepted on a prompt target)", code)
+	}
+	req := fc.LastCreateSchedReq
+	if req.Target != "prompt" {
+		t.Errorf("target = %q, want prompt", req.Target)
+	}
+	if req.Model == nil || *req.Model != "fable" {
+		t.Errorf("model = %v, want \"fable\"", req.Model)
+	}
+}
+
+// TestScheduleCreateIssueModel: --model rides an issue target too, forwarded as a
+// non-nil *string.
+func TestScheduleCreateIssueModel(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_im"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--model", "opus",
+		"--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.Model == nil || *req.Model != "opus" {
+		t.Errorf("model = %v, want \"opus\"", req.Model)
+	}
+}
+
+// TestScheduleCreateNoModel: an unset --model stays absent (nil) rather than clearing on
+// the PATCH-shaped payload.
+func TestScheduleCreateNoModel(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_nm"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.Model != nil {
+		t.Errorf("model = %v, want nil (unset flag stays absent)", req.Model)
+	}
+}
+
+// TestScheduleGetDetailShowsModel: the detail block carries a MODEL row on every target
+// — the frozen model when set, "-" when nil.
+func TestScheduleGetDetailShowsModel(t *testing.T) {
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_m":  {ID: "sch_m", Target: "prompt", Prompt: "do a thing", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, Model: sptr("fable")},
+		"sch_nm": {ID: "sch_nm", Target: "prompt", Prompt: "do a thing", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, Model: nil},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_m")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "MODEL") || !strings.Contains(out, "fable") {
+		t.Errorf("detail missing MODEL row with fable\n%s", out)
+	}
+	out2, _, _ := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_nm")
+	if !strings.Contains(out2, "MODEL") {
+		t.Errorf("detail missing MODEL row\n%s", out2)
+	}
+}
+
 // TestScheduleCreatePromptBody asserts the ad-hoc prompt target and that
 // --auto-approve=false is forwarded as a non-nil false (the plan gate is kept).
 func TestScheduleCreatePromptBody(t *testing.T) {
