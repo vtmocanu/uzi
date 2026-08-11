@@ -940,6 +940,16 @@ WHERE id = @id AND worker_id = @worker_id
   -- pre-run path (park -> answer -> re-plan -> submit_plan -> gate) and is legitimate,
   -- so we ALLOW the transition and clear the resolved id above instead.
   --
+  -- Post-#307 the clear here is a FALLBACK, not the normal path. The worker now emits a
+  -- `running` report when a clarification resolves with an answer (agent/src/runner.ts
+  -- `askUser` settle), so SetRunRunning normally intervenes on the resume and clears
+  -- open_question_id FIRST; by the time this statement runs the id is usually already
+  -- NULL. This clear is what still saves the run when that `running` report is dropped,
+  -- delayed, or never sent (a worker that dies between consuming the answer and
+  -- reporting) — the report is fire-and-forget, so the pre-run gate must not depend on
+  -- it having landed. The transition being allowed AND clearing the id keeps the
+  -- pre-run path correct in both the report-landed and report-absent cases.
+  --
   -- And awaiting_input IS still protected, just not here: its guard is SetRunRunning's
   -- consumed-answer identity predicate, which is where an un-park would actually have
   -- to happen. Said explicitly because "handled by opposite mechanisms" otherwise

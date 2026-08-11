@@ -437,4 +437,165 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
         `(a per-question deadline would land near ${budgetMs + answerDelayMs}ms)`,
     );
   });
+
+  /**
+   * PRD #307 — the fix under test. Delete the `v.kind === "answer"` `running`
+   * report in `askUser`'s `settle` (runner.ts) and this test reddens.
+   *
+   * Every run reports `running` ONCE at claim time (runner.ts:423), so "any running
+   * exists" does not discriminate. `askingExecutor` drives NO plan gate and NO
+   * `reportIteration`, so the ONLY thing that can put a SECOND `running` AFTER the
+   * awaiting_input park is settle's answer-verdict report. Pre-fix statuses are
+   * `[running, awaiting_input, completed]`; post-fix they gain a `running` between
+   * the park and completion. That inserted `running` is the whole behavioural fix:
+   * on the plan-phase resume it is the report that drives SetRunRunning, the one
+   * existing transition that clears `open_question_id`.
+   */
+  it("emits a `running` report after an ANSWER verdict resolves a park", async () => {
+    const log: AskLog = { asked: [], verdicts: [] };
+    const claim = claimFor(45);
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          answerInput(body.open_question_id, "proceed"),
+        ]);
+      }
+    });
+
+    await runnerFor(askingExecutor(1, log)).execute(claim);
+
+    const seq = statuses(claim.run_id);
+    const parkAt = seq.indexOf("awaiting_input");
+    assert.notStrictEqual(parkAt, -1, "the run must park on the question");
+    assert.strictEqual(
+      log.verdicts.at(0)?.kind,
+      "answer",
+      "positive control: the park resolved with an ANSWER verdict",
+    );
+    assert.ok(
+      seq.slice(parkAt + 1).includes("running"),
+      "a `running` report MUST follow the awaiting_input park — settle emits it on " +
+        "the answer verdict so the server runs SetRunRunning and clears " +
+        `open_question_id; statuses were ${JSON.stringify(seq)}`,
+    );
+    // And the report body carries status `running` explicitly (not merely a
+    // status-mismatched ack): find the first state AFTER the park and confirm it.
+    const parkIdx = api.states.findIndex(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_input",
+    );
+    const settleRunning = api.states.find(
+      (s, i) =>
+        i > parkIdx &&
+        s.runId === claim.run_id &&
+        s.body.status === "running",
+    );
+    assert.strictEqual(
+      settleRunning?.body.status,
+      "running",
+      "the settle report must carry status: running",
+    );
+  });
+
+  /**
+   * PRD #307 — the AUTOPILOT short-circuit must not park, and therefore never
+   * reaches settle's `running` at all. Mutation guarded: removing the autopilot
+   * early return in `askUser` (runner.ts) would make an autopilot run PARK.
+   *
+   * The honest observable is the NO-PARK property. An autopilot run may legitimately
+   * report `running` from other sources (claim-time at runner.ts:423), so counting
+   * `running` reports would not isolate the settle report; the autopilot return
+   * happens BEFORE `settle` is even defined, so the settle path is structurally
+   * unreachable here. Asserting "no awaiting_input ever" is the property that fails
+   * if the short-circuit is removed.
+   */
+  it("never parks (and so never emits a settle `running`) on the AUTOPILOT short-circuit", async () => {
+    const log: AskLog = { asked: [], verdicts: [] };
+    const claim = claimFor(46, { auto_approve: true });
+
+    await runnerFor(askingExecutor(1, log)).execute(claim);
+
+    assert.ok(
+      !statuses(claim.run_id).includes("awaiting_input"),
+      "an autopilot run must NEVER enter awaiting_input; settle's `running` " +
+        "(PRD #307) is unreachable because autopilot returns before `settle` is defined",
+    );
+    assert.strictEqual(
+      log.verdicts.at(0)?.kind,
+      "answer",
+      "the autopilot short-circuit still resolves the ask with a sentinel answer",
+    );
+    assert.strictEqual(statuses(claim.run_id).at(-1), "completed");
+  });
+
+  /**
+   * PRD #307 — the TIMEOUT path resolves the park by THROWING
+   * REASON_QUESTION_TIMEOUT before `settle` is ever called, so no `running` may appear
+   * after the awaiting_input park. This is a PROPERTY assertion (a timed-out park must
+   * surface as `failed`, never `running`), and its scope is worth stating honestly:
+   * because timeout throws before `settle`, an "emit `running` unconditionally inside
+   * settle" mutation would still NOT redden this test — settle is unreachable on
+   * timeout — so this test does NOT exercise the `v.kind === "answer"` guard. What it
+   * guards is that no SETTLE `running` — a bare `{status:"running"}` — spuriously
+   * reports after the park (e.g. a report moved ahead of the race, or into a
+   * catch/finally).
+   *
+   * The claim-time `running` (runner.ts:423) precedes the park (it is AWAITED), so the
+   * discriminating fact is the ABSENCE of a bare `running` AFTER the park.
+   *
+   * Why "bare": the runner ALSO emits an informational repo-agents roster report,
+   * `void reportState({status:"running", repo_agents})` at runner.ts:630, as
+   * fire-and-forget during setup. Its landing order relative to the awaited park is not
+   * guaranteed, so under CPU contention (CI) it can be recorded AFTER the park — a
+   * legitimate report unrelated to settle. It carries a `repo_agents` field, whereas a
+   * settle `running` does not, so the assertion below excludes it. (`indexOf`-on-status
+   * would false-fail on that roster report; this was the 2026-08-11 CI flake.)
+   *
+   * (cancel path) The verdict union is `answer | cancel` only, and CANCEL is the path
+   * that actually reaches `settle` with a non-answer verdict — so the `v.kind ===
+   * "answer"` guard's real job is to suppress the report on cancel. That mutation (drop
+   * the guard, emit unconditionally) reddens on a CANCEL, not on this timeout. A cancel
+   * is not cleanly injectable through the FakeApi input seam without steering-channel
+   * scaffolding, so it is deliberately not given its own test; the guard's answer-side
+   * is exercised positively by the answer test above, and its shape (`=== "answer"`) is
+   * what makes the cancel case fall through. Documented rather than half-tested.
+   */
+  it("emits NO settle `running` on the TIMEOUT path (the park never resolves with an answer)", async () => {
+    const log: AskLog = { asked: [], verdicts: [] };
+    const claim = claimFor(47);
+    // Deliberately inject NO answer: the single question expires on its deadline.
+    await runnerFor(askingExecutor(1, log)).execute(claim);
+
+    const seq = statuses(claim.run_id);
+    assert.notStrictEqual(
+      seq.indexOf("awaiting_input"),
+      -1,
+      "the run must park on the question",
+    );
+    assert.strictEqual(
+      failureReason(claim.run_id),
+      REASON_QUESTION_TIMEOUT,
+      "the unanswered question must expire the run",
+    );
+    assert.strictEqual(
+      seq.at(-1),
+      "failed",
+      "the run ends failed, not running",
+    );
+    // Index into the report BODIES (not the flattened status list): a bare `running`
+    // after the park is a settle report; the roster `running` (repo_agents present) is
+    // excluded because its fire-and-forget landing order vs. the awaited park is not
+    // guaranteed. See the doc comment above.
+    const runStates = api.states.filter((s) => s.runId === claim.run_id);
+    const parkPos = runStates.findIndex(
+      (s) => s.body.status === "awaiting_input",
+    );
+    const settleRunningAfterPark = runStates
+      .slice(parkPos + 1)
+      .some((s) => s.body.status === "running" && s.body.repo_agents === undefined);
+    assert.ok(
+      !settleRunningAfterPark,
+      "a timed-out park must NOT emit a settle `running` — there is no answer " +
+        `verdict; report bodies were ${JSON.stringify(runStates.map((s) => s.body))}`,
+    );
+  });
 });

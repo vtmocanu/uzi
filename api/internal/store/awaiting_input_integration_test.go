@@ -313,15 +313,23 @@ func TestSetRunRunningClearsOpenQuestionLiveDB(t *testing.T) {
 	}
 }
 
-// D-AG regression: the PRE-RUN path. A run that parks before it plans reaches the
-// plan gate WITHOUT an intervening `running` report, so SetRunRunning's clear is never
-// reached and only SetRunAwaitingApproval's can save it.
+// D-AG regression: the PRE-RUN path, FALLBACK case. Post-#307 the worker normally DOES
+// emit a `running` report when a clarification resolves with an answer, so SetRunRunning
+// usually intervenes on the pre-run resume and clears open_question_id first. This test
+// deliberately exercises the case where that report is DROPPED or ABSENT (a worker that
+// dies between consuming the answer and reporting, or a lost/late fire-and-forget
+// report): it drives SetRunAwaitingInput -> answer -> ConsumeRunInputs ->
+// SetRunAwaitingApproval with NO intervening SetRunRunning, so SetRunAwaitingApproval's
+// own clear is the ONLY thing that can save the run. That path is still reachable and
+// still necessary — the #307 report is best-effort, so the pre-run gate must not depend
+// on it having landed — which is why this remains a valid regression.
 //
 // This is the chain the runner-layer "B2, WORKER half" tests cannot express, and the
 // reason is worth stating: they reason about the id lifecycle correctly but assume
 // SetRunRunning always intervenes between a park and the next question. True mid-run,
-// false pre-run — and M4 added the pre-run path AFTER those tests were written. The
-// tests never became wrong, only insufficient, which is why nothing went red.
+// and true pre-run too WHEN the #307 report lands — but this test pins the case where it
+// does not. M4 added the pre-run path AFTER those tests were written; the tests never
+// became wrong, only insufficient, which is why nothing went red.
 func TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
