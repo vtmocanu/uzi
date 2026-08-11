@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   canPromote,
   DEFAULT_BOARD_EXTRA_LABELS,
+  highlightSegments,
   isEligibleCard,
   isMemberCard,
   isPRDCard,
   isSelfImproveTracker,
+  matchesQuery,
   SELF_IMPROVE_LABEL,
   visibleCards,
 } from "./boardCards";
@@ -209,5 +211,121 @@ describe("canPromote", () => {
     // that narrowly on purpose: the comment that used to claim this was the ordinary
     // post-close window was wrong.
     expect(canPromote(card(["documentation"], true), eligible)).toBe(false);
+  });
+});
+
+describe("matchesQuery", () => {
+  const qcard = (iid: number, title: string, labels: string[] = []) => ({ iid, title, labels });
+
+  it("matches every card on an empty or whitespace query", () => {
+    expect(matchesQuery(qcard(1, "anything"), "")).toBe(true);
+    expect(matchesQuery(qcard(1, "anything"), "   ")).toBe(true);
+  });
+
+  it("matches a title substring, case-insensitively", () => {
+    expect(matchesQuery(qcard(1, "Add dashboard"), "dash")).toBe(true);
+    expect(matchesQuery(qcard(1, "Add dashboard"), "DASH")).toBe(true);
+    expect(matchesQuery(qcard(1, "Add dashboard"), "widget")).toBe(false);
+  });
+
+  it("matches any label substring, case-insensitively", () => {
+    expect(matchesQuery(qcard(1, "t", ["bug"]), "BUG")).toBe(true);
+    expect(matchesQuery(qcard(1, "t", ["needs-triage"]), "triage")).toBe(true);
+    expect(matchesQuery(qcard(1, "t", ["bug"]), "security")).toBe(false);
+  });
+
+  it("matches the iid, stripping a single leading '#', as a substring", () => {
+    // #42 matches iid 429 and 142 — a partial issue number is a useful search.
+    expect(matchesQuery(qcard(429, "t"), "#42")).toBe(true);
+    expect(matchesQuery(qcard(142, "t"), "#42")).toBe(true);
+    expect(matchesQuery(qcard(7, "t"), "#42")).toBe(false);
+    // A bare number (no '#') hits the iid arm too.
+    expect(matchesQuery(qcard(429, "t"), "42")).toBe(true);
+  });
+
+  it("does not treat a lone '#' as an iid query", () => {
+    // Stripping the single '#' leaves an empty remainder, so the iid arm is skipped;
+    // only the title/label substring test remains (which no plain title contains).
+    expect(matchesQuery(qcard(429, "issue"), "#")).toBe(false);
+  });
+
+  it("returns false when nothing matches", () => {
+    expect(matchesQuery(qcard(429, "Add dashboard", ["bug"]), "zzz")).toBe(false);
+  });
+});
+
+describe("highlightSegments", () => {
+  const concat = (segs: { text: string; hit: boolean }[]) => segs.map((s) => s.text).join("");
+
+  it("returns one non-hit segment when there is no match", () => {
+    expect(highlightSegments("Add dashboard", "widget")).toEqual([
+      { text: "Add dashboard", hit: false },
+    ]);
+  });
+
+  it("marks a match at the start", () => {
+    expect(highlightSegments("dashboard", "dash")).toEqual([
+      { text: "dash", hit: true },
+      { text: "board", hit: false },
+    ]);
+  });
+
+  it("marks a match in the middle", () => {
+    expect(highlightSegments("Add dashboard now", "dashboard")).toEqual([
+      { text: "Add ", hit: false },
+      { text: "dashboard", hit: true },
+      { text: " now", hit: false },
+    ]);
+  });
+
+  it("marks a match at the end", () => {
+    expect(highlightSegments("the bug", "bug")).toEqual([
+      { text: "the ", hit: false },
+      { text: "bug", hit: true },
+    ]);
+  });
+
+  it("marks every occurrence and preserves the text's original casing", () => {
+    // The match test is case-insensitive but the emitted text keeps the source casing.
+    const segs = highlightSegments("Bug bug BUG", "bug");
+    expect(segs).toEqual([
+      { text: "Bug", hit: true },
+      { text: " ", hit: false },
+      { text: "bug", hit: true },
+      { text: " ", hit: false },
+      { text: "BUG", hit: true },
+    ]);
+    expect(concat(segs)).toBe("Bug bug BUG");
+  });
+
+  it("does not overlap matches (scans past each match)", () => {
+    // "aa" in "aaa": one match at 0, then a trailing non-hit "a" — never two overlapping.
+    expect(highlightSegments("aaa", "aa")).toEqual([
+      { text: "aa", hit: true },
+      { text: "a", hit: false },
+    ]);
+  });
+
+  it("treats an empty or whitespace query as a single non-hit segment", () => {
+    expect(highlightSegments("Add dashboard", "")).toEqual([
+      { text: "Add dashboard", hit: false },
+    ]);
+    expect(highlightSegments("Add dashboard", "  ")).toEqual([
+      { text: "Add dashboard", hit: false },
+    ]);
+  });
+
+  it("returns [] for empty text", () => {
+    expect(highlightSegments("", "")).toEqual([]);
+    expect(highlightSegments("", "dash")).toEqual([]);
+  });
+
+  it("never interprets the query as a regular expression", () => {
+    // A regex-special query is matched literally: ".*" only hits the literal ".*".
+    expect(highlightSegments("a.*b and axyzb", ".*")).toEqual([
+      { text: "a", hit: false },
+      { text: ".*", hit: true },
+      { text: "b and axyzb", hit: false },
+    ]);
   });
 });

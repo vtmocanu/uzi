@@ -32,14 +32,16 @@ import {
 } from "../lib/runBadge";
 import { runDurationLabel } from "../lib/runDuration";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { visibleColumns } from "../lib/boardColumns";
+import { lanePaging, visibleColumns } from "../lib/boardColumns";
 import { boundedChips, chipLabels, hoistLabels } from "../lib/labelChips";
 import {
   canPromote,
   DEFAULT_BOARD_EXTRA_LABELS,
+  highlightSegments,
   isEligibleCard,
   isPRDCard,
   isSelfImproveTracker,
+  matchesQuery,
   SELF_IMPROVE_LABEL,
   visibleCards,
 } from "../lib/boardCards";
@@ -64,6 +66,14 @@ import { stripUnsafeChars } from "../lib/safeText";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
+
+// PRD #304. A lane renders its per-lane cap (default 10) cards, then reveals one PAGE
+// (up to 50) at a time. The cap is a RENDER-only slice — cardsByColumn stays full, so
+// the reorder anchors still see the whole lane (Decision 2). PER_LANE_OPTIONS is the
+// density control's choice set; a hand-edited or missing pref falls back to the default.
+const PAGE = 50;
+const DEFAULT_PER_LANE = 10;
+const PER_LANE_OPTIONS = [5, 10, 20] as const;
 
 // Stable accents for working columns, cycled by position.
 const COLUMN_ACCENTS = ["bg-info", "bg-brand", "bg-warn", "bg-ok", "bg-danger"];
@@ -235,6 +245,48 @@ export function Board() {
     [repoId],
   );
 
+  // Board search (PRD #304 M2). A live, client-side filter over the already-loaded
+  // cards. `q` is the trimmed query; `searchActive` gates every "while searching"
+  // behaviour (caps lift, empty lanes drop, the result count). It narrows renderCards
+  // AFTER visibleCards and BEFORE the cardsByColumn memo (Decision 6) — payloadCards is
+  // never touched, so the reorder freeze stays correct (Decision 2).
+  const [query, setQuery] = useState("");
+  const q = query.trim();
+  const searchActive = q.length > 0;
+  // The search input is focused (M5, `/`) via its stable id rather than a ref: the
+  // shared <Input> is a plain function component, not forwardRef, so a ref on it would
+  // be dropped in React 18 — and ui.tsx is outside this change's scope. Escape blurs via
+  // the keydown event's currentTarget, so it needs no handle at all.
+  const SEARCH_INPUT_ID = "board-search";
+
+  // Per-lane default (PRD #304 M4). A per-browser, per-repo VIEW preference (density,
+  // not policy), so it lives in prefs beside hideEmpty/sortMode — including the
+  // useEffect re-read on repoId, because the route swaps :id without remounting and a
+  // lazy initialiser only ever runs for the first repo (the trap those two document,
+  // fixed in this file once already). A hand-edited or missing value degrades to the
+  // default rather than selecting an unsupported cap.
+  const perLaneKey = `uzi.board.${repoId}.perLane`;
+  const readPerLane = (v: unknown): number =>
+    typeof v === "number" && (PER_LANE_OPTIONS as readonly number[]).includes(v) ? v : DEFAULT_PER_LANE;
+  const [perLane, setPerLaneState] = useState(() => readPerLane(prefs.get(perLaneKey, DEFAULT_PER_LANE)));
+  useEffect(() => {
+    setPerLaneState(readPerLane(prefs.get(`uzi.board.${repoId}.perLane`, DEFAULT_PER_LANE)));
+  }, [repoId]);
+  const setPerLane = (next: number) => {
+    setPerLaneState(next);
+    prefs.set(perLaneKey, next);
+  };
+
+  // Per-lane reveal state (PRD #304 M1/M2): how many cards each lane has been asked to
+  // show beyond its baseline. lanePaging() clamps a missing/low entry up to the
+  // baseline, so `{}` means "every lane at its starting size". Re-baselined (reset to
+  // {}) whenever the search toggles, the per-lane default changes, or the repo changes —
+  // each of those moves what the baseline IS, so a stale reveal count would be wrong.
+  const [shownCounts, setShownCounts] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setShownCounts({});
+  }, [searchActive, perLane, repoId]);
+
   // The live insertion point during a drag: which card the pointer is over and which
   // edge. Driven by dragIid + this state, never by reading e.dataTransfer in
   // onDragOver — the HTML drag-and-drop model puts the drag data store in protected
@@ -345,6 +397,24 @@ export function Board() {
     setAnnouncement(text);
     const timer = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
     toastTimers.current.push(timer);
+  }, []);
+
+  // M5: `/` focuses the search input, the ubiquitous "search" shortcut. Only when the
+  // user is NOT already typing somewhere (an input, textarea or contenteditable), so it
+  // never steals a literal slash mid-word. Guarded/cleaned up like the Issues-popover
+  // effect above; a document listener because the target is a specific input, not the
+  // focused element.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "/") return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
+      e.preventDefault();
+      document.getElementById(SEARCH_INPUT_ID)?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
   }, []);
 
   // iids the operator moved by hand within the last poll window. The column change
@@ -641,6 +711,32 @@ export function Board() {
     [payloadCards, membershipLabels, showAll],
   );
 
+  // Board search filter (PRD #304 M2, Decision 6): membership → SEARCH → sort → cap.
+  // Applied to renderCards (post-membership) and consumed by cardsByColumn, which then
+  // sorts and the lane loop slices. An empty query is the identity, so the board reads
+  // exactly as it did before search when nothing is typed. payloadCards is untouched —
+  // the reorder freeze must never see a filtered set (Decision 2).
+  const searchedCards = useMemo(
+    () => (q ? renderCards.filter((c) => matchesQuery(c, q)) : renderCards),
+    [renderCards, q],
+  );
+
+  // M5: announce the result count through the EXISTING sr-only live region (no second
+  // region), DEBOUNCED and last-writer-wins. That region is the single-string channel
+  // pushToast also feeds, so a per-keystroke announcement would spam assistive tech and
+  // race the auto-move toasts — the 300ms timer collapses a burst of typing to one
+  // announcement. Only while a search is active; clearing the query stops announcing
+  // (it does not announce "0 results" for an emptied box). Declared here, after
+  // searchedCards, because it reads its length.
+  useEffect(() => {
+    if (!searchActive) return;
+    const n = searchedCards.length;
+    const timer = setTimeout(() => {
+      setAnnouncement(`${n} result${n === 1 ? "" : "s"}`);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchActive, searchedCards.length]);
+
   // persistPrefs writes the server row OPTIMISTICALLY (PRD #196 M3): the caller has
   // already updated local state so the toggle feels instant. On a failed PUT surface
   // the error and reload the row to resync, so the client never silently diverges from
@@ -761,7 +857,7 @@ export function Board() {
 
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
-    for (const c of sortCards(renderCards, sortMode)) {
+    for (const c of sortCards(searchedCards, sortMode)) {
       const key = columnKeyForCard(c);
       const arr = map.get(key) ?? [];
       arr.push(c);
@@ -781,7 +877,7 @@ export function Board() {
     const closed = map.get(CLOSED_KEY);
     if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
     return map;
-  }, [renderCards, sortMode]);
+  }, [searchedCards, sortMode]);
 
   // applyDrop is THE single order-computing path. A pointer drop and a keyboard ↑/↓
   // both land here with the same three arguments, so the two gestures cannot drift:
@@ -849,6 +945,15 @@ export function Board() {
         // authoritative board replaces this one, matching move()'s snap-back contract.
         setBoard(fresh);
         setSortMode("manual");
+        // Auto-reveal (PRD #304 M1): a card moved or dropped PAST the per-lane cap must
+        // not vanish into the hidden window. intent.iids is the destination column's
+        // full new iid order, so the dragged card's index there is its rank in the lane;
+        // bump the lane's shownCount to include it. Over-revealing slightly is safe.
+        // moveCard routes through applyDrop, so keyboard moves are covered too.
+        const idx = intent.iids.indexOf(dragIid);
+        if (idx >= 0) {
+          setShownCounts((m) => ({ ...m, [destKey]: Math.max(m[destKey] ?? 0, idx + 1) }));
+        }
         return true;
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Could not save the new order");
@@ -904,10 +1009,15 @@ export function Board() {
   // next poll. A live drag reveals every lane so they stay drop targets, which
   // drives hiddenCount to 0 — the toolbar hint (gated on hiddenCount > 0) simply
   // disappears mid-drag rather than reading "0 hidden".
+  //
+  // PRD #304 M2: an active search ALSO drops empty lanes — a query with no match in a
+  // lane should not leave that lane's header taking space — so it composes with
+  // hideEmpty here (`hideEmpty || searchActive`). It still yields to a live drag, which
+  // reveals every lane, because visibleColumns returns all columns when dragActive.
   const visible = visibleColumns(
     columns,
     (key) => cardsByColumn.get(key)?.length ?? 0,
-    hideEmpty,
+    hideEmpty || searchActive,
     dragIid != null,
   );
   const hiddenCount = columns.length - visible.length;
@@ -925,6 +1035,16 @@ export function Board() {
 
   return (
     <div className="space-y-5">
+      {/* M3: the toolbar pins so search stays reachable while a long lane scrolls. The
+          app shell scrolls the WINDOW and neither <main> owns an overflow ancestor
+          (AppShell.tsx), so plain `sticky top-0` is expected to hold; z-10 sits below
+          the mobile shell's own sticky top bar (z-20). bg-ink is the page-background
+          token (tailwind.config.js: `ink: token("bg")`) — an OPAQUE backing so cards
+          scroll cleanly under it (plain `bg-bg` is not a real class and renders
+          transparent). On mobile the shell's own bar is a 49px-tall sticky top-0 z-20
+          strip, so offset below it; on lg the shell bar is hidden and we pin at 0.
+          Verified in a browser pass. */}
+      <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
         backLabel="Boards"
@@ -944,6 +1064,26 @@ export function Board() {
         description={boardDescription}
         actions={
           <>
+            {/* M3: board search. First in the toolbar so it is the primary action; the
+                label is sr-only (the placeholder carries the visible affordance) and the
+                ref lets `/` focus it (M5). Escape clears the query and blurs. */}
+            <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
+              Search issues
+            </label>
+            <Input
+              id={SEARCH_INPUT_ID}
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setQuery("");
+                  e.currentTarget.blur();
+                }
+              }}
+              placeholder="Search issues…"
+              className="w-44 py-1 text-xs"
+            />
             {/* A real <label> around the repo's Select, so the control is named for a
                 screen reader without any custom markup. */}
             <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
@@ -956,6 +1096,23 @@ export function Board() {
                 {SORT_MODES.map((m) => (
                   <option key={m.value} value={m.value}>
                     {m.label}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            {/* Per-lane density (PRD #304 M4), mirroring the Sort control's markup.
+                Changing it re-baselines every lane's shownCount (the effect on
+                [searchActive, perLane, repoId]). */}
+            <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+              Per lane
+              <Select
+                value={String(perLane)}
+                onChange={(e) => setPerLane(Number(e.target.value))}
+                className="py-1 text-xs"
+              >
+                {PER_LANE_OPTIONS.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
                   </option>
                 ))}
               </Select>
@@ -1012,6 +1169,17 @@ export function Board() {
           </>
         }
       />
+      {/* Board-level result count (PRD #304 M2): only while a search is active, so a
+          user knows the board is filtered and by how much. Pinned with the toolbar.
+          Purely VISUAL — deliberately NOT a live region: the count is announced through
+          the existing sr-only role=status region, debounced (M5), so a second announcing
+          region here would spam assistive tech on every keystroke. */}
+      {searchActive && (
+        <p className="px-1 pb-2 text-xs text-muted">
+          {searchedCards.length} result{searchedCards.length === 1 ? "" : "s"}
+        </p>
+      )}
+      </div>
 
       {/* S5: ALWAYS MOUNTED, and that is the entire fix. A live region must exist
           before its content changes for assistive tech to announce the change; a
@@ -1082,6 +1250,18 @@ export function Board() {
       <div className="flex items-start gap-4 overflow-x-auto pb-4">
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
+          // Per-lane paging (PRD #304 M1/M2). `cards` stays FULL — it drives the count
+          // badge, the reorder-anchor gating (canMoveDown reads cards.length) and the
+          // append-to-end drop — while `shown` is the render-only slice. A search lifts
+          // the cap to a page (searchActive → baseline = page inside lanePaging).
+          const paging = lanePaging({
+            total: cards.length,
+            shownCount: shownCounts[col.key] ?? 0,
+            cap: perLane,
+            page: PAGE,
+            searchActive,
+          });
+          const shown = cards.slice(0, paging.render);
           const isTarget = dropTarget === col.key && col.droppable;
           const closedCol = col.key === CLOSED_KEY;
           // An empty lane only visible because a drag is in progress: dim it so it
@@ -1122,11 +1302,16 @@ export function Board() {
                   {col.label}
                 </span>
                 <span className="ml-auto rounded-md bg-raised px-1.5 py-0.5 text-[11px] tabular-nums text-faint">
-                  {cards.length}
+                  {/* `render/total` when the lane is capped (PRD #304 M2's N/M), else the
+                      plain total. */}
+                  {paging.countLabel || String(cards.length)}
                 </span>
               </div>
-              <div className="flex flex-col gap-2">
-                {cards.map((card, i) => {
+              {/* When expanded past its baseline the lane scrolls INTERNALLY within a
+                  bounded height, so clicking Show more on a huge lane cannot grow the
+                  page to hundreds of rows tall (Decision 3). */}
+              <div className={cx("flex flex-col gap-2", paging.canCollapse && "max-h-[70vh] overflow-y-auto")}>
+                {shown.map((card, i) => {
                   // The extras this card carries are the "why this card is here"
                   // chips (PRD #196): hoisted ahead of MAX_CARD_CHIPS (Decision 11) so
                   // they cannot fall into the "+N" overflow, and highlighted (mock §4).
@@ -1151,6 +1336,9 @@ export function Board() {
                     projectWebUrl={board?.web_url}
                     chips={hoistLabels(chipLabels(card.labels, chipExclusions), matchedExtras)}
                     highlightLabels={matchedExtras}
+                    // The active query, so the card highlights the matched substring in
+                    // its title and any matching chip (PRD #304 M2). "" when not searching.
+                    query={q}
                     laneLabel={col.label}
                     // Reorder controls exist only in a droppable lane, and only where
                     // there is somewhere to go. Closed is not a drop target, so its
@@ -1273,6 +1461,46 @@ export function Board() {
                   </p>
                 )}
               </div>
+              {/* Paging affordances (PRD #304 M1). Outside the bounded scroll region
+                  above so they stay visible below a scrolling card list. Show more
+                  reveals one page; Collapse returns the lane to its baseline; and past
+                  two pages of remainder a nudge points at search rather than a "show
+                  all" that would rebuild the wall. Accessible names carry the counts /
+                  lane name (M5). */}
+              {(paging.showMoreBy > 0 || paging.canCollapse || (paging.nudgeSearch && !searchActive)) && (
+                <div className="mt-2 flex flex-col gap-1.5">
+                  {paging.showMoreBy > 0 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setShownCounts((m) => ({
+                          ...m,
+                          [col.key]: (m[col.key] ?? (searchActive ? PAGE : perLane)) + PAGE,
+                        }))
+                      }
+                      aria-label={`Show ${paging.showMoreBy} more in ${col.label}, ${paging.remaining} hidden`}
+                      className="rounded-md border border-edge bg-raised px-2 py-1 text-xs text-muted transition-colors hover:text-fg"
+                    >
+                      Show {paging.showMoreBy} more · {paging.remaining} left
+                    </button>
+                  )}
+                  {paging.canCollapse && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setShownCounts((m) => ({ ...m, [col.key]: searchActive ? PAGE : perLane }))
+                      }
+                      aria-label={`Collapse ${col.label}`}
+                      className="self-start text-xs text-faint transition-colors hover:text-muted"
+                    >
+                      Collapse
+                    </button>
+                  )}
+                  {paging.nudgeSearch && !searchActive && (
+                    <p className="text-[11px] text-faint">Too many to show — use search to narrow.</p>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -1298,6 +1526,33 @@ export function Board() {
   );
 }
 
+// Highlighted renders `text`, wrapping every case-insensitive occurrence of `query` in
+// a <mark> (PRD #304 M2/M5). <mark> is SEMANTIC — it carries the "this is a search hit"
+// meaning to assistive tech, not color alone. The caller passes the ALREADY
+// display-sanitized string (titles/labels go through stripUnsafeChars), so
+// highlightSegments does no sanitizing and the segments are safe to render. An empty
+// query yields a single non-hit segment, so the text renders unchanged off-search.
+function Highlighted({ text, query }: { text: string; query: string }) {
+  return (
+    <>
+      {highlightSegments(text, query).map((seg, i) =>
+        seg.hit ? (
+          <mark key={i} className="rounded-[2px] bg-warn/30 text-fg">
+            {seg.text}
+          </mark>
+        ) : (
+          // A BARE string, not a wrapping <span>: off-search this leaves the parent
+          // (the title Link / the chip span) with a single direct text node, so an
+          // existing getByText/title-attribute lookup still resolves to that parent
+          // exactly as it did before highlighting existed. React does not require a key
+          // on a plain-string array child, so no warning.
+          seg.text
+        ),
+      )}
+    </>
+  );
+}
+
 /**
  * One board card. Exported for the same reason RunView factors out its panels: `Board`
  * itself needs routing, four API mocks and a drag context to mount, and this file had NO
@@ -1310,6 +1565,7 @@ export function IssueCard({
   projectWebUrl,
   chips,
   highlightLabels = [],
+  query,
   maxChips,
   laneLabel,
   canMoveUp,
@@ -1350,6 +1606,11 @@ export function IssueCard({
   // label is in this set gets the brand "hit" treatment — it is why the card is on the
   // board. Defaults to none so the direct-render tests need not supply it.
   highlightLabels?: string[];
+  // The active board search query (PRD #304 M2). When non-empty, the card highlights
+  // every case-insensitive occurrence of it in the title and in any matching chip via
+  // <mark>. Optional and defaulting to none so the direct-render tests need not supply
+  // it, and so a card outside a search renders exactly as before.
+  query?: string;
   // Overrides MAX_CARD_CHIPS. Exists so the cap-0 edge — where every label is overflow
   // and a shownChips-gated row would drop the "+N" along with them — is reachable from
   // a test without changing the shipped cap.
@@ -1526,8 +1787,10 @@ export function IssueCard({
           className="font-medium leading-snug text-fg hover:text-brand-hover"
         >
           {/* Issue #124: the forge issue title, writable by anyone who can open an issue
-              on the repo. Display only — the link targets card.iid, not this string. */}
-          {stripUnsafeChars(card.title)}
+              on the repo. Display only — the link targets card.iid, not this string.
+              Highlighted passes the ALREADY-sanitized string to highlightSegments, so
+              the marked segments are safe for the same reason their input is (PRD #304). */}
+          <Highlighted text={stripUnsafeChars(card.title)} query={query ?? ""} />
         </Link>
         <div className="flex shrink-0 items-center gap-1.5">
           {/* Keyboard reorder (PRD #102 M5). NOT redundant with the drag: native HTML5
@@ -1669,7 +1932,7 @@ export function IssueCard({
                   hit ? "border-brand/50 bg-brand/10 text-brand" : "border-edge bg-raised text-muted",
                 )}
               >
-                {stripUnsafeChars(l)}
+                <Highlighted text={stripUnsafeChars(l)} query={query ?? ""} />
               </span>
             );
           })}

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { Board, IssueCard } from "./Board";
 import { api, type Board as BoardData, type Card, type LatestRun } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -601,7 +601,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     renderBoard();
     await screen.findByText("Backlog");
     // Start somewhere other than Manual so the flip is observable.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "updated" } });
     expect(store.get("uzi.board.repo-1.sortMode")).toBe('"updated"');
 
     // Under `updated` the lane renders 4,3,2,1, so card 4 is FIRST and its up button
@@ -614,7 +614,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     mockApi.reorderBoard.mockRejectedValue(new Error("boom"));
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "title" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "title" } });
     fireEvent.click(moveBtn(1, "down"));
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
     expect(store.get("uzi.board.repo-1.sortMode")).toBe('"title"');
@@ -626,7 +626,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     // re-sort the board under the user's hand and read as having scrambled it.
     renderBoard();
     await screen.findByText("Backlog");
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "updated" } });
     // Backlog now displays 4,3,2,1 (newest first) — the reverse of iid order.
     fireEvent.click(moveBtn(4, "down"));
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
@@ -643,7 +643,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
 
     // Manual is the identity over the payload: 1,2,3,4 as the server sent them.
     expect(titlesIn(laneFor("Backlog"))).toEqual(["issue one", "issue two", "issue three", "issue four"]);
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "updated" } });
     expect(titlesIn(laneFor("Backlog"))).toEqual(["issue four", "issue three", "issue two", "issue one"]);
   });
 
@@ -960,7 +960,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     // first. It must stay in iid order either way.
     // 15, 18, 99 — the base fixture already contributes a closed card at iid 99.
     expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "updated" } });
     expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
   });
 
@@ -968,7 +968,7 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     store.set("uzi.board.repo-1.sortMode", '"not-a-mode"');
     renderBoard();
     await screen.findByText("Backlog");
-    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("manual");
+    expect((screen.getByRole("combobox", { name: "Sort" }) as HTMLSelectElement).value).toBe("manual");
   });
 });
 
@@ -1483,5 +1483,266 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     await screen.findByText("1 run needs an answer");
     expect(strip().textContent).toBe("1 run needs an answer");
     expect(screen.getAllByRole("link", { name: "#7 →" })).toHaveLength(1);
+  });
+});
+
+// PRD #304 — board search + per-lane paging, the WIRING layer. The paging helper
+// (boardColumns.ts) and matchesQuery/highlightSegments (boardCards.ts) are unit-tested
+// at the lib level; these assert Board.tsx feeds them the right sets and renders their
+// results — most load-bearing, the freeze still uses the UNFILTERED payload while a cap
+// or a search hides cards (Decision 2, the same trap PRD #102's freeze tests guard).
+describe("Board — search + per-lane paging (PRD #304)", () => {
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
+  let store: Map<string, string>;
+
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [{ label_name: "Planned" }] as BoardData["columns"],
+    cards: [aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] })],
+    pipeline: null,
+    ...over,
+  });
+
+  // n PRD cards in the Backlog lane, titled "issue 1".."issue n". A generator because
+  // the cap tests need more cards than a lane fits without a wall of literals.
+  const backlog = (n: number): Card[] =>
+    Array.from({ length: n }, (_, k) => aCard({ iid: k + 1, title: `issue ${k + 1}`, column: "", labels: ["PRD"] }));
+
+  beforeEach(() => {
+    store = installStorage();
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: false,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 1, column: "" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  const laneFor = (label: string) => {
+    const lane = screen.getByText(label).parentElement?.parentElement;
+    if (!lane) throw new Error(`no lane for ${label}`);
+    return lane;
+  };
+  const cardCount = () => screen.getAllByRole("link", { name: /^issue \d/ }).length;
+  const search = () => screen.getByRole("searchbox");
+
+  // --- M1/M6: per-lane cap, Show more, Collapse, N/M count ---
+  it("caps a lane at the per-lane default and reveals a page with Show more, then Collapse resets", async () => {
+    // 12 cards, default cap 10: the lane shows 10 and a "Show 2 more" expander.
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: backlog(12) }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    expect(cardCount()).toBe(10);
+    // The capped lane's count badge reads render/total (N/M), not the bare total.
+    expect(within(laneFor("Backlog")).getByText("10/12")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Show 2 more/ }));
+    expect(cardCount()).toBe(12);
+    // Fully revealed: no Show more left, but a Collapse is now offered.
+    expect(screen.queryByRole("button", { name: /Show \d+ more/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Collapse/ }));
+    expect(cardCount()).toBe(10);
+  });
+
+  it("does not cap or offer Show more on a lane at or under the default", async () => {
+    // The control for the cap test: a small lane renders in full with no expander and
+    // its badge is the bare count, not N/M.
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: backlog(4) }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(cardCount()).toBe(4);
+    expect(screen.queryByRole("button", { name: /Show \d+ more/ })).toBeNull();
+    expect(within(laneFor("Backlog")).getByText("4")).toBeTruthy();
+  });
+
+  // --- M2/M6: search filters, drops empty lanes, board-level count, clearing restores ---
+  it("filters lanes to matching cards, drops emptied lanes, and shows a result count", async () => {
+    const cards = [
+      aCard({ iid: 1, title: "alpha one", column: "", labels: ["PRD"] }),
+      aCard({ iid: 2, title: "beta two", column: "", labels: ["PRD"] }),
+      aCard({ iid: 3, title: "beta three", column: "Planned", labels: ["PRD"] }),
+    ];
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Off-search: every card and both working lanes are present.
+    expect(screen.getByText("beta two")).toBeTruthy();
+    expect(screen.getByText("Planned")).toBeTruthy();
+
+    fireEvent.change(search(), { target: { value: "alpha" } });
+    // Only the matching card survives; the non-matching one drops. The title is queried
+    // by the link's accessible NAME (the full title) rather than getByText, because the
+    // matched substring is split into a <mark> + text and no single node holds it whole.
+    expect(screen.getByRole("link", { name: "alpha one" })).toBeTruthy();
+    expect(screen.queryByText("beta two")).toBeNull();
+    // The Planned lane held only a non-match, so the lane itself drops during search.
+    expect(screen.queryByText("Planned")).toBeNull();
+    // A board-level result count renders.
+    expect(screen.getByText("1 result")).toBeTruthy();
+
+    // Clearing restores the full board — the dropped card and lane return.
+    fireEvent.change(search(), { target: { value: "" } });
+    expect(screen.getByText("beta two")).toBeTruthy();
+    expect(screen.getByText("Planned")).toBeTruthy();
+    expect(screen.queryByText("1 result")).toBeNull();
+  });
+
+  it("matches on #iid and pluralizes the result count", async () => {
+    const cards = [
+      aCard({ iid: 42, title: "answer everything", column: "", labels: ["PRD"] }),
+      aCard({ iid: 7, title: "lucky", column: "", labels: ["PRD"] }),
+    ];
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    // "#4" is a substring of iid 42 by design; iid 7 does not contain it.
+    fireEvent.change(search(), { target: { value: "#4" } });
+    expect(screen.getByText("answer everything")).toBeTruthy();
+    expect(screen.queryByText("lucky")).toBeNull();
+    expect(screen.getByText("1 result")).toBeTruthy();
+  });
+
+  // --- M2/M6: highlight in both title and chip ---
+  it("wraps the matched substring in a <mark> in both the title and a matching chip", async () => {
+    const cards = [aCard({ iid: 1, title: "find alpha here", column: "", labels: ["PRD", "alpha-tag"] })];
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.change(search(), { target: { value: "alpha" } });
+
+    // One hit in the title, one in the chip label — both real <mark> elements carrying
+    // the matched substring (semantic, not color-only).
+    const marks = screen.getAllByText("alpha");
+    expect(marks).toHaveLength(2);
+    marks.forEach((m) => expect(m.tagName).toBe("MARK"));
+  });
+
+  // --- M4/M6: per-lane preference persists and re-reads on repo change ---
+  it("persists the per-lane default to localStorage", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.change(screen.getByRole("combobox", { name: "Per lane" }), { target: { value: "5" } });
+    expect(store.get("uzi.board.repo-1.perLane")).toBe("5");
+  });
+
+  it("re-reads the per-lane default when the route repo id changes without a remount", async () => {
+    // The route swaps :id without remounting Board, so a lazy useState initialiser only
+    // ran for the first repo — the trap this file's sortMode/hideEmpty comments name.
+    // repo-2 has a saved value of 20; navigating to it must adopt that value.
+    store.set("uzi.board.repo-2.perLane", "20");
+    const NavProbe = () => {
+      const nav = useNavigate();
+      return <button onClick={() => nav("/repos/repo-2/board")}>go repo2</button>;
+    };
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+        <NavProbe />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Backlog");
+    // repo-1 has no saved value → the default 10.
+    expect((screen.getByRole("combobox", { name: "Per lane" }) as HTMLSelectElement).value).toBe("10");
+
+    fireEvent.click(screen.getByRole("button", { name: "go repo2" }));
+    await waitFor(() =>
+      expect((screen.getByRole("combobox", { name: "Per lane" }) as HTMLSelectElement).value).toBe("20"),
+    );
+  });
+
+  // --- M6: THE freeze guard. Cap and/or search hide cards from the render set; the
+  // reorder freeze must still submit the UNFILTERED payload order (Decision 2). ---
+  it("freezes hidden-by-cap cards: reorder submits iids beyond the visible cap", async () => {
+    // 12 cards, default cap 10 → #11 and #12 are hidden. Moving a visible card must
+    // still submit every open card's iid, including the two the cap hid.
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: backlog(12) }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(cardCount()).toBe(10);
+
+    fireEvent.click(screen.getByRole("button", { name: "Move issue #1 down in Backlog" }));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    const iids = mockApi.reorderBoard.mock.calls[0][1] as number[];
+    // The hidden cards are IN the freeze — omit them and the server NULLs their
+    // positions, dropping them on any other view of this board.
+    expect(iids).toContain(11);
+    expect(iids).toContain(12);
+    expect(iids).toHaveLength(12);
+  });
+
+  it("freezes hidden-by-search cards: reorder submits iids the query filtered out", async () => {
+    const cards = [
+      aCard({ iid: 1, title: "alpha one", column: "", labels: ["PRD"] }),
+      aCard({ iid: 2, title: "beta two", column: "", labels: ["PRD"] }),
+      aCard({ iid: 3, title: "alpha three", column: "", labels: ["PRD"] }),
+    ];
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Search hides #2 (beta); the two alpha cards remain and one can be reordered.
+    fireEvent.change(search(), { target: { value: "alpha" } });
+    expect(screen.queryByText("beta two")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move issue #1 down in Backlog" }));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    const iids = mockApi.reorderBoard.mock.calls[0][1] as number[];
+    // The search-hidden card is still frozen with the rest — payloadCards is unfiltered.
+    expect(iids).toContain(2);
+    expect(iids).toHaveLength(3);
   });
 });

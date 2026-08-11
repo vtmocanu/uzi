@@ -137,3 +137,54 @@ export function visibleCards<T extends Pick<Card, "labels">>(
   if (!showAll) return cards.filter((c) => isMemberCard(c, membershipLabels));
   return cards.filter((c) => isMemberCard(c, membershipLabels) || !isSelfImproveTracker(c));
 }
+
+/**
+ * The board search predicate (PRD #304 M2): does this card match the free-text query
+ * `q`? Case-insensitive across the card's title, any of its labels, and its `#iid`. An
+ * empty or whitespace-only query matches every card (the board with no filter). Runs
+ * over `renderCards` AFTER `visibleCards`, so a card excluded by membership is
+ * unfindable (Decision 9) — search narrows the board, it does not widen it.
+ *
+ * The iid arm strips a single leading '#' from the trimmed query and, if anything
+ * remains, tests `String(iid).includes(remainder)` — so `#42` matches iid 429 and 142,
+ * a substring match by design (a partial issue number is a useful search).
+ */
+export function matchesQuery(card: Pick<Card, "iid" | "title" | "labels">, q: string): boolean {
+  const trimmed = q.trim();
+  if (trimmed === "") return true;
+  const needle = trimmed.toLowerCase();
+  if (card.title.toLowerCase().includes(needle)) return true;
+  if (card.labels.some((l) => l.toLowerCase().includes(needle))) return true;
+  const iidQuery = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
+  return iidQuery !== "" && String(card.iid).includes(iidQuery);
+}
+
+/**
+ * Split `text` into consecutive segments, marking every case-insensitive,
+ * non-overlapping occurrence of `q` as `hit:true` and the rest `hit:false`, so a caller
+ * can wrap the hits in `<mark>` (PRD #304 M2/M5). Concatenating the segment texts
+ * reproduces `text` exactly — the ORIGINAL casing is preserved; only the match test is
+ * lowercased. An empty/whitespace query yields a single non-hit segment (or `[]` when
+ * `text` is itself empty).
+ *
+ * Matching is indexOf-based, never `new RegExp(q)`: `q` is user input and must never be
+ * interpreted as a pattern. This function does NO sanitizing — the caller passes the
+ * already display-sanitized string (titles are rendered through `stripUnsafeChars`), so
+ * the segments it returns are safe to render for the same reason their input was.
+ */
+export function highlightSegments(text: string, q: string): { text: string; hit: boolean }[] {
+  const needle = q.trim().toLowerCase();
+  if (needle === "") return text === "" ? [] : [{ text, hit: false }];
+  const hay = text.toLowerCase();
+  const segments: { text: string; hit: boolean }[] = [];
+  let from = 0;
+  let i = hay.indexOf(needle, from);
+  while (i !== -1) {
+    if (i > from) segments.push({ text: text.slice(from, i), hit: false });
+    segments.push({ text: text.slice(i, i + needle.length), hit: true });
+    from = i + needle.length;
+    i = hay.indexOf(needle, from);
+  }
+  if (from < text.length) segments.push({ text: text.slice(from), hit: false });
+  return segments;
+}
