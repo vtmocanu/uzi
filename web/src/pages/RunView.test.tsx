@@ -520,26 +520,64 @@ describe("RunCompletedLine — report-only deliverable (issue #279)", () => {
   });
 });
 
-describe("RunCompletedLine — the frozen per-schedule model (PRD #300)", () => {
-  it("renders run.model (escaped) when a schedule froze one onto the run", () => {
-    const { container } = render(
-      <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42, model: "fable" })} duration="3m" />,
+// PRD #300: the frozen per-schedule model is shown in the STATUS-INDEPENDENT header
+// metadata row (a Badge), not in the completed-hero line — a wrong/typo'd model must be
+// visible on a FAILED or stopped run too (Risks / SC6). These render the whole page
+// (useRunStream mocked) so the header badge is exercised where it actually lives.
+describe("RunView header — the frozen per-schedule model badge (PRD #300)", () => {
+  const MODEL_BADGE_TITLE = "Model this run was fired with (frozen by its schedule)";
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
     );
-    expect(screen.getByText("fable")).toBeTruthy();
-    expect(container.textContent).toContain("Model");
-    // run.model is display metadata, still stripped of format characters like branch.
-    const injected = `cl${String.fromCodePoint(0x202e)}aude`;
-    const { container: bidi } = render(
-      <RunCompletedLine run={run({ branch: null, mr_iid: null, model: injected })} duration="1m" />,
-    );
-    expect(bidi.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  }
+
+  it("shows the model badge on a COMPLETED run", async () => {
+    const { container } = renderPage({
+      status: "completed",
+      model: "fable",
+      branch: "agent/issue-87",
+      mr_iid: 42,
+      mr_state: "merged",
+    });
+    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
+    expect(container.textContent).toContain("model fable");
+    // The old completed-hero "Model <code>…</code>." clause is gone — no double render.
+    expect(container.textContent).not.toContain("Model fable");
   });
 
-  it("renders no Model clause when the run inherited (model null)", () => {
-    const { container } = render(
-      <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42, model: null })} duration="3m" />,
-    );
-    expect(container.textContent).not.toContain("Model");
+  it("shows the model badge on a FAILED run — the whole point of the header placement (SC6)", async () => {
+    const { container } = renderPage({ status: "failed", model: "fable", failure_reason: "boom" });
+    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
+    expect(container.textContent).toContain("model fable");
+  });
+
+  it("strips format characters from the model value, like the other header metadata", async () => {
+    const injected = `cl${String.fromCodePoint(0x202e)}aude`;
+    const { container } = renderPage({ status: "failed", model: injected });
+    expect(await screen.findByTitle(MODEL_BADGE_TITLE)).toBeTruthy();
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("shows no model badge when the run inherited (model null)", async () => {
+    renderPage({ status: "failed", model: null });
+    // Wait for the page to settle (RunHeading renders the issue title synchronously).
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByTitle(MODEL_BADGE_TITLE)).toBeNull();
   });
 });
 

@@ -106,17 +106,21 @@ export const MAX_MODEL_LEN = 100;
 
 // modelFieldWarning mirrors the server's validateModel (PRD #17 Decision 4): a
 // blank value is inherit (fine); otherwise the trimmed value must be a single
-// whitespace-free token, control-char-free, and at most MAX_MODEL_LEN chars.
-// The value is trimmed first, exactly as the server does, so a stray trailing
-// space does not warn on something the server would accept. "" means clean.
+// whitespace-free token, at most MAX_MODEL_LEN chars, and free of control chars
+// AND Unicode Cf format chars (bidi overrides, zero-width joiners/spaces). The
+// Cf rejection is scoped here only — it matches the server's tightened
+// ValidateModel (base a8234ce9) and is NOT applied to the description/tools
+// fields, which the server does not reject Cf on. The value is trimmed first,
+// exactly as the server does, so a stray trailing space does not warn on
+// something the server would accept. "" means clean.
 export function modelFieldWarning(model: string): string {
   const m = model.trim();
   if (m === "") return "";
   if (m.length > MAX_MODEL_LEN) {
     return `Model is too long (max ${MAX_MODEL_LEN} characters); use a shorter alias or model ID.`;
   }
-  if (hasControlChar(m)) {
-    return "Model contains a newline or control character; remove it before saving.";
+  if (hasControlChar(m) || /\p{Cf}/u.test(m)) {
+    return "Model contains a newline, control, or format character; remove it before saving.";
   }
   if (/\s/.test(m)) {
     return "Model must be a single token with no spaces.";

@@ -2312,7 +2312,10 @@ export const mockRuns: Run[] = [
     auto_approve: true,
     worker_id: "w-laptop",
     branch: "agent/issue-18",
-    model: null,
+    // PRD #300: a completed run whose schedule froze a per-run model, so the
+    // run-detail header model badge is exercisable in mock mode (the rest stay
+    // null = inherited the owner's Worker default).
+    model: "fable",
     forge_type: "gitlab",
     mr_web_url: "https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/42",
     mr_iid: 42,

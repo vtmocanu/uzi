@@ -705,7 +705,7 @@ export function ScheduleModal({
           <Field label="Model (optional)" htmlFor="sched-model">
             <ModelSelect id="sched-model" value={model} onChange={setModel} />
             <p className="mt-1 text-[11px] text-faint">
-              Runs this schedule fires use this model on every target. Leave on Inherit to
+              Runs fired by this schedule use this model on every target. Leave on Inherit to
               use your per-user Worker default.
             </p>
           </Field>
