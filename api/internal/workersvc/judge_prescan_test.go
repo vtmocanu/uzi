@@ -345,6 +345,103 @@ func TestExecutablesInParsesExecutablePosition(t *testing.T) {
 	}
 }
 
+// TestGoRunPinnedNamesParsesPinnedRefs pins the go-run parser directly, so a regression
+// names the parser rather than surfacing as a mysterious suppression (the same reason
+// TestExecutablesInParsesExecutablePosition exists). A tool reached via
+// `go run <module>@<version>` needs no bare executable, so its name is what the scan
+// suppresses.
+func TestGoRunPinnedNamesParsesPinnedRefs(t *testing.T) {
+	cases := []struct {
+		command string
+		want    []string
+	}{
+		// The motivating shape (judge rec run eaa26abe): golangci-lint via a pinned ref.
+		{"go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...", []string{"golangci-lint"}},
+		{"go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...", []string{"govulncheck"}},
+		{"go run golang.org/x/tools/cmd/deadcode@latest -test ./...", []string{"deadcode"}},
+		// A build flag before the pinned package is skipped; the FIRST non-flag token is
+		// the package, per `go run [build flags] <package> [args…]`.
+		{"go run -mod=mod example.com/cmd/tool@v1.2.3", []string{"tool"}},
+		// `go` must be in executable position — after a separator it still is.
+		{"cd api && go run rsc.io/sqlc@v1.0.0 generate", []string{"sqlc"}},
+		// UNPINNED shapes yield nothing: the version pin is the signal.
+		{"go run .", nil},
+		{"go run ./cmd/foo", nil},
+		{"go run main.go", nil},
+		// A `go` subcommand other than `run` provides nothing.
+		{"go build ./...", nil},
+		{"go test ./...", nil},
+		// A MENTION is not an invocation — the strings.Contains trap this parser avoids.
+		{"echo go run tool@v1 later", nil},
+		{"grep 'go run' Makefile", nil},
+		// `go` not in executable position (an argument to another command).
+		{"which go run", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			got := goRunPinnedNames(tc.command)
+			if len(got) != len(tc.want) {
+				t.Fatalf("goRunPinnedNames(%q) = %v, want %v", tc.command, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("goRunPinnedNames(%q) = %v, want %v", tc.command, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestPrescanSuppressesGoRunPinnedTool pins the behaviour (judge rec run eaa26abe): a
+// tool the repo invokes via `go run <module>@<version>` is reachable through that pinned
+// ref, so a `command not found` for its bare name must NOT surface as a missing worker
+// tool. Suppression is presence-based, so it holds whichever order the two rows arrive.
+func TestPrescanSuppressesGoRunPinnedTool(t *testing.T) {
+	const pinnedLint = "go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./..."
+
+	// The agent probes the bare name (not found), and the repo lints via the pinned ref.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "command -v golangci-lint"),
+		traceResult(10, "u1", "bash: golangci-lint: command not found", true),
+		traceUse(29, "u2", pinnedLint),
+		traceResult(30, "u2", "0 issues.", false),
+	}, []string{})
+
+	// Order-independent: the not-found probe often comes AFTER the successful `go run`,
+	// which suppressResolved's strictly-later green rule would NOT catch — presence does.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", pinnedLint),
+		traceResult(10, "u1", "0 issues.", false),
+		traceUse(29, "u2", "command -v golangci-lint"),
+		traceResult(30, "u2", "bash: golangci-lint: command not found", true),
+	}, []string{})
+}
+
+// TestPrescanGoRunSuppressionSparesGenuineMiss is the guarantee the suppression must not
+// break: a DIFFERENT tool that is genuinely absent stays reported even when a pinned
+// go-run tool is suppressed in the same trace, and an UNPINNED `go run` suppresses
+// nothing. Asserting both in one place is the control that the filter is name-specific
+// and pin-specific, not a blanket "saw go run, drop everything".
+func TestPrescanGoRunSuppressionSparesGenuineMiss(t *testing.T) {
+	// golangci-lint suppressed (pinned ref present), kubectl still reported.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "golangci-lint run"),
+		traceResult(10, "u1", "bash: golangci-lint: command not found", true),
+		traceUse(19, "u3", "kubectl get pods"),
+		traceResult(20, "u3", "bash: kubectl: command not found", true),
+		traceUse(29, "u2", "go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./..."),
+		traceResult(30, "u2", "0 issues.", false),
+	}, []string{"kubectl"})
+
+	// A bare `go run .` pins no tool, so a real miss in the same run is untouched.
+	assertReported(t, []store.ListToolTraceForRunRow{
+		traceUse(9, "u1", "kubectl get pods"),
+		traceResult(10, "u1", "bash: kubectl: command not found", true),
+		traceUse(29, "u2", "go run ."),
+		traceResult(30, "u2", "", false),
+	}, []string{"kubectl"})
+}
+
 // TestScriptEchoIgnoresOutputBelowTheHeaderBlock pins the bound on the script-echo
 // channel. A suite that prints a shell transcript — CLI usage goldens, README-driven
 // tests, markdown snapshots — must not fake a green for the tool in that transcript.

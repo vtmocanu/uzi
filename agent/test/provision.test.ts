@@ -91,9 +91,10 @@ describe("provisionTools", () => {
       },
     );
 
-    // Manifest is packages-only, written outside any clone.
+    // Manifest is packages-only, written outside any clone, in devbox's current OBJECT
+    // form (name -> version, "" when unpinned) rather than the deprecated array shape.
     const manifest = JSON.parse(await fs.readFile(path.join(tmp, "run", "devbox.json"), "utf8"));
-    assert.deepStrictEqual(manifest, { packages: ["kubectl@1.31", "jq"] });
+    assert.deepStrictEqual(manifest, { packages: { kubectl: "1.31", jq: "" } });
 
     // install ran first, in a scrubbed env (no join token / anthropic token anywhere).
     const install = calls[0];

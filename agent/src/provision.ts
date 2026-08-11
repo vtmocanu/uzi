@@ -187,7 +187,21 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
   await fs.mkdir(input.runDir, { recursive: true });
   // Packages-only manifest, synthesized OUTSIDE the clone (Decision 3): no
   // init_hook/scripts, no repo input — just the resolved, validated package list.
-  const manifest = JSON.stringify({ packages: input.packages }, null, 2) + "\n";
+  //
+  // Written in devbox's OBJECT form (name -> version, "" when unpinned), NOT the bare
+  // `["go", "kubectl@1.31"]` array: the array is the deprecated shape devbox 0.17.5 warns
+  // on ("devbox.json … contains packages in legacy format. Please run devbox update",
+  // judge rec run c926fa20), and `devbox update` migrates array -> object exactly this way
+  // (["go@latest","hello"] -> {"go":"latest","hello":""}). The strings are already
+  // shape-validated `name` / `name@version` (repo-tools.ts PKG_RE) and merged so base
+  // names are unique, so splitting on the first `@` cannot collide keys.
+  const packages: Record<string, string> = {};
+  for (const pkg of input.packages) {
+    const at = pkg.indexOf("@");
+    if (at === -1) packages[pkg] = "";
+    else packages[pkg.slice(0, at)] = pkg.slice(at + 1);
+  }
+  const manifest = JSON.stringify({ packages }, null, 2) + "\n";
   await fs.writeFile(path.join(input.runDir, "devbox.json"), manifest, "utf8");
 
   const env = buildProvisionEnv(source, input.homeDir);
