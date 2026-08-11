@@ -69,6 +69,7 @@ function runFixture(over: Partial<Run> = {}): Run {
     auto_approve: false,
     worker_id: "w1",
     branch: null,
+    model: null,
     mr_iid: null,
     mr_web_url: null,
     mr_state: null,

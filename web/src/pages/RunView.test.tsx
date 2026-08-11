@@ -100,6 +100,7 @@ function run(over: Partial<Run>): Run {
     auto_approve: false,
     worker_id: "w1",
     branch: null,
+    model: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -516,6 +517,29 @@ describe("RunCompletedLine — report-only deliverable (issue #279)", () => {
       <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42 })} duration="3m" mrState="merged" />,
     );
     expect(container.textContent).not.toContain("Report only");
+  });
+});
+
+describe("RunCompletedLine — the frozen per-schedule model (PRD #300)", () => {
+  it("renders run.model (escaped) when a schedule froze one onto the run", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42, model: "fable" })} duration="3m" />,
+    );
+    expect(screen.getByText("fable")).toBeTruthy();
+    expect(container.textContent).toContain("Model");
+    // run.model is display metadata, still stripped of format characters like branch.
+    const injected = `cl${String.fromCodePoint(0x202e)}aude`;
+    const { container: bidi } = render(
+      <RunCompletedLine run={run({ branch: null, mr_iid: null, model: injected })} duration="1m" />,
+    );
+    expect(bidi.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("renders no Model clause when the run inherited (model null)", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-87", mr_iid: 42, model: null })} duration="3m" />,
+    );
+    expect(container.textContent).not.toContain("Model");
   });
 });
 

@@ -29,6 +29,8 @@ import {
   cx,
 } from "./ui";
 import { XIcon, TrashIcon } from "./icons";
+import { ModelSelect } from "./ModelSelect";
+import { modelFieldWarning } from "../lib/agentTemplates";
 import {
   cronFromPreset,
   DEFAULT_PRESET_STATE,
@@ -199,6 +201,11 @@ export function ScheduleModal({
   // Optional owner guidance for issue/sweep targets; a string in state ("" = none).
   // Steers HOW a run approaches the task — the issue body stays the task.
   const [guidance, setGuidance] = useState<string>(editing?.guidance ?? "");
+  // Per-schedule model override; "" = inherit the owner's per-user Worker default.
+  // Applies to ALL targets (unlike guidance). Injection-suspect custom IDs are gated
+  // below (modelWarning) mirroring the server's ValidateModel reject.
+  const [model, setModel] = useState<string>(editing?.model ?? "");
+  const modelWarning = modelFieldWarning(model);
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
   const [previewError, setPreviewError] = useState(false);
@@ -358,6 +365,8 @@ export function ScheduleModal({
       return false;
     if (timing === "recurring" && cron.trim() === "") return false;
     if (timing === "once" && !fromLocalInput(runAtLocal)) return false;
+    // An injection-suspect custom model ID blocks the form (mirrors ValidateModel).
+    if (modelWarning !== "") return false;
     return true;
   };
 
@@ -383,6 +392,9 @@ export function ScheduleModal({
     timezone,
     auto_approve: autoApprove,
     wait_on_limit: waitOnLimit,
+    // Model override on EVERY target (all-targets field, unlike guidance); an empty
+    // control sends explicit null to clear-to-inherit (replace-semantics).
+    model: model.trim() === "" ? null : model,
   });
 
   const submit = async (e: React.FormEvent) => {
@@ -688,6 +700,16 @@ export function ScheduleModal({
               </Field>
             </div>
           </details>
+
+          {/* Model override — shown for ALL targets (unlike guidance), in the common area. */}
+          <Field label="Model (optional)" htmlFor="sched-model">
+            <ModelSelect id="sched-model" value={model} onChange={setModel} />
+            <p className="mt-1 text-[11px] text-faint">
+              Runs this schedule fires use this model on every target. Leave on Inherit to
+              use your per-user Worker default.
+            </p>
+          </Field>
+          {modelWarning && <Alert message={modelWarning} tone="warning" />}
 
           {/* Options */}
           <div className="space-y-3">

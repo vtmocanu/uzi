@@ -67,6 +67,7 @@ function fakeRun(): Run {
     auto_approve: false,
     worker_id: "worker-1",
     branch: null,
+    model: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,

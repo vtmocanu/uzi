@@ -63,6 +63,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     auto_approve: false,
     worker_id: "w1",
     branch: null,
+    model: null,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,

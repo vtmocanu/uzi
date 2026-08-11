@@ -1376,6 +1376,14 @@ export function RunCompletedLine({
           </>
         )
       )}
+      {/* PRD #300: the per-schedule model this run froze at fire time, shown only when a
+          schedule pinned one (null = inherited the owner's per-user Worker default). */}
+      {run.model && (
+        <>
+          {" "}
+          Model <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.model)}</code>.
+        </>
+      )}
     </p>
   );
 }

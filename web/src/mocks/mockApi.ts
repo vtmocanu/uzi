@@ -849,6 +849,7 @@ let schedules: Schedule[] = [
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
     max_issues: 10,
     guidance: "Keep the diff small and add a failing test first.",
+    model: "fable",
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
     updated_at: daysFromNow(-1, 2), next_fires: [],
   },
@@ -860,6 +861,7 @@ let schedules: Schedule[] = [
     last_fired_at: daysFromNow(0, 3), auto_approve: false, wait_on_limit: true,
     max_issues: null,
     guidance: "Prefer the smallest change that closes the issue; no new deps.",
+    model: null,
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
     updated_at: daysFromNow(0, 3), next_fires: [],
   },
@@ -871,6 +873,7 @@ let schedules: Schedule[] = [
     last_fired_at: null, auto_approve: true, wait_on_limit: false,
     max_issues: null,
     guidance: null,
+    model: null,
     enabled: true, status: "active", created_at: daysFromNow(-1, 20),
     updated_at: daysFromNow(-1, 20), next_fires: [],
   },
@@ -883,6 +886,7 @@ let schedules: Schedule[] = [
     last_fired_at: daysFromNow(-7, 9), auto_approve: true, wait_on_limit: false,
     max_issues: null,
     guidance: null,
+    model: null,
     enabled: true, status: "active", created_at: daysFromNow(-21, 11),
     updated_at: daysFromNow(-7, 9), next_fires: [],
   },
@@ -894,6 +898,7 @@ let schedules: Schedule[] = [
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
     max_issues: 10,
     guidance: null,
+    model: null,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
     updated_at: daysFromNow(-3, 18), next_fires: [],
   },
@@ -908,6 +913,7 @@ let schedules: Schedule[] = [
     last_fired_at: daysFromNow(-1, 1, 30), auto_approve: true, wait_on_limit: false,
     max_issues: null,
     guidance: null,
+    model: null,
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
     updated_at: daysFromNow(-1, 1, 30), next_fires: [],
   },
@@ -2546,6 +2552,7 @@ export const mockApi = {
       auto_approve: false,
       worker_id: null,
       branch: null,
+      model: null,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -2612,6 +2619,7 @@ export const mockApi = {
       auto_approve: false,
       worker_id: null,
       branch: null,
+      model: null,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -3041,6 +3049,7 @@ export const mockApi = {
       auto_approve: false,
       worker_id: "w-laptop",
       branch: null,
+      model: null,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -3296,6 +3305,8 @@ export const mockApi = {
       max_issues: target === "sweep" ? (input.max_issues ?? 10) : null,
       // Guidance on issue/sweep only; null (none) for prompt (re-nulled per target).
       guidance: target === "issue" || target === "sweep" ? (input.guidance ?? null) : null,
+      // Model applies to ALL targets (unlike guidance); null = inherit.
+      model: input.model ?? null,
       enabled: input.enabled ?? true,
       status: "active",
       created_at: now,
@@ -3330,6 +3341,8 @@ export const mockApi = {
     if (input.max_issues !== undefined) m.max_issues = input.max_issues;
     // Same replace-semantics for guidance (explicit null/"" clears to none).
     if (input.guidance !== undefined) m.guidance = input.guidance;
+    // Model applies to all targets, so it is not re-nulled per target below.
+    if (input.model !== undefined) m.model = input.model;
     if (input.enabled !== undefined) m.enabled = input.enabled;
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.
