@@ -22,6 +22,7 @@
     "jq.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#jq.bin", "source": "nixpkg" },
     "shellcheck.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#shellcheck.bin", "source": "nixpkg" },
     "fd": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#fd", "source": "nixpkg" },
-    "yq-go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#yq-go", "source": "nixpkg" }
+    "yq-go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#yq-go", "source": "nixpkg" },
+    "gnumake": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#gnumake", "source": "nixpkg" }
   }
 }

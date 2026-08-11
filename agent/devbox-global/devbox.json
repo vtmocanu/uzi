@@ -256,6 +256,31 @@
   // writes a fat `systems:` block) for the pinning reason recorded above; both lock as
   // `source: "nixpkg"` at 20535e48…, matching every entry.
   //
+  // `gnumake` (2026-08-11, owner decision) bakes GNU make into every worker. Same "every
+  // worker should have it, in ANY repo" class as gcc/go-task above — make is gcc's build
+  // companion and countless repos drive their build/test through a Makefile, so an agent
+  // without it 127s on `make`. It was first shipped (0.14.x) via the apk layer of both
+  // template Dockerfiles, then MOVED here so it rides the ONE pinned nix/devbox path this
+  // file's header mandates (no second apk package path, no version drift, and — unlike the
+  // apk utils — covered by the build guard). The attr is bare `gnumake`; its mainProgram is
+  // `make`, so it lands bin/make (the guard row is `gnumake  make  make --version`).
+  //
+  // gnumake IS multi-output at this rev (measured: outputs [out man info doc debug],
+  // meta.outputsToInstall [out man]), but it does NOT hit the openssl.bin/file.out/
+  // shellcheck.bin split-output trap, and this was MEASURED not assumed: the `make` binary
+  // lives in the `out` output, so the bare attr carries the CLI and no `.bin`/`.out`
+  // selector is needed or correct. Verified by substituting the x86_64-linux `out` output
+  // from cache and listing it (`nix build …#legacyPackages.x86_64-linux.gnumake^out`, then
+  // `ls bin/` → `make`) — the PROFILE-level check this file preaches, done cross-system
+  // because the full manifest cannot `devbox install` on darwin (chromium is linux-only).
+  // This rev carries make 4.4.1; its out-output narinfo (9m4gd15rxxz4xfafqysi5q7jaczxv65c)
+  // is HTTP 200 on cache.nixos.org for x86_64-linux (406.8 KiB download / 1.5 MiB unpacked),
+  // so CI's amd64-only kaniko build SUBSTITUTES it rather than compiling — the
+  // non-negotiable condition for baking a tool in. Written BARE of any version/`@latest`
+  // suffix and added by hand-editing this file + the sibling devbox.lock entry (never
+  // `devbox add`, which pins to its own nixpkgs rev and writes a fat `systems:` block) for
+  // the pinning reason recorded above; locks as `source: "nixpkg"` at 20535e48….
+  //
   // NOT added, deliberately:
   //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
   //     any cluster by construction: `automountServiceAccountToken: false` at BOTH the
@@ -297,6 +322,7 @@
     "jq.bin",
     "shellcheck.bin",
     "fd",
-    "yq-go"
+    "yq-go",
+    "gnumake"
   ]
 }

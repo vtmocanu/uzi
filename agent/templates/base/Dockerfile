@@ -29,7 +29,7 @@ WORKDIR /app
 # ("cannot connect to the Docker daemon") rather than reaching for a host socket, and
 # the Bash guardrail denies docker outright until a daemon is wired. compose ships the
 # v2 subcommand plugin (`docker compose`), buildx the build plugin.
-RUN apk add --no-cache git bash tini curl xz tar make setpriv docker-cli docker-cli-compose docker-cli-buildx \
+RUN apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # Two runtime uids (PRD #51 A1). `worker` (uid 10001) holds the run credentials
