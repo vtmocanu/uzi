@@ -6,6 +6,33 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-11
+
+### Added
+
+- **Scheduled runs can pin the model they use (PRD #300).** A schedule now
+  carries an optional model that is frozen onto every run it fires, overriding
+  your per-user Worker model at claim time; leaving it unset inherits the Worker
+  model exactly as before. Set it in the schedule modal (all target kinds) or
+  from the CLI with `uzi schedule create --model`, and the frozen model shows on
+  the run detail as a badge (visible on failed runs too). A subagent template's
+  own `model:` pin still wins, and no worker image change is needed.
+- **New `uzi schedule edit` command (PRD #302).** Change a schedule's cron,
+  timezone, prompt, labels, guidance, or max-issues in place without churning
+  its id or losing its run history. It reads the current schedule and overlays
+  only the flags you pass, so editing one field leaves the rest untouched;
+  `--clear-guidance` and `--clear-max-issues` remove a value explicitly.
+  Previously the only way to change these was to delete and recreate the
+  schedule.
+- **Board search and per-lane "Show more" paging (PRD #304).** The board has a
+  search field that filters every column live by title, issue number, or label
+  and highlights the match. Each column now shows a set number of cards
+  (default 10, tunable with the "Per lane" control) and reveals the rest a page
+  at a time with "Show N more", so a busy backlog stays scannable instead of
+  rendering hundreds of cards at once. The toolbar stays pinned while you
+  scroll a long column. These are view-only changes; drag-and-drop ordering is
+  unaffected.
+
 ## [0.27.0] - 2026-08-10
 
 ### Added
