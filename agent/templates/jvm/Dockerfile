@@ -19,7 +19,7 @@ WORKDIR /app
 # docker-cli-compose + docker-cli-buildx (PRD #83 Decision 1): the docker CLIENT only,
 # NO dockerd, inert without a wired daemon (DOCKER_HOST not baked). MIRRORED from
 # templates/base (jvm is NOT `FROM base`; keep in lockstep).
-RUN apk add --no-cache git bash tini curl xz tar openjdk17 setpriv docker-cli docker-cli-compose docker-cli-buildx \
+RUN apk add --no-cache git bash tini curl xz tar make openjdk17 setpriv docker-cli docker-cli-compose docker-cli-buildx \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # JAVA_HOME + PATH so `java`/`javac` and Maven/Gradle wrappers resolve for the
