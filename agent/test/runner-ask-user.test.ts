@@ -535,11 +535,20 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
    * because timeout throws before `settle`, an "emit `running` unconditionally inside
    * settle" mutation would still NOT redden this test — settle is unreachable on
    * timeout — so this test does NOT exercise the `v.kind === "answer"` guard. What it
-   * guards is that nothing on the failure path spuriously reports `running` after the
-   * park (e.g. a report moved ahead of the race, or into a catch/finally).
+   * guards is that no SETTLE `running` — a bare `{status:"running"}` — spuriously
+   * reports after the park (e.g. a report moved ahead of the race, or into a
+   * catch/finally).
    *
-   * The claim-time `running` (runner.ts:423) precedes the park, so the discriminating
-   * fact is the ABSENCE of a `running` AFTER the park.
+   * The claim-time `running` (runner.ts:423) precedes the park (it is AWAITED), so the
+   * discriminating fact is the ABSENCE of a bare `running` AFTER the park.
+   *
+   * Why "bare": the runner ALSO emits an informational repo-agents roster report,
+   * `void reportState({status:"running", repo_agents})` at runner.ts:630, as
+   * fire-and-forget during setup. Its landing order relative to the awaited park is not
+   * guaranteed, so under CPU contention (CI) it can be recorded AFTER the park — a
+   * legitimate report unrelated to settle. It carries a `repo_agents` field, whereas a
+   * settle `running` does not, so the assertion below excludes it. (`indexOf`-on-status
+   * would false-fail on that roster report; this was the 2026-08-11 CI flake.)
    *
    * (cancel path) The verdict union is `answer | cancel` only, and CANCEL is the path
    * that actually reaches `settle` with a non-answer verdict — so the `v.kind ===
@@ -557,8 +566,11 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     await runnerFor(askingExecutor(1, log)).execute(claim);
 
     const seq = statuses(claim.run_id);
-    const parkAt = seq.indexOf("awaiting_input");
-    assert.notStrictEqual(parkAt, -1, "the run must park on the question");
+    assert.notStrictEqual(
+      seq.indexOf("awaiting_input"),
+      -1,
+      "the run must park on the question",
+    );
     assert.strictEqual(
       failureReason(claim.run_id),
       REASON_QUESTION_TIMEOUT,
@@ -569,10 +581,21 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
       "failed",
       "the run ends failed, not running",
     );
+    // Index into the report BODIES (not the flattened status list): a bare `running`
+    // after the park is a settle report; the roster `running` (repo_agents present) is
+    // excluded because its fire-and-forget landing order vs. the awaited park is not
+    // guaranteed. See the doc comment above.
+    const runStates = api.states.filter((s) => s.runId === claim.run_id);
+    const parkPos = runStates.findIndex(
+      (s) => s.body.status === "awaiting_input",
+    );
+    const settleRunningAfterPark = runStates
+      .slice(parkPos + 1)
+      .some((s) => s.body.status === "running" && s.body.repo_agents === undefined);
     assert.ok(
-      !seq.slice(parkAt + 1).includes("running"),
+      !settleRunningAfterPark,
       "a timed-out park must NOT emit a settle `running` — there is no answer " +
-        `verdict; statuses were ${JSON.stringify(seq)}`,
+        `verdict; report bodies were ${JSON.stringify(runStates.map((s) => s.body))}`,
     );
   });
 });
