@@ -206,6 +206,7 @@ func normalizeCommandToken(cmd string) string {
 // introduce, in the function whose whole job this milestone is to make more accurate.
 func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 	invoked := invokedExecutables(rows)
+	pinned := goRunPinnedTools(rows)
 	var out []missCandidate
 	seen := map[string]bool{}
 	scanned := 0
@@ -244,7 +245,17 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 			// the barred class so the model reclassifies to adjust_template/improve_agent,
 			// which is the actionable category — that prompt line, not this filter, is
 			// what addresses those two.
-			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) ||
+			//
+			// pinned[cmd] is the same shape of not-a-gap: a tool the run invokes via
+			// `go run <module>@<version>` is reached THROUGH that pinned ref and needs no
+			// bare executable, so its `command not found` is by-design, not a missing
+			// worker tool to install (judge rec run eaa26abe: golangci-lint reached via
+			// `go run …/golangci-lint@v2.12.2`, then flagged missing). Filtered HERE for
+			// the same candidate-slot reason as the denylist above. Presence-based, not
+			// green/seq-gated like suppressResolved: the ref's mere presence proves the
+			// canonical invocation does not need PATH, and the bare-name probe often comes
+			// AFTER the successful `go run`.
+			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] ||
 				(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
@@ -296,6 +307,88 @@ func invokedExecutables(rows []store.ListToolTraceForRunRow) map[string]bool {
 		}
 	}
 	return invoked
+}
+
+// goRunPinnedRef matches a pinned Go module reference — a module path with an
+// `@version` suffix, as `go run` accepts it (`…/cmd/golangci-lint@v2.12.2`,
+// `example.com/tool@latest`). The captured group is the path before the `@`, whose last
+// segment is the tool name.
+var goRunPinnedRef = regexp.MustCompile(`^(\S+)@[^@\s]+$`)
+
+// goRunPinnedNames returns the tool names a shell command provides via
+// `go run <module>@<version>`. Such a tool is reached THROUGH the pinned module ref and
+// needs no bare executable on PATH, so a later `command not found` for its name is
+// by-design rather than a missing worker tool (scanCommandNotFound consults this).
+//
+// The name is the last path segment before the `@version` (`…/cmd/govulncheck@v1.1.4`
+// → `govulncheck`). Only `go` in EXECUTABLE POSITION unlocks it — `echo go run …` and
+// `grep "go run" Makefile` do not — reusing the same position discipline as
+// executablesIn so a MENTION never counts. `go run`'s grammar is
+// `go run [build flags] <package> [args…]`, so the FIRST non-flag token after `run` is
+// the package; an unpinned one (`go run .`, `go run ./cmd/foo`) yields nothing, since
+// the version pin is the signal. Residual (safe under-suppression, per this file's
+// philosophy): a space-separated build flag whose value is non-flag-shaped
+// (`go run -exec wrapper pkg@v1`) shadows the package token, leaving the tool reported.
+func goRunPinnedNames(command string) []string {
+	toks := shellTokens(command)
+	var out []string
+	execNext := true
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		if shellSeparators[t] {
+			execNext = true
+			continue
+		}
+		if !execNext {
+			continue
+		}
+		if envAssignment.MatchString(t) {
+			continue // a FOO=bar prefix; the executable is still ahead
+		}
+		execNext = false
+		if basenameToken(t) != "go" || i+1 >= len(toks) || toks[i+1] != "run" {
+			continue
+		}
+		for j := i + 2; j < len(toks) && !shellSeparators[toks[j]]; j++ {
+			arg := toks[j]
+			if strings.HasPrefix(arg, "-") {
+				continue // a build flag to `go run` (e.g. -mod=mod, -tags=…)
+			}
+			if m := goRunPinnedRef.FindStringSubmatch(arg); m != nil {
+				if name := basenameToken(m[1]); name != "" {
+					out = append(out, name)
+				}
+			}
+			break // the first non-flag token is the package; the rest are its args
+		}
+	}
+	return out
+}
+
+// goRunPinnedTools indexes the tool names a run provides via `go run <module>@<version>`
+// across its tool_use commands. See goRunPinnedNames for why such a name's bare-executable
+// absence is by-design. Bounded by judgeCommandByteBudget with the same check-before-add
+// discipline as invokedExecutables, so the constant is a true bound.
+func goRunPinnedTools(rows []store.ListToolTraceForRunRow) map[string]bool {
+	pinned := map[string]bool{}
+	cmdBytes := 0
+	for _, row := range rows {
+		if row.Kind != "tool_use" {
+			continue
+		}
+		_, cmd := toolUseCommand(row.Payload)
+		if cmd == "" {
+			continue
+		}
+		if cmdBytes+len(cmd) > judgeCommandByteBudget {
+			continue
+		}
+		cmdBytes += len(cmd)
+		for _, name := range goRunPinnedNames(cmd) {
+			pinned[name] = true
+		}
+	}
+	return pinned
 }
 
 // suppressResolved drops a candidate whose tool the SAME run demonstrably ran green

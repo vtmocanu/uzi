@@ -91,9 +91,16 @@ describe("provisionTools", () => {
       },
     );
 
-    // Manifest is packages-only, written outside any clone.
+    // Manifest is packages-only, written outside any clone, with every package VERSIONED
+    // (unversioned ones pinned to @latest) so devbox emits no "legacy format" warning —
+    // that warning is keyed on unversioned packages, not on the array shape.
     const manifest = JSON.parse(await fs.readFile(path.join(tmp, "run", "devbox.json"), "utf8"));
-    assert.deepStrictEqual(manifest, { packages: ["kubectl@1.31", "jq"] });
+    assert.deepStrictEqual(manifest, { packages: ["kubectl@1.31", "jq@latest"] });
+    // Guard the invariant directly, not just this fixture: a regression that stopped
+    // pinning (the empty-string no-op an object reshape allows) would leave a bare name.
+    for (const pkg of manifest.packages) {
+      assert.ok(pkg.includes("@"), `package ${pkg} must be versioned to avoid the devbox legacy-format warning`);
+    }
 
     // install ran first, in a scrubbed env (no join token / anthropic token anywhere).
     const install = calls[0];

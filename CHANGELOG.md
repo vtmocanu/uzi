@@ -6,6 +6,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Fixed
+
+- **The judge no longer flags a tool invoked via `go run <module>@<version>` as a
+  missing worker tool.** A repo that runs a linter or checker through a pinned module
+  ref (for example `go run .../golangci-lint@v2.12.2`) needs no bare executable on
+  PATH, so the deterministic command-not-found pre-scan now recognises that shape and
+  suppresses the false "install this tool" recommendation. Genuinely absent tools are
+  still reported.
+- **Worker tool provisioning no longer trips a devbox "legacy format" warning.** The
+  synthesized per-run `devbox.json` now pins every unversioned package to `@latest` (for
+  example `go` becomes `go@latest`), which is what actually clears the warning (devbox
+  keys it on unversioned packages), so `devbox install` runs cleanly. Already
+  version-pinned packages are left unchanged.
+
 ## [0.29.0] - 2026-08-11
 
 ### Added
