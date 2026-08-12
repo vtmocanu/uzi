@@ -1251,6 +1251,85 @@ describe("SdkExecutor model precedence on baseOptions", () => {
   });
 });
 
+describe("SdkExecutor override_subagent_model (PRD #305 M4)", () => {
+  // Decision 7: calibrate on a PINNED subagent whose pin ("opus") differs from the
+  // run model ("fable"). An unpinned subagent already inherits the run model, so it
+  // would assert-pass with the flag off and prove nothing.
+  const pinnedReviewer: AgentTemplate = { ...reviewer, model: "opus" };
+  const pinnedRepoAuditor: AgentTemplate = { ...repoAuditor, model: "opus" };
+
+  /** Run a plan turn + one implement turn, returning the turns for inspection. */
+  async function runTurns(overrides: Partial<RunContext>, verdict?: PlanVerdict) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = verdict === undefined ? makeCtx(overrides) : makeCtx(overrides, verdict);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return turns;
+  }
+
+  it("flag ON, own roster: the pinned subagent's model is overridden to the run model on BOTH turns", async () => {
+    const turns = await runTurns(
+      {
+        agents: [lead, coder, pinnedReviewer],
+        config: { default_model: "fable", override_subagent_model: true },
+      },
+      approveWith("own"),
+    );
+    const plan = turns[0]!.options;
+    const impl = turns[1]!.options;
+    // The load-bearing assertion the ordering fix exists for: the override reached
+    // the PLAN turn (which copies the own roster before the run model was resolved
+    // before this change), not just the implement turn.
+    assert.strictEqual(plan.agents!.reviewer!.model, "fable", "plan turn: pinned reviewer overridden");
+    assert.strictEqual(impl.agents!.reviewer!.model, "fable", "implement turn: pinned reviewer overridden");
+    assert.strictEqual(plan.model, "fable", "plan turn: lead runs the run model");
+    assert.strictEqual(impl.model, "fable", "implement turn: lead runs the run model");
+  });
+
+  it("flag OFF (absent), own roster: the subagent pin is preserved while the lead is still overridden", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: { default_model: "fable" } },
+      approveWith("own"),
+    );
+    const plan = turns[0]!.options;
+    const impl = turns[1]!.options;
+    // Byte-identical to today for subagents: the pin wins.
+    assert.strictEqual(plan.agents!.reviewer!.model, "opus", "plan turn: pin preserved when flag off");
+    assert.strictEqual(impl.agents!.reviewer!.model, "opus", "implement turn: pin preserved when flag off");
+    // The lead is still overridden (PRD #300 / #17), independent of this flag.
+    assert.strictEqual(plan.model, "fable", "plan turn: lead still overridden");
+    assert.strictEqual(impl.model, "fable", "implement turn: lead still overridden");
+  });
+
+  it("flag ON, repo roster: an absent selection resolves to repo and its pinned subagent runs the run model", async () => {
+    // SC7's shape: an auto-approved scheduled run against a repo shipping
+    // .claude/agents/ resolves to the REPO roster by default (absent selection),
+    // built worker-side and NOT touched by the own-roster override.
+    const turns = await runTurns({
+      agents: [lead, coder, pinnedReviewer],
+      repoAgents: [repoCoder, pinnedRepoAuditor],
+      config: { default_model: "fable", override_subagent_model: true },
+    });
+    const impl = turns[1]!.options;
+    // Confirm the implement turn really ran the repo roster (not own).
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(impl.agents!.auditor!.model, "fable", "repo pinned auditor overridden to the run model");
+    assert.strictEqual(impl.model, "fable", "lead runs the run model");
+  });
+
+  it("plain interactive run unchanged: no default_model, no flag → subagent pins untouched", async () => {
+    const turns = await runTurns(
+      { agents: [lead, coder, pinnedReviewer], config: null },
+      approveWith("own"),
+    );
+    const impl = turns[1]!.options;
+    // Lead falls back to the lead-template pin; the reviewer keeps its own pin.
+    assert.strictEqual(impl.agents!.reviewer!.model, "opus", "subagent pin untouched");
+  });
+});
+
 // PRD #16 M4: skill plugin delivery. The four load-bearing assertions the PRD
 // milestone names — plugin-qualifier naming, plugin skills configured under
 // settingSources:[], a tools-restricted subagent gets its allocated skill, and

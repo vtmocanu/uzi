@@ -43,6 +43,12 @@ type ScheduleRequest struct {
 	MaxIssues   *int       `json:"max_issues"`
 	Guidance    *string    `json:"guidance"`
 	Model       *string    `json:"model"`
+	// OverrideSubagentModel is the per-schedule "apply model also to agents" opt-in (PRD
+	// #305, all targets): when true, a fired run's resolved model overrides every
+	// subagent's own model pin too, not just the lead. Boolean, not tri-state (Decision 5):
+	// nil ≡ false (off) under replace semantics — an omitted value turns it off, which the
+	// web avoids by always sending the full config. Default off is byte-identical to today.
+	OverrideSubagentModel *bool `json:"override_subagent_model"`
 }
 
 // ScheduleDTO is the response view of a run schedule (PRD #241 M4). All fields are
@@ -79,10 +85,15 @@ type ScheduleDTO struct {
 	// the owner's per-user Worker model (NULL or empty in the DB), a value is the model a
 	// schedule fires its runs on. Validated via agenttmpl.ValidateModel; replace-semantics
 	// on PATCH (see mergeSchedule).
-	Model     *string   `json:"model"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Model *string `json:"model"`
+	// OverrideSubagentModel is the per-schedule "apply model also to agents" opt-in (PRD
+	// #305, all targets): true means a fired run's resolved model overrides every subagent's
+	// own model pin too, not just the lead. Boolean, not tri-state (Decision 5): nil ≡ false
+	// (off) under replace semantics. Default off is byte-identical to PRD #300's behaviour.
+	OverrideSubagentModel *bool     `json:"override_subagent_model"`
+	Status                string    `json:"status"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 	// NextFires is the live "next N fires" preview (up to 3), computed from the same
 	// cron/next-fire logic the modal preview endpoint uses so the list and the modal
 	// agree.

@@ -349,6 +349,56 @@ func TestScheduleGetDetailShowsModel(t *testing.T) {
 	}
 }
 
+// TestScheduleCreateApplyModelToAgents (PRD #305): --apply-model-to-agents opts every
+// subagent onto the run model, forwarded as a non-nil true *bool.
+func TestScheduleCreateApplyModelToAgents(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_am"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--model", "fable",
+		"--apply-model-to-agents", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.OverrideSubagentModel == nil || !*req.OverrideSubagentModel {
+		t.Errorf("override_subagent_model = %v, want a non-nil true", req.OverrideSubagentModel)
+	}
+}
+
+// TestScheduleCreateNoApplyModelToAgents: an unset --apply-model-to-agents stays absent
+// (nil), so the server default (false) governs rather than an explicit clear.
+func TestScheduleCreateNoApplyModelToAgents(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedSchedule: apitypes.ScheduleDTO{ID: "sch_nam"}}
+	_, _, code := runCLI(t, fakeEnv(fc),
+		"schedule", "create", "--repo", "r1", "--issue", "158", "--at", "2026-08-08T09:00:00Z")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if req := fc.LastCreateSchedReq; req.OverrideSubagentModel != nil {
+		t.Errorf("override_subagent_model = %v, want nil (unset flag stays absent)", req.OverrideSubagentModel)
+	}
+}
+
+// TestScheduleGetDetailShowsApplyModelToAgents: the detail block carries an
+// APPLY_MODEL_TO_AGENTS row rendered from the *bool (true when set-and-on, false otherwise).
+func TestScheduleGetDetailShowsApplyModelToAgents(t *testing.T) {
+	on, off := true, false
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_on":  {ID: "sch_on", Target: "prompt", Prompt: "x", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, OverrideSubagentModel: &on},
+		"sch_off": {ID: "sch_off", Target: "prompt", Prompt: "x", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, OverrideSubagentModel: &off},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_on")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "APPLY_MODEL_TO_AGENTS") || !strings.Contains(out, "true") {
+		t.Errorf("detail missing APPLY_MODEL_TO_AGENTS true row\n%s", out)
+	}
+	out2, _, _ := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_off")
+	if !strings.Contains(out2, "APPLY_MODEL_TO_AGENTS") || !strings.Contains(out2, "false") {
+		t.Errorf("detail missing APPLY_MODEL_TO_AGENTS false row\n%s", out2)
+	}
+}
+
 // TestScheduleCreatePromptBody asserts the ad-hoc prompt target and that
 // --auto-approve=false is forwarded as a non-nil false (the plan gate is kept).
 func TestScheduleCreatePromptBody(t *testing.T) {
@@ -611,6 +661,71 @@ func TestScheduleEditSurvivesUntouched(t *testing.T) {
 	}
 	if req.Enabled != nil {
 		t.Errorf("enabled = %v, want nil (pause flag untouched)", req.Enabled)
+	}
+}
+
+// editModelFixture seeds a schedule whose stored model AND subagent-override are both
+// set, so the edit tests can prove a partial edit restates them (the model-wipe bug fix,
+// PRD #300/#305) and that --apply-model-to-agents overlays a new value.
+func editModelFixture(id string) *uzicli.FakeClient {
+	on := true
+	return &uzicli.FakeClient{
+		ScheduleByID: map[string]apitypes.ScheduleDTO{
+			id: {
+				ID:                    id,
+				Target:                "sweep",
+				Labels:                []string{"bug"},
+				Timing:                "recurring",
+				CronExpr:              "0 9 * * 1",
+				Timezone:              "UTC",
+				AutoApprove:           true,
+				WaitOnLimit:           true,
+				Enabled:               true,
+				Status:                "active",
+				Model:                 sptr("fable"),
+				OverrideSubagentModel: &on,
+			},
+		},
+		PatchedSchedule: apitypes.ScheduleDTO{ID: id, Target: "sweep", Timing: "recurring", CronExpr: "0 4 * * 2", Enabled: true},
+	}
+}
+
+// TestScheduleEditRestatesModel (load-bearing regression, PRD #300/#305): a --cron-only
+// edit — one that never touches the model — must RESTATE the fetched schedule's stored
+// Model and OverrideSubagentModel on the PATCH. mergeSchedule takes both straight from the
+// request (nil clears them), so without the restate a plain retime silently WIPED the
+// model (the pre-existing bug this milestone fixes) and would likewise drop the override.
+func TestScheduleEditRestatesModel(t *testing.T) {
+	fc := editModelFixture("sch_em")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_em", "--cron", "0 4 * * 2")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	req := fc.LastPatchSchedReq
+	if req.Model == nil || *req.Model != "fable" {
+		t.Errorf("model = %v, want the original \"fable\" re-sent, not wiped", req.Model)
+	}
+	if req.OverrideSubagentModel == nil || !*req.OverrideSubagentModel {
+		t.Errorf("override_subagent_model = %v, want the original true re-sent, not wiped", req.OverrideSubagentModel)
+	}
+}
+
+// TestScheduleEditApplyModelToAgentsFalse: --apply-model-to-agents=false on a schedule
+// whose flag is currently true overlays an explicit non-nil false (turning the override
+// off), rather than leaving the restated true untouched.
+func TestScheduleEditApplyModelToAgentsFalse(t *testing.T) {
+	fc := editModelFixture("sch_em")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_em", "--apply-model-to-agents=false")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut)
+	}
+	req := fc.LastPatchSchedReq
+	if req.OverrideSubagentModel == nil || *req.OverrideSubagentModel {
+		t.Errorf("override_subagent_model = %v, want a non-nil false (explicit override)", req.OverrideSubagentModel)
+	}
+	// The model itself is untouched by this edit, so it stays restated from the fetch.
+	if req.Model == nil || *req.Model != "fable" {
+		t.Errorf("model = %v, want the original \"fable\" preserved", req.Model)
 	}
 }
 

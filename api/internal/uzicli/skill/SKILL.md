@@ -346,6 +346,10 @@ nothing a manual start cannot.
   - `--guidance <text>` (with `--issue`/`--sweep`) injects free owner steering into the
     run instruction ("keep the diff small", "add a failing test first") without editing
     each issue; capped at 8 KiB.
+  - `--model <alias|id>` (valid on every target) pins the model a fired run uses;
+    `--apply-model-to-agents` (default off) additionally applies that model to every
+    subagent, overriding each agent's own model pin. Both are restated on `edit`, so a
+    partial `edit` never wipes them.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
   `NEXT`, `ON`); `--json` dumps the raw array.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
@@ -356,7 +360,10 @@ nothing a manual start cannot.
   (enabled=false) schedule, which stays off until `resume`. Retime with `--cron` or `--at`
   (switching timing accordingly), adjust `--tz`, and — scoped to the target — `--prompt`,
   `--label`, `--guidance`/`--clear-guidance`, `--max-issues`/`--clear-max-issues`,
-  `--auto-approve`, `--wait-on-limit`. At least one field is required.
+  `--auto-approve`, `--wait-on-limit`, `--apply-model-to-agents` (toggle the subagent
+  model override). At least one field is required. `edit` does NOT change the model
+  itself, but it now preserves the stored `--model` and `--apply-model-to-agents` across
+  any partial edit (previously a plain retime silently wiped the stored model).
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
 - `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence;

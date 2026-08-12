@@ -24,6 +24,12 @@ leaves `model` unset), uzi resolves the model in this order:
 A subagent with its own `model` override always uses that, regardless of the
 schedule model or your setting.
 
+If a schedule has **"Apply model also to agents"** turned on, that default is
+overridden: the run's resolved model is applied to every subagent too,
+including one with its own `model` pin, so the whole run — lead and all
+subagents — runs on a single model. This covers both your own agent
+templates and a cloned repo's `.claude/agents/`.
+
 ## Set your worker model
 
 1. Open **Settings → Worker model**.
@@ -49,6 +55,13 @@ Inherit uses your Worker model. The model a scheduled run actually used is
 shown on that run's detail page and by `uzi run get`. Same validation as the
 Worker model above (single token, at most 100 characters; blank means
 inherit).
+
+Tick **"Apply model also to agents"** (or pass `uzi schedule create
+--apply-model-to-agents`) to make the schedule's model apply to every
+subagent too, not just the lead — useful for a cheap recurring bot whose
+subagents would otherwise run on their own pinned (and pricier) models.
+Whether a given run applied the model fleet-wide is shown on that run's
+detail page and by `uzi run get`.
 
 ## Good to know
 

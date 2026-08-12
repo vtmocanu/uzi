@@ -68,6 +68,7 @@ function fakeRun(): Run {
     worker_id: "worker-1",
     branch: null,
     model: null,
+    override_subagent_model: false,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,

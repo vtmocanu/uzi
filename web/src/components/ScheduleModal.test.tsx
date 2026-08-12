@@ -132,6 +132,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     max_issues: 10,
     guidance: null,
     model: "fable",
+    override_subagent_model: false,
     enabled: true,
     status: "active",
     created_at: "2026-01-01T00:00:00Z",
@@ -174,6 +175,51 @@ describe("the per-schedule model control (PRD #300)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
     expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.model).toBeNull();
+  });
+});
+
+describe('the "apply model also to agents" toggle (PRD #305)', () => {
+  it("renders always enabled, including when Model is Inherit/empty", () => {
+    renderModal();
+    // A fresh create leaves Model on Inherit (empty). The toggle is first-class on
+    // Inherit (Decision 3), so it must render and never be disabled.
+    const model = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(model.value).toBe("inherit");
+    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    expect(toggle.hasAttribute("disabled")).toBe(false);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("reflects the stored override_subagent_model when editing", () => {
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ override_subagent_model: true })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    const toggle = screen.getByRole("switch", { name: "Apply model also to agents" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("flows the flag into the submitted ScheduleInput", async () => {
+    mockApi.updateSchedule.mockResolvedValue(schedFixture({ override_subagent_model: true }));
+    render(
+      <MemoryRouter>
+        <ScheduleModal
+          editing={schedFixture({ override_subagent_model: false })}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("switch", { name: "Apply model also to agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+    expect(mockApi.updateSchedule.mock.calls[0]?.[1]?.override_subagent_model).toBe(true);
   });
 });
 

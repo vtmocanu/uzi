@@ -1,7 +1,7 @@
 # PRD #305: Apply a schedule's model to subagents, not just the lead
 
 **GitLab Issue**: [#305](https://gitlab.example.com/vtmocanu/uzi/-/issues/305)
-**Status**: Draft
+**Status**: Complete (2026-08-12)
 **Priority**: Medium
 **Design mock**: [interactive ScheduleModal mock](https://claude.ai/code/artifact/d25daba5-aed2-4264-94c6-33ee37027dac) (the new checkbox + the Lead / All subagents summary)
 **Related**: PRD #300 (per-schedule model — this PRD is its direct sequel and reuses its `runs.model` freeze, its `default_model` claim delivery, and its DTO/`schedsvc`/modal surfaces). PRD #17 (per-user Worker model + the precedence lane). PRD #37 Decision 2 / #3 (subagent `model:` pins, the own-vs-repo roster source, and the inherit-all contract this flag opts out of). PRD #302 (`uzi schedule edit` verb, which carries this field on existing schedules). PRD #58 / builtin templates (all eleven builtins pin a `model:`, and uzi's own `.claude/agents/*.md` pin `claude-opus-4-8`, which is why the pinned case is the whole point).
@@ -90,7 +90,7 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
 
 ## Milestones
 
-- [ ] **M1 — Schema, DTO & shared-insert threading.** Goose migration adds
+- [x] **M1 — Schema, DTO & shared-insert threading.** Goose migration adds
   `override_subagent_model boolean NOT NULL DEFAULT false` to `run_schedules` and
   `runs`. Thread the flag onto the created run through the exact insert seams PRD
   #300 M1 threaded `model`, and **name them**: the `CreatePromptRun` INSERT and the
@@ -108,7 +108,7 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
   a nil→false column mapper against the `NOT NULL DEFAULT false` column (analogous to
   `modelColumn`, `schedules.go:609`).
 
-- [ ] **M2 — API round-trip & the `onlyEnabled` fix.** The schedule handler carries
+- [x] **M2 — API round-trip & the `onlyEnabled` fix.** The schedule handler carries
   the flag on create and patch; it is added to the config-PATCH replace set and the
   `onlyEnabled` enumeration (`schedules.go`) so a `{enabled, override_subagent_model}`
   PATCH is not misrouted and the flag silently dropped — the exact bug PRD #300 M2
@@ -116,47 +116,87 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
   semantics: because the flag is a `*bool`, an omitted value collapses to false
   (Decision 5), which the web always avoids by sending the full config.
 
-- [ ] **M3 — Freeze & claim delivery.** `schedsvc` freezes the schedule's flag onto
+- [x] **M3 — Freeze & claim delivery.** `schedsvc` freezes the schedule's flag onto
   each run it fires (all targets); claim assembly delivers it on the claim config as
   `override_subagent_model` (a new field alongside `default_model`,
   `api/internal/workersvc/claim.go`). Store round-trip proven in M7's live-DB sweep;
   the freeze/deliver wiring proven by a workersvc unit test (flag off → config field
   false/absent, byte-identical to today; flag on → true).
 
-- [ ] **M4 — Worker-side subagent override (the behavior).** In the agent, when the
+- [x] **M4 — Worker-side subagent override (the behavior).** In the agent, when the
   delivered `override_subagent_model` is set and a run model resolves (the lead
-  model / `baseOptions.model`), `toDefinition` sets every subagent's `def.model` to
-  that model instead of the template pin — so it applies to **both** the own roster
+  model / `baseOptions.model`), every subagent's `model` is set to that model
+  instead of the template pin — so it applies to **both** the own roster
   (`assembleAgents`) and the repo roster (`subagentsFromTemplates`). Unit tests on
   **both** rosters, each **calibrated on a PINNED subagent** (an unpinned one passes
   with or without the flag — Decision 7): flag off → pins preserved byte-identical;
   flag on → every subagent carries the run model, pin overridden. `agent/` unit
   tests (`agents.test.ts`, `sdk-executor.test.ts`).
+  - Landed as a post-build helper `applySubagentModelOverride` in `agent/src/agents.ts`
+    applied to BOTH rosters by the executor, rather than a branch inside
+    `toDefinition`: `toDefinition` runs *inside* `assembleAgents`, which must complete
+    before `leadModel` can resolve (it needs `assembled.leadModel`), so `toDefinition`
+    cannot receive the run model. The `leadModel`
+    computation was hoisted to right after `assembleAgents` so the own roster is
+    overridden before the `planTurnSubagents` copy; the repo roster is overridden where it is freshly
+    built after `selectSubagents`. Still one mechanism covering both rosters
+    (Decision 2). Claim field `override_subagent_model` added to `ClaimConfig`
+    (`agent/src/protocol.ts`). `task gate:agent` green.
 
-- [ ] **M5 — Web (schedule modal + run-detail read).** ScheduleModal gains a
+- [x] **M5 — Web (schedule modal + run-detail read).** ScheduleModal gains a
   checkbox **"Apply model also to agents"** directly under the Model field, **always
   enabled** (first-class on Inherit, Decision 3), helper text "Subagents run on the
   same model as the lead"; editing reflects the stored value. The run detail view
   shows whether the run applied the model to agents. `mockApi.ts` schedule mocks
   carry the field. Component tests cover the round-trip and the flag-on/Inherit
   state.
+  - Landed. Types: `Schedule`/`ScheduleInput`/`Run` in `web/src/lib/api.ts` carry
+    `override_subagent_model` (`Run` required, so every Run/Schedule fixture across
+    `mocks/` and the `*.test.tsx` factories gained the field — `tsc` green). Modal:
+    a `Toggle` labelled "Apply model also to agents" under the Model `<Field>`,
+    always enabled, wired to state seeded from `editing?.override_subagent_model` and
+    sent on every `ScheduleInput`. Run detail: a "model on all agents" `Badge` on
+    `RunView` shown on every status when `run.override_subagent_model`. Mocks:
+    `sch-7kd2` demos flag-on plus a flag-on run fixture; `createSchedule`/`updateSchedule`
+    round-trip it. Tests: new `ScheduleModal.test.tsx` block (always-enabled on
+    Inherit, reflects stored value, flows into the payload) and `RunView.test.tsx`
+    badge on/off cases. `task gate:web` green; `vite build` clean. api/agent/CLI
+    untouched (M6 is the CLI milestone).
 
-- [ ] **M6 — CLI.** `uzi schedule create --apply-model-to-agents` and `--json`
+- [x] **M6 — CLI.** `uzi schedule create --apply-model-to-agents` and `--json`
   carry the flag; `uzi run get` surfaces the frozen value (`--field` / `--json`).
   The `schedule edit` verb (PRD #302, already shipped) carries it for existing
   schedules. The embedded `api/internal/uzicli/skill/SKILL.md` is updated (source of
   truth, not the installed copy).
 
-- [ ] **M7 — Live-DB sweep.** The store round-trip (schedule + frozen run column)
+- [x] **M7 — Live-DB sweep.** The store round-trip (schedule + frozen run column)
   runs through the live-DB harness (`./e2e/run-store-it.sh`) — the toolchain-boundary
   check the repo requires for any new/edited query. Unit proofs live in M2/M3/M4, not
   duplicated.
 
-- [ ] **M8 — Docs & specs.** `docs/worker-model.md`'s precedence section documents
+- [x] **M8 — Docs & specs.** `docs/worker-model.md`'s precedence section documents
   the opt-in that overrides subagent pins across both rosters (contrast with the
   default lane, where pins win); a `specs/ai.md` decision records the worker-side
   placement, the roster-coverage reason, and the "whole run follows the lead model"
   semantics. PRD moved to `prds/done/`.
+
+### As-built notes (divergences from the plan above)
+
+- **`RunDTO.override_subagent_model` landed as its own small step.** The run-detail
+  read (M5) and `uzi run get` (M6) both consume the frozen flag on the RunDTO, so
+  it was exposed once, ahead of both, as `RunDTO.OverrideSubagentModel bool`
+  (`api/internal/apitypes/run.go`, populated in `handler/workers.go`, wire-pinned in
+  `apitypes/wire_test.go`) — mirroring PRD #300's `RunDTO.Model`. `uzi run get
+  --field override_subagent_model` then works through the generic field accessor
+  with no CLI code change.
+- **M6 fixed a pre-existing PRD #302 bug.** `buildScheduleEditRequest`
+  (`api/cmd/uzi/schedule.go`) restated `max_issues`/`guidance` from the fetched DTO
+  but NOT the replace-semantics `model` field, so a partial `uzi schedule edit`
+  (e.g. `--cron`) silently wiped a schedule's stored model. It now restates both
+  `model` and `override_subagent_model`; `TestScheduleEditRestatesModel` guards it.
+- **M4 shape.** The override is a post-build helper (`applySubagentModelOverride`)
+  applied to both rosters by the executor, not a branch inside `toDefinition` — see
+  the M4 sub-note above for why (`toDefinition` runs before the run model resolves).
 
 ## Decision Log
 

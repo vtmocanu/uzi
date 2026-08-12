@@ -25,6 +25,7 @@ function run(over: Partial<Run> = {}): Run {
     worker_id: null,
     branch: "ci-fix/pipeline-4200",
     model: null,
+    override_subagent_model: false,
     mr_iid: 7,
     mr_state: null,
     failure_reason: null,

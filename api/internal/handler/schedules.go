@@ -182,23 +182,24 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
 	s, err := h.q.CreateRunSchedule(r.Context(), store.CreateRunScheduleParams{
-		UserID:      user.ID,
-		RepoID:      repo.ID,
-		Target:      m.Target,
-		IssueIid:    issueIID,
-		Labels:      labels,
-		Prompt:      prompt,
-		Timing:      m.Timing,
-		CronExpr:    cronExpr,
-		RunAt:       runAt,
-		Timezone:    m.Timezone,
-		NextFireAt:  nextFire,
-		AutoApprove: *m.AutoApprove,
-		WaitOnLimit: *m.WaitOnLimit,
-		Enabled:     *m.Enabled,
-		MaxIssues:   maxIssuesColumn(m),
-		Guidance:    guidanceColumn(m),
-		Model:       modelColumn(m),
+		UserID:                user.ID,
+		RepoID:                repo.ID,
+		Target:                m.Target,
+		IssueIid:              issueIID,
+		Labels:                labels,
+		Prompt:                prompt,
+		Timing:                m.Timing,
+		CronExpr:              cronExpr,
+		RunAt:                 runAt,
+		Timezone:              m.Timezone,
+		NextFireAt:            nextFire,
+		AutoApprove:           *m.AutoApprove,
+		WaitOnLimit:           *m.WaitOnLimit,
+		Enabled:               *m.Enabled,
+		MaxIssues:             maxIssuesColumn(m),
+		Guidance:              guidanceColumn(m),
+		Model:                 modelColumn(m),
+		OverrideSubagentModel: overrideSubagentModelColumn(m),
 	})
 	if err != nil {
 		slog.Error("create run schedule", "error", err)
@@ -280,22 +281,23 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		}
 		issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
 		final, err = h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
-			Target:      m.Target,
-			IssueIid:    issueIID,
-			Labels:      labels,
-			Prompt:      prompt,
-			Timing:      m.Timing,
-			CronExpr:    cronExpr,
-			RunAt:       runAt,
-			Timezone:    m.Timezone,
-			NextFireAt:  nextFire,
-			AutoApprove: *m.AutoApprove,
-			WaitOnLimit: *m.WaitOnLimit,
-			MaxIssues:   maxIssuesColumn(m),
-			Guidance:    guidanceColumn(m),
-			Model:       modelColumn(m),
-			ID:          id,
-			UserID:      user.ID,
+			Target:                m.Target,
+			IssueIid:              issueIID,
+			Labels:                labels,
+			Prompt:                prompt,
+			Timing:                m.Timing,
+			CronExpr:              cronExpr,
+			RunAt:                 runAt,
+			Timezone:              m.Timezone,
+			NextFireAt:            nextFire,
+			AutoApprove:           *m.AutoApprove,
+			WaitOnLimit:           *m.WaitOnLimit,
+			MaxIssues:             maxIssuesColumn(m),
+			Guidance:              guidanceColumn(m),
+			Model:                 modelColumn(m),
+			OverrideSubagentModel: overrideSubagentModelColumn(m),
+			ID:                    id,
+			UserID:                user.ID,
 		})
 		if err != nil {
 			slog.Error("update run schedule", "error", err)
@@ -467,7 +469,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		req.IssueIID == nil && req.Labels == nil && req.Prompt == "" &&
 		req.CronExpr == "" && req.RunAt == nil && req.Timezone == "" &&
 		req.AutoApprove == nil && req.WaitOnLimit == nil && req.MaxIssues == nil &&
-		req.Guidance == nil && req.Model == nil
+		req.Guidance == nil && req.Model == nil && req.OverrideSubagentModel == nil
 }
 
 // mergeSchedule overlays the provided PATCH fields onto the current stored schedule,
@@ -554,6 +556,11 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	// the DB as NULL = inherit. A seed-and-keep would make an explicit clear indistinguishable
 	// from omitted.
 	m.Model = req.Model
+	// override_subagent_model (PRD #305) takes the request value DIRECTLY, same
+	// replace-semantics as model/guidance/max_issues above: the config PATCH rewrites the
+	// whole row (enabled-only is short-circuited by onlyEnabled), so nil ≡ false (Decision 5)
+	// means an omitted value turns it off — which the web avoids by sending the full config.
+	m.OverrideSubagentModel = req.OverrideSubagentModel
 	return m
 }
 
@@ -611,6 +618,13 @@ func modelColumn(m apitypes.ScheduleRequest) pgtype.Text {
 		return pgtype.Text{String: *m.Model, Valid: true}
 	}
 	return pgtype.Text{}
+}
+
+// overrideSubagentModelColumn maps the request's *bool to the NOT NULL DEFAULT false
+// column (PRD #305): nil (absent) ≡ false. Unlike modelColumn there is no tri-state —
+// the flag is off or on (Decision 5), not target-scoped (applies to every target).
+func overrideSubagentModelColumn(m apitypes.ScheduleRequest) bool {
+	return m.OverrideSubagentModel != nil && *m.OverrideSubagentModel
 }
 
 // nextFireFor computes the durable next_fire_at from a validated request: the next cron
@@ -695,6 +709,9 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		v := s.Model.String
 		dto.Model = &v
 	}
+	// override_subagent_model is a plain bool column (never NULL, PRD #305), so always set it.
+	ov := s.OverrideSubagentModel
+	dto.OverrideSubagentModel = &ov
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {
 			dto.NextFires = fires

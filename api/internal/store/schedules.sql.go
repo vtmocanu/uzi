@@ -19,7 +19,7 @@ SET last_fired_at = $1,
     status        = $3,
     updated_at    = now()
 WHERE id = $4
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
 `
 
 type AdvanceScheduleParams struct {
@@ -64,12 +64,13 @@ func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
 
 const claimDueSchedules = `-- name: ClaimDueSchedules :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()
 ORDER BY next_fire_at
@@ -115,6 +116,7 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 			&i.MaxIssues,
 			&i.Guidance,
 			&i.Model,
+			&i.OverrideSubagentModel,
 		); err != nil {
 			return nil, err
 		}
@@ -128,22 +130,23 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 
 const createPromptRun = `-- name: CreatePromptRun :one
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model
+    user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model, override_subagent_model
 ) VALUES (
-    $1, $2::uuid, 'prompt', $3, $4, $5::uuid, $6, $7, $8
+    $1, $2::uuid, 'prompt', $3, $4, $5::uuid, $6, $7, $8, $9
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model
 `
 
 type CreatePromptRunParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
-	ScheduleID       uuid.UUID   `json:"schedule_id"`
-	AutoApprove      bool        `json:"auto_approve"`
-	WaitOnLimit      bool        `json:"wait_on_limit"`
-	Model            pgtype.Text `json:"model"`
+	UserID                uuid.UUID   `json:"user_id"`
+	RepoID                uuid.UUID   `json:"repo_id"`
+	IssueTitle            string      `json:"issue_title"`
+	IssueDescription      string      `json:"issue_description"`
+	ScheduleID            uuid.UUID   `json:"schedule_id"`
+	AutoApprove           bool        `json:"auto_approve"`
+	WaitOnLimit           bool        `json:"wait_on_limit"`
+	Model                 pgtype.Text `json:"model"`
+	OverrideSubagentModel bool        `json:"override_subagent_model"`
 }
 
 // The scheduler's dedicated insert for a kind='prompt' run (PRD #241): repo-ful,
@@ -163,6 +166,7 @@ func (q *Queries) CreatePromptRun(ctx context.Context, arg CreatePromptRunParams
 		arg.AutoApprove,
 		arg.WaitOnLimit,
 		arg.Model,
+		arg.OverrideSubagentModel,
 	)
 	var i Run
 	err := row.Scan(
@@ -239,6 +243,7 @@ func (q *Queries) CreatePromptRun(ctx context.Context, arg CreatePromptRunParams
 		&i.ReportMd,
 		&i.CiConfigPaths,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
@@ -248,33 +253,34 @@ const createRunSchedule = `-- name: CreateRunSchedule :one
 INSERT INTO run_schedules (
     user_id, repo_id, target, issue_iid, labels, prompt,
     timing, cron_expr, run_at, timezone, next_fire_at,
-    auto_approve, wait_on_limit, enabled, max_issues, guidance, model
+    auto_approve, wait_on_limit, enabled, max_issues, guidance, model, override_subagent_model
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10, $11,
-    $12, $13, $14, $15, $16, $17
+    $12, $13, $14, $15, $16, $17, $18
 )
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
 `
 
 type CreateRunScheduleParams struct {
-	UserID      uuid.UUID          `json:"user_id"`
-	RepoID      uuid.UUID          `json:"repo_id"`
-	Target      string             `json:"target"`
-	IssueIid    pgtype.Int8        `json:"issue_iid"`
-	Labels      []byte             `json:"labels"`
-	Prompt      pgtype.Text        `json:"prompt"`
-	Timing      string             `json:"timing"`
-	CronExpr    pgtype.Text        `json:"cron_expr"`
-	RunAt       pgtype.Timestamptz `json:"run_at"`
-	Timezone    string             `json:"timezone"`
-	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove bool               `json:"auto_approve"`
-	WaitOnLimit bool               `json:"wait_on_limit"`
-	Enabled     bool               `json:"enabled"`
-	MaxIssues   pgtype.Int4        `json:"max_issues"`
-	Guidance    pgtype.Text        `json:"guidance"`
-	Model       pgtype.Text        `json:"model"`
+	UserID                uuid.UUID          `json:"user_id"`
+	RepoID                uuid.UUID          `json:"repo_id"`
+	Target                string             `json:"target"`
+	IssueIid              pgtype.Int8        `json:"issue_iid"`
+	Labels                []byte             `json:"labels"`
+	Prompt                pgtype.Text        `json:"prompt"`
+	Timing                string             `json:"timing"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	RunAt                 pgtype.Timestamptz `json:"run_at"`
+	Timezone              string             `json:"timezone"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	Enabled               bool               `json:"enabled"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	Guidance              pgtype.Text        `json:"guidance"`
+	Model                 pgtype.Text        `json:"model"`
+	OverrideSubagentModel bool               `json:"override_subagent_model"`
 }
 
 // Scheduled runs (PRD #241). run_schedules is the durable, time-driven origin of a
@@ -302,6 +308,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		arg.MaxIssues,
 		arg.Guidance,
 		arg.Model,
+		arg.OverrideSubagentModel,
 	)
 	var i RunSchedule
 	err := row.Scan(
@@ -327,6 +334,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
@@ -350,7 +358,7 @@ func (q *Queries) DeleteRunSchedule(ctx context.Context, arg DeleteRunSchedulePa
 }
 
 const getRunSchedule = `-- name: GetRunSchedule :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model FROM run_schedules WHERE id = $1
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE id = $1
 `
 
 // Unscoped fetch by id (server-internal: the claimer/firing path already holds a
@@ -381,12 +389,13 @@ func (q *Queries) GetRunSchedule(ctx context.Context, id uuid.UUID) (RunSchedule
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
 
 const getRunScheduleForUser = `-- name: GetRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model FROM run_schedules WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE id = $1 AND user_id = $2
 `
 
 type GetRunScheduleForUserParams struct {
@@ -422,6 +431,7 @@ func (q *Queries) GetRunScheduleForUser(ctx context.Context, arg GetRunScheduleF
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
@@ -445,7 +455,7 @@ func (q *Queries) HasActiveRunForSchedule(ctx context.Context, scheduleID pgtype
 }
 
 const listRunSchedulesForUser = `-- name: ListRunSchedulesForUser :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
 `
 
 // The owner's schedules, newest first.
@@ -481,6 +491,7 @@ func (q *Queries) ListRunSchedulesForUser(ctx context.Context, userID uuid.UUID)
 			&i.MaxIssues,
 			&i.Guidance,
 			&i.Model,
+			&i.OverrideSubagentModel,
 		); err != nil {
 			return nil, err
 		}
@@ -548,7 +559,7 @@ const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
 `
 
 type SetRunScheduleEnabledParams struct {
@@ -584,6 +595,7 @@ func (q *Queries) SetRunScheduleEnabled(ctx context.Context, arg SetRunScheduleE
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
@@ -592,7 +604,7 @@ const setRunScheduleStatus = `-- name: SetRunScheduleStatus :one
 UPDATE run_schedules
 SET status = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
 `
 
 type SetRunScheduleStatusParams struct {
@@ -628,6 +640,7 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }
@@ -648,29 +661,31 @@ SET target        = $1,
     max_issues    = $12,
     guidance      = $13,
     model         = $14,
+    override_subagent_model = $15,
     status        = 'active',
     updated_at    = now()
-WHERE id = $15 AND user_id = $16
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model
+WHERE id = $16 AND user_id = $17
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
 `
 
 type UpdateRunScheduleParams struct {
-	Target      string             `json:"target"`
-	IssueIid    pgtype.Int8        `json:"issue_iid"`
-	Labels      []byte             `json:"labels"`
-	Prompt      pgtype.Text        `json:"prompt"`
-	Timing      string             `json:"timing"`
-	CronExpr    pgtype.Text        `json:"cron_expr"`
-	RunAt       pgtype.Timestamptz `json:"run_at"`
-	Timezone    string             `json:"timezone"`
-	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
-	AutoApprove bool               `json:"auto_approve"`
-	WaitOnLimit bool               `json:"wait_on_limit"`
-	MaxIssues   pgtype.Int4        `json:"max_issues"`
-	Guidance    pgtype.Text        `json:"guidance"`
-	Model       pgtype.Text        `json:"model"`
-	ID          uuid.UUID          `json:"id"`
-	UserID      uuid.UUID          `json:"user_id"`
+	Target                string             `json:"target"`
+	IssueIid              pgtype.Int8        `json:"issue_iid"`
+	Labels                []byte             `json:"labels"`
+	Prompt                pgtype.Text        `json:"prompt"`
+	Timing                string             `json:"timing"`
+	CronExpr              pgtype.Text        `json:"cron_expr"`
+	RunAt                 pgtype.Timestamptz `json:"run_at"`
+	Timezone              string             `json:"timezone"`
+	NextFireAt            pgtype.Timestamptz `json:"next_fire_at"`
+	AutoApprove           bool               `json:"auto_approve"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	MaxIssues             pgtype.Int4        `json:"max_issues"`
+	Guidance              pgtype.Text        `json:"guidance"`
+	Model                 pgtype.Text        `json:"model"`
+	OverrideSubagentModel bool               `json:"override_subagent_model"`
+	ID                    uuid.UUID          `json:"id"`
+	UserID                uuid.UUID          `json:"user_id"`
 }
 
 // Owner-scoped edit of the mutable fields. A foreign id matches no row and returns
@@ -699,6 +714,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		arg.MaxIssues,
 		arg.Guidance,
 		arg.Model,
+		arg.OverrideSubagentModel,
 		arg.ID,
 		arg.UserID,
 	)
@@ -726,6 +742,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		&i.MaxIssues,
 		&i.Guidance,
 		&i.Model,
+		&i.OverrideSubagentModel,
 	)
 	return i, err
 }

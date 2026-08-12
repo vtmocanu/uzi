@@ -386,6 +386,183 @@ func TestRunModelFrozenLiveDB(t *testing.T) {
 	}
 }
 
+// TestRunScheduleOverrideSubagentModelRoundTripLiveDB is the mandatory live-DB coverage for
+// the PRD #305 per-schedule override on run_schedules.override_subagent_model: a green
+// `sqlc generate` does not prove the new `bool NOT NULL DEFAULT false` column round-trips
+// through a real INSERT/UPDATE, so this exercises the OverrideSubagentModel param on both
+// CreateRunSchedule and UpdateRunSchedule against real Postgres.
+func TestRunScheduleOverrideSubagentModelRoundTripLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, userID, repoID := schedFixture(ctx, t)
+
+	// Create a valid prompt/once schedule carrying the override flag on.
+	sched, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:                userID,
+		RepoID:                repoID,
+		Target:                "prompt",
+		Prompt:                pgtype.Text{String: "do the thing", Valid: true},
+		Timing:                "once",
+		RunAt:                 tsPast(),
+		Timezone:              "UTC",
+		NextFireAt:            tsPast(),
+		AutoApprove:           true,
+		Enabled:               true,
+		OverrideSubagentModel: true,
+	})
+	if err != nil {
+		t.Fatalf("create schedule with override_subagent_model: %v", err)
+	}
+	if !sched.OverrideSubagentModel {
+		t.Fatalf("created schedule override_subagent_model = %v, want true", sched.OverrideSubagentModel)
+	}
+
+	// Update clearing the override to false (proves the column round-trips through UPDATE,
+	// not just the DB default).
+	updated, err := q.UpdateRunSchedule(ctx, store.UpdateRunScheduleParams{
+		Target:                "prompt",
+		Prompt:                pgtype.Text{String: "do the thing", Valid: true},
+		Timing:                "once",
+		RunAt:                 tsPast(),
+		Timezone:              "UTC",
+		NextFireAt:            tsPast(),
+		AutoApprove:           true,
+		OverrideSubagentModel: false,
+		ID:                    sched.ID,
+		UserID:                userID,
+	})
+	if err != nil {
+		t.Fatalf("update schedule clearing override_subagent_model: %v", err)
+	}
+	if updated.OverrideSubagentModel {
+		t.Fatalf("after update, schedule override_subagent_model = %v, want false", updated.OverrideSubagentModel)
+	}
+
+	// A create with the field OMITTED (Go zero value false) stores false via the
+	// NOT NULL DEFAULT false path.
+	def, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "another", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create schedule with default override_subagent_model: %v", err)
+	}
+	if def.OverrideSubagentModel {
+		t.Fatalf("default-path create stored override_subagent_model = %v, want false", def.OverrideSubagentModel)
+	}
+}
+
+// TestRunOverrideSubagentModelFrozenLiveDB proves runs.override_subagent_model (PRD #305)
+// persists on BOTH insert paths — CreatePromptRun (the scheduler's prompt-run insert) and
+// CreateRun (the shared engine insert) — and reads back via GetRunByID, the exact SELECT *
+// row the claim path loads. A green `sqlc generate` does not prove the new column survives
+// a real round-trip, so this runs it against real Postgres.
+func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, userID, repoID := schedFixture(ctx, t)
+
+	// runs.schedule_id has an FK to run_schedules, so a prompt run needs a real schedule.
+	sched, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "do the thing", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create schedule for prompt run: %v", err)
+	}
+
+	// CreatePromptRun with the override on → GetRunByID reads it back.
+	promptRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		UserID:                userID,
+		RepoID:                repoID,
+		ScheduleID:            sched.ID,
+		IssueTitle:            "prompt run",
+		IssueDescription:      "do the thing",
+		AutoApprove:           true,
+		WaitOnLimit:           false,
+		OverrideSubagentModel: true,
+	})
+	if err != nil {
+		t.Fatalf("CreatePromptRun with override_subagent_model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, promptRun.ID); err != nil {
+		t.Fatalf("GetRunByID (prompt run): %v", err)
+	} else if !got.OverrideSubagentModel {
+		t.Fatalf("prompt run override_subagent_model = %v, want true", got.OverrideSubagentModel)
+	}
+
+	// The shared engine insert (CreateRun) also freezes the override → GetRunByID reads it back.
+	engineRun, err := q.CreateRun(ctx, store.CreateRunParams{
+		UserID:                userID,
+		RepoID:                repoID,
+		IssueIid:              pgtype.Int8{Int64: 4343, Valid: true},
+		IssueTitle:            "engine run",
+		IssueDescription:      "an issue-driven run",
+		AutoApprove:           false,
+		WaitOnLimit:           false,
+		PlanSource:            "agent",
+		RequireBaseMatch:      false,
+		OverrideSubagentModel: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun with override_subagent_model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, engineRun.ID); err != nil {
+		t.Fatalf("GetRunByID (engine run): %v", err)
+	} else if !got.OverrideSubagentModel {
+		t.Fatalf("engine run override_subagent_model = %v, want true", got.OverrideSubagentModel)
+	}
+
+	// A second prompt schedule + run with the field OMITTED (false) → GetRunByID reads
+	// false (default-off path).
+	sched2, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "prompt",
+		Prompt:      pgtype.Text{String: "another", Valid: true},
+		Timing:      "once",
+		RunAt:       tsPast(),
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create second schedule: %v", err)
+	}
+	defRun, err := q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		UserID:           userID,
+		RepoID:           repoID,
+		ScheduleID:       sched2.ID,
+		IssueTitle:       "prompt run 2",
+		IssueDescription: "another",
+		AutoApprove:      true,
+		WaitOnLimit:      false,
+	})
+	if err != nil {
+		t.Fatalf("CreatePromptRun with default override_subagent_model: %v", err)
+	}
+	if got, err := q.GetRunByID(ctx, defRun.ID); err != nil {
+		t.Fatalf("GetRunByID (default prompt run): %v", err)
+	} else if got.OverrideSubagentModel {
+		t.Fatalf("default prompt run override_subagent_model = %v, want false", got.OverrideSubagentModel)
+	}
+}
+
 func containsSchedule(rows []store.RunSchedule, id uuid.UUID) bool {
 	for _, r := range rows {
 		if r.ID == id {

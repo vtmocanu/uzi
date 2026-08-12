@@ -20070,3 +20070,73 @@ filters — instant view state, not a sync setting a poll-cycle away.
   backing so cards scroll cleanly under the bar; the `top-[49px]` offset (dropped to `0` at `lg`) clears
   the mobile shell's own 49px `sticky top-0 z-20` bar, below which this bar's `z-10` sits. A browser
   pass caught the original transparent `bg-bg` (not a real class) and confirmed the fix.
+
+## 522. PRD #305 — apply a schedule's model to subagents too (opt-in), overriding pins across both rosters — WORKER-SIDE (not worker-unchanged, unlike #300)
+
+Design record `prds/done/305-schedule-model-to-subagents.md`. Extends #300 (§520): the schedule
+model already overrode the lead; this adds an opt-in that also pushes that model onto every
+subagent, overriding each subagent's own `model:` pin. Off = today's behaviour (pins win); the flag
+only bites once the agent image is current (see Decision 2).
+
+- **Storage & freeze (Decision 1/4).** `run_schedules.override_subagent_model` (owner-set) and
+  `runs.override_subagent_model` (frozen at fire time), both `boolean NOT NULL DEFAULT false`,
+  migration `00119_schedule_run_override_subagent_model.sql` (above the live head 00118; subject to
+  the assign-at-merge renumber rule if another PRD lands a 00119 first). False = today's behaviour, no backfill. The scheduler freezes the schedule's flag
+  onto each run through the SAME run-insert seams #300 threaded `model`: `CreatePromptRun`
+  (`api/internal/workersvc/prompt.go`, prompt) and the shared `createRun`
+  (`api/internal/workersvc/service.go`) via `CreateScheduledRun`/`CreateScheduledAutopilotRun`
+  (issue/sweep). The value is derived by `scheduleOverrideSubagentModel(sched)`
+  (`api/internal/schedsvc/scheduler.go`, beside `scheduleModel`); non-scheduled callers pass false.
+  Run stays self-describing (immune to later schedule edits/deletion); the hot claim path stays a
+  single-row read.
+- **WORKER-SIDE placement (Decision 2) — the load-bearing decision, and why it is NOT the
+  API-side / worker-unchanged approach #300 used.** A run resolves its subagents from one of two
+  sources (PRD #37): the OWN roster (the claim's Agents, assembled by `assembleAgents`) or the cloned
+  repo's `.claude/agents/` (the REPO roster, `subagentsFromTemplates`, parsed worker-side). An
+  API-side override of the claim's per-agent `Model` would reach only the OWN roster — but an
+  auto-approved scheduled run against a repo shipping `.claude/agents/` resolves to the REPO roster by
+  default (`resolveAgentSelection`/`selectSubagents`), which is exactly the motivating case (uzi's own
+  repo ships that roster with opus pins). So the override MUST be worker-side. Both rosters are
+  overridden by ONE helper, `applySubagentModelOverride` (`agent/src/agents.ts`) — mutates each
+  def's `model` in place; the lead is never in these maps — applied by the executor
+  (`agent/src/sdk-executor.ts`) at TWO points: the OWN roster (`assembled.subagents`, ~519) before
+  `planTurnSubagents` copies it, and the freshly-built REPO roster (`selectSubagents` result, ~1117)
+  after selection. It is a POST-BUILD helper, NOT a branch inside `toDefinition`, because
+  `toDefinition` runs inside `assembleAgents` — before the run's model resolves — so the `leadModel`
+  computation was HOISTED to right after `assembleAgents` (~510) so the own roster is overridden
+  before the plan-turn copy. The repo-path re-apply is idempotent for own-source defs (copied by
+  reference from the already-overridden map). Consequence: this feature is NOT "worker unchanged"
+  (contrast §520 Decision 7) — an un-upgraded agent image ignores the new `override_subagent_model`
+  claim field and safely degrades to pins-win (never a wrong model); the feature takes effect only
+  once the agent image is current.
+- **Precedence when set, and semantics.** The run's resolved model (schedule model → else per-user
+  Worker model → else lead template model — the SAME value the lead resolves via `resolveLeadModel`,
+  §413) is applied uniformly to the lead AND every subagent; a subagent's own `model:` pin is
+  OVERRIDDEN. When off, #300's precedence is untouched (pin wins). Semantics = "the whole run follows
+  its lead model." First-class on Inherit (Decision 3): if no model resolves (Inherit, no account
+  default), the override is a harmless no-op — subagents inherit the account default, same as the
+  lead — so the guard is `ctx.config?.override_subagent_model && leadModel`; an unresolved model
+  skips the override (never sets `def.model` to undefined).
+- **Claim delivery (Decision 3/M3).** `ClaimConfig.OverrideSubagentModel bool
+  json:"override_subagent_model,omitempty"` (`api/internal/workersvc/claim.go`), delivered at claim
+  assembly from `run.OverrideSubagentModel` (`service.go`, beside `DefaultModel`). `omitempty` keeps a
+  flag-off claim byte-identical to today's wire.
+- **Boolean, not tri-state (Decision 5).** `*bool` DTO under replace-semantics (absent ≡ false),
+  simpler than model's NULL=inherit tri-state. `mergeSchedule` (`api/internal/handler/schedules.go`)
+  takes the request value directly (`m.OverrideSubagentModel = req.OverrideSubagentModel`);
+  `req.OverrideSubagentModel == nil` was added to `onlyEnabled` so an
+  `{enabled, override_subagent_model}` patch is not misrouted to the enabled-only short-circuit (the
+  #300 M2 bug class).
+- **Surfaces.** `OverrideSubagentModel` on `ScheduleRequest`/`ScheduleDTO` (`*bool`) and `RunDTO`
+  (`bool`, `override_subagent_model`); the web schedule modal adds an always-enabled "Apply model
+  also to agents" toggle under the Model control (first-class on Inherit) plus a "model on all agents"
+  run-detail badge; CLI `uzi schedule create/edit --apply-model-to-agents`, a `schedule get` detail
+  row, and `uzi run get --field override_subagent_model` (auto-derived from `RunDTO`). A pre-existing
+  bug was fixed in passing: `buildScheduleEditRequest` (`api/cmd/uzi/schedule.go`) did not restate the
+  replace-semantics `model` field, so a partial `schedule edit` silently wiped a schedule's stored
+  model — it now restates BOTH `model` and `override_subagent_model`.
+- **Verification.** agent/ both-rosters unit matrix calibrated on PINNED subagents
+  (`agents.test.ts`, `sdk-executor.test.ts` — flag off byte-identical, flag on every subagent carries
+  the run model, on the plan turn too); workersvc claim-delivery test (off omitted / on true);
+  live-DB round-trip & freeze under `./e2e/run-store-it.sh`
+  (`TestRunScheduleOverrideSubagentModelRoundTripLiveDB`, `TestRunOverrideSubagentModelFrozenLiveDB`).

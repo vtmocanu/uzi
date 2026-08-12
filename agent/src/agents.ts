@@ -271,6 +271,26 @@ export function subagentsFromTemplates(
   return subagents;
 }
 
+/**
+ * PRD #305: when a schedule opts into "apply model also to agents", overwrite every
+ * subagent's model with the run's resolved model (the same value the lead runs on),
+ * overriding each template's own `model:` pin. Applied to BOTH rosters by the
+ * executor — the own roster (assembled.subagents, before the plan-turn copy) and the
+ * freshly-built repo roster — which is why it is a post-build mutation here rather
+ * than a branch in `toDefinition`: the own roster is built and plan-turn-copied before
+ * the run model resolves, so `toDefinition` cannot see it (PRD Decision 2 asks for one
+ * mechanism covering both rosters; this helper is that mechanism). Mutates in place;
+ * the lead is never in these maps (it is the main thread), so it is untouched.
+ */
+export function applySubagentModelOverride(
+  subagents: Record<string, AgentDefinition>,
+  model: string,
+): void {
+  for (const def of Object.values(subagents)) {
+    def.model = model;
+  }
+}
+
 /** What a planning turn runs with (#203): the write-stripped roster, plus the
  *  names that had to be dropped outright so the caller can report them. */
 export interface PlanTurnRoster {

@@ -80,14 +80,14 @@ type RunCreator interface {
 	// CreateScheduledRun is the non-auto-approve scheduled path: like CreateRun but
 	// without PRD #196's interactive PRD-link waiver, so a timer-fired sweep never
 	// starts a link-less non-primary-eligible run (see workersvc.CreateScheduledRun).
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, seed *workersvc.SeededPlan) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string) (store.Run, error)
-	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool, model *string, overrideSubagentModel bool) (store.Run, error)
+	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error)
 }
 
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection — the same
@@ -323,7 +323,7 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 	}
 	prompt := sched.Prompt.String
 	title := promptTitle(prompt)
-	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, prompt, sched.AutoApprove, sched.WaitOnLimit, scheduleModel(sched))
+	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, prompt, sched.AutoApprove, sched.WaitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	switch {
 	case err == nil:
 		return []uuid.UUID{run.ID}, nil
@@ -373,13 +373,13 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
 		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
 		// guarantee that label-driven autopilot behaviour is unchanged.
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched))
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	} else {
 		// CreateScheduledRun, NOT CreateRun: a timer-fired sweep is not the interactive
 		// human click PRD #196's PRD-link waiver is scoped to, so a link-less
 		// non-primary-eligible issue swept in here still needs a link or PRDLESS. Using
 		// CreateRun would silently widen the scheduler past the PRD's stated invariant.
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), nil)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
 	switch {
@@ -625,6 +625,14 @@ func scheduleModel(s store.RunSchedule) *string {
 	}
 	m := s.Model.String
 	return &m
+}
+
+// scheduleOverrideSubagentModel returns the schedule's "apply model also to agents"
+// opt-in (PRD #305) for the run-insert seams: false when off, so a schedule freezes
+// false onto the run and it stays in the default lane where subagent pins win (today's
+// behaviour). It is a plain bool (NOT NULL DEFAULT false column), not a tri-state.
+func scheduleOverrideSubagentModel(s store.RunSchedule) bool {
+	return s.OverrideSubagentModel
 }
 
 // truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split

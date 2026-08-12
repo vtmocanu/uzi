@@ -786,6 +786,9 @@ export interface Schedule {
   // Per-schedule model override; null = inherit the owner's per-user Worker model.
   // Applies to ALL targets (prompt/issue/sweep), unlike guidance which is issue/sweep-only.
   model: string | null;
+  // PRD #305: "apply model also to agents" — when true, the run's model overrides
+  // every subagent's pin (lead + all subagents on one model). Default false.
+  override_subagent_model: boolean;
   enabled: boolean;
   status: ScheduleStatus;
   created_at: string;
@@ -818,6 +821,8 @@ export interface ScheduleInput {
   // Model override for runs this schedule fires (all targets); explicit null/"" clears
   // to inherit. Unlike guidance it is sent on every target.
   model?: string | null;
+  // PRD #305 opt-in; omitted ≡ false (server replace-semantics). The modal always sends it.
+  override_subagent_model?: boolean;
   enabled?: boolean;
 }
 
@@ -1074,6 +1079,9 @@ export interface Run {
    *  null = the run inherited the owner's per-user Worker default. Applies to all
    *  schedule targets (unlike guidance). */
   model: string | null;
+  /** PRD #305: the frozen "apply model also to agents" flag; true means this run's
+   *  model was applied to every subagent (overriding pins), false is the default. */
+  override_subagent_model: boolean;
   mr_iid: number | null;
   /** Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
    *  null on runs created before it landed. Rendered directly through isHttpsUrl; a

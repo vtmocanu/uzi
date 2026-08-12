@@ -379,6 +379,9 @@ export interface ClaimConfig {
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */
   default_model?: string;
+  /** PRD #305: apply the run's resolved model to every subagent, overriding pins,
+   *  across both rosters. Absent/false = pins win (today's behavior). */
+  override_subagent_model?: boolean;
   /** Skill caps the server configured (PRD #16), delivered so the worker enforces
    *  the same limits (no drift): skill_max_bytes bounds a skill body (applied to
    *  repo-borne skills worker-side), skills_max_per_run bounds the combined

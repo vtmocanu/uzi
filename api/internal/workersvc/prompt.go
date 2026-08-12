@@ -31,7 +31,7 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // dropped). auto_approve and wait_on_limit ride straight from the schedule the owner
 // configured. A second active run for the schedule is rejected by the partial unique
 // index → ErrActivePromptExists.
-func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string) (store.Run, error) {
+func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error) {
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
@@ -49,6 +49,9 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		// PRD #300: the schedule's per-schedule model override, frozen onto this run.
 		// nil → NULL → the run inherits the owner's per-user Worker default.
 		Model: pgTextPtr(model),
+		// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
+		// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
+		OverrideSubagentModel: overrideSubagentModel,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

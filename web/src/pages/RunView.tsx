@@ -663,6 +663,17 @@ export function RunView() {
                   model {stripUnsafeChars(run.model)}
                 </Badge>
               )}
+              {/* PRD #305: the frozen "apply model also to agents" flag, shown on EVERY
+                  status like the model badge (SC6) so a user can confirm a run applied its
+                  model fleet-wide. Absent = pins won (today's default). */}
+              {run.override_subagent_model && (
+                <Badge
+                  tone="neutral"
+                  title="This run's model was applied to every subagent, overriding their own model pins"
+                >
+                  model on all agents
+                </Badge>
+              )}
             </div>
           </div>
         }
