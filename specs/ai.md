@@ -20069,15 +20069,15 @@ filters — instant view state, not a sync setting a poll-cycle away.
 
 ## 522. PRD #305 — apply a schedule's model to subagents too (opt-in), overriding pins across both rosters — WORKER-SIDE (not worker-unchanged, unlike #300)
 
-Design record `prds/305-apply-schedule-model-to-subagents.md`. Extends #300 (§520): the schedule
+Design record `prds/done/305-schedule-model-to-subagents.md`. Extends #300 (§520): the schedule
 model already overrode the lead; this adds an opt-in that also pushes that model onto every
 subagent, overriding each subagent's own `model:` pin. Off = today's behaviour (pins win); the flag
 only bites once the agent image is current (see Decision 2).
 
 - **Storage & freeze (Decision 1/4).** `run_schedules.override_subagent_model` (owner-set) and
   `runs.override_subagent_model` (frozen at fire time), both `boolean NOT NULL DEFAULT false`,
-  migration `00119_schedule_run_override_subagent_model.sql` (draft number; renumber above the live
-  head at merge). False = today's behaviour, no backfill. The scheduler freezes the schedule's flag
+  migration `00119_schedule_run_override_subagent_model.sql` (above the live head 00118; subject to
+  the assign-at-merge renumber rule if another PRD lands a 00119 first). False = today's behaviour, no backfill. The scheduler freezes the schedule's flag
   onto each run through the SAME run-insert seams #300 threaded `model`: `CreatePromptRun`
   (`api/internal/workersvc/prompt.go`, prompt) and the shared `createRun`
   (`api/internal/workersvc/service.go`) via `CreateScheduledRun`/`CreateScheduledAutopilotRun`
