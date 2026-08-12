@@ -48,6 +48,7 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
       "56%, resets in 2h — projected 130% by reset, over",
     );
     expect(bar.getAttribute("aria-valuenow")).toBe("56"); // fill still reflects CURRENT usage
+    expect(container.textContent).not.toContain("130"); // projection is NEVER inline visible text (D4)
   });
 
   it("on-pace over the cap (100–115) → gold ghost + gold » ", () => {
