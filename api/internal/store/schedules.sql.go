@@ -128,6 +128,31 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 	return items, nil
 }
 
+const countSweepCandidateIssues = `-- name: CountSweepCandidateIssues :one
+SELECT count(*)
+FROM issues
+WHERE repo_id = $1 AND state = 'opened'
+  AND labels @> $2::jsonb
+`
+
+type CountSweepCandidateIssuesParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Labels []byte    `json:"labels"`
+}
+
+// The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
+// number of open issues in the repo matching the same selector as ListSweepCandidateIssues,
+// WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
+// it fetched to know the cap truncated newer eligible issues. It is called only when the
+// schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
+// extra count never runs on the unbounded path.
+func (q *Queries) CountSweepCandidateIssues(ctx context.Context, arg CountSweepCandidateIssuesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSweepCandidateIssues, arg.RepoID, arg.Labels)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createPromptRun = `-- name: CreatePromptRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, model, override_subagent_model

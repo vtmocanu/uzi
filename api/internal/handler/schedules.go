@@ -355,7 +355,7 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "schedule not found")
 		return
 	}
-	ids, err := h.scheduler.RunNow(r.Context(), s)
+	out, err := h.scheduler.RunNow(r.Context(), s)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -368,6 +368,7 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	ids := out.RunIDs()
 	runIDs := make([]string, 0, len(ids))
 	for _, x := range ids {
 		runIDs = append(runIDs, x.String())

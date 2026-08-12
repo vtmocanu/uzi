@@ -129,6 +129,18 @@ WHERE repo_id = @repo_id AND state = 'opened'
 ORDER BY forge_issue_iid ASC
 LIMIT sqlc.narg('max_issues');
 
+-- name: CountSweepCandidateIssues :one
+-- The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
+-- number of open issues in the repo matching the same selector as ListSweepCandidateIssues,
+-- WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
+-- it fetched to know the cap truncated newer eligible issues. It is called only when the
+-- schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
+-- extra count never runs on the unbounded path.
+SELECT count(*)
+FROM issues
+WHERE repo_id = @repo_id AND state = 'opened'
+  AND labels @> @labels::jsonb;
+
 -- name: HasActiveRunForSchedule :one
 -- Whether a non-terminal prompt run already exists for this schedule. The pre-check
 -- the firing code uses to swallow a re-fire while a prior prompt run is still live,

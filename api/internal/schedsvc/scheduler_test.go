@@ -2,6 +2,7 @@ package schedsvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,14 @@ type fakeStore struct {
 	sweepRows           []store.ListSweepCandidateIssuesRow
 	sweepLabelParam     []byte
 	sweepMaxIssuesParam pgtype.Int4
+
+	// sweepCount is the total returned by CountSweepCandidateIssues (the Capped probe);
+	// sweepCountErr forces a transient DB error on it. countLabelParam records the label
+	// selector the probe was called with (to prove it matches the list query's).
+	sweepCount      int64
+	sweepCountErr   error
+	sweepCountCalls int
+	countLabelParam []byte
 }
 
 func (f *fakeStore) ClaimDueSchedules(context.Context) ([]store.RunSchedule, error) {
@@ -51,6 +60,14 @@ func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSw
 	f.sweepLabelParam = arg.Labels
 	f.sweepMaxIssuesParam = arg.MaxIssues
 	return f.sweepRows, nil
+}
+func (f *fakeStore) CountSweepCandidateIssues(_ context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error) {
+	f.sweepCountCalls++
+	f.countLabelParam = arg.Labels
+	if f.sweepCountErr != nil {
+		return 0, f.sweepCountErr
+	}
+	return f.sweepCount, nil
 }
 func (f *fakeStore) HasActiveRunForIssue(_ context.Context, _ store.HasActiveRunForIssueParams) (bool, error) {
 	return f.activeIssue, f.activeIssueErr
@@ -536,6 +553,425 @@ func TestPromptTitleDerivation(t *testing.T) {
 	}
 	if promptTitle("   \n  ") != "Scheduled prompt run" {
 		t.Fatalf("blank prompt title fallback missing")
+	}
+}
+
+// ── Fire outcomes (PRD #308 M1) ──────────────────────────────────────────────
+
+// assertBalances is the matched == started + skipped invariant every fire must satisfy
+// (PRD #308 Decision 4): every candidate lands in exactly one bucket.
+func assertBalances(t *testing.T, o FireOutcome) {
+	t.Helper()
+	if o.Matched != len(o.Started)+len(o.Skips) {
+		t.Fatalf("invariant broken: Matched=%d != started(%d)+skips(%d)", o.Matched, len(o.Started), len(o.Skips))
+	}
+}
+
+// TestSkipReasonForErr pins the seam-sentinel → reason mapping directly: each of the four
+// benign run-creation sentinels maps to its reason; ErrActivePromptExists and an unrelated
+// error are NOT mapped here (the prompt path records already_running at its own site, and
+// an unknown error is left to the caller to classify as transient/permanent).
+func TestSkipReasonForErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want SkipReason
+		ok   bool
+	}{
+		{workersvc.ErrNoPRDLink, SkipNoPRDLink, true},
+		{workersvc.ErrNotPRDIssue, SkipNotEligible, true},
+		{workersvc.ErrActiveRunExists, SkipAlreadyRunning, true},
+		{workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge, true},
+		{workersvc.ErrActivePromptExists, "", false},
+		{workersvc.ErrRepoNotFound, "", false},
+		{context.DeadlineExceeded, "", false},
+	}
+	for _, c := range cases {
+		got, ok := skipReasonForErr(c.err)
+		if ok != c.ok || got != c.want {
+			t.Fatalf("skipReasonForErr(%v) = (%q,%v), want (%q,%v)", c.err, got, ok, c.want, c.ok)
+		}
+	}
+	// AllSkipReasons enumerates the full closed set.
+	if len(AllSkipReasons) != 5 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 5", len(AllSkipReasons))
+	}
+}
+
+// TestFireIssueSentinelSkips proves each benign seam sentinel becomes a typed Skip on the
+// single-issue create attempt (Matched=1, one Skip, no Started), carrying the fetched
+// issue title and its iid — and the invariant balances.
+func TestFireIssueSentinelSkips(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want SkipReason
+	}{
+		{"active_run", workersvc.ErrActiveRunExists, SkipAlreadyRunning},
+		{"not_eligible", workersvc.ErrNotPRDIssue, SkipNotEligible},
+		{"no_prd_link", workersvc.ErrNoPRDLink, SkipNoPRDLink},
+		{"too_large", workersvc.ErrDescriptionTooLarge, SkipDescriptionTooLarge},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness()
+			h.fb.f.issue.Title = "Fix the bug"
+			h.runs.err = c.err
+			out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+			if err != nil {
+				t.Fatalf("a benign sentinel must NOT surface as an error, got %v", err)
+			}
+			if out.Matched != 1 || len(out.Started) != 0 || len(out.Skips) != 1 {
+				t.Fatalf("outcome = %+v, want Matched:1 Started:0 Skips:1", out)
+			}
+			s := out.Skips[0]
+			if s.Reason != c.want {
+				t.Fatalf("skip reason = %q, want %q", s.Reason, c.want)
+			}
+			if s.IssueIID == nil || *s.IssueIID != 7 {
+				t.Fatalf("skip IssueIID = %v, want 7", s.IssueIID)
+			}
+			if s.Title != "Fix the bug" {
+				t.Fatalf("skip Title = %q, want the fetched issue title", s.Title)
+			}
+			assertBalances(t, out)
+		})
+	}
+}
+
+// TestFireIssuePrecheckAlreadyRunning: the active-run pre-check records already_running
+// WITHOUT firing the seam and without an extra forge call — so Title is left empty.
+func TestFireIssuePrecheckAlreadyRunning(t *testing.T) {
+	h := newHarness()
+	h.st.activeIssue = true
+	out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if err != nil {
+		t.Fatalf("pre-check skip is benign, got err %v", err)
+	}
+	if out.Matched != 1 || len(out.Skips) != 1 || len(out.Started) != 0 {
+		t.Fatalf("outcome = %+v, want Matched:1 one already_running skip", out)
+	}
+	if out.Skips[0].Reason != SkipAlreadyRunning {
+		t.Fatalf("reason = %q, want already_running", out.Skips[0].Reason)
+	}
+	if out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 7 {
+		t.Fatalf("skip IssueIID = %v, want 7", out.Skips[0].IssueIID)
+	}
+	if out.Skips[0].Title != "" {
+		t.Fatalf("pre-check skip Title = %q, want empty (no extra forge call)", out.Skips[0].Title)
+	}
+	if len(h.runs.autopilot) != 0 || len(h.runs.runs) != 0 {
+		t.Fatalf("pre-check skip must not fire the seam")
+	}
+	assertBalances(t, out)
+}
+
+// TestFireIssueSuccessStarted: a successful issue fire yields one Started pairing the issue
+// (iid + fetched title) with the run it produced.
+func TestFireIssueSuccessStarted(t *testing.T) {
+	h := newHarness()
+	h.fb.f.issue.Title = "Ship it"
+	out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if err != nil {
+		t.Fatalf("success fire err = %v", err)
+	}
+	if out.Matched != 1 || len(out.Started) != 1 || len(out.Skips) != 0 {
+		t.Fatalf("outcome = %+v, want Matched:1 Started:1 Skips:0", out)
+	}
+	st := out.Started[0]
+	if st.IssueIID == nil || *st.IssueIID != 7 || st.Title != "Ship it" || st.RunID == (uuid.UUID{}) {
+		t.Fatalf("started = %+v, want iid 7 / title / non-zero run id", st)
+	}
+	if ids := out.RunIDs(); len(ids) != 1 || ids[0] != st.RunID {
+		t.Fatalf("RunIDs() = %v, want the single started run id", ids)
+	}
+	assertBalances(t, out)
+}
+
+// TestFireIssueForgeErrorIsTransientNoRecord: a forge GetIssue error on an ISSUE target is
+// transient (retry next tick), NOT a recorded fetch_failed — the zero outcome is returned
+// with the error (PRD #308: fetch_failed is a sweep-only bucketing).
+func TestFireIssueForgeErrorIsTransientNoRecord(t *testing.T) {
+	h := newHarness()
+	h.fb.f.err = context.DeadlineExceeded
+	out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if err == nil {
+		t.Fatalf("forge error on issue target must surface as a transient error")
+	}
+	if out.Matched != 0 || len(out.Started) != 0 || len(out.Skips) != 0 {
+		t.Fatalf("transient error must return the zero outcome, got %+v", out)
+	}
+}
+
+// TestFirePromptOutcomes covers the three prompt paths: pre-check already_running, the
+// ErrActivePromptExists race (same reason), and success. All carry Matched=1, a nil
+// IssueIID, and the derived prompt title.
+func TestFirePromptOutcomes(t *testing.T) {
+	promptSched := func(h *harness) store.RunSchedule {
+		s := h.issueSchedule()
+		s.Target = "prompt"
+		s.IssueIid = pgtype.Int8{}
+		s.Prompt = pgtype.Text{String: "Do the nightly report", Valid: true}
+		return s
+	}
+
+	t.Run("precheck_already_running", func(t *testing.T) {
+		h := newHarness()
+		h.st.activeSchedule = true
+		out, err := h.sched.RunNow(context.Background(), promptSched(h))
+		if err != nil {
+			t.Fatalf("pre-check skip err = %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+			t.Fatalf("outcome = %+v, want one already_running skip", out)
+		}
+		if out.Skips[0].IssueIID != nil {
+			t.Fatalf("prompt skip IssueIID = %v, want nil", out.Skips[0].IssueIID)
+		}
+		if out.Skips[0].Title != "Do the nightly report" {
+			t.Fatalf("prompt skip Title = %q, want the derived prompt title", out.Skips[0].Title)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("race_already_running", func(t *testing.T) {
+		h := newHarness()
+		h.runs.err = workersvc.ErrActivePromptExists
+		out, err := h.sched.RunNow(context.Background(), promptSched(h))
+		if err != nil {
+			t.Fatalf("race skip is benign, got err %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+			t.Fatalf("outcome = %+v, want one already_running skip from the race", out)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		h := newHarness()
+		out, err := h.sched.RunNow(context.Background(), promptSched(h))
+		if err != nil {
+			t.Fatalf("success err = %v", err)
+		}
+		if out.Matched != 1 || len(out.Started) != 1 || len(out.Skips) != 0 {
+			t.Fatalf("outcome = %+v, want Matched:1 Started:1", out)
+		}
+		if out.Started[0].IssueIID != nil {
+			t.Fatalf("prompt started IssueIID = %v, want nil", out.Started[0].IssueIID)
+		}
+		if out.Started[0].Title != "Do the nightly report" {
+			t.Fatalf("prompt started Title = %q, want the derived prompt title", out.Started[0].Title)
+		}
+		assertBalances(t, out)
+	})
+}
+
+// TestFireSweepPerCandidateBuckets pins each per-candidate branch to its bucket, one
+// candidate at a time, and the invariant for each.
+func TestFireSweepPerCandidateBuckets(t *testing.T) {
+	oneRow := []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+
+	t.Run("active_run_db_error_is_fetch_failed", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.st.activeIssueErr = context.DeadlineExceeded
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if err != nil {
+			t.Fatalf("sweep must not abort on a per-candidate error, got %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipFetchFailed {
+			t.Fatalf("outcome = %+v, want one fetch_failed skip", out)
+		}
+		if out.Skips[0].IssueIID == nil || *out.Skips[0].IssueIID != 96 {
+			t.Fatalf("fetch_failed skip iid = %v, want 96", out.Skips[0].IssueIID)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("active_bool_is_already_running", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.st.activeIssue = true
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipAlreadyRunning {
+			t.Fatalf("outcome = %+v, want one already_running skip", out)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("forge_error_is_fetch_failed", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.fb.f.err = context.DeadlineExceeded
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipFetchFailed {
+			t.Fatalf("outcome = %+v, want one fetch_failed skip", out)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("benign_sentinel_becomes_its_skip", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.fb.f.issue.Title = "Broken login"
+		h.runs.err = workersvc.ErrNoPRDLink
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipNoPRDLink {
+			t.Fatalf("outcome = %+v, want one no_prd_link skip", out)
+		}
+		if out.Skips[0].Title != "Broken login" {
+			t.Fatalf("sweep skip Title = %q, want the fetched issue title", out.Skips[0].Title)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("unexpected_repo_error_midsweep_is_fetch_failed", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.runs.err = workersvc.ErrRepoNotFound
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if err != nil {
+			t.Fatalf("a mid-sweep repo error must not abort the fan-out, got %v", err)
+		}
+		if out.Matched != 1 || len(out.Skips) != 1 || out.Skips[0].Reason != SkipFetchFailed {
+			t.Fatalf("outcome = %+v, want one fetch_failed skip", out)
+		}
+		assertBalances(t, out)
+	})
+
+	t.Run("success_becomes_started", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = oneRow
+		h.fb.f.issue.Title = "Do it"
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if out.Matched != 1 || len(out.Started) != 1 || len(out.Skips) != 0 {
+			t.Fatalf("outcome = %+v, want one Started", out)
+		}
+		if out.Started[0].IssueIID == nil || *out.Started[0].IssueIID != 96 || out.Started[0].Title != "Do it" {
+			t.Fatalf("started = %+v, want iid 96 / title", out.Started[0])
+		}
+		assertBalances(t, out)
+	})
+}
+
+// TestFireSweepMultiCandidateBalances proves the invariant across a mixed fan-out: two
+// candidates that both take the fetch_failed path still balance (Matched=2 == 2 skips).
+func TestFireSweepMultiCandidateBalances(t *testing.T) {
+	h := newHarness()
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{
+		{ForgeIssueIid: 96},
+		{ForgeIssueIid: 97},
+	}
+	h.st.activeIssueErr = context.DeadlineExceeded // both candidates → fetch_failed
+	out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+	if out.Matched != 2 || len(out.Skips) != 2 {
+		t.Fatalf("outcome = %+v, want Matched:2 with 2 fetch_failed skips", out)
+	}
+	for _, s := range out.Skips {
+		if s.Reason != SkipFetchFailed {
+			t.Fatalf("skip reason = %q, want fetch_failed", s.Reason)
+		}
+	}
+	assertBalances(t, out)
+}
+
+// TestFireSweepCapped pins the Capped truncation probe: Capped is true only when a set cap
+// left more matching issues behind than were fetched; a NULL cap never counts and never caps.
+func TestFireSweepCapped(t *testing.T) {
+	t.Run("capped_when_total_exceeds_fetched", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCount = 3 // 3 match, only 1 fetched under the cap
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 1, Valid: true}))
+		if !out.Capped {
+			t.Fatalf("Capped = false, want true (total 3 > fetched 1)")
+		}
+		if h.st.sweepCountCalls != 1 {
+			t.Fatalf("CountSweepCandidateIssues called %d times, want 1", h.st.sweepCountCalls)
+		}
+		// The probe must use the SAME resolved label selector as the list query.
+		if string(h.st.countLabelParam) != string(h.st.sweepLabelParam) {
+			t.Fatalf("count labels %q != list labels %q", h.st.countLabelParam, h.st.sweepLabelParam)
+		}
+	})
+
+	t.Run("not_capped_when_total_equals_fetched", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCount = 1
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 4, Valid: true}))
+		if out.Capped {
+			t.Fatalf("Capped = true, want false (total 1 == fetched 1)")
+		}
+	})
+
+	t.Run("null_cap_never_counts_or_caps", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCount = 9 // would be "capped" IF the probe ran
+		out, _ := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{}))
+		if out.Capped {
+			t.Fatalf("NULL cap can never truncate; Capped must be false")
+		}
+		if h.st.sweepCountCalls != 0 {
+			t.Fatalf("NULL cap must skip the count probe entirely, got %d calls", h.st.sweepCountCalls)
+		}
+	})
+
+	// A DB error on the count probe is TRANSIENT: fireSweep must surface it unchanged and
+	// return the zero outcome, NOT swallow the error and proceed as uncapped. A set cap
+	// (so the probe runs) plus at least one candidate reaches the probe; the sentinel is
+	// forced there. Because RunNow does not drive the advance path, the guard here is the
+	// non-nil error + zero outcome (mirroring TestFireIssueForgeErrorIsTransientNoRecord):
+	// a mutation that drops the count error and continues would return a non-zero outcome
+	// with a nil error and fail this case. The transient-does-not-advance discipline is
+	// pinned separately by the tick-path tests.
+	t.Run("count_probe_error_is_transient", func(t *testing.T) {
+		h := newHarness()
+		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
+		h.st.sweepCountErr = context.DeadlineExceeded // sentinel forced on the count probe
+		out, err := h.sched.RunNow(context.Background(), h.sweepSchedule(pgtype.Int4{Int32: 1, Valid: true}))
+		if err == nil {
+			t.Fatalf("count-probe DB error must surface as a transient error, got nil")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("count-probe error = %v, want it to wrap the sentinel (context.DeadlineExceeded)", err)
+		}
+		if out.Matched != 0 || len(out.Started) != 0 || len(out.Skips) != 0 || out.Capped {
+			t.Fatalf("transient count-probe error must return the zero outcome, got %+v", out)
+		}
+		if h.st.sweepCountCalls != 1 {
+			t.Fatalf("CountSweepCandidateIssues called %d times, want 1 (the probe ran and failed)", h.st.sweepCountCalls)
+		}
+	})
+}
+
+// TestFireMatchedPerTarget pins the per-target Matched definition: sweep = candidate count,
+// issue = 1, prompt = 1.
+func TestFireMatchedPerTarget(t *testing.T) {
+	h := newHarness()
+	issueOut, _ := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if issueOut.Matched != 1 {
+		t.Fatalf("issue Matched = %d, want 1", issueOut.Matched)
+	}
+
+	h2 := newHarness()
+	h2.st.sweepRows = []store.ListSweepCandidateIssuesRow{
+		{ForgeIssueIid: 1}, {ForgeIssueIid: 2}, {ForgeIssueIid: 3},
+	}
+	sweepOut, _ := h2.sched.RunNow(context.Background(), h2.sweepSchedule(pgtype.Int4{}))
+	if sweepOut.Matched != 3 {
+		t.Fatalf("sweep Matched = %d, want 3 (candidate count)", sweepOut.Matched)
+	}
+	assertBalances(t, sweepOut)
+
+	h3 := newHarness()
+	ps := h3.issueSchedule()
+	ps.Target = "prompt"
+	ps.IssueIid = pgtype.Int8{}
+	ps.Prompt = pgtype.Text{String: "hello", Valid: true}
+	promptOut, _ := h3.sched.RunNow(context.Background(), ps)
+	if promptOut.Matched != 1 {
+		t.Fatalf("prompt Matched = %d, want 1", promptOut.Matched)
 	}
 }
 
