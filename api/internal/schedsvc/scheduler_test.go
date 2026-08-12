@@ -2,6 +2,7 @@ package schedsvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -665,6 +666,25 @@ func TestFireIssuePrecheckAlreadyRunning(t *testing.T) {
 	assertBalances(t, out)
 }
 
+// TestRunNowDoesNotPersistLastFire pins Decision 3 behaviourally, not just structurally: a
+// manual RunNow fire must not disturb the cadence, so it must never reach advance() and
+// therefore never write last_fire. A future refactor routing RunNow through advance would
+// redden here even though the fire itself succeeds.
+func TestRunNowDoesNotPersistLastFire(t *testing.T) {
+	h := newHarness()
+	h.fb.f.issue.Title = "Ship it"
+	out, err := h.sched.RunNow(context.Background(), h.issueSchedule())
+	if err != nil {
+		t.Fatalf("success fire err = %v", err)
+	}
+	if len(out.Started) != 1 {
+		t.Fatalf("expected a successful fire, got outcome %+v", out)
+	}
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("RunNow must NOT advance (and so must not persist last_fire): advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+}
+
 // TestFireIssueSuccessStarted: a successful issue fire yields one Started pairing the issue
 // (iid + fetched title) with the run it produced.
 func TestFireIssueSuccessStarted(t *testing.T) {
@@ -972,6 +992,189 @@ func TestFireMatchedPerTarget(t *testing.T) {
 	promptOut, _ := h3.sched.RunNow(context.Background(), ps)
 	if promptOut.Matched != 1 {
 		t.Fatalf("prompt Matched = %d, want 1", promptOut.Matched)
+	}
+}
+
+// ── Persisted last_fire (PRD #308 M2) ────────────────────────────────────────
+
+// TestTickPersistsLastFireOnSuccess pins the M2 threading: a success/benign fire on the
+// tick path must persist a NON-nil last_fire into AdvanceSchedule, and the serialized
+// bytes must decode to the fire's matched/started/skips/capped. The fake store records the
+// AdvanceScheduleParams, so we read the captured LastFire and unmarshal it.
+func TestTickPersistsLastFireOnSuccess(t *testing.T) {
+	h := newHarness()
+	h.fb.f.issue.Title = "Ship it"
+	h.st.due = []store.RunSchedule{h.issueSchedule()} // auto-approve issue, success
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	raw := h.st.advanceCalls[0].LastFire
+	if raw == nil {
+		t.Fatalf("success fire must persist a non-nil last_fire, got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, raw)
+	}
+	if rec.Matched != 1 || len(rec.Started) != 1 || len(rec.Skips) != 0 || rec.Capped {
+		t.Fatalf("last_fire = %+v, want matched:1 started:1 skips:0 capped:false", rec)
+	}
+	st := rec.Started[0]
+	if st.IssueIID == nil || *st.IssueIID != 7 || st.Title != "Ship it" || st.RunID == "" {
+		t.Fatalf("last_fire started = %+v, want iid 7 / title / non-empty run id", st)
+	}
+	// FiredAt is the advance instant (the scheduler's now).
+	if !rec.FiredAt.Equal(h.now) {
+		t.Fatalf("last_fire fired_at = %v, want the scheduler now %v", rec.FiredAt, h.now)
+	}
+	// The empty-slice convention: started/skips serialize as [] not null, so a client sees
+	// a present array even when a bucket is empty.
+	if !strings.Contains(string(raw), `"skips":[]`) {
+		t.Fatalf("last_fire must encode empty skips as [] not null, got %s", raw)
+	}
+}
+
+// TestTickBenignSkipPersistsLastFire proves a benign dedup skip (which STILL advances) also
+// persists last_fire, carrying the typed skip reason — so a schedule that only skipped is
+// still observable.
+func TestTickBenignSkipPersistsLastFire(t *testing.T) {
+	h := newHarness()
+	h.st.activeIssue = true // prior run live → already_running skip, still advances
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("benign skip must still advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	raw := h.st.advanceCalls[0].LastFire
+	if raw == nil {
+		t.Fatalf("benign skip must still persist a last_fire, got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, raw)
+	}
+	if rec.Matched != 1 || len(rec.Started) != 0 || len(rec.Skips) != 1 {
+		t.Fatalf("last_fire = %+v, want matched:1 started:0 skips:1", rec)
+	}
+	if rec.Skips[0].Reason != string(SkipAlreadyRunning) {
+		t.Fatalf("last_fire skip reason = %q, want %q", rec.Skips[0].Reason, SkipAlreadyRunning)
+	}
+}
+
+// TestTickEmptySweepPersistsLastFire covers Decision 4: a matched:0 empty-label sweep is a
+// legitimate, observable outcome — it must persist a valid last_fire with matched 0 and
+// empty (non-null) started/skips, not skip the write.
+func TestTickEmptySweepPersistsLastFire(t *testing.T) {
+	h := newHarness()
+	h.st.sweepRows = nil // no candidates matched
+	h.st.due = []store.RunSchedule{h.sweepSchedule(pgtype.Int4{})}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("empty sweep must advance: advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	raw := h.st.advanceCalls[0].LastFire
+	if raw == nil {
+		t.Fatalf("empty sweep must persist a last_fire (matched:0 is legitimate), got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, raw)
+	}
+	if rec.Matched != 0 || len(rec.Started) != 0 || len(rec.Skips) != 0 {
+		t.Fatalf("empty sweep last_fire = %+v, want matched:0 started:[] skips:[]", rec)
+	}
+	if !strings.Contains(string(raw), `"started":[]`) || !strings.Contains(string(raw), `"skips":[]`) {
+		t.Fatalf("empty sweep last_fire must encode [] not null, got %s", raw)
+	}
+}
+
+// TestTickTransientDoesNotPersistLastFire pins Decision 5: a transient fire error does NOT
+// advance, so AdvanceSchedule (the only last_fire write site) is never called and the prior
+// last_fire is untouched.
+func TestTickTransientDoesNotPersistLastFire(t *testing.T) {
+	h := newHarness()
+	h.fb.err = context.DeadlineExceeded // transient
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("transient error must NOT write last_fire (no advance): advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+}
+
+// TestTickParkDoesNotPersistLastFire pins Decision 5: a permanent (park) fire error routes
+// to SetRunScheduleStatus, NOT AdvanceSchedule, so last_fire is left untouched.
+func TestTickParkDoesNotPersistLastFire(t *testing.T) {
+	h := newHarness()
+	h.st.repoErr = pgx.ErrNoRows // repo gone → permanent park
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("park must NOT write last_fire (no advance): advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 1 || h.st.statusCalls[0].Status != "error" {
+		t.Fatalf("park must SetRunScheduleStatus to error, got %+v", h.st.statusCalls)
+	}
+}
+
+// TestMarshalLastFire is a direct unit check on the wire shape: the exact json tags
+// (the M3/CLI/web contract), the run-id-as-string and reason-as-string projections, and
+// the non-nil empty-slice convention.
+func TestMarshalLastFire(t *testing.T) {
+	iid := int64(7)
+	runID := uuid.New()
+	out := FireOutcome{
+		Matched: 2,
+		Capped:  true,
+		Started: []Started{{IssueIID: &iid, RunID: runID, Title: "Do it"}},
+		Skips:   []Skip{{IssueIID: nil, Title: "prompt", Reason: SkipAlreadyRunning}},
+	}
+	firedAt := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
+	raw, err := marshalLastFire(out, firedAt)
+	if err != nil {
+		t.Fatalf("marshalLastFire err = %v", err)
+	}
+	// Assert the exact tag keys are present (the persisted contract).
+	for _, key := range []string{`"fired_at"`, `"matched"`, `"capped"`, `"started"`, `"skips"`,
+		`"issue_iid"`, `"run_id"`, `"title"`, `"reason"`} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("last_fire JSON missing key %s, got %s", key, raw)
+		}
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rec.Matched != 2 || !rec.Capped {
+		t.Fatalf("matched/capped = %d/%v, want 2/true", rec.Matched, rec.Capped)
+	}
+	if len(rec.Started) != 1 || rec.Started[0].RunID != runID.String() {
+		t.Fatalf("started run id = %+v, want the uuid string %s", rec.Started, runID)
+	}
+	if rec.Started[0].IssueIID == nil || *rec.Started[0].IssueIID != 7 {
+		t.Fatalf("started issue_iid = %v, want 7", rec.Started[0].IssueIID)
+	}
+	if len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipAlreadyRunning) || rec.Skips[0].IssueIID != nil {
+		t.Fatalf("skip = %+v, want already_running / nil iid", rec.Skips)
+	}
+
+	// The empty-outcome case: non-nil [] arrays, not null.
+	rawEmpty, err := marshalLastFire(FireOutcome{Matched: 0}, firedAt)
+	if err != nil {
+		t.Fatalf("marshalLastFire(empty) err = %v", err)
+	}
+	if !strings.Contains(string(rawEmpty), `"started":[]`) || !strings.Contains(string(rawEmpty), `"skips":[]`) {
+		t.Fatalf("empty outcome must encode [] not null, got %s", rawEmpty)
 	}
 }
 

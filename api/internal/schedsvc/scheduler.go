@@ -182,10 +182,11 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule) {
 			e.logger.Error("scheduler: panic firing schedule", "schedule", sched.ID.String(), "panic", r)
 		}
 	}()
-	// The tick path ignores the FireOutcome for now; only RunNow surfaces it (M2 will
-	// persist it into last_fire on the advance path).
-	_, fireErr := e.fireOne(ctx, sched)
-	e.advance(ctx, sched, fireErr)
+	// The tick path threads the FireOutcome into advance, which persists it into
+	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
+	// a manual fire never persists a last_fire (Decision 3).
+	out, fireErr := e.fireOne(ctx, sched)
+	e.advance(ctx, sched, out, fireErr)
 }
 
 // RunNow fires a schedule ONCE, manually, and returns the FireOutcome (matched/started/
@@ -468,7 +469,13 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 //   - transient error → log, do NOT advance (next_fire_at stays in the past → retry)
 //   - success/benign  → recurring: next next_fire_at, status stays 'active';
 //     once: next_fire_at NULL, status='fired'
-func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireErr error) {
+//
+// On the success/benign path it also serializes the FireOutcome into last_fire (PRD #308
+// M2). A marshal error is LOGGED and last_fire falls back to nil (SQL NULL): a
+// serialization hiccup must never wedge the cadence — the schedule still advances. The
+// park and transient branches never touch last_fire, so a parked/transient fire keeps the
+// prior last_fire or none (Decision 5).
+func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out FireOutcome, fireErr error) {
 	if fireErr != nil {
 		if errors.Is(fireErr, workersvc.ErrRepoNotFound) {
 			e.park(ctx, sched, "the schedule's repo is disconnected or no longer owned by you")
@@ -484,6 +491,13 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 	}
 
 	now := e.now()
+	lastFireJSON, err := marshalLastFire(out, now)
+	if err != nil {
+		// Never let a serialization hiccup wedge the cadence: log it and advance with a
+		// NULL last_fire rather than skipping the advance.
+		e.logger.Error("scheduler: marshal last_fire", "schedule", sched.ID.String(), "error", err)
+		lastFireJSON = nil
+	}
 	switch sched.Timing {
 	case "recurring":
 		next, err := NextFire(sched.CronExpr.String, sched.Timezone, now)
@@ -498,6 +512,7 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			LastFiredAt: pgTime(now),
 			NextFireAt:  pgTime(next),
 			Status:      "active",
+			LastFire:    lastFireJSON,
 			ID:          sched.ID,
 		}); err != nil {
 			e.logger.Error("scheduler: advance recurring", "schedule", sched.ID.String(), "error", err)
@@ -507,6 +522,7 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			LastFiredAt: pgTime(now),
 			NextFireAt:  pgtype.Timestamptz{}, // NULL: a once schedule never fires again
 			Status:      "fired",
+			LastFire:    lastFireJSON,
 			ID:          sched.ID,
 		}); err != nil {
 			e.logger.Error("scheduler: advance once", "schedule", sched.ID.String(), "error", err)

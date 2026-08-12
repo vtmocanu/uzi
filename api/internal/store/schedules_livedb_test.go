@@ -2,8 +2,10 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -560,6 +562,130 @@ func TestRunOverrideSubagentModelFrozenLiveDB(t *testing.T) {
 		t.Fatalf("GetRunByID (default prompt run): %v", err)
 	} else if got.OverrideSubagentModel {
 		t.Fatalf("default prompt run override_subagent_model = %v, want false", got.OverrideSubagentModel)
+	}
+}
+
+// TestRunScheduleLastFireLiveDB is the mandatory live-DB coverage for the PRD #308 M2
+// last_fire jsonb column: a green `sqlc generate` does not prove the new nullable jsonb
+// column round-trips through a real INSERT/UPDATE, so this exercises it against real
+// Postgres. It pins three facts:
+//   - a freshly created schedule reads last_fire NULL (never fired);
+//   - AdvanceSchedule with a marshaled last_fire persists it and reads back structurally
+//     equal (the jsonb round-trip);
+//   - SetRunScheduleStatus (the park path) does NOT touch an existing last_fire.
+func TestRunScheduleLastFireLiveDB(t *testing.T) {
+	ctx := context.Background()
+	q, userID, repoID := schedFixture(ctx, t)
+
+	sched, err := q.CreateRunSchedule(ctx, store.CreateRunScheduleParams{
+		UserID:      userID,
+		RepoID:      repoID,
+		Target:      "sweep",
+		Timing:      "recurring",
+		CronExpr:    pgtype.Text{String: "*/5 * * * *", Valid: true},
+		Timezone:    "UTC",
+		NextFireAt:  tsPast(),
+		AutoApprove: true,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	// (1) A never-fired schedule reads last_fire NULL.
+	if sched.LastFire != nil {
+		t.Fatalf("freshly created schedule last_fire = %s, want NULL (never fired)", sched.LastFire)
+	}
+
+	// (2) AdvanceSchedule persists the marshaled summary and reads it back. The bytes are
+	// the same shape schedsvc.marshalLastFire produces (asserted structurally, since jsonb
+	// storage may reorder keys / restyle whitespace — a byte-equal check would be brittle).
+	iid := int64(42)
+	firedAt := time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC)
+	type startedT struct {
+		IssueIID *int64 `json:"issue_iid"`
+		RunID    string `json:"run_id"`
+		Title    string `json:"title"`
+	}
+	type skipT struct {
+		IssueIID *int64 `json:"issue_iid"`
+		Title    string `json:"title"`
+		Reason   string `json:"reason"`
+	}
+	type recordT struct {
+		FiredAt time.Time  `json:"fired_at"`
+		Matched int        `json:"matched"`
+		Capped  bool       `json:"capped"`
+		Started []startedT `json:"started"`
+		Skips   []skipT    `json:"skips"`
+	}
+	want := recordT{
+		FiredAt: firedAt,
+		Matched: 2,
+		Capped:  true,
+		Started: []startedT{{IssueIID: &iid, RunID: uuid.New().String(), Title: "Ship it"}},
+		Skips:   []skipT{{IssueIID: nil, Title: "nightly", Reason: "already_running"}},
+	}
+	lastFireJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal last_fire: %v", err)
+	}
+
+	adv, err := q.AdvanceSchedule(ctx, store.AdvanceScheduleParams{
+		ID:          sched.ID,
+		LastFiredAt: pgtype.Timestamptz{Time: firedAt, Valid: true},
+		NextFireAt:  pgtype.Timestamptz{Time: firedAt.Add(time.Hour), Valid: true},
+		Status:      "active",
+		LastFire:    lastFireJSON,
+	})
+	if err != nil {
+		t.Fatalf("AdvanceSchedule with last_fire: %v", err)
+	}
+	if adv.LastFire == nil {
+		t.Fatalf("AdvanceSchedule returned a NULL last_fire, want the persisted summary")
+	}
+	assertLastFireEqual(t, "advance return", adv.LastFire, want)
+
+	// Read back through a separate SELECT to prove it was committed, not just echoed.
+	reread, err := q.GetRunSchedule(ctx, sched.ID)
+	if err != nil {
+		t.Fatalf("GetRunSchedule: %v", err)
+	}
+	assertLastFireEqual(t, "re-read", reread.LastFire, want)
+
+	// (3) The park path (SetRunScheduleStatus) must NOT alter the stored last_fire.
+	parked, err := q.SetRunScheduleStatus(ctx, store.SetRunScheduleStatusParams{
+		ID:     sched.ID,
+		Status: "error",
+	})
+	if err != nil {
+		t.Fatalf("SetRunScheduleStatus (park): %v", err)
+	}
+	if parked.Status != "error" {
+		t.Fatalf("park status = %q, want error", parked.Status)
+	}
+	assertLastFireEqual(t, "after park", parked.LastFire, want)
+}
+
+// assertLastFireEqual decodes a stored last_fire blob and compares it structurally to the
+// wanted record, so a jsonb key-reorder or whitespace change does not fail the assertion.
+func assertLastFireEqual(t *testing.T, where string, raw []byte, want any) {
+	t.Helper()
+	if raw == nil {
+		t.Fatalf("%s: last_fire is NULL, want the persisted summary", where)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("%s: marshal want: %v", where, err)
+	}
+	var gotAny, wantAny any
+	if err := json.Unmarshal(raw, &gotAny); err != nil {
+		t.Fatalf("%s: last_fire is not valid JSON: %v (%s)", where, err, raw)
+	}
+	if err := json.Unmarshal(wantJSON, &wantAny); err != nil {
+		t.Fatalf("%s: unmarshal want: %v", where, err)
+	}
+	if !reflect.DeepEqual(gotAny, wantAny) {
+		t.Fatalf("%s: last_fire = %s, want structurally %s", where, raw, wantJSON)
 	}
 }
 
