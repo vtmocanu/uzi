@@ -850,6 +850,7 @@ let schedules: Schedule[] = [
     max_issues: 10,
     guidance: "Keep the diff small and add a failing test first.",
     model: "fable",
+    override_subagent_model: true,
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
     updated_at: daysFromNow(-1, 2), next_fires: [],
   },
@@ -862,6 +863,7 @@ let schedules: Schedule[] = [
     max_issues: null,
     guidance: "Prefer the smallest change that closes the issue; no new deps.",
     model: null,
+    override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
     updated_at: daysFromNow(0, 3), next_fires: [],
   },
@@ -874,6 +876,7 @@ let schedules: Schedule[] = [
     max_issues: null,
     guidance: null,
     model: null,
+    override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-1, 20),
     updated_at: daysFromNow(-1, 20), next_fires: [],
   },
@@ -887,6 +890,7 @@ let schedules: Schedule[] = [
     max_issues: null,
     guidance: null,
     model: null,
+    override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-21, 11),
     updated_at: daysFromNow(-7, 9), next_fires: [],
   },
@@ -899,6 +903,7 @@ let schedules: Schedule[] = [
     max_issues: 10,
     guidance: null,
     model: null,
+    override_subagent_model: false,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
     updated_at: daysFromNow(-3, 18), next_fires: [],
   },
@@ -914,6 +919,7 @@ let schedules: Schedule[] = [
     max_issues: null,
     guidance: null,
     model: null,
+    override_subagent_model: false,
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
     updated_at: daysFromNow(-1, 1, 30), next_fires: [],
   },
@@ -2553,6 +2559,7 @@ export const mockApi = {
       worker_id: null,
       branch: null,
       model: null,
+      override_subagent_model: false,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -2620,6 +2627,7 @@ export const mockApi = {
       worker_id: null,
       branch: null,
       model: null,
+      override_subagent_model: false,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -3050,6 +3058,7 @@ export const mockApi = {
       worker_id: "w-laptop",
       branch: null,
       model: null,
+      override_subagent_model: false,
       mr_iid: null,
       mr_state: null,
       failure_reason: null,
@@ -3307,6 +3316,8 @@ export const mockApi = {
       guidance: target === "issue" || target === "sweep" ? (input.guidance ?? null) : null,
       // Model applies to ALL targets (unlike guidance); null = inherit.
       model: input.model ?? null,
+      // PRD #305: omitted ≡ false (replace-semantics), default off.
+      override_subagent_model: input.override_subagent_model ?? false,
       enabled: input.enabled ?? true,
       status: "active",
       created_at: now,
@@ -3343,6 +3354,9 @@ export const mockApi = {
     if (input.guidance !== undefined) m.guidance = input.guidance;
     // Model applies to all targets, so it is not re-nulled per target below.
     if (input.model !== undefined) m.model = input.model;
+    // PRD #305: replace-semantics, applied when the key is present.
+    if (input.override_subagent_model !== undefined)
+      m.override_subagent_model = input.override_subagent_model;
     if (input.enabled !== undefined) m.enabled = input.enabled;
     // Re-null the fields the (possibly changed) target/timing does not use, so the
     // stored shape matches the DB's field-presence CHECK.

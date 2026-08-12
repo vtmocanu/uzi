@@ -101,6 +101,7 @@ function run(over: Partial<Run>): Run {
     worker_id: "w1",
     branch: null,
     model: null,
+    override_subagent_model: false,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
@@ -578,6 +579,26 @@ describe("RunView header — the frozen per-schedule model badge (PRD #300)", ()
     // Wait for the page to settle (RunHeading renders the issue title synchronously).
     await screen.findByText("Add rate limiting");
     expect(screen.queryByTitle(MODEL_BADGE_TITLE)).toBeNull();
+  });
+
+  // PRD #305: the frozen "apply model also to agents" flag, shown on every status.
+  const OVERRIDE_BADGE_TITLE =
+    "This run's model was applied to every subagent, overriding their own model pins";
+
+  it("shows the override-subagent-model badge when the run applied its model fleet-wide", async () => {
+    const { container } = renderPage({
+      status: "completed",
+      model: "fable",
+      override_subagent_model: true,
+    });
+    expect(await screen.findByTitle(OVERRIDE_BADGE_TITLE)).toBeTruthy();
+    expect(container.textContent).toContain("model on all agents");
+  });
+
+  it("shows no override-subagent-model badge when the flag is off (today's default)", async () => {
+    renderPage({ status: "failed", model: "fable", override_subagent_model: false });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByTitle(OVERRIDE_BADGE_TITLE)).toBeNull();
   });
 });
 

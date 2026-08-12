@@ -143,13 +143,25 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
     (Decision 2). Claim field `override_subagent_model` added to `ClaimConfig`
     (`agent/src/protocol.ts`). `task gate:agent` green.
 
-- [ ] **M5 — Web (schedule modal + run-detail read).** ScheduleModal gains a
+- [x] **M5 — Web (schedule modal + run-detail read).** ScheduleModal gains a
   checkbox **"Apply model also to agents"** directly under the Model field, **always
   enabled** (first-class on Inherit, Decision 3), helper text "Subagents run on the
   same model as the lead"; editing reflects the stored value. The run detail view
   shows whether the run applied the model to agents. `mockApi.ts` schedule mocks
   carry the field. Component tests cover the round-trip and the flag-on/Inherit
   state.
+  - Landed. Types: `Schedule`/`ScheduleInput`/`Run` in `web/src/lib/api.ts` carry
+    `override_subagent_model` (`Run` required, so every Run/Schedule fixture across
+    `mocks/` and the `*.test.tsx` factories gained the field — `tsc` green). Modal:
+    a `Toggle` labelled "Apply model also to agents" under the Model `<Field>`,
+    always enabled, wired to state seeded from `editing?.override_subagent_model` and
+    sent on every `ScheduleInput`. Run detail: a "model on all agents" `Badge` on
+    `RunView` shown on every status when `run.override_subagent_model`. Mocks:
+    `sch-7kd2` demos flag-on plus a flag-on run fixture; `createSchedule`/`updateSchedule`
+    round-trip it. Tests: new `ScheduleModal.test.tsx` block (always-enabled on
+    Inherit, reflects stored value, flows into the payload) and `RunView.test.tsx`
+    badge on/off cases. `task gate:web` green; `vite build` clean. api/agent/CLI
+    untouched (M6 is the CLI milestone).
 
 - [ ] **M6 — CLI.** `uzi schedule create --apply-model-to-agents` and `--json`
   carry the flag; `uzi run get` surfaces the frozen value (`--field` / `--json`).

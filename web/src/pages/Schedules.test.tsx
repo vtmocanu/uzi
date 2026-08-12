@@ -42,6 +42,7 @@ function sched(over: Partial<Schedule>): Schedule {
     max_issues: 10,
     guidance: null,
     model: null,
+    override_subagent_model: false,
     enabled: true,
     status: "active",
     created_at: new Date().toISOString(),

@@ -206,6 +206,10 @@ export function ScheduleModal({
   // below (modelWarning) mirroring the server's ValidateModel reject.
   const [model, setModel] = useState<string>(editing?.model ?? "");
   const modelWarning = modelFieldWarning(model);
+  // PRD #305: apply the run model to every subagent (overriding pins). Default off.
+  const [overrideSubagentModel, setOverrideSubagentModel] = useState<boolean>(
+    editing?.override_subagent_model ?? false,
+  );
 
   const [fires, setFires] = useState<string[]>(editing?.next_fires ?? []);
   const [previewError, setPreviewError] = useState(false);
@@ -395,6 +399,8 @@ export function ScheduleModal({
     // Model override on EVERY target (all-targets field, unlike guidance); an empty
     // control sends explicit null to clear-to-inherit (replace-semantics).
     model: model.trim() === "" ? null : model,
+    // PRD #305: apply the run model to every subagent. Always sent (replace-semantics).
+    override_subagent_model: overrideSubagentModel,
   });
 
   const submit = async (e: React.FormEvent) => {
@@ -710,6 +716,22 @@ export function ScheduleModal({
             </p>
           </Field>
           {modelWarning && <Alert message={modelWarning} tone="warning" />}
+
+          {/* PRD #305: apply the run model to every subagent. Always enabled — first-class
+              on Inherit (the applied model is the same one the lead resolves). */}
+          <div className="flex items-start gap-3">
+            <Toggle
+              checked={overrideSubagentModel}
+              onChange={setOverrideSubagentModel}
+              label="Apply model also to agents"
+            />
+            <span className="text-[13px] text-fg">
+              Apply model also to agents
+              <span className="block text-[11px] text-faint">
+                Subagents run on the same model as the lead — overrides each agent's own model.
+              </span>
+            </span>
+          </div>
 
           {/* Options */}
           <div className="space-y-3">

@@ -62,6 +62,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     worker_id: "w1",
     branch: null,
     model: null,
+    override_subagent_model: false,
     mr_iid: null,
     mr_state: null,
     failure_reason: null,
