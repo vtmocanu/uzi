@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { AdminRateLimits } from "./AdminRateLimits";
 import { api, type AdminRateLimitUser, type MyRateLimits } from "../lib/api";
 
@@ -160,5 +160,43 @@ describe("AdminRateLimits", () => {
     expect(screen.queryByRole("columnheader", { name: "Updated" })).toBeNull();
     expect(screen.queryByRole("columnheader", { name: "5-hour window" })).toBeNull();
     expect(screen.queryByRole("columnheader", { name: "7-day window" })).toBeNull();
+  });
+});
+
+// PRD #309 M4 — the burn-rate forecast wired through the admin table (its primary
+// target). Drives the real accumulation across polls on the row's own series.
+describe("AdminRateLimits forecast (PRD #309)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const flush = (ms = 0) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+
+  it("draws a forecast ghost + » on a row whose rising trailing series projects over the cap", async () => {
+    let poll = 0;
+    // 40, 48, 56 … capped below 100; far-out reset so the projection blows past 100.
+    mockApi.getAdminRateLimits.mockImplementation(async () => {
+      const pct5 = Math.min(40 + poll * 8, 96);
+      poll += 1;
+      return { users: [row("ana", ok(pct5, 20))] };
+    });
+    render(<AdminRateLimits />);
+    await flush(); // initial read (40%)
+    for (let k = 0; k < 6; k++) await flush(60_000); // rising polls, >3-min span accrues
+
+    const ana = screen.getByText("ana").closest("tr")!;
+    const bar5h = within(ana).getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
+    expect(within(ana).getByText("»")).toBeTruthy();
+  });
+
+  it("stays silent (plain bar) on a FLAT series — reads the slope, not presence", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("vlad", ok(62, 20))] });
+    render(<AdminRateLimits />);
+    await flush();
+    for (let k = 0; k < 6; k++) await flush(60_000);
+
+    const vlad = screen.getByText("vlad").closest("tr")!;
+    const bar5h = within(vlad).getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
+    expect(within(vlad).queryByText("»")).toBeNull();
   });
 });

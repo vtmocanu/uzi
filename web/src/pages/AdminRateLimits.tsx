@@ -4,11 +4,26 @@
 // Admin → Users; the meters reuse the shared MeterTrack + toneFor thresholds.
 
 import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type AdminRateLimitUser, type MyRateLimits } from "../lib/api";
+import { api, ApiError, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { formatAgo, formatCountdown, sortAdminRows, statusBadge, useNow } from "../lib/rateLimits";
+import {
+  burnForecast,
+  forecastKey,
+  forecastReadingsFor,
+  formatAgo,
+  formatCountdown,
+  sortAdminRows,
+  statusBadge,
+  useNow,
+  useReadingSeries,
+  type BurnForecast,
+} from "../lib/rateLimits";
 import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
-import { MeterTrack } from "../components/Meter";
+import { RateLimitForecastMeter } from "../components/RateLimitForecast";
+
+// Series is the accumulation getter useReadingSeries returns, threaded to each
+// window row for burnForecast (the admin view accumulates across ALL users' tokens).
+type Series = ReturnType<typeof useReadingSeries>;
 
 // One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
 // the shared MeterTrack, its percent, and the reset countdown. The visible chip is
@@ -25,18 +40,20 @@ function WindowRow({
   label,
   stale,
   now,
+  forecast,
 }: {
   win: OkWindow;
   chip: string;
   label: string;
   stale: boolean;
   now: number;
+  forecast: BurnForecast;
 }) {
   const reset = stale ? "stale" : (formatCountdown(win.resets_at, now) ?? "—");
   return (
     <div className="grid grid-cols-[1.5rem_minmax(4rem,1fr)_2.5rem_4.25rem] items-center gap-2.5">
       <span className="font-mono text-xs text-muted">{chip}</span>
-      <MeterTrack className="h-1.5" label={label} fillPct={win.pct} valueText={`${win.pct}%`} dim={stale} />
+      <RateLimitForecastMeter className="h-1.5" label={label} pct={win.pct} valueText={`${win.pct}%`} forecast={forecast} dim={stale} />
       <span className={cx("text-right font-mono tabular-nums", stale ? "text-faint" : "text-muted")}>
         {win.pct}%
       </span>
@@ -60,12 +77,27 @@ function WindowRow({
 // (PRD #240): what used to be two ~280px side-by-side columns, halving the table's
 // width so it fits its card. A non-ok reading collapses to a single em-dash — never
 // two — so the row stays one Utilization cell.
-function UtilizationCell({ limits, now }: { limits: MyRateLimits; now: number }) {
+function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: number; series: Series }) {
+  const { limits } = token;
   if (limits.status !== "ok") return <span className="text-faint">—</span>;
   return (
     <div className="flex max-w-[22rem] flex-col gap-2">
-      <WindowRow win={limits.five_hour} chip="5h" label="5-hour window" stale={limits.stale} now={now} />
-      <WindowRow win={limits.seven_day} chip="7d" label="7-day window" stale={limits.stale} now={now} />
+      <WindowRow
+        win={limits.five_hour}
+        chip="5h"
+        label="5-hour window"
+        stale={limits.stale}
+        now={now}
+        forecast={burnForecast(series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+      />
+      <WindowRow
+        win={limits.seven_day}
+        chip="7d"
+        label="7-day window"
+        stale={limits.stale}
+        now={now}
+        forecast={burnForecast(series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+      />
     </div>
   );
 }
@@ -100,6 +132,9 @@ export function AdminRateLimits() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const now = useNow();
+  // One accumulation store across every user's tokens — secret_id keys are globally
+  // unique, so cross-user rows never collide (forecastKey).
+  const series = useReadingSeries(forecastReadingsFor(users.flatMap((u) => u.tokens)), now);
 
   const load = useCallback(() => {
     api
@@ -186,7 +221,7 @@ export function AdminRateLimits() {
                               </div>
                             </td>
                             <td className="px-4 py-3 align-top">
-                              <UtilizationCell limits={t.limits} now={now} />
+                              <UtilizationCell token={t} now={now} series={series} />
                             </td>
                             <td className="px-4 py-3 align-top">
                               <Badge tone={badge.tone} dot={badge.dot}>

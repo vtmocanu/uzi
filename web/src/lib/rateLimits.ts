@@ -471,6 +471,30 @@ export function useReadingSeries(readings: SeriesReading[], nowMs: number): (key
   return useCallback((key: string) => ref.current.get(key) ?? [], []);
 }
 
+// forecastKey names a window's accumulation slot. `secret_id` is the user_secrets
+// PRIMARY KEY, so `${secret_id}:${window}` is globally unique — the keys do not
+// collide even on the cross-user admin view (one accumulation store, all tokens).
+export function forecastKey(secretId: string, window: "5h" | "7d"): string {
+  return `${secretId}:${window}`;
+}
+
+// forecastReadingsFor flattens a token list into the per-window SeriesReading rows
+// useReadingSeries folds. A non-ok OR stale reading contributes `null` (clears the
+// run): a stale/frozen reading must never accrue a sample, and the forecast is gated
+// to ok+!stale rows anyway (a stale row draws a plain, dimmed bar). Shared by both
+// surfaces so their keys — and thus what burnForecast reads — cannot drift apart.
+export function forecastReadingsFor(tokens: TokenRateLimits[]): SeriesReading[] {
+  const out: SeriesReading[] = [];
+  for (const t of tokens) {
+    const l = t.limits;
+    const five = l.status === "ok" && !l.stale ? l.five_hour.pct : null;
+    const seven = l.status === "ok" && !l.stale ? l.seven_day.pct : null;
+    out.push({ key: forecastKey(t.secret_id, "5h"), pct: five });
+    out.push({ key: forecastKey(t.secret_id, "7d"), pct: seven });
+  }
+  return out;
+}
+
 // useNow ticks a Date.now() clock so a rendered countdown re-derives between the
 // 60s polls (Decision 7). Default 30s: fine-grained enough for "1h 23m" without
 // re-rendering every second.
