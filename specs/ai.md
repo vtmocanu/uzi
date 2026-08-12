@@ -451,8 +451,11 @@ Serves human: best-practice (protect the upstream forge; abuse resistance).
   endpoints only: verify, projects, move, sync. Budget `FORGE_RATE_LIMIT_MAX`/
   `FORGE_RATE_LIMIT_WINDOW` (default 30/min), separate from the auth limiter.
 - **Poller bounding**: per-tick **bounded concurrency of 4**
-  (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** clamped to one poll
-  interval, so a slow forge can't let ticks pile up. In-memory per-repo state
+  (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** of the poll
+  interval, floored at **2x the forge HTTP timeout** (`tickBudget`, issue #139) so a
+  poll interval shorter than the tick's forge calls (the e2e 2s cadence) can't cancel
+  an in-flight sync; ticks never overlap (single-goroutine `Run`), so a slow forge
+  can't let them pile up. In-memory per-repo state
   (`marks forgesvc.Marks` — one high-water mark per fetch, §447 — plus poll count)
   — a disabled repo drops out; a re-enabled one restarts with a fresh full
   reconcile.
