@@ -286,6 +286,11 @@ type RunDTO struct {
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.
 	Model *string `json:"model"`
+	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
+	// at fire time by the schedule that created it (PRD #305): true means the run's model
+	// was applied to every subagent (overriding pins), false is today's default. Surfaced
+	// read-only so a scheduled run's fleet-wide model choice is confirmable.
+	OverrideSubagentModel bool `json:"override_subagent_model"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status

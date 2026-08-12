@@ -344,6 +344,9 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),
+		// PRD #305: the frozen "apply model also to agents" flag; false for every run
+		// that did not opt in (the default).
+		OverrideSubagentModel: r.OverrideSubagentModel,
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()
