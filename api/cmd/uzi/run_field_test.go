@@ -111,6 +111,30 @@ func TestRunGetFieldModelNullIsEmptyLine(t *testing.T) {
 	}
 }
 
+// The frozen "apply model also to agents" flag (PRD #305) is a top-level bool on RunDTO,
+// so `--field override_subagent_model` prints it raw (true/false, unquoted, one line) with
+// no CLI change — this pins that read surface, both polarities.
+func TestRunGetFieldOverrideSubagentModel(t *testing.T) {
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"on":  {ID: "on", Status: "completed", OverrideSubagentModel: true},
+		"off": {ID: "off", Status: "completed", OverrideSubagentModel: false},
+	}}
+	stdout, _, code := runCLI(t, fakeEnv(fc), "run", "get", "on", "--field", "override_subagent_model")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if stdout != "true\n" {
+		t.Errorf("stdout = %q, want raw \"true\\n\" (unquoted, one line)", stdout)
+	}
+	stdout2, _, code2 := runCLI(t, fakeEnv(fc), "run", "get", "off", "--field", "override_subagent_model")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code2)
+	}
+	if stdout2 != "false\n" {
+		t.Errorf("stdout = %q, want raw \"false\\n\"", stdout2)
+	}
+}
+
 func TestRunGetFieldUnknownIsUsageError(t *testing.T) {
 	_, stderr, code := runCLI(t, fakeEnv(fieldFake()), "run", "get", "r1", "--field", "nope")
 	if code != uzicli.ExitUsage {

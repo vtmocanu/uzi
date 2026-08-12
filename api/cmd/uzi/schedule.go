@@ -87,6 +87,7 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().Int("max-issues", 10, "for --sweep: cap on issues started per fire, oldest-first (default 10; ignored for non-sweep targets)")
 	create.Flags().String("guidance", "", "optional owner guidance injected into the run instruction (--issue/--sweep only)")
 	create.Flags().String("model", "", "model alias (opus/sonnet/haiku/fable) or a custom model ID for runs this schedule fires; empty inherits your Worker-model default (valid on all targets)")
+	create.Flags().Bool("apply-model-to-agents", false, "also apply the schedule's model to every subagent (overrides each agent's own model pin); default off keeps per-agent pins")
 	create.Flags().String("at", "", "fire once at this RFC3339 time (one of --at/--cron)")
 	create.Flags().String("cron", "", "recurring 5-field cron expression (one of --at/--cron)")
 	create.Flags().String("tz", "UTC", "IANA timezone the --cron expression is interpreted in")
@@ -175,6 +176,13 @@ func buildScheduleRequest(cmd *cobra.Command) (apitypes.ScheduleRequest, string,
 	if cmd.Flags().Changed("model") {
 		model, _ := cmd.Flags().GetString("model")
 		req.Model = &model
+	}
+
+	// PRD #305: opt-in to override every subagent's model with the run model. Only set
+	// when the caller passed the flag, so an omitted flag stays nil (server default false).
+	if cmd.Flags().Changed("apply-model-to-agents") {
+		v, _ := cmd.Flags().GetBool("apply-model-to-agents")
+		req.OverrideSubagentModel = &v
 	}
 
 	// Exactly one timing.
@@ -331,6 +339,7 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().Int("max-issues", 10, "change the per-fire sweep cap, oldest-first (sweep target only)")
 	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets only)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
+	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
 	return edit
 }
 
@@ -341,10 +350,11 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 // deliberate: the PATCH endpoint decodes with DisallowUnknownFields, so the DTO's
 // response-only fields (id, status, created_at, updated_at, next_fire_at, last_fired_at,
 // next_fires, repo_id, repo_path) would be rejected as unknown → 400. It also compensates
-// for mergeSchedule, which is keep-on-empty for most fields but takes max_issues and
-// guidance STRAIGHT from the request (nil clears them) — so those two MUST be re-sent from
-// the fetched row, or a --cron-only edit would silently wipe them. Enabled is left nil so
-// a config edit never touches the pause flag (enable/disable is pause/resume's job).
+// for mergeSchedule, which is keep-on-empty for most fields but takes max_issues,
+// guidance, model and override_subagent_model STRAIGHT from the request (nil clears them)
+// — so those MUST be re-sent from the fetched row, or a --cron-only edit would silently
+// wipe them. Enabled is left nil so a config edit never touches the pause flag
+// (enable/disable is pause/resume's job).
 func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apitypes.ScheduleRequest, error) {
 	req := apitypes.ScheduleRequest{
 		Target:    s.Target,
@@ -357,6 +367,12 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 		Timezone:  s.Timezone,
 		MaxIssues: s.MaxIssues,
 		Guidance:  s.Guidance,
+		// PRD #300 replace-semantics: restate or a partial edit (e.g. --cron only) wipes
+		// the stored model, since mergeSchedule does m.Model = req.Model (pre-existing bug).
+		Model: s.Model,
+		// PRD #305 replace-semantics: same class — restate the subagent override or a
+		// partial edit wipes it. The DTO always sets this bool non-nil.
+		OverrideSubagentModel: s.OverrideSubagentModel,
 	}
 	// DTO carries these as plain bool; re-send as pointer copies (the config PATCH path
 	// always restates them). Enabled stays nil — see the doc comment.
@@ -462,6 +478,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, s apitypes.ScheduleDTO) (apity
 	}
 	if clearMaxIssues {
 		req.MaxIssues = nil
+		changed = true
+	}
+	if f.Changed("apply-model-to-agents") {
+		v, _ := f.GetBool("apply-model-to-agents")
+		req.OverrideSubagentModel = &v
 		changed = true
 	}
 	if !changed {
@@ -673,6 +694,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	rows = append(rows,
 		[]string{"MODEL", strOr(s.Model, "-")},
+		[]string{"APPLY_MODEL_TO_AGENTS", boolStr(s.OverrideSubagentModel != nil && *s.OverrideSubagentModel)},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},
 		[]string{"ENABLED", boolStr(s.Enabled)},

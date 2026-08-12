@@ -94,6 +94,7 @@ uzi schedule create --repo <id> (--issue <iid> | --sweep [--label <l> ...] | --p
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
+                    [--model <alias|id>] [--apply-model-to-agents]
 uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--category label,label]
 uzi review resolve <id> <rec> | --category <c> --target <t>
@@ -193,14 +194,21 @@ A few worth knowing:
   section separate from the issue body; it does not change which issues are
   eligible to run, is capped at 8 KiB, and is truncated — never dropped — if a
   large issue body plus guidance would otherwise push the composed instruction
-  over its size limit. Both `--max-issues` and `--wait-on-limit`'s new default
+  over its size limit. `--model <alias|id>` (valid on every target) pins the
+  model a fired run uses; add `--apply-model-to-agents` (default off) to also
+  apply that model to every subagent, overriding each agent's own model pin.
+  Both `--max-issues` and `--wait-on-limit`'s new default
   apply at create time only — existing schedules keep their stored values.
   `schedule list`/`get` read them, `edit <schedule-id>` changes a schedule's
   mutable config in place — retime with `--cron`/`--at`, adjust `--tz`, or,
   scoped to the existing target, `--prompt`/`--label`/`--guidance`
   (`--clear-guidance`)/`--max-issues` (`--clear-max-issues`)/`--auto-approve`/
-  `--wait-on-limit` (no `--model`, out of scope) — without churning the id or
-  run history the way delete-and-recreate would; any field you omit keeps its
+  `--wait-on-limit`/`--apply-model-to-agents` (toggle the subagent model
+  override) — without churning the id or
+  run history the way delete-and-recreate would; `edit` does not change the
+  model itself (there is no `--model` edit flag), but it now preserves the
+  stored `--model` and `--apply-model-to-agents` across a partial edit — a plain
+  retime previously wiped the stored model. Any field you omit keeps its
   stored value, and editing config revives a terminal schedule (its status
   returns to active — a recurring one resumes, a fired one-shot needs a fresh
   future `--at`) but does not un-pause a paused schedule, while `pause`/`resume`
@@ -654,6 +662,12 @@ line, not an error). An unknown field, or a **non-scalar** one that is populated
 — any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
 `usage`), which you read with `--json` — is a usage error (exit 2). `--field` and
 `--json` are mutually exclusive (two output modes).
+
+The model a schedule froze onto a run is readable this way too:
+`uzi run get <id> --field model` (the model alias/id, an empty line when the
+schedule pinned none) and `uzi run get <id> --field override_subagent_model`
+(the boolean literal `true`/`false` — whether that model was also applied to
+every subagent).
 
 ### Run status, and what `--follow` waits for
 
