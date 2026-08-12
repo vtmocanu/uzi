@@ -103,7 +103,7 @@ uzi review undo <id> <rec> | stats [--json]
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
 uzi version
@@ -284,6 +284,15 @@ A few worth knowing:
   not an oversight, but worth knowing before you mint or hand out one of
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
+- **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
+  enabled repos, factory-wide, the push/merge guardrail would refuse right now
+  (the bot can push or merge to the default branch). It **persists nothing**: it
+  re-checks the forge on each call rather than reading the stored privilege
+  report, so it reflects the forge as it is now, not as of the last sweep. The
+  table has `PATH`, `BLOCKED`, `UNEVALUABLE`, and a summary line
+  `enabled=… blocked=… unevaluable=…`. `UNEVALUABLE` is counted apart from
+  `BLOCKED` and is **not** safe: a forge error or a repo with no default branch
+  means uzi could not tell — read it as unknown, never as zero affected.
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).

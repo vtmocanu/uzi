@@ -240,6 +240,24 @@ func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleE
 	}
 }
 
+// BlocksRun reports whether the bot's rights on a protected-branch reading mean
+// uzi must refuse (PRD #66 D3/D6). Protected FIRST (R3 inversion guard): an
+// unprotected default branch is the worst case and short-circuits true; only on
+// a protected branch are the push/merge fields consulted. This is the structured
+// counterpart of the coded-findings BLOCK set M1/M2 build on — keep the two in
+// agreement.
+//
+// ProtectionUnverified is deliberately NOT OR'd in here: that is the fail-closed
+// error/unreadable path (a read the driver could not authoritatively resolve),
+// which the CALLER handles by treating the whole read as unevaluable — not a bp
+// field this predicate consumes.
+func BlocksRun(bp forge.BranchProtection) bool {
+	if !bp.Protected {
+		return true
+	}
+	return bp.WriteRoleCanPush || bp.BotCanPush || bp.WriteRoleCanMerge || bp.BotCanMerge
+}
+
 // evaluateToken applies the token rules to introspection data + the admin flag.
 // It is a pure function (no forge calls) so the rule matrix is trivially fixture
 // -tested. introspectionWarn, when non-empty, means scopes/active/expiry could

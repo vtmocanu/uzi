@@ -157,6 +157,136 @@ func TestCheckConnectionForgeBuildFailurePersistsError(t *testing.T) {
 	}
 }
 
+// TestGuardrailImpact: a live scan over one connection with three repos — a
+// blocked one (bot may push to protected main), a clean one, and an unevaluable
+// one (protection read errors) — counts each correctly and PERSISTS NOTHING.
+func TestGuardrailImpact(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	st.conns = []store.ForgeConnection{conn}
+	blocked := aRepo(1, "main") // WriteRoleCanPush → blocked
+	clean := aRepo(2, "main")   // protected, nothing granted → not blocked
+	broken := aRepo(3, "main")  // protection read errors → unevaluable
+	st.reposByConn[conn.ID] = []store.Repo{blocked, clean, broken}
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles: map[int64]roleResult{
+			1: {role: forge.RoleWrite, member: true},
+			2: {role: forge.RoleWrite, member: true},
+			3: {role: forge.RoleWrite, member: true},
+		},
+		prots: map[int64]protResult{
+			1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: true}},
+			2: {bp: forge.BranchProtection{Protected: true}},
+			3: {err: errors.New("403 from protected-branches")},
+		},
+	}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	rep, err := svc.GuardrailImpact(context.Background())
+	if err != nil {
+		t.Fatalf("GuardrailImpact: %v", err)
+	}
+	if rep.EnabledRepoCount != 3 || rep.BlockedCount != 1 || rep.UnevaluableCount != 1 {
+		t.Fatalf("counts = enabled %d / blocked %d / unevaluable %d, want 3/1/1",
+			rep.EnabledRepoCount, rep.BlockedCount, rep.UnevaluableCount)
+	}
+	byID := map[string]ImpactRepo{}
+	for _, r := range rep.Repos {
+		byID[r.RepoID] = r
+		if r.UserID != conn.UserID.String() || r.ConnectionID != conn.ID.String() {
+			t.Fatalf("repo %s carries user %q / conn %q, want %q / %q", r.RepoID, r.UserID, r.ConnectionID, conn.UserID, conn.ID)
+		}
+	}
+	if r := byID[blocked.ID.String()]; !r.Blocked || r.Unevaluable {
+		t.Fatalf("blocked repo = %+v, want Blocked && !Unevaluable", r)
+	}
+	if r := byID[clean.ID.String()]; r.Blocked || r.Unevaluable {
+		t.Fatalf("clean repo = %+v, want !Blocked && !Unevaluable", r)
+	}
+	if r := byID[broken.ID.String()]; r.Blocked || !r.Unevaluable {
+		t.Fatalf("broken repo = %+v, want Unevaluable && !Blocked", r)
+	}
+	// The whole point of M3: it measures without touching the stored report.
+	if len(st.writes) != 0 {
+		t.Fatalf("GuardrailImpact persisted %d reports, want 0", len(st.writes))
+	}
+}
+
+// TestGuardrailImpactVerifyTokenFailureIsUnevaluable: a connection whose bot token
+// cannot be verified marks all its repos unevaluable (not blocked, not safe) and
+// does not crash the scan.
+func TestGuardrailImpactVerifyTokenFailureIsUnevaluable(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	st.conns = []store.ForgeConnection{conn}
+	st.reposByConn[conn.ID] = []store.Repo{aRepo(1, "main"), aRepo(2, "main")}
+	f := &fakeForge{verifyErr: errors.New("401 token revoked")}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	rep, err := svc.GuardrailImpact(context.Background())
+	if err != nil {
+		t.Fatalf("a VerifyToken failure must not be a returned error: %v", err)
+	}
+	if rep.EnabledRepoCount != 2 || rep.UnevaluableCount != 2 || rep.BlockedCount != 0 {
+		t.Fatalf("counts = enabled %d / blocked %d / unevaluable %d, want 2/0/2",
+			rep.EnabledRepoCount, rep.BlockedCount, rep.UnevaluableCount)
+	}
+	if len(st.writes) != 0 {
+		t.Fatalf("persisted %d reports, want 0", len(st.writes))
+	}
+}
+
+// TestGuardrailImpactNoDefaultBranchIsUnevaluable: a repo with no default branch
+// is unevaluable (there is nothing to read protection on), not silently safe.
+func TestGuardrailImpactProtectionUnverifiedIsUnevaluable(t *testing.T) {
+	// A protected branch the driver could not authoritatively read (GitHub
+	// legacy-branch case) comes back with a nil error and all Can* fields false —
+	// which is "unknown", not "safe". It must count unevaluable, never as
+	// not-affected (R1; matches what M2's live gate refuses as protection_unreadable).
+	conn := aConn()
+	st := newFakeStore()
+	st.conns = []store.ForgeConnection{conn}
+	st.reposByConn[conn.ID] = []store.Repo{aRepo(1, "main")}
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots: map[int64]protResult{
+			1: {bp: forge.BranchProtection{Protected: true, ProtectionUnverified: true}},
+		},
+	}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	rep, err := svc.GuardrailImpact(context.Background())
+	if err != nil {
+		t.Fatalf("GuardrailImpact: %v", err)
+	}
+	if rep.EnabledRepoCount != 1 || rep.UnevaluableCount != 1 || rep.BlockedCount != 0 {
+		t.Fatalf("counts = enabled %d / blocked %d / unevaluable %d, want 1/0/1",
+			rep.EnabledRepoCount, rep.BlockedCount, rep.UnevaluableCount)
+	}
+	if len(st.writes) != 0 {
+		t.Fatalf("persisted %d reports, want 0", len(st.writes))
+	}
+}
+func TestGuardrailImpactNoDefaultBranchIsUnevaluable(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	st.conns = []store.ForgeConnection{conn}
+	st.reposByConn[conn.ID] = []store.Repo{aRepo(1, "")}
+	f := &fakeForge{identity: forge.BotIdentity{ForgeUserID: 42}}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	rep, err := svc.GuardrailImpact(context.Background())
+	if err != nil {
+		t.Fatalf("GuardrailImpact: %v", err)
+	}
+	if rep.EnabledRepoCount != 1 || rep.UnevaluableCount != 1 || rep.BlockedCount != 0 {
+		t.Fatalf("counts = enabled %d / blocked %d / unevaluable %d, want 1/0/1",
+			rep.EnabledRepoCount, rep.BlockedCount, rep.UnevaluableCount)
+	}
+}
+
 // TestSweepToleratesDeletedMidSweep: a 0-row write-back (connection deleted mid
 // -sweep) is not an error.
 func TestSweepToleratesDeletedMidSweep(t *testing.T) {

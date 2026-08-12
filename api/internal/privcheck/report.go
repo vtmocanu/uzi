@@ -87,6 +87,32 @@ type Repo struct {
 	DefaultBranch string
 }
 
+// ImpactRepo is one enabled repo's line in the pre-flight guardrail impact scan
+// (PRD #66 M3). Blocked and Unevaluable are mutually exclusive: an unevaluable
+// repo is "unknown" (a forge read errored, or it has no default branch to read
+// protection on), counted apart from Blocked and NOT read as safe (R1).
+type ImpactRepo struct {
+	RepoID       string `json:"repo_id"`
+	Path         string `json:"path"`
+	UserID       string `json:"user_id"` // owning connection's user, for admin cross-user view
+	ConnectionID string `json:"connection_id"`
+	Blocked      bool   `json:"blocked"`
+	Unevaluable  bool   `json:"unevaluable"` // forge error — unknown, not safe
+}
+
+// ImpactReport is the result of a live, non-persisting scan (PRD #66 M3) of every
+// enabled repo across every forge connection: how many would be refused under the
+// new guardrail (the bot can push/merge to the default branch). It reports
+// BlockedCount and UnevaluableCount separately so an empty count is never read as
+// "zero affected" when it is really "could not tell" (R1).
+type ImpactReport struct {
+	CheckedAt        time.Time    `json:"checked_at"`
+	EnabledRepoCount int          `json:"enabled_repo_count"`
+	BlockedCount     int          `json:"blocked_count"`
+	UnevaluableCount int          `json:"unevaluable_count"`
+	Repos            []ImpactRepo `json:"repos"`
+}
+
 // errorReport builds a StatusError report carrying a single top-level warning.
 // Used when the check could not even run (forge unreachable, token revoked, or a
 // connection whose client can't be built) — surfaced, never crashed on.

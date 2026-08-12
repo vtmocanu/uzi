@@ -886,6 +886,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Agents-status overview: every user's workers + active runs.
 				r.Get("/workers", h.AdminListWorkers)
 				r.Get("/runs", h.AdminListRuns)
+				// PRD #66 M3: the live, non-persisting guardrail pre-flight impact count.
+				// It fans out a 1 + 2×repos forge scan across every user's connections,
+				// so it wears the per-user forge budget — forgeLimiter is a Routes
+				// parameter and so in scope here, the same limiter POST
+				// /{id}/privilege-check uses for the same reason.
+				r.With(forgeLimiter.PerUserMiddleware).Get("/guardrail-impact", h.AdminGuardrailImpact)
 				// Factory-wide token/cost usage + per-user breakdown (PRD #40).
 				r.Get("/usage", h.AdminUsage)
 				// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors

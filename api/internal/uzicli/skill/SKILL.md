@@ -153,6 +153,7 @@ uzi admin workers
 uzi admin usage
 uzi admin rate-limits
 uzi admin cli-tokens
+uzi admin guardrail-impact
 uzi skill status
 uzi skill install [--force]
 uzi skill install-hook
@@ -650,9 +651,13 @@ as inert data.
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not
   the CLI; the CLI is your visibility + purge control over a stored learning.
 - `uzi repo list` — repositories, with their ids and enabled state.
-- `uzi admin users|runs|workers|usage|rate-limits` — **read-only** factory-wide
-  views. These require an admin-scoped (`uza_`) token; a default token gets exit
-  3. There are no admin write verbs — those stay cookie-only in the web UI.
+- `uzi admin users|runs|workers|usage|rate-limits|cli-tokens|guardrail-impact` —
+  **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a
+  default token gets exit 3. There are no admin write verbs — those stay cookie-only
+  in the web UI. `guardrail-impact` (PRD #66) is a LIVE, non-persisting scan: it
+  reports how many enabled repos the push/merge guardrail would refuse right now,
+  counting UNEVALUABLE repos (forge error / no default branch) apart from blocked
+  ones — unknown, never read as zero affected.
 
 ### The skill itself
 

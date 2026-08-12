@@ -111,6 +111,114 @@ func (s *Service) CheckAllConnections(ctx context.Context) (SweepResult, error) 
 	return res, nil
 }
 
+// GuardrailImpact runs a live, non-persisting pre-flight scan (PRD #66 M3): it
+// iterates every forge connection, and for each enabled repo asks whether the new
+// guardrail would refuse a run (the bot can push/merge to the default branch, per
+// BlocksRun). It PERSISTS NOTHING — it never calls persist/UpdatePrivilegeReport —
+// because it is a measurement, not enforcement, and M3 runs before M1's migration
+// NULLs the stored reports (R1/R2), so it must re-sweep live rather than read the
+// blob.
+//
+// It fails soft per connection and per repo (R1): a client-build error, a
+// VerifyToken error, or a per-repo forge error records that repo as UNEVALUABLE —
+// "unknown", counted apart from blocked and never read as safe — and the scan
+// continues. Only a genuine DB error (listing connections or repos) returns an
+// error, matching CheckConnection. Cancellation (shutdown) stops it promptly.
+func (s *Service) GuardrailImpact(ctx context.Context) (ImpactReport, error) {
+	conns, err := s.q.ListAllForgeConnections(ctx)
+	if err != nil {
+		return ImpactReport{}, err
+	}
+	report := ImpactReport{CheckedAt: s.now(), Repos: []ImpactRepo{}}
+	for i := range conns {
+		if err := ctx.Err(); err != nil {
+			return ImpactReport{}, err
+		}
+		conn := conns[i]
+		rows, err := s.q.ListEnabledReposByConnection(ctx, conn.ID)
+		if err != nil {
+			return ImpactReport{}, err
+		}
+		repos := toRepos(rows)
+
+		// Build the client and derive the bot user id once per connection. A failure
+		// at either step is not fatal: it marks every one of this connection's repos
+		// unevaluable (we could not read the forge to tell), never blocked and never
+		// safe.
+		f, buildErr := s.forges.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+		var (
+			botUserID int64
+			connErr   = buildErr
+		)
+		if connErr == nil {
+			identity, verr := f.VerifyToken(ctx)
+			if verr != nil {
+				connErr = verr
+			} else {
+				botUserID = identity.ForgeUserID
+			}
+		}
+
+		for _, repo := range repos {
+			ir := ImpactRepo{
+				RepoID:       repo.ID,
+				Path:         repo.Path,
+				UserID:       conn.UserID.String(),
+				ConnectionID: conn.ID.String(),
+			}
+			if connErr != nil {
+				ir.Unevaluable = true
+			} else if blocked, ok := s.impactForRepo(ctx, f, botUserID, repo); ok {
+				ir.Blocked = blocked
+			} else {
+				ir.Unevaluable = true
+			}
+
+			report.EnabledRepoCount++
+			switch {
+			case ir.Unevaluable:
+				report.UnevaluableCount++
+			case ir.Blocked:
+				report.BlockedCount++
+			}
+			report.Repos = append(report.Repos, ir)
+		}
+	}
+	return report, nil
+}
+
+// impactForRepo runs the same live forge reads the enforcement gate performs for
+// one repo (ProjectRole + DefaultBranchProtection) and applies BlocksRun. It
+// returns ok=false — the repo is unevaluable — when the repo has no default
+// branch to read protection on, when either forge read errors, or when the
+// protection read came back ProtectionUnverified (protected but the driver could
+// not authoritatively read who may push/merge): fail-closed, "unknown" is not
+// "safe" (R1). The role read is exercised (not consumed by BlocksRun, whose
+// blocking set is the push/merge fields only) so that a repo whose forge
+// round-trips error is counted unevaluable exactly as the live gate would be
+// unable to clear it.
+func (s *Service) impactForRepo(ctx context.Context, f forge.Forge, botUserID int64, repo Repo) (blocked, ok bool) {
+	if repo.DefaultBranch == "" {
+		return false, false
+	}
+	if _, _, err := f.ProjectRole(ctx, repo.ForgeProjectID, botUserID); err != nil {
+		return false, false
+	}
+	bp, err := f.DefaultBranchProtection(ctx, repo.ForgeProjectID, repo.DefaultBranch, botUserID)
+	if err != nil {
+		return false, false
+	}
+	// Protected but unreadable (GitHub legacy-branch case, returned with a nil
+	// error per forge.BranchProtection): the Can* fields are false because the
+	// driver could not tell, not because the branch is safe. Count it unevaluable,
+	// matching BlocksRun's contract and what M2's live gate will refuse as
+	// protection_unreadable — never as not-affected.
+	if bp.ProtectionUnverified {
+		return false, false
+	}
+	return BlocksRun(bp), true
+}
+
 // persist writes the report + denormalized status onto the connection. A 0-row
 // write (connection deleted mid-sweep) is tolerated silently.
 func (s *Service) persist(ctx context.Context, connID uuid.UUID, rep Report) error {

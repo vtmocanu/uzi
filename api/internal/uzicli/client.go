@@ -116,6 +116,9 @@ type Client interface {
 	AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
+	// GuardrailImpact reads the live, non-persisting guardrail pre-flight impact
+	// count (PRD #66 M3): GET /api/admin/guardrail-impact.
+	GuardrailImpact(ctx context.Context) (apitypes.GuardrailImpactDTO, error)
 
 	// StartCLIAuth begins a browser-brokered login: POST /api/auth/cli/start with the
 	// PKCE S256 challenge and a client description. UNAUTH by design (the CLI has no
@@ -869,6 +872,17 @@ func (c *HTTPClient) AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCL
 		return nil, err
 	}
 	return env.Tokens, nil
+}
+
+// GuardrailImpact reads the live guardrail pre-flight impact count. The endpoint
+// persists nothing; it re-sweeps the forge and returns how many enabled repos
+// would be refused under the new guardrail (PRD #66 M3).
+func (c *HTTPClient) GuardrailImpact(ctx context.Context) (apitypes.GuardrailImpactDTO, error) {
+	var out apitypes.GuardrailImpactDTO
+	if err := c.get(ctx, "/api/admin/guardrail-impact", &out); err != nil {
+		return apitypes.GuardrailImpactDTO{}, err
+	}
+	return out, nil
 }
 
 func (c *HTTPClient) AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error) {

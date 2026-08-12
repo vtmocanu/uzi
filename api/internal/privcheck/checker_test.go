@@ -107,6 +107,42 @@ func hasFinding(list []string, substr string) bool {
 	return false
 }
 
+// TestBlocksRun pins the canonical blocking predicate (PRD #66 D3/D6). The
+// load-bearing rows are the first (unprotected → blocked, the R3 inversion guard)
+// and the last (a protected branch with all four push/merge fields false is NOT
+// read as blocked — the false,false,false,false case must clear).
+func TestBlocksRun(t *testing.T) {
+	cases := []struct {
+		name string
+		bp   forge.BranchProtection
+		want bool
+	}{
+		{"unprotected is the worst case and blocks", forge.BranchProtection{Protected: false}, true},
+		{"protected with nothing granted does not block", forge.BranchProtection{Protected: true}, false},
+		{"write role may push blocks", forge.BranchProtection{Protected: true, WriteRoleCanPush: true}, true},
+		{"bot direct push grant blocks", forge.BranchProtection{Protected: true, BotCanPush: true}, true},
+		{"write role may merge blocks", forge.BranchProtection{Protected: true, WriteRoleCanMerge: true}, true},
+		{"bot direct merge grant blocks", forge.BranchProtection{Protected: true, BotCanMerge: true}, true},
+		// The inversion trap: a protected branch reporting false on every push/merge
+		// field is genuinely safe and must clear — proving BlocksRun is not just
+		// returning true on a zero value.
+		{"protected false,false,false,false is not blocked", forge.BranchProtection{
+			Protected: true, WriteRoleCanPush: false, BotCanPush: false, WriteRoleCanMerge: false, BotCanMerge: false,
+		}, false},
+		// ProtectionUnverified is NOT a bp field BlocksRun OR's in (that is the
+		// caller's fail-closed error path): on a protected branch with all grants
+		// false, it stays unblocked here.
+		{"protection unverified alone does not block", forge.BranchProtection{Protected: true, ProtectionUnverified: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := BlocksRun(tc.bp); got != tc.want {
+				t.Fatalf("BlocksRun(%+v) = %v, want %v", tc.bp, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEvaluateToken(t *testing.T) {
 	warnWindow := 14 * 24 * time.Hour
 	soon := now.Add(7 * 24 * time.Hour)

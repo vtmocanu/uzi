@@ -572,3 +572,10 @@ func TestBuildInfoDTOTags(t *testing.T) {
 	assertTags(t, "BuildInfoDTO(uptime 0)", BuildInfoDTO{UptimeSeconds: &zero},
 		"version", "founded", "uptime_seconds")
 }
+
+func TestGuardrailImpactDTOTags(t *testing.T) {
+	assertTags(t, "GuardrailImpactDTO", GuardrailImpactDTO{},
+		"checked_at", "enabled_repo_count", "blocked_count", "unevaluable_count", "repos")
+	assertTags(t, "GuardrailImpactRepoDTO", GuardrailImpactRepoDTO{},
+		"repo_id", "path", "user_id", "connection_id", "blocked", "unevaluable")
+}
