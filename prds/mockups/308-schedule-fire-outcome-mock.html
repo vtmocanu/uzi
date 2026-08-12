@@ -1,0 +1,336 @@
+<title>Schedule fire outcomes — mock</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38;
+    --edge: 39 45 60; --edge-strong: 58 66 86;
+    --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154;
+    --brand: 251 146 60; --ok: 52 211 153; --warn: 251 191 36; --danger: 251 113 133;
+    --violet: 167 139 250;
+    --radius: 0.75rem;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 48px 24px 80px;
+    font-family: var(--sans); -webkit-font-smoothing: antialiased;
+    color: rgb(var(--fg));
+    background: radial-gradient(1200px 640px at 8% -12%, rgb(var(--brand) / 0.06), transparent 58%), rgb(var(--bg));
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: rgb(var(--brand)); margin: 0 0 12px; }
+  h1 { margin: 0; font-size: 30px; line-height: 1.15; letter-spacing: -0.02em; text-wrap: balance; }
+  .lede { margin: 14px 0 0; max-width: 74ch; color: rgb(var(--muted)); font-size: 15px; }
+  .lede code, .sub code, .prose code { font-family: var(--mono); font-size: 0.86em; color: rgb(var(--fg)); background: rgb(var(--raised)); padding: 1px 5px; border-radius: 5px; }
+
+  section { margin-top: 40px; }
+  h2 { margin: 0 0 4px; font-size: 15px; font-family: var(--mono); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .sub { margin: 0 0 16px; font-size: 13.5px; color: rgb(var(--muted)); max-width: 82ch; }
+
+  .frame { position: relative; border: 1px dashed rgb(var(--edge-strong)); border-radius: 14px; padding: 30px 22px 24px; background: rgb(var(--bg) / 0.4); }
+  .frame::before { content: attr(data-w); position: absolute; top: -9px; left: 20px; font-family: var(--mono); font-size: 10.5px; color: rgb(var(--faint)); background: rgb(var(--bg)); padding: 0 8px; letter-spacing: 0.04em; }
+
+  .card { border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); border-radius: var(--radius); overflow: hidden; }
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13.5px; min-width: 720px; }
+  thead th { font-weight: 500; color: rgb(var(--muted)); padding: 11px 16px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; font-size: 12.5px; }
+  tbody td { padding: 13px 16px; border-top: 1px solid rgb(var(--edge)); vertical-align: middle; }
+  tbody tr.off { opacity: 0.6; }
+  .right { text-align: right; }
+
+  .tgt { font-weight: 500; color: rgb(var(--fg)); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .repo { font-size: 12px; color: rgb(var(--faint)); margin-top: 2px; font-family: var(--mono); }
+  .when { font-family: var(--mono); font-size: 12.5px; color: rgb(var(--fg)); }
+  .when .human { font-family: var(--sans); font-size: 12px; color: rgb(var(--muted)); margin-top: 2px; }
+  .stamp { font-size: 12.5px; color: rgb(var(--muted)); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .stamp .rel { font-size: 11px; color: rgb(var(--faint)); }
+  .dash { color: rgb(var(--faint)); }
+
+  .badge { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; border: 1px solid; font-size: 11.5px; padding: 2px 9px; font-weight: 500; white-space: nowrap; }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; flex: none; }
+  .badge.ok { color: rgb(var(--ok)); background: rgb(var(--ok) / 0.1); border-color: rgb(var(--ok) / 0.4); }
+  .badge.warn { color: rgb(var(--warn)); background: rgb(var(--warn) / 0.1); border-color: rgb(var(--warn) / 0.4); }
+  .badge.danger { color: rgb(var(--danger)); background: rgb(var(--danger) / 0.1); border-color: rgb(var(--danger) / 0.4); }
+  .badge.neutral { color: rgb(var(--muted)); background: rgb(var(--raised)); border-color: rgb(var(--edge)); }
+  .badge.brand { color: rgb(var(--brand)); background: rgb(var(--brand) / 0.1); border-color: rgb(var(--brand) / 0.4); }
+  .badge.violet { color: rgb(var(--violet)); background: rgb(var(--violet) / 0.1); border-color: rgb(var(--violet) / 0.4); }
+  .badge.info { color: rgb(var(--violet)); background: rgb(var(--violet) / 0.1); border-color: rgb(var(--violet) / 0.4); }
+
+  /* the enriched "Last run" cell */
+  .outcome { display: flex; flex-direction: column; gap: 3px; }
+  .outcome .line { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; }
+  .outcome .sub2 { font-size: 11px; color: rgb(var(--faint)); font-variant-numeric: tabular-nums; }
+  .disclose { display: inline-flex; align-items: center; gap: 5px; margin-top: 2px; font-size: 11px; color: rgb(var(--violet)); cursor: pointer; font-weight: 500; background: none; border: 0; padding: 0; }
+  .caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; }
+  .caret.open { transform: rotate(180deg); }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px; border: 1px solid rgb(var(--edge)); background: rgb(var(--raised)); color: rgb(var(--muted)); font-size: 11.5px; padding: 2px 8px; font-family: var(--mono); }
+  .chip.run { color: rgb(var(--ok)); border-color: rgb(var(--ok) / 0.35); background: rgb(var(--ok) / 0.08); }
+
+  .sw { position: relative; width: 34px; height: 19px; border-radius: 999px; background: rgb(var(--edge-strong)); flex: none; display: inline-block; }
+  .sw.on { background: rgb(var(--brand)); }
+  .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 999px; background: #fff; }
+  .sw.on::after { left: 17px; }
+  .iconbtn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 7px; border: 1px solid transparent; background: transparent; color: rgb(var(--muted)); cursor: pointer; }
+  .iconbtn:hover { background: rgb(var(--raised)); border-color: rgb(var(--edge)); }
+  .actions { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
+
+  /* expanded detail row */
+  tr.detail td { padding: 0 16px 0; border-top: 0; background: rgb(var(--raised) / 0.35); }
+  .detail-inner { border-left: 2px solid rgb(var(--warn) / 0.5); margin: 0 0 16px 4px; padding: 14px 18px; border-radius: 0 10px 10px 0; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-left: 2px solid rgb(var(--warn) / 0.6); }
+  .detail-inner.good { border-left-color: rgb(var(--ok) / 0.6); }
+  .dhead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .dhead .title { font-size: 13px; font-weight: 600; color: rgb(var(--fg)); }
+  .dhead .meta { font-size: 12px; color: rgb(var(--faint)); font-family: var(--mono); }
+  .tally { display: flex; gap: 18px; flex-wrap: wrap; margin: 2px 0 14px; }
+  .tally .t { display: flex; flex-direction: column; gap: 1px; }
+  .tally .t .n { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1; }
+  .tally .t .k { font-size: 11px; color: rgb(var(--faint)); text-transform: uppercase; letter-spacing: 0.06em; }
+  .n.ok { color: rgb(var(--ok)); } .n.warn { color: rgb(var(--warn)); } .n.mut { color: rgb(var(--muted)); }
+
+  .rows { display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; align-items: flex-start; gap: 12px; padding: 9px 12px; border-radius: 9px; background: rgb(var(--raised) / 0.5); border: 1px solid rgb(var(--edge)); }
+  .row .iss { font-family: var(--mono); font-size: 12.5px; color: rgb(var(--fg)); flex: none; min-width: 46px; padding-top: 1px; }
+  .row .body { flex: 1 1 auto; min-width: 0; }
+  .row .body .t { font-size: 12.5px; color: rgb(var(--muted)); }
+  .row .body .why { font-size: 11.5px; color: rgb(var(--faint)); margin-top: 3px; }
+  .row .why b { color: rgb(var(--muted)); font-weight: 600; }
+  .row .verdict { flex: none; }
+
+  .hint { margin-top: 14px; display: flex; gap: 10px; align-items: flex-start; padding: 11px 13px; border-radius: 9px; background: rgb(var(--brand) / 0.06); border: 1px solid rgb(var(--brand) / 0.25); font-size: 12.5px; color: rgb(var(--muted)); }
+  .hint b { color: rgb(var(--fg)); font-weight: 600; }
+  .hint code { font-family: var(--mono); font-size: 0.9em; background: rgb(var(--raised)); padding: 1px 5px; border-radius: 5px; color: rgb(var(--fg)); }
+  .hint .i { color: rgb(var(--brand)); flex: none; font-weight: 700; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 10px; margin-top: 14px; }
+  .lg { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: rgb(var(--muted)); border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 5px 10px; background: rgb(var(--surface)); }
+  .lg .k { font-family: var(--mono); font-size: 11px; color: rgb(var(--fg)); }
+
+  pre.cli { margin: 0; overflow-x: auto; border-radius: 10px; border: 1px solid rgb(var(--edge)); background: #0b0d13; padding: 15px 17px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: rgb(var(--muted)); }
+  pre.cli .p { color: rgb(var(--faint)); } pre.cli .k2 { color: rgb(var(--fg)); }
+  pre.cli .ok { color: rgb(var(--ok)); } pre.cli .warn { color: rgb(var(--warn)); } pre.cli .b { color: rgb(var(--brand)); }
+  pre.cli .c { color: rgb(var(--faint)); font-style: italic; }
+
+  .prose { color: rgb(var(--muted)); font-size: 13.5px; max-width: 82ch; }
+  .prose b { color: rgb(var(--fg)); }
+  .note { font-size: 12px; color: rgb(var(--faint)); margin-top: 26px; border-top: 1px solid rgb(var(--edge)); padding-top: 14px; max-width: 82ch; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">uzi · schedules · design mock</p>
+  <h1>Why did my schedule start nothing?</h1>
+  <p class="lede">
+    A schedule can fire on time and still start zero runs — every candidate skipped for a benign
+    reason the run-creation gate applies (no PRD link, not eligible, already running). Today that
+    reason lives only in the api pod logs; the row just advances <code>Last run</code> and looks
+    healthy. This mock surfaces the <b>fire outcome</b>: a per-fire breakdown of what matched,
+    what started, and what was skipped and why — inline in the Schedules table and in
+    <code>uzi schedule get</code>.
+  </p>
+
+  <!-- ─────────────────────────── list view ─────────────────────────── -->
+  <section>
+    <h2>1 · Schedules list — the <span style="text-transform:none;font-family:var(--sans);color:rgb(var(--muted))">Last run</span> column, enriched</h2>
+    <p class="sub">
+      The existing <code>Last run</code> cell shows only a timestamp. It gains an outcome summary —
+      <b>started</b> in green, <b>skipped</b> in amber — and a disclosure to expand the last fire.
+      A row that fired but started nothing now reads as a problem at a glance instead of looking fine.
+    </p>
+    <div class="frame" data-w="/schedules">
+      <div class="card tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Target</th><th>When</th><th>Next run</th><th>Last run</th><th>Options</th><th class="right">On</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- the bug sweep: fired, started nothing -->
+            <tr>
+              <td>
+                <div class="tgt">Sweep · label <span class="chip">bug</span> <span class="badge info"><span class="dot"></span>sweep</span></div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">0 2 * * *</div>
+                <div class="when human">Every day · Europe/Bucharest</div>
+              </td>
+              <td><div class="stamp">Wed 02:00<div class="rel">in 14 hours</div></div></td>
+              <td>
+                <div class="outcome">
+                  <span class="line"><span class="badge warn"><span class="dot"></span>0 started · 1 skipped</span></span>
+                  <span class="sub2">Tue 02:00 · matched 1</span>
+                  <button class="disclose">Last fire <span class="caret open"></span></button>
+                </div>
+              </td>
+              <td><span class="chip">auto-approve</span></td>
+              <td class="right"><div class="actions"><span class="iconbtn">▶</span><span class="iconbtn">✎</span><span class="sw on"></span></div></td>
+            </tr>
+
+            <!-- expanded detail for the bug sweep -->
+            <tr class="detail">
+              <td colspan="6">
+                <div class="detail-inner">
+                  <div class="dhead">
+                    <span class="title">Last fire</span>
+                    <span class="meta">Tue Aug 12, 02:00 · Europe/Bucharest</span>
+                    <span class="badge warn" style="margin-left:auto"><span class="dot"></span>started nothing</span>
+                  </div>
+                  <div class="tally">
+                    <div class="t"><span class="n mut">1</span><span class="k">matched</span></div>
+                    <div class="t"><span class="n ok">0</span><span class="k">started</span></div>
+                    <div class="t"><span class="n warn">1</span><span class="k">skipped</span></div>
+                    <div class="t"><span class="n mut">1</span><span class="k">max&nbsp;issues</span></div>
+                  </div>
+                  <div class="rows">
+                    <div class="row">
+                      <span class="iss">#96</span>
+                      <div class="body">
+                        <div class="t">Mid-run worker restart discards all un-pushed commits on resume</div>
+                        <div class="why">Skipped — <b>no PRD link.</b> The issue is run-eligible via <code style="font-family:var(--mono)">bug</code>, but a scheduled fire needs a <code style="font-family:var(--mono)">prds/*.md</code> link or the <code style="font-family:var(--mono)">PRDLESS</code> label; the human-only link waiver does not apply to a timer.</div>
+                      </div>
+                      <span class="verdict"><span class="badge warn">no&nbsp;PRD&nbsp;link</span></span>
+                    </div>
+                  </div>
+                  <div class="hint">
+                    <span class="i">→</span>
+                    <div>
+                      <b>Nothing newer was reached.</b> <code>max issues</code> is <b>1</b>, so only the oldest
+                      candidate (#96) was tried. Raise the cap so the sweep reaches the <code>PRDLESS</code>-labelled
+                      bug issues behind it, or add <code>PRDLESS</code> / a PRD link to #96.
+                    </div>
+                  </div>
+                </div>
+              </td>
+            </tr>
+
+            <!-- a healthy sweep, for contrast -->
+            <tr>
+              <td>
+                <div class="tgt">Sweep · label <span class="chip">Night</span> <span class="badge info"><span class="dot"></span>sweep</span></div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">0 2 * * *</div>
+                <div class="when human">Every day · Europe/Bucharest</div>
+              </td>
+              <td><div class="stamp">Wed 02:00<div class="rel">in 14 hours</div></div></td>
+              <td>
+                <div class="outcome">
+                  <span class="line"><span class="badge ok"><span class="dot"></span>3 started</span></span>
+                  <span class="sub2">Tue 02:00 · matched 3</span>
+                  <button class="disclose">Last fire <span class="caret"></span></button>
+                </div>
+              </td>
+              <td><span class="chip">auto-approve</span> <span class="chip">wait-on-limit</span></td>
+              <td class="right"><div class="actions"><span class="iconbtn">▶</span><span class="iconbtn">✎</span><span class="sw on"></span></div></td>
+            </tr>
+
+            <!-- a pinned issue, never fired -->
+            <tr>
+              <td>
+                <div class="tgt">#231</div>
+                <div class="repo">vtmocanu/uzi</div>
+              </td>
+              <td>
+                <div class="when">Sat Aug 16, 09:00</div>
+                <div class="when human">One time · Europe/Bucharest</div>
+              </td>
+              <td><div class="stamp">Sat 09:00<div class="rel">in 4 days</div></div></td>
+              <td><span class="dash">— never fired</span></td>
+              <td><span class="chip">auto-approve</span></td>
+              <td class="right"><div class="actions"><span class="iconbtn">▶</span><span class="iconbtn">✎</span><span class="sw on"></span></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── healthy detail ─────────────────────────── -->
+  <section>
+    <h2>2 · Expanded — a fire that <span style="text-transform:none;font-family:var(--sans);color:rgb(var(--ok))">worked</span></h2>
+    <p class="sub">The same panel for a healthy fire lists the runs it started, each linking to the run.</p>
+    <div class="frame" data-w="last fire · started runs">
+      <div class="detail-inner good">
+        <div class="dhead">
+          <span class="title">Last fire</span>
+          <span class="meta">Tue Aug 12, 02:00 · Europe/Bucharest</span>
+          <span class="badge ok" style="margin-left:auto"><span class="dot"></span>3 started</span>
+        </div>
+        <div class="tally">
+          <div class="t"><span class="n mut">3</span><span class="k">matched</span></div>
+          <div class="t"><span class="n ok">3</span><span class="k">started</span></div>
+          <div class="t"><span class="n mut">0</span><span class="k">skipped</span></div>
+          <div class="t"><span class="n mut">3</span><span class="k">max&nbsp;issues</span></div>
+        </div>
+        <div class="rows">
+          <div class="row">
+            <span class="iss">#124</span>
+            <div class="body"><div class="t">web: judge free text renders without Unicode Cf stripping</div></div>
+            <span class="verdict"><span class="chip run">▶ run 3f1a…</span></span>
+          </div>
+          <div class="row">
+            <span class="iss">#139</span>
+            <div class="body"><div class="t">Poller sync timeouts against forge-fake in the e2e stack</div></div>
+            <span class="verdict"><span class="chip run">▶ run a20b…</span></span>
+          </div>
+          <div class="row">
+            <span class="iss">#142</span>
+            <div class="body"><div class="t">RunKind (TypeScript) omits 'chat', which the DB CHECK allows</div></div>
+            <span class="verdict"><span class="chip run">▶ run c7d5…</span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── reasons ─────────────────────────── -->
+  <section>
+    <h2>3 · Skip reasons</h2>
+    <p class="sub">
+      Every benign skip the scheduler already computes becomes a named, typed reason — no free text.
+      These are exactly the sentinels the run-creation gate returns today; the fire outcome just stops
+      swallowing them.
+    </p>
+    <div class="legend">
+      <span class="lg"><span class="badge warn" style="padding:1px 7px"><span class="dot"></span></span><span class="k">no PRD link</span> eligible but no <code style="font-family:var(--mono);font-size:11px">prds/*.md</code> link or PRDLESS</span>
+      <span class="lg"><span class="badge warn" style="padding:1px 7px"><span class="dot"></span></span><span class="k">not eligible</span> carries no run-eligible label</span>
+      <span class="lg"><span class="badge neutral" style="padding:1px 7px"><span class="dot"></span></span><span class="k">already running</span> a run for this issue is active</span>
+      <span class="lg"><span class="badge neutral" style="padding:1px 7px"><span class="dot"></span></span><span class="k">description too large</span> issue body over the run cap</span>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── CLI parity ─────────────────────────── -->
+  <section>
+    <h2>4 · CLI parity — <span style="text-transform:none;font-family:var(--mono);color:rgb(var(--muted))">uzi schedule get</span></h2>
+    <p class="sub">The same last-fire summary is added to the CLI so an agent driving uzi headless can read why a sweep did nothing, without pod access. <code>uzi schedule run-now</code> returns the same per-candidate breakdown for the fire it triggers.</p>
+    <div class="frame" data-w="terminal">
+<pre class="cli"><span class="p">$</span> <span class="k2">uzi schedule get</span> <span class="b">11129581</span> <span class="k2">--json</span> <span class="c"># jq of the new block</span>
+{
+  <span class="b">"id"</span>: <span class="ok">"11129581-a872-40ad-905b-993429168b39"</span>,
+  <span class="b">"target"</span>: <span class="ok">"sweep"</span>, <span class="b">"labels"</span>: [<span class="ok">"bug"</span>], <span class="b">"max_issues"</span>: 1,
+  <span class="b">"last_fire"</span>: {
+    <span class="b">"fired_at"</span>: <span class="ok">"2026-08-12T00:00:07Z"</span>,
+    <span class="b">"matched"</span>: 1, <span class="b">"started"</span>: 0, <span class="warn">"skipped"</span>: 1,
+    <span class="b">"run_ids"</span>: [],
+    <span class="b">"skips"</span>: [
+      { <span class="b">"issue_iid"</span>: 96, <span class="b">"reason"</span>: <span class="warn">"no_prd_link"</span> }
+    ]
+  }
+}
+
+<span class="p">$</span> <span class="k2">uzi schedule run-now</span> <span class="b">11129581</span>
+<span class="warn">Started 0 runs.</span> Matched 1 candidate, skipped 1:
+  <span class="p">#96</span>  no PRD link  <span class="c"># add PRDLESS / a prds link, or raise --max-issues</span></pre>
+    </div>
+  </section>
+
+  <p class="note">
+    Mock only — illustrative data. Palette and components mirror the shipped Schedules page
+    (<code style="font-family:var(--mono)">web/src/pages/Schedules.tsx</code>) and the PRD&nbsp;#241 mockup.
+    The <code style="font-family:var(--mono)">last_fire</code> shape here is a proposal for the PRD to pin down.
+  </p>
+</div>
