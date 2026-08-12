@@ -142,10 +142,13 @@ describe("IssueView — the forge title and description carry no format characte
       }),
     });
     const { container } = renderIssueView();
-    // Anchored on the iid chip, not on either cleaned string.
-    await waitFor(() => expect(screen.getByText("#7")).toBeTruthy());
+    // Wait for the LOADED, sanitized title before asserting. The "#7" breadcrumb
+    // renders from the URL param during the loading state, before getIssue resolves,
+    // so anchoring on it let the synchronous assertions below race the async fetch.
+    // The stripped title only appears once the issue has loaded and been sanitized,
+    // so findByText on it is the deterministic gate for both assertions.
+    expect(await screen.findByText("Fix the parser bug")).toBeTruthy();
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
-    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
     expect(container.textContent).toContain("The approved fix is in");
   });
 });
