@@ -9,9 +9,9 @@
 #
 # Unlike the api image (distroless), the worker CANNOT be distroless: M3's Claude
 # Agent SDK spawns a real Bash tool and the git flow needs git + coreutils. This
-# is a minimal Node 22 + git + bash base (digest shared with web/Dockerfile), run
+# is a minimal Node 24 + git + bash base (digest shared with web/Dockerfile), run
 # as a non-root user (PRD §Worker runtime).
-FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
@@ -250,7 +250,7 @@ COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 # broken browser/font/lib set is caught here, not shipped as a run-time crash. The
 # `agent-browser --version` step runs the CLI end-to-end through the shim and exercises the
 # real native musl binary (a file-check alone would miss an unrunnable wrapper — e.g.
-# engines.node>=24 vs node:22-alpine, or a failed native-binary postinstall). `timeout` turns
+# an engines.node floor the base image does not meet, or a failed native-binary postinstall). `timeout` turns
 # a hung launch into a build failure; --dump-dom actually starts Chromium (unlike a bare
 # --version). CAVEAT: this runs in the BUILDER (root, no cap_drop, builder /dev), so it
 # validates the binary + shared libs, NOT the runtime hardening posture — only M7 does that.
