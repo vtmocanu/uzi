@@ -6,19 +6,46 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-12
+
+### Added
+
+- **A schedule's model now applies to every subagent, not just the lead.** A new
+  opt-in ("Apply model also to agents") makes a scheduled run's resolved model
+  override every subagent's model, pinned or not, whether the run uses the owner's
+  own agent roster or the cloned repo's. Default off preserves the prior behavior,
+  where a subagent's own `model:` pin wins. This fixes the case where a `fable`
+  schedule that delegates to a subagent still ran that subagent on `opus`. (#305)
+
+### Security
+
+- **Guardrails now deny an inline `git -c key=value` / `--config-env=key=env` write
+  to a protected config namespace** (remote, core, http, url, credential, include,
+  includeIf, alias, filter), mirroring the existing `git config <ns>.<x>` write
+  deny. The inline form sets the same config without ever reaching `git config`, so
+  an `alias.<x>=!<shell>` body or a credential/remote repoint could otherwise slip
+  past the subcommand scan. (a4326e64)
+
 ### Fixed
 
+- **Runs no longer get stuck at `awaiting_input` after a plan-phase clarification
+  is answered.** The status now flips back to `running` when the answer is
+  consumed, so `uzi run wait` and the web run page no longer report a false state
+  (the page previously advised cancelling a healthy run), and Slack no longer
+  accepts a stale answer as a fresh one. (#307)
 - **The judge no longer flags a tool invoked via `go run <module>@<version>` as a
   missing worker tool.** A repo that runs a linter or checker through a pinned module
   ref (for example `go run .../golangci-lint@v2.12.2`) needs no bare executable on
   PATH, so the deterministic command-not-found pre-scan now recognises that shape and
   suppresses the false "install this tool" recommendation. Genuinely absent tools are
-  still reported.
+  still reported. (58f53100)
 - **Worker tool provisioning no longer trips a devbox "legacy format" warning.** The
   synthesized per-run `devbox.json` now pins every unversioned package to `@latest` (for
   example `go` becomes `go@latest`), which is what actually clears the warning (devbox
   keys it on unversioned packages), so `devbox install` runs cleanly. Already
-  version-pinned packages are left unchanged.
+  version-pinned packages are left unchanged. (58f53100)
+- **De-flaked the docker-wiring readiness-timeout test** with an injectable clock,
+  removing a load-dependent CI flake. (b70e5dc5)
 
 ## [0.29.0] - 2026-08-11
 
