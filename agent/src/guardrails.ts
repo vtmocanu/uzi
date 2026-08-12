@@ -17,7 +17,10 @@
 // bypassed: `git -C /repo push`, `git -c x=y push`, and `sh -c 'git push'` all
 // hide the real subcommand from a `/git\s+push/` regex. The analyzer splits on
 // shell operators, skips git global options to reach the REAL subcommand, and
-// recursively unwraps `sh -c` / `bash -c` / `eval` / `env VAR=v` wrappers.
+// recursively unwraps `sh -c` / `bash -c` / `eval` / `env VAR=v` wrappers. An
+// inline `-c key=value` / `--config-env=key=env` that sets a protected config
+// namespace is denied as it is skipped (mirroring `analyzeGitConfig`), so a
+// `git -c alias.x=!<shell> x` cannot smuggle a config write past the subcommand scan.
 //
 // The file tools (Read/Edit/Write/Glob/Grep) get their own PreToolUse matcher
 // (buildPathGuardHook): the Bash deny-list would otherwise be sidestepped by
@@ -215,6 +218,12 @@ const PATH_TOOLS = new Set<string>(["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS]
 const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"]);
 const GIT_CONFIG_VALUE_OPTS = new Set(["--file", "-f", "--type", "--blob"]);
+// Config namespaces whose WRITE can repoint origin, inject an auth header, pull in an
+// attacker config (include/includeIf), or run an arbitrary shell command
+// (alias.<x>=!…, filter.<x>.clean/smudge). Screened both for a `git config` write
+// (analyzeGitConfig) and for an inline `-c key=value`/`--config-env=key=env` set
+// (analyzeGit), which sets the SAME config without ever reaching `git config`.
+const DANGEROUS_CONFIG_NS = /^(remote|core|http|url|credential|include|includeif|alias|filter)\./i;
 
 const deny = (reason: string): BashScreenResult => ({ denied: true, reason });
 const ALLOW: BashScreenResult = { denied: false };
@@ -352,14 +361,36 @@ function analyzeGitConfig(rest: string[]): BashScreenResult {
   // `filter.<x>.clean/smudge` bodies run as a shell command on checkout/add via a
   // matching .gitattributes — a second code-exec route, so deny writes to it too
   // (M10 audit, defense in depth alongside the worker's core.hooksPath neutralization).
-  if (key && /^(remote|core|http|url|credential|include|includeif|alias|filter)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
+  if (key && DANGEROUS_CONFIG_NS.test(key)) return deny(REASON_CONFIG_WRITE);
   return ALLOW;
+}
+
+/** The config KEY set by an inline `-c key=value` / `--config-env=key=envvar`. */
+function inlineConfigKey(raw: string): string {
+  const eq = raw.indexOf("=");
+  return eq >= 0 ? raw.slice(0, eq) : raw;
 }
 
 function analyzeGit(args: string[]): BashScreenResult {
   let j = 0;
   while (j < args.length) {
     const a = args[j]!;
+    // Screen the config-setting globals (`-c key=value`, `--config-env=key=env`) the SAME
+    // way analyzeGitConfig screens a `git config` write — the inline form sets the config
+    // without ever reaching `git config`, so an `alias.<x>=!<shell>` / credential repoint
+    // would otherwise slip through. Only these two set config; -C/--git-dir/etc. set paths
+    // and stay on the generic skip below.
+    if (a === "-c" || a === "--config-env") {
+      const v = args[j + 1];
+      if (v !== undefined && DANGEROUS_CONFIG_NS.test(inlineConfigKey(v))) return deny(REASON_CONFIG_WRITE);
+      j += 2;
+      continue;
+    }
+    if (a.startsWith("--config-env=")) {
+      if (DANGEROUS_CONFIG_NS.test(inlineConfigKey(a.slice("--config-env=".length)))) return deny(REASON_CONFIG_WRITE);
+      j++;
+      continue;
+    }
     if (GIT_VALUE_OPTS.has(a)) { j += 2; continue; }
     if (/^--(git-dir|work-tree|exec-path|namespace|super-prefix|config-env)=/.test(a)) { j++; continue; }
     if (a.startsWith("-")) { j++; continue; } // -p, --no-pager, --bare, --exec-path, … (flags)
