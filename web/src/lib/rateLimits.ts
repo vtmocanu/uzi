@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from "react";
 import { toneFor } from "../components/Meter";
-import type { AdminRateLimitUser, AutoStatus, MyRateLimits, TokenRateLimits } from "./api";
+import type { AdminRateLimitUser, AutoStatus, MyRateLimits, RateLimitSource, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
 
 // formatCountdown renders "resets in <this>" (Decision 7): "2d 4h", "1h 23m",
@@ -311,6 +311,88 @@ export function autoStatusChip(status: AutoStatus | string): AutoStatusChip {
       hint: `This uzi build does not recognise the eligibility state “${status}”. It is reported as-is rather than guessed at.`,
     }
   );
+}
+
+// ── Burn-rate forecast (PRD #309) ────────────────────────────────────────────
+//
+// A window-model-AGNOSTIC trajectory hint: is a window on track to exhaust BEFORE
+// it resets, at the CURRENT observed rate? The rate is measured from a short
+// in-session sample of the window's own pct readings (see the accumulation hook,
+// PRD M2), NOT from `elapsed = now − (resets_at − duration)` — that anchored term
+// is only valid if the window resets at a fixed boundary, which is undocumented and
+// the evidence leans sliding (see the PRD Resolution + specs/ai.md §523). Deriving
+// the rate from observed Δpct is correct whether the window is anchored or sliding.
+//
+// DISPLAY-ONLY (PRD D2): this drives no backend decision and must NEVER become an
+// input to auto-selection or any gate — it is imported only by rendering code.
+
+// BurnSample is one poll's reading of ONE window: a wall-clock stamp (ms) and the
+// integer pct it carried. The accumulation hook keeps a bounded, non-decreasing run
+// of these per (secret_id, window); the forecast reads their slope.
+export interface BurnSample {
+  tMs: number;
+  pct: number;
+}
+
+export type BurnState = "over" | "on_pace" | "safe";
+
+export interface BurnForecast {
+  // over: projected past the cap before reset; on_pace: lands ~at the cap; safe:
+  // headroom to spare OR not enough signal to say (silence = safe, PRD D3).
+  state: BurnState;
+  // The projected utilization AT reset, rounded and capped to a sane display range.
+  // Meaningful only when state !== "safe"; 0 on the safe/silent path.
+  projectedPct: number;
+}
+
+// Below this sample span a single early burst dominates the slope, so the forecast
+// stays silent. This is also the cold-start floor (a freshly loaded page has no span
+// yet) and the reason the slow-moving 7-day window is usually silent — its pct
+// rarely clears the integer noise floor within a few minutes. PRD D5's intent, in
+// model-agnostic form.
+const MIN_SAMPLE_SPAN_MS = 3 * 60_000;
+
+// Cap the projected % to a sane display range: an early burst over a short span can
+// extrapolate to absurd magnitudes ("projected 1600%"), which the bands already read
+// as "over" — the number past the cap is a rough hint, not a precise promise (D6, no
+// smoothing). The ghost width is clamped to 100 separately by the wrapper.
+const MAX_PROJECTED_PCT = 999;
+
+// burnForecast projects a single window's landing utilization from its observed
+// trailing samples. PURE and wall-clock-free — nowMs is injected. Returns a silent
+// "safe" whenever the projection would be meaningless or misleading:
+//   - fewer than 2 samples, or a span below MIN_SAMPLE_SPAN_MS (cold start / noise);
+//   - a flat or DECAYING slope (rate ≤ 0) — not approaching the cap (a sliding
+//     window idles DOWNWARD, which reads as safe, correctly);
+//   - pct already ≥ 100, or a `limit_report` source — a park-time inference that is
+//     AT the cap, not "on track to be" (PRD D8);
+//   - resets_at null, or already passed (clock skew) — no horizon to project onto.
+// Otherwise projectedPct = pct + rate × secondsToReset, banded strictly (PRD D7):
+// > 115 → over, > 85 → on_pace, else safe.
+export function burnForecast(
+  samples: BurnSample[],
+  resetsAtSec: number | null,
+  nowMs: number,
+  source?: RateLimitSource,
+): BurnForecast {
+  const SAFE: BurnForecast = { state: "safe", projectedPct: 0 };
+  if (samples.length < 2) return SAFE;
+  const latest = samples[samples.length - 1];
+  if (latest.pct >= 100) return SAFE; // D8: already at the cap, not heading there
+  if (source === "limit_report") return SAFE; // D8: park-time inference
+  if (resetsAtSec == null) return SAFE;
+  const secondsToReset = resetsAtSec - nowMs / 1000;
+  if (secondsToReset <= 0) return SAFE; // reset passed / clock skew
+  const oldest = samples[0];
+  const spanMs = latest.tMs - oldest.tMs;
+  if (spanMs < MIN_SAMPLE_SPAN_MS) return SAFE; // cold start / insufficient span
+  const ratePerSec = (latest.pct - oldest.pct) / (spanMs / 1000);
+  if (ratePerSec <= 0) return SAFE; // flat or decaying → not approaching the cap
+  const projectedPct = Math.round(
+    Math.max(0, Math.min(MAX_PROJECTED_PCT, latest.pct + ratePerSec * secondsToReset)),
+  );
+  if (projectedPct <= 85) return SAFE; // headroom to spare (strict lower band, D7)
+  return { state: projectedPct > 115 ? "over" : "on_pace", projectedPct };
 }
 
 // useNow ticks a Date.now() clock so a rendered countdown re-derives between the

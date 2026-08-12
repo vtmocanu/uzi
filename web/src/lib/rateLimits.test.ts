@@ -3,12 +3,14 @@ import { describe, it, expect } from "vitest";
 import {
   autoChipFor,
   autoStatusChip,
+  burnForecast,
   formatAgo,
   formatCountdown,
   rowState,
   sortAdminRows,
   statusBadge,
   worstWindow,
+  type BurnSample,
   type RowState,
 } from "./rateLimits";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits } from "./api";
@@ -271,5 +273,54 @@ describe("autoStatusChip", () => {
     expect(code).not.toMatch(/100\s*-/);
     expect(code).not.toMatch(/synced_at/);
     expect(code).not.toMatch(/auto_eligible/);
+  });
+});
+
+describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
+  // Two samples spanning `spanMs` and ending at NOW. With RESET_5MIN the horizon
+  // (secondsToReset) equals a 5-min span, so projected = pct1 + (pct1 − pct0) =
+  // 2·pct1 − pct0 — which is how the boundary fixtures below land on exact integers.
+  function samples(pct0: number, pct1: number, spanMs = 5 * 60_000): BurnSample[] {
+    return [
+      { tMs: NOW - spanMs, pct: pct0 },
+      { tMs: NOW, pct: pct1 },
+    ];
+  }
+  const RESET_5MIN = NOW_SECS + 300; // secondsToReset == 300s == the default span
+
+  it("bands strictly at the 85/86/115/116 boundaries (D7)", () => {
+    expect(burnForecast(samples(15, 50), RESET_5MIN, NOW).state).toBe("safe"); // projected 85 → safe
+    expect(burnForecast(samples(14, 50), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 86 });
+    expect(burnForecast(samples(5, 60), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 115 });
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW)).toEqual({ state: "over", projectedPct: 116 });
+  });
+
+  it("is silent on too-few samples or too-short a span (cold start, slow 7d window)", () => {
+    expect(burnForecast([], RESET_5MIN, NOW).state).toBe("safe");
+    expect(burnForecast(samples(4, 60).slice(0, 1), RESET_5MIN, NOW).state).toBe("safe");
+    // A steep rise measured over only 2 min is below MIN_SAMPLE_SPAN_MS → silent.
+    expect(burnForecast(samples(4, 60, 2 * 60_000), RESET_5MIN, NOW).state).toBe("safe");
+  });
+
+  it("is silent on a flat or decaying slope (a sliding window idles downward → safe)", () => {
+    expect(burnForecast(samples(50, 50), RESET_5MIN, NOW).state).toBe("safe"); // flat
+    expect(burnForecast(samples(60, 40), RESET_5MIN, NOW).state).toBe("safe"); // decaying
+  });
+
+  it("suppresses a pct≥100 window and a limit_report inference, but not a live rise (D8)", () => {
+    expect(burnForecast(samples(90, 100), RESET_5MIN, NOW).state).toBe("safe"); // already at the cap
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "limit_report").state).toBe("safe");
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "usage_endpoint").state).toBe("over");
+  });
+
+  it("is silent past the reset horizon or with no reset (clock skew / null)", () => {
+    expect(burnForecast(samples(4, 60), NOW_SECS - 10, NOW).state).toBe("safe"); // reset already passed
+    expect(burnForecast(samples(4, 60), null, NOW).state).toBe("safe");
+  });
+
+  it("discriminates on the SLOPE, not the latest pct (fails a stub that ignores elapsed)", () => {
+    // Latest pct is 60 in both; only the earlier sample — hence the slope — differs.
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW).state).toBe("over"); // steep rise
+    expect(burnForecast(samples(58, 60), RESET_5MIN, NOW).state).toBe("safe"); // gentle rise
   });
 });
