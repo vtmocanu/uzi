@@ -780,8 +780,8 @@ export const mockConnection: ForgeConnection = {
     status: "ok",
     token: { scopes: ["api"], active: true, violations: [], warnings: [] },
     repos: [
-      { repo_id: "repo-uzi", path: "vtmocanu/uzi", role: "write", member: true, violations: [], warnings: [] },
-      { repo_id: "repo-atlas", path: "vtmocanu/atlas-api", role: "write", member: true, violations: [], warnings: [] },
+      { repo_id: "repo-uzi", path: "vtmocanu/uzi", role: "write", member: true, findings: [] },
+      { repo_id: "repo-atlas", path: "vtmocanu/atlas-api", role: "write", member: true, findings: [] },
     ],
   },
 };

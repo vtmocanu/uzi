@@ -107,6 +107,72 @@ func hasFinding(list []string, substr string) bool {
 	return false
 }
 
+// hasCode reports whether the coded findings contain a finding with the given
+// Code (PRD #66 D5).
+func hasCode(list []Finding, code Code) bool {
+	for _, f := range list {
+		if f.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// findingByCode returns the first finding with the given Code, or (zero, false).
+func findingByCode(list []Finding, code Code) (Finding, bool) {
+	for _, f := range list {
+		if f.Code == code {
+			return f, true
+		}
+	}
+	return Finding{}, false
+}
+
+// allDeclaredCodes lists every Code constant declared in report.go. The coverage
+// test (TestFindingSeverityCoversEveryCode) asserts this list and findingSeverity
+// are in exact agreement, so a Code added without a severity — or a map entry
+// without a declared Code — fails the build's tests (D5).
+var allDeclaredCodes = []Code{
+	CodeDefaultBranchUnprotected,
+	CodeWriteRoleCanPush,
+	CodeBotCanPush,
+	CodeWriteRoleCanMerge,
+	CodeBotCanMerge,
+	CodeUnprotectedFilePatterns,
+	CodeProtectionUnreadable,
+	CodeBotNotMember,
+	CodeBotRoleBelowWrite,
+	CodeBotRoleAboveWrite,
+	CodeGroupPushGrantUndetected,
+	CodeRoleUnreadable,
+	CodeNoDefaultBranch,
+}
+
+// TestFindingSeverityCoversEveryCode pins D5: findingSeverity is the single source
+// of severity, so every declared Code must map to a valid (block|warn) severity,
+// and the map must carry no code beyond the declared set.
+func TestFindingSeverityCoversEveryCode(t *testing.T) {
+	for _, c := range allDeclaredCodes {
+		sev, ok := findingSeverity[c]
+		if !ok {
+			t.Errorf("code %q missing from findingSeverity (D5: severity is never hand-set)", c)
+			continue
+		}
+		if sev != SeverityBlock && sev != SeverityWarn {
+			t.Errorf("code %q has invalid severity %q", c, sev)
+		}
+	}
+	if len(findingSeverity) != len(allDeclaredCodes) {
+		t.Errorf("findingSeverity has %d entries, allDeclaredCodes has %d — a map entry has no declared Code (or vice versa)",
+			len(findingSeverity), len(allDeclaredCodes))
+	}
+	// newFinding must stamp the severity from the map, never leave it empty.
+	f := newFinding(CodeDefaultBranchUnprotected, "x")
+	if f.Severity != SeverityBlock {
+		t.Errorf("newFinding severity = %q, want block", f.Severity)
+	}
+}
+
 // TestBlocksRun pins the canonical blocking predicate (PRD #66 D3/D6). The
 // load-bearing rows are the first (unprotected → blocked, the R3 inversion guard)
 // and the last (a protected branch with all four push/merge fields false is NOT
@@ -241,17 +307,22 @@ func TestCheckFullReport(t *testing.T) {
 	for _, r := range rep.Repos {
 		byID[r.RepoID] = r
 	}
-	if len(byID["r1"].Violations) != 0 {
-		t.Errorf("r1 should be clean, got %v", byID["r1"].Violations)
+	if len(byID["r1"].Findings) != 0 {
+		t.Errorf("r1 should be clean, got %v", byID["r1"].Findings)
 	}
-	if !hasFinding(byID["r2"].Violations, "role is admin, above") {
-		t.Errorf("r2 want above-write violation, got %v", byID["r2"].Violations)
+	// r2: bot above write — a WARN under D6 (was a violation), so it no longer
+	// drives the connection to violations on its own.
+	if !hasCode(byID["r2"].Findings, CodeBotRoleAboveWrite) {
+		t.Errorf("r2 want bot_role_above_write finding, got %v", byID["r2"].Findings)
 	}
-	if !hasFinding(byID["r3"].Violations, "no longer a member") {
-		t.Errorf("r3 want not-a-member violation, got %v", byID["r3"].Violations)
+	// r3: not a member — a WARN under D6 (was a violation).
+	if !hasCode(byID["r3"].Findings, CodeBotNotMember) {
+		t.Errorf("r3 want bot_not_member finding, got %v", byID["r3"].Findings)
 	}
-	if !hasFinding(byID["r4"].Violations, "not protected") {
-		t.Errorf("r4 want unprotected-branch violation, got %v", byID["r4"].Violations)
+	// r4: unprotected default branch — the BLOCK finding that drives status to
+	// violations (the connection-level assertion above).
+	if f, ok := findingByCode(byID["r4"].Findings, CodeDefaultBranchUnprotected); !ok || f.Severity != SeverityBlock {
+		t.Errorf("r4 want default_branch_unprotected BLOCK finding, got %v", byID["r4"].Findings)
 	}
 }
 
@@ -263,8 +334,8 @@ func TestCheckWriteRoleCanPushIsViolation(t *testing.T) {
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: true}}},
 	}
 	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
-	if !hasFinding(rep.Repos[0].Violations, "the write role may push") {
-		t.Fatalf("want write-role-can-push violation, got %v", rep.Repos[0].Violations)
+	if f, ok := findingByCode(rep.Repos[0].Findings, CodeWriteRoleCanPush); !ok || f.Severity != SeverityBlock {
+		t.Fatalf("want write_role_can_push BLOCK finding, got %v", rep.Repos[0].Findings)
 	}
 }
 
@@ -279,8 +350,8 @@ func TestCheckBotDirectPushGrantIsViolation(t *testing.T) {
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false, BotCanPush: true}}},
 	}
 	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
-	if !hasFinding(rep.Repos[0].Violations, "direct push grant") {
-		t.Fatalf("want bot direct-push-grant violation, got %v", rep.Repos[0].Violations)
+	if f, ok := findingByCode(rep.Repos[0].Findings, CodeBotCanPush); !ok || f.Severity != SeverityBlock {
+		t.Fatalf("want bot_can_push BLOCK finding, got %v", rep.Repos[0].Findings)
 	}
 }
 
@@ -291,11 +362,11 @@ func TestCheckEmptyDefaultBranchWarns(t *testing.T) {
 		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 	}
 	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: ""}}, now)
-	if len(rep.Repos[0].Violations) != 0 {
-		t.Fatalf("empty-default-branch repo should not violate, got %v", rep.Repos[0].Violations)
+	if rep.Repos[0].Blocks() {
+		t.Fatalf("empty-default-branch repo should not block, got %v", rep.Repos[0].Findings)
 	}
-	if !hasFinding(rep.Repos[0].Warnings, "no default branch") {
-		t.Fatalf("want no-default-branch warning, got %v", rep.Repos[0].Warnings)
+	if f, ok := findingByCode(rep.Repos[0].Findings, CodeNoDefaultBranch); !ok || f.Severity != SeverityWarn {
+		t.Fatalf("want no_default_branch WARN finding, got %v", rep.Repos[0].Findings)
 	}
 	if rep.Status != StatusWarnings {
 		t.Fatalf("status = %q, want warnings", rep.Status)
@@ -303,7 +374,10 @@ func TestCheckEmptyDefaultBranchWarns(t *testing.T) {
 }
 
 // TestCheckDrift: the same connection flips ok→violations when the fake forge
-// changes the bot's role between checks — the drift scenario the sweep exists for.
+// changes the branch protection between checks — the drift scenario the sweep
+// exists for. Drift is on branch protection (a BLOCK finding under D6) rather than
+// role: #66 D6 downgrades bot_role_above_write to a warn, so a role promotion no
+// longer drives the connection to violations on its own.
 func TestCheckDrift(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
@@ -317,8 +391,8 @@ func TestCheckDrift(t *testing.T) {
 	if rep := c.Check(context.Background(), f, forge.TypeGitLab, repos, now); rep.Status != StatusOK {
 		t.Fatalf("initial status = %q, want ok", rep.Status)
 	}
-	// A teammate promotes the bot to Maintainer.
-	f.roles[1] = roleResult{role: forge.RoleAdmin, member: true}
+	// A teammate removes branch protection on the default branch (a BLOCK finding).
+	f.prots[1] = protResult{bp: forge.BranchProtection{Protected: false}}
 	if rep := c.Check(context.Background(), f, forge.TypeGitLab, repos, now); rep.Status != StatusViolations {
 		t.Fatalf("post-drift status = %q, want violations", rep.Status)
 	}
@@ -466,37 +540,38 @@ func TestIntrospectionUnsupportedMessagePerForge(t *testing.T) {
 	}
 }
 
-// TestEvaluateRepoProtectionUnverified pins PRD #238 D6/H1: a github-shaped
-// protected-but-unverified branch (WriteRoleCanPush/Merge=false, the driver never
-// fabricating a true) yields a WARNING that the rights are undetermined, not a
-// push/merge Violation. When ProtectionUnverified is false, behaviour is the
-// existing one — the push Violation still fires.
+// TestEvaluateRepoProtectionUnverified pins PRD #238 D6/H1 as reshaped by #66
+// D3/D6: a github-shaped protected-but-unverified branch (WriteRoleCanPush/Merge
+// =false, the driver never fabricating a true) folds into the protection_unreadable
+// BLOCK code — "could not tell" is fail-closed the same as a read error — not a
+// push/merge finding. When ProtectionUnverified is false, behaviour is the
+// existing one: the push BLOCK finding fires and no protection_unreadable is added.
 func TestEvaluateRepoProtectionUnverified(t *testing.T) {
 	repo := Repo{ID: "r1", Path: "g/one", ForgeProjectID: 1, DefaultBranch: "main"}
 
 	// Undetermined: protected, but the driver could not read push/merge rights.
 	var unver RepoReport
-	unver.Violations, unver.Warnings = []string{}, []string{}
+	unver.Findings = []Finding{}
 	evaluateRepo(&unver, repo, forge.RoleWrite, true, nil, true,
 		forge.BranchProtection{Protected: true, ProtectionUnverified: true, WriteRoleCanPush: false, WriteRoleCanMerge: false}, nil)
-	if len(unver.Violations) != 0 {
-		t.Fatalf("unverified protection must not produce a violation, got %v", unver.Violations)
+	if f, ok := findingByCode(unver.Findings, CodeProtectionUnreadable); !ok || f.Severity != SeverityBlock {
+		t.Fatalf("want protection_unreadable BLOCK finding, got %v", unver.Findings)
 	}
-	if !hasFinding(unver.Warnings, "could not fully verify push/merge rights on protected") {
-		t.Fatalf("want the undetermined-rights warning, got %v", unver.Warnings)
+	if hasCode(unver.Findings, CodeWriteRoleCanPush) || hasCode(unver.Findings, CodeWriteRoleCanMerge) {
+		t.Fatalf("unverified protection must not emit push/merge findings, got %v", unver.Findings)
 	}
 
 	// Verified (ProtectionUnverified=false) with a real push right: unchanged, the
-	// push Violation still fires and no warning is added.
+	// push BLOCK finding fires and no protection_unreadable is added.
 	var ver RepoReport
-	ver.Violations, ver.Warnings = []string{}, []string{}
+	ver.Findings = []Finding{}
 	evaluateRepo(&ver, repo, forge.RoleWrite, true, nil, true,
 		forge.BranchProtection{Protected: true, ProtectionUnverified: false, WriteRoleCanPush: true}, nil)
-	if !hasFinding(ver.Violations, "the write role may push") {
-		t.Fatalf("verified protection with push right must still violate, got %v", ver.Violations)
+	if !hasCode(ver.Findings, CodeWriteRoleCanPush) {
+		t.Fatalf("verified protection with push right must still emit write_role_can_push, got %v", ver.Findings)
 	}
-	if len(ver.Warnings) != 0 {
-		t.Fatalf("verified protection must not add the undetermined warning, got %v", ver.Warnings)
+	if hasCode(ver.Findings, CodeProtectionUnreadable) {
+		t.Fatalf("verified protection must not add protection_unreadable, got %v", ver.Findings)
 	}
 }
 
@@ -523,17 +598,14 @@ func TestMergeFindingsAreViolations(t *testing.T) {
 	}
 	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
 	rr := rep.Repos[0]
-	if len(rr.Warnings) != 0 {
-		t.Fatalf("merge findings must be violations, not warnings, got warnings %v", rr.Warnings)
+	if wf, ok := findingByCode(rr.Findings, CodeWriteRoleCanMerge); !ok || wf.Severity != SeverityBlock {
+		t.Fatalf("want a write_role_can_merge BLOCK finding, got %v", rr.Findings)
 	}
-	if !hasFinding(rr.Violations, "the write role may merge into protected") {
-		t.Fatalf("want a write-role merge violation, got %v", rr.Violations)
-	}
-	if !hasFinding(rr.Violations, "the bot has a direct merge grant on protected") {
-		t.Fatalf("want a bot merge-grant violation, got %v", rr.Violations)
+	if bf, ok := findingByCode(rr.Findings, CodeBotCanMerge); !ok || bf.Severity != SeverityBlock {
+		t.Fatalf("want a bot_can_merge BLOCK finding, got %v", rr.Findings)
 	}
 	// A merge finding drives the connection status to violations (the badge), but
-	// this blocks nothing: no save is rejected and no run is refused on it in #65.
+	// this blocks nothing in M1: no save is rejected and no run is refused on it.
 	if rep.Status != StatusViolations {
 		t.Fatalf("a merge finding must drive status to violations, got %q", rep.Status)
 	}
@@ -554,26 +626,83 @@ func TestEvaluateRepoProtectedFirst(t *testing.T) {
 	// finding would show up as an EXTRA violation — the exact-count assertion
 	// below is what catches it, on whichever array it would land.
 	var unprot RepoReport
-	unprot.Violations, unprot.Warnings = []string{}, []string{}
+	unprot.Findings = []Finding{}
 	evaluateRepo(&unprot, repo, forge.RoleWrite, true, nil, true,
 		forge.BranchProtection{Protected: false, WriteRoleCanPush: true, BotCanPush: true, WriteRoleCanMerge: true, BotCanMerge: true}, nil)
-	if !hasFinding(unprot.Violations, "is not protected") {
-		t.Fatalf("unprotected must yield the not-protected violation, got %v", unprot.Violations)
+	if f, ok := findingByCode(unprot.Findings, CodeDefaultBranchUnprotected); !ok || f.Severity != SeverityBlock {
+		t.Fatalf("unprotected must yield the default_branch_unprotected BLOCK finding, got %v", unprot.Findings)
 	}
-	if len(unprot.Violations) != 1 {
-		t.Fatalf("unprotected must short-circuit to the single strongest finding, got %v", unprot.Violations)
+	if len(unprot.Findings) != 1 {
+		t.Fatalf("unprotected must short-circuit to the single strongest finding, got %v", unprot.Findings)
 	}
-	if len(unprot.Warnings) != 0 {
-		t.Fatalf("unprotected must not emit any secondary finding, got %v", unprot.Warnings)
+	// The push/merge codes must NOT leak on the unprotected path (the inversion trap).
+	for _, c := range []Code{CodeWriteRoleCanPush, CodeBotCanPush, CodeWriteRoleCanMerge, CodeBotCanMerge} {
+		if hasCode(unprot.Findings, c) {
+			t.Fatalf("unprotected must not emit %q, got %v", c, unprot.Findings)
+		}
 	}
 
 	// A fully clean protected branch produces nothing — the negative control that
 	// proves the short-circuit is not just swallowing everything.
 	var clean RepoReport
-	clean.Violations, clean.Warnings = []string{}, []string{}
+	clean.Findings = []Finding{}
 	evaluateRepo(&clean, repo, forge.RoleWrite, true, nil, true,
 		forge.BranchProtection{Protected: true}, nil)
-	if len(clean.Violations) != 0 || len(clean.Warnings) != 0 {
-		t.Fatalf("a clean protected branch must be finding-free, got v=%v w=%v", clean.Violations, clean.Warnings)
+	if len(clean.Findings) != 0 {
+		t.Fatalf("a clean protected branch must be finding-free, got %v", clean.Findings)
+	}
+}
+
+// TestEvaluateRepoProtectionReadErrorBlocks pins D3/D6: a branch-protection read
+// error escalates to the protection_unreadable BLOCK code (was a warning before
+// #66). Fail-closed: a hostile forge must not pass the guardrail by erroring.
+func TestEvaluateRepoProtectionReadErrorBlocks(t *testing.T) {
+	repo := Repo{ID: "r1", Path: "g/one", ForgeProjectID: 1, DefaultBranch: "main"}
+	var rr RepoReport
+	rr.Findings = []Finding{}
+	evaluateRepo(&rr, repo, forge.RoleWrite, true, nil, true,
+		forge.BranchProtection{}, errors.New("503 service unavailable"))
+	if f, ok := findingByCode(rr.Findings, CodeProtectionUnreadable); !ok || f.Severity != SeverityBlock {
+		t.Fatalf("a protection read error must yield protection_unreadable BLOCK, got %v", rr.Findings)
+	}
+	if !rr.Blocks() {
+		t.Fatalf("a protection read error must make the repo block, got %v", rr.Findings)
+	}
+	// The raw driver error must not leak into the finding message.
+	if f, _ := findingByCode(rr.Findings, CodeProtectionUnreadable); strings.Contains(f.Message, "503") {
+		t.Fatalf("protection_unreadable message leaked the raw error: %q", f.Message)
+	}
+}
+
+// TestEvaluateRepoPushMergeFlagsBlock pins D6: on a protected branch, each of the
+// four push/merge flags yields its own BLOCK code with the correct severity.
+func TestEvaluateRepoPushMergeFlagsBlock(t *testing.T) {
+	repo := Repo{ID: "r1", Path: "g/one", ForgeProjectID: 1, DefaultBranch: "main"}
+	cases := []struct {
+		name string
+		bp   forge.BranchProtection
+		code Code
+	}{
+		{"write role can push", forge.BranchProtection{Protected: true, WriteRoleCanPush: true}, CodeWriteRoleCanPush},
+		{"bot can push", forge.BranchProtection{Protected: true, BotCanPush: true}, CodeBotCanPush},
+		{"write role can merge", forge.BranchProtection{Protected: true, WriteRoleCanMerge: true}, CodeWriteRoleCanMerge},
+		{"bot can merge", forge.BranchProtection{Protected: true, BotCanMerge: true}, CodeBotCanMerge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rr RepoReport
+			rr.Findings = []Finding{}
+			evaluateRepo(&rr, repo, forge.RoleWrite, true, nil, true, tc.bp, nil)
+			f, ok := findingByCode(rr.Findings, tc.code)
+			if !ok {
+				t.Fatalf("want %q finding, got %v", tc.code, rr.Findings)
+			}
+			if f.Severity != SeverityBlock {
+				t.Fatalf("%q severity = %q, want block", tc.code, f.Severity)
+			}
+			if !rr.Blocks() {
+				t.Fatalf("%q must make the repo block", tc.code)
+			}
+		})
 	}
 }

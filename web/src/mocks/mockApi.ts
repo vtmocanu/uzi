@@ -2109,8 +2109,7 @@ export const mockApi = {
           path: r.path_with_namespace,
           role: "write",
           member: true,
-          violations: [],
-          warnings: [],
+          findings: [],
         })),
     };
     c.privilege_status = "ok";

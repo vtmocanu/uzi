@@ -33,7 +33,15 @@ describe("privilegeBadge", () => {
       status: "violations",
       token: { scopes: ["api", "sudo"], active: true, violations: ["token scopes exceed"], warnings: [] },
       repos: [
-        { repo_id: "r1", path: "g/one", role: "admin", member: true, violations: ["bot role is Maintainer"], warnings: [] },
+        {
+          repo_id: "r1",
+          path: "g/one",
+          role: "write",
+          member: true,
+          findings: [
+            { code: "default_branch_unprotected", severity: "block", message: 'default branch "main" is not protected' },
+          ],
+        },
       ],
     });
     expect(privilegeBadge("violations", r)).toEqual({ tone: "danger", label: "2 violations" });
@@ -50,10 +58,20 @@ describe("countFindings", () => {
 });
 
 describe("repoFindings", () => {
+  const blockFinding = {
+    code: "default_branch_unprotected",
+    severity: "block" as const,
+    message: 'default branch "main" is not protected',
+  };
+  const warnFinding = {
+    code: "bot_role_above_write",
+    severity: "warn" as const,
+    message: "bot role is admin, above the expected write role",
+  };
   const r = report({
     repos: [
-      { repo_id: "clean", path: "g/clean", role: "write", member: true, violations: [], warnings: [] },
-      { repo_id: "bad", path: "g/bad", role: "admin", member: true, violations: ["bot role is Maintainer (40)"], warnings: [] },
+      { repo_id: "clean", path: "g/clean", role: "write", member: true, findings: [] },
+      { repo_id: "bad", path: "g/bad", role: "admin", member: true, findings: [blockFinding, warnFinding] },
     ],
   });
   it("returns null for a repo with no entry", () => {
@@ -62,7 +80,7 @@ describe("repoFindings", () => {
   it("returns null for a clean repo", () => {
     expect(repoFindings(r, "clean")).toBeNull();
   });
-  it("returns the findings for a repo with violations", () => {
-    expect(repoFindings(r, "bad")).toEqual({ violations: ["bot role is Maintainer (40)"], warnings: [] });
+  it("splits a repo's coded findings by severity (block→violations, warn→warnings)", () => {
+    expect(repoFindings(r, "bad")).toEqual({ violations: [blockFinding], warnings: [warnFinding] });
   });
 });

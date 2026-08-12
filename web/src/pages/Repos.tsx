@@ -343,7 +343,7 @@ export function Repos() {
                                 <Badge
                                   tone={hasViolations ? "danger" : "warning"}
                                   dot
-                                  title={[...f.violations, ...f.warnings].join("\n")}
+                                  title={[...f.violations, ...f.warnings].map((x) => x.message).join("\n")}
                                 >
                                   {n} privilege {hasViolations ? "issue" : "warning"}
                                   {n === 1 ? "" : "s"}

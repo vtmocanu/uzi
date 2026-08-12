@@ -253,6 +253,21 @@ export interface PrivilegeTokenReport {
   warnings: string[];
 }
 
+// A per-repo finding's severity (PRD #66 D5/D6). "block" findings mean the bot can
+// reach the default branch (or uzi could not tell — fail closed); "warn" are
+// advisory. Mirrors privcheck.Severity's json values exactly.
+export type PrivilegeSeverity = "block" | "warn";
+
+// One coded per-repo finding (PRD #66 D5). code is the stable enum
+// (default_branch_unprotected, write_role_can_push, …); severity comes from the
+// server's single findingSeverity table; message is human copy. Mirrors
+// privcheck.Finding's json tags (code, severity, message) exactly.
+export interface PrivilegeFinding {
+  code: string;
+  severity: PrivilegeSeverity;
+  message: string;
+}
+
 export interface PrivilegeRepoReport {
   repo_id: string;
   path: string;
@@ -264,8 +279,10 @@ export interface PrivilegeRepoReport {
   // violation copy itself, so the web never compares this numerically.
   role: string;
   member: boolean;
-  violations: string[];
-  warnings: string[];
+  // Coded per-repo findings (PRD #66 D5), replacing the old free-text
+  // violations/warnings string slices. Always present (server serializes [] not
+  // null); split by severity at the call site.
+  findings: PrivilegeFinding[];
 }
 
 export interface PrivilegeReport {

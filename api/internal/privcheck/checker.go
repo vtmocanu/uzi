@@ -134,7 +134,7 @@ func (c *Checker) checkRepos(ctx context.Context, f forge.Forge, botUserID int64
 // failing mid-repo is a warning on that repo, never a crash — the sweep must
 // keep going across a flaky project.
 func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64, repo Repo) RepoReport {
-	rr := RepoReport{RepoID: repo.ID, Path: repo.Path, Violations: []string{}, Warnings: []string{}}
+	rr := RepoReport{RepoID: repo.ID, Path: repo.Path, Findings: []Finding{}}
 
 	role, member, roleErr := f.ProjectRole(ctx, repo.ForgeProjectID, botUserID)
 
@@ -170,73 +170,67 @@ func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64,
 // per CLAUDE.md's "don't weaken a layer because another covers it".
 func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleErr error, haveBranch bool, bp forge.BranchProtection, bpErr error) {
 	if roleErr != nil {
-		rr.Warnings = append(rr.Warnings, "could not read the bot's role on this repo")
+		rr.Findings = append(rr.Findings, newFinding(CodeRoleUnreadable, "could not read the bot's role on this repo"))
 	} else {
 		rr.Role = role
 		rr.Member = member
 		switch {
 		case !member:
-			rr.Violations = append(rr.Violations, "bot is no longer a member of this repo; sync is broken")
+			// D6 downgrades bot-not-member from a violation to a warn: the bot being
+			// too weak is not the "too strong" case #66 refuses on.
+			rr.Findings = append(rr.Findings, newFinding(CodeBotNotMember, "bot is no longer a member of this repo; sync is broken"))
 		case role == forge.RoleWrite:
 			// Exactly the role uzi wants: no finding.
 		case role.AtLeast(forge.RoleWrite):
-			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s, above the expected write role", role))
+			rr.Findings = append(rr.Findings, newFinding(CodeBotRoleAboveWrite, fmt.Sprintf("bot role is %s, above the expected write role", role)))
 		default:
-			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s, below the expected write role", role))
+			rr.Findings = append(rr.Findings, newFinding(CodeBotRoleBelowWrite, fmt.Sprintf("bot role is %s, below the expected write role", role)))
 		}
 	}
 
 	if !haveBranch {
-		rr.Warnings = append(rr.Warnings, "repo has no default branch; branch-protection check skipped")
+		rr.Findings = append(rr.Findings, newFinding(CodeNoDefaultBranch, "repo has no default branch; branch-protection check skipped"))
 		return
 	}
 	if bpErr != nil {
-		rr.Warnings = append(rr.Warnings, "could not read default-branch protection on this repo")
+		// D6/D3 fail-closed: a read error escalates to a BLOCK finding. This changes
+		// only the badge tier in M1 (was a Warning), not any run — no gate reads it
+		// until M2.
+		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, "could not read default-branch protection on this repo"))
 		return
 	}
-	// Protected FIRST (R12) — see the doc comment. An unprotected branch stops
+	// Protected FIRST (R3/R12) — see the doc comment. An unprotected branch stops
 	// here with the strongest finding; nothing below is reached for it.
 	if !bp.Protected {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("default branch %q is not protected", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeDefaultBranchUnprotected, fmt.Sprintf("default branch %q is not protected", repo.DefaultBranch)))
 		return
 	}
 	// ProtectionUnverified (PRD #238 D6/H1): the branch IS protected, but the
 	// driver could not authoritatively read who may push/merge — the GitHub
 	// legacy-branch-protection case, where /protection 403s a write bot and no
 	// ruleset illuminates it. The driver reports WriteRoleCanPush/Merge=false
-	// (never a fabricated true), so the Violation branches below correctly do not
-	// fire; without this Warning the "undetermined" state would read as clean.
-	// This surfaces it as a Warning, not a Violation — the Can* fields being false
-	// here means "could not tell", not "safe" (see forge.BranchProtection). On
-	// GitLab/Forgejo, and GitHub with a readable ruleset, the flag is false and
-	// behaviour is unchanged.
+	// (never a fabricated true), so the push/merge branches below correctly do not
+	// fire; without this the "undetermined" state would read as clean. "Could not
+	// tell" is fail-closed the same as a read error (D3), so #66 folds it into the
+	// protection_unreadable BLOCK code. It does NOT early-return: the Can* fields
+	// are false here so nothing else fires, but the structure is preserved.
 	if bp.ProtectionUnverified {
-		rr.Warnings = append(rr.Warnings, fmt.Sprintf("could not fully verify push/merge rights on protected %q", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, fmt.Sprintf("could not fully verify push/merge rights on protected %q", repo.DefaultBranch)))
 	}
-	// Push findings are violations — pre-existing PRD #5 behaviour, unchanged.
+	// Push/merge findings all BLOCK (D6): a bot that can push or merge into
+	// protected main breaks the primary directive. M1 only surfaces them as coded
+	// findings; the REFUSAL is deferred to M2 — nothing gates a run on these yet.
 	if bp.WriteRoleCanPush {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("the write role may push to protected %q", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeWriteRoleCanPush, fmt.Sprintf("the write role may push to protected %q", repo.DefaultBranch)))
 	}
 	if bp.BotCanPush {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct push grant on protected %q", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeBotCanPush, fmt.Sprintf("the bot has a direct push grant on protected %q", repo.DefaultBranch)))
 	}
-	// Merge findings are violations, the same tier as the push sibling above and
-	// for the same reason: a bot that can merge its own PR into protected main
-	// breaks the primary directive exactly as one that can push directly to it
-	// does (report.go reserves Violations for "branch problems that break the
-	// directive"). This is NOT a new GitLab behaviour — the push sibling is
-	// already a Violation that flips a GitLab badge under PRD #5, so surfacing a
-	// merge one is the same existing tier, not a change #66 was split out to
-	// avoid. What #66 defers is the REFUSAL, not the surfacing: a per-repo
-	// Violation never blocks a save (only token violations do, report.go:37-38)
-	// and nothing gates a run on privilege_status — verified, the run/claim path
-	// never reads it. #66 promotes these fields to run-refusals via a
-	// Protected-first read (evaluateRepo above), never via the badge tier.
 	if bp.WriteRoleCanMerge {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("the write role may merge into protected %q", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeWriteRoleCanMerge, fmt.Sprintf("the write role may merge into protected %q", repo.DefaultBranch)))
 	}
 	if bp.BotCanMerge {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct merge grant on protected %q", repo.DefaultBranch))
+		rr.Findings = append(rr.Findings, newFinding(CodeBotCanMerge, fmt.Sprintf("the bot has a direct merge grant on protected %q", repo.DefaultBranch)))
 	}
 }
 

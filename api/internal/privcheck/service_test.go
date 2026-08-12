@@ -98,7 +98,8 @@ func TestCheckConnectionPersists(t *testing.T) {
 
 // TestSweepGrandfatheredAndDrift: the boot sweep checks a never-checked
 // (grandfathered) connection — turning a NULL status into a real one — and a
-// re-run flips ok→violations when the bot's role drifts to Maintainer.
+// re-run flips ok→violations when the default branch's protection is removed (a
+// BLOCK finding under #66 D6; a role promotion is only a warn now).
 func TestSweepGrandfatheredAndDrift(t *testing.T) {
 	conn := aConn() // no privilege_status yet: the grandfathered case
 	st := newFakeStore()
@@ -124,8 +125,8 @@ func TestSweepGrandfatheredAndDrift(t *testing.T) {
 		t.Fatalf("grandfathered connection not back-filled to ok, got %q", st.writes[conn.ID].status)
 	}
 
-	// Drift: a teammate promotes the bot to Maintainer; the next sweep flips it.
-	f.roles[1] = roleResult{role: forge.RoleAdmin, member: true}
+	// Drift: a teammate removes branch protection on main; the next sweep flips it.
+	f.prots[1] = protResult{bp: forge.BranchProtection{Protected: false}}
 	res, err = svc.CheckAllConnections(context.Background())
 	if err != nil {
 		t.Fatalf("sweep 2: %v", err)

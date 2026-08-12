@@ -34,6 +34,109 @@ const (
 	StatusError Status = "error"
 )
 
+// Code is the enumerable identifier of a per-repo finding (PRD #66 D5/D6). It
+// replaces the old free-text per-repo Violations/Warnings so the blocking set is
+// enumerable in code, not read out of prose. Severity is NEVER hand-set at the
+// call site — it is looked up in findingSeverity, the single source of truth.
+type Code string
+
+const (
+	// CodeDefaultBranchUnprotected: the repo's default branch is not protected at
+	// all — the bot can push and merge freely (D6, BLOCK).
+	CodeDefaultBranchUnprotected Code = "default_branch_unprotected"
+	// CodeWriteRoleCanPush: the protected default branch admits the write role to
+	// push directly (D6, BLOCK).
+	CodeWriteRoleCanPush Code = "write_role_can_push"
+	// CodeBotCanPush: a per-user allow-to-push grant lets the bot push directly to
+	// the protected default branch (D6, BLOCK).
+	CodeBotCanPush Code = "bot_can_push"
+	// CodeWriteRoleCanMerge: the protected default branch admits the write role to
+	// merge (D6, BLOCK).
+	CodeWriteRoleCanMerge Code = "write_role_can_merge"
+	// CodeBotCanMerge: a per-user merge grant lets the bot merge its own PR into
+	// the protected default branch (D6, BLOCK).
+	CodeBotCanMerge Code = "bot_can_merge"
+	// CodeUnprotectedFilePatterns: a non-empty unprotected-file-patterns list means
+	// the bot can push commits touching only those paths to main (D6/D7, BLOCK).
+	// Forward-declared per D6: no driver reports it today (Forgejo-specific), so it
+	// is never emitted by evaluateRepo yet.
+	CodeUnprotectedFilePatterns Code = "unprotected_file_patterns"
+	// CodeProtectionUnreadable: the branch-protection read errored, or the branch
+	// is protected but the driver could not authoritatively read who may push/merge
+	// (the GitHub legacy case). "Could not tell" is fail-closed the same as a read
+	// error (D3, BLOCK).
+	CodeProtectionUnreadable Code = "protection_unreadable"
+
+	// CodeBotNotMember: the bot is no longer a member of this repo (D6, warn — the
+	// bot is too weak, not too strong).
+	CodeBotNotMember Code = "bot_not_member"
+	// CodeBotRoleBelowWrite: the bot's role is below the expected write role (D6,
+	// warn).
+	CodeBotRoleBelowWrite Code = "bot_role_below_write"
+	// CodeBotRoleAboveWrite: the bot's role is above the expected write role (D6,
+	// warn — an admin/owner bot is already caught by the token gate at save).
+	CodeBotRoleAboveWrite Code = "bot_role_above_write"
+	// CodeGroupPushGrantUndetected: a group/team push whitelist uzi cannot resolve
+	// to the bot (D6, warn). Forward-declared per D6: no driver reports it today
+	// (documented gap), so it is never emitted by evaluateRepo yet.
+	CodeGroupPushGrantUndetected Code = "group_push_grant_undetected"
+	// CodeRoleUnreadable: the bot's role on the repo could not be read (warn — the
+	// role check was skipped, distinct from an authoritative "not a member").
+	CodeRoleUnreadable Code = "role_unreadable"
+	// CodeNoDefaultBranch: the repo has no default branch (empty project), so the
+	// branch-protection check was skipped (warn).
+	CodeNoDefaultBranch Code = "no_default_branch"
+)
+
+// Severity is a finding's tier. It is set only via findingSeverity, never by a
+// call site (D5).
+type Severity string
+
+const (
+	// SeverityBlock is a finding that breaks the primary directive — the bot can
+	// reach the default branch, or uzi could not tell (fail-closed). This is the
+	// enumerable set M2 will refuse runs on.
+	SeverityBlock Severity = "block"
+	// SeverityWarn is an advisory finding — drift worth surfacing that does not, on
+	// its own, mean the bot can reach the default branch.
+	SeverityWarn Severity = "warn"
+)
+
+// findingSeverity is the SINGLE source of a finding's severity (D5). A Code
+// missing from this map is a programming error — a test asserts every declared
+// Code is present. Never hand-set Severity at a call site; go through newFinding.
+var findingSeverity = map[Code]Severity{
+	CodeDefaultBranchUnprotected: SeverityBlock,
+	CodeWriteRoleCanPush:         SeverityBlock,
+	CodeBotCanPush:               SeverityBlock,
+	CodeWriteRoleCanMerge:        SeverityBlock,
+	CodeBotCanMerge:              SeverityBlock,
+	CodeUnprotectedFilePatterns:  SeverityBlock,
+	CodeProtectionUnreadable:     SeverityBlock,
+	CodeBotNotMember:             SeverityWarn,
+	CodeBotRoleBelowWrite:        SeverityWarn,
+	CodeBotRoleAboveWrite:        SeverityWarn,
+	CodeGroupPushGrantUndetected: SeverityWarn,
+	CodeRoleUnreadable:           SeverityWarn,
+	CodeNoDefaultBranch:          SeverityWarn,
+}
+
+// Finding is one coded per-repo finding: a stable Code, its Severity taken from
+// findingSeverity, and a human message. Replaces the old free-text
+// Violations/Warnings string slices (D5).
+type Finding struct {
+	Code     Code     `json:"code"`
+	Severity Severity `json:"severity"`
+	Message  string   `json:"message"`
+}
+
+// newFinding builds a Finding with its severity looked up from findingSeverity —
+// the only way severity is set (D5). A Code absent from the map yields the empty
+// severity, which the coverage test forbids.
+func newFinding(code Code, msg string) Finding {
+	return Finding{Code: code, Severity: findingSeverity[code], Message: msg}
+}
+
 // TokenReport is the token-level half of a Report. Violations block a save;
 // warnings never do.
 type TokenReport struct {
@@ -44,10 +147,10 @@ type TokenReport struct {
 	Warnings   []string   `json:"warnings"`
 }
 
-// RepoReport is one enabled repo's findings. Per-repo findings always warn (in
-// the sense that they never block a save) — they are drift observed after the
-// fact — but role/branch problems are Violations (they break the directive) and
-// count toward the connection's violations status.
+// RepoReport is one enabled repo's findings. Per-repo findings never block a save
+// (only token violations do) — they are drift observed after the fact — but a
+// SeverityBlock finding breaks the primary directive and counts toward the
+// connection's violations status (and, from PRD #66 M2, will refuse a run).
 type RepoReport struct {
 	// RepoID is the uzi repo row id (uuid string), so the UI can badge the exact
 	// Repos-page row.
@@ -60,9 +163,23 @@ type RepoReport struct {
 	// re-stamps them.
 	Role forge.Role `json:"role"`
 	// Member is false when the bot has no effective membership on the repo.
-	Member     bool     `json:"member"`
-	Violations []string `json:"violations"`
-	Warnings   []string `json:"warnings"`
+	Member bool `json:"member"`
+	// Findings is the coded per-repo finding set (PRD #66 D5), replacing the old
+	// free-text Violations/Warnings slices. Never nil (JSON serializes []Finding{}
+	// as [] rather than null).
+	Findings []Finding `json:"findings"`
+}
+
+// Blocks reports whether this repo carries any SeverityBlock finding — the
+// enumerable "does this repo block" predicate M2's gate consumes (PRD #66 D5).
+// M1 does not call it from any gate; nothing refuses yet.
+func (rr RepoReport) Blocks() bool {
+	for _, f := range rr.Findings {
+		if f.Severity == SeverityBlock {
+			return true
+		}
+	}
+	return false
 }
 
 // Report is one connection's full privilege picture: the token plus every
@@ -131,12 +248,17 @@ func errorReport(now time.Time, warning string) Report {
 func computeStatus(token TokenReport, repos []RepoReport) Status {
 	violations := len(token.Violations) > 0
 	warnings := len(token.Warnings) > 0
+	// The token half still uses its Violations/Warnings slices; per-repo tiers now
+	// derive from coded finding severities (PRD #66 D5): any SeverityBlock finding
+	// is a violation, any SeverityWarn is a warning.
 	for _, r := range repos {
-		if len(r.Violations) > 0 {
-			violations = true
-		}
-		if len(r.Warnings) > 0 {
-			warnings = true
+		for _, f := range r.Findings {
+			switch f.Severity {
+			case SeverityBlock:
+				violations = true
+			case SeverityWarn:
+				warnings = true
+			}
 		}
 	}
 	switch {
