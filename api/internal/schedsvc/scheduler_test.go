@@ -701,9 +701,6 @@ func TestFireIssueSuccessStarted(t *testing.T) {
 	if st.IssueIID == nil || *st.IssueIID != 7 || st.Title != "Ship it" || st.RunID == (uuid.UUID{}) {
 		t.Fatalf("started = %+v, want iid 7 / title / non-zero run id", st)
 	}
-	if ids := out.RunIDs(); len(ids) != 1 || ids[0] != st.RunID {
-		t.Fatalf("RunIDs() = %v, want the single started run id", ids)
-	}
 	assertBalances(t, out)
 }
 

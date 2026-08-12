@@ -852,7 +852,7 @@ let schedules: Schedule[] = [
     model: "fable",
     override_subagent_model: true,
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
-    updated_at: daysFromNow(-1, 2), next_fires: [],
+    updated_at: daysFromNow(-1, 2), next_fires: [], last_fire: null,
   },
   {
     id: "sch-3bf1", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
@@ -865,7 +865,7 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
-    updated_at: daysFromNow(0, 3), next_fires: [],
+    updated_at: daysFromNow(0, 3), next_fires: [], last_fire: null,
   },
   {
     id: "sch-9qm4", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
@@ -878,7 +878,7 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-1, 20),
-    updated_at: daysFromNow(-1, 20), next_fires: [],
+    updated_at: daysFromNow(-1, 20), next_fires: [], last_fire: null,
   },
   {
     id: "sch-pr0m", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
@@ -892,7 +892,7 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-21, 11),
-    updated_at: daysFromNow(-7, 9), next_fires: [],
+    updated_at: daysFromNow(-7, 9), next_fires: [], last_fire: null,
   },
   {
     id: "sch-zt88", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas-api",
@@ -905,7 +905,7 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
-    updated_at: daysFromNow(-3, 18), next_fires: [],
+    updated_at: daysFromNow(-3, 18), next_fires: [], last_fire: null,
   },
   {
     // A parked schedule (status='error'): the last fire failed and the scheduler
@@ -921,7 +921,7 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: true, status: "error", created_at: daysFromNow(-12, 15),
-    updated_at: daysFromNow(-1, 1, 30), next_fires: [],
+    updated_at: daysFromNow(-1, 1, 30), next_fires: [], last_fire: null,
   },
 ];
 
@@ -3308,6 +3308,7 @@ export const mockApi = {
       timezone: input.timezone || "UTC",
       next_fire_at: null,
       last_fired_at: null,
+      last_fire: null,
       auto_approve: input.auto_approve ?? true,
       wait_on_limit: input.wait_on_limit ?? true,
       // Sweep-only; new sweeps default to 10 (mirrors the server), unlimited otherwise.
@@ -3384,7 +3385,18 @@ export const mockApi = {
     if (!s) throw new ApiError(404, "schedule not found");
     // The demo does not spin up a live worker run; it reports one fired, matching
     // the seam's typical single-run outcome for a pinned issue / prompt.
-    return delay({ created: 1, run_ids: [nextRunId()] }, 250);
+    const runId = nextRunId();
+    return delay(
+      {
+        created: 1,
+        run_ids: [runId],
+        matched: 1,
+        capped: false,
+        started: [{ issue_iid: s.issue_iid, run_id: runId, title: s.prompt || `#${s.issue_iid ?? ""}` }],
+        skips: [],
+      },
+      250,
+    );
   },
   previewSchedule: async (input: SchedulePreviewInput) => {
     requireSession();

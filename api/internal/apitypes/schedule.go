@@ -98,6 +98,43 @@ type ScheduleDTO struct {
 	// cron/next-fire logic the modal preview endpoint uses so the list and the modal
 	// agree.
 	NextFires []time.Time `json:"next_fires"`
+	// LastFire is the structured summary of this schedule's most recent persisted fire
+	// (PRD #308 M3), unmarshalled straight from the run_schedules.last_fire jsonb column
+	// (its json tags mirror schedsvc's package-internal persisted wire shape exactly). A
+	// nil value means the schedule has never fired — or, since only the success/benign
+	// advance path persists, that a parked-or-transient fire left the prior summary (or
+	// none) in place rather than overwriting it.
+	LastFire *LastFire `json:"last_fire"`
+}
+
+// LastFireStarted is one run a persisted fire actually created (PRD #308 M3). Its json
+// tags mirror schedsvc's package-internal lastFireStarted exactly, since apitypes.LastFire
+// is json.Unmarshalled straight from the persisted last_fire jsonb bytes.
+type LastFireStarted struct {
+	IssueIID *int64 `json:"issue_iid"` // nil for a prompt schedule
+	RunID    string `json:"run_id"`    // uuid string
+	Title    string `json:"title"`
+}
+
+// LastFireSkip is one candidate a persisted fire considered but started nothing for, with
+// its typed reason (a SkipReason string, never free text). Tags mirror schedsvc's
+// lastFireSkip exactly.
+type LastFireSkip struct {
+	IssueIID *int64 `json:"issue_iid"`
+	Title    string `json:"title"`
+	Reason   string `json:"reason"`
+}
+
+// LastFire is the top-level persisted summary of a schedule's last fire (PRD #308 M3).
+// FiredAt is the advance instant; Matched == len(Started) + len(Skips) balances (Decision
+// 4). Tags mirror schedsvc's lastFireRecord exactly so the raw jsonb column unmarshals
+// straight into this struct.
+type LastFire struct {
+	FiredAt time.Time         `json:"fired_at"`
+	Matched int               `json:"matched"`
+	Capped  bool              `json:"capped"`
+	Started []LastFireStarted `json:"started"`
+	Skips   []LastFireSkip    `json:"skips"`
 }
 
 // SchedulePreviewRequest asks for a live "next fires" preview from a timing spec that
@@ -116,9 +153,16 @@ type SchedulePreviewResponse struct {
 	Fires []time.Time `json:"fires"`
 }
 
-// RunNowResponse reports the outcome of a manual run-now fire: how many runs were
-// created and their ids (empty when a benign dedup skip fired nothing).
+// RunNowResponse reports the outcome of a manual run-now fire (PRD #308 M3). Created and
+// RunIDs are retained for back-compat (Created == len(Started), RunIDs are the started
+// runs' ids) and are derivable from Started; the structured Matched/Capped/Started/Skips
+// fields carry the full per-candidate outcome so a caller can render it without a second
+// fetch. Started/Skips are non-nil empty slices, matching the persisted convention.
 type RunNowResponse struct {
-	Created int      `json:"created"`
-	RunIDs  []string `json:"run_ids"`
+	Created int               `json:"created"`
+	RunIDs  []string          `json:"run_ids"`
+	Matched int               `json:"matched"`
+	Capped  bool              `json:"capped"`
+	Started []LastFireStarted `json:"started"`
+	Skips   []LastFireSkip    `json:"skips"`
 }

@@ -190,8 +190,8 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule) {
 }
 
 // RunNow fires a schedule ONCE, manually, and returns the FireOutcome (matched/started/
-// skips; RunIDs() yields the created run ids: issue→0/1, sweep→N, prompt→0/1, a benign
-// dedup skip → 0 started). It is the seam behind POST /api/schedules/{id}/run-now.
+// skips; the number started is issue→0/1, sweep→N, prompt→0/1, a benign dedup skip → 0
+// started). It is the seam behind POST /api/schedules/{id}/run-now.
 //
 // Unlike the tick path it does NOT advance or park the schedule: a manual extra fire
 // must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor

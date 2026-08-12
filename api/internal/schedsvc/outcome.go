@@ -41,13 +41,3 @@ type FireOutcome struct {
 	Started []Started
 	Skips   []Skip
 }
-
-// RunIDs returns the ids of the runs this fire started, so callers that only need the
-// created run ids (the tick path, the run-now handler until it widens) can still get them.
-func (o FireOutcome) RunIDs() []uuid.UUID {
-	ids := make([]uuid.UUID, 0, len(o.Started))
-	for _, s := range o.Started {
-		ids = append(ids, s.RunID)
-	}
-	return ids
-}

@@ -127,6 +127,7 @@ function schedFixture(over: Partial<Schedule> = {}): Schedule {
     timezone: "UTC",
     next_fire_at: null,
     last_fired_at: null,
+    last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
     max_issues: 10,

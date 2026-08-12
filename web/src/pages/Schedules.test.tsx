@@ -37,6 +37,7 @@ function sched(over: Partial<Schedule>): Schedule {
     timezone: "Europe/Bucharest",
     next_fire_at: new Date(Date.now() + 3_600_000).toISOString(),
     last_fired_at: null,
+    last_fire: null,
     auto_approve: true,
     wait_on_limit: true,
     max_issues: 10,
