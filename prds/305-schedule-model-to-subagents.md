@@ -134,11 +134,11 @@ or the cloned repo's. Default off preserves PRD #300's behavior exactly (pins wi
   tests (`agents.test.ts`, `sdk-executor.test.ts`).
   - Landed as a post-build helper `applySubagentModelOverride` in `agent/src/agents.ts`
     applied to BOTH rosters by the executor, rather than a branch inside
-    `toDefinition`: the own roster is assembled and plan-turn-copied before the run
-    model resolves, so `toDefinition` cannot see the run model (the own-source copy at
-    `planTurnSubagents` happens before `leadModel` is computed). The `leadModel`
+    `toDefinition`: `toDefinition` runs *inside* `assembleAgents`, which must complete
+    before `leadModel` can resolve (it needs `assembled.leadModel`), so `toDefinition`
+    cannot receive the run model. The `leadModel`
     computation was hoisted to right after `assembleAgents` so the own roster is
-    overridden before that copy; the repo roster is overridden where it is freshly
+    overridden before the `planTurnSubagents` copy; the repo roster is overridden where it is freshly
     built after `selectSubagents`. Still one mechanism covering both rosters
     (Decision 2). Claim field `override_subagent_model` added to `ClaimConfig`
     (`agent/src/protocol.ts`). `task gate:agent` green.
