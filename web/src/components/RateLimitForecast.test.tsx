@@ -1,0 +1,80 @@
+// @vitest-environment jsdom
+import { afterEach, describe, it, expect } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { RateLimitForecastMeter } from "./RateLimitForecast";
+import { MeterTrack } from "./Meter";
+import type { BurnForecast } from "../lib/rateLimits";
+
+afterEach(cleanup);
+
+const OVER: BurnForecast = { state: "over", projectedPct: 130 };
+const ON_PACE_HIGH: BurnForecast = { state: "on_pace", projectedPct: 108 };
+const ON_PACE_LOW: BurnForecast = { state: "on_pace", projectedPct: 95 };
+const SAFE: BurnForecast = { state: "safe", projectedPct: 0 };
+
+function renderMeter(forecast: BurnForecast, pct = 56) {
+  return render(
+    <RateLimitForecastMeter label="5-hour window" pct={pct} valueText={`${pct}%, resets in 2h`} forecast={forecast} className="mt-1.5 h-2" />,
+  );
+}
+
+// The ghost is an aria-hidden div carrying the translucent tone class; the fill is
+// MeterTrack's own div. Query the ghost by its tone class.
+function ghost(container: HTMLElement, tone: string): HTMLElement | null {
+  return container.querySelector<HTMLElement>(`div[aria-hidden].${tone.replace("/", "\\/")}`);
+}
+
+describe("RateLimitForecastMeter (PRD #309 M3)", () => {
+  it("safe → renders the plain atom: no ghost, no marker, no title, base valueText", () => {
+    const { container } = renderMeter(SAFE);
+    const bar = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar.getAttribute("aria-valuetext")).toBe("56%, resets in 2h"); // untouched
+    expect(container.querySelector("[title]")).toBeNull(); // no hover projection
+    expect(container.textContent).not.toContain("»");
+    expect(ghost(container, "bg-warn/40")).toBeNull();
+    expect(ghost(container, "bg-danger/40")).toBeNull();
+  });
+
+  it("over → coral ghost + », projection only in aria-valuetext and the hover title", () => {
+    const { container } = renderMeter(OVER);
+    expect(ghost(container, "bg-danger/40")).not.toBeNull(); // coral ghost
+    expect(ghost(container, "bg-warn/40")).toBeNull();
+    const marker = screen.getByText("»");
+    expect(marker.className).toContain("text-danger");
+    // Projected % is hover/aria-only, NEVER printed inline as visible number text.
+    const bar = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar.getAttribute("aria-valuetext")).toBe("56%, resets in 2h — projected 130% by reset, over");
+    expect(container.querySelector("[title]")?.getAttribute("title")).toBe(
+      "56%, resets in 2h — projected 130% by reset, over",
+    );
+    expect(bar.getAttribute("aria-valuenow")).toBe("56"); // fill still reflects CURRENT usage
+  });
+
+  it("on-pace over the cap (100–115) → gold ghost + gold » ", () => {
+    const { container } = renderMeter(ON_PACE_HIGH);
+    expect(ghost(container, "bg-warn/40")).not.toBeNull(); // gold ghost
+    expect(ghost(container, "bg-danger/40")).toBeNull();
+    expect(screen.getByText("»").className).toContain("text-warn");
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuetext")).toBe(
+      "56%, resets in 2h — projected 108% by reset, on pace",
+    );
+  });
+
+  it("on-pace landing at/under the cap (≤100) → gold ghost but NO » marker", () => {
+    const { container } = renderMeter(ON_PACE_LOW);
+    expect(ghost(container, "bg-warn/40")).not.toBeNull();
+    expect(container.textContent).not.toContain("»");
+  });
+
+  it("ghost animation is disabled under prefers-reduced-motion", () => {
+    const { container } = renderMeter(OVER);
+    expect(ghost(container, "bg-danger/40")?.className).toContain("motion-reduce:transition-none");
+  });
+
+  it("the shared MeterTrack atom, used directly (e.g. WorkerStats), carries no forecast overlay", () => {
+    const { container } = render(<MeterTrack label="cpu" fillPct={70} valueText="70%" className="h-2" />);
+    expect(container.querySelector("[title]")).toBeNull();
+    expect(container.textContent).not.toContain("»");
+    expect(container.querySelector("div[aria-hidden]")).toBeNull();
+  });
+});
