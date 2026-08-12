@@ -1,17 +1,23 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
+import { renderHook } from "@testing-library/react";
 import {
   autoChipFor,
   autoStatusChip,
   burnForecast,
   formatAgo,
   formatCountdown,
+  pushSample,
   rowState,
+  SERIES_MAX_AGE_MS,
+  SERIES_MAX_SAMPLES,
   sortAdminRows,
   statusBadge,
+  useReadingSeries,
   worstWindow,
   type BurnSample,
   type RowState,
+  type SeriesReading,
 } from "./rateLimits";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits } from "./api";
 // ?raw rather than node:fs — the web tsconfig carries no node types, and the same
@@ -324,5 +330,95 @@ describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
     // Latest pct is 60 in both; only the earlier sample — hence the slope — differs.
     expect(burnForecast(samples(4, 60), RESET_5MIN, NOW).state).toBe("over"); // steep rise
     expect(burnForecast(samples(58, 60), RESET_5MIN, NOW).state).toBe("safe"); // gentle rise
+  });
+});
+
+describe("pushSample (PRD #309 M2 — bounded non-decreasing trailing run)", () => {
+  it("seeds from empty, appends a changed pct immediately", () => {
+    expect(pushSample([], 10, 0)).toEqual([{ tMs: 0, pct: 10 }]);
+    expect(pushSample([{ tMs: 0, pct: 10 }], 12, 1_000)).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 1_000, pct: 12 },
+    ]);
+  });
+
+  it("dedupes a flat reading within the min interval, but records elapsed time past it", () => {
+    const seed = [{ tMs: 0, pct: 10 }];
+    expect(pushSample(seed, 10, 5_000)).toEqual(seed); // same pct, <20s → no append
+    expect(pushSample(seed, 10, 25_000)).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 25_000, pct: 10 },
+    ]); // same pct, ≥20s → records the passage of time
+  });
+
+  it("restarts the run on a pct decrease (window reset / sliding decay)", () => {
+    const prev = [
+      { tMs: 0, pct: 40 },
+      { tMs: 60_000, pct: 55 },
+    ];
+    expect(pushSample(prev, 5, 120_000)).toEqual([{ tMs: 120_000, pct: 5 }]);
+  });
+
+  it("prunes points older than the max age window", () => {
+    const prev = [
+      { tMs: 0, pct: 10 },
+      { tMs: 100_000, pct: 12 },
+    ];
+    // cutoff = now − SERIES_MAX_AGE_MS = 60_000, so the t=0 point falls out.
+    const now = SERIES_MAX_AGE_MS + 60_000;
+    const out = pushSample(prev, 12, now);
+    expect(out[0].tMs).toBe(100_000);
+    expect(out.every((s) => s.tMs >= now - SERIES_MAX_AGE_MS)).toBe(true);
+  });
+
+  it("caps the retained count, dropping the oldest", () => {
+    const prev: BurnSample[] = Array.from({ length: SERIES_MAX_SAMPLES }, (_, i) => ({
+      tMs: i * 25_000,
+      pct: i,
+    }));
+    const out = pushSample(prev, SERIES_MAX_SAMPLES, SERIES_MAX_SAMPLES * 25_000);
+    expect(out.length).toBe(SERIES_MAX_SAMPLES);
+    expect(out[0]).toEqual({ tMs: 25_000, pct: 1 }); // original[0] dropped
+  });
+});
+
+describe("useReadingSeries (PRD #309 M2)", () => {
+  const hook = (readings: SeriesReading[], now: number) =>
+    renderHook(
+      ({ r, n }: { r: SeriesReading[]; n: number }) => useReadingSeries(r, n),
+      { initialProps: { r: readings, n: now } },
+    );
+
+  it("accumulates per key across polls and drops keys no longer present", () => {
+    const { result, rerender } = hook([{ key: "a:5h", pct: 10 }], 0);
+    expect(result.current("a:5h")).toEqual([{ tMs: 0, pct: 10 }]);
+
+    rerender({
+      r: [
+        { key: "a:5h", pct: 20 },
+        { key: "b:5h", pct: 5 },
+      ],
+      n: 30_000,
+    });
+    expect(result.current("a:5h")).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 30_000, pct: 20 },
+    ]);
+    expect(result.current("b:5h")).toEqual([{ tMs: 30_000, pct: 5 }]); // isolated per key
+
+    rerender({ r: [{ key: "b:5h", pct: 6 }], n: 60_000 });
+    expect(result.current("a:5h")).toEqual([]); // 'a' absent → run dropped
+    expect(result.current("b:5h")).toEqual([
+      { tMs: 30_000, pct: 5 },
+      { tMs: 60_000, pct: 6 },
+    ]);
+  });
+
+  it("clears a run on a null (stale / non-ok / gated) reading", () => {
+    const { result, rerender } = hook([{ key: "a:5h", pct: 40 }], 0);
+    rerender({ r: [{ key: "a:5h", pct: 60 }], n: 30_000 });
+    expect(result.current("a:5h").length).toBe(2);
+    rerender({ r: [{ key: "a:5h", pct: null }], n: 60_000 });
+    expect(result.current("a:5h")).toEqual([]);
   });
 });

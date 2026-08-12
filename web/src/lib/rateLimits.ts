@@ -4,7 +4,7 @@
 // countdowns tick between the 60s polls. Kept free of the api client so it unit-
 // tests without the mock; types are imported type-only (erased at build).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toneFor } from "../components/Meter";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits, RateLimitSource, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
@@ -397,6 +397,78 @@ export function burnForecast(
   );
   if (projectedPct <= 85) return SAFE; // headroom to spare (strict lower band, D7)
   return { state: projectedPct > 115 ? "over" : "on_pace", projectedPct };
+}
+
+// ── Trailing-sample accumulation (PRD #309 M2) ───────────────────────────────
+//
+// burnForecast reads a slope, but the API ships one point-in-time reading per poll
+// and NOTHING is retained (the server keeps one gauge row per token, overwritten
+// each tick — D4; the web replaces the reading each 60s poll). So the trailing
+// sample is accumulated CLIENT-SIDE, IN SESSION, per (secret_id, window) key. This
+// is why the forecast is silent for the first few minutes after a page load (no
+// span yet) and why a reload starts cold — the honest cost of not retaining history.
+
+// Keep roughly the last 15 minutes of readings: recent enough that the rate tracks
+// current burn, long enough that a real rise clears the integer noise floor.
+export const SERIES_MAX_AGE_MS = 15 * 60_000;
+// Hard cap on retained points (a fast poll cadence should never grow the run without
+// bound); the oldest are dropped first.
+export const SERIES_MAX_SAMPLES = 30;
+// Collapse re-render storms: a flat reading is re-sampled at most this often, so the
+// buffer measures the passage of time without one sample per React render. A CHANGED
+// pct always samples immediately.
+const SERIES_MIN_APPEND_INTERVAL_MS = 20_000;
+
+// pushSample folds one reading into a window's bounded, non-decreasing sample run —
+// PURE, so the retention rules unit-test without a renderer. Rules:
+//   - a pct DECREASE (an anchored window resetting, or a sliding window decaying)
+//     DISCARDS the prior run and restarts from this reading: a trailing rate must
+//     never span a reset, or it would read a drop as negative burn and mask the rise
+//     after it.
+//   - otherwise append, but at most once per SERIES_MIN_APPEND_INTERVAL_MS unless
+//     the pct changed (dedupe re-renders while still recording elapsed time).
+//   - prune points older than SERIES_MAX_AGE_MS, then cap the count (drop oldest).
+export function pushSample(prev: BurnSample[], pct: number, nowMs: number): BurnSample[] {
+  const last = prev[prev.length - 1];
+  if (last && pct < last.pct) return [{ tMs: nowMs, pct }]; // reset / decay → restart
+  let next = prev;
+  if (!last) {
+    next = [{ tMs: nowMs, pct }];
+  } else if (pct !== last.pct || nowMs - last.tMs >= SERIES_MIN_APPEND_INTERVAL_MS) {
+    next = [...prev, { tMs: nowMs, pct }];
+  }
+  const cutoff = nowMs - SERIES_MAX_AGE_MS;
+  const pruned = next.filter((s) => s.tMs >= cutoff);
+  return pruned.length > SERIES_MAX_SAMPLES ? pruned.slice(pruned.length - SERIES_MAX_SAMPLES) : pruned;
+}
+
+// SeriesReading is one window's current reading for accumulation: a stable key
+// (`${secret_id}:${window}`) and its pct — or null to CLEAR the run (a stale, non-ok,
+// or otherwise gated reading must not feed a sample, and a token that goes
+// unavailable then ok again should start fresh rather than bridge the gap).
+export interface SeriesReading {
+  key: string;
+  pct: number | null;
+}
+
+// useReadingSeries accumulates a trailing BurnSample run per key across polls, held
+// in a ref so it survives re-renders. Feed it the CURRENT readings each render plus a
+// nowMs clock (e.g. useNow); it folds each via pushSample and returns a getter. Keys
+// absent from `readings` are dropped, so a deleted token stops accumulating. The
+// accrual runs in an effect, so a brand-new reading is reflected on the next render
+// (≤ one useNow tick) — immaterial at a 60s poll cadence. StrictMode's double-run is
+// a no-op: pushSample dedupes a same-(nowMs,pct) re-append.
+export function useReadingSeries(readings: SeriesReading[], nowMs: number): (key: string) => BurnSample[] {
+  const ref = useRef<Map<string, BurnSample[]>>(new Map());
+  useEffect(() => {
+    const next = new Map<string, BurnSample[]>();
+    for (const r of readings) {
+      const prev = ref.current.get(r.key) ?? [];
+      next.set(r.key, r.pct == null ? [] : pushSample(prev, r.pct, nowMs));
+    }
+    ref.current = next;
+  }, [readings, nowMs]);
+  return useCallback((key: string) => ref.current.get(key) ?? [], []);
 }
 
 // useNow ticks a Date.now() clock so a rendered countdown re-derives between the
