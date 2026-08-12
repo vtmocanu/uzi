@@ -316,6 +316,8 @@ describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
   it("is silent past the reset horizon or with no reset (clock skew / null)", () => {
     expect(burnForecast(samples(4, 60), NOW_SECS - 10, NOW).state).toBe("safe"); // reset already passed
     expect(burnForecast(samples(4, 60), null, NOW).state).toBe("safe");
+    // A non-finite horizon (bad nowMs / resets_at) must not leak a NaN projection.
+    expect(burnForecast(samples(4, 60), RESET_5MIN, Number.NaN)).toEqual({ state: "safe", projectedPct: 0 });
   });
 
   it("discriminates on the SLOPE, not the latest pct (fails a stub that ignores elapsed)", () => {

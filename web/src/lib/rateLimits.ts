@@ -334,7 +334,9 @@ export interface BurnSample {
   pct: number;
 }
 
-export type BurnState = "over" | "on_pace" | "safe";
+// Not exported: consumers compare `forecast.state === "over"` structurally; the
+// M3 wrapper needs no named import. Keeping it local avoids an orphaned export.
+type BurnState = "over" | "on_pace" | "safe";
 
 export interface BurnForecast {
   // over: projected past the cap before reset; on_pace: lands ~at the cap; safe:
@@ -382,7 +384,9 @@ export function burnForecast(
   if (source === "limit_report") return SAFE; // D8: park-time inference
   if (resetsAtSec == null) return SAFE;
   const secondsToReset = resetsAtSec - nowMs / 1000;
-  if (secondsToReset <= 0) return SAFE; // reset passed / clock skew
+  // `!(x > 0)` rather than `x <= 0` so a non-finite horizon (NaN from a bad nowMs /
+  // resets_at) is also rejected, never propagating to a NaN projectedPct.
+  if (!(secondsToReset > 0)) return SAFE; // reset passed / clock skew / non-finite
   const oldest = samples[0];
   const spanMs = latest.tMs - oldest.tMs;
   if (spanMs < MIN_SAMPLE_SPAN_MS) return SAFE; // cold start / insufficient span
