@@ -63,7 +63,7 @@ esac
 # Run from the repo root so a relative component dir means the same thing from any
 # caller's directory. Resolved from THIS SCRIPT'S OWN LOCATION, deliberately NOT via
 # `git rev-parse --show-toplevel` (which lint-formula.sh uses): this wrapper runs inside
-# validate:web's `node:22-alpine` CI image, which ships NO git, so a `git rev-parse` here
+# validate:web's `node:24-alpine` CI image, which ships NO git, so a `git rev-parse` here
 # fails and reds the very gate it exists to keep honest (PRD #293 M3; caught in CI
 # 2026-08-10, pipeline 20725). The script lives in scripts/, so its parent is the root.
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)" || {
