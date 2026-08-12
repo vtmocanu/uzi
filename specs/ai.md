@@ -1065,7 +1065,11 @@ Layered so no single layer is load-bearing, and none trusts the model:
    **this is realized now** (M2), the strongest layer.
 3. **SDK `PreToolUse` deny-hook** (M3, defense-in-depth): deny `git push`, any
    `--force`/`-f`, remote mutation, and credential-reading commands (`git config
-   --get`, `env`, and `ps`/`/proc` probes per the auditor ask).
+   --get`, `env`, and `ps`/`/proc` probes per the auditor ask). Also denies inline
+   `-c key=value`/`--config-env=key=env` config-SET whose key is in a protected
+   namespace (remote|core|http|url|credential|include|includeif|alias|filter, not
+   exhaustive), mirroring the `git config <ns>.<x>` write-deny — the inline form
+   sets the same config without ever reaching `git config`.
 4. **Permission mode `bypassPermissions` + deny-hook + `disallowedTools`** (M3): not
    `default` (hangs headless) nor `dontAsk` (too restrictive for the coder). Read-only
    subagents constrained via per-`AgentDefinition` `tools` allowlist (subagents
