@@ -1,7 +1,7 @@
 # PRD #66: Refuse runs when the bot can push or merge to the default branch
 
 **GitLab Issue**: [#66](https://gitlab.example.com/vtmocanu/uzi/-/issues/66)
-**Status**: Draft (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it)
+**Status**: Draft (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it; extended 2026-08-12 at the user's direction with the admin per-repo override — D8, M8–M9)
 **Priority**: High
 **Depends on**: **PRD #65** — it lands `WriteRoleCanMerge`/`BotCanMerge`, the `Role` enum, and the shared `evaluateRepo` whose fields this PRD consumes. #65 reports; #66 refuses.
 **Touches the contracts of**: PRD #5 (privilege checks — **this PRD changes its warn-don't-block policy**, the first time uzi refuses a run for any reason), PRD #19 (autopilot creates runs), PRD #6 (CI-fix creates runs), PRD #46 (self-improve creates runs), PRD #42 (claim path).
@@ -45,6 +45,13 @@ report) and **fails closed** (cannot-evaluate is cannot-run).
 
 Three enforcement points, because the capability is granted at three different
 moments and a run can sit queued between them.
+
+**Admin escape hatch (D8).** An instance admin may explicitly allow a specific repo
+whose `main` the bot can reach — a per-repo, reasoned, audited exception, never a
+global off-switch (R6). The refusal is the default; the override is the deliberate,
+recorded departure from it. It waives only the "bot is too strong" findings and never
+the fail-closed `protection_unreadable` case, so a forge blip still refuses even an
+allowed repo. Added 2026-08-12 at the user's direction.
 
 ## Out of Scope
 
@@ -223,6 +230,79 @@ justified by "it's only markdown" is exactly what the four-layer doctrine refuse
 
 Same reasoning for GitLab's `bot_can_push` and `write_role_can_push`: **both block.**
 
+### D8 — Admin per-repo override (the escape hatch)
+
+The guardrail defaults to refusing; **an admin may allow one named repo** through it,
+with a reason, on the record. This is not the R6 bypass — that is a flag that *disables
+enforcement*; this is a per-repo, admin-only, audited accept-risk decision, the same
+shape as PRD #89's `docker_repo_allowlist` (a per-repo trust grant, fail-closed by
+default). "`main` is never touched" stays the default; the override is the deliberate,
+logged exception to it, on the repo an admin explicitly named.
+
+**Scope — per repo, admin only, multi-user.** Repos are per-user (every repo query is
+scoped to the owning forge connection). So:
+
+- The **owner** (a member) sees the block on their Repos page and a pointer to ask an
+  admin. **They cannot self-allow** — the owner is exactly who R6 says would route
+  around a block they consider wrong.
+- An **admin** allows/revokes: inline on the Repos page for a repo they own, and from a
+  new **admin cross-user "blocked repos" list** (beside Agents-status) for anyone
+  else's. The write is **admin-only, with no member path at all** — gated on
+  `user.IsAdmin` and using an unscoped by-id query, the shape of `PatchRepo`'s *admin*
+  branch (`SetRepoTrustFlags`), **not** its member `...ForUser` branch. Note `PatchRepo`
+  *does* let a member patch their own repo's trust flags (`forge.go:646` else-branch); the
+  override deliberately does not, because a member self-allowing is exactly the R6
+  route-around. So the override is best modelled as a **dedicated admin-only route**
+  (`POST /api/admin/repos/:id/guardrail-override`, required `reason`), not a fourth
+  disjoint branch inside `PatchRepo` (which is bool-pointers-only and rejects combining
+  paths at `forge.go:627`). Only the admin *read* surface (the blocked-repos list) and
+  this admin write are new.
+
+**What it waives, and what it never does (fail-closed preserved).** The override
+downgrades the known "bot is too strong" blocking codes — `default_branch_unprotected`,
+`write_role_can_push`, `bot_can_push`, `write_role_can_merge`, `bot_can_merge`,
+`unprotected_file_patterns` — to a non-blocking "overridden" state on that repo. It
+**never** waives `protection_unreadable` (D3): a 403/5xx/timeout still refuses, even on
+an allowed repo, because you cannot acknowledge a risk uzi could not read and a hostile
+forge must not pass by erroring. Mechanically this is a **post-evaluation severity
+downgrade**: `evaluateRepo` runs unchanged (Protected-first, R3), produces its
+`Finding{Code, Severity}` set, and only *then* are the six waivable codes downgraded on
+an allowed repo — **never** an early `if override { skip }`, which would reintroduce the
+Protected-first inversion (an unprotected `main` reads `false,false` as safe) and would
+waive `protection_unreadable` (R8). The override enters as a **new parameter** to the
+gate evaluator and a **new field** on `privcheck.Repo` for the badge; `evaluateRepo`
+itself (today pure, with no override state) stays pure. So an allowed repo is allowed
+identically at enable, insert, and claim — there is no second code path to drift.
+
+**Storage — on the `repos` row (Q2).** Three columns: `guardrail_override_reason` (text,
+**NULL = no override** — this is the active discriminator, so Revoke NULLs all three),
+`guardrail_override_by` (user FK — the admin) and `guardrail_override_at` (timestamptz).
+Chosen over an `app_settings` repo allow-list (the lighter `docker_repo_allowlist` shape)
+because multi-user needs a per-owner audit trail and a list cannot hold a reason. The
+actor FK must **not** be a naive `ON DELETE SET NULL` (the agent-template `updated_by`
+trap CLAUDE.md flags): nulling the actor while the override stays live is an audit gap —
+use `ON DELETE RESTRICT`, or treat null-actor-with-non-null-reason as needing
+re-attestation.
+
+**Lifecycle — persist until revoked, never silently re-arm (Q3).** An override does
+**not** auto-expire. Auto-expiry would re-block a member's runs with nobody present to
+fix it — the exact "block nobody is watching" failure the guardrail exists to avoid.
+Instead the admin list shows the override's age and flags it stale past ~30 days
+(visibility, not automatic revocation). Fixing protection on the forge clears the
+finding on the next sweep and the override simply sits harmless; **Revoke** re-arms the
+block immediately.
+
+**Discovery — pull now, nudge later (Q4).** The admin blocked-repos list is the pull
+surface shipped here. A Slack/notification nudge on the first guardrail block per repo
+is the right follow-up on the existing `slacksvc`/health-nudge machinery, filed rather
+than built on this milestone's critical path. The member already learns via the 422 at
+the UI gate, or a `failed: guardrail` run for the autopilot / CI-fix / self-improve
+paths.
+
+The one-line rule across storage, lifecycle, and discovery: **fail closed, but never
+silently** — the exception persists and stays visible, and nothing re-blocks without a
+human seeing it.
+
 ## Milestones
 
 - [ ] **M1 — Coded findings + severity table** (D5, D6): `Finding{Code, Severity, Message}`
@@ -244,7 +324,31 @@ Same reasoning for GitLab's `bot_can_push` and `write_role_can_push`: **both blo
       `ForgePAT` is attached. Run → `failed` with a reason, never a 500.
 - [ ] **M7 — Release note + docs**: name the affected repos from M3, say how to fix
       each forge, and flip `docs/forgejo-bot-setup.md`'s "uzi will not do it for you"
-      to "uzi will refuse to run until you do".
+      to "uzi will refuse to run until you do"; and document the admin override (D8) —
+      who can set it, that it is per-repo and audited, and that it never waives the
+      unreadable case.
+- [ ] **M8 — Admin per-repo override, backend** (D8): a goose migration adding the three
+      `repos` columns (draft number, renamed to the next free number at merge per repo
+      convention); **admin-only, unscoped** set/clear-override queries (no `...ForUser`
+      member variant); the new columns added to **every projection that must see them** —
+      the gate's repo fetch, `GetRepoForUser` (`forge.sql:80`, explicit column list — a
+      new column is invisible until added there), and the badge read; a dedicated
+      admin-only route `POST /api/admin/repos/:id/guardrail-override` (required `reason`);
+      the shared evaluator downgrades the six waivable codes to "overridden"
+      **post-evaluation**, never `protection_unreadable`; the three gates honor it. Tests:
+      an allowed repo runs at all three gates; a member cannot self-allow **any** repo
+      (owned included); an allowed repo whose protection read *errors* is still refused;
+      the Protected-first inversion is not reintroduced.
+- [ ] **M9 — Override UI** (D8): **extend** M4's Repos-page badge (same file, later
+      phase — do not rebuild it) with "ask an admin" (member) / inline Allow-anyway +
+      Revoke (admin-owner); a new admin cross-user **blocked repos** list (allow/revoke
+      any owner's repo) beside Agents-status, backed by a **new admin-only query + route**
+      (precedent `AdminListRuns`) reading the **stored** `privilege_report` /
+      `privilege_status` — cheap and display-appropriate, but it inherits R1's
+      `INTERVAL=0` → empty-is-*unknown* caveat, which the list must state rather than
+      render as "none blocked". The Allow-anyway modal names the exact findings being
+      accepted and requires a reason. Per repo convention, check `api/cmd/uzi/` for a
+      matching CLI surface (the CLI is a second API consumer) and note it even if deferred.
 
 ### Execution plan
 
@@ -253,7 +357,8 @@ Same reasoning for GitLab's `bot_can_push` and `write_role_can_push`: **both blo
 | **1** | **M3** alone | **Must precede M1** — the migration destroys the evidence. |
 | **2** | **M1** → **M2** | M2 builds on the coded findings. |
 | **3** | **M4** ∥ **M5** ∥ **M6** | Three disjoint gates: handler+web / service / claim. |
-| **4** | **M7** alone | Docs once the as-built and the impact count are known. |
+| **4** | **M8** → **M9** | Override backend before its UI; both need the gates (M4–M6) landed and the coded findings (M1). |
+| **5** | **M7** alone | Docs once the as-built, the impact count, and the override are known. |
 
 **Nothing here lands dark.** Unlike #65, **M4/M5/M6 refuse GitLab repos the moment
 they land** — no `forgejo` row needed. This PRD's landing is when the behaviour change
@@ -268,7 +373,9 @@ becomes user-visible, and it should be released on that basis.
 | **R3** | **The inversion**: `false,false` on an unprotected branch means *unevaluated*, not *safe* (#65 R12). A naive gate would wave through the worst case. | **High** | `Protected` checked first in the shared evaluator (M2), inherited from #65. Test asserts unprotected → blocked. |
 | **R4** | **Fail-closed turns a forge blip into refused runs.** | Medium | Accepted and correct — the alternative is a forge that passes the guardrail by erroring. Note run-creation already 502s on forge unavailability (`workers.go:480`), so this is not a new coupling. |
 | **R5** | **A gate in the wrong layer misses autopilot / CI-fix / self-improve** — three separate PAT-bearing inserts, not one. | Medium | D1's service-layer helper + claim backstop. The handler alone covers 1 of 3. |
-| **R6** | **Users route around a block they consider wrong** — e.g. by disabling privcheck. | Medium | Verify no bypass flag exists before shipping; if one does, it must not disable *enforcement*. `INTERVAL=0` is explicitly reporting-only under D2 and must be tested as such. |
+| **R6** | **Users route around a block they consider wrong** — e.g. by disabling privcheck. | Medium | Verify no bypass flag exists before shipping; if one does, it must not disable *enforcement*. `INTERVAL=0` is explicitly reporting-only under D2 and must be tested as such. **The admin override (D8) is the sanctioned route: per-repo, admin-only, audited — not a global switch.** |
+| **R7** | **The override becomes a de-facto always-on bypass** — set once and forgotten, silently defeating the guardrail on that repo. | Medium | Per-repo + admin-only + required reason + actor/timestamp + a visible, staleness-flagged admin list (D8). Scoped and logged, not a global switch. No auto-expiry precisely so re-blocking is never silent — but the list surfaces age and flags stale overrides. |
+| **R8** | **An override waives the fail-closed unreadable case**, letting a hostile or erroring forge pass on an allowed repo. | High | The evaluator only downgrades the known "too strong" codes; `protection_unreadable` is **never** overridable (D8, D3). Test: an overridden repo whose protection read errors is still refused. |
 
 ## Success Criteria
 
@@ -287,6 +394,16 @@ becomes user-visible, and it should be released on that basis.
 - `UZI_PRIVILEGE_CHECK_INTERVAL=0` disables *reporting* and **not** *enforcement* (D2).
 - M3's count is in the release note, and every affected repo is named before the flip
   (R1).
+- An **admin** can allow a blocked repo — one they own (inline on Repos) and one owned
+  by another user (from the admin blocked-repos list) — and it then runs at all three
+  gates (D8).
+- A **member cannot self-allow**; they see the block and a pointer to ask an admin (D8).
+- An **overridden** repo whose branch-protection read **errors** is still refused — the
+  override never waives the unreadable case (D8/D3, R8).
+- An override **persists until revoked** and never silently re-arms; the admin list
+  surfaces its age (D8, Q3), and **Revoke** re-blocks immediately.
+- The override is **recorded** with reason, actor, and timestamp on the `repos` row
+  (D8, Q2).
 
 ## Decision Log
 
@@ -298,4 +415,5 @@ becomes user-visible, and it should be released on that basis.
 | D4 | Refuse the action, never auto-disable | 2026-07-17 | Architect. Silently dropping a repo is a worse surprise and destroys config for a one-click fix. Badge is part of the feature. |
 | D5 | Coded findings, severity from a table | 2026-07-17 | Architect + Fable review. Free-text violations make the blocking set unenumerable; hand-set severity loses it again. |
 | D7 | `unprotected_file_patterns` blocks | 2026-07-17 | Architect. "`main` is never touched", not "except `*.md`". |
+| D8 | Admin per-repo override (escape hatch): per-repo, admin-only, audited; owner cannot self-allow; never waives `protection_unreadable`; stored on the `repos` row with reason/actor/timestamp; persists until revoked; multi-user needs a new admin cross-user blocked-repos surface | 2026-08-12 | User. A scoped, logged accept-risk exception (the `docker_repo_allowlist` shape), not the R6 global bypass. Q2 storage = `repos` row; Q3 = persist-until-revoked with staleness surfaced; Q4 = pull list now, Slack nudge as follow-up. **Refined same day per architect review**: admin-only write with NO member path (`PatchRepo` has a member branch — reuse only its admin shape, via a dedicated `POST /api/admin/repos/:id/guardrail-override`); override applied as a post-evaluation severity downgrade (never an early skip, R3/R8); migration + new admin queries + column projections (incl. `GetRepoForUser`) named in M8; actor FK not naive `ON DELETE SET NULL`. |
 | — | **Split from #65** | 2026-07-17 | User, on the architect's escalation. A GitLab behaviour change with no Forgejo content should not ship as a footnote to a driver PRD, and it needs its own impact count, release note, and rollout. Splitting also restored #65's dark-landing property. |
