@@ -1052,14 +1052,48 @@ back to defaults (PRD #1/#2 convention). Worker-side: `UZI_API_URL`,
 `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`, `UZI_WORKER_NAME`, and the interval knobs above
 (duration-or-ms).
 
-## 50. Guardrail layering (design; enforcement lands M3)
+## 50. Guardrail layering (layer 2 = M2, layers 3–5 = M3; layer 1 enforced by PRD #66)
 
 Serves human: "agents only ever create MRs, never write to main — primary directive."
 
+Note on the "M3" in this section: layer 2 (worker-owned network git) landed in **M2**;
+**layers 3–5** are the rest of the agent/worker git guardrails and landed in **M3 of the
+original guardrail PRD** (deny-hook, permission mode, settingSources). That is a different
+milestone set from PRD #66, which is what makes **layer 1** enforced — do not conflate the
+two.
+
 Layered so no single layer is load-bearing, and none trusts the model:
-1. **GitLab role**: the bot is Developer and `main` is protected (documented project
-   config; **now continuously verified by PRD #5's privcheck** — see §405–§407, which
-   turns this layer from documented-and-hoped into checked-at-save-and-periodically).
+1. **Forge role / protected default branch — ENFORCED (PRD #66).** The bot is Developer
+   and `main` is protected (documented project config), verified by PRD #5's privcheck
+   (§405–§407). **PRD #66 turns this layer from checked-and-reported into refused:** uzi
+   now REFUSES a run when the bot can push or merge to the default branch — no longer a
+   badge nobody reads. This closes the problem #66 names: the platform layer was
+   previously checked, reported, then *ignored* (a repo the bot could push `main` on ran
+   exactly like one it could not).
+   - **Three refusal points** (D1, one per moment the capability is granted): **repo-enable**
+     (`422`, so the present user can fix it); the **PAT-bearing run inserts** — issue/autopilot,
+     CI-fix, self-improve, scheduled prompt — all via one shared service-layer helper so the
+     unattended paths are covered (`422` at the UI, refused otherwise); and the **claim backstop**
+     (the run goes `failed`, since a queued run outlives its earlier checks). A gate in the handler
+     alone covers only 1 of the inserts; the service-layer + claim placement covers all.
+   - **Live, not the stored report (D2):** the gate re-reads protection at decision time, never
+     the cached `privilege_report`. So `UZI_PRIVILEGE_CHECK_INTERVAL=0` disables *reporting*, not
+     *enforcement*, and a user who fixes protection is unblocked at once (not up to 24h later).
+   - **Fails closed (D3):** cannot-evaluate is cannot-run — a forge read error or otherwise
+     unverifiable protection also refuses (a hostile forge must not pass by erroring). The
+     evaluator checks `Protected` FIRST, so an unprotected `main` is not misread as `false,false` safe.
+   - **The rule / coded blocking set (D3/D6):** refuse on `user_can_push` / `user_can_merge`
+     on the default branch, the unprotected default branch, or the fail-closed
+     `protection_unreadable` condition. **Judge and chat runs are unaffected** — they carry no
+     PAT by construction, so there is nothing to guard (Out of Scope).
+   - **Admin per-repo override (D8):** an instance admin may allow ONE named repo through —
+     per-repo, admin-only (no member self-allow path), with a required reason, audited (actor +
+     timestamp on the `repos` row). Applied as a **post-evaluation severity downgrade** of the six
+     waivable "bot too strong" codes only; it **never** waives the fail-closed `protection_unreadable`
+     case, so a forge blip still refuses even an allowed repo.
+   - **Scope limit (Out of Scope):** only the bot's **PAT** is guarded. A write **deploy key**
+     could still reach `main` and this check cannot see it (uzi provisions none). Say "the bot's
+     PAT cannot", never "nothing can".
 2. **Worker-owned network git** (§45): the agent literally has no push credential, so
    protected-branch writes are impossible regardless of what the model attempts —
    **this is realized now** (M2), the strongest layer.

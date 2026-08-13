@@ -10,9 +10,11 @@ audience: user
 fresh Forgejo repo ships with `main` completely unprotected, and even once you
 protect it, the merge whitelist itself defaults **off** — meaning any Write-role
 account, including the bot, can merge its own pull request into `main`. Do this
-first, before you connect the bot: it's step 1 below, not a footnote. (Today uzi
-only warns about a missing whitelist, it doesn't refuse to run — see
-[Least privilege](#least-privilege-what-uzi-verifies) below.)
+first, before you connect the bot: it's step 1 below, not a footnote. **uzi
+refuses to run until you do** — it won't let you enable the repo, and it
+refuses to start (or claim) a run against one that's already enabled but
+still unprotected (see [Least privilege](#least-privilege-what-uzi-verifies)
+below).
 
 uzi acts on the forge as **your own bot account**, never your personal identity: a
 revocable, individually-scoped identity instead of one shared credential. See
@@ -97,13 +99,20 @@ over-privilege violation rejects the save and stores nothing), on demand
 (**Check privileges** in Settings → Forge), and periodically (the background
 sweep, `UZI_PRIVILEGE_CHECK_INTERVAL`).
 
-**Today, a missing merge whitelist (or an unprotected `main`) shows as a
-violation badge — it does not block sync or refuse to run.** A follow-up will
-turn this into a hard refusal; until then, treat the badge as the signal and
-step 1 above as the fix. Separately: a **deploy key** with write access bypasses
-Forgejo's role checks entirely, so "the bot's PAT can't merge or push" isn't "nothing
-can" — uzi provisions no deploy keys itself, but if your project already has one it
-sits outside everything checked here.
+**A missing merge whitelist (or an unprotected `main`) shows as a violation
+badge, and uzi refuses to act on it**: it won't let you enable the repo, and
+it refuses to start or claim a run against one that's already enabled. The
+check is live and fails closed, so a Forgejo that errors or times out while
+uzi reads branch protection also refuses, rather than passing by accident.
+Sync itself is unaffected — the board keeps syncing so you can see and fix
+the problem; only starting an agent against the repo is refused. Treat the
+badge as the signal and step 1 above as the fix. An instance admin can
+override the refusal for one named repo, with a recorded reason, if the risk
+is knowingly accepted — see [Admin settings](./admin-settings.md#guardrail-override-per-repo).
+Separately: a **deploy key** with write access bypasses Forgejo's role checks
+entirely, so "the bot's PAT can't merge or push" isn't "nothing can" — uzi
+provisions no deploy keys itself, but if your project already has one it sits
+outside everything checked here, admin override included.
 
 **Two gaps uzi cannot see, by design** (reading either needs repo-admin, which the
 bot deliberately never holds): a **team** the bot belongs to on the push/merge
