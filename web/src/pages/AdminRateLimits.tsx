@@ -7,11 +7,11 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
-  burnForecast,
   forecastKey,
   forecastReadingsFor,
   formatAgo,
   formatCountdown,
+  rowForecast,
   sortAdminRows,
   statusBadge,
   useNow,
@@ -26,7 +26,8 @@ import { RateLimitForecastMeter } from "../components/RateLimitForecast";
 type Series = ReturnType<typeof useReadingSeries>;
 
 // One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
-// the shared MeterTrack, its percent, and the reset countdown. The visible chip is
+// the RateLimitForecastMeter (the shared MeterTrack plus the PRD #309 burn-rate
+// ghost overlay), its percent, and the reset countdown. The visible chip is
 // short, but MeterTrack's aria-label carries the FULL window name ("5-hour window"
 // / "7-day window") for screen readers (Decision 4 — the test selects bars by that
 // name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
@@ -88,7 +89,7 @@ function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: 
         label="5-hour window"
         stale={limits.stale}
         now={now}
-        forecast={burnForecast(series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
       />
       <WindowRow
         win={limits.seven_day}
@@ -96,7 +97,7 @@ function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: 
         label="7-day window"
         stale={limits.stale}
         now={now}
-        forecast={burnForecast(series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
       />
     </div>
   );

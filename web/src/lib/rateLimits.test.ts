@@ -8,6 +8,7 @@ import {
   formatAgo,
   formatCountdown,
   pushSample,
+  rowForecast,
   rowState,
   SERIES_MAX_AGE_MS,
   SERIES_MAX_SAMPLES,
@@ -330,6 +331,25 @@ describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
     // Latest pct is 60 in both; only the earlier sample — hence the slope — differs.
     expect(burnForecast(samples(4, 60), RESET_5MIN, NOW).state).toBe("over"); // steep rise
     expect(burnForecast(samples(58, 60), RESET_5MIN, NOW).state).toBe("safe"); // gentle rise
+  });
+});
+
+describe("rowForecast (PRD #309 M4 — render-side stale short-circuit)", () => {
+  // A would-be "over" series: pct 4→60 over a 5-min span, reset 5 min out → projected 116.
+  const rising: BurnSample[] = [
+    { tMs: NOW - 5 * 60_000, pct: 4 },
+    { tMs: NOW, pct: 60 },
+  ];
+  const RESET = NOW_SECS + 300;
+
+  it("delegates to burnForecast for a live (non-stale) row", () => {
+    expect(rowForecast(false, rising, RESET, NOW, "usage_endpoint").state).toBe("over");
+  });
+
+  it("is silent for a stale row even with a would-be-over series (no forecast off a frozen reading)", () => {
+    // Guards the ok→stale transient: the accumulation clears one render late, so the
+    // render-side gate must suppress the forecast immediately on the stale render.
+    expect(rowForecast(true, rising, RESET, NOW, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
   });
 });
 

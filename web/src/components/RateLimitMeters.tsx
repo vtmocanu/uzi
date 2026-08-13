@@ -7,11 +7,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
-  burnForecast,
   forecastKey,
   forecastReadingsFor,
   formatAgo,
   formatCountdown,
+  rowForecast,
   statusBadge,
   useNow,
   useReadingSeries,
@@ -165,14 +165,14 @@ function TokenMeters({
           win={limits.five_hour}
           now={now}
           dim={limits.stale}
-          forecast={burnForecast(series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+          forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
         />
         <SettingsWindowRow
           label="7-day window"
           win={limits.seven_day}
           now={now}
           dim={limits.stale}
-          forecast={burnForecast(series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+          forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
         />
       </div>
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
@@ -362,13 +362,13 @@ function TokenMicroMeters({
         label="5h"
         win={limits.five_hour}
         dim={limits.stale}
-        forecast={burnForecast(series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
       />
       <MicroRow
         label="7d"
         win={limits.seven_day}
         dim={limits.stale}
-        forecast={burnForecast(series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
       />
     </div>
   );

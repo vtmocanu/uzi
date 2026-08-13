@@ -399,6 +399,23 @@ export function burnForecast(
   return { state: projectedPct > 115 ? "over" : "on_pace", projectedPct };
 }
 
+// rowForecast is burnForecast with the stale short-circuit the three surfaces share.
+// A stale reading draws NO forecast on the SAME render it goes stale, rather than
+// waiting for useReadingSeries' deferred clear (the accumulation clears an ok→stale
+// key in an effect, one render later — so without this gate a just-frozen row could
+// carry a ghost for up to a clock tick). Centralised so a new surface can't forget
+// it. Silent = safe (D3); projecting off a frozen number is misleading (D8 kin).
+export function rowForecast(
+  stale: boolean,
+  samples: BurnSample[],
+  resetsAtSec: number | null,
+  nowMs: number,
+  source?: RateLimitSource,
+): BurnForecast {
+  if (stale) return { state: "safe", projectedPct: 0 };
+  return burnForecast(samples, resetsAtSec, nowMs, source);
+}
+
 // ── Trailing-sample accumulation (PRD #309 M2) ───────────────────────────────
 //
 // burnForecast reads a slope, but the API ships one point-in-time reading per poll

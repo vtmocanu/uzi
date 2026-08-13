@@ -372,4 +372,25 @@ describe("RateLimitCard forecast (PRD #309)", () => {
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
     expect(screen.queryByText("»")).toBeNull();
   });
+
+  it("clears the forecast the moment a forecasting row goes stale (no ghost on a frozen bar)", async () => {
+    let poll = 0;
+    mockApi.getMyRateLimits.mockImplementation(async () => {
+      const pct5 = Math.min(40 + poll * 8, 88);
+      const stale = poll >= 7; // polls 0..6 rise live; 7+ freeze the same reading stale
+      poll += 1;
+      const r = fiveHourAt(pct5);
+      return tokens(r.status === "ok" ? { ...r, stale } : r);
+    });
+    render(<RateLimitCard />);
+    await flush(); // 40%
+    for (let k = 0; k < 6; k++) await flush(60_000); // rising, live → forecast appears
+    expect(screen.getByText("»")).toBeTruthy();
+
+    await flush(60_000); // poll 7 → same pct, stale=true
+    await flush(60_000); // settle
+    expect(screen.queryByText("»")).toBeNull(); // ghost gone immediately (rowForecast gate)
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
+  });
 });
