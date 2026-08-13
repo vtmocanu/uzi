@@ -12,6 +12,80 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminListReposWithPrivilege = `-- name: AdminListReposWithPrivilege :many
+SELECT r.id, r.path_with_namespace, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       c.id AS connection_id, c.forge_type, c.privilege_report,
+       c.privilege_status, c.privilege_checked_at,
+       u.id AS owner_id, u.email AS owner_email,
+       ab.email AS override_by_email
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+JOIN users u ON u.id = c.user_id
+LEFT JOIN users ab ON ab.id = r.guardrail_override_by
+ORDER BY u.email ASC, r.path_with_namespace ASC
+`
+
+type AdminListReposWithPrivilegeRow struct {
+	ID                      uuid.UUID          `json:"id"`
+	PathWithNamespace       string             `json:"path_with_namespace"`
+	Enabled                 bool               `json:"enabled"`
+	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	ConnectionID            uuid.UUID          `json:"connection_id"`
+	ForgeType               string             `json:"forge_type"`
+	PrivilegeReport         []byte             `json:"privilege_report"`
+	PrivilegeStatus         pgtype.Text        `json:"privilege_status"`
+	PrivilegeCheckedAt      pgtype.Timestamptz `json:"privilege_checked_at"`
+	OwnerID                 uuid.UUID          `json:"owner_id"`
+	OwnerEmail              string             `json:"owner_email"`
+	OverrideByEmail         pgtype.Text        `json:"override_by_email"`
+}
+
+// PRD #66 M9 (D8): the admin cross-user blocked-repos list. Every repo across ALL
+// connections joined to its connection (for the stored privilege_report, status,
+// checked_at and forge_type) and its owning user (email/id), plus the per-repo
+// guardrail_override_* columns and — via a LEFT JOIN — the override actor's email
+// when resolvable. UNSCOPED (admin-only, gated in the handler, precedent
+// ListActiveRunsAll). The handler computes Blocks() from the report and returns
+// only the blocked-or-overridden rows; the query returns all so the handler can
+// also flag connections that were never checked (privilege_status NULL, R1).
+func (q *Queries) AdminListReposWithPrivilege(ctx context.Context) ([]AdminListReposWithPrivilegeRow, error) {
+	rows, err := q.db.Query(ctx, adminListReposWithPrivilege)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminListReposWithPrivilegeRow{}
+	for rows.Next() {
+		var i AdminListReposWithPrivilegeRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PathWithNamespace,
+			&i.Enabled,
+			&i.GuardrailOverrideReason,
+			&i.GuardrailOverrideBy,
+			&i.GuardrailOverrideAt,
+			&i.ConnectionID,
+			&i.ForgeType,
+			&i.PrivilegeReport,
+			&i.PrivilegeStatus,
+			&i.PrivilegeCheckedAt,
+			&i.OwnerID,
+			&i.OwnerEmail,
+			&i.OverrideByEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const clearBoardOrderExcept = `-- name: ClearBoardOrderExcept :exec
 UPDATE issues
 SET board_position = NULL
@@ -44,6 +118,40 @@ type ClearBoardOrderExceptParams struct {
 func (q *Queries) ClearBoardOrderExcept(ctx context.Context, arg ClearBoardOrderExceptParams) error {
 	_, err := q.db.Exec(ctx, clearBoardOrderExcept, arg.RepoID, arg.Iids)
 	return err
+}
+
+const clearRepoGuardrailOverride = `-- name: ClearRepoGuardrailOverride :one
+UPDATE repos
+SET guardrail_override_reason = NULL,
+    guardrail_override_by     = NULL,
+    guardrail_override_at     = NULL
+WHERE id = $1
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+`
+
+// PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
+// immediately at the next gate call. NULLs all three columns — the reason NULL is
+// the active discriminator every gate reads. ADMIN-ONLY, UNSCOPED by id (same
+// reasoning as SetRepoGuardrailOverride). An unknown id returns no rows (404).
+func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) (Repo, error) {
+	row := q.db.QueryRow(ctx, clearRepoGuardrailOverride, id)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+	)
+	return i, err
 }
 
 const countBoardColumns = `-- name: CountBoardColumns :one
@@ -239,6 +347,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -251,21 +360,27 @@ type GetRepoForUserParams struct {
 }
 
 type GetRepoForUserRow struct {
-	ID                uuid.UUID   `json:"id"`
-	ConnectionID      uuid.UUID   `json:"connection_id"`
-	ForgeProjectID    int64       `json:"forge_project_id"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	Enabled           bool        `json:"enabled"`
-	ForgeType         string      `json:"forge_type"`
-	BaseUrl           string      `json:"base_url"`
-	TokenCiphertext   []byte      `json:"token_ciphertext"`
-	UserID            uuid.UUID   `json:"user_id"`
+	ID                      uuid.UUID          `json:"id"`
+	ConnectionID            uuid.UUID          `json:"connection_id"`
+	ForgeProjectID          int64              `json:"forge_project_id"`
+	PathWithNamespace       string             `json:"path_with_namespace"`
+	WebUrl                  string             `json:"web_url"`
+	DefaultBranch           pgtype.Text        `json:"default_branch"`
+	Enabled                 bool               `json:"enabled"`
+	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	ForgeType               string             `json:"forge_type"`
+	BaseUrl                 string             `json:"base_url"`
+	TokenCiphertext         []byte             `json:"token_ciphertext"`
+	UserID                  uuid.UUID          `json:"user_id"`
 }
 
 // One repo plus the connection fields needed to build a forge client, scoped to
-// the owning user.
+// the owning user. guardrail_override_reason feeds the #66 gates (M4 enable, M5
+// create): a non-NULL reason means the admin per-repo override is active, so the
+// gate passes Overridden=true and the shared evaluator downgrades the waivable
+// "bot is too strong" findings (never protection_unreadable — D8/D3).
 func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) (GetRepoForUserRow, error) {
 	row := q.db.QueryRow(ctx, getRepoForUser, arg.ID, arg.UserID)
 	var i GetRepoForUserRow
@@ -277,6 +392,9 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.WebUrl,
 		&i.DefaultBranch,
 		&i.Enabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -377,7 +495,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -404,6 +522,9 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
 			&i.RepoClaudemdEnabled,
+			&i.GuardrailOverrideReason,
+			&i.GuardrailOverrideBy,
+			&i.GuardrailOverrideAt,
 		); err != nil {
 			return nil, err
 		}
@@ -416,7 +537,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -443,6 +564,9 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
 			&i.RepoClaudemdEnabled,
+			&i.GuardrailOverrideReason,
+			&i.GuardrailOverrideBy,
+			&i.GuardrailOverrideAt,
 		); err != nil {
 			return nil, err
 		}
@@ -892,7 +1016,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -924,6 +1048,9 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.RepoSkillsEnabled,
 			&i.RepoDevboxOptIn,
 			&i.RepoClaudemdEnabled,
+			&i.GuardrailOverrideReason,
+			&i.GuardrailOverrideBy,
+			&i.GuardrailOverrideAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1022,7 +1149,7 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -1046,6 +1173,9 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }
@@ -1054,7 +1184,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -1079,6 +1209,9 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }
@@ -1087,7 +1220,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -1110,6 +1243,57 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+	)
+	return i, err
+}
+
+const setRepoGuardrailOverride = `-- name: SetRepoGuardrailOverride :one
+UPDATE repos
+SET guardrail_override_reason = $2,
+    guardrail_override_by     = $3,
+    guardrail_override_at     = $4
+WHERE id = $1
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
+`
+
+type SetRepoGuardrailOverrideParams struct {
+	ID                      uuid.UUID          `json:"id"`
+	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+}
+
+// PRD #66 M8 (D8): set the admin per-repo guardrail override. ADMIN-ONLY and
+// UNSCOPED by id — there is deliberately no `...ForUser` member variant, because a
+// member self-allowing is exactly the R6 route-around D8 forbids. Gated on
+// user.IsAdmin in the handler; the actor id ($3) and timestamp ($4) come from the
+// session and now(), never the request body. reason ($2) is required non-empty
+// (enforced in the handler). An unknown id returns no rows (mapped to 404).
+func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuardrailOverrideParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoGuardrailOverride,
+		arg.ID,
+		arg.GuardrailOverrideReason,
+		arg.GuardrailOverrideBy,
+		arg.GuardrailOverrideAt,
+	)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }
@@ -1119,7 +1303,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -1146,6 +1330,9 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }
@@ -1156,7 +1343,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -1187,6 +1374,9 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }
@@ -1420,7 +1610,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at
 `
 
 type UpsertRepoParams struct {
@@ -1454,6 +1644,9 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.RepoSkillsEnabled,
 		&i.RepoDevboxOptIn,
 		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
 	)
 	return i, err
 }

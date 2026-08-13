@@ -370,7 +370,18 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline")
+		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline",
+		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
+		// override is active. Display-only surfacing for M9's badge.
+		"guardrail_override",
+		// PRD #66 M9 (D8): the server-computed "would a run be refused now" bool the
+		// web reads for the badge STATE (override already applied, single Go rule).
+		"guardrail_blocked")
+}
+
+func TestGuardrailOverrideDTOTags(t *testing.T) {
+	assertTags(t, "GuardrailOverrideDTO", GuardrailOverrideDTO{},
+		"reason", "by", "at")
 }
 
 func TestPipelineDTOTags(t *testing.T) {
@@ -571,4 +582,22 @@ func TestBuildInfoDTOTags(t *testing.T) {
 	zero := int64(0)
 	assertTags(t, "BuildInfoDTO(uptime 0)", BuildInfoDTO{UptimeSeconds: &zero},
 		"version", "founded", "uptime_seconds")
+}
+
+func TestGuardrailImpactDTOTags(t *testing.T) {
+	assertTags(t, "GuardrailImpactDTO", GuardrailImpactDTO{},
+		"checked_at", "enabled_repo_count", "blocked_count", "unevaluable_count", "repos")
+	assertTags(t, "GuardrailImpactRepoDTO", GuardrailImpactRepoDTO{},
+		"repo_id", "path", "user_id", "connection_id", "blocked", "unevaluable")
+}
+
+func TestAdminBlockedReposDTOTags(t *testing.T) {
+	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown")
+	// guardrail_override is null when no override is active but the key is always on
+	// the wire (a blocked-not-overridden repo carries it as null); privilege_status /
+	// privilege_checked_at are pointers, present-as-null when the connection was never
+	// checked, so all keys are asserted on the zero value.
+	assertTags(t, "BlockedRepoDTO", BlockedRepoDTO{},
+		"id", "path", "owner_id", "owner_email", "forge_type", "blocked",
+		"block_messages", "guardrail_override", "privilege_status", "privilege_checked_at")
 }

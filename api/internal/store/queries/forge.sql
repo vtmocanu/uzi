@@ -79,13 +79,43 @@ ORDER BY r.path_with_namespace ASC;
 
 -- name: GetRepoForUser :one
 -- One repo plus the connection fields needed to build a forge client, scoped to
--- the owning user.
+-- the owning user. guardrail_override_reason feeds the #66 gates (M4 enable, M5
+-- create): a non-NULL reason means the admin per-repo override is active, so the
+-- gate passes Overridden=true and the shared evaluator downgrades the waivable
+-- "bot is too strong" findings (never protection_unreadable — D8/D3).
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2;
+
+-- name: SetRepoGuardrailOverride :one
+-- PRD #66 M8 (D8): set the admin per-repo guardrail override. ADMIN-ONLY and
+-- UNSCOPED by id — there is deliberately no `...ForUser` member variant, because a
+-- member self-allowing is exactly the R6 route-around D8 forbids. Gated on
+-- user.IsAdmin in the handler; the actor id ($3) and timestamp ($4) come from the
+-- session and now(), never the request body. reason ($2) is required non-empty
+-- (enforced in the handler). An unknown id returns no rows (mapped to 404).
+UPDATE repos
+SET guardrail_override_reason = $2,
+    guardrail_override_by     = $3,
+    guardrail_override_at     = $4
+WHERE id = $1
+RETURNING *;
+
+-- name: ClearRepoGuardrailOverride :one
+-- PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
+-- immediately at the next gate call. NULLs all three columns — the reason NULL is
+-- the active discriminator every gate reads. ADMIN-ONLY, UNSCOPED by id (same
+-- reasoning as SetRepoGuardrailOverride). An unknown id returns no rows (404).
+UPDATE repos
+SET guardrail_override_reason = NULL,
+    guardrail_override_by     = NULL,
+    guardrail_override_at     = NULL
+WHERE id = $1
+RETURNING *;
 
 -- name: ListEnabledReposByConnection :many
 -- Enabled repos for one connection (privilege sweep + on-demand check). Caller
@@ -93,6 +123,27 @@ WHERE r.id = $1 AND c.user_id = $2;
 -- connection id alone.
 SELECT * FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC;
+
+-- name: AdminListReposWithPrivilege :many
+-- PRD #66 M9 (D8): the admin cross-user blocked-repos list. Every repo across ALL
+-- connections joined to its connection (for the stored privilege_report, status,
+-- checked_at and forge_type) and its owning user (email/id), plus the per-repo
+-- guardrail_override_* columns and — via a LEFT JOIN — the override actor's email
+-- when resolvable. UNSCOPED (admin-only, gated in the handler, precedent
+-- ListActiveRunsAll). The handler computes Blocks() from the report and returns
+-- only the blocked-or-overridden rows; the query returns all so the handler can
+-- also flag connections that were never checked (privilege_status NULL, R1).
+SELECT r.id, r.path_with_namespace, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       c.id AS connection_id, c.forge_type, c.privilege_report,
+       c.privilege_status, c.privilege_checked_at,
+       u.id AS owner_id, u.email AS owner_email,
+       ab.email AS override_by_email
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+JOIN users u ON u.id = c.user_id
+LEFT JOIN users ab ON ab.id = r.guardrail_override_by
+ORDER BY u.email ASC, r.path_with_namespace ASC;
 
 -- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2

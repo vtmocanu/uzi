@@ -45,6 +45,8 @@ type FakeClient struct {
 	AdminCLITokens []apitypes.AdminCLITokenDTO
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
+	GuardrailV     apitypes.GuardrailImpactDTO
+	BlockedReposV  apitypes.AdminBlockedReposDTO
 
 	// Build is the canned GET /api/version reply; BuildErr fails that one call
 	// without failing the rest (see BuildInfo). BuildInfoCalls counts the calls —
@@ -449,6 +451,20 @@ func (f *FakeClient) AdminRateLimits(context.Context) ([]apitypes.AdminRateLimit
 		return nil, f.Err
 	}
 	return f.RateLimits, nil
+}
+
+func (f *FakeClient) GuardrailImpact(context.Context) (apitypes.GuardrailImpactDTO, error) {
+	if f.Err != nil {
+		return apitypes.GuardrailImpactDTO{}, f.Err
+	}
+	return f.GuardrailV, nil
+}
+
+func (f *FakeClient) AdminBlockedRepos(context.Context) (apitypes.AdminBlockedReposDTO, error) {
+	if f.Err != nil {
+		return apitypes.AdminBlockedReposDTO{}, f.Err
+	}
+	return f.BlockedReposV, nil
 }
 
 func (f *FakeClient) StartCLIAuth(context.Context, string, string) (CLIAuthStartResult, error) {

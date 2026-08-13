@@ -87,6 +87,16 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 
 	run, err := h.wsvc.CreateCIFixRun(r.Context(), user.ID, repo.ID, ref, title, description, snapshot, ciConfigPaths)
 	if err != nil {
+		// #66 D1 layer 2: the service-layer guardrail refused. 422 with the forge.go:191
+		// body shape (error + violations), matching the issue-lane gate.
+		var ge *workersvc.GuardrailBlockedError
+		if errors.As(err, &ge) {
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error":      "this CI-fix run was refused: the bot can push or merge to the repo's default branch, or that could not be verified (main is never touched). Fix branch protection on the forge, then retry.",
+				"violations": ge.Findings,
+			})
+			return
+		}
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")

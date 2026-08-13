@@ -128,6 +128,42 @@ signal off, from **Admin → Instance settings → Run health**:
 | Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
 | Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
 
+## Guardrail override (per repo)
+
+uzi refuses to enable a repo, or to start or claim a run against it, if its bot
+could push or merge to the default branch — see "Least privilege: what uzi
+verifies" in the [GitLab](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies),
+[Forgejo](./forgejo-bot-setup.md#least-privilege-what-uzi-verifies), and
+[GitHub](./github-bot-setup.md#least-privilege-what-uzi-verifies) setup docs
+for what triggers the block on each forge.
+
+This is not one of the instance-wide settings above: it is a **per-repo, per-decision**
+exception, not a knob. An **instance admin only** can grant it — a member cannot
+self-allow, not even for a repo they own; they see the block on their own Repos
+page with a pointer to ask an admin. Allowing a repo requires a written reason,
+and the write is recorded with the admin's identity and a timestamp — there's no
+anonymous or unattributed override.
+
+Admins act on it in two places: **inline on the Repos page**, for any repo they
+can already see, with "Allow anyway" (blocked) or "Revoke" (already allowed); and
+from a cross-user **Admin → Blocked repos** page, which lists every user's
+blocked or overridden repos so an admin doesn't have to hunt through each user's
+own Repos page to find one. **Revoke** re-arms the block immediately. An
+override never auto-expires — silently re-blocking a repo with nobody present to
+fix it would be worse than the problem the guardrail exists to prevent — but the
+Blocked repos page flags an override as stale once it's roughly 30 days old, so
+an old accept-risk decision doesn't quietly outlive its reason.
+
+**The override can never waive the case where uzi couldn't read the repo's
+protection at all.** A forge read error, timeout, or an unverifiable answer (see
+the GitHub classic-branch-protection case in the setup doc above) still refuses
+the run even on a repo an admin has allowed — an admin can accept a risk uzi
+told them about, never one uzi couldn't see.
+
+The `uzi admin guardrail-impact` and `uzi admin blocked-repos` CLI commands give
+the same picture from a terminal instead of the web UI — see
+[docs/cli.md](./cli.md#commands) for both.
+
 ## Validation
 
 - A label value (PRD, autopilot, or PRDLESS) may not be empty, longer than 64

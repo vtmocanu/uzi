@@ -38,6 +38,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/planpolicy"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/pushbroker"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
@@ -205,7 +206,22 @@ var (
 	// read from) → 409 (PRD #158 M1). Distinct from ErrRunNotOwned (404): the run
 	// exists and is held by this worker, it just has nothing to read against.
 	ErrForgeNoRepo = errors.New("run has no repo for forge read")
+
+	// ErrGuardrailBlocked is the sentinel the #66 default-branch guardrail refuses a
+	// run with (D1 layer 2). Returned wrapped in a *GuardrailBlockedError so callers
+	// can errors.Is it for the 422 mapping and errors.As it to read the block
+	// findings.
+	ErrGuardrailBlocked = errors.New("run refused by the default-branch guardrail")
 )
+
+// GuardrailBlockedError is returned by the run-create paths when the #66 default-
+// branch guardrail refuses (D1 layer 2). Findings carries the block-finding
+// messages for the 422 body. It wraps ErrGuardrailBlocked so callers can errors.Is
+// it, and errors.As it to read Findings.
+type GuardrailBlockedError struct{ Findings []string }
+
+func (e *GuardrailBlockedError) Error() string { return ErrGuardrailBlocked.Error() }
+func (e *GuardrailBlockedError) Unwrap() error { return ErrGuardrailBlocked }
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
@@ -766,6 +782,11 @@ type Service struct {
 	// composite ops return ErrForgesUnavailable rather than panic (the pre-#191
 	// deployments and every test that never wires it are unaffected).
 	forges ForgeBuilder
+	// guard is the #66 default-branch guardrail (D1 layer 2), a narrow RepoGuard
+	// interface *privcheck.Service satisfies; set via SetRepoGuard. Nil ⇒ the
+	// service-layer gate is skipped (guardDefaultBranch is a no-op) and layer 3 (the
+	// claim backstop) remains the security net, so a wiring gap never fails all runs.
+	guard RepoGuard
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -778,6 +799,11 @@ func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 // startup, before serving; pass the same *forgesvc.Service the handlers hold. A nil
 // builder leaves the composite ops returning ErrForgesUnavailable.
 func (s *Service) SetForges(fb ForgeBuilder) { s.forges = fb }
+
+// SetRepoGuard wires the #66 default-branch guardrail (D1 layer 2). Late-injected
+// in main.go because the privcheck.Service is built after this Service. A nil guard
+// leaves guardDefaultBranch a no-op — the claim backstop (M6, layer 3) is the net.
+func (s *Service) SetRepoGuard(g RepoGuard) { s.guard = g }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted
@@ -1026,8 +1052,9 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 //     fail it), keeping worker_id for affinity and NOT bumping requeue_count, so a
 //     persistently locked vault can't trip the requeue cap (mirrors
 //     SweepClaimedNeverStarted);
-//   - a missing/undecryptable credential (or a rejected tool package) is terminal —
-//     fail the run with the safe (no-secret-bytes) reason and fire the failed notify;
+//   - a missing/undecryptable credential (or a rejected tool package), and a #66
+//     guardrail block at claim (D1 layer 3), are terminal — fail the run with the
+//     safe (no-secret-bytes) reason and fire the failed notify;
 //   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
 //
 // The returned error is nil for every handled case (report idle) and non-nil only
@@ -1039,7 +1066,10 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 			return rerr
 		}
 		return nil // idle; the run is queued again, awaiting unlock
-	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected):
+	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) || errors.Is(err, errGuardrailBlockedClaim):
+		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
+		// forge blip (R4; the user restarts after fixing protection), matching
+		// errCredentialUnavailable rather than the transient errVaultLocked requeue.
 		if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 			ID:            run.ID,
 			FailureReason: pgText(err.Error()),
@@ -1063,6 +1093,15 @@ var errCredentialUnavailable = errors.New("credential unavailable")
 // errRunVanished marks a claim whose run disappeared before its payload could be
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
+
+// errGuardrailBlockedClaim marks a claim the #66 default-branch guardrail refused
+// AT CLAIM (D1 layer 3, the security net): the bot can reach the repo's default
+// branch, or that could not be verified (fail-closed). recoverClaimAssembly treats
+// it as TERMINAL (like errCredentialUnavailable, not the transient errVaultLocked
+// requeue), so the run is failed rather than pushing. Its message is safe to store
+// as a run failure reason — it carries only the block finding messages, never any
+// secret bytes.
+var errGuardrailBlockedClaim = errors.New("run refused by the default-branch guardrail at claim")
 
 // errVaultLocked marks a claim that cannot open the owner's DEK-sealed Anthropic
 // token because their vault locked between the claim gate and the open. It must
@@ -1560,6 +1599,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			return nil, errRunVanished
 		}
 		return nil, fmt.Errorf("claim context: %w", err)
+	}
+
+	// #66 D1 layer 3, the claim backstop: this is the single ForgePAT-attach choke
+	// point (the PAT is decrypted just below and shipped at ~1790), reached ONLY by
+	// PAT-bearing runs — the judge lane forked above, and chat is claimed on a
+	// separate lane (ClaimChat/assembleChatClaim; ClaimRun excludes kind<>'chat'), so
+	// no extra kind-guard is needed. This is the security net that SUBSUMES layer 2:
+	// a run queued while main was protected and claimed after protection was removed
+	// is refused HERE rather than pushing. Placed before box.Open so a blocked run is
+	// never decrypted. A nil guard skips (same nil-safety as layer 2; production wires
+	// it via SetRepoGuard). Overridden comes from the live guardrail_override_reason
+	// column GetRunClaimContext now carries (M8): a non-NULL reason means the admin
+	// per-repo override is active, so GuardRepo downgrades the waivable findings
+	// post-evaluation — never protection_unreadable (D8/D3), so a queued-then-claimed
+	// run whose protection read errors is still refused even on an overridden repo.
+	if s.guard != nil {
+		res := s.guard.GuardRepo(ctx, privcheck.GuardInput{
+			ForgeType:       rc.ForgeType,
+			BaseURL:         rc.BaseUrl,
+			TokenCiphertext: rc.TokenCiphertext,
+			Repo: privcheck.Repo{
+				ID:             uuid.UUID(run.RepoID.Bytes).String(),
+				Path:           rc.RepoPath,
+				ForgeProjectID: rc.ForgeProjectID,
+				DefaultBranch:  rc.DefaultBranch.String,
+			},
+			// Live per-repo override (M8): NULL reason ⇒ no override.
+			Overridden: rc.GuardrailOverrideReason.Valid,
+		})
+		if res.Blocked {
+			return nil, fmt.Errorf("%w: %s", errGuardrailBlockedClaim, strings.Join(res.BlockMessages(), "; "))
+		}
 	}
 
 	botPAT, err := s.box.Open(rc.TokenCiphertext)
@@ -3708,10 +3779,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		requireBaseMatch = seed.RequireBase
 	}
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// #66 D1 layer 2: the service-layer guardrail, shared across the PAT-bearing
+	// inserts (issue lane, CI-fix, self-improve, scheduled prompt). Reached by the UI
+	// AND autopilot, so gating here (not the handler) is what covers the unattended path.
+	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
 	issue, err := s.q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: issueIID})

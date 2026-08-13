@@ -107,9 +107,24 @@ over-privilege or fine-grained-token violation rejects the save and stores
 nothing), on demand (**Check privileges** in Settings → Forge), and periodically
 (the background sweep, `UZI_PRIVILEGE_CHECK_INTERVAL`).
 
-**An unverified protection finding does not yet block anything.** Today the
-guardrail that would refuse to run against a repo whose protection uzi can't
-confirm is not built — see [ADR-0238](../adr/0238-github-driver.md) for the
-accepted limitation. Until then, the other guardrail layers hold regardless: the
-worker only ever pushes the agent's own branch and never merges, so `main`
-cannot be written even on a repo whose ruleset coverage uzi cannot see.
+**uzi refuses to run against a repo the bot could push or merge to `main` on —
+and an unverified finding refuses too, not just a confirmed-bad one.** A
+readable ruleset that lets the write role push or merge is a blocking finding
+like GitLab's or Forgejo's: uzi won't let you enable the repo, and refuses to
+start or claim a run against one that's already enabled. On a
+**classic**-protected repo, where uzi cannot read who may push or merge at
+write role, the finding comes back **unverified** rather than a guessed
+answer, and uzi treats "could not confirm" as fail-closed — it refuses the
+same as a confirmed violation, rather than assuming a ruleset it can't see is
+safe. See [ADR-0238](../adr/0238-github-driver.md) for why classic protection
+is undetectable at write role and why that case must fail closed. Because of
+this, prefer a **ruleset** over classic branch protection: it's the only way
+uzi's report (and the fix, once you protect `main`) is authoritative rather
+than "unverified" no matter what you do to classic protection. An instance
+admin can still override the refusal for one named repo, with a recorded
+reason, if the risk is knowingly accepted — see [Admin settings](./admin-settings.md#guardrail-override-per-repo)
+— but the override never waives the unverified case either: an admin can
+accept a risk uzi told them about, never one uzi couldn't read. The other
+guardrail layers hold regardless: the worker only ever pushes the agent's own
+branch and never merges, so `main` cannot be written even where a ruleset's
+coverage is unclear.

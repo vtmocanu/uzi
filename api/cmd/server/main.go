@@ -519,6 +519,10 @@ func run() error {
 	// after deploy, then it ticks on UZI_PRIVILEGE_CHECK_INTERVAL. 0 disables it
 	// entirely (no boot pass, no loop).
 	pcheck := privcheck.NewService(q, svc)
+	// #66 D1 layer 2: wire the default-branch guardrail into the run-create service.
+	// Late-injected here because pcheck is built after wsvc; *privcheck.Service
+	// satisfies workersvc.RepoGuard via its GuardRepo method (M2).
+	wsvc.SetRepoGuard(pcheck)
 
 	var bgWG sync.WaitGroup
 	bgWG.Add(6)

@@ -229,7 +229,87 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens)
+	guardrailImpact := &cobra.Command{
+		Use:   "guardrail-impact",
+		Short: "Pre-flight count of repos the push/merge guardrail would refuse",
+		Long: "Run a LIVE, read-only scan of every enabled repo across the factory and " +
+			"report how many would be refused under the PRD #66 guardrail (the bot can " +
+			"push or merge to the default branch).\n\n" +
+			"It persists nothing: it re-checks the forge on each call rather than reading " +
+			"the stored privilege report, so it reflects the forge as it is right now. " +
+			"UNEVALUABLE repos are counted separately and are NOT safe: a forge error, or " +
+			"a repo with no default branch, means uzi could not tell — treat it as unknown, " +
+			"not as zero affected.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			rep, err := c.GuardrailImpact(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(rep)
+			}
+			rows := make([][]string, 0, len(rep.Repos))
+			for _, r := range rep.Repos {
+				rows = append(rows, []string{cellText(r.Path), boolStr(r.Blocked), boolStr(r.Unevaluable)})
+			}
+			if err := p.Table([]string{"PATH", "BLOCKED", "UNEVALUABLE"}, rows); err != nil {
+				return err
+			}
+			p.Printf("enabled=%d blocked=%d unevaluable=%d\n",
+				rep.EnabledRepoCount, rep.BlockedCount, rep.UnevaluableCount)
+			return nil
+		},
+	}
+
+	blockedRepos := &cobra.Command{
+		Use:   "blocked-repos",
+		Short: "Cross-user list of repos the guardrail blocks or an admin has allowed",
+		Long: "List every user's repos that the push/merge guardrail refuses right now, " +
+			"OR that an admin has explicitly allowed (PRD #66 D8). It reads the STORED " +
+			"privilege report (cheap, display-appropriate) rather than re-sweeping the " +
+			"forge — so unlike `guardrail-impact`, a repo whose connection was never " +
+			"checked (UZI_PRIVILEGE_CHECK_INTERVAL=0) is INVISIBLE here. When that is the " +
+			"case a warning is printed and CHECKS_UNKNOWN is true: an empty list then means " +
+			"\"unknown\", not \"none blocked\".",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			rep, err := c.AdminBlockedRepos(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(rep)
+			}
+			rows := make([][]string, 0, len(rep.Repos))
+			for _, r := range rep.Repos {
+				allowed := "—"
+				if r.Override != nil {
+					allowed = r.Override.By
+				}
+				rows = append(rows, []string{cellText(r.OwnerEmail), cellText(r.Path), boolStr(r.Blocked), cellText(allowed)})
+			}
+			if err := p.Table([]string{"OWNER", "PATH", "BLOCKED", "ALLOWED BY"}, rows); err != nil {
+				return err
+			}
+			if rep.ChecksUnknown {
+				p.Printf("note: at least one connection was never privilege-checked — this list may be incomplete (empty is \"unknown\", not \"none blocked\").\n")
+			}
+			return nil
+		},
+	}
+
+	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos)
 	return cmd
 }
 

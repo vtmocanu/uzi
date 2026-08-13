@@ -464,7 +464,7 @@ function PrivilegeFindings({ report }: { report: PrivilegeReport }) {
   const clean =
     report.token.violations.length === 0 &&
     report.token.warnings.length === 0 &&
-    report.repos.every((r) => r.violations.length === 0 && r.warnings.length === 0);
+    report.repos.every((r) => r.findings.length === 0);
 
   return (
     <div className="space-y-3 text-sm">
@@ -475,16 +475,22 @@ function PrivilegeFindings({ report }: { report: PrivilegeReport }) {
         </p>
         <FindingList violations={report.token.violations} warnings={report.token.warnings} />
       </div>
-      {report.repos.map((r) => (
-        <div key={r.repo_id}>
-          <p className="font-medium text-fg">{r.path}</p>
-          {r.violations.length === 0 && r.warnings.length === 0 ? (
-            <p className="text-xs text-muted">Developer on a protected default branch.</p>
-          ) : (
-            <FindingList violations={r.violations} warnings={r.warnings} />
-          )}
-        </div>
-      ))}
+      {report.repos.map((r) => {
+        // Split the coded findings by severity (PRD #66 D5): block-severity findings
+        // render as violations (danger/✕), warn-severity as warnings (warn/!).
+        const violations = r.findings.filter((f) => f.severity === "block").map((f) => f.message);
+        const warnings = r.findings.filter((f) => f.severity === "warn").map((f) => f.message);
+        return (
+          <div key={r.repo_id}>
+            <p className="font-medium text-fg">{r.path}</p>
+            {r.findings.length === 0 ? (
+              <p className="text-xs text-muted">Developer on a protected default branch.</p>
+            ) : (
+              <FindingList violations={violations} warnings={warnings} />
+            )}
+          </div>
+        );
+      })}
       {clean && <p className="text-xs text-ok">Everything is least-privilege.</p>}
     </div>
   );

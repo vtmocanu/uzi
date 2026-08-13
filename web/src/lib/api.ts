@@ -253,6 +253,21 @@ export interface PrivilegeTokenReport {
   warnings: string[];
 }
 
+// A per-repo finding's severity (PRD #66 D5/D6). "block" findings mean the bot can
+// reach the default branch (or uzi could not tell — fail closed); "warn" are
+// advisory. Mirrors privcheck.Severity's json values exactly.
+export type PrivilegeSeverity = "block" | "warn";
+
+// One coded per-repo finding (PRD #66 D5). code is the stable enum
+// (default_branch_unprotected, write_role_can_push, …); severity comes from the
+// server's single findingSeverity table; message is human copy. Mirrors
+// privcheck.Finding's json tags (code, severity, message) exactly.
+export interface PrivilegeFinding {
+  code: string;
+  severity: PrivilegeSeverity;
+  message: string;
+}
+
 export interface PrivilegeRepoReport {
   repo_id: string;
   path: string;
@@ -264,8 +279,10 @@ export interface PrivilegeRepoReport {
   // violation copy itself, so the web never compares this numerically.
   role: string;
   member: boolean;
-  violations: string[];
-  warnings: string[];
+  // Coded per-repo findings (PRD #66 D5), replacing the old free-text
+  // violations/warnings string slices. Always present (server serializes [] not
+  // null); split by severity at the call site.
+  findings: PrivilegeFinding[];
 }
 
 export interface PrivilegeReport {
@@ -330,6 +347,53 @@ export interface Repo {
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
+  // Admin per-repo guardrail override metadata (PRD #66 D8), null when no override
+  // is active. Display-only surfacing shipped by M8 so M9 can render the badge; M8
+  // itself adds no UI control. Shares the GuardrailOverrideMeta shape with BlockedRepo.
+  guardrail_override?: GuardrailOverrideMeta | null;
+  // Server-computed "would a run be refused on this repo right now" (PRD #66 M9,
+  // D8): the stored findings run through the single shared Go downgrade + Blocks(),
+  // with the override already applied. The badge STATE reads THIS boolean and never
+  // re-derives the waivable set. False on a never-checked connection is "unknown,
+  // not safe" — the enable/run gates still fail closed server-side.
+  guardrail_blocked: boolean;
+}
+
+// GuardrailOverrideMeta is the audit metadata for an active admin per-repo guardrail
+// override (PRD #66 D8): the reason, the actor (email when resolvable, else the raw
+// id), and when it was set.
+export interface GuardrailOverrideMeta {
+  reason: string;
+  by: string;
+  at: string;
+}
+
+// BlockedRepo is one row of the admin cross-user blocked-repos list (PRD #66 M9,
+// D8): a repo that is blocked by the guardrail OR carries an active admin override.
+export interface BlockedRepo {
+  id: string;
+  path: string;
+  owner_id: string;
+  owner_email: string;
+  forge_type: string;
+  // Blocked is the stored-report equivalent of Repo.guardrail_blocked. An
+  // overridden-clean repo reads false but still appears; an overridden repo whose
+  // only finding is protection_unreadable reads true (the override never waives it).
+  blocked: boolean;
+  // Human messages of the block findings; empty for an overridden-clean repo.
+  block_messages: string[];
+  guardrail_override: GuardrailOverrideMeta | null;
+  // The owning connection's last privilege-check state; null when never checked.
+  privilege_status: string | null;
+  privilege_checked_at: string | null;
+}
+
+// AdminBlockedRepos is the GET /api/admin/blocked-repos envelope (PRD #66 M9). When
+// checks_unknown is true at least one connection was never privilege-checked, so an
+// empty list is "unknown", NOT "none blocked" (R1) — the page says so.
+export interface AdminBlockedRepos {
+  repos: BlockedRepo[];
+  checks_unknown: boolean;
 }
 
 export interface BoardColumn {
@@ -2402,6 +2466,15 @@ const realApi = {
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
       repo_devbox_opt_in: enabled,
     }),
+  // Admin per-repo guardrail override (PRD #66 D8). ADMIN-ONLY, no member path — a
+  // dedicated route, not PatchRepo. Requires a non-empty reason; returns the repo.
+  setRepoGuardrailOverride: (id: string, reason: string) =>
+    request<{ repo: Repo }>("POST", `/admin/repos/${id}/guardrail-override`, {
+      reason,
+    }),
+  // Revoke the override (PRD #66 D8): NULLs it, re-arming the guardrail immediately.
+  clearRepoGuardrailOverride: (id: string) =>
+    request<{ repo: Repo }>("DELETE", `/admin/repos/${id}/guardrail-override`),
 
   getBoard: (repoId: string) =>
     request<{ board: Board }>("GET", `/repos/${repoId}/board`),
@@ -2766,6 +2839,10 @@ const realApi = {
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
+  // Admin cross-user blocked-repos list (PRD #66 M9, D8). Returns the envelope with
+  // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).
+  adminListBlockedRepos: () =>
+    request<AdminBlockedRepos>("GET", "/admin/blocked-repos"),
 
   // Notifications inbox (PRD #46 M2). listNotifications is the caller's own inbox;
   // { all: true } asks for every user's (admin only — a non-admin gets 403). The

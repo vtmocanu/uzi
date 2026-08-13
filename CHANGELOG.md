@@ -6,6 +6,46 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Security
+
+- **uzi now refuses to run against a repo whose bot could push or merge straight to
+  the default branch (PRD #66).** Enforcement lands at three points: enabling the
+  repo (422, before the toggle flips), creating a run — the web UI, autopilot,
+  the CI-fix loop, self-improve, and a scheduled prompt all go through the same
+  gate — and at claim, where a run queued while the branch was still protected
+  fails outright if protection was removed in the meantime, rather than pushing.
+  The check is **live**, not the cached privilege report, and it **fails closed**:
+  a forge that errors, times out, or cannot confirm branch protection also
+  refuses, where it previously only warned. This is the first time uzi refuses a
+  run for any reason, and it changes existing GitLab/Forgejo/GitHub behavior on
+  purpose. **Before upgrading**, run `uzi admin guardrail-impact` (or
+  `GET /api/admin/guardrail-impact`) against your instance — a live, read-only
+  scan that reports how many currently-enabled repos would now be refused, and
+  which ones, so the blast radius is known before the rollout rather than
+  discovered repo by repo afterward. To fix an affected repo: protect its
+  default branch and keep the bot off it — see [GitLab bot
+  setup](docs/gitlab-bot-setup.md#least-privilege-what-uzi-verifies), [Forgejo
+  bot setup](docs/forgejo-bot-setup.md#least-privilege-what-uzi-verifies), and
+  [GitHub bot setup](docs/github-bot-setup.md#least-privilege-what-uzi-verifies).
+  This guards only the bot's own PAT: a write **deploy key**, which uzi never
+  provisions, can still push to a protected branch and this check cannot see it.
+
+### Added
+
+- **An instance admin can allow one named repo through the new guardrail (PRD
+  #66).** The override is per-repo, admin-only — a member cannot self-allow,
+  not even for a repo they own — and requires a written reason; who set it and
+  when is recorded on the repo, persists until explicitly revoked, and is
+  flagged stale on the admin list after ~30 days rather than silently
+  re-blocking. It shows inline on the Repos page (a blocked repo carries a
+  badge and, for an admin, an "Allow anyway" control; a member instead sees a
+  pointer to ask an admin) and on a new admin **Blocked repos** page listing
+  every user's blocked or overridden repos, with Revoke re-arming the block
+  immediately. The override never waives the fail-closed case: a repo whose
+  branch protection uzi cannot read stays refused even when allowed. New `uzi
+  admin guardrail-impact` and `uzi admin blocked-repos` CLI commands surface
+  the same data from the terminal — see [docs/cli.md](docs/cli.md).
+
 ## [0.30.0] - 2026-08-12
 
 ### Added

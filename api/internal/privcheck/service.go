@@ -111,6 +111,199 @@ func (s *Service) CheckAllConnections(ctx context.Context) (SweepResult, error) 
 	return res, nil
 }
 
+// GuardrailImpact runs a live, non-persisting pre-flight scan (PRD #66 M3): it
+// iterates every forge connection, and for each enabled repo asks whether the new
+// guardrail would refuse a run (the bot can push/merge to the default branch, per
+// BlocksRun). It PERSISTS NOTHING — it never calls persist/UpdatePrivilegeReport —
+// because it is a measurement, not enforcement, and M3 runs before M1's migration
+// NULLs the stored reports (R1/R2), so it must re-sweep live rather than read the
+// blob.
+//
+// It fails soft per connection and per repo (R1): a client-build error, a
+// VerifyToken error, or a per-repo forge error records that repo as UNEVALUABLE —
+// "unknown", counted apart from blocked and never read as safe — and the scan
+// continues. Only a genuine DB error (listing connections or repos) returns an
+// error, matching CheckConnection. Cancellation (shutdown) stops it promptly.
+func (s *Service) GuardrailImpact(ctx context.Context) (ImpactReport, error) {
+	conns, err := s.q.ListAllForgeConnections(ctx)
+	if err != nil {
+		return ImpactReport{}, err
+	}
+	report := ImpactReport{CheckedAt: s.now(), Repos: []ImpactRepo{}}
+	for i := range conns {
+		if err := ctx.Err(); err != nil {
+			return ImpactReport{}, err
+		}
+		conn := conns[i]
+		rows, err := s.q.ListEnabledReposByConnection(ctx, conn.ID)
+		if err != nil {
+			return ImpactReport{}, err
+		}
+		repos := toRepos(rows)
+
+		// Build the client and derive the bot user id once per connection. A failure
+		// at either step is not fatal: it marks every one of this connection's repos
+		// unevaluable (we could not read the forge to tell), never blocked and never
+		// safe.
+		f, buildErr := s.forges.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+		var (
+			botUserID int64
+			connErr   = buildErr
+		)
+		if connErr == nil {
+			identity, verr := f.VerifyToken(ctx)
+			if verr != nil {
+				connErr = verr
+			} else {
+				botUserID = identity.ForgeUserID
+			}
+		}
+
+		for _, repo := range repos {
+			ir := ImpactRepo{
+				RepoID:       repo.ID,
+				Path:         repo.Path,
+				UserID:       conn.UserID.String(),
+				ConnectionID: conn.ID.String(),
+			}
+			if connErr != nil {
+				ir.Unevaluable = true
+			} else if blocked, ok := s.impactForRepo(ctx, f, botUserID, repo); ok {
+				ir.Blocked = blocked
+			} else {
+				ir.Unevaluable = true
+			}
+
+			report.EnabledRepoCount++
+			switch {
+			case ir.Unevaluable:
+				report.UnevaluableCount++
+			case ir.Blocked:
+				report.BlockedCount++
+			}
+			report.Repos = append(report.Repos, ir)
+		}
+	}
+	return report, nil
+}
+
+// impactForRepo runs the same live forge reads the enforcement gate performs for
+// one repo (ProjectRole + DefaultBranchProtection) and applies BlocksRun. It
+// returns ok=false — the repo is unevaluable — when the repo has no default
+// branch to read protection on, when either forge read errors, or when the
+// protection read came back ProtectionUnverified (protected but the driver could
+// not authoritatively read who may push/merge): fail-closed, "unknown" is not
+// "safe" (R1). The role read is exercised (not consumed by BlocksRun, whose
+// blocking set is the push/merge fields only) so that a repo whose forge
+// round-trips error is counted unevaluable exactly as the live gate would be
+// unable to clear it.
+func (s *Service) impactForRepo(ctx context.Context, f forge.Forge, botUserID int64, repo Repo) (blocked, ok bool) {
+	if repo.DefaultBranch == "" {
+		return false, false
+	}
+	if _, _, err := f.ProjectRole(ctx, repo.ForgeProjectID, botUserID); err != nil {
+		return false, false
+	}
+	bp, err := f.DefaultBranchProtection(ctx, repo.ForgeProjectID, repo.DefaultBranch, botUserID)
+	if err != nil {
+		return false, false
+	}
+	// Protected but unreadable (GitHub legacy-branch case, returned with a nil
+	// error per forge.BranchProtection): the Can* fields are false because the
+	// driver could not tell, not because the branch is safe. Count it unevaluable,
+	// matching BlocksRun's contract and what M2's live gate will refuse as
+	// protection_unreadable — never as not-affected.
+	if bp.ProtectionUnverified {
+		return false, false
+	}
+	return BlocksRun(bp), true
+}
+
+// GuardInput is the minimal per-repo view the live guard needs, decoupled from
+// any store row shape so the handler, the run-create service, and the claim path
+// can each fill it from whatever row they hold.
+type GuardInput struct {
+	ForgeType       string
+	BaseURL         string
+	TokenCiphertext []byte
+	Repo            Repo
+	Overridden      bool
+}
+
+// GuardResult is the guard's verdict. Findings is the post-downgrade set (so a
+// caller can render/message exactly what blocked, or what was overridden).
+type GuardResult struct {
+	Blocked  bool
+	Findings []Finding
+}
+
+// GuardRepo is the shared, fail-closed live guard (PRD #66 M2, D3/D8). It answers
+// one question — may uzi run against this repo right now? — with a live forge read
+// (never the stored report, D2), reusing the single shared evaluateRepo so the
+// Protected-first rule (R3/R12) is never reimplemented or drifted.
+//
+// It fails CLOSED on every unreadable step: a client-build failure, a VerifyToken
+// failure, or (inside evaluateRepo) a branch-protection read error all become a
+// blocking CodeProtectionUnreadable finding. The override (in.Overridden) is
+// applied ONLY as a post-evaluation severity downgrade via DowngradeOverridden —
+// never an early "if overridden { skip }", which would reintroduce the
+// Protected-first inversion and would waive protection_unreadable (R3/R8). Because
+// protection_unreadable is not a waivable code, a forge blip refuses even an
+// allowed repo.
+//
+// Callers: the repo-enable gate (handler.SetRepoEnabled, M4). The run-create
+// service inserts and the claim backstop wire in at M5/M6.
+func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
+	f, err := s.forges.ForgeForConnection(in.ForgeType, in.BaseURL, in.TokenCiphertext)
+	if err != nil {
+		// Client won't build (token undecryptable, key rotated, misconfigured): we
+		// cannot read the forge, so we cannot clear the bot. Fail closed. The message
+		// stays generic — PAT-redaction is the driver's job (matches CheckConnection)
+		// — and this is never waived by the override (not a waivable code).
+		return blockedResult(newFinding(CodeProtectionUnreadable, "could not build a forge client for this connection"))
+	}
+	identity, err := f.VerifyToken(ctx)
+	if err != nil {
+		// Cannot identify the bot ⇒ cannot clear it. Fail closed, generic message.
+		return blockedResult(newFinding(CodeProtectionUnreadable, "could not verify the bot token against the forge"))
+	}
+
+	role, member, roleErr := f.ProjectRole(ctx, in.Repo.ForgeProjectID, identity.ForgeUserID)
+
+	haveBranch := in.Repo.DefaultBranch != ""
+	var (
+		bp    forge.BranchProtection
+		bpErr error
+	)
+	if haveBranch {
+		bp, bpErr = f.DefaultBranchProtection(ctx, in.Repo.ForgeProjectID, in.Repo.DefaultBranch, identity.ForgeUserID)
+	}
+
+	// The one shared evaluator (Protected-first, R3/R12). A bpErr becomes a
+	// protection_unreadable BLOCK inside evaluateRepo, so DefaultBranchProtection
+	// errors are handled there, not by a second code path here. A repo with no
+	// default branch is deliberately NOT blocked: evaluateRepo emits no_default_branch
+	// (a warn) and returns — that is an evaluable "no protected main to reach", not an
+	// unreadable error.
+	rr := RepoReport{RepoID: in.Repo.ID, Path: in.Repo.Path, Findings: []Finding{}}
+	evaluateRepo(&rr, in.Repo, role, member, roleErr, haveBranch, bp, bpErr)
+
+	// Post-evaluation downgrade only (never an early skip): evaluateRepo has already
+	// run Protected-first, so an unprotected main was seen and blocked, and only the
+	// six waivable codes are downgraded on an allowed repo — protection_unreadable
+	// never is (R8).
+	findings := DowngradeOverridden(rr.Findings, in.Overridden)
+	return GuardResult{Blocked: RepoReport{Findings: findings}.Blocks(), Findings: findings}
+}
+
+// blockedResult wraps a single fail-closed finding as a blocked verdict. Used only
+// for the pre-evaluation unreadable steps (client build, VerifyToken), whose
+// findings are protection_unreadable and thus never waived by the override.
+func blockedResult(f Finding) GuardResult {
+	findings := []Finding{f}
+	return GuardResult{Blocked: RepoReport{Findings: findings}.Blocks(), Findings: findings}
+}
+
 // persist writes the report + denormalized status onto the connection. A 0-row
 // write (connection deleted mid-sweep) is tolerated silently.
 func (s *Service) persist(ctx context.Context, connID uuid.UUID, rep Report) error {

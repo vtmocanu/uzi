@@ -63,11 +63,14 @@ var limiterNames = [...]string{
 	limBoardOrder,
 }
 
-// The limiter names, as constants so a typo in the 143-row table below is a compile
+// The limiter names, as constants so a typo in the 146-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 143 as of this commit; it was 142 until PRD #122 M8 added POST
+// 147 as of this commit; it was 146 until PRD #66 M9 added GET
+// /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
+// /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
+// /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
 // /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
 // /api/admin/cli-tokens.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
@@ -132,6 +135,9 @@ type routeMount struct {
 // across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
 // and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
+	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
+	// unscoped-by-id DB write, no forge call → noLimiter.
+	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
@@ -148,6 +154,13 @@ var wantRouteMounts = []routeMount{
 	// credentials, so it rides the credential-surface limiter. Its bucket is keyed by
 	// (pattern, user) and is therefore disjoint from the other authLimiter mounts.
 	{"GET", "/api/admin/cli-tokens", limAuth},
+	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
+	// privilege_report (no forge call) → noLimiter.
+	{"GET", "/api/admin/blocked-repos", noLimiter},
+	// PRD #66 M3: the live guardrail impact scan carries the per-user forge budget,
+	// like POST /{id}/privilege-check — it makes the same class of upstream forge
+	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.
+	{"GET", "/api/admin/guardrail-impact", limForge},
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/selfimprove", noLimiter},
@@ -251,6 +264,9 @@ var wantRouteMounts = []routeMount{
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
+	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
+	// unscoped-by-id DB write, no forge call → noLimiter.
+	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},
