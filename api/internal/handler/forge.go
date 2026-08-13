@@ -541,6 +541,20 @@ type setRepoEnabledRequest struct {
 	Enabled bool `json:"enabled"`
 }
 
+// blockFindingMessages extracts the human messages of exactly the SeverityBlock
+// findings, for the 422 "violations" array (PRD #66 D1 layer 1). Overridden and
+// warn findings are excluded — only findings that actually refuse the run are
+// reported as the reason it was refused.
+func blockFindingMessages(findings []privcheck.Finding) []string {
+	msgs := make([]string, 0, len(findings))
+	for _, f := range findings {
+		if f.Severity == privcheck.SeverityBlock {
+			msgs = append(msgs, f.Message)
+		}
+	}
+	return msgs
+}
+
 // SetRepoEnabled toggles whether a repo is tracked (its board shown, its poller
 // active). Authorization is enforced in the UPDATE (user must own the
 // connection); a non-owned or unknown id returns 404.
@@ -560,6 +574,52 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// D1 layer 1 (PRD #66): the repo-enable gate. Enabling is the moment the user
+	// is present and can fix a forge misconfiguration, so a live, fail-closed guard
+	// runs BEFORE the flip on the enable path only. The disable path is NEVER gated
+	// (D4) — a user must always be able to stop tracking a repo.
+	if req.Enabled {
+		row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("get repo for enable guard", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		res := h.pcheck.GuardRepo(r.Context(), privcheck.GuardInput{
+			ForgeType:       row.ForgeType,
+			BaseURL:         row.BaseUrl,
+			TokenCiphertext: row.TokenCiphertext,
+			Repo: privcheck.Repo{
+				ID:             row.ID.String(),
+				Path:           row.PathWithNamespace,
+				ForgeProjectID: row.ForgeProjectID,
+				DefaultBranch:  row.DefaultBranch.String,
+			},
+			Overridden: false, // M8 threads the real per-repo override; M4 is always false.
+		})
+		if res.Blocked {
+			// 422 mirroring the save-time token gate's body shape (forge.go, key
+			// "violations") so the existing web 422 handling applies. Only the
+			// SeverityBlock findings' messages go in "violations" — an overridden or
+			// warn finding must not appear as a reason the run was refused.
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				// Headline stays cause-agnostic: the block set spans both "the bot
+				// can push/merge to the default branch" and the fail-closed
+				// "protection could not be verified" case, and hardcoding the
+				// push/merge reason misdescribes the latter. The specific, actionable
+				// reason(s) are in "violations".
+				"error":      "this repo cannot be enabled: uzi will not run while the bot can reach the default branch, or while that cannot be verified (main is never touched). See the reasons below, fix branch protection on the forge, then retry.",
+				"violations": blockFindingMessages(res.Findings),
+			})
+			return
+		}
+	}
+
 	repo, err := h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: req.Enabled, UserID: user.ID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

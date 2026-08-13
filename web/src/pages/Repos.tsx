@@ -337,16 +337,32 @@ export function Repos() {
                             {(() => {
                               const f = repoFindings(privilegeReport, r.id);
                               if (!f) return null;
-                              const hasViolations = f.violations.length > 0;
-                              const n = hasViolations ? f.violations.length : f.warnings.length;
+                              // D4 (PRD #66 M4): a block-severity finding means uzi
+                              // REFUSES runs on this repo (the bot can push/merge to
+                              // main). That is a distinct, actionable state from the
+                              // advisory "N privilege issue" wording, which does not
+                              // tell the user their runs are refused — so it gets its
+                              // own "runs blocked" danger badge, the sign on the wall.
+                              // Warn-only repos keep the existing advisory badge.
+                              if (f.violations.length > 0) {
+                                return (
+                                  <Badge
+                                    tone="danger"
+                                    dot
+                                    title={f.violations.map((x) => x.message).join("\n")}
+                                  >
+                                    runs blocked
+                                  </Badge>
+                                );
+                              }
+                              const n = f.warnings.length;
                               return (
                                 <Badge
-                                  tone={hasViolations ? "danger" : "warning"}
+                                  tone="warning"
                                   dot
-                                  title={[...f.violations, ...f.warnings].map((x) => x.message).join("\n")}
+                                  title={f.warnings.map((x) => x.message).join("\n")}
                                 >
-                                  {n} privilege {hasViolations ? "issue" : "warning"}
-                                  {n === 1 ? "" : "s"}
+                                  {n} privilege warning{n === 1 ? "" : "s"}
                                 </Badge>
                               );
                             })()}

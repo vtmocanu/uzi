@@ -251,8 +251,8 @@ type GuardResult struct {
 // protection_unreadable is not a waivable code, a forge blip refuses even an
 // allowed repo.
 //
-// This milestone adds the helper only; no handler, service insert, or claim path
-// calls it yet (that is M4/M5/M6).
+// Callers: the repo-enable gate (handler.SetRepoEnabled, M4). The run-create
+// service inserts and the claim backstop wire in at M5/M6.
 func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
 	f, err := s.forges.ForgeForConnection(in.ForgeType, in.BaseURL, in.TokenCiphertext)
 	if err != nil {

@@ -238,6 +238,81 @@ describe("Repos — Trusted repo panel", () => {
   });
 });
 
+describe("Repos — guardrail blocking badge (PRD #66 M4, D4)", () => {
+  // A connection whose privilege report marks one repo block-severity (runs
+  // refused), one warn-only (advisory), and leaves the third with no entry (clean).
+  const CONN_WITH_REPORT: ForgeConnection = {
+    ...CONN,
+    privilege_status: "violations",
+    privilege_checked_at: "2026-08-13T00:00:00Z",
+    privilege_report: {
+      checked_at: "2026-08-13T00:00:00Z",
+      token: { scopes: [], active: true, violations: [], warnings: [] },
+      status: "violations",
+      repos: [
+        {
+          repo_id: "repo-uzi",
+          path: "vtmocanu/uzi",
+          role: "write",
+          member: true,
+          findings: [
+            {
+              code: "write_role_can_push",
+              severity: "block",
+              message: "the write role may push to protected main",
+            },
+          ],
+        },
+        {
+          repo_id: "repo-atlas",
+          path: "vtmocanu/atlas",
+          role: "admin",
+          member: true,
+          findings: [
+            {
+              code: "bot_role_above_write",
+              severity: "warn",
+              message: "the bot is above the write role",
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN_WITH_REPORT] });
+  });
+
+  it("shows the 'runs blocked' badge on a repo with a block-severity finding", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const row = within(rowFor("vtmocanu/uzi"));
+    const badge = row.getByText(/runs blocked/i);
+    expect(badge).toBeTruthy();
+    // The block finding's message is the actionable "sign on the wall" (D4).
+    expect(badge.getAttribute("title")).toContain("the write role may push to protected main");
+    // It is NOT the advisory wording.
+    expect(row.queryByText(/privilege warning/i)).toBeNull();
+  });
+
+  it("keeps a warn-only repo on the advisory badge, never 'runs blocked'", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/atlas");
+    const row = within(rowFor("vtmocanu/atlas"));
+    expect(row.queryByText(/runs blocked/i)).toBeNull();
+    expect(row.getByText(/privilege warning/i)).toBeTruthy();
+  });
+
+  it("shows neither badge on a clean repo (no findings entry)", async () => {
+    renderPage();
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+    expect(row.queryByText(/runs blocked/i)).toBeNull();
+    expect(row.queryByText(/privilege warning/i)).toBeNull();
+  });
+});
+
 describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
   it("opens the Tools panel and toggles the repo devbox opt-in", async () => {
     mockApi.setRepoDevboxOptIn.mockResolvedValue({
