@@ -983,6 +983,39 @@ func TestScheduleRunNowBreakdown(t *testing.T) {
 	}
 }
 
+// TestScheduleRunNowStartedNothing: the flagship case — a sweep fire that started zero
+// runs but skipped candidates. It leads with "Started 0 runs from <id>." (a clean clause,
+// not the run-started wording) followed by the per-candidate skip breakdown and hint.
+func TestScheduleRunNowStartedNothing(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 0,
+		RunIDs:  []string{},
+		Matched: 1,
+		Capped:  true,
+		Started: []apitypes.LastFireStarted{},
+		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"Started 0 runs from sch_rn.",
+		"Matched 1 candidate(s), skipped 1:",
+		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("started-nothing run-now missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "no run started") {
+		t.Errorf("a fire that skipped candidates must NOT report 'no run started'\n%s", out)
+	}
+	if strings.Contains(out, "no_prd_link") {
+		t.Errorf("raw wire reason leaked\n%s", out)
+	}
+}
+
 // TestScheduleRunNowBreakdownJSON: --json dumps the raw widened RunNowResponse unchanged.
 func TestScheduleRunNowBreakdownJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{

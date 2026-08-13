@@ -443,7 +443,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
 
       <div className="mb-3.5 flex flex-wrap gap-x-5 gap-y-2">
         <Tally n={fire.matched} label="matched" tone="mut" />
-        <Tally n={fire.started.length} label="started" tone="ok" />
+        <Tally n={fire.started.length} label="started" tone={fire.started.length > 0 ? "ok" : "mut"} />
         <Tally n={fire.skips.length} label="skipped" tone={fire.skips.length > 0 ? "warn" : "mut"} />
         <Tally
           n={s.max_issues == null ? "—" : s.max_issues}
@@ -487,7 +487,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
           <div>
             <span className="font-semibold text-fg">Nothing newer was reached.</span> max issues is{" "}
             <span className="font-semibold text-fg">{s.max_issues ?? "—"}</span>, so only the oldest
-            candidate{fire.skips.length === 1 ? "" : "s"} were tried. Raise the cap so the sweep
+            candidate{fire.skips.length === 1 ? " was" : "s were"} tried. Raise the cap so the sweep
             reaches the candidates behind them, or add <code className="rounded bg-raised px-1 text-fg">PRDLESS</code>{" "}
             / a PRD link.
           </div>

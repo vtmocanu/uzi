@@ -788,11 +788,18 @@ func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
 		p.Printf("no run started from %s (a matching run may already be active)\n", id)
 		return
 	}
-	p.Printf("Started %d run(s) from %s", res.Created, id)
-	if len(res.RunIDs) > 0 {
-		p.Printf(": %s", strings.Join(res.RunIDs, ", "))
+	if res.Created == 0 {
+		// The flagship case (a sweep that skipped every candidate): lead with a clean
+		// period-terminated clause rather than "Started 0 run(s) from <id>" trailing into
+		// the skip breakdown below.
+		p.Printf("Started 0 runs from %s.\n", id)
+	} else {
+		p.Printf("Started %d run(s) from %s", res.Created, id)
+		if len(res.RunIDs) > 0 {
+			p.Printf(": %s", strings.Join(res.RunIDs, ", "))
+		}
+		p.Printf("\n")
 	}
-	p.Printf("\n")
 	for _, st := range res.Started {
 		p.Printf("  %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
 	}
