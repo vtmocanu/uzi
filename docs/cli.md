@@ -214,7 +214,22 @@ A few worth knowing:
   future `--at`) but does not un-pause a paused schedule, while `pause`/`resume`
   flip firing without
   deleting, `run-now` fires one immediately without disturbing its cadence,
-  and `delete` removes it (run history is preserved).
+  and `delete` removes it (run history is preserved). Once a schedule has fired,
+  `schedule get` also prints a **Last fire** block below the config: a summary
+  line (`fired <time> · matched N · started M · skipped K`), one line per started
+  run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
+  schedule), one line per skipped candidate with a human reason label (`no PRD
+  link`, `already running`, `not eligible`, `description too large`, `fetch
+  failed` — the raw wire reason for anything newer), and, when a capped fire
+  reached nobody, a hint to raise `--max-issues` or add `PRDLESS` / a PRD link; a
+  never-fired schedule reads `Last fire: never fired`, and `--json` carries the
+  same detail under `.last_fire`. `run-now` prints the matching per-candidate
+  breakdown inline — a `Started N run(s)` header with the created run id(s), a
+  line per started run, then a `Matched N candidate(s), skipped K:` tally with a
+  reason label per skip (and a `# add PRDLESS / a prds link, or raise
+  --max-issues` hint for a missing PRD link) — or `no run started` when a benign
+  dedup fired none; `--json` dumps the raw response (`created`, `run_ids`,
+  `matched`, `capped`, `started`, `skips`).
 - **`review show <id>`** (formerly `run review <id>`, still around as a
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see

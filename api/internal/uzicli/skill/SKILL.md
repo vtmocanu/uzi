@@ -353,6 +353,14 @@ nothing a manual start cannot.
 - `uzi schedule list` — your schedules as a table (`ID`, `TARGET`, `REPO`, `WHEN`,
   `NEXT`, `ON`); `--json` dumps the raw array.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
+  When the schedule has fired at least once it also prints a **Last fire** block: a
+  summary line (`fired <time> · matched N · started M · skipped K`), one line per started
+  run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one
+  line per skipped candidate with a human reason label (`no PRD link`, `already running`,
+  `not eligible`, `description too large`, `fetch failed`), and — when a capped fire
+  reached nobody — a hint to raise `--max-issues` or add `PRDLESS` / a PRD link. A
+  never-fired schedule reads `Last fire: never fired`. `--json` carries the same detail
+  under `.last_fire`.
 - `uzi schedule edit <schedule-id>` — change a schedule's mutable config in place, keeping
   its id and run history (unlike delete-and-recreate). Any flag you omit keeps its stored
   value; editing config revives a terminal schedule (status returns to active — a recurring
@@ -366,8 +374,14 @@ nothing a manual start cannot.
   any partial edit (previously a plain retime silently wiped the stored model).
 - `uzi schedule pause <schedule-id>` / `uzi schedule resume <schedule-id>` — stop or
   restart firing without deleting (a `PATCH` of just `enabled`).
-- `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence;
-  prints the created run id(s), or reports nothing started when a dedup skip fired none.
+- `uzi schedule run-now <schedule-id>` — fire immediately without disturbing the cadence.
+  Prints a per-candidate breakdown: a `Started N run(s)` header with the created run
+  id(s), one line per started run, then — when candidates were skipped — a
+  `Matched N candidate(s), skipped K:` tally with a human reason label per skip and, for a
+  missing PRD link, a `# add PRDLESS / a prds link, or raise --max-issues` hint. A fire
+  that started nothing AND skipped nothing (a benign dedup, a prior run still live) reports
+  `no run started`. `--json` dumps the raw response (`created`, `run_ids`, `matched`,
+  `capped`, `started`, `skips`).
 - `uzi schedule delete <schedule-id>` — delete a schedule. Run history is preserved.
 
 ### Send to uzi (orchestration)
