@@ -20180,6 +20180,22 @@ only bites once the agent image is current (see Decision 2).
 
 ## 523. PRD #309 — rate-limit burn-rate forecast: a window-model-AGNOSTIC trailing-burn signal, client-sampled, display-only
 
+> **WINDOW MODEL REVERSED by PRD #310 (2026-08-13) — read the record below as HISTORY, not current design. Current design: §529.**
+> The load-bearing sliding-lean conclusion in this section was empirically DISPROVEN. The unified 5h/7d
+> windows were measured ANCHORED (a fixed wall-clock boundary at which usage fully resets), not sliding, on
+> 2026-08-13 against live `anthropic_rate_limits` header-probe rows on dev-cluster (`source = header_probe`,
+> the real `anthropic-ratelimit-unified-*` headers). Three anchored tells: `resets_at` held a FIXED boundary
+> across every poll (a sliding reset would creep forward); `used%` did NOT decay approaching reset; and at the
+> boundary `used%` stepped 32%→0% in one jump while `resets_at` jumped forward by exactly the window length
+> (06:40→11:40, +18000s). Reproducible offline from uzi's own DB (query in the PRD's Testing section) — no
+> internet access is a dependency. PRD #310 therefore REVERSED #309's reframe: it switched the forecast to the
+> anchored single-reading `paceForecast`, RE-ENABLED the `18000`/`604800` window constants this section dropped
+> (D10), and DELETED the trailing-sample machinery (`burnForecast`/`pushSample`/`useReadingSeries`/ring buffer).
+> So the two present-tense claims below — "the evidence leans SLIDING" and "the constants … are dropped
+> entirely" — are NO LONGER true of current code. Design record: [prds/310-rate-limit-anchored-forecast.md](../prds/310-rate-limit-anchored-forecast.md).
+> The #309 account is kept intact below because it is a correct past-tense record of a real decision, since
+> empirically reversed.
+
 Design record [prds/done/309-rate-limit-forecast.md](../prds/done/309-rate-limit-forecast.md). Adds a burn-rate
 forecast — a translucent "ghost" extending each meter to its projected landing point plus a `»` overflow
 marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/pages/AdminRateLimits.tsx`
@@ -20269,3 +20285,64 @@ untouched, so a parked or transient schedule shows its prior fire or none rather
 empty record. The transient-vs-terminal framing is target-dependent: the same forge/DB error retries
 on an issue target (it does not advance) but is recorded as a per-candidate `fetch_failed` on a sweep
 target, where the fan-out continues past the failed candidate.
+
+# PRD #310 — Rate-limit forecast: anchored always-on model + reset label
+
+Decision Log with the richer rationale: `prds/310-rate-limit-anchored-forecast.md`.
+
+## 529. PRD #310 — rate-limit forecast REVERSED to the ANCHORED single-reading model (always-on); supersedes §523's window model
+
+Design record [prds/310-rate-limit-anchored-forecast.md](../prds/310-rate-limit-anchored-forecast.md). WEB-ONLY:
+no API, Go, DB, or migration change (PRD Success Criterion 6) — the inputs (`pct`, `resets_at`, `source`) are
+already in the DTOs. This reverses the load-bearing window-model decision recorded in §523 (PRD #309).
+
+- **The empirical finding that reverses §523 (measured 2026-08-13, offline-repeatable).** The unified 5h/7d
+  rate-limit windows are ANCHORED — a fixed wall-clock boundary at which usage FULLY resets — not sliding.
+  Measured against live `anthropic_rate_limits` rows on dev-cluster (`source = header_probe`, the real
+  `anthropic-ratelimit-unified-*` headers the poller stores), sampling a 5h window ~every 50s across its reset.
+  Three independent anchored tells: (1) `resets_at` held a FIXED boundary across every poll — a sliding reset
+  tracks *now* and would creep forward; (2) `used%` did NOT decay approaching reset, it sat flat — a sliding
+  window sheds old usage continuously and would trend down; (3) at the boundary `used%` stepped 32%→0% in one
+  jump while `resets_at` jumped forward by exactly the window length (06:40:00→11:40:00, +18000s), to another
+  round boundary. A second token's 7-day window sat fixed at a round boundary (`Sat 03:00 / 99%`) the whole
+  observation. Reproducible OFFLINE from uzi's own DB (query in the PRD's Testing section) — no internet access
+  is a dependency of this decision. This DISPROVES §523's sliding lean (which rested on a public GitHub thread)
+  and vindicates the anchored formula #309 dropped.
+- **Anchored single-reading projection (replaces the trailing-burn signal).** The forecast now computes
+  `projected% = pct × windowDurationSec / elapsed`, with `elapsed = nowSec − (resetsAtSec − windowDurationSec)`
+  and `nowSec = nowMs / 1000`. Because it needs only the CURRENT reading, the forecast is ALWAYS visible — this
+  fixes the two silences §523 accepted as costs: cold-start (no in-session sample yet) and the mostly-silent
+  7-day window (its integer pct moves too slowly for a short in-session sample to measure a rate). An idle window
+  at 99% now forecasts; a 7-day window heading past the cap now renders coral (Success Criterion 2, the case
+  #309 could not render). The ms→seconds conversion is the one silent-failure mode: feeding raw `nowMs` into
+  `elapsed` collapses `projected` to ~0 and the forecast stays silent forever (the exact bug this reversal
+  fixes); a unit test asserts a real-millisecond `nowMs` projects rather than collapsing.
+- **Re-enabled the window-duration constants (#309 D10, which §523 dropped).** `WINDOW_DURATION = { "5h":
+  18000, "7d": 604800 }` in `web/src/lib/rateLimits.ts`; the 5h value is confirmed by the measured +5h reset
+  jump. §523 had dropped these to remove a silent-divergence risk under the trailing model that no longer
+  applies (the anchored formula needs the window length).
+- **Purity + the retained stale short-circuit.** `paceForecast(pct, resetsAtSec, windowDurationSec, nowMs,
+  source)` is a PURE single-reading helper in `rateLimits.ts` returning `{ state, projectedPct }`; bands are
+  UNCHANGED from #309 D7 (strict `> 115` over / `> 85` on_pace / else safe; `»` overflow marker when projected
+  > 100). Silent (→ safe) when `pct >= 100`, `source === "limit_report"`, `resetsAtSec` null, `!(elapsed > 0)`
+  (passed reset / clock skew / NaN `nowMs`), `projected <= 85`, or within the early-window floor
+  `elapsed <= max(windowDurationSec/50, 900)` (≈ first 15 min of the 5h, ≈3.4h of the 7d) — this floor replaces
+  #309's `MIN_SAMPLE_SPAN_MS` and doubles as the divide-by-zero guard. `projectedPct` is clamped to
+  `MAX_PROJECTED_PCT` (999) so hover/aria text never prints an absurd projection. The shared `rowForecast(stale,
+  pct, resetsAtSec, windowDurationSec, nowMs, source)` wrapper keeps the stale short-circuit centralized
+  (returns safe when stale, else `paceForecast`); the three surfaces call ONLY `rowForecast`, never
+  `paceForecast` directly.
+- **Deleted the trailing-sample machinery.** `burnForecast`, `pushSample`, `useReadingSeries`, `forecastKey`,
+  `forecastReadingsFor`, `SeriesReading`, `BurnSample`, and the ring-buffer constants (`MIN_SAMPLE_SPAN_MS`,
+  `SERIES_MAX_AGE_MS`, `SERIES_MAX_SAMPLES`, `SERIES_MIN_APPEND_INTERVAL_MS`) are removed WITH their tests — the
+  anchored formula makes them unreachable and the dead-code/knip gate is the backstop. Return types renamed
+  `BurnForecast`→`PaceForecast`, `BurnState`→`PaceState` (it is no longer a burn-rate signal).
+- **Display-only invariant preserved (#309 D2).** `paceForecast`/`rowForecast` gate NOTHING and are imported
+  only by rendering code; projected % stays HOVER/ARIA-ONLY. The shared `MeterTrack` atom
+  (`web/src/components/Meter.tsx`) stays byte-unchanged and the `WorkerStats` cpu/mem gauges are untouched.
+- **Reset-time label + column rename (mock-parity, PRD M3).** A `resets <Day HH:MM>` absolute label — viewer's
+  local timezone, derived from the 7-DAY window's `resets_at` (the weekly quota users plan around; D4), omitted
+  when null — renders under each token name on the admin table (`AdminRateLimits.tsx`) and the settings card
+  (`RateLimitMeters.tsx`); the sidebar micro-meters degrade gracefully if it does not fit. The admin column
+  header is renamed "Utilization" → "Utilization & Forecast". The per-window relative countdowns stay in the
+  utilization column.

@@ -52,8 +52,9 @@ other one.
 ## Reading the forecast
 
 The bar tells you how much of a window is gone; a lighter **ghost** extending
-past the fill tells you where it's *heading*. uzi watches how fast a window is
-climbing and projects that pace forward to when the window resets:
+past the fill tells you where it's *heading*. uzi takes the window's current
+reading — how much is used and how long the window has been open — and
+projects that pace forward to when the window resets:
 
 - **Nothing** — the common, calm case. At the current rate the window finishes
   with room to spare, so there's nothing to watch. Silence means safe.
@@ -67,13 +68,16 @@ cap — always on a coral ghost, and on a gold one when it's heading just past
 100%. Read it as a "past the limit" flag.
 
 Hover a forecasting bar to read the projected figure ("projected 106% by
-reset"). It's a straight-line estimate from recent readings, not a promise —
-usage comes in bursts, so treat it as "if this pace holds", not a countdown.
+reset"). It's a straight-line estimate from the window's current reading, not
+a promise — usage comes in bursts, so treat it as "if this pace holds", not a
+countdown.
 
-The pace is measured live from the readings uzi has seen **this session**, so a
-freshly opened page shows no forecast for the first few minutes, and the slower
-7-day window rarely says anything at all — it moves too gently for a short look
-to read a trend. The forecast only ever informs you; it never changes which
+Because it only needs that one reading, the forecast is there from the
+moment a window shows up — including a window that's just sitting idle and
+the slow 7-day window, the two cases a trend-based forecast would otherwise
+miss. Very early in a fresh 5-hour window (the first fifteen minutes or so)
+too little of it has passed to project reliably, so the bar shows the plain
+fill until then. The forecast only ever informs you; it never changes which
 token a run picks or when.
 
 ## How fresh is this?
