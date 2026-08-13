@@ -183,8 +183,20 @@ SELECT
     -- "inconsistent types deduced for parameter" (SQLSTATE 42P08). Note sqlc's static
     -- analysis accepts it uncast — this failure appears only against a real server,
     -- which is why the live-DB test is what proves the query runs at all.
-    CASE WHEN $1::text IN ('rolling', 'stuck') THEN $10::timestamptz ELSE NULL END,
-    $11, $12
+    --
+    -- The IS DISTINCT FROM guard makes the anchor per-incident (issue #155): a
+    -- ` + "`" + `rolling` + "`" + `/` + "`" + `stuck` + "`" + ` report whose target equals the worker's registered version is an
+    -- innocent same-release blip, not a roll, and must NOT arm the ceiling. It reuses
+    -- RegisterWorker's build-metadata-stripped IS DISTINCT FROM idiom (runtime.sql), so
+    -- the arm and the version-move clear share one definition of "the release moved". It
+    -- lives here in the SELECT because w.version is only referenceable from FROM workers w,
+    -- not in the ON CONFLICT DO UPDATE clause — the guard flows into the conflict path via
+    -- EXCLUDED.upgrading_since automatically.
+    CASE WHEN $1::text IN ('rolling', 'stuck')
+              AND split_part($11::text, '+', 1)
+                  IS DISTINCT FROM split_part(w.version, '+', 1)
+         THEN $10::timestamptz ELSE NULL END,
+    $12, $11
 FROM workers w
 WHERE w.id = $13 AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
@@ -359,8 +371,8 @@ type UpsertWorkerRollHealthParams struct {
 	LastExitCode         pgtype.Int4        `json:"last_exit_code"`
 	ControllerReportedAt pgtype.Timestamptz `json:"controller_reported_at"`
 	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
-	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
 	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
+	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
 	WorkerID             uuid.UUID          `json:"worker_id"`
 }
 
@@ -397,8 +409,8 @@ func (q *Queries) UpsertWorkerRollHealth(ctx context.Context, arg UpsertWorkerRo
 		arg.LastExitCode,
 		arg.ControllerReportedAt,
 		arg.ObservedAt,
-		arg.PollIntervalSeconds,
 		arg.WorkerImageTag,
+		arg.PollIntervalSeconds,
 		arg.WorkerID,
 	)
 	if err != nil {
