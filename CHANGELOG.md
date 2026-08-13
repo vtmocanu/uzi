@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-08-13
+
 ### Security
 
 - **uzi now refuses to run against a repo whose bot could push or merge straight to
@@ -30,6 +32,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   This guards only the bot's own PAT: a write **deploy key**, which uzi never
   provisions, can still push to a protected branch and this check cannot see it.
 
+- **Judge free text is stripped of Unicode format and bidi-control characters
+  before it renders (issue #124).** The last untreated sink, a run's agent label
+  in the activity feed, now passes through the same `\p{Cc}\p{Cf}` strip that the
+  other judge-text surfaces already use, closing a bidi-spoofing vector in the
+  review UI. Newlines and tabs are preserved; combining marks and emoji are left
+  untouched.
+
 ### Added
 
 - **An instance admin can allow one named repo through the new guardrail (PRD
@@ -45,6 +54,36 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   branch protection uzi cannot read stays refused even when allowed. New `uzi
   admin guardrail-impact` and `uzi admin blocked-repos` CLI commands surface
   the same data from the terminal — see [docs/cli.md](docs/cli.md).
+
+- **Schedules now record and surface why a fire started nothing (PRD #308).** Each
+  schedule keeps a `last_fire` outcome, the matched / started / skipped breakdown
+  with a typed skip reason per candidate (`no_prd_link`, `not_eligible`,
+  `already_running`, `description_too_large`, `fetch_failed`), shown as an outcome
+  badge and a detail panel on the Schedules page, in `uzi schedule get`, and
+  returned by `run-now`. A capped-sweep hint calls out when an issue cap, rather
+  than eligibility, is why a sweep started nothing. A manual `run-now` reports its
+  full outcome but never overwrites the recorded last scheduled fire.
+
+- **The Claude rate-limit meters now show a burn-rate forecast (PRD #309).** Each
+  meter grows a translucent "ghost" toward its projected landing point, plus a `»`
+  marker when the projection overflows, computed from a trailing burn rate sampled
+  during the session. It is display-only and deliberately hedged ("if this pace
+  holds"), never an input to model auto-selection; the fast 5-hour window carries
+  the useful signal while the slow 7-day window stays mostly quiet. Web-only: no
+  API, database, or migration change.
+
+### Changed
+
+- **Dev and test Node bumped from 22 to 24 (Active LTS), matching CI (316a742b).**
+
+### Fixed
+
+- **The e2e poller no longer spuriously times out its forge sync (issue #139).**
+  The per-tick context deadline was pinned to the poll interval, so a 2-second
+  e2e interval cancelled a 15-second forge call mid-flight. The tick deadline is
+  now floored at twice the forge HTTP timeout, decoupling it from the poll cadence.
+  At the default one-minute interval behavior is unchanged, and a genuinely wedged
+  forge still surfaces through the forge client's own 15-second timeout.
 
 ## [0.30.0] - 2026-08-12
 
