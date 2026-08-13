@@ -93,14 +93,14 @@ func TestControllerStatusComputesTagValidFromSemver(t *testing.T) {
 	// blip — but semver.IsValid(normSemver("0.11.7+_x")) is false, so the classifier discards
 	// it and falls back to CPVersion. TagValid must be false so the SQL arms fail-closed.
 	if got := post("0.11.7+_x"); got.TagValid {
-		t.Errorf("TagValid = true for the unparseable tag \"0.11.7+_x\"; it must be false so the arm guard "+
-			"engages the ceiling. The classifier discards this tag and compares against CPVersion, so a "+
+		t.Errorf("TagValid = true for the unparseable tag \"0.11.7+_x\"; it must be false so the arm guard " +
+			"engages the ceiling. The classifier discards this tag and compares against CPVersion, so a " +
 			"true here lets a raw split_part read it as a same-release blip and suppress `outdated` forever.")
 	}
 
 	// VALID: a real release coordinate the classifier trusts as the target.
 	if got := post("0.11.9"); !got.TagValid {
-		t.Errorf("TagValid = false for the valid semver tag \"0.11.9\"; it must be true so a genuine "+
+		t.Errorf("TagValid = false for the valid semver tag \"0.11.9\"; it must be true so a genuine " +
 			"same-release blip is still recognised as one and does not spuriously arm the ceiling.")
 	}
 }

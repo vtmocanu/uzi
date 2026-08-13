@@ -359,7 +359,7 @@ func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
 	}
 	got := anchor("after a genuine next-release roll")
 	if got == nil {
-		t.Fatalf("a genuine roll to a DIFFERENT release (0.11.9 vs 0.11.8) did not arm the ceiling; the "+
+		t.Fatalf("a genuine roll to a DIFFERENT release (0.11.9 vs 0.11.8) did not arm the ceiling; the " +
 			"anchor has nothing to gate the next roll against")
 	}
 	if !got.Equal(genuineRoll) {
@@ -440,11 +440,11 @@ func TestInvalidTargetTagArmsCeilingFailClosedLiveDB(t *testing.T) {
 		t.Fatalf("upsert poison invalid-tag report: %v", err)
 	}
 	if got := anchor(poisonWorker, "after the poison invalid-tag report"); got == nil {
-		t.Errorf("a `rolling` report with an INVALID worker_image_tag (\"0.11.8+_x\") that split_part-strips "+
-			"to the worker's own version (0.11.8) did NOT arm upgrading_since. The classifier discards this "+
-			"tag as unparseable and falls back to CPVersion, so the worker can read `outdated` — the ceiling "+
-			"MUST engage. A raw-split_part guard reads it as a same-release blip and suppresses that "+
-			"`outdated` forever, past MaxUpgradingWindow. This is the security audit's HIGH finding: an "+
+		t.Errorf("a `rolling` report with an INVALID worker_image_tag (\"0.11.8+_x\") that split_part-strips " +
+			"to the worker's own version (0.11.8) did NOT arm upgrading_since. The classifier discards this " +
+			"tag as unparseable and falls back to CPVersion, so the worker can read `outdated` — the ceiling " +
+			"MUST engage. A raw-split_part guard reads it as a same-release blip and suppresses that " +
+			"`outdated` forever, past MaxUpgradingWindow. This is the security audit's HIGH finding: an " +
 			"invalid tag must arm fail-closed.")
 	}
 
