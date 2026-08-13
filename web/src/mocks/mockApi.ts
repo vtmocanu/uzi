@@ -6,6 +6,7 @@
 import {
   ApiError,
   isTerminalRun,
+  type AdminBlockedRepos,
   type AutoStatus,
   type BindMode,
   type AgentSelectionInput,
@@ -73,6 +74,7 @@ import {
   LIVE_RUN_ID,
   MOCK_CLI_AUTH_REQUEST_ID,
   mockAdmin,
+  mockBlockedRepoMeta,
   mockAdminRateLimits,
   mockAdminWorkers,
   mockAllocations,
@@ -2146,8 +2148,7 @@ export const mockApi = {
           path: r.path_with_namespace,
           role: "write",
           member: true,
-          violations: [],
-          warnings: [],
+          findings: [],
         })),
     };
     c.privilege_status = "ok";
@@ -2196,6 +2197,27 @@ export const mockApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_devbox_opt_in = enabled;
+    return delay({ repo: { ...r } });
+  },
+  // PRD #66 M9 (D8): admin per-repo guardrail override. Requires a non-empty reason
+  // (mirrors the server 400). Setting it clears guardrail_blocked in the demo (the
+  // override downgrades the waivable findings); revoking re-arms it as blocked.
+  setRepoGuardrailOverride: async (id: string, reason: string) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    if (reason.trim() === "") throw new ApiError(400, "a non-empty reason is required to override the guardrail");
+    r.guardrail_override = { reason: reason.trim(), by: "you@example.com", at: new Date().toISOString() };
+    r.guardrail_blocked = false;
+    return delay({ repo: { ...r } });
+  },
+  clearRepoGuardrailOverride: async (id: string) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.guardrail_override = null;
+    // Re-arm the guardrail: absent the override, the repo is blocked again iff its
+    // underlying findings are still waivable blocks (mock stand-in: seeded block
+    // messages). This is what makes Revoke round-trip back to "runs blocked".
+    r.guardrail_blocked = (mockBlockedRepoMeta[id]?.block_messages.length ?? 0) > 0;
     return delay({ repo: { ...r } });
   },
 
@@ -3061,6 +3083,37 @@ export const mockApi = {
   },
 
   adminListWorkers: async () => delay({ workers: mockAdminWorkers.map((w) => ({ ...w })) }),
+  // PRD #66 M9 (D8): the admin cross-user blocked-repos list. DERIVED from the shared,
+  // mutable repos state (not a static deep-copy) joined with mockBlockedRepoMeta for the
+  // owner/reasons the wire Repo doesn't carry — so an Allow or Revoke on that shared
+  // state (setRepoGuardrailOverride / clearRepoGuardrailOverride) round-trips into this
+  // list, and the repo an admin allows here actually exists in the mutation's target.
+  // block_messages is never null (always []), matching the server contract. Typed as
+  // the AdminBlockedRepos envelope — the mock is a second implementation of that wire
+  // contract, so the annotation keeps the two shapes in lockstep.
+  adminListBlockedRepos: async (): Promise<AdminBlockedRepos> =>
+    delay({
+      checks_unknown: false,
+      repos: repos
+        .filter((r) => r.guardrail_blocked || r.guardrail_override)
+        .map((r) => {
+          const meta = mockBlockedRepoMeta[r.id];
+          return {
+            id: r.id,
+            path: r.path_with_namespace,
+            owner_id: meta?.owner_id ?? mockAdmin.id,
+            owner_email: meta?.owner_email ?? mockAdmin.email,
+            forge_type: meta?.forge_type ?? mockConnection.forge_type,
+            blocked: r.guardrail_blocked,
+            // Emit the underlying reasons only while the repo is actually blocked; an
+            // overridden-clean repo lists [] (the override downgraded them). Never null.
+            block_messages: r.guardrail_blocked ? [...(meta?.block_messages ?? [])] : [],
+            guardrail_override: r.guardrail_override ? { ...r.guardrail_override } : null,
+            privilege_status: meta?.privilege_status ?? mockConnection.privilege_status,
+            privilege_checked_at: meta?.privilege_checked_at ?? mockConnection.privilege_checked_at,
+          };
+        }),
+    }),
   adminListRuns: async () =>
     delay({
       runs: listRunsFor()

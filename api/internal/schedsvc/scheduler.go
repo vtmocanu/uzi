@@ -204,10 +204,13 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 
 // fireOne dispatches on the schedule target and returns the FireOutcome for this fire,
 // plus:
-//   - nil                        → success or a benign per-fire skip (advance the schedule)
-//   - workersvc.ErrRepoNotFound  → permanent (park the schedule at status='error')
-//   - ErrBadConfig               → permanent (malformed stored config)
-//   - any other error            → transient (do NOT advance; retry next tick)
+//   - nil                          → success or a benign per-fire skip (advance the schedule)
+//   - workersvc.ErrRepoNotFound    → permanent (park the schedule at status='error')
+//   - ErrBadConfig                 → permanent (malformed stored config)
+//   - workersvc.ErrGuardrailBlocked → permanent (#66: the bot can reach the default
+//     branch, or it can't be verified — will not change tick-to-tick, so park rather
+//     than tick-storm; the owner fixes forge protection or an admin allows the repo)
+//   - any other error              → transient (do NOT advance; retry next tick)
 //
 // On any non-nil error the returned FireOutcome is the zero value: the outcome is only
 // meaningful on the success/benign advance path (M2 persists it there).
@@ -483,6 +486,15 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 		}
 		if errors.Is(fireErr, errBadConfig) {
 			e.park(ctx, sched, "the schedule's configuration is invalid and cannot fire")
+			return
+		}
+		if errors.Is(fireErr, workersvc.ErrGuardrailBlocked) {
+			// #66: the bot can push or merge to this repo's default branch, or that
+			// could not be verified. This will not resolve tick-to-tick, so park the
+			// schedule rather than refire (and re-block) every tick — a self-inflicted
+			// tick-storm. The owner fixes branch protection on the forge, or an admin
+			// allows the repo, then re-enables the schedule.
+			e.park(ctx, sched, "runs are blocked: the bot can push or merge to this repo's default branch (or it could not be verified); fix branch protection on the forge, or ask an admin to allow this repo, then re-enable the schedule")
 			return
 		}
 		// Transient: leave next_fire_at in the past so the next tick retries.

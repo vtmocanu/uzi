@@ -886,6 +886,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Agents-status overview: every user's workers + active runs.
 				r.Get("/workers", h.AdminListWorkers)
 				r.Get("/runs", h.AdminListRuns)
+				// PRD #66 M9 (D8): the admin cross-user blocked-repos list. A read of the
+				// STORED privilege_report across all users (no forge call), so it carries no
+				// per-user limiter — same shape as /runs and /workers.
+				r.Get("/blocked-repos", h.AdminListBlockedRepos)
+				// PRD #66 M3: the live, non-persisting guardrail pre-flight impact count.
+				// It fans out a 1 + 2×repos forge scan across every user's connections,
+				// so it wears the per-user forge budget — forgeLimiter is a Routes
+				// parameter and so in scope here, the same limiter POST
+				// /{id}/privilege-check uses for the same reason.
+				r.With(forgeLimiter.PerUserMiddleware).Get("/guardrail-impact", h.AdminGuardrailImpact)
 				// Factory-wide token/cost usage + per-user breakdown (PRD #40).
 				r.Get("/usage", h.AdminUsage)
 				// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
@@ -929,6 +939,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// PUT sets the enabling admin (session, never the body) as the run owner and
 				// requires a repo the admin owns.
 				r.Put("/selfimprove", h.PutSelfimproveConfig)
+				// Admin per-repo guardrail override (PRD #66 D8, M8): allow/revoke ONE named
+				// repo through the guardrail, with a reason, audited. Deliberately a dedicated
+				// admin-only route (NOT a branch in PatchRepo, which has a member path) using
+				// the unscoped-by-id set/clear queries — a member self-allowing is the R6
+				// route-around D8 forbids. Actor + timestamp from the session, never the body.
+				r.Post("/repos/{id}/guardrail-override", h.SetRepoGuardrailOverride)
+				r.Delete("/repos/{id}/guardrail-override", h.ClearRepoGuardrailOverride)
 			})
 		})
 

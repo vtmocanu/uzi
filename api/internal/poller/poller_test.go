@@ -30,6 +30,31 @@ func TestReconcileDueEveryOne(t *testing.T) {
 	}
 }
 
+func TestTickBudget(t *testing.T) {
+	// tickBudget floors the per-tick deadline at 2x the forge HTTP timeout so a poll
+	// interval shorter than the forge calls a tick makes cannot preempt an in-flight
+	// sync (issue #139). Deterministic: pure function of its two duration inputs.
+	tests := []struct {
+		name         string
+		interval     time.Duration
+		forgeTimeout time.Duration
+		want         time.Duration
+	}{
+		{"interval below the 2x floor is floored (the e2e 2s case)", 2 * time.Second, 15 * time.Second, 30 * time.Second},
+		{"interval between 1x and 2x is still floored", 20 * time.Second, 15 * time.Second, 30 * time.Second},
+		{"interval above the 2x floor is unchanged (production)", time.Minute, 15 * time.Second, time.Minute},
+		{"interval equal to the 2x floor is unchanged", 30 * time.Second, 15 * time.Second, 30 * time.Second},
+		{"zero forge timeout disables the floor (pre-#139 behaviour)", 2 * time.Second, 0, 2 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tickBudget(tt.interval, tt.forgeTimeout); got != tt.want {
+				t.Errorf("tickBudget(%v, %v) = %v, want %v", tt.interval, tt.forgeTimeout, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestForceReconcileNonBlockingAndCoalesces(t *testing.T) {
 	// The settings PUT handler must never block on the poller, and a burst of
 	// changes must not queue a backlog of reconciles: repeated signals coalesce

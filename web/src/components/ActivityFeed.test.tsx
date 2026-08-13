@@ -811,6 +811,26 @@ describe("ActivityFeed instance lanes (PRD #99)", () => {
     expect(laneTitles(r)).toEqual(["reviewer"]);
   });
 
+  it("strips Unicode Cf (bidi override, zero-width) from the label before it reaches the DOM (#124)", () => {
+    // agent_label is model-authored, attacker-influenceable free text. A U+202E RIGHT-TO-
+    // LEFT OVERRIDE renders the lane title reading the opposite of its bytes (Trojan
+    // Source, CVE-2021-42574); a zero-width U+200B hides text and defeats search. React
+    // escapes HTML but does NOT strip Cf, so without the render-site strip these survive.
+    const RLO = "‮"; // RIGHT-TO-LEFT OVERRIDE (category Cf, NOT Cc)
+    const ZWSP = "​"; // ZERO WIDTH SPACE
+    const r = renderFeed(
+      [mi(1, "coder", "toolu_A", `web gate ${RLO}XU${ZWSP}`)],
+      { status: "running", health: "ok" },
+    );
+    // laneTitles reads the header's aria-label — one of the three sinks fed by the label;
+    // the whole container text covers the plain text child and title attribute too.
+    const title = laneTitles(r)[0];
+    expect(title).not.toMatch(/[\p{Cf}]/u);
+    expect(r.container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    // The visible glyphs are untouched — only the format controls are removed.
+    expect(title).toBe("coder · web gate XU");
+  });
+
   it("coalesces a legacy NULL-instance run into one lane per ROLE ([C3])", () => {
     // leadWorkerLead() is nine messages of lead/worker/lead built with `m()` — every
     // instance NULL, i.e. a pre-migration run. By-agent must show two lanes, not the

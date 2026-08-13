@@ -28,14 +28,23 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // Ownership is still enforced: the prompt path bypasses createRun, where
 // GetRepoForUser normally validates that repoID is a repo userID owns, so this
 // method replicates that consent check up front (else ownership is silently
-// dropped). auto_approve and wait_on_limit ride straight from the schedule the owner
-// configured. A second active run for the schedule is rejected by the partial unique
-// index → ErrActivePromptExists.
+// dropped). The #66 default-branch guardrail (D1 layer 2) also gates this path:
+// a prompt run is scheduler-fired unattended and receives the bot PAT at claim,
+// so an un-gated scheduled prompt against a repo whose bot can reach the default
+// branch would bypass the guardrail entirely — hence guardDefaultBranch runs on
+// the fetched repo row before the insert, identical to the other PAT-bearing
+// run-create paths. auto_approve and wait_on_limit ride straight from the schedule
+// the owner configured. A second active run for the schedule is rejected by the
+// partial unique index → ErrActivePromptExists.
 func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, model *string, overrideSubagentModel bool) (store.Run, error) {
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
 	run, err := s.q.CreatePromptRun(ctx, store.CreatePromptRunParams{

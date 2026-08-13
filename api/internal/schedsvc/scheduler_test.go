@@ -487,6 +487,28 @@ func TestTickPermanentErrorParks(t *testing.T) {
 	}
 }
 
+// TestTickGuardrailBlockedParks: a scheduled fire refused by the #66 default-branch
+// guardrail is PERMANENT (the bot's default-branch permissions do not change
+// tick-to-tick), so the schedule parks at status='error' rather than refiring — and
+// re-blocking — every tick (a self-inflicted tick-storm). The owner is notified.
+func TestTickGuardrailBlockedParks(t *testing.T) {
+	h := newHarness()
+	h.runs.err = &workersvc.GuardrailBlockedError{Findings: []string{`the write role may push to protected "main"`}}
+	h.st.due = []store.RunSchedule{h.issueSchedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 0 {
+		t.Fatalf("guardrail block must NOT advance: advance calls = %d, want 0", len(h.st.advanceCalls))
+	}
+	if len(h.st.statusCalls) != 1 || h.st.statusCalls[0].Status != "error" {
+		t.Fatalf("guardrail block must PARK at status='error' (not tick-storm): status calls = %+v", h.st.statusCalls)
+	}
+	if len(h.notif.notifications) != 1 || h.notif.notifications[0].Kind != "schedule_error" {
+		t.Fatalf("park must notify the owner once with a schedule_error, got %+v", h.notif.notifications)
+	}
+}
+
 func TestTickMalformedConfigParks(t *testing.T) {
 	h := newHarness()
 	s := h.issueSchedule()

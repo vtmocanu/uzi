@@ -451,8 +451,11 @@ Serves human: best-practice (protect the upstream forge; abuse resistance).
   endpoints only: verify, projects, move, sync. Budget `FORGE_RATE_LIMIT_MAX`/
   `FORGE_RATE_LIMIT_WINDOW` (default 30/min), separate from the auth limiter.
 - **Poller bounding**: per-tick **bounded concurrency of 4**
-  (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** clamped to one poll
-  interval, so a slow forge can't let ticks pile up. In-memory per-repo state
+  (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** of the poll
+  interval, floored at **2x the forge HTTP timeout** (`tickBudget`, issue #139) so a
+  poll interval shorter than the tick's forge calls (the e2e 2s cadence) can't cancel
+  an in-flight sync; ticks never overlap (single-goroutine `Run`), so a slow forge
+  can't let them pile up. In-memory per-repo state
   (`marks forgesvc.Marks` — one high-water mark per fetch, §447 — plus poll count)
   — a disabled repo drops out; a re-enabled one restarts with a fresh full
   reconcile.
@@ -1052,14 +1055,48 @@ back to defaults (PRD #1/#2 convention). Worker-side: `UZI_API_URL`,
 `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`, `UZI_WORKER_NAME`, and the interval knobs above
 (duration-or-ms).
 
-## 50. Guardrail layering (design; enforcement lands M3)
+## 50. Guardrail layering (layer 2 = M2, layers 3–5 = M3; layer 1 enforced by PRD #66)
 
 Serves human: "agents only ever create MRs, never write to main — primary directive."
 
+Note on the "M3" in this section: layer 2 (worker-owned network git) landed in **M2**;
+**layers 3–5** are the rest of the agent/worker git guardrails and landed in **M3 of the
+original guardrail PRD** (deny-hook, permission mode, settingSources). That is a different
+milestone set from PRD #66, which is what makes **layer 1** enforced — do not conflate the
+two.
+
 Layered so no single layer is load-bearing, and none trusts the model:
-1. **GitLab role**: the bot is Developer and `main` is protected (documented project
-   config; **now continuously verified by PRD #5's privcheck** — see §405–§407, which
-   turns this layer from documented-and-hoped into checked-at-save-and-periodically).
+1. **Forge role / protected default branch — ENFORCED (PRD #66).** The bot is Developer
+   and `main` is protected (documented project config), verified by PRD #5's privcheck
+   (§405–§407). **PRD #66 turns this layer from checked-and-reported into refused:** uzi
+   now REFUSES a run when the bot can push or merge to the default branch — no longer a
+   badge nobody reads. This closes the problem #66 names: the platform layer was
+   previously checked, reported, then *ignored* (a repo the bot could push `main` on ran
+   exactly like one it could not).
+   - **Three refusal points** (D1, one per moment the capability is granted): **repo-enable**
+     (`422`, so the present user can fix it); the **PAT-bearing run inserts** — issue/autopilot,
+     CI-fix, self-improve, scheduled prompt — all via one shared service-layer helper so the
+     unattended paths are covered (`422` at the UI, refused otherwise); and the **claim backstop**
+     (the run goes `failed`, since a queued run outlives its earlier checks). A gate in the handler
+     alone covers only 1 of the inserts; the service-layer + claim placement covers all.
+   - **Live, not the stored report (D2):** the gate re-reads protection at decision time, never
+     the cached `privilege_report`. So `UZI_PRIVILEGE_CHECK_INTERVAL=0` disables *reporting*, not
+     *enforcement*, and a user who fixes protection is unblocked at once (not up to 24h later).
+   - **Fails closed (D3):** cannot-evaluate is cannot-run — a forge read error or otherwise
+     unverifiable protection also refuses (a hostile forge must not pass by erroring). The
+     evaluator checks `Protected` FIRST, so an unprotected `main` is not misread as `false,false` safe.
+   - **The rule / coded blocking set (D3/D6):** refuse on `user_can_push` / `user_can_merge`
+     on the default branch, the unprotected default branch, or the fail-closed
+     `protection_unreadable` condition. **Judge and chat runs are unaffected** — they carry no
+     PAT by construction, so there is nothing to guard (Out of Scope).
+   - **Admin per-repo override (D8):** an instance admin may allow ONE named repo through —
+     per-repo, admin-only (no member self-allow path), with a required reason, audited (actor +
+     timestamp on the `repos` row). Applied as a **post-evaluation severity downgrade** of the six
+     waivable "bot too strong" codes only; it **never** waives the fail-closed `protection_unreadable`
+     case, so a forge blip still refuses even an allowed repo.
+   - **Scope limit (Out of Scope):** only the bot's **PAT** is guarded. A write **deploy key**
+     could still reach `main` and this check cannot see it (uzi provisions none). Say "the bot's
+     PAT cannot", never "nothing can".
 2. **Worker-owned network git** (§45): the agent literally has no push credential, so
    protected-branch writes are impossible regardless of what the model attempts —
    **this is realized now** (M2), the strongest layer.
@@ -20141,11 +20178,54 @@ only bites once the agent image is current (see Decision 2).
   live-DB round-trip & freeze under `./e2e/run-store-it.sh`
   (`TestRunScheduleOverrideSubagentModelRoundTripLiveDB`, `TestRunOverrideSubagentModelFrozenLiveDB`).
 
+## 523. PRD #309 — rate-limit burn-rate forecast: a window-model-AGNOSTIC trailing-burn signal, client-sampled, display-only
+
+Design record [prds/done/309-rate-limit-forecast.md](../prds/done/309-rate-limit-forecast.md). Adds a burn-rate
+forecast — a translucent "ghost" extending each meter to its projected landing point plus a `»` overflow
+marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/pages/AdminRateLimits.tsx`
+`WindowRow`) and the Settings card + sidebar micro-meters (`web/src/components/RateLimitMeters.tsx`
+`SettingsWindowRow` / `MicroRow`). WEB-ONLY: no API, Go, DB, or migration change (PRD Success Criterion 5).
+
+- **The window-model reframe (the load-bearing decision, taken 2026-08-12).** The PRD's original signal
+  ported cc-statusline's `projected = used × window ÷ elapsed`, which is valid ONLY for an ANCHORED window
+  (usage accrues from a boundary and resets there). That premise is undocumented and the public evidence
+  leans SLIDING (Anthropic's claude-code#62223 calls the 5h a sliding window whose "resets at" label is a
+  known misnomer), under which `elapsed = now − (resets_at − duration)` is meaningless, not merely
+  imprecise. The PRD gated everything on **M0** empirically settling anchored-vs-sliding — which is
+  UNSETTLEABLE in a build worker: no `pct` series is retained anywhere (the server keeps ONE gauge row per
+  token, overwritten each poll — migrations `00065_anthropic_rate_limits.sql` / `00080_rate_limits_per_token.sql`,
+  D4; the web replaces the reading on each 60s poll), and a fresh observation would need a live token with a
+  burst-then-idle pattern watched over hours/days on a running poller. So the feature was reframed to a signal
+  that makes NO window-model assumption: a **trailing burn rate** from OBSERVED Δpct over a short in-session
+  sample, projecting `pct + rate × seconds_to_reset`. It is correct under BOTH models (anchored idle → flat →
+  safe; sliding idle → decaying → safe). The anchored formula and the hardcoded `18000`/`604800` window
+  constants (PRD D10) are dropped entirely — the trailing math reads `resets_at` directly and needs no
+  window-length constant, removing that silent-divergence risk.
+- **Cost of the reframe, accepted.** COLD-START SILENCE — a freshly loaded page has no sample for a few
+  minutes, so the forecast is absent then appears, degrading to the PRD's own "silence = safe" default — and a
+  mostly-SILENT 7-day window, because `pct` moves too slowly for a short sample to clear the integer-resolution
+  noise floor. The 5-hour window — where burn-to-park is actually fast — carries the useful signal. The
+  rejected alternative was shipping the anchored projected-% verbatim (as cc-statusline does) with hedged copy;
+  rejected because it bets on the premise the evidence contradicts and the PRD gate forbids.
+- **Purity + statefulness split.** `burnForecast(samples, resetsAtSec, nowMs)` is a PURE, wall-clock-free
+  helper in `web/src/lib/rateLimits.ts` returning `{ state: "over" | "on_pace" | "safe"; projectedPct }`:
+  bands strict `> 115` over / `> 85` on_pace / else safe (PRD D7); suppress (→ safe/silent) when `< 2` samples,
+  span below a min floor, `rate ≤ 0` (flat/decaying), `pct >= 100`, `source === "limit_report"`, or `resets_at`
+  null/past (PRD D8). The only STATEFUL piece is a per-`(secret_id, window)` ring buffer of `{tMs, pct}`
+  accumulated across the existing polls; the two surfaces accumulate from their two distinct queries
+  (`/me/rate-limits`, `/admin/rate-limits`), each keyed by `secret_id`.
+- **Display-only invariant (PRD D2).** The forecast gates NOTHING and is imported only by rendering code — it
+  must never become an input to auto-selection or any decision (that would reintroduce the exact client/server
+  drift the auto-selection eligibility MAP deliberately avoids — the "A MAP, NOT A COMPUTATION" note in
+  `rateLimits.ts`). Projected % is HOVER/ARIA-ONLY via `MeterTrack`'s caller-supplied `aria-valuetext` (D4);
+  the shared `MeterTrack` atom (`web/src/components/Meter.tsx`) is COMPOSED by a rate-limit-specific wrapper and
+  left byte-unchanged (D9), so the `WorkerStats` cpu/mem gauges are untouched.
+
 # PRD #308 — Schedule fire outcomes (surface why a fire started nothing)
 
 Decision Log with the richer rationale: `prds/308-schedule-fire-outcome.md`.
 
-## 523. PRD #308 Decision 1 — last fire only, a single JSONB column, not a history table
+## 524. PRD #308 Decision 1 — last fire only, a single JSONB column, not a history table
 
 Shipped a single nullable `run_schedules.last_fire jsonb` that overwrites each fire, not a
 `schedule_fires` history table. This is the minimal surface that answers the only question the PRD
@@ -20153,7 +20233,7 @@ asks — "why did the last tick start nothing" — without a second table, its i
 policy. A per-fire history table remains a clean future extension: the outcome payload is already a
 self-contained struct, so adding an append-only log later does not reshape what a fire records.
 
-## 524. PRD #308 Decision 2 — typed skip reasons from one Go enum, pinned cross-language by a contract test
+## 525. PRD #308 Decision 2 — typed skip reasons from one Go enum, pinned cross-language by a contract test
 
 Shipped a closed `schedsvc.SkipReason` set (`no_prd_link`, `not_eligible`, `already_running`,
 `description_too_large`, `fetch_failed`) as the only vocabulary on the wire — no free text. The first
@@ -20164,7 +20244,7 @@ literals are the source of truth, pinned by a contract test (`web/src/lib/schedu
 parses them) so a Go reason with no TS counterpart reddens CI rather than reaching a user as an
 unlabelled code.
 
-## 525. PRD #308 Decision 3 — `run-now` reports its full outcome but never persists `last_fire`
+## 526. PRD #308 Decision 3 — `run-now` reports its full outcome but never persists `last_fire`
 
 A manual `run-now` fire returns the complete matched/started/skipped breakdown in its HTTP and CLI
 response, but never writes `last_fire`. It never reaches `advance()`, which is where the scheduled
@@ -20173,7 +20253,7 @@ manual fire does not disturb the schedule's cadence — and, by the same token, 
 record of the last *scheduled* fire. The operator still gets the per-candidate answer immediately;
 it just is not durable.
 
-## 526. PRD #308 Decision 4 — `matched == started + skipped` is an enforced invariant; `matched: 0` is a valid outcome
+## 527. PRD #308 Decision 4 — `matched == started + skipped` is an enforced invariant; `matched: 0` is a valid outcome
 
 Every matched candidate lands in exactly one bucket — started or skipped — and the two must sum to
 `matched` on every fire. Per-candidate transient sweep failures are therefore recorded as
@@ -20181,7 +20261,7 @@ Every matched candidate lands in exactly one bucket — started or skipped — a
 `matched: 0` (an empty label set, or nothing eligible) is a legitimate, observable outcome the surface
 reports plainly, not an error or a null.
 
-## 527. PRD #308 Decision 5 — `last_fire` records the scheduled fire only; the park and transient-error paths do not write it
+## 528. PRD #308 Decision 5 — `last_fire` records the scheduled fire only; the park and transient-error paths do not write it
 
 Only the scheduled-fire path (through `advance()`) writes `last_fire`. Parking a schedule
 (`SetRunScheduleStatus`) and a transient fire error that does not advance both leave the column

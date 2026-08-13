@@ -49,6 +49,33 @@ a window is genuinely close to its cap. The **reset countdown** ("resets
 in 1h 23m") counts down to when that window clears, independent of the
 other one.
 
+## Reading the forecast
+
+The bar tells you how much of a window is gone; a lighter **ghost** extending
+past the fill tells you where it's *heading*. uzi watches how fast a window is
+climbing and projects that pace forward to when the window resets:
+
+- **Nothing** — the common, calm case. At the current rate the window finishes
+  with room to spare, so there's nothing to watch. Silence means safe.
+- **A gold ghost** — on pace to land right around the cap by the time it resets.
+- **A coral ghost** — burning fast enough to overshoot the cap well before the
+  window resets. This is the one worth acting on: pace down or switch to another
+  token.
+
+A small **`»`** rides the end of the ghost whenever the projection crosses the
+cap — always on a coral ghost, and on a gold one when it's heading just past
+100%. Read it as a "past the limit" flag.
+
+Hover a forecasting bar to read the projected figure ("projected 106% by
+reset"). It's a straight-line estimate from recent readings, not a promise —
+usage comes in bursts, so treat it as "if this pace holds", not a countdown.
+
+The pace is measured live from the readings uzi has seen **this session**, so a
+freshly opened page shows no forecast for the first few minutes, and the slower
+7-day window rarely says anything at all — it moves too gently for a short look
+to read a trend. The forecast only ever informs you; it never changes which
+token a run picks or when.
+
 ## How fresh is this?
 
 uzi polls Anthropic in the background, by default every 5 minutes, once per

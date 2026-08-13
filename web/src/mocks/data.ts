@@ -14,6 +14,7 @@ import type {
   CliToken,
   Disposition,
   ForgeConnection,
+  GuardrailOverrideMeta,
   IssueProposal,
   LatestRun,
   Memory,
@@ -780,8 +781,8 @@ export const mockConnection: ForgeConnection = {
     status: "ok",
     token: { scopes: ["api"], active: true, violations: [], warnings: [] },
     repos: [
-      { repo_id: "repo-uzi", path: "vtmocanu/uzi", role: "write", member: true, violations: [], warnings: [] },
-      { repo_id: "repo-atlas", path: "vtmocanu/atlas-api", role: "write", member: true, violations: [], warnings: [] },
+      { repo_id: "repo-uzi", path: "vtmocanu/uzi", role: "write", member: true, findings: [] },
+      { repo_id: "repo-atlas", path: "vtmocanu/atlas-api", role: "write", member: true, findings: [] },
     ],
   },
 };
@@ -814,6 +815,16 @@ export const mockForgeConfigAllForges = {
   forge_types: ["gitlab", "forgejo", "github"],
 };
 
+// PRD #66 M9 (D8): the atlas repo's admin override, shared by the Boards repo fixture
+// and the admin blocked-repos list so both read ONE literal. Typed as the wire
+// GuardrailOverrideMeta (the same shape RepoDTO.guardrail_override and
+// BlockedRepoDTO.guardrail_override carry).
+export const mockAtlasOverride: GuardrailOverrideMeta = {
+  reason: "forge fix scheduled for next sprint; accepting the risk until then",
+  by: "vlad@example.com",
+  at: daysAgo(3),
+};
+
 export const mockRepos: Repo[] = [
   {
     id: "repo-uzi",
@@ -835,6 +846,10 @@ export const mockRepos: Repo[] = [
       pipeline_id: 4242,
       synced_at: minsAgo(1),
     },
+    // PRD #66 M8 (D8): no admin guardrail override active. The M9 UI renders off this.
+    guardrail_override: null,
+    // PRD #66 M9 (D8): not refused by the guardrail (server-computed).
+    guardrail_blocked: false,
   },
   {
     id: "repo-atlas",
@@ -854,6 +869,30 @@ export const mockRepos: Repo[] = [
       pipeline_id: 3311,
       synced_at: minsAgo(2),
     },
+    // PRD #66 M9 (D8): an admin has explicitly allowed this repo through the
+    // guardrail — the "allowed by admin" badge + Revoke path in the demo.
+    guardrail_override: { ...mockAtlasOverride },
+    guardrail_blocked: false,
+  },
+  {
+    // PRD #66 M9 (D8): a repo the push/merge guardrail REFUSES right now
+    // (guardrail_blocked, server-computed). It makes the Boards "runs blocked" badge,
+    // the admin inline "Allow anyway" modal, and the member "ask an admin" pointer all
+    // reachable under VITE_UZI_MOCK=1, and it is the row the admin blocked-repos list's
+    // Allow/Revoke round-trips against (see mockBlockedRepoMeta + mockApi).
+    id: "repo-payments",
+    connection_id: "conn-1",
+    forge_project_id: 512,
+    path_with_namespace: "team-beta/payments-api",
+    web_url: "https://gitlab.example.com/team-beta/payments-api",
+    default_branch: "main",
+    enabled: true,
+    repo_skills_enabled: false,
+    repo_claudemd_enabled: false,
+    repo_devbox_opt_in: false,
+    pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: true,
   },
   {
     id: "repo-www",
@@ -867,8 +906,55 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
+    guardrail_override: null,
+    guardrail_blocked: false,
   },
 ];
+
+// PRD #66 M9 (D8): per-repo metadata the admin cross-user blocked-repos list needs but
+// the wire Repo does not carry — owner identity and the UNDERLYING (pre-override) block
+// reasons live on the connection/report server-side. mockApi.adminListBlockedRepos JOINS
+// this with the SHARED, mutable repos state (the same state the Boards page and the
+// Allow/Revoke mutations act on), so a demo Allow or Revoke round-trips into the list
+// instead of 404ing against a static deep-copy. Keyed by repo id; a repo absent here
+// falls back to the demo owner/connection.
+//
+// block_messages here are the repo's UNDERLYING waivable block reasons (what it shows
+// when blocked, and what re-arms the guardrail on Revoke). An overridden-clean repo like
+// repo-atlas still lists them so revoking its override re-blocks it — the admin DTO emits
+// [] for it while the override stands (it is not currently blocked).
+export interface MockBlockedRepoMeta {
+  owner_id: string;
+  owner_email: string;
+  forge_type: string;
+  block_messages: string[];
+  privilege_status: string | null;
+  privilege_checked_at: string | null;
+}
+
+export const mockBlockedRepoMeta: Record<string, MockBlockedRepoMeta> = {
+  // Cross-user: an owner's repo the guardrail refuses right now (blocked).
+  "repo-payments": {
+    owner_id: "u-dana",
+    owner_email: "dana@example.com",
+    forge_type: "gitlab",
+    block_messages: [
+      "the default branch is protected but the write role (Developer) may push to it",
+      "the write role (Developer) may merge to the default branch",
+    ],
+    privilege_status: "violations",
+    privilege_checked_at: minsAgo(18),
+  },
+  // Overridden-clean now, but carries the underlying waivable block so Revoke re-arms it.
+  "repo-atlas": {
+    owner_id: "u-admin",
+    owner_email: "vlad@example.com",
+    forge_type: "gitlab",
+    block_messages: ["the default branch is protected but the write role (Developer) may push to it"],
+    privilege_status: "violations",
+    privilege_checked_at: minsAgo(18),
+  },
+};
 
 // ── Boards ───────────────────────────────────────────────────────────────────
 

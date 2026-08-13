@@ -322,3 +322,75 @@ describe("RateLimitAnnouncer (aria-live)", () => {
     expect(region()).toBe("");
   });
 });
+
+// PRD #309 M4 — the burn-rate forecast, wired end to end through the Settings card.
+// These drive the real accumulation (useReadingSeries) across polls, so they prove
+// the WIRING (series → burnForecast → RateLimitForecastMeter), not just the helper.
+describe("RateLimitCard forecast (PRD #309)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const flush = (ms = 0) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+
+  // A 5-hour reading at pct5 with a far-out reset, so a rising trailing series
+  // projects well past the cap. Not stale → it accrues a sample.
+  const fiveHourAt = (pct5: number): MyRateLimits => ({
+    status: "ok",
+    five_hour: { pct: pct5, resets_at: nowSecs + 5000 },
+    seven_day: { pct: 20, resets_at: nowSecs + 200_000 },
+    source: "usage_endpoint",
+    synced_at: new Date().toISOString(),
+    stale: false,
+  });
+
+  it("draws a coral ghost + » once a rising trailing series projects over the cap", async () => {
+    let poll = 0;
+    // 40, 48, 56 … capped below 100 so late polls are flat (no reset/decay restart).
+    mockApi.getMyRateLimits.mockImplementation(async () => {
+      const pct5 = Math.min(40 + poll * 8, 96);
+      poll += 1;
+      return tokens(fiveHourAt(pct5));
+    });
+    render(<RateLimitCard />);
+    await flush(); // initial read (40%)
+    for (let k = 0; k < 6; k++) await flush(60_000); // rising polls, >3-min span accrues
+
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
+    expect(screen.getByText("»")).toBeTruthy();
+    // The projected % is NEVER inline visible text (D4): the row shows only the
+    // current pct, not the projection.
+    expect(screen.getByText("»").closest("div")?.parentElement?.textContent).not.toMatch(/projected/);
+  });
+
+  it("stays silent (plain bar) on a FLAT series — proving it reads the slope, not presence", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(fiveHourAt(62))); // constant 62%
+    render(<RateLimitCard />);
+    await flush();
+    for (let k = 0; k < 6; k++) await flush(60_000);
+
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
+    expect(screen.queryByText("»")).toBeNull();
+  });
+
+  it("clears the forecast the moment a forecasting row goes stale (no ghost on a frozen bar)", async () => {
+    let poll = 0;
+    mockApi.getMyRateLimits.mockImplementation(async () => {
+      const pct5 = Math.min(40 + poll * 8, 88);
+      const stale = poll >= 7; // polls 0..6 rise live; 7+ freeze the same reading stale
+      poll += 1;
+      const r = fiveHourAt(pct5);
+      return tokens(r.status === "ok" ? { ...r, stale } : r);
+    });
+    render(<RateLimitCard />);
+    await flush(); // 40%
+    for (let k = 0; k < 6; k++) await flush(60_000); // rising, live → forecast appears
+    expect(screen.getByText("»")).toBeTruthy();
+
+    await flush(60_000); // poll 7 → same pct, stale=true
+    await flush(60_000); // settle
+    expect(screen.queryByText("»")).toBeNull(); // ghost gone immediately (rowForecast gate)
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
+    expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
+  });
+});

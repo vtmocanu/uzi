@@ -1,7 +1,17 @@
 # PRD #66: Refuse runs when the bot can push or merge to the default branch
 
 **GitLab Issue**: [#66](https://gitlab.example.com/vtmocanu/uzi/-/issues/66)
-**Status**: Draft (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it; extended 2026-08-12 at the user's direction with the admin per-repo override — D8, M8–M9)
+**Status**: **Done** (created 2026-07-17; split out of [PRD #65](done/65-forgejo-support.md) mid-session, on the architect's escalation, once it was clear this is a GitLab behaviour change with no Forgejo content in it; extended 2026-08-12 at the user's direction with the admin per-repo override — D8, M8–M9; all nine milestones landed and reviewed 2026-08-13)
+
+**As-built close-out (2026-08-13).** All milestones shipped. One operational item is
+NOT a code deliverable and remains for the operator at rollout: M3's *impact count* —
+run `uzi admin guardrail-impact` (or `GET /api/admin/guardrail-impact`) against the live
+instance BEFORE upgrading to see how many enabled repos would be refused and which. The
+count is instance-specific and was not captured here (this run has no live instance); the
+mechanism (the live, non-persisting scan) shipped in M3 and the release note (CHANGELOG,
+M7) instructs the operator to run it. The one design refinement from build: an empty
+scan under `UZI_PRIVILEGE_CHECK_INTERVAL=0` is *unknown*, not *zero affected* (R1) —
+surfaced in the admin blocked-repos list and the CLI output.
 **Priority**: High
 **Depends on**: **PRD #65** — it lands `WriteRoleCanMerge`/`BotCanMerge`, the `Role` enum, and the shared `evaluateRepo` whose fields this PRD consumes. #65 reports; #66 refuses.
 **Touches the contracts of**: PRD #5 (privilege checks — **this PRD changes its warn-don't-block policy**, the first time uzi refuses a run for any reason), PRD #19 (autopilot creates runs), PRD #6 (CI-fix creates runs), PRD #46 (self-improve creates runs), PRD #42 (claim path).
@@ -305,29 +315,29 @@ human seeing it.
 
 ## Milestones
 
-- [ ] **M1 — Coded findings + severity table** (D5, D6): `Finding{Code, Severity, Message}`
+- [x] **M1 — Coded findings + severity table** (D5, D6): `Finding{Code, Severity, Message}`
       replaces the string slices; severity from the map; the blocking set becomes
       enumerable. Reporting only — nothing refuses yet.
-- [ ] **M2 — The shared fail-closed evaluator** (D3): one `evaluate` used by both the
+- [x] **M2 — The shared fail-closed evaluator** (D3): one `evaluate` used by both the
       gate and the reporting checker, `Protected` checked first, unevaluable → block.
       Tests: unprotected → blocked; read error → blocked; the `false,false` inversion
       cannot be read as safe.
-- [ ] **M3 — Pre-flight impact count** (R1): **run before M1's migration NULLs the
+- [x] **M3 — Pre-flight impact count** (R1): **run before M1's migration NULLs the
       evidence.** Re-sweep with the new checks (a jsonb query over stored reports is
       not sufficient — see R1) and report how many live repos would be refused.
-- [ ] **M4 — Repo-enable gate + Repos-page blocking badge** (D1 layer 1, D4): 422 with
+- [x] **M4 — Repo-enable gate + Repos-page blocking badge** (D1 layer 1, D4): 422 with
       the `forge.go:191` body shape; the badge that stops this being a wall with no sign.
-- [ ] **M5 — Service-layer gate** (D1 layer 2): one helper called by `CreateRun`,
+- [x] **M5 — Service-layer gate** (D1 layer 2): one helper called by `CreateRun`,
       `CreateCIFixRun`, `CreateSelfImproveRun`. **Not the handler** — that misses
       autopilot.
-- [ ] **M6 — Claim backstop** (D1 layer 3): at `service.go:682`, the single place
+- [x] **M6 — Claim backstop** (D1 layer 3): at `service.go:682`, the single place
       `ForgePAT` is attached. Run → `failed` with a reason, never a 500.
-- [ ] **M7 — Release note + docs**: name the affected repos from M3, say how to fix
+- [x] **M7 — Release note + docs**: name the affected repos from M3, say how to fix
       each forge, and flip `docs/forgejo-bot-setup.md`'s "uzi will not do it for you"
       to "uzi will refuse to run until you do"; and document the admin override (D8) —
       who can set it, that it is per-repo and audited, and that it never waives the
       unreadable case.
-- [ ] **M8 — Admin per-repo override, backend** (D8): a goose migration adding the three
+- [x] **M8 — Admin per-repo override, backend** (D8): a goose migration adding the three
       `repos` columns (draft number, renamed to the next free number at merge per repo
       convention); **admin-only, unscoped** set/clear-override queries (no `...ForUser`
       member variant); the new columns added to **every projection that must see them** —
@@ -339,7 +349,7 @@ human seeing it.
       an allowed repo runs at all three gates; a member cannot self-allow **any** repo
       (owned included); an allowed repo whose protection read *errors* is still refused;
       the Protected-first inversion is not reintroduced.
-- [ ] **M9 — Override UI** (D8): **extend** M4's Repos-page badge (same file, later
+- [x] **M9 — Override UI** (D8): **extend** M4's Repos-page badge (same file, later
       phase — do not rebuild it) with "ask an admin" (member) / inline Allow-anyway +
       Revoke (admin-owner); a new admin cross-user **blocked repos** list (allow/revoke
       any owner's repo) beside Agents-status, backed by a **new admin-only query + route**

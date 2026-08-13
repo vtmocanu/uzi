@@ -255,9 +255,15 @@ type fakeStore struct {
 
 	// CI-fix (PRD #6). Counts default to 0 (no active run/fix) so existing
 	// CreateRun tests are unaffected by the new cross-kind checks.
-	ciFixRunResult   store.Run
-	ciFixRunErr      error
-	ciFixRunParams   *store.CreateCIFixRunParams
+	ciFixRunResult store.Run
+	ciFixRunErr    error
+	ciFixRunParams *store.CreateCIFixRunParams
+
+	// Scheduled prompt (PRD #241). promptRunParams stays nil until CreatePromptRun's
+	// insert runs, so a #66 guardrail test can assert the gate blocked before the insert.
+	promptRunResult  store.Run
+	promptRunErr     error
+	promptRunParams  *store.CreatePromptRunParams
 	activeBranchRuns int64 // CountActiveRunsWithBranch
 	activeCIFixRuns  int64 // CountActiveCIFixForRef
 
@@ -785,6 +791,10 @@ func (f *fakeStore) CreateSelfImproveRun(_ context.Context, arg store.CreateSelf
 func (f *fakeStore) CreateCIFixRun(_ context.Context, arg store.CreateCIFixRunParams) (store.Run, error) {
 	f.ciFixRunParams = &arg
 	return f.ciFixRunResult, f.ciFixRunErr
+}
+func (f *fakeStore) CreatePromptRun(_ context.Context, arg store.CreatePromptRunParams) (store.Run, error) {
+	f.promptRunParams = &arg
+	return f.promptRunResult, f.promptRunErr
 }
 func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
 	return f.activeBranchRuns, nil

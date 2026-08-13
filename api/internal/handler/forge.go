@@ -71,22 +71,52 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 		t := c.PrivilegeCheckedAt.Time
 		dto.PrivilegeCheckedAt = &t
 	}
-	if len(c.PrivilegeReport) > 0 {
-		var rep privcheck.Report
-		if err := json.Unmarshal(c.PrivilegeReport, &rep); err == nil {
-			dto.PrivilegeReport = &rep
-		} else {
-			// D7: rows written before PRD #65 hold "role" as a number, which no
-			// longer unmarshals against the Role string field. The report blanks
-			// until the next privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default
-			// 24h) re-stamps it in the new shape. This log is deliberate — the
-			// pre-#65 code discarded the error, which would hide a real corruption
-			// behind the same silent blank as this expected one-time migration miss.
-			slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
-				"connection", c.ID, "error", err)
+	dto.PrivilegeReport = parsePrivilegeReport(c.PrivilegeReport, c.ID)
+	return dto
+}
+
+// parsePrivilegeReport unmarshals a connection's stored privilege_report jsonb into
+// a *privcheck.Report, or nil when the column is empty or fails to unmarshal (a
+// pre-#65 blob holding "role" as a number). Shared by connToDTO's report surfacing
+// and M9's guardrail_blocked / admin blocked-repos computations so all three read the
+// blob exactly one way.
+func parsePrivilegeReport(raw []byte, connID uuid.UUID) *privcheck.Report {
+	if len(raw) == 0 {
+		return nil
+	}
+	var rep privcheck.Report
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		// D7: rows written before PRD #65 hold "role" as a number, which no longer
+		// unmarshals against the Role string field. The report blanks until the next
+		// privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default 24h) re-stamps it in
+		// the new shape. This log is deliberate — the pre-#65 code discarded the
+		// error, which would hide a real corruption behind the same silent blank as
+		// this expected one-time migration miss.
+		slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
+			"connection", connID, "error", err)
+		return nil
+	}
+	return &rep
+}
+
+// guardrailBlockedForRepo computes the authoritative "would a run be refused on this
+// repo right now" from its OWNING connection's STORED privilege_report (PRD #66 M9,
+// D8). It applies the admin per-repo override via the SINGLE shared
+// privcheck.DowngradeOverridden — the same primitive the live gates use — so the web
+// never re-derives the waivable set. A nil report (connection never swept, or
+// UZI_PRIVILEGE_CHECK_INTERVAL=0) yields false, which is "unknown, not safe": the
+// enable/run gates still fail closed live (M4-M6), and the admin blocked-repos list
+// surfaces the unknown explicitly (R1).
+func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bool) bool {
+	if rep == nil {
+		return false
+	}
+	for _, rr := range rep.Repos {
+		if rr.RepoID == repoID {
+			return privcheck.RepoReport{Findings: privcheck.DowngradeOverridden(rr.Findings, overridden)}.Blocks()
 		}
 	}
-	return dto
+	return false
 }
 
 // repoDTO (apitypes.RepoDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
@@ -105,6 +135,19 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
+	}
+	// #66 M8 (D8): expose the admin per-repo override metadata when active. The
+	// reason NULL is the discriminator — a non-NULL reason means the override is on.
+	// Display-only surfacing for M9's badge; no findings downgrade happens here.
+	if r.GuardrailOverrideReason.Valid {
+		ov := &apitypes.GuardrailOverrideDTO{Reason: r.GuardrailOverrideReason.String}
+		if r.GuardrailOverrideBy.Valid {
+			ov.By = uuid.UUID(r.GuardrailOverrideBy.Bytes).String()
+		}
+		if r.GuardrailOverrideAt.Valid {
+			ov.At = r.GuardrailOverrideAt.Time
+		}
+		dto.GuardrailOverride = ov
 	}
 	return dto
 }
@@ -497,9 +540,13 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		// Non-fatal: badges are enrichment, not the payload. Render without them.
 		slog.Warn("list projects: default-branch pipelines", "error", err)
 	}
+	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
+	// through the single shared downgrade — parsed once for the whole page.
+	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
+		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -529,9 +576,22 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Warn("list repos: default-branch pipelines", "error", err)
 	}
+	// The badge STATE (PRD #66 M9) reads each repo's OWNING connection's stored
+	// report. These repos span the user's connections, so parse each connection's
+	// blob once into a map keyed by connection id. Non-fatal on error — the badge is
+	// enrichment, and a missing report reads as "unknown" (false), never as "safe".
+	reports := map[uuid.UUID]*privcheck.Report{}
+	if conns, err := h.q.ListForgeConnectionsByUser(r.Context(), user.ID); err != nil {
+		slog.Warn("list repos: connections for guardrail badge", "error", err)
+	} else {
+		for _, c := range conns {
+			reports[c.ID] = parsePrivilegeReport(c.PrivilegeReport, c.ID)
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
+		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -539,6 +599,20 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 
 type setRepoEnabledRequest struct {
 	Enabled bool `json:"enabled"`
+}
+
+// blockFindingMessages extracts the human messages of exactly the SeverityBlock
+// findings, for the 422 "violations" array (PRD #66 D1 layer 1). Overridden and
+// warn findings are excluded — only findings that actually refuse the run are
+// reported as the reason it was refused.
+func blockFindingMessages(findings []privcheck.Finding) []string {
+	msgs := make([]string, 0, len(findings))
+	for _, f := range findings {
+		if f.Severity == privcheck.SeverityBlock {
+			msgs = append(msgs, f.Message)
+		}
+	}
+	return msgs
 }
 
 // SetRepoEnabled toggles whether a repo is tracked (its board shown, its poller
@@ -560,6 +634,55 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// D1 layer 1 (PRD #66): the repo-enable gate. Enabling is the moment the user
+	// is present and can fix a forge misconfiguration, so a live, fail-closed guard
+	// runs BEFORE the flip on the enable path only. The disable path is NEVER gated
+	// (D4) — a user must always be able to stop tracking a repo.
+	if req.Enabled {
+		row, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: id, UserID: user.ID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			slog.Error("get repo for enable guard", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		res := h.pcheck.GuardRepo(r.Context(), privcheck.GuardInput{
+			ForgeType:       row.ForgeType,
+			BaseURL:         row.BaseUrl,
+			TokenCiphertext: row.TokenCiphertext,
+			Repo: privcheck.Repo{
+				ID:             row.ID.String(),
+				Path:           row.PathWithNamespace,
+				ForgeProjectID: row.ForgeProjectID,
+				DefaultBranch:  row.DefaultBranch.String,
+			},
+			// Live per-repo override (M8): a non-NULL guardrail_override_reason means
+			// the admin override is active, so GuardRepo downgrades the waivable
+			// findings post-evaluation — never protection_unreadable (D8/D3).
+			Overridden: row.GuardrailOverrideReason.Valid,
+		})
+		if res.Blocked {
+			// 422 mirroring the save-time token gate's body shape (forge.go, key
+			// "violations") so the existing web 422 handling applies. Only the
+			// SeverityBlock findings' messages go in "violations" — an overridden or
+			// warn finding must not appear as a reason the run was refused.
+			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+				// Headline stays cause-agnostic: the block set spans both "the bot
+				// can push/merge to the default branch" and the fail-closed
+				// "protection could not be verified" case, and hardcoding the
+				// push/merge reason misdescribes the latter. The specific, actionable
+				// reason(s) are in "violations".
+				"error":      "this repo cannot be enabled: uzi will not run while the bot can reach the default branch, or while that cannot be verified (main is never touched). See the reasons below, fix branch protection on the forge, then retry.",
+				"violations": blockFindingMessages(res.Findings),
+			})
+			return
+		}
+	}
+
 	repo, err := h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: req.Enabled, UserID: user.ID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

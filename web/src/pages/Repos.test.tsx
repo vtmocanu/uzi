@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter } from "react-router-dom";
 import { Repos } from "./Repos";
 import { api, type ForgeConnection, type Repo } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -20,11 +21,21 @@ vi.mock("../lib/api", async (importOriginal) => {
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
       setRepoDevboxOptIn: vi.fn(),
+      setRepoGuardrailOverride: vi.fn(),
+      clearRepoGuardrailOverride: vi.fn(),
     },
   };
 });
 
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
 const mockApi = vi.mocked(api);
+
+function asAdmin(isAdmin: boolean) {
+  vi.mocked(useAuth).mockReturnValue({
+    user: { id: "u1", is_admin: isAdmin },
+  } as unknown as ReturnType<typeof useAuth>);
+}
 
 const CONN: ForgeConnection = {
   id: "conn-1",
@@ -51,6 +62,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
+    guardrail_blocked: false,
     ...over,
   };
 }
@@ -76,6 +88,7 @@ function rowFor(name: string): HTMLElement {
 }
 
 beforeEach(() => {
+  asAdmin(false);
   mockApi.listConnections.mockResolvedValue({ connections: [CONN] });
   mockApi.listProjects.mockResolvedValue({ repos: REPOS.map((r) => ({ ...r })) });
   mockApi.getRepoToolProfile.mockResolvedValue({ packages: [] });
@@ -238,6 +251,91 @@ describe("Repos — Trusted repo panel", () => {
   });
 });
 
+describe("Repos — guardrail blocking badge (PRD #66 M4/M9, D4/D8)", () => {
+  // A connection whose privilege report marks one repo block-severity (runs
+  // refused), one warn-only (advisory), and leaves the third with no entry (clean).
+  const CONN_WITH_REPORT: ForgeConnection = {
+    ...CONN,
+    privilege_status: "violations",
+    privilege_checked_at: "2026-08-13T00:00:00Z",
+    privilege_report: {
+      checked_at: "2026-08-13T00:00:00Z",
+      token: { scopes: [], active: true, violations: [], warnings: [] },
+      status: "violations",
+      repos: [
+        {
+          repo_id: "repo-uzi",
+          path: "vtmocanu/uzi",
+          role: "write",
+          member: true,
+          findings: [
+            {
+              code: "write_role_can_push",
+              severity: "block",
+              message: "the write role may push to protected main",
+            },
+          ],
+        },
+        {
+          repo_id: "repo-atlas",
+          path: "vtmocanu/atlas",
+          role: "admin",
+          member: true,
+          findings: [
+            {
+              code: "bot_role_above_write",
+              severity: "warn",
+              message: "the bot is above the write role",
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  // M9 (D8): the badge STATE is the SERVER's guardrail_blocked, not re-derived from
+  // the report. repo-uzi is blocked; the report supplies the finding MESSAGE for the
+  // title/modal. repo-atlas carries a warn-only finding and is not blocked.
+  const REPORTED_REPOS: Repo[] = [
+    { ...REPOS[0], guardrail_blocked: true },
+    { ...REPOS[1], guardrail_blocked: false },
+    { ...REPOS[2], guardrail_blocked: false },
+  ];
+
+  beforeEach(() => {
+    mockApi.listConnections.mockResolvedValue({ connections: [CONN_WITH_REPORT] });
+    mockApi.listProjects.mockResolvedValue({ repos: REPORTED_REPOS.map((r) => ({ ...r })) });
+  });
+
+  it("shows the 'runs blocked' badge on a server-blocked repo", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const row = within(rowFor("vtmocanu/uzi"));
+    const badge = row.getByText(/runs blocked/i);
+    expect(badge).toBeTruthy();
+    // The block finding's message is the actionable "sign on the wall" (D4).
+    expect(badge.getAttribute("title")).toContain("the write role may push to protected main");
+    // It is NOT the advisory wording.
+    expect(row.queryByText(/privilege warning/i)).toBeNull();
+  });
+
+  it("keeps a warn-only repo on the advisory badge, never 'runs blocked'", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/atlas");
+    const row = within(rowFor("vtmocanu/atlas"));
+    expect(row.queryByText(/runs blocked/i)).toBeNull();
+    expect(row.getByText(/privilege warning/i)).toBeTruthy();
+  });
+
+  it("shows neither badge on a clean repo (no findings entry)", async () => {
+    renderPage();
+    await screen.findByText("example/website");
+    const row = within(rowFor("example/website"));
+    expect(row.queryByText(/runs blocked/i)).toBeNull();
+    expect(row.queryByText(/privilege warning/i)).toBeNull();
+  });
+});
+
 describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
   it("opens the Tools panel and toggles the repo devbox opt-in", async () => {
     mockApi.setRepoDevboxOptIn.mockResolvedValue({
@@ -253,5 +351,99 @@ describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
     fireEvent.click(toggle);
 
     await waitFor(() => expect(mockApi.setRepoDevboxOptIn).toHaveBeenCalledWith("repo-uzi", true));
+  });
+});
+
+describe("Repos — admin per-repo override UI (PRD #66 M9, D8)", () => {
+  const blockedRepo = (): Repo =>
+    repo({ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", guardrail_blocked: true });
+  const overriddenRepo = (): Repo =>
+    repo({
+      id: "repo-atlas",
+      path_with_namespace: "vtmocanu/atlas",
+      guardrail_blocked: false,
+      guardrail_override: { reason: "forge fix scheduled", by: "admin@x", at: "2026-08-10T00:00:00Z" },
+    });
+
+  it("a member sees 'ask an admin' and NO Allow-anyway control on a blocked repo", async () => {
+    asAdmin(false);
+    mockApi.listProjects.mockResolvedValue({ repos: [blockedRepo()] });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const row = within(rowFor("vtmocanu/uzi"));
+    expect(row.getByText(/runs blocked/i)).toBeTruthy();
+    expect(row.getByText(/ask an admin to allow this repo/i)).toBeTruthy();
+    expect(row.queryByRole("button", { name: /allow anyway/i })).toBeNull();
+  });
+
+  it("an admin sees Allow-anyway; the modal requires a reason before POSTing", async () => {
+    asAdmin(true);
+    mockApi.listProjects.mockResolvedValue({ repos: [blockedRepo()] });
+    mockApi.setRepoGuardrailOverride.mockResolvedValue({ repo: { ...blockedRepo(), guardrail_blocked: false } });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /allow anyway/i }));
+
+    // The modal opens and its Allow button is disabled until a reason is typed.
+    const dialog = await screen.findByRole("dialog", { name: /allow runs on vtmocanu\/uzi/i });
+    const allowBtn = within(dialog).getByRole("button", { name: /allow anyway/i });
+    expect((allowBtn as HTMLButtonElement).disabled).toBe(true);
+
+    // A blank/whitespace reason keeps it disabled and never calls the API.
+    const textarea = within(dialog).getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "   " } });
+    expect((allowBtn as HTMLButtonElement).disabled).toBe(true);
+
+    // A real reason enables it; clicking POSTs the reason and refetches.
+    fireEvent.change(textarea, { target: { value: "accepting the risk until the forge fix" } });
+    expect((allowBtn as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(allowBtn);
+    await waitFor(() =>
+      expect(mockApi.setRepoGuardrailOverride).toHaveBeenCalledWith(
+        "repo-uzi",
+        "accepting the risk until the forge fix",
+      ),
+    );
+    // Refetch after the write.
+    await waitFor(() => expect(mockApi.listProjects).toHaveBeenCalledTimes(2));
+  });
+
+  it("an overridden repo shows 'allowed by admin' and (admin) a Revoke that clears it", async () => {
+    asAdmin(true);
+    mockApi.listProjects.mockResolvedValue({ repos: [overriddenRepo()] });
+    mockApi.clearRepoGuardrailOverride.mockResolvedValue({
+      repo: { ...overriddenRepo(), guardrail_override: null },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/atlas");
+    const row = within(rowFor("vtmocanu/atlas"));
+    expect(row.getByText(/allowed by admin/i)).toBeTruthy();
+    fireEvent.click(row.getByRole("button", { name: /revoke/i }));
+    await waitFor(() => expect(mockApi.clearRepoGuardrailOverride).toHaveBeenCalledWith("repo-atlas"));
+  });
+
+  it("a member sees 'allowed by admin' but NO Revoke control", async () => {
+    asAdmin(false);
+    mockApi.listProjects.mockResolvedValue({ repos: [overriddenRepo()] });
+    renderPage();
+    await screen.findByText("vtmocanu/atlas");
+    const row = within(rowFor("vtmocanu/atlas"));
+    expect(row.getByText(/allowed by admin/i)).toBeTruthy();
+    expect(row.queryByRole("button", { name: /revoke/i })).toBeNull();
+  });
+
+  it("closes the Allow-anyway modal on Escape and manages focus (a11y: shared Modal)", async () => {
+    asAdmin(true);
+    mockApi.listProjects.mockResolvedValue({ repos: [blockedRepo()] });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /allow anyway/i }));
+
+    const dialog = await screen.findByRole("dialog", { name: /allow runs on vtmocanu\/uzi/i });
+    // On open, focus is inside the dialog, never left on the page behind the backdrop.
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });

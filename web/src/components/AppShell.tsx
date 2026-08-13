@@ -551,6 +551,14 @@ function SidebarContent({
               onNavigate={onNavigate}
               collapsed={collapsed}
             />
+            {/* PRD #66 M9 (D8): the cross-user guardrail blocked/allowed repos list. */}
+            <NavItem
+              to="/admin/blocked-repos"
+              icon={<GitIcon />}
+              label="Blocked repos"
+              onNavigate={onNavigate}
+              collapsed={collapsed}
+            />
             <NavItem
               to="/admin/settings"
               icon={<GearIcon />}

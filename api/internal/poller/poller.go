@@ -65,6 +65,15 @@ type Engine struct {
 	// pipeline watch is on (pipelineMaxRefs > 0), since it reads the pipeline cache the
 	// same tick populates.
 	ciAutoFix *CIAutoFix
+
+	// forgeTimeout is the per-forge-call HTTP timeout (config.ForgeHTTPTimeout). It
+	// is used ONLY to floor the per-tick deadline (tickBudget, at 2x) so a poll
+	// interval shorter than the forge calls a tick makes — the e2e harness pins 2s,
+	// well under the 15s default — cannot preempt an in-flight sync call. Optional
+	// (zero => no floor, tick budget stays exactly interval), set via SetForgeTimeout,
+	// the same optional-collaborator pattern as autopilot/pipeline/ciAutoFix above
+	// (issue #139).
+	forgeTimeout time.Duration
 }
 
 // repoState is one repo's in-memory sync state. marks holds a SEPARATE
@@ -121,6 +130,14 @@ func (e *Engine) SetPipelineWatch(window time.Duration, maxRefs int) {
 	e.pipelineMaxRefs = maxRefs
 }
 
+// SetForgeTimeout records the per-forge-call HTTP timeout so tickBudget can floor
+// the per-tick deadline at 2x it. Call once at startup, before Run. Without it (the
+// zero value) the tick budget is exactly the poll interval — the pre-#139
+// behaviour. This decouples the tick DEADLINE from the poll CADENCE: a short
+// interval keeps its fast cadence, but a single tick is always granted enough time
+// for the forge round-trips it makes, so a healthy forge is never cancelled mid-call.
+func (e *Engine) SetForgeTimeout(d time.Duration) { e.forgeTimeout = d }
+
 // ForceReconcile requests that the next tick full-syncs every enabled repo,
 // dropping the incremental fast-path so a changed prd_label immediately re-filters
 // each board (PRD #19 M2). It is non-blocking: it drops the signal when one is
@@ -151,6 +168,35 @@ func reconcileDue(pollCount, reconcileEvery int) bool {
 	return pollCount == 1 || pollCount%reconcileEvery == 0
 }
 
+// tickBudget is the deadline for one tick: the poll interval, floored at 2x the
+// forge HTTP timeout. Without the floor, an interval shorter than the forge calls a
+// tick makes (the e2e harness pins 2s, well under the 15s FORGE_HTTP_TIMEOUT
+// default) makes the tick's context deadline fire before the forge client's own
+// per-call timeout, cancelling an in-flight ListIssues with a spurious "context
+// deadline exceeded" (issue #139) and, worse, risking interruption of the post-sync
+// autopilot/ci-fix detectors mid-operation. A zero forgeTimeout disables the floor
+// (budget == interval), preserving the pre-#139 behaviour for callers that never
+// wire it.
+//
+// The floor is 2x, not 1x: FullSync makes TWO sequential ListIssues calls (and the
+// tick opens with a ListEnabledReposWithConnections DB query before any forge call),
+// so one per-call timeout of budget could still cancel the second call mid-flight.
+// 2x-of-ForgeHTTPTimeout is the same margin config.go clamps the sweep timeouts to,
+// and for the same reason (an operation that must clear two forge calls).
+//
+// This floors the DEADLINE only, not the cadence: the Run ticker still fires every
+// interval, and because ticks never overlap (the Run loop is single-goroutine), a
+// budget larger than the interval only lets Go's ticker coalesce — it never runs two
+// ticks at once, and a tick that overruns the interval merely delays the next one.
+// The common fast path (a responsive forge answering in ms) still completes far
+// inside the interval, so a short poll cadence is preserved.
+func tickBudget(interval, forgeTimeout time.Duration) time.Duration {
+	if floor := 2 * forgeTimeout; forgeTimeout > 0 && interval < floor {
+		return floor
+	}
+	return interval
+}
+
 // Run blocks until ctx is cancelled, ticking every interval. It does not run an
 // immediate tick on start; the first pass happens one interval in (the compose
 // stack is up by then and the board's first-open path seeds initial data).
@@ -175,15 +221,17 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// tick syncs every enabled repo once, with bounded concurrency and a hard
-// per-tick deadline so one slow forge call can neither stall the cycle nor let
-// a tick run longer than the poll interval. Errors on one repo are logged and
-// skipped so a single bad connection (revoked PAT, forge down) never stalls the
-// others.
+// tick syncs every enabled repo once, with bounded concurrency and a hard per-tick
+// deadline (tickBudget) so a dead or wedged forge can neither stall the cycle nor
+// let a tick run unbounded. Errors on one repo are logged and skipped so a single
+// bad connection (revoked PAT, forge down) never stalls the others.
 func (e *Engine) tick(ctx context.Context) {
-	// Cap the whole tick at one interval: even under bounded concurrency, a
-	// pile-up of slow forges can't run past the next scheduled tick.
-	tickCtx, cancel := context.WithTimeout(ctx, e.interval)
+	// Bound the whole tick at tickBudget — the poll interval, but floored at 2x the
+	// forge HTTP timeout so a poll interval shorter than the tick's forge calls (the
+	// e2e 2s cadence) can't preempt an in-flight sync call (issue #139). When the
+	// floor applies, a slow-but-alive forge lets the tick run past the interval; that
+	// is fine — ticks never overlap (see below), so it only delays the next tick.
+	tickCtx, cancel := context.WithTimeout(ctx, tickBudget(e.interval, e.forgeTimeout))
 	defer cancel()
 
 	repos, err := e.q.ListEnabledReposWithConnections(tickCtx)

@@ -25,6 +25,30 @@ type RepoDTO struct {
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
 	Pipeline *PipelineDTO `json:"pipeline"`
+	// GuardrailOverride is the admin per-repo #66 guardrail override metadata (D8),
+	// null when no override is active (guardrail_override_reason IS NULL). M8 exposes
+	// it so M9 can render the badge; M8 itself adds no new UI control.
+	GuardrailOverride *GuardrailOverrideDTO `json:"guardrail_override"`
+	// GuardrailBlocked is the authoritative, server-computed "would a run be refused
+	// on this repo right now" (PRD #66 M9, D8): the repo's stored privilege_report
+	// findings run through the SINGLE shared privcheck.DowngradeOverridden (so the
+	// override is applied identically to the live gates, never re-derived in the web)
+	// and then RepoReport.Blocks(). The web reads this boolean for the badge STATE and
+	// never re-implements the waivable-set rule. False on a connection with no report
+	// yet (never swept, or UZI_PRIVILEGE_CHECK_INTERVAL=0) is "unknown, not safe": the
+	// enable/run gates still fail closed live (M4-M6); the admin blocked-repos list is
+	// where that unknown is surfaced explicitly (R1).
+	GuardrailBlocked bool `json:"guardrail_blocked"`
+}
+
+// GuardrailOverrideDTO is the audit metadata for an active admin per-repo guardrail
+// override (PRD #66 D8): the reason the admin gave, the actor's user id, and when it
+// was set. By is the raw actor uuid string — M9 may resolve a display name; M8 keeps
+// it simple.
+type GuardrailOverrideDTO struct {
+	Reason string    `json:"reason"`
+	By     string    `json:"by"`
+	At     time.Time `json:"at"`
 }
 
 // PipelineDTO is the CI-badge payload (PRD #6) a repo row, board header, or card

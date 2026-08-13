@@ -148,10 +148,16 @@ func (s *Service) CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UU
 // plan gate. Everything else — repo-ownership check, the guards, the snapshot
 // serialization and the queued notify — is identical, so the two paths cannot drift.
 func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string, autoApprove bool) (store.Run, error) {
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// #66 D1 layer 2: the shared service-layer guardrail. Covers both the manual
+	// Fix-CI button and the automatic ci-autofix poller (createCIFixRun is shared).
+	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
 

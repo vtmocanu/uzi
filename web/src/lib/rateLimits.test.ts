@@ -1,15 +1,24 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
+import { renderHook } from "@testing-library/react";
 import {
   autoChipFor,
   autoStatusChip,
+  burnForecast,
   formatAgo,
   formatCountdown,
+  pushSample,
+  rowForecast,
   rowState,
+  SERIES_MAX_AGE_MS,
+  SERIES_MAX_SAMPLES,
   sortAdminRows,
   statusBadge,
+  useReadingSeries,
   worstWindow,
+  type BurnSample,
   type RowState,
+  type SeriesReading,
 } from "./rateLimits";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits } from "./api";
 // ?raw rather than node:fs — the web tsconfig carries no node types, and the same
@@ -271,5 +280,165 @@ describe("autoStatusChip", () => {
     expect(code).not.toMatch(/100\s*-/);
     expect(code).not.toMatch(/synced_at/);
     expect(code).not.toMatch(/auto_eligible/);
+  });
+});
+
+describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
+  // Two samples spanning `spanMs` and ending at NOW. With RESET_5MIN the horizon
+  // (secondsToReset) equals a 5-min span, so projected = pct1 + (pct1 − pct0) =
+  // 2·pct1 − pct0 — which is how the boundary fixtures below land on exact integers.
+  function samples(pct0: number, pct1: number, spanMs = 5 * 60_000): BurnSample[] {
+    return [
+      { tMs: NOW - spanMs, pct: pct0 },
+      { tMs: NOW, pct: pct1 },
+    ];
+  }
+  const RESET_5MIN = NOW_SECS + 300; // secondsToReset == 300s == the default span
+
+  it("bands strictly at the 85/86/115/116 boundaries (D7)", () => {
+    expect(burnForecast(samples(15, 50), RESET_5MIN, NOW).state).toBe("safe"); // projected 85 → safe
+    expect(burnForecast(samples(14, 50), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 86 });
+    expect(burnForecast(samples(5, 60), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 115 });
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW)).toEqual({ state: "over", projectedPct: 116 });
+  });
+
+  it("is silent on too-few samples or too-short a span (cold start, slow 7d window)", () => {
+    expect(burnForecast([], RESET_5MIN, NOW).state).toBe("safe");
+    expect(burnForecast(samples(4, 60).slice(0, 1), RESET_5MIN, NOW).state).toBe("safe");
+    // A steep rise measured over only 2 min is below MIN_SAMPLE_SPAN_MS → silent.
+    expect(burnForecast(samples(4, 60, 2 * 60_000), RESET_5MIN, NOW).state).toBe("safe");
+  });
+
+  it("is silent on a flat or decaying slope (a sliding window idles downward → safe)", () => {
+    expect(burnForecast(samples(50, 50), RESET_5MIN, NOW).state).toBe("safe"); // flat
+    expect(burnForecast(samples(60, 40), RESET_5MIN, NOW).state).toBe("safe"); // decaying
+  });
+
+  it("suppresses a pct≥100 window and a limit_report inference, but not a live rise (D8)", () => {
+    expect(burnForecast(samples(90, 100), RESET_5MIN, NOW).state).toBe("safe"); // already at the cap
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "limit_report").state).toBe("safe");
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "usage_endpoint").state).toBe("over");
+  });
+
+  it("is silent past the reset horizon or with no reset (clock skew / null)", () => {
+    expect(burnForecast(samples(4, 60), NOW_SECS - 10, NOW).state).toBe("safe"); // reset already passed
+    expect(burnForecast(samples(4, 60), null, NOW).state).toBe("safe");
+    // A non-finite horizon (bad nowMs / resets_at) must not leak a NaN projection.
+    expect(burnForecast(samples(4, 60), RESET_5MIN, Number.NaN)).toEqual({ state: "safe", projectedPct: 0 });
+  });
+
+  it("discriminates on the SLOPE, not the latest pct (fails a stub that ignores elapsed)", () => {
+    // Latest pct is 60 in both; only the earlier sample — hence the slope — differs.
+    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW).state).toBe("over"); // steep rise
+    expect(burnForecast(samples(58, 60), RESET_5MIN, NOW).state).toBe("safe"); // gentle rise
+  });
+});
+
+describe("rowForecast (PRD #309 M4 — render-side stale short-circuit)", () => {
+  // A would-be "over" series: pct 4→60 over a 5-min span, reset 5 min out → projected 116.
+  const rising: BurnSample[] = [
+    { tMs: NOW - 5 * 60_000, pct: 4 },
+    { tMs: NOW, pct: 60 },
+  ];
+  const RESET = NOW_SECS + 300;
+
+  it("delegates to burnForecast for a live (non-stale) row", () => {
+    expect(rowForecast(false, rising, RESET, NOW, "usage_endpoint").state).toBe("over");
+  });
+
+  it("is silent for a stale row even with a would-be-over series (no forecast off a frozen reading)", () => {
+    // Guards the ok→stale transient: the accumulation clears one render late, so the
+    // render-side gate must suppress the forecast immediately on the stale render.
+    expect(rowForecast(true, rising, RESET, NOW, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
+  });
+});
+
+describe("pushSample (PRD #309 M2 — bounded non-decreasing trailing run)", () => {
+  it("seeds from empty, appends a changed pct immediately", () => {
+    expect(pushSample([], 10, 0)).toEqual([{ tMs: 0, pct: 10 }]);
+    expect(pushSample([{ tMs: 0, pct: 10 }], 12, 1_000)).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 1_000, pct: 12 },
+    ]);
+  });
+
+  it("dedupes a flat reading within the min interval, but records elapsed time past it", () => {
+    const seed = [{ tMs: 0, pct: 10 }];
+    expect(pushSample(seed, 10, 5_000)).toEqual(seed); // same pct, <20s → no append
+    expect(pushSample(seed, 10, 25_000)).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 25_000, pct: 10 },
+    ]); // same pct, ≥20s → records the passage of time
+  });
+
+  it("restarts the run on a pct decrease (window reset / sliding decay)", () => {
+    const prev = [
+      { tMs: 0, pct: 40 },
+      { tMs: 60_000, pct: 55 },
+    ];
+    expect(pushSample(prev, 5, 120_000)).toEqual([{ tMs: 120_000, pct: 5 }]);
+  });
+
+  it("prunes points older than the max age window", () => {
+    const prev = [
+      { tMs: 0, pct: 10 },
+      { tMs: 100_000, pct: 12 },
+    ];
+    // cutoff = now − SERIES_MAX_AGE_MS = 60_000, so the t=0 point falls out.
+    const now = SERIES_MAX_AGE_MS + 60_000;
+    const out = pushSample(prev, 12, now);
+    expect(out[0].tMs).toBe(100_000);
+    expect(out.every((s) => s.tMs >= now - SERIES_MAX_AGE_MS)).toBe(true);
+  });
+
+  it("caps the retained count, dropping the oldest", () => {
+    const prev: BurnSample[] = Array.from({ length: SERIES_MAX_SAMPLES }, (_, i) => ({
+      tMs: i * 25_000,
+      pct: i,
+    }));
+    const out = pushSample(prev, SERIES_MAX_SAMPLES, SERIES_MAX_SAMPLES * 25_000);
+    expect(out.length).toBe(SERIES_MAX_SAMPLES);
+    expect(out[0]).toEqual({ tMs: 25_000, pct: 1 }); // original[0] dropped
+  });
+});
+
+describe("useReadingSeries (PRD #309 M2)", () => {
+  const hook = (readings: SeriesReading[], now: number) =>
+    renderHook(
+      ({ r, n }: { r: SeriesReading[]; n: number }) => useReadingSeries(r, n),
+      { initialProps: { r: readings, n: now } },
+    );
+
+  it("accumulates per key across polls and drops keys no longer present", () => {
+    const { result, rerender } = hook([{ key: "a:5h", pct: 10 }], 0);
+    expect(result.current("a:5h")).toEqual([{ tMs: 0, pct: 10 }]);
+
+    rerender({
+      r: [
+        { key: "a:5h", pct: 20 },
+        { key: "b:5h", pct: 5 },
+      ],
+      n: 30_000,
+    });
+    expect(result.current("a:5h")).toEqual([
+      { tMs: 0, pct: 10 },
+      { tMs: 30_000, pct: 20 },
+    ]);
+    expect(result.current("b:5h")).toEqual([{ tMs: 30_000, pct: 5 }]); // isolated per key
+
+    rerender({ r: [{ key: "b:5h", pct: 6 }], n: 60_000 });
+    expect(result.current("a:5h")).toEqual([]); // 'a' absent → run dropped
+    expect(result.current("b:5h")).toEqual([
+      { tMs: 30_000, pct: 5 },
+      { tMs: 60_000, pct: 6 },
+    ]);
+  });
+
+  it("clears a run on a null (stale / non-ok / gated) reading", () => {
+    const { result, rerender } = hook([{ key: "a:5h", pct: 40 }], 0);
+    rerender({ r: [{ key: "a:5h", pct: 60 }], n: 30_000 });
+    expect(result.current("a:5h").length).toBe(2);
+    rerender({ r: [{ key: "a:5h", pct: null }], n: 60_000 });
+    expect(result.current("a:5h")).toEqual([]);
   });
 });
