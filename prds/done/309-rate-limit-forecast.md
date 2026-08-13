@@ -2,7 +2,7 @@
 
 **Issue**: [#309](https://gitlab.example.com/vtmocanu/uzi/-/issues/309)
 **Priority**: Medium (an operability improvement to an existing surface; no correctness or security impact)
-**Status**: In progress (implemented as the model-agnostic trailing-burn variant — see Resolution)
+**Status**: Done (implemented as the model-agnostic trailing-burn variant — see Resolution)
 **Anchor**: file references below are against `main` @ `cd0d6cf7`.
 **Design reference**: forecast mock (published artifact) — the meter forecast, three states, and hover-only projected %: https://claude.ai/code/artifact/1473afe3-9a54-4f16-9014-cb2d1fef431a
 
@@ -74,7 +74,7 @@ Web-only, single shared wrapper fanned out to three surfaces. M0 is a **blocking
 - [x] **M2 — Forecast meter wrapper.** Add a rate-limit-specific component that composes `MeterTrack` (leaving the shared atom's 72-line contract unchanged — no rate-limit copy or ghost logic inside it) and renders: the translucent ghost to `min(projected,100)%` in the pace tone (Tailwind translucent utilities, `bg-warn/40` / `bg-danger/40`, matching how the atom uses `bg-warn`/`bg-danger` at `Meter.tsx:29-33` — not raw CSS vars), an inset target edge, and the `»` slot shown only when `projected > 100`. Silent when `state === "safe"`. Passes the forecast phrase into `MeterTrack`'s `aria-valuetext`. Respects `prefers-reduced-motion` (static render, no animated growth). Component tests in `web/src/components/Meter.test.tsx` (or a new `RateLimitForecast.test.tsx`): ghost present/absent per state, tone mapping, `aria-valuetext` carries the projection, no `»` when `projected ≤ 100`, and `WorkerStats`'s use of `MeterTrack` is untouched.
 - [x] **M3 — Wire the wrapper into all three surfaces.** `AdminRateLimits.tsx` `WindowRow`, and `RateLimitMeters.tsx` (`SettingsWindowRow` + `MicroRow`), call the wrapper with `paceForecast(win, now)`, gating on `status:"ok"` and skipping when `stale` (per the contract above). Verify the sidebar's narrow width degrades gracefully (ghost always fits; `»` may drop at the tightest width without losing the color signal). Render tests extended in `AdminRateLimits.test.tsx` and `RateLimitMeters.test.tsx`: a forecasting window shows the ghost/marker; a safe/stale/`limit_report` one shows a plain bar; the projected % is reachable only via the accessible description, not printed inline.
 - [x] **M4 — Docs.** Update **`docs/rate-limits.md`** (it exists and is `audience: user`) with a short "reading the forecast" section — three states, silence = safe, the projection is a linear hint ("projected", "at the current rate", not a promise) — following the existing frontmatter conventions so `web/scripts/check-docs.mjs` passes. This edit is also where M0's rolling-vs-anchored wording is corrected.
-- [ ] **M5 — Full gate green + a11y pass.** `task gate:web` (lint, deadcode/knip, check-docs, typecheck, vitest) clean. Confirm the forecast is conveyed non-visually (aria) and that the safe/quiet case renders identically to today (no layout shift, no new element on a plain row).
+- [x] **M5 — Full gate green + a11y pass.** `task gate:web` (lint, deadcode/knip, check-docs, typecheck, vitest) clean. Confirm the forecast is conveyed non-visually (aria) and that the safe/quiet case renders identically to today (no layout shift, no new element on a plain row).
 
 ## Success criteria
 
