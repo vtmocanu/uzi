@@ -20192,7 +20192,7 @@ only bites once the agent image is current (see Decision 2).
 > anchored single-reading `paceForecast`, RE-ENABLED the `18000`/`604800` window constants this section dropped
 > (D10), and DELETED the trailing-sample machinery (`burnForecast`/`pushSample`/`useReadingSeries`/ring buffer).
 > So the two present-tense claims below — "the evidence leans SLIDING" and "the constants … are dropped
-> entirely" — are NO LONGER true of current code. Design record: [prds/310-rate-limit-anchored-forecast.md](../prds/310-rate-limit-anchored-forecast.md).
+> entirely" — are NO LONGER true of current code. Design record: [prds/done/310-rate-limit-anchored-forecast.md](../prds/done/310-rate-limit-anchored-forecast.md).
 > The #309 account is kept intact below because it is a correct past-tense record of a real decision, since
 > empirically reversed.
 
@@ -20288,11 +20288,11 @@ target, where the fan-out continues past the failed candidate.
 
 # PRD #310 — Rate-limit forecast: anchored always-on model + reset label
 
-Decision Log with the richer rationale: `prds/310-rate-limit-anchored-forecast.md`.
+Decision Log with the richer rationale: `prds/done/310-rate-limit-anchored-forecast.md`.
 
 ## 529. PRD #310 — rate-limit forecast REVERSED to the ANCHORED single-reading model (always-on); supersedes §523's window model
 
-Design record [prds/310-rate-limit-anchored-forecast.md](../prds/310-rate-limit-anchored-forecast.md). WEB-ONLY:
+Design record [prds/done/310-rate-limit-anchored-forecast.md](../prds/done/310-rate-limit-anchored-forecast.md). WEB-ONLY:
 no API, Go, DB, or migration change (PRD Success Criterion 6) — the inputs (`pct`, `resets_at`, `source`) are
 already in the DTOs. This reverses the load-bearing window-model decision recorded in §523 (PRD #309).
 
