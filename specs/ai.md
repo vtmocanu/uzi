@@ -20143,7 +20143,7 @@ only bites once the agent image is current (see Decision 2).
 
 ## 523. PRD #309 — rate-limit burn-rate forecast: a window-model-AGNOSTIC trailing-burn signal, client-sampled, display-only
 
-Design record [prds/309-rate-limit-forecast.md](../prds/309-rate-limit-forecast.md). Adds a burn-rate
+Design record [prds/done/309-rate-limit-forecast.md](../prds/done/309-rate-limit-forecast.md). Adds a burn-rate
 forecast — a translucent "ghost" extending each meter to its projected landing point plus a `»` overflow
 marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/pages/AdminRateLimits.tsx`
 `WindowRow`) and the Settings card + sidebar micro-meters (`web/src/components/RateLimitMeters.tsx`
