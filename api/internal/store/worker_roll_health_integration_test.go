@@ -43,16 +43,24 @@ func rollReport(workerID uuid.UUID, phase string, observedAt time.Time) store.Up
 		ControllerReportedAt: ts(observedAt),
 		RestartCount:         0,
 		WorkerImageTag:       pgtype.Text{String: "0.11.7", Valid: true},
+		// The default tag 0.11.7 is valid semver, so the arm guard treats it as a usable
+		// target. RecordRollHealth computes this api-side as semver.IsValid(normSemver(tag));
+		// mirror it here so these params match what the service actually sends.
+		TagValid: true,
 	}
 }
 
-// rollReportTag is rollReport with an explicit worker_image_tag, so a test can control
-// whether the roll target matches the worker's registered version — the distinction the
-// issue #155 per-incident guard turns on. rollReport's default tag (0.11.7) is left as is
-// because other tests depend on it.
-func rollReportTag(workerID uuid.UUID, phase string, observedAt time.Time, tag string) store.UpsertWorkerRollHealthParams {
+// rollReportTag is rollReport with an explicit worker_image_tag AND its validity, so a test
+// can control both whether the roll target matches the worker's registered version — the
+// distinction the issue #155 per-incident guard turns on — and whether the tag is usable
+// semver at all, which is the fail-closed discriminator the arm guard adds on top. tagValid
+// is passed explicitly rather than derived so a test can pin an INVALID tag that
+// split_part-strips equal to the version (the audit's HIGH suppression hole). rollReport's
+// default tag (0.11.7) is left as is because other tests depend on it.
+func rollReportTag(workerID uuid.UUID, phase string, observedAt time.Time, tag string, tagValid bool) store.UpsertWorkerRollHealthParams {
 	p := rollReport(workerID, phase, observedAt)
 	p.WorkerImageTag = pgtype.Text{String: tag, Valid: true}
+	p.TagValid = tagValid
 	return p
 }
 
@@ -212,7 +220,7 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 	// re-registers on every start, each restart would buy a fresh window.
 	// The worker is registered at 0.11.7 here, so an arming report needs a target
 	// distinct from it (issue #155 guard); a same-version tag is now an innocent blip.
-	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(hosted, "rolling", t0.Add(25*time.Minute), "0.11.8")); err != nil {
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(hosted, "rolling", t0.Add(25*time.Minute), "0.11.8", true)); err != nil {
 		t.Fatalf("re-arm before the metadata check: %v", err)
 	}
 	if anchorAfter("armed for the metadata check") == nil {
@@ -323,7 +331,7 @@ func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
 	}
 
 	// (a) A same-release `rolling` blip (tag == version) must NOT arm the anchor.
-	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", t0, "0.11.8")); err != nil {
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", t0, "0.11.8", true)); err != nil {
 		t.Fatalf("upsert same-release rolling blip: %v", err)
 	}
 	if got := anchor("after a same-release rolling blip"); got != nil {
@@ -335,7 +343,7 @@ func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
 
 	// (b) A same-release `stuck` blip must ALSO not arm — the guard is on the target
 	// matching, not on the phase being `rolling`.
-	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "stuck", t0.Add(time.Minute), "0.11.8")); err != nil {
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "stuck", t0.Add(time.Minute), "0.11.8", true)); err != nil {
 		t.Fatalf("upsert same-release stuck blip: %v", err)
 	}
 	if got := anchor("after a same-release stuck blip"); got != nil {
@@ -346,7 +354,7 @@ func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
 	// (c) A GENUINE next-release roll (tag != version) must arm FRESH — at its OWN first
 	// report — proving the earlier blips left the anchor clean rather than poisoning it.
 	genuineRoll := t0.Add(2 * time.Minute)
-	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", genuineRoll, "0.11.9")); err != nil {
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", genuineRoll, "0.11.9", true)); err != nil {
 		t.Fatalf("upsert genuine next-release roll: %v", err)
 	}
 	got := anchor("after a genuine next-release roll")
@@ -358,6 +366,98 @@ func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
 		t.Errorf("the ceiling armed at %v, want the genuine roll's own first report %v. A mismatch means an "+
 			"earlier same-release blip poisoned the anchor — the exact per-release bug of issue #155, where "+
 			"the real roll inherits a window that started before it did.", got, genuineRoll)
+	}
+}
+
+// Issue #155, security audit HIGH — an UNPARSEABLE roll target arms the ceiling FAIL-CLOSED.
+//
+// The per-incident guard (TestBlipAtSameReleaseDoesNotArmCeilingLiveDB) skips arming when the
+// roll target strips-equal to the worker's registered version. But split_part strips build
+// metadata from ANY string, valid semver or not: "0.11.8+_x" strips to "0.11.8". The
+// classifier (classifyWithTarget, upgrade.go ~397-400) does NOT trust "0.11.8+_x" — it is not
+// valid semver, so the tag is DISCARDED and the target falls back to CPVersion, against which
+// the worker can read `outdated`. A raw-split_part guard would meanwhile read "0.11.8+_x" as a
+// same-release blip and NOT arm, leaving ceilingOK permanently true — so a wedged or
+// compromised controller reporting `rolling` with worker_image_tag="<version>+_x" suppresses a
+// genuine `outdated` forever, past MaxUpgradingWindow. That is the audit's HIGH finding.
+//
+// The fix carries @tag_valid = semver.IsValid(normSemver(tag)) — the classifier's OWN gate —
+// and arms whenever the tag is NOT valid. This test pins both directions on two fresh workers
+// (separate rows, so no set-if-null ordering between them): the POISON tag arms, an equal-but-
+// VALID tag does not. That difference proves the discriminator is tag VALIDITY, not the raw
+// string, which is what closes the hole.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
+// e2e/run-store-it.sh.
+func TestInvalidTargetTagArmsCeilingFailClosedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("failclosed-%s@e2e", userID))
+
+	// Both workers are registered at 0.11.8 — the guard reads this as w.version.
+	// ck_workers_hosted_metadata (migration 00066) requires hosted_size and template_declared.
+	seed := func() uuid.UUID {
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO workers (id, user_id, name, token_hash, status, kind, version, hosted_size, template_declared)
+			 VALUES ($1, $2, $3, $4, 'offline', 'hosted', '0.11.8', 'm', 'base')`,
+			id, userID, "w-"+id.String()[:8], []byte(id.String()))
+		return id
+	}
+	poisonWorker := seed()
+	controlWorker := seed()
+
+	t0 := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+
+	anchor := func(worker uuid.UUID, what string) *time.Time {
+		var got *time.Time
+		if err := pool.QueryRow(ctx, `SELECT upgrading_since FROM worker_upgrade_reports WHERE worker_id = $1`, worker).
+			Scan(&got); err != nil {
+			t.Fatalf("read upgrading_since (%s): %v", what, err)
+		}
+		return got
+	}
+
+	// POISON: an INVALID tag that split_part-strips to the worker's own version. The
+	// classifier discards it and falls back to CPVersion, so the ceiling MUST engage; a
+	// raw-split_part guard would wrongly read "0.11.8+_x" as a same-release blip.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(poisonWorker, "rolling", t0, "0.11.8+_x", false)); err != nil {
+		t.Fatalf("upsert poison invalid-tag report: %v", err)
+	}
+	if got := anchor(poisonWorker, "after the poison invalid-tag report"); got == nil {
+		t.Errorf("a `rolling` report with an INVALID worker_image_tag (\"0.11.8+_x\") that split_part-strips "+
+			"to the worker's own version (0.11.8) did NOT arm upgrading_since. The classifier discards this "+
+			"tag as unparseable and falls back to CPVersion, so the worker can read `outdated` — the ceiling "+
+			"MUST engage. A raw-split_part guard reads it as a same-release blip and suppresses that "+
+			"`outdated` forever, past MaxUpgradingWindow. This is the security audit's HIGH finding: an "+
+			"invalid tag must arm fail-closed.")
+	}
+
+	// CONTROL: a VALID tag EQUAL to the version is a genuine same-release blip and must NOT
+	// arm. This is what proves the discriminator is tag VALIDITY, not the raw string.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(controlWorker, "rolling", t0, "0.11.8", true)); err != nil {
+		t.Fatalf("upsert control valid-tag report: %v", err)
+	}
+	if got := anchor(controlWorker, "after the control valid-tag report"); got != nil {
+		t.Errorf("a `rolling` report with a VALID tag equal to the worker's version (0.11.8) armed "+
+			"upgrading_since = %v. That is an innocent same-release blip — the classifier trusts the tag, "+
+			"the strip-equal guard should skip arming. If the invalid case above passes only because ALL "+
+			"reports now arm, this assertion catches it: the fix must discriminate on tag validity.", got)
 	}
 }
 

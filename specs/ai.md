@@ -12545,21 +12545,54 @@ record worth keeping.
     retracted two bullets up as deserving its own issue — is now implemented, and this was that issue,
     so the anchor is per-**incident** again rather than per-release. `UpsertWorkerRollHealth`'s
     anchor-arming CASE gained a second conjunct
-    (`api/internal/store/queries/worker_roll_health.sql`): `split_part(worker_image_tag, '+', 1) IS
-    DISTINCT FROM split_part(w.version, '+', 1)`. A `rolling`/`stuck` report whose target equals the
-    worker's own registered version — an innocent same-release blip — no longer arms the ceiling, so
-    the permanent-arm cry-wolf above cannot occur. **Keyed on the worker's OWN authenticated registered
+    (`api/internal/store/queries/worker_roll_health.sql`) that skips arming the ceiling ONLY for the
+    genuine same-release blip and ARMS in every other case, fail-closed:
+    ```
+    AND (NOT @tag_valid::boolean
+         OR split_part(worker_image_tag,'+',1) IS DISTINCT FROM split_part(w.version,'+',1))
+    ```
+    A `rolling`/`stuck` report whose target is a VALID semver that strips-equal to the worker's own
+    registered version — an innocent same-release blip — no longer arms the ceiling, so the
+    permanent-arm cry-wolf above cannot occur. **Keyed on the worker's OWN authenticated registered
     version** (`workers.version`, written only at authenticated register), NOT on the
     controller-supplied `target_tag`: keying on `(worker, target_tag)` is the forgeable trap
     `TestP2CeilingHoldsWhileTheControllerRotatesEveryFieldItControls` pins, and a controller cannot
-    forge the worker's version. **No suppression hole**: to suppress a genuine `outdated`,
-    version-compare must want to say outdated (target > worker version), which means the tags differ,
-    which arms the anchor, so the ceiling still engages and expires at `MaxUpgradingWindow`. Reuses
-    `RegisterWorker`'s build-metadata-stripped `IS DISTINCT FROM` idiom (`runtime.sql`) so ARM and the
-    version-move CLEAR share one definition of "the release moved" — avoiding a semver-ordering-in-SQL
-    alternative that would diverge from the string-equality clear. No migration, no new column, no
-    generated Go signature change (sqlc regen only): `worker_image_tag` and `observed_at` were already
-    query params and `w.version` is already in the FROM.
+    forge the worker's version. Reuses `RegisterWorker`'s build-metadata-stripped `IS DISTINCT FROM`
+    idiom (`runtime.sql`) so ARM and the version-move CLEAR share one definition of "the release
+    moved" — avoiding a semver-ordering-in-SQL alternative that would diverge from the string-equality
+    clear.
+  - **No suppression hole — and the FIRST version of this argument had one, found by security audit
+    (2026-08-13).** The guard skips arming only for a valid tag that strips-equal to the worker
+    version, which is exactly the case where the classifier's target IS that tag (`classifyWithTarget`,
+    upgrade.go ~397-400, trusts the tag as the target only when `semver.IsValid(normSemver(...))`) and
+    version-compare therefore says `up_to_date` — nothing to suppress. Every case where the classifier
+    could show `outdated` arms the anchor: a valid tag strictly ABOVE the version (the tags differ, so
+    the `split_part` disjunct is true), OR **any INVALID tag** (the classifier discards it and falls
+    back to `CPVersion`, a different, higher coordinate, so it can say `outdated` WITHOUT the raw tag
+    differing from the worker version) — caught by the `NOT @tag_valid` disjunct. So in every
+    `outdated`-reachable case the ceiling still engages and expires at `MaxUpgradingWindow`.
+    - An EARLIER version of this fix keyed the guard on the raw `split_part`-stripped tag ALONE, and
+      the "No suppression hole" text here asserted: *"version-compare must want to say outdated
+      (target > worker version), which means the tags differ, which arms the anchor."* That middle
+      step — "which means the tags differ" — is FALSE for an unparseable tag. For
+      `worker_image_tag = "0.11.7+_x"` against a worker registered on `0.11.7`, the classifier DISCARDS
+      the tag and compares `CPVersion` (a different, higher coordinate) to answer `outdated`, while
+      `split_part("0.11.7+_x",'+',1) = "0.11.7"` equals the worker version, so the raw-`split_part`
+      guard did NOT arm and R2 suppressed `outdated` INDEFINITELY. That was a real HIGH suppression
+      hole against a wedged/compromised controller — the very actor INV-5 exists to bound.
+    - The fix adds `@tag_valid`, computed api-side in `RecordRollHealth`
+      (`api/internal/workersvc/upgrade.go`) as `semver.IsValid(normSemver(worker_image_tag))` — the
+      SAME validity gate the classifier uses to decide whether to trust the tag as the target — so the
+      arm predicate and the classifier cannot disagree on which tags are usable. That is why the arm
+      predicate consumes the classifier's notion of a USABLE target rather than the raw controller
+      field: an unusable (invalid) tag is precisely one the classifier will not trust and will replace
+      with `CPVersion`, so the guard must fail-closed and arm.
+  - **Shape of the change.** No migration, no new column (`worker_image_tag`, `observed_at` and
+    `w.version` were already available to the query). It DOES change the generated Go signature: a
+    `TagValid bool` param/field is added to `UpsertWorkerRollHealthParams`, set by `RecordRollHealth`
+    and consumed as `@tag_valid`. (An earlier version of this bullet claimed "no generated Go signature
+    change, sqlc regen only"; the `@tag_valid` parameter falsified that — the SQL now takes an argument
+    Go must supply.)
 
 ## 417. Issue #157 — the agent was never TOLD its dependencies were provisioned, so it reinstalled them
 

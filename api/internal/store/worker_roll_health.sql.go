@@ -192,13 +192,30 @@ SELECT
     -- lives here in the SELECT because w.version is only referenceable from FROM workers w,
     -- not in the ON CONFLICT DO UPDATE clause — the guard flows into the conflict path via
     -- EXCLUDED.upgrading_since automatically.
+    --
+    -- FAIL-CLOSED on an unparseable tag (@tag_valid = false), and the NOT @tag_valid arm is
+    -- the security fix, not defensiveness. The classifier (classifyWithTarget, upgrade.go
+    -- ~397-400) trusts worker_image_tag as the roll target ONLY when it is valid semver;
+    -- an invalid tag is DISCARDED and it falls back to CPVersion, against which the worker
+    -- can read ` + "`" + `outdated` + "`" + `. But split_part still strips an invalid tag: "0.11.7+_x" strips to
+    -- "0.11.7", which equals a worker registered at 0.11.7, so the IS DISTINCT FROM arm
+    -- alone would read a same-release blip and NOT arm — leaving ceilingOK permanently true
+    -- while the classifier compares against CPVersion and says ` + "`" + `outdated` + "`" + `. A wedged or
+    -- compromised controller reporting ` + "`" + `rolling` + "`" + ` with worker_image_tag="<version>+_x" would
+    -- then suppress a genuine ` + "`" + `outdated` + "`" + ` forever, past MaxUpgradingWindow — the exact INV-5
+    -- hole this guard exists to close. So an invalid tag must ARM. @tag_valid is computed
+    -- api-side as semver.IsValid(normSemver(worker_image_tag)) — the SAME validity gate the
+    -- classifier uses — so the guard's notion of a "usable target" cannot diverge from the
+    -- classifier's. The parentheses around the OR are load-bearing: AND binds tighter, so
+    -- without them the phase check would attach to only the first disjunct.
     CASE WHEN $1::text IN ('rolling', 'stuck')
-              AND split_part($11::text, '+', 1)
-                  IS DISTINCT FROM split_part(w.version, '+', 1)
+              AND (NOT $11::boolean
+                   OR split_part($12::text, '+', 1)
+                      IS DISTINCT FROM split_part(w.version, '+', 1))
          THEN $10::timestamptz ELSE NULL END,
-    $12, $11
+    $13, $12
 FROM workers w
-WHERE w.id = $13 AND w.kind = 'hosted'
+WHERE w.id = $14 AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
     phase                  = EXCLUDED.phase,
     phase_since            = EXCLUDED.phase_since,
@@ -371,6 +388,7 @@ type UpsertWorkerRollHealthParams struct {
 	LastExitCode         pgtype.Int4        `json:"last_exit_code"`
 	ControllerReportedAt pgtype.Timestamptz `json:"controller_reported_at"`
 	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	TagValid             bool               `json:"tag_valid"`
 	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
 	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
 	WorkerID             uuid.UUID          `json:"worker_id"`
@@ -409,6 +427,7 @@ func (q *Queries) UpsertWorkerRollHealth(ctx context.Context, arg UpsertWorkerRo
 		arg.LastExitCode,
 		arg.ControllerReportedAt,
 		arg.ObservedAt,
+		arg.TagValid,
 		arg.WorkerImageTag,
 		arg.PollIntervalSeconds,
 		arg.WorkerID,
