@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-08-13
+
+### Fixed
+
+- **The `»` rate-limit forecast overflow marker is now vertically centered on its
+  bar.** It rendered about 1.24px below the bar midline, most visible on the thin
+  sidebar micro-meter where that offset is a quarter of the bar height: the
+  `-translate-y-1/2` positioning centers the glyph's box, but the `»` ink is
+  bottom-heavy in its line box under `leading-none`, so centering the box left the
+  ink hanging low. The nudge to `-translate-y-[62%]` centers the ink instead. The
+  past-the-cap horizontal placement introduced with the forecast (PRD #309) is
+  unchanged, and the rendered glyph is still `»`. Web-only. (!286, 23a0b693)
+
 ## [0.32.0] - 2026-08-13
 
 ### Changed
