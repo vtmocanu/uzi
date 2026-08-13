@@ -20140,3 +20140,46 @@ only bites once the agent image is current (see Decision 2).
   the run model, on the plan turn too); workersvc claim-delivery test (off omitted / on true);
   live-DB round-trip & freeze under `./e2e/run-store-it.sh`
   (`TestRunScheduleOverrideSubagentModelRoundTripLiveDB`, `TestRunOverrideSubagentModelFrozenLiveDB`).
+
+## 523. PRD #309 — rate-limit burn-rate forecast: a window-model-AGNOSTIC trailing-burn signal, client-sampled, display-only
+
+Design record [prds/done/309-rate-limit-forecast.md](../prds/done/309-rate-limit-forecast.md). Adds a burn-rate
+forecast — a translucent "ghost" extending each meter to its projected landing point plus a `»` overflow
+marker — to the three Claude rate-limit meter surfaces: admin table (`web/src/pages/AdminRateLimits.tsx`
+`WindowRow`) and the Settings card + sidebar micro-meters (`web/src/components/RateLimitMeters.tsx`
+`SettingsWindowRow` / `MicroRow`). WEB-ONLY: no API, Go, DB, or migration change (PRD Success Criterion 5).
+
+- **The window-model reframe (the load-bearing decision, taken 2026-08-12).** The PRD's original signal
+  ported cc-statusline's `projected = used × window ÷ elapsed`, which is valid ONLY for an ANCHORED window
+  (usage accrues from a boundary and resets there). That premise is undocumented and the public evidence
+  leans SLIDING (Anthropic's claude-code#62223 calls the 5h a sliding window whose "resets at" label is a
+  known misnomer), under which `elapsed = now − (resets_at − duration)` is meaningless, not merely
+  imprecise. The PRD gated everything on **M0** empirically settling anchored-vs-sliding — which is
+  UNSETTLEABLE in a build worker: no `pct` series is retained anywhere (the server keeps ONE gauge row per
+  token, overwritten each poll — migrations `00065_anthropic_rate_limits.sql` / `00080_rate_limits_per_token.sql`,
+  D4; the web replaces the reading on each 60s poll), and a fresh observation would need a live token with a
+  burst-then-idle pattern watched over hours/days on a running poller. So the feature was reframed to a signal
+  that makes NO window-model assumption: a **trailing burn rate** from OBSERVED Δpct over a short in-session
+  sample, projecting `pct + rate × seconds_to_reset`. It is correct under BOTH models (anchored idle → flat →
+  safe; sliding idle → decaying → safe). The anchored formula and the hardcoded `18000`/`604800` window
+  constants (PRD D10) are dropped entirely — the trailing math reads `resets_at` directly and needs no
+  window-length constant, removing that silent-divergence risk.
+- **Cost of the reframe, accepted.** COLD-START SILENCE — a freshly loaded page has no sample for a few
+  minutes, so the forecast is absent then appears, degrading to the PRD's own "silence = safe" default — and a
+  mostly-SILENT 7-day window, because `pct` moves too slowly for a short sample to clear the integer-resolution
+  noise floor. The 5-hour window — where burn-to-park is actually fast — carries the useful signal. The
+  rejected alternative was shipping the anchored projected-% verbatim (as cc-statusline does) with hedged copy;
+  rejected because it bets on the premise the evidence contradicts and the PRD gate forbids.
+- **Purity + statefulness split.** `burnForecast(samples, resetsAtSec, nowMs)` is a PURE, wall-clock-free
+  helper in `web/src/lib/rateLimits.ts` returning `{ state: "over" | "on_pace" | "safe"; projectedPct }`:
+  bands strict `> 115` over / `> 85` on_pace / else safe (PRD D7); suppress (→ safe/silent) when `< 2` samples,
+  span below a min floor, `rate ≤ 0` (flat/decaying), `pct >= 100`, `source === "limit_report"`, or `resets_at`
+  null/past (PRD D8). The only STATEFUL piece is a per-`(secret_id, window)` ring buffer of `{tMs, pct}`
+  accumulated across the existing polls; the two surfaces accumulate from their two distinct queries
+  (`/me/rate-limits`, `/admin/rate-limits`), each keyed by `secret_id`.
+- **Display-only invariant (PRD D2).** The forecast gates NOTHING and is imported only by rendering code — it
+  must never become an input to auto-selection or any decision (that would reintroduce the exact client/server
+  drift the auto-selection eligibility MAP deliberately avoids — the "A MAP, NOT A COMPUTATION" note in
+  `rateLimits.ts`). Projected % is HOVER/ARIA-ONLY via `MeterTrack`'s caller-supplied `aria-valuetext` (D4);
+  the shared `MeterTrack` atom (`web/src/components/Meter.tsx`) is COMPOSED by a rate-limit-specific wrapper and
+  left byte-unchanged (D9), so the `WorkerStats` cpu/mem gauges are untouched.
