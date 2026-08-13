@@ -326,6 +326,31 @@ describe("RateLimitAnnouncer (aria-live)", () => {
 // PRD #310 — the anchored forecast, wired end to end through the Settings card. The
 // projection is computed from a SINGLE reading (no sample warm-up), so one render
 // with a window heading past the cap must already show the ghost/marker.
+// PRD #310 M3 — the absolute "resets <Day HH:MM>" line under the token name,
+// derived from the 7-day reset. The countdown ("resets in …") in the utilization
+// column is a different string; the label regex matches only "resets <Wd> HH:MM".
+describe("RateLimitCard reset label (PRD #310 M3)", () => {
+  const RESET_LABEL = /resets [A-Za-z]{3} \d{2}:\d{2}/;
+
+  it("renders the 7-day reset label under the token name", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading)); // 7d resets_at set
+    const { container } = render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(container.textContent).toMatch(RESET_LABEL);
+  });
+
+  it("omits the label when the 7-day resets_at is null", async () => {
+    const noSevenReset: MyRateLimits = {
+      ...okReading,
+      seven_day: { pct: 27, resets_at: null },
+    };
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(noSevenReset));
+    const { container } = render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(container.textContent).not.toMatch(RESET_LABEL);
+  });
+});
+
 describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
   // A 5-hour window at 90% with a near reset (elapsed ≈ 13000s on the 18000s window
   // ⇒ factor ≈ 1.385 ⇒ projected ≈ 125): heading well past the cap from one reading.

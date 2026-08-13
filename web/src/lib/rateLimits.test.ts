@@ -5,6 +5,7 @@ import {
   autoStatusChip,
   formatAgo,
   formatCountdown,
+  formatResetLabel,
   paceForecast,
   rowForecast,
   rowState,
@@ -69,6 +70,35 @@ describe("formatCountdown (Decision 7)", () => {
     expect(formatCountdown(NOW_SECS + 44 * 60, NOW)).toBe("44m");
     expect(formatCountdown(NOW_SECS + 30, NOW)).toBe("<1m");
     expect(formatCountdown(NOW_SECS - 10, NOW)).toBe("now");
+  });
+});
+
+describe("formatResetLabel (PRD #310 M3 — 7-day reset label)", () => {
+  it("renders 'resets <Weekday> <HH:MM>' in the viewer's local tz", () => {
+    const resetsAt = Math.floor(Date.parse("2026-07-18T19:00:00Z") / 1000); // a Saturday
+    const label = formatResetLabel(resetsAt);
+    // Shape: a 3-letter weekday abbrev + 24h HH:MM. Not a hardcoded "Sat 19:00" —
+    // the wall-clock value depends on the CI machine's tz, so we assert the shape…
+    expect(label).toMatch(/^resets [A-Za-z]{3} \d{2}:\d{2}$/);
+    // …and that it reflects the LOCAL Intl rendering of that same epoch (whatever tz
+    // the runner is in), composed with no locale separator.
+    const parts = new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(resetsAt * 1000));
+    const at = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)!.value;
+    expect(label).toBe(`resets ${at("weekday")} ${at("hour")}:${at("minute")}`);
+  });
+
+  it("returns null for a null resets_at (caller omits the line)", () => {
+    expect(formatResetLabel(null)).toBeNull();
+  });
+
+  it("returns null for a non-finite resets_at (guarded defensively)", () => {
+    expect(formatResetLabel(Number.NaN)).toBeNull();
+    expect(formatResetLabel(Number.POSITIVE_INFINITY)).toBeNull();
   });
 });
 

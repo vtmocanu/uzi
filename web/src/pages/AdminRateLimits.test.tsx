@@ -198,3 +198,26 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
     expect(within(mihai).queryByText("»")).toBeNull();
   });
 });
+
+// PRD #310 M3 — the absolute "resets <Day HH:MM>" line under the token name in the
+// Token cell, from the 7-day reset. The utilization column shows a bare countdown
+// ("1h 23m"), not a "resets …" string, so the label regex is unambiguous.
+describe("AdminRateLimits reset label (PRD #310 M3)", () => {
+  const RESET_LABEL = /resets [A-Za-z]{3} \d{2}:\d{2}/;
+
+  it("renders the 7-day reset label under the token name", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("ana", ok(90, 20))] }); // 7d set
+    render(<AdminRateLimits />);
+    const ana = (await screen.findByText("ana")).closest("tr")!;
+    expect(ana.textContent).toMatch(RESET_LABEL);
+  });
+
+  it("omits the label when the 7-day resets_at is null", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({
+      users: [row("vlad", ok(20, 20, { seven_day: { pct: 20, resets_at: null } }))],
+    });
+    render(<AdminRateLimits />);
+    const vlad = (await screen.findByText("vlad")).closest("tr")!;
+    expect(vlad.textContent).not.toMatch(RESET_LABEL);
+  });
+});

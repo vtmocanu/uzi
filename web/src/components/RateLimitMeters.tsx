@@ -9,6 +9,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
   formatAgo,
   formatCountdown,
+  formatResetLabel,
   rowForecast,
   statusBadge,
   useNow,
@@ -148,9 +149,14 @@ function TokenMeters({
   // /me/rate-limits carries no vault_locked field, so vaultLocked is false — a
   // stale self reading reads "stale" (the single-source-of-truth wording).
   const badge = statusBadge(limits, false);
+  // The mock's absolute "resets <Day HH:MM>" line under the token name (PRD #310 M3),
+  // from the 7-day reset — the weekly quota users plan around. Omitted when the 7-day
+  // resets_at is null (formatResetLabel returns null).
+  const resetLabel = formatResetLabel(limits.seven_day.resets_at);
   return (
     <div className="border-t border-line pt-4 first:border-t-0 first:pt-0">
       {heading}
+      {resetLabel && <div className="mt-0.5 text-xs text-faint">{resetLabel}</div>}
       <div className={showLabel ? "mt-2" : ""}>
         <SettingsWindowRow
           label="5-hour window"

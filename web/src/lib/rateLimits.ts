@@ -25,6 +25,28 @@ export function formatCountdown(resetsAt: number | null, nowMs = Date.now()): st
   return "<1m";
 }
 
+// formatResetLabel renders a 7-day window's absolute reset as "resets <Day HH:MM>"
+// in the VIEWER'S LOCAL timezone (weekday included so it is unambiguous), the mock's
+// line under each token name (PRD #310 M3 / D4 — the weekly quota users plan around;
+// the per-window relative countdowns stay in the utilization column). null / non-
+// finite resets_at → null (the caller omits the line). resetsAt is a SECONDS epoch,
+// like resets_at everywhere else in this module. Built via Intl.DateTimeFormat +
+// formatToParts (not getHours) so the weekday abbrev and 24h HH:MM come out locale/
+// tz-correct and we compose exactly "resets <Weekday> <HH:MM>" with no locale
+// separator. Absolute, so it takes no nowMs — unlike its formatCountdown sibling.
+export function formatResetLabel(resetsAt: number | null): string | null {
+  if (resetsAt == null || !Number.isFinite(resetsAt)) return null;
+  const parts = new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    hourCycle: "h23", // midnight is "00:00", never "24:00" (some ICU builds render h24 otherwise)
+  }).formatToParts(new Date(resetsAt * 1000));
+  const at = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? "";
+  return `resets ${at("weekday")} ${at("hour")}:${at("minute")}`;
+}
+
 // formatAgo renders an ISO timestamp as "2m ago" / "3h ago" / "1d ago" — the
 // "updated N ago" line under the meters. nowMs is injectable for tests.
 export function formatAgo(iso: string, nowMs = Date.now()): string {

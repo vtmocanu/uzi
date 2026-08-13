@@ -9,6 +9,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
   formatAgo,
   formatCountdown,
+  formatResetLabel,
   rowForecast,
   sortAdminRows,
   statusBadge,
@@ -199,6 +200,13 @@ export function AdminRateLimits() {
                       ]
                     : u.tokens.map((t, i) => {
                         const badge = statusBadge(t.limits, u.vault_locked);
+                        // The mock's absolute "resets <Day HH:MM>" line under the token
+                        // name (PRD #310 M3), from the 7-day reset — the weekly quota
+                        // users plan around. The map also runs for non-ok tokens (which
+                        // carry no seven_day), so the status guard is required; omitted
+                        // when the 7-day resets_at is null.
+                        const resetLabel =
+                          t.limits.status === "ok" ? formatResetLabel(t.limits.seven_day.resets_at) : null;
                         return (
                           <tr key={`${u.id}:${t.secret_id}`} className="transition-colors hover:bg-raised/30">
                             {/* The identity cell renders on the user's FIRST token
@@ -211,6 +219,9 @@ export function AdminRateLimits() {
                                 <span className="text-xs font-medium text-fg">{t.label}</span>
                                 {t.is_default && <Badge tone="neutral">default</Badge>}
                               </div>
+                              {resetLabel && (
+                                <div className="mt-0.5 text-xs text-faint">{resetLabel}</div>
+                              )}
                             </td>
                             <td className="px-4 py-3 align-top">
                               <UtilizationCell token={t} now={now} />
