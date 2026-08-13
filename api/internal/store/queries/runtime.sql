@@ -615,6 +615,7 @@ RETURNING *;
 -- (here: create-time-supplied) text.
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
+       rp.forge_project_id,
        rp.default_branch,
        rp.repo_skills_enabled,
        rp.repo_claudemd_enabled,

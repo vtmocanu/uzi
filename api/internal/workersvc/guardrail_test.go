@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -188,6 +189,113 @@ func TestCreateRunNotBlockedGuardProceeds(t *testing.T) {
 	}
 	if fs.createRunParams == nil {
 		t.Fatal("CreateRun store insert must run when the guard clears the repo")
+	}
+}
+
+// TestClaimGuardrailBlocksAtClaim is the D1 layer 3 backstop (PRD #66 M6): a queued
+// PAT-bearing run whose repo the bot can now reach is refused AT CLAIM — the run is
+// marked failed with the guardrail reason, the failed notify fires, and the worker
+// gets NO payload (idle), never a 500. This is the Success Criterion "a run queued
+// while main was protected, and claimed after protection was removed, fails at claim
+// rather than pushing."
+func TestClaimGuardrailBlocksAtClaim(t *testing.T) {
+	f := newClaimFixture(t)
+	guard, _ := blockedGuard()
+	f.svc.SetRepoGuard(guard)
+
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	if err != nil {
+		t.Fatalf("Claim must report idle (nil error) for a guardrail-blocked run, got %v", err)
+	}
+	if payload != nil {
+		t.Fatalf("a guardrail-blocked claim must return NO payload, got %+v", payload)
+	}
+	if guard.called != 1 {
+		t.Fatalf("guard called %d times, want 1", guard.called)
+	}
+	if f.fs.markedFailed == nil {
+		t.Fatal("a guardrail-blocked claim must mark the run failed")
+	}
+	if f.fs.markedFailed.ID != f.runID {
+		t.Fatalf("failed run id = %v, want %v", f.fs.markedFailed.ID, f.runID)
+	}
+	if reason := f.fs.markedFailed.FailureReason.String; !strings.Contains(reason, "default-branch guardrail") {
+		t.Fatalf("failure reason = %q, want it to name the guardrail", reason)
+	}
+	// The block finding messages ride the reason (safe to store — no secret bytes),
+	// and never the PAT ciphertext.
+	if reason := f.fs.markedFailed.FailureReason.String; !strings.Contains(reason, "the bot can push to the default branch") {
+		t.Fatalf("failure reason = %q, want the block finding message", reason)
+	}
+	// A blocked claim aborts before openAnthropic, so no Anthropic credential is
+	// recorded on the run — proof the claim short-circuited (the guard runs before
+	// the bot-PAT box.Open too, but this assertion gates the downstream record, not
+	// box.Open directly).
+	if len(f.fs.recordedCreds) != 0 {
+		t.Fatalf("a blocked claim must record no credential, got %d", len(f.fs.recordedCreds))
+	}
+}
+
+// TestClaimGuardrailNotBlockedProceeds: a clearing guard (Blocked=false) lets the
+// claim proceed to a full payload, and the guard was consulted exactly once.
+func TestClaimGuardrailNotBlockedProceeds(t *testing.T) {
+	f := newClaimFixture(t)
+	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
+	f.svc.SetRepoGuard(guard)
+
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	if err != nil {
+		t.Fatalf("Claim with a clearing guard: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a payload when the guard clears the repo, got idle")
+	}
+	if guard.called != 1 {
+		t.Fatalf("guard called %d times, want 1", guard.called)
+	}
+	if f.fs.markedFailed != nil {
+		t.Fatalf("a cleared claim must not fail the run, got %+v", f.fs.markedFailed)
+	}
+}
+
+// TestClaimJudgeSkipsGuard: a judge run forks before GetRunClaimContext and carries
+// no PAT (PRD #66 out-of-scope), so the claim backstop must never invoke the guard
+// for it — guard.called stays 0.
+func TestClaimJudgeSkipsGuard(t *testing.T) {
+	box := newBox(t)
+	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
+	uid, target := uuid.New(), uuid.New()
+	fs := &fakeStore{claimRun: judgeRun(uid, target), anthropic: sealedTok}
+	svc := New(fs, box, testParams())
+	guard := &fakeGuard{res: privcheck.GuardResult{Blocked: true}}
+	svc.SetRepoGuard(guard)
+
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: uid})
+	if err != nil {
+		t.Fatalf("Claim (judge): %v", err)
+	}
+	if payload == nil || payload.Kind != RunKindJudge {
+		t.Fatalf("expected a judge payload, got %+v", payload)
+	}
+	if guard.called != 0 {
+		t.Fatalf("the guard must never run for a judge claim, called %d times", guard.called)
+	}
+}
+
+// TestClaimNilGuardBackstopSkips: with no guard wired (SetRepoGuard never called), the
+// claim backstop is a no-op and the claim proceeds — the same nil-safety as layer 2.
+func TestClaimNilGuardBackstopSkips(t *testing.T) {
+	f := newClaimFixture(t) // SetRepoGuard deliberately not called
+
+	payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner})
+	if err != nil {
+		t.Fatalf("Claim with a nil guard: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("a nil guard must not block the claim, got idle")
+	}
+	if f.fs.markedFailed != nil {
+		t.Fatalf("a nil guard must not fail the run, got %+v", f.fs.markedFailed)
 	}
 }
 

@@ -1512,6 +1512,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 const getRunClaimContext = `-- name: GetRunClaimContext :one
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
+       rp.forge_project_id,
        rp.default_branch,
        rp.repo_skills_enabled,
        rp.repo_claudemd_enabled,
@@ -1533,6 +1534,7 @@ WHERE r.id = $1
 type GetRunClaimContextRow struct {
 	RepoWebUrl          string      `json:"repo_web_url"`
 	RepoPath            string      `json:"repo_path"`
+	ForgeProjectID      int64       `json:"forge_project_id"`
 	DefaultBranch       pgtype.Text `json:"default_branch"`
 	RepoSkillsEnabled   bool        `json:"repo_skills_enabled"`
 	RepoClaudemdEnabled bool        `json:"repo_claudemd_enabled"`
@@ -1599,6 +1601,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 	err := row.Scan(
 		&i.RepoWebUrl,
 		&i.RepoPath,
+		&i.ForgeProjectID,
 		&i.DefaultBranch,
 		&i.RepoSkillsEnabled,
 		&i.RepoClaudemdEnabled,
