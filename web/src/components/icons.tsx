@@ -215,6 +215,16 @@ export const ChevronRightIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// ChevronsRightIcon: lucide "chevrons-right" (a vector »). The rate-limit forecast
+// overflow marker (RateLimitForecast.tsx): an SVG rather than the » glyph so it is
+// viewBox-centred (no font-metric vertical nudge) and stays crisp in the row margin.
+export const ChevronsRightIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="m6 17 5-5-5-5" />
+    <path d="m13 17 5-5-5-5" />
+  </Icon>
+);
+
 export const ChevronDownIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="m6 9 6 6 6-6" />

@@ -30,7 +30,7 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
     const bar = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar.getAttribute("aria-valuetext")).toBe("56%, resets in 2h"); // untouched
     expect(container.querySelector("[title]")).toBeNull(); // no hover projection
-    expect(container.textContent).not.toContain("»");
+    expect(container.querySelector('[data-testid="forecast-overflow-marker"]')).toBeNull();
     expect(ghost(container, "bg-warn/40")).toBeNull();
     expect(ghost(container, "bg-danger/40")).toBeNull();
   });
@@ -39,8 +39,9 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
     const { container } = renderMeter(OVER);
     expect(ghost(container, "bg-danger/40")).not.toBeNull(); // coral ghost
     expect(ghost(container, "bg-warn/40")).toBeNull();
-    const marker = screen.getByText("»");
+    const marker = screen.getByTestId("forecast-overflow-marker");
     expect(marker.className).toContain("text-danger");
+    expect(marker.className).toContain("left-full"); // over → OUTSIDE the bar's right edge (overshoot)
     // Projected % is hover/aria-only, NEVER printed inline as visible number text.
     const bar = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar.getAttribute("aria-valuetext")).toBe("56%, resets in 2h — projected 130% by reset, over");
@@ -55,7 +56,10 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
     const { container } = renderMeter(ON_PACE_HIGH);
     expect(ghost(container, "bg-warn/40")).not.toBeNull(); // gold ghost
     expect(ghost(container, "bg-danger/40")).toBeNull();
-    expect(screen.getByText("»").className).toContain("text-warn");
+    const marker = screen.getByTestId("forecast-overflow-marker");
+    expect(marker.className).toContain("text-warn");
+    expect(marker.className).not.toContain("left-full"); // on pace → NOT outside the bar
+    expect(marker.style.left).toContain("56%"); // anchored just past the fill's end (pct=56), not the cap
     expect(screen.getByRole("progressbar").getAttribute("aria-valuetext")).toBe(
       "56%, resets in 2h — projected 108% by reset, on pace",
     );
@@ -64,7 +68,7 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
   it("on-pace landing at/under the cap (≤100) → gold ghost but NO » marker", () => {
     const { container } = renderMeter(ON_PACE_LOW);
     expect(ghost(container, "bg-warn/40")).not.toBeNull();
-    expect(container.textContent).not.toContain("»");
+    expect(container.querySelector('[data-testid="forecast-overflow-marker"]')).toBeNull();
   });
 
   it("ghost animation is disabled under prefers-reduced-motion", () => {
@@ -75,7 +79,7 @@ describe("RateLimitForecastMeter (PRD #309 M3)", () => {
   it("the shared MeterTrack atom, used directly (e.g. WorkerStats), carries no forecast overlay", () => {
     const { container } = render(<MeterTrack label="cpu" fillPct={70} valueText="70%" className="h-2" />);
     expect(container.querySelector("[title]")).toBeNull();
-    expect(container.textContent).not.toContain("»");
+    expect(container.querySelector('[data-testid="forecast-overflow-marker"]')).toBeNull();
     expect(container.querySelector("div[aria-hidden]")).toBeNull();
   });
 });
