@@ -847,12 +847,26 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 2 * * 1-5", run_at: null,
     timezone: "Europe/Bucharest", next_fire_at: null,
     last_fired_at: daysFromNow(-1, 2), auto_approve: true, wait_on_limit: true,
-    max_issues: 10,
+    max_issues: 1,
     guidance: "Keep the diff small and add a failing test first.",
     model: "fable",
     override_subagent_model: true,
     enabled: true, status: "active", created_at: daysFromNow(-14, 9),
-    updated_at: daysFromNow(-1, 2), next_fires: [], last_fire: null,
+    updated_at: daysFromNow(-1, 2), next_fires: [],
+    // Fired on time, started nothing: the one candidate within the cap was skipped
+    // for a benign reason, and `capped` says there were older candidates behind it —
+    // the amber cell + the cap hint (Goal 2). The whole point of PRD #308.
+    last_fire: {
+      fired_at: daysFromNow(-1, 2), matched: 1, capped: true,
+      started: [],
+      skips: [
+        {
+          issue_iid: 96,
+          title: "Mid-run worker restart discards all un-pushed commits on resume",
+          reason: "no_prd_link",
+        },
+      ],
+    },
   },
   {
     id: "sch-3bf1", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
@@ -865,7 +879,19 @@ let schedules: Schedule[] = [
     model: null,
     override_subagent_model: false,
     enabled: true, status: "active", created_at: daysFromNow(-9, 10),
-    updated_at: daysFromNow(0, 3), next_fires: [], last_fire: null,
+    updated_at: daysFromNow(0, 3), next_fires: [],
+    // A healthy fire: it started the run it matched (green "1 started").
+    last_fire: {
+      fired_at: daysFromNow(0, 3), matched: 1, capped: false,
+      started: [
+        {
+          issue_iid: 142,
+          run_id: "3f1a2b7c-9d4e-4a1b-8c6d-1e2f3a4b5c6d",
+          title: "RunKind (TypeScript) omits 'chat', which the DB CHECK allows",
+        },
+      ],
+      skips: [],
+    },
   },
   {
     id: "sch-9qm4", repo_id: "repo-uzi", repo_path: "vtmocanu/uzi",
@@ -900,12 +926,23 @@ let schedules: Schedule[] = [
     timing: "recurring", cron_expr: "0 */6 * * *", run_at: null,
     timezone: "UTC", next_fire_at: null,
     last_fired_at: daysFromNow(-3, 18), auto_approve: true, wait_on_limit: false,
-    max_issues: 10,
+    max_issues: 3,
     guidance: null,
     model: null,
     override_subagent_model: false,
     enabled: false, status: "active", created_at: daysFromNow(-30, 8),
-    updated_at: daysFromNow(-3, 18), next_fires: [], last_fire: null,
+    updated_at: daysFromNow(-3, 18), next_fires: [],
+    // A healthy sweep: every matched candidate started a run (green "3 started",
+    // each pairing issue ↔ run in the expanded panel).
+    last_fire: {
+      fired_at: daysFromNow(-3, 18), matched: 3, capped: false,
+      started: [
+        { issue_iid: 124, run_id: "a20b4e51-77c8-4d2a-9f10-2b3c4d5e6f70", title: "web: judge free text renders without Unicode Cf stripping" },
+        { issue_iid: 139, run_id: "c7d5f0a2-1e34-4b56-88a9-0c1d2e3f4a5b", title: "Poller sync timeouts against forge-fake in the e2e stack" },
+        { issue_iid: 151, run_id: "e91f6b03-42d7-4c88-b1a2-3c4d5e6f7a80", title: "Board card CI badge flickers on refetch" },
+      ],
+      skips: [],
+    },
   },
   {
     // A parked schedule (status='error'): the last fire failed and the scheduler

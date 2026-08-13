@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import type { ScheduleSkipReason } from "./api";
+import { SCHEDULE_SKIP_REASON_LABELS, scheduleSkipReasonLabel } from "./scheduleSkipReasons";
 
 // 🔴 THE CROSS-LANGUAGE GUARD (PRD #308 M3), mirroring runCredential.test.ts.
 //
@@ -47,5 +48,20 @@ describe("the schedule skip-reason vocabulary is one vocabulary", () => {
     // loudly rather than false-green against an empty TS set.
     expect(fromGo.length).toBeGreaterThan(0);
     expect(fromGo).toEqual([...ALL_SCHEDULE_SKIP_REASONS].sort());
+  });
+});
+
+describe("every skip reason has a human label (PRD #308 M4)", () => {
+  it("labels every reason with non-empty text, never the raw sentinel", () => {
+    for (const reason of ALL_SCHEDULE_SKIP_REASONS) {
+      const label = scheduleSkipReasonLabel(reason);
+      expect(label.length).toBeGreaterThan(0);
+      // The label is human copy, not the machine sentinel.
+      expect(label).not.toBe(reason);
+    }
+    // No stray keys beyond the union (the Record is exhaustive by construction).
+    expect(Object.keys(SCHEDULE_SKIP_REASON_LABELS).sort()).toEqual(
+      [...ALL_SCHEDULE_SKIP_REASONS].sort(),
+    );
   });
 });
