@@ -58,9 +58,13 @@ climbing and projects that pace forward to when the window resets:
 - **Nothing** — the common, calm case. At the current rate the window finishes
   with room to spare, so there's nothing to watch. Silence means safe.
 - **A gold ghost** — on pace to land right around the cap by the time it resets.
-- **A coral ghost with a `»`** — on pace to hit the cap *before* the window
-  resets, at the current rate. This is the one worth acting on: pace down or
-  switch to another token.
+- **A coral ghost** — burning fast enough to overshoot the cap well before the
+  window resets. This is the one worth acting on: pace down or switch to another
+  token.
+
+A small **`»`** rides the end of the ghost whenever the projection crosses the
+cap — always on a coral ghost, and on a gold one when it's heading just past
+100%. Read it as a "past the limit" flag.
 
 Hover a forecasting bar to read the projected figure ("projected 106% by
 reset"). It's a straight-line estimate from recent readings, not a promise —
