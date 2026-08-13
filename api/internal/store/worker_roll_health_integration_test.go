@@ -46,6 +46,16 @@ func rollReport(workerID uuid.UUID, phase string, observedAt time.Time) store.Up
 	}
 }
 
+// rollReportTag is rollReport with an explicit worker_image_tag, so a test can control
+// whether the roll target matches the worker's registered version — the distinction the
+// issue #155 per-incident guard turns on. rollReport's default tag (0.11.7) is left as is
+// because other tests depend on it.
+func rollReportTag(workerID uuid.UUID, phase string, observedAt time.Time, tag string) store.UpsertWorkerRollHealthParams {
+	p := rollReport(workerID, phase, observedAt)
+	p.WorkerImageTag = pgtype.Text{String: tag, Valid: true}
+	return p
+}
+
 func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -200,7 +210,9 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 	// The trigger is the scenario the +g<sha> stamp was adopted to expose: a re-cut tag
 	// producing two images at one release. Composed with a crash-looping agent, which
 	// re-registers on every start, each restart would buy a fresh window.
-	if _, err := q.UpsertWorkerRollHealth(ctx, rollReport(hosted, "rolling", t0.Add(25*time.Minute))); err != nil {
+	// The worker is registered at 0.11.7 here, so an arming report needs a target
+	// distinct from it (issue #155 guard); a same-version tag is now an innocent blip.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(hosted, "rolling", t0.Add(25*time.Minute), "0.11.8")); err != nil {
 		t.Fatalf("re-arm before the metadata check: %v", err)
 	}
 	if anchorAfter("armed for the metadata check") == nil {
@@ -249,6 +261,103 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 	if rearmed.Equal(*first) {
 		t.Errorf("the re-armed anchor equals the original (%v); a second roll must get a full fresh "+
 			"window, not the remainder of the first", first)
+	}
+}
+
+// Issue #155 — the ceiling anchor is per-INCIDENT, not per-RELEASE.
+//
+// UpsertWorkerRollHealth arms upgrading_since only when the roll target differs from the
+// worker's own registered version (build-metadata stripped). A `rolling`/`stuck` report
+// whose worker_image_tag EQUALS workers.version is an innocent same-release not-Ready blip
+// — the pod flapped without any roll in progress — and must NOT arm the ceiling. The
+// pre-fix code (before commit 7e9777ed) armed on phase alone, so such a blip stamped the
+// anchor permanently: the blip's own restart re-registers at the SAME version, so the
+// version-move clear never fires, and the stale anchor then poisoned the NEXT release's
+// roll (R2 is ceiling-gated on it, so a healthy roll badged outdated).
+//
+// This test pins that property end to end: two same-release blips leave the anchor clean,
+// then a genuine next-release roll arms FRESH at its own first report rather than
+// inheriting a poisoned earlier timestamp. Every assertion here FAILS before commit
+// 7e9777ed, where the first blip would have armed and (c) would read the blip's time.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
+// e2e/run-store-it.sh.
+func TestBlipAtSameReleaseDoesNotArmCeilingLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("blip-%s@e2e", userID))
+
+	// The worker's registered version is 0.11.8 — the guard reads this as w.version.
+	// ck_workers_hosted_metadata (migration 00066) requires hosted_size and
+	// template_declared on a hosted row.
+	worker := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, kind, version, hosted_size, template_declared)
+		 VALUES ($1, $2, $3, $4, 'offline', 'hosted', '0.11.8', 'm', 'base')`,
+		worker, userID, "w-"+worker.String()[:8], []byte(worker.String()))
+
+	t0 := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+
+	anchor := func(what string) *time.Time {
+		var got *time.Time
+		if err := pool.QueryRow(ctx, `SELECT upgrading_since FROM worker_upgrade_reports WHERE worker_id = $1`, worker).
+			Scan(&got); err != nil {
+			t.Fatalf("read upgrading_since (%s): %v", what, err)
+		}
+		return got
+	}
+
+	// (a) A same-release `rolling` blip (tag == version) must NOT arm the anchor.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", t0, "0.11.8")); err != nil {
+		t.Fatalf("upsert same-release rolling blip: %v", err)
+	}
+	if got := anchor("after a same-release rolling blip"); got != nil {
+		t.Errorf("a `rolling` report whose target (0.11.8) EQUALS the worker's registered version armed "+
+			"upgrading_since = %v. That is an innocent same-release not-Ready blip, not a roll; arming here "+
+			"is the per-release bug of issue #155 — the blip re-registers at the same version so the "+
+			"version-move clear never fires, and the stale anchor poisons the next real roll.", got)
+	}
+
+	// (b) A same-release `stuck` blip must ALSO not arm — the guard is on the target
+	// matching, not on the phase being `rolling`.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "stuck", t0.Add(time.Minute), "0.11.8")); err != nil {
+		t.Fatalf("upsert same-release stuck blip: %v", err)
+	}
+	if got := anchor("after a same-release stuck blip"); got != nil {
+		t.Errorf("a `stuck` report at the worker's own release (0.11.8) armed upgrading_since = %v. A "+
+			"same-release blip is not a roll regardless of whether it reads rolling or stuck.", got)
+	}
+
+	// (c) A GENUINE next-release roll (tag != version) must arm FRESH — at its OWN first
+	// report — proving the earlier blips left the anchor clean rather than poisoning it.
+	genuineRoll := t0.Add(2 * time.Minute)
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReportTag(worker, "rolling", genuineRoll, "0.11.9")); err != nil {
+		t.Fatalf("upsert genuine next-release roll: %v", err)
+	}
+	got := anchor("after a genuine next-release roll")
+	if got == nil {
+		t.Fatalf("a genuine roll to a DIFFERENT release (0.11.9 vs 0.11.8) did not arm the ceiling; the "+
+			"anchor has nothing to gate the next roll against")
+	}
+	if !got.Equal(genuineRoll) {
+		t.Errorf("the ceiling armed at %v, want the genuine roll's own first report %v. A mismatch means an "+
+			"earlier same-release blip poisoned the anchor — the exact per-release bug of issue #155, where "+
+			"the real roll inherits a window that started before it did.", got, genuineRoll)
 	}
 }
 

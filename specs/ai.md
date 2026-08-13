@@ -12534,13 +12534,32 @@ record worth keeping.
   truthful `upgrade_failed` was reachable. So the ceiling measures "how long have we believed a roll
   is in progress" while being read as "how long may a pod be broken before we say so".
 
-- **Still open, in the same anchor, and NOT fixed by the above.** `upgrading_since` clears only on a
-  version move at register, so any transient not-Ready blip arms it permanently for that release (the
-  blip's restart re-registers at the same version, so nothing clears). R2 is still gated on it, so a
-  worker that blipped once can badge `outdated` on a **later, healthy** roll — the cry-wolf Decision 1
-  exists to forbid, produced by INV-5's own anchor. The ceiling is therefore per-**release**, not
-  per-incident. R8's no-signal grace cannot soften it, because the signal is fresh. Filed as **#155**;
-  #151 deliberately does not touch R2.
+- **Was open in the same anchor, NOT fixed by #151 above; now RESOLVED by #155 (2026-08-13).** As
+  filed: `upgrading_since` clears only on a version move at register, so any transient not-Ready blip
+  arms it permanently for that release (the blip's restart re-registers at the same version, so nothing
+  clears). R2 is still gated on it, so a worker that blipped once can badge `outdated` on a **later,
+  healthy** roll — the cry-wolf Decision 1 exists to forbid, produced by INV-5's own anchor. The
+  ceiling is therefore per-**release**, not per-incident. R8's no-signal grace cannot soften it,
+  because the signal is fresh. Filed as **#155**; #151 deliberately does not touch R2.
+  - **The fix (#155).** The §391 "arm only where version-compare would already say `outdated`" guard —
+    retracted two bullets up as deserving its own issue — is now implemented, and this was that issue,
+    so the anchor is per-**incident** again rather than per-release. `UpsertWorkerRollHealth`'s
+    anchor-arming CASE gained a second conjunct
+    (`api/internal/store/queries/worker_roll_health.sql`): `split_part(worker_image_tag, '+', 1) IS
+    DISTINCT FROM split_part(w.version, '+', 1)`. A `rolling`/`stuck` report whose target equals the
+    worker's own registered version — an innocent same-release blip — no longer arms the ceiling, so
+    the permanent-arm cry-wolf above cannot occur. **Keyed on the worker's OWN authenticated registered
+    version** (`workers.version`, written only at authenticated register), NOT on the
+    controller-supplied `target_tag`: keying on `(worker, target_tag)` is the forgeable trap
+    `TestP2CeilingHoldsWhileTheControllerRotatesEveryFieldItControls` pins, and a controller cannot
+    forge the worker's version. **No suppression hole**: to suppress a genuine `outdated`,
+    version-compare must want to say outdated (target > worker version), which means the tags differ,
+    which arms the anchor, so the ceiling still engages and expires at `MaxUpgradingWindow`. Reuses
+    `RegisterWorker`'s build-metadata-stripped `IS DISTINCT FROM` idiom (`runtime.sql`) so ARM and the
+    version-move CLEAR share one definition of "the release moved" — avoiding a semver-ordering-in-SQL
+    alternative that would diverge from the string-equality clear. No migration, no new column, no
+    generated Go signature change (sqlc regen only): `worker_image_tag` and `observed_at` were already
+    query params and `w.version` is already in the FROM.
 
 ## 417. Issue #157 — the agent was never TOLD its dependencies were provisioned, so it reinstalled them
 
