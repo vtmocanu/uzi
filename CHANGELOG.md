@@ -6,6 +6,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-13
+
+### Changed
+
+- **The Claude rate-limit forecast is now always-on and computed from a single
+  reading.** The burn-rate forecast shipped in 0.31.0 needed an in-session sample
+  series and a live, climbing burn rate, so its ghost and `»` marker stayed silent on
+  idle windows and on the 7-day window, exactly where a "you are about to run out"
+  warning matters. It now uses an anchored single-reading projection
+  (`projected = used% * window / elapsed`), backed by a live measurement that the
+  unified 5h/7d windows reset at a fixed boundary, so the forecast renders immediately
+  on page load whenever a window is heading past its cap, idle and 7-day windows
+  included. Each token now also shows its 7-day reset as a "resets <Day HH:MM>" label
+  under its name, and the admin table column is retitled "Utilization & Forecast".
+  Web-only. (#310)
+
 ## [0.31.0] - 2026-08-13
 
 ### Security
