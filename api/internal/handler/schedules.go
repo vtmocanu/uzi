@@ -355,7 +355,7 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "schedule not found")
 		return
 	}
-	ids, err := h.scheduler.RunNow(r.Context(), s)
+	out, err := h.scheduler.RunNow(r.Context(), s)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -368,11 +368,42 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	runIDs := make([]string, 0, len(ids))
-	for _, x := range ids {
-		runIDs = append(runIDs, x.String())
+	httpx.JSON(w, http.StatusAccepted, runNowResponse(out))
+}
+
+// runNowResponse maps a FireOutcome onto the run-now wire shape (PRD #308 M3). It is pure
+// (no clock, no DB) so it is unit-tested directly against a constructed outcome. Created /
+// RunIDs are retained for back-compat and derived from Started; Started/Skips are non-nil
+// empty slices, matching the persisted last_fire convention. RunNow does NOT persist the
+// outcome — that invariant is pinned in schedsvc's TestRunNowDoesNotPersistLastFire.
+func runNowResponse(out schedsvc.FireOutcome) apitypes.RunNowResponse {
+	started := make([]apitypes.LastFireStarted, 0, len(out.Started))
+	runIDs := make([]string, 0, len(out.Started))
+	for _, s := range out.Started {
+		id := s.RunID.String()
+		runIDs = append(runIDs, id)
+		started = append(started, apitypes.LastFireStarted{
+			IssueIID: s.IssueIID,
+			RunID:    id,
+			Title:    s.Title,
+		})
 	}
-	httpx.JSON(w, http.StatusAccepted, apitypes.RunNowResponse{Created: len(runIDs), RunIDs: runIDs})
+	skips := make([]apitypes.LastFireSkip, 0, len(out.Skips))
+	for _, s := range out.Skips {
+		skips = append(skips, apitypes.LastFireSkip{
+			IssueIID: s.IssueIID,
+			Title:    s.Title,
+			Reason:   string(s.Reason),
+		})
+	}
+	return apitypes.RunNowResponse{
+		Created: len(started),
+		RunIDs:  runIDs,
+		Matched: out.Matched,
+		Capped:  out.Capped,
+		Started: started,
+		Skips:   skips,
+	}
 }
 
 // PreviewSchedule computes a live "next fires" preview from a timing spec that need not
@@ -712,6 +743,17 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 	// override_subagent_model is a plain bool column (never NULL, PRD #305), so always set it.
 	ov := s.OverrideSubagentModel
 	dto.OverrideSubagentModel = &ov
+	// last_fire is the persisted jsonb summary of the most recent fire (PRD #308 M3). NULL
+	// or empty ⇒ never fired, leave nil. A malformed payload is logged and left nil — a
+	// bad summary must never fail the whole DTO.
+	if len(s.LastFire) > 0 {
+		var lf apitypes.LastFire
+		if err := json.Unmarshal(s.LastFire, &lf); err != nil {
+			slog.Error("unmarshal schedule last_fire", "schedule", s.ID.String(), "error", err)
+		} else {
+			dto.LastFire = &lf
+		}
+	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {
 			dto.NextFires = fires

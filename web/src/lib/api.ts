@@ -817,6 +817,53 @@ export type ScheduleTiming = "once" | "recurring";
 // error — parked because its owner/token/repo is gone (surfaced, not dropped).
 export type ScheduleStatus = "active" | "fired" | "error";
 
+// The closed set of reasons a schedule fire started no run for a candidate (PRD #308).
+// The authoritative source is Go's schedsvc.SkipReason; scheduleSkipReasons.test.ts is a
+// cross-language drift guard that reddens if Go gains a reason this union lacks.
+export type ScheduleSkipReason =
+  | "no_prd_link"
+  | "not_eligible"
+  | "already_running"
+  | "description_too_large"
+  | "fetch_failed";
+
+// One run a persisted fire actually created; issue_iid is null for a prompt schedule.
+export interface LastFireStarted {
+  issue_iid: number | null;
+  run_id: string;
+  title: string;
+}
+
+// One candidate a persisted fire considered but started nothing for, with its typed
+// reason (never free text).
+export interface LastFireSkip {
+  issue_iid: number | null;
+  title: string;
+  reason: ScheduleSkipReason;
+}
+
+// The structured summary of a schedule's most recent persisted fire (PRD #308). matched
+// == started.length + skips.length balances.
+export interface LastFire {
+  fired_at: string;
+  matched: number;
+  capped: boolean;
+  started: LastFireStarted[];
+  skips: LastFireSkip[];
+}
+
+// The outcome of a manual run-now fire (PRD #308). created/run_ids are retained for
+// back-compat and derivable from started; matched/capped/started/skips carry the full
+// per-candidate outcome.
+export type RunNowResponse = {
+  created: number;
+  run_ids: string[];
+  matched: number;
+  capped: boolean;
+  started: LastFireStarted[];
+  skips: LastFireSkip[];
+};
+
 export interface Schedule {
   id: string;
   repo_id: string;
@@ -838,6 +885,10 @@ export interface Schedule {
   timezone: string;
   next_fire_at: string | null;
   last_fired_at: string | null;
+  // The structured summary of the most recent persisted fire (PRD #308); null = never
+  // fired (or a parked/transient fire left the prior summary — or none — in place, since
+  // only the success/benign advance path persists).
+  last_fire: LastFire | null;
   auto_approve: boolean;
   wait_on_limit: boolean;
   // Per-sweep upper bound on issues fanned out per fire, oldest-first; null =
@@ -2928,10 +2979,7 @@ const realApi = {
   // Fire immediately through the seam WITHOUT advancing the recurring cadence
   // (202). created counts the runs actually started (0 on a benign dedup skip).
   runScheduleNow: (id: string) =>
-    request<{ created: number; run_ids: string[] }>(
-      "POST",
-      `/schedules/${id}/run-now`,
-    ),
+    request<RunNowResponse>("POST", `/schedules/${id}/run-now`),
   // Live "next fires" preview (RFC3339 UTC), computed from the same cron logic the
   // scheduler fires on, so the modal always matches server truth (Decision 6).
   previewSchedule: (input: SchedulePreviewInput) =>

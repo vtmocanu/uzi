@@ -93,10 +93,18 @@ FOR UPDATE SKIP LOCKED;
 -- next_fire_at (status stays 'active'), or a once schedule to status='fired' with
 -- next_fire_at NULL so the due index no longer holds it. Kept separate from the claim
 -- so the firing code decides the next fire.
+--
+-- It also writes last_fire (PRD #308 M2): the serialized summary of THIS fire
+-- (matched/started/skipped + typed reasons). This is the ONLY write site for last_fire —
+-- the park/transient paths never advance, so a parked/transient fire keeps the prior
+-- last_fire (Decision 5). last_fire is a jsonb column, so the param is []byte; passing
+-- nil writes SQL NULL (the caller does this when the summary could not be serialized, so
+-- a serialization hiccup never wedges the cadence).
 UPDATE run_schedules
 SET last_fired_at = @last_fired_at,
     next_fire_at  = sqlc.narg('next_fire_at'),
     status        = @status,
+    last_fire     = @last_fire,
     updated_at    = now()
 WHERE id = @id
 RETURNING *;
@@ -128,6 +136,18 @@ WHERE repo_id = @repo_id AND state = 'opened'
   AND labels @> @labels::jsonb
 ORDER BY forge_issue_iid ASC
 LIMIT sqlc.narg('max_issues');
+
+-- name: CountSweepCandidateIssues :one
+-- The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
+-- number of open issues in the repo matching the same selector as ListSweepCandidateIssues,
+-- WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
+-- it fetched to know the cap truncated newer eligible issues. It is called only when the
+-- schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
+-- extra count never runs on the unbounded path.
+SELECT count(*)
+FROM issues
+WHERE repo_id = @repo_id AND state = 'opened'
+  AND labels @> @labels::jsonb;
 
 -- name: HasActiveRunForSchedule :one
 -- Whether a non-terminal prompt run already exists for this schedule. The pre-check

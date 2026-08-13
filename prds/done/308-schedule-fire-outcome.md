@@ -3,7 +3,7 @@
 **Issue**: [#308](https://gitlab.example.com/vtmocanu/uzi/-/issues/308)
 **Mock**: [`prds/mockups/308-schedule-fire-outcome-mock.html`](mockups/308-schedule-fire-outcome-mock.html)
 **Priority**: Medium
-**Status**: Draft
+**Status**: Done
 
 ## Problem
 
@@ -85,12 +85,12 @@ Per its contract `RunNow` must not disturb the cadence; it calls `fireOne` direc
 
 ## Milestones
 
-- [ ] **M1 — Scheduler produces the outcome.** `fireOne`/`fire*`/`createIssueRun` return the `FireOutcome` above; the reason enum is declared as the authoritative Go artifact. `already_running` is recorded at **both** the pre-check and the seam race; sweep per-candidate transient errors become `fetch_failed`; `Matched` is defined per target (sweep/issue/prompt) and `Capped` is set from the truncation probe. Unit + live-DB tests assert each reason maps from its source, each target populates the shape, and the `matched == started + skipped` invariant holds (including the `fetch_failed` path).
-- [ ] **M2 — Persist last-fire summary.** Migration adds `run_schedules.last_fire jsonb`; `AdvanceSchedule` writes it; `advance()` threads the outcome through only on the success/benign path. sqlc regenerated (no-op in CI). Live-DB tests: a scheduled fire persists the expected `last_fire`; a never-fired schedule reads NULL; a parked/transient fire does **not** overwrite it.
-- [ ] **M3 — API surface + drift guard.** `ScheduleDTO.last_fire`, the widened `RunNowResponse`, and the Go↔TS reason contract test. Handler tests for both DTOs and the `RunNow`-does-not-persist invariant.
-- [ ] **M4 — Web UI** (depends on M3). Enriched `Last run` cell + expandable Last-fire panel per the mock, including the issue↔run pairing and the `Capped`-derived actionable hint. `api.ts` types; `mockApi.ts` `last_fire` fixture. Component tests for every state: `started` / `started-nothing` / `empty-label (matched 0)` / `never-fired` / `parked (prior or no last_fire)`, plus an explicit test of the hint's `Capped && skipped > 0` derivation.
-- [ ] **M5 — CLI** (depends on M3). `uzi schedule get` last-fire block and `uzi schedule run-now` per-candidate summary; `SKILL.md`; CLI tests.
-- [ ] **M6 — Docs, specs, gates.** `docs/scheduling.md` "Fire outcomes" section; `specs/ai.md` Decisions 1-4 recorded (specs contract); the mock referenced from the PRD. All gates green: `task gate:api`, `gate:web`, `gate:repo`, and `agent`/`controller` untouched.
+- [x] **M1 — Scheduler produces the outcome.** `fireOne`/`fire*`/`createIssueRun` return the `FireOutcome` above; the reason enum is declared as the authoritative Go artifact. `already_running` is recorded at **both** the pre-check and the seam race; sweep per-candidate transient errors become `fetch_failed`; `Matched` is defined per target (sweep/issue/prompt) and `Capped` is set from the truncation probe. Unit + live-DB tests assert each reason maps from its source, each target populates the shape, and the `matched == started + skipped` invariant holds (including the `fetch_failed` path).
+- [x] **M2 — Persist last-fire summary.** Migration adds `run_schedules.last_fire jsonb`; `AdvanceSchedule` writes it; `advance()` threads the outcome through only on the success/benign path. sqlc regenerated (no-op in CI). Live-DB tests: a scheduled fire persists the expected `last_fire`; a never-fired schedule reads NULL; a parked/transient fire does **not** overwrite it.
+- [x] **M3 — API surface + drift guard.** `ScheduleDTO.last_fire`, the widened `RunNowResponse`, and the Go↔TS reason contract test. Handler tests for both DTOs and the `RunNow`-does-not-persist invariant. *(Landed: `apitypes.LastFire`/`RunNowResponse` widened; `scheduleDTO` unmarshals the `last_fire` jsonb; pure `runNowResponse` helper; handler tests `TestScheduleDTOLastFire`/`TestRunNowResponse`; Go enum test `TestSkipReasonEnumIsHonest`; cross-language guard `web/src/lib/scheduleSkipReasons.test.ts`.)*
+- [x] **M4 — Web UI** (depends on M3). Enriched `Last run` cell + expandable Last-fire panel per the mock, including the issue↔run pairing and the `Capped`-derived actionable hint. `api.ts` types; `mockApi.ts` `last_fire` fixture. Component tests for every state: `started` / `started-nothing` / `empty-label (matched 0)` / `never-fired` / `parked (prior or no last_fire)`, plus an explicit test of the hint's `Capped && skipped > 0` derivation. *(Landed: `Schedules.tsx` outcome badge + expandable `LastFireDetail` panel; exhaustive `scheduleSkipReasons.ts` label map; three demo `mockApi.ts` fixtures; component + hint tests; web-ux live-DOM reviewed.)*
+- [x] **M5 — CLI** (depends on M3). `uzi schedule get` last-fire block and `uzi schedule run-now` per-candidate summary; `SKILL.md`; CLI tests. *(Landed: `renderLastFire`/`renderRunNow` in `cmd/uzi/schedule.go` with a reason→label map + capped hint; `SKILL.md` + `docs/cli.md` updated; `--json` unchanged; CLI tests incl. the started-nothing flagship case.)*
+- [x] **M6 — Docs, specs, gates.** `docs/scheduling.md` "Fire outcomes" section; `specs/ai.md` Decisions 1-5 recorded (specs contract); the mock referenced from the PRD. All gates green: `task gate:api`, `gate:web`, `gate:repo`, and `agent`/`controller` untouched. *(Landed: `docs/scheduling.md` "Fire outcomes"; `specs/ai.md` §523-527.)*
 
 ## Success criteria
 

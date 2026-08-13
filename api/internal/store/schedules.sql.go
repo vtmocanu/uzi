@@ -17,15 +17,17 @@ UPDATE run_schedules
 SET last_fired_at = $1,
     next_fire_at  = $2,
     status        = $3,
+    last_fire     = $4,
     updated_at    = now()
-WHERE id = $4
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
+WHERE id = $5
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type AdvanceScheduleParams struct {
 	LastFiredAt pgtype.Timestamptz `json:"last_fired_at"`
 	NextFireAt  pgtype.Timestamptz `json:"next_fire_at"`
 	Status      string             `json:"status"`
+	LastFire    []byte             `json:"last_fire"`
 	ID          uuid.UUID          `json:"id"`
 }
 
@@ -33,11 +35,19 @@ type AdvanceScheduleParams struct {
 // next_fire_at (status stays 'active'), or a once schedule to status='fired' with
 // next_fire_at NULL so the due index no longer holds it. Kept separate from the claim
 // so the firing code decides the next fire.
+//
+// It also writes last_fire (PRD #308 M2): the serialized summary of THIS fire
+// (matched/started/skipped + typed reasons). This is the ONLY write site for last_fire —
+// the park/transient paths never advance, so a parked/transient fire keeps the prior
+// last_fire (Decision 5). last_fire is a jsonb column, so the param is []byte; passing
+// nil writes SQL NULL (the caller does this when the summary could not be serialized, so
+// a serialization hiccup never wedges the cadence).
 func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, advanceSchedule,
 		arg.LastFiredAt,
 		arg.NextFireAt,
 		arg.Status,
+		arg.LastFire,
 		arg.ID,
 	)
 	var i RunSchedule
@@ -65,12 +75,13 @@ func (q *Queries) AdvanceSchedule(ctx context.Context, arg AdvanceScheduleParams
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
 
 const claimDueSchedules = `-- name: ClaimDueSchedules :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire FROM run_schedules
 WHERE enabled AND status = 'active'
   AND next_fire_at IS NOT NULL AND next_fire_at <= now()
 ORDER BY next_fire_at
@@ -117,6 +128,7 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 			&i.Guidance,
 			&i.Model,
 			&i.OverrideSubagentModel,
+			&i.LastFire,
 		); err != nil {
 			return nil, err
 		}
@@ -126,6 +138,31 @@ func (q *Queries) ClaimDueSchedules(ctx context.Context) ([]RunSchedule, error) 
 		return nil, err
 	}
 	return items, nil
+}
+
+const countSweepCandidateIssues = `-- name: CountSweepCandidateIssues :one
+SELECT count(*)
+FROM issues
+WHERE repo_id = $1 AND state = 'opened'
+  AND labels @> $2::jsonb
+`
+
+type CountSweepCandidateIssuesParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Labels []byte    `json:"labels"`
+}
+
+// The truncation probe for the sweep fire outcome's Capped flag (PRD #308 M1): the total
+// number of open issues in the repo matching the same selector as ListSweepCandidateIssues,
+// WITHOUT the max_issues LIMIT. fireSweep compares this against the (capped) candidate set
+// it fetched to know the cap truncated newer eligible issues. It is called only when the
+// schedule carries a set cap (a NULL cap can never truncate → Capped stays false), so the
+// extra count never runs on the unbounded path.
+func (q *Queries) CountSweepCandidateIssues(ctx context.Context, arg CountSweepCandidateIssuesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSweepCandidateIssues, arg.RepoID, arg.Labels)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const createPromptRun = `-- name: CreatePromptRun :one
@@ -259,7 +296,7 @@ INSERT INTO run_schedules (
     $7, $8, $9, $10, $11,
     $12, $13, $14, $15, $16, $17, $18
 )
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type CreateRunScheduleParams struct {
@@ -335,6 +372,7 @@ func (q *Queries) CreateRunSchedule(ctx context.Context, arg CreateRunSchedulePa
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
@@ -358,7 +396,7 @@ func (q *Queries) DeleteRunSchedule(ctx context.Context, arg DeleteRunSchedulePa
 }
 
 const getRunSchedule = `-- name: GetRunSchedule :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE id = $1
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire FROM run_schedules WHERE id = $1
 `
 
 // Unscoped fetch by id (server-internal: the claimer/firing path already holds a
@@ -390,12 +428,13 @@ func (q *Queries) GetRunSchedule(ctx context.Context, id uuid.UUID) (RunSchedule
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
 
 const getRunScheduleForUser = `-- name: GetRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire FROM run_schedules WHERE id = $1 AND user_id = $2
 `
 
 type GetRunScheduleForUserParams struct {
@@ -432,6 +471,7 @@ func (q *Queries) GetRunScheduleForUser(ctx context.Context, arg GetRunScheduleF
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
@@ -455,7 +495,7 @@ func (q *Queries) HasActiveRunForSchedule(ctx context.Context, scheduleID pgtype
 }
 
 const listRunSchedulesForUser = `-- name: ListRunSchedulesForUser :many
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire FROM run_schedules WHERE user_id = $1 ORDER BY created_at DESC
 `
 
 // The owner's schedules, newest first.
@@ -492,6 +532,7 @@ func (q *Queries) ListRunSchedulesForUser(ctx context.Context, userID uuid.UUID)
 			&i.Guidance,
 			&i.Model,
 			&i.OverrideSubagentModel,
+			&i.LastFire,
 		); err != nil {
 			return nil, err
 		}
@@ -559,7 +600,7 @@ const setRunScheduleEnabled = `-- name: SetRunScheduleEnabled :one
 UPDATE run_schedules
 SET enabled = $1, updated_at = now()
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type SetRunScheduleEnabledParams struct {
@@ -596,6 +637,7 @@ func (q *Queries) SetRunScheduleEnabled(ctx context.Context, arg SetRunScheduleE
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
@@ -604,7 +646,7 @@ const setRunScheduleStatus = `-- name: SetRunScheduleStatus :one
 UPDATE run_schedules
 SET status = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type SetRunScheduleStatusParams struct {
@@ -641,6 +683,7 @@ func (q *Queries) SetRunScheduleStatus(ctx context.Context, arg SetRunScheduleSt
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }
@@ -665,7 +708,7 @@ SET target        = $1,
     status        = 'active',
     updated_at    = now()
 WHERE id = $16 AND user_id = $17
-RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model
+RETURNING id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire
 `
 
 type UpdateRunScheduleParams struct {
@@ -743,6 +786,7 @@ func (q *Queries) UpdateRunSchedule(ctx context.Context, arg UpdateRunSchedulePa
 		&i.Guidance,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.LastFire,
 	)
 	return i, err
 }

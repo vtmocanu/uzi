@@ -399,6 +399,7 @@ type RunSchedule struct {
 	Guidance              pgtype.Text        `json:"guidance"`
 	Model                 pgtype.Text        `json:"model"`
 	OverrideSubagentModel bool               `json:"override_subagent_model"`
+	LastFire              []byte             `json:"last_fire"`
 }
 
 type RunUsage struct {

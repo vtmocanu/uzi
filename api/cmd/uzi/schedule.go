@@ -559,13 +559,7 @@ func newScheduleRunNowCmd(env Env, gf *globalFlags) *cobra.Command {
 			if gf.quiet {
 				return nil
 			}
-			// A benign dedup skip (a prior run still live) creates nothing — say so
-			// rather than printing "started run" with no id.
-			if res.Created == 0 {
-				p.Printf("no run started from %s (a matching run may already be active)\n", args[0])
-				return nil
-			}
-			p.Printf("started %d run(s) from %s: %s\n", res.Created, args[0], strings.Join(res.RunIDs, ", "))
+			renderRunNow(p, args[0], res)
 			return nil
 		},
 	}
@@ -709,5 +703,114 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	for i, f := range s.NextFires {
 		rows = append(rows, []string{fmt.Sprintf("  next[%d]", i), f.UTC().Format(time.RFC3339)})
 	}
-	return p.Table(nil, rows)
+	if err := p.Table(nil, rows); err != nil {
+		return err
+	}
+	renderLastFire(p, s.LastFire)
+	return nil
+}
+
+// skipReasonLabels maps a schedsvc.SkipReason wire string to a short human label for CLI
+// output (PRD #308 M5). This is PRESENTATIONAL only — it is NOT the cross-language drift
+// guard (that is the Go↔TS test in web/src/lib/scheduleSkipReasons.test.ts). An unknown
+// reason falls back to the raw wire string in skipReasonLabel, so a new server-side reason
+// degrades gracefully rather than rendering blank.
+var skipReasonLabels = map[string]string{
+	"no_prd_link":           "no PRD link",
+	"not_eligible":          "not eligible",
+	"already_running":       "already running",
+	"description_too_large": "description too large",
+	"fetch_failed":          "fetch failed",
+}
+
+// skipReasonLabel renders a skip reason as its human label, falling back to the raw wire
+// string for an unmapped value (graceful degradation — the wire is the source of truth).
+func skipReasonLabel(reason string) string {
+	if label, ok := skipReasonLabels[reason]; ok {
+		return label
+	}
+	return reason
+}
+
+// skipReasonHints carries an optional remediation hint per skip reason for the run-now
+// per-candidate breakdown. A reason with no actionable hint is absent (empty), and the
+// caller omits the trailing `# …` for it.
+var skipReasonHints = map[string]string{
+	"no_prd_link": "add PRDLESS / a prds link, or raise --max-issues",
+}
+
+// skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
+func skipReasonHint(reason string) string { return skipReasonHints[reason] }
+
+// lastFireCappedHint is the one-line steer shown when a capped fire started nothing and
+// every matched candidate was skipped — the newest issues were never reached.
+const lastFireCappedHint = "newer issues not reached — raise --max-issues or add PRDLESS / a PRD link"
+
+// fireCandidateLabel renders a started/skipped candidate's identity: "#<iid>" for an
+// issue/sweep candidate, or "prompt" for a prompt schedule (which carries a nil iid).
+func fireCandidateLabel(iid *int64) string {
+	if iid == nil {
+		return "prompt"
+	}
+	return fmt.Sprintf("#%d", *iid)
+}
+
+// renderLastFire appends the "Last fire" block to a schedule detail (PRD #308 M5),
+// summarising the schedule's most recent persisted fire: a one-line summary, the runs it
+// started, the candidates it skipped (with human reason labels), and — when a capped fire
+// reached nobody — the raise-the-cap hint. A nil last_fire means the schedule never fired.
+func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
+	if lf == nil {
+		p.Printf("Last fire: never fired\n")
+		return
+	}
+	p.Printf("Last fire:\n")
+	p.Printf("  fired %s · matched %d · started %d · skipped %d\n",
+		lf.FiredAt.UTC().Format(time.RFC3339), lf.Matched, len(lf.Started), len(lf.Skips))
+	for _, st := range lf.Started {
+		p.Printf("    %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
+	}
+	for _, sk := range lf.Skips {
+		p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), sk.Title)
+	}
+	if lf.Capped && len(lf.Skips) > 0 && len(lf.Started) == 0 {
+		p.Printf("  %s\n", lastFireCappedHint)
+	}
+}
+
+// renderRunNow prints the human outcome of a `schedule run-now` fire (PRD #308 M5) from
+// the widened RunNowResponse: a header with the started run ids, a per-started line, and —
+// when candidates were skipped — the matched/skipped tally with a human reason label and
+// an optional remediation hint per skip. A fire that started nothing AND skipped nothing is
+// a benign dedup (a prior run still live), reported as such rather than as "started 0".
+func renderRunNow(p *uzicli.Printer, id string, res apitypes.RunNowResponse) {
+	if res.Created == 0 && len(res.Skips) == 0 {
+		p.Printf("no run started from %s (a matching run may already be active)\n", id)
+		return
+	}
+	if res.Created == 0 {
+		// The flagship case (a sweep that skipped every candidate): lead with a clean
+		// period-terminated clause rather than "Started 0 run(s) from <id>" trailing into
+		// the skip breakdown below.
+		p.Printf("Started 0 runs from %s.\n", id)
+	} else {
+		p.Printf("Started %d run(s) from %s", res.Created, id)
+		if len(res.RunIDs) > 0 {
+			p.Printf(": %s", strings.Join(res.RunIDs, ", "))
+		}
+		p.Printf("\n")
+	}
+	for _, st := range res.Started {
+		p.Printf("  %s → run %s  %s\n", fireCandidateLabel(st.IssueIID), st.RunID, st.Title)
+	}
+	if len(res.Skips) > 0 {
+		p.Printf("Matched %d candidate(s), skipped %d:\n", res.Matched, len(res.Skips))
+		for _, sk := range res.Skips {
+			line := fmt.Sprintf("  %s  %s", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason))
+			if hint := skipReasonHint(sk.Reason); hint != "" {
+				line += "   # " + hint
+			}
+			p.Printf("%s\n", line)
+		}
+	}
 }

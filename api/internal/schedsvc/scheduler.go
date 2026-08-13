@@ -68,6 +68,7 @@ type Store interface {
 	AdvanceSchedule(ctx context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error)
 	SetRunScheduleStatus(ctx context.Context, arg store.SetRunScheduleStatusParams) (store.RunSchedule, error)
 	ListSweepCandidateIssues(ctx context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error)
+	CountSweepCandidateIssues(ctx context.Context, arg store.CountSweepCandidateIssuesParams) (int64, error)
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
 	HasActiveRunForSchedule(ctx context.Context, scheduleID pgtype.UUID) (bool, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
@@ -181,26 +182,28 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule) {
 			e.logger.Error("scheduler: panic firing schedule", "schedule", sched.ID.String(), "panic", r)
 		}
 	}()
-	// The tick path ignores the created run ids; only RunNow surfaces them.
-	_, fireErr := e.fireOne(ctx, sched)
-	e.advance(ctx, sched, fireErr)
+	// The tick path threads the FireOutcome into advance, which persists it into
+	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
+	// a manual fire never persists a last_fire (Decision 3).
+	out, fireErr := e.fireOne(ctx, sched)
+	e.advance(ctx, sched, out, fireErr)
 }
 
-// RunNow fires a schedule ONCE, manually, and returns the ids of the runs it created
-// (issue→0/1, sweep→N, prompt→0/1; a benign dedup skip → empty). It is the seam behind
-// POST /api/schedules/{id}/run-now.
+// RunNow fires a schedule ONCE, manually, and returns the FireOutcome (matched/started/
+// skips; the number started is issue→0/1, sweep→N, prompt→0/1, a benign dedup skip → 0
+// started). It is the seam behind POST /api/schedules/{id}/run-now.
 //
 // Unlike the tick path it does NOT advance or park the schedule: a manual extra fire
 // must not disturb the recurring cadence (next_fire_at stays where the tick left it) nor
 // terminate a once schedule. Errors ride up UNCHANGED — workersvc.ErrRepoNotFound (repo
 // gone / not owned), ErrBadConfig (malformed stored config), or a transient forge/DB
 // error — so the handler can map each to the right HTTP code.
-func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	return e.fireOne(ctx, sched)
 }
 
-// fireOne dispatches on the schedule target and returns the ids of the runs it created
-// this fire, plus:
+// fireOne dispatches on the schedule target and returns the FireOutcome for this fire,
+// plus:
 //   - nil                          → success or a benign per-fire skip (advance the schedule)
 //   - workersvc.ErrRepoNotFound    → permanent (park the schedule at status='error')
 //   - ErrBadConfig                 → permanent (malformed stored config)
@@ -208,7 +211,10 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) ([]uuid
 //     branch, or it can't be verified — will not change tick-to-tick, so park rather
 //     than tick-storm; the owner fixes forge protection or an admin allows the repo)
 //   - any other error              → transient (do NOT advance; retry next tick)
-func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+//
+// On any non-nil error the returned FireOutcome is the zero value: the outcome is only
+// meaningful on the success/benign advance path (M2 persists it there).
+func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	switch sched.Target {
 	case "issue":
 		return e.fireIssue(ctx, sched)
@@ -219,38 +225,45 @@ func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) ([]uui
 	default:
 		// A target the DB CHECK should have rejected. Park it rather than retry forever.
 		e.logger.Error("scheduler: unknown target", "schedule", sched.ID.String(), "target", sched.Target)
-		return nil, workersvc.ErrRepoNotFound
+		return FireOutcome{}, workersvc.ErrRepoNotFound
 	}
 }
 
 // fireIssue fires a single-issue schedule through the same seam a manual/autopilot
 // start uses, computing the PRDLESS bypass from a fresh GetIssue snapshot exactly
 // like the poller/handler.
-func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
-		return nil, err
+		return FireOutcome{}, err
 	}
 	iid := sched.IssueIid.Int64
 
 	// Benign dedup: a prior run for this issue is still live. Swallow WITHOUT firing,
-	// but the schedule still advances (Decision 5-style: no queued re-runs).
+	// but the schedule still advances (Decision 5-style: no queued re-runs). Matched=1:
+	// the pinned issue was considered; it lands in the Skips bucket as already_running.
+	// Title is left empty — the pre-check does not pay for a forge GetIssue just to label
+	// a skip (PRD #308 M1).
 	active, err := e.store.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
 		RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 	})
 	if err != nil {
-		return nil, err // transient DB error: retry next tick
+		return FireOutcome{}, err // transient DB error: retry next tick
 	}
 	if active {
 		e.logger.Info("scheduler: issue has active run, skipping fire", "schedule", sched.ID.String(), "issue", iid)
-		return nil, nil
+		iidCopy := iid
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipAlreadyRunning}}}, nil
 	}
 
 	issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
 	if err != nil {
-		return nil, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
+		// A forge error on an ISSUE target is transient (retry next tick), NOT a recorded
+		// fetch_failed skip — that bucketing is a sweep-only choice (PRD #308). Return the
+		// zero outcome so nothing is recorded for this fire.
+		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
-	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Description, issue.Labels)
+	return e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -264,80 +277,111 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) ([]u
 // ListSweepCandidateIssuesParams.MaxIssues: a NULL/invalid cap renders an unlimited
 // LIMIT (today's unbounded behaviour), and a set cap N returns the N OLDEST candidates
 // (the query's ORDER BY forge_issue_iid ASC), so the fan-out is an oldest-first batch.
-func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
-		return nil, err
+		return FireOutcome{}, err
 	}
 	labelsJSON, err := e.resolveSweepLabels(ctx, sched.Labels)
 	if err != nil {
-		return nil, err
+		return FireOutcome{}, err
 	}
 	candidates, err := e.store.ListSweepCandidateIssues(ctx, store.ListSweepCandidateIssuesParams{
 		RepoID: repo.ID, Labels: labelsJSON, MaxIssues: sched.MaxIssues,
 	})
 	if err != nil {
-		return nil, err // transient DB error
+		return FireOutcome{}, err // transient DB error
 	}
 	e.logger.Info("scheduler: sweep fan-out (not behind the per-user run limiter, review N1)",
 		"schedule", sched.ID.String(), "candidates", len(candidates))
-	var created []uuid.UUID
+
+	// Capped probe: only a set max_issues can truncate, so count the full matching set
+	// only when the cap is present (a NULL cap can never truncate → Capped=false, no count).
+	capped := false
+	if sched.MaxIssues.Valid {
+		total, err := e.store.CountSweepCandidateIssues(ctx, store.CountSweepCandidateIssuesParams{
+			RepoID: repo.ID, Labels: labelsJSON,
+		})
+		if err != nil {
+			return FireOutcome{}, err // transient DB error
+		}
+		capped = total > int64(len(candidates))
+	}
+
+	// Matched = the capped candidate set; every candidate must land in exactly one of
+	// Started/Skips (the matched == started + skipped invariant, PRD #308 Decision 4).
+	out := FireOutcome{Matched: len(candidates), Capped: capped}
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
+		iidCopy := iid
 		active, err := e.store.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
 			RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 		})
 		if err != nil {
+			// Transient per-candidate DB error: recorded as fetch_failed so the candidate
+			// is not silently dropped. Title is unavailable (not fetched) → left empty.
 			e.logger.Warn("scheduler: sweep active-run check", "schedule", sched.ID.String(), "issue", iid, "error", err)
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
 		if active {
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipAlreadyRunning})
 			continue
 		}
 		issue, err := f.GetIssue(ctx, repo.ForgeProjectID, iid)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
 			continue
 		}
-		ids, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Description, issue.Labels)
+		res, err := e.createIssueRun(ctx, sched, repo.ID, iid, issue.Title, issue.Description, issue.Labels)
 		if err != nil {
-			// A permanent repo error mid-sweep is unexpected (the repo just resolved);
-			// log and keep going rather than aborting the whole fan-out.
+			// A permanent/transient repo error mid-sweep is unexpected (the repo just
+			// resolved); record it as fetch_failed and keep going rather than aborting the
+			// whole fan-out or dropping the candidate.
 			e.logger.Warn("scheduler: sweep create run", "schedule", sched.ID.String(), "issue", iid, "error", err)
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed})
+		} else {
+			// createIssueRun returns a single-issue FireOutcome (one Started or one Skip);
+			// fold it into the sweep's buckets.
+			out.Started = append(out.Started, res.Started...)
+			out.Skips = append(out.Skips, res.Skips...)
 		}
-		created = append(created, ids...)
 		// Light pacing between seam calls (review N1: no per-user limiter guards this).
 		e.sleep(sweepPacing)
 	}
-	return created, nil
+	return out, nil
 }
 
 // firePrompt fires a free-form prompt schedule: a repo-ful, issue-less prompt run
 // keyed to the schedule. HasActiveRunForSchedule is the benign dedup pre-check
 // alongside the uq_runs_one_active_prompt_per_schedule structural backstop.
-func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]uuid.UUID, error) {
+func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
+	// Matched=1 always: a prompt schedule is its own single candidate whenever a fire is
+	// attempted. The prompt title labels its Started/Skip; IssueIID is nil (issue-less).
+	title := promptTitle(sched.Prompt.String)
 	active, err := e.store.HasActiveRunForSchedule(ctx, pgUUID(sched.ID))
 	if err != nil {
-		return nil, err // transient DB error
+		return FireOutcome{}, err // transient DB error
 	}
 	if active {
 		e.logger.Info("scheduler: prompt schedule has active run, skipping fire", "schedule", sched.ID.String())
-		return nil, nil
+		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	}
 	prompt := sched.Prompt.String
-	title := promptTitle(prompt)
 	run, err := e.runs.CreatePromptRun(ctx, sched.UserID, sched.RepoID, sched.ID, title, prompt, sched.AutoApprove, sched.WaitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched))
 	switch {
 	case err == nil:
-		return []uuid.UUID{run.ID}, nil
+		return FireOutcome{Matched: 1, Started: []Started{{RunID: run.ID, Title: title}}}, nil
 	case errors.Is(err, workersvc.ErrActivePromptExists):
-		// Raced the pre-check; the unique index did its job. Benign — advance.
+		// Raced the pre-check; the unique index did its job. Benign — advance. Recorded as
+		// already_running, the same reason the pre-check bool synthesizes.
 		e.logger.Info("scheduler: prompt run already active (race)", "schedule", sched.ID.String())
-		return nil, nil
+		return FireOutcome{Matched: 1, Skips: []Skip{{Title: title, Reason: SkipAlreadyRunning}}}, nil
 	case errors.Is(err, workersvc.ErrRepoNotFound):
-		return nil, workersvc.ErrRepoNotFound // permanent
+		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent
 	default:
-		return nil, err // transient
+		return FireOutcome{}, err // transient
 	}
 }
 
@@ -363,7 +407,8 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) ([]
 // MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
 // ErrDescriptionTooLarge skip. It is purely additive: allowWithoutPRD is computed from
 // the raw labels and no eligibility gate sees the composed text.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, description string, labels []string) ([]uuid.UUID, error) {
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, labels []string) (FireOutcome, error) {
+	iidCopy := iid
 	allowWithoutPRD := e.allowWithoutPRD(ctx, labels)
 
 	desc := composeRunDescription(description, guidanceOf(sched))
@@ -385,21 +430,21 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, allowWithoutPRD, &waitOnLimit, scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil)
 	}
 
-	switch {
-	case err == nil:
-		return []uuid.UUID{run.ID}, nil
-	case errors.Is(err, workersvc.ErrActiveRunExists),
-		errors.Is(err, workersvc.ErrNotPRDIssue),
-		errors.Is(err, workersvc.ErrNoPRDLink),
-		errors.Is(err, workersvc.ErrDescriptionTooLarge):
-		// Benign per-fire skip: the schedule still advances (no tick-storm).
-		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
-		return nil, nil
-	case errors.Is(err, workersvc.ErrRepoNotFound):
-		return nil, workersvc.ErrRepoNotFound // permanent
-	default:
-		return nil, err // transient
+	if err == nil {
+		return FireOutcome{Matched: 1, Started: []Started{{IssueIID: &iidCopy, RunID: run.ID, Title: title}}}, nil
 	}
+	// Benign per-fire seam sentinel → a typed Skip; the schedule still advances (no
+	// tick-storm). skipReasonForErr maps the four benign sentinels (ErrActiveRunExists →
+	// already_running, ErrNotPRDIssue → not_eligible, ErrNoPRDLink → no_prd_link,
+	// ErrDescriptionTooLarge → description_too_large).
+	if reason, ok := skipReasonForErr(err); ok {
+		e.logger.Info("scheduler: issue fire skipped", "schedule", sched.ID.String(), "issue", iid, "reason", err)
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason}}}, nil
+	}
+	if errors.Is(err, workersvc.ErrRepoNotFound) {
+		return FireOutcome{}, workersvc.ErrRepoNotFound // permanent
+	}
+	return FireOutcome{}, err // transient
 }
 
 // resolveRepoForge loads the owner's repo and builds its forge driver. A missing repo
@@ -427,7 +472,13 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 //   - transient error → log, do NOT advance (next_fire_at stays in the past → retry)
 //   - success/benign  → recurring: next next_fire_at, status stays 'active';
 //     once: next_fire_at NULL, status='fired'
-func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireErr error) {
+//
+// On the success/benign path it also serializes the FireOutcome into last_fire (PRD #308
+// M2). A marshal error is LOGGED and last_fire falls back to nil (SQL NULL): a
+// serialization hiccup must never wedge the cadence — the schedule still advances. The
+// park and transient branches never touch last_fire, so a parked/transient fire keeps the
+// prior last_fire or none (Decision 5).
+func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out FireOutcome, fireErr error) {
 	if fireErr != nil {
 		if errors.Is(fireErr, workersvc.ErrRepoNotFound) {
 			e.park(ctx, sched, "the schedule's repo is disconnected or no longer owned by you")
@@ -452,6 +503,13 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 	}
 
 	now := e.now()
+	lastFireJSON, err := marshalLastFire(out, now)
+	if err != nil {
+		// Never let a serialization hiccup wedge the cadence: log it and advance with a
+		// NULL last_fire rather than skipping the advance.
+		e.logger.Error("scheduler: marshal last_fire", "schedule", sched.ID.String(), "error", err)
+		lastFireJSON = nil
+	}
 	switch sched.Timing {
 	case "recurring":
 		next, err := NextFire(sched.CronExpr.String, sched.Timezone, now)
@@ -466,6 +524,7 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			LastFiredAt: pgTime(now),
 			NextFireAt:  pgTime(next),
 			Status:      "active",
+			LastFire:    lastFireJSON,
 			ID:          sched.ID,
 		}); err != nil {
 			e.logger.Error("scheduler: advance recurring", "schedule", sched.ID.String(), "error", err)
@@ -475,6 +534,7 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, fireEr
 			LastFiredAt: pgTime(now),
 			NextFireAt:  pgtype.Timestamptz{}, // NULL: a once schedule never fires again
 			Status:      "fired",
+			LastFire:    lastFireJSON,
 			ID:          sched.ID,
 		}); err != nil {
 			e.logger.Error("scheduler: advance once", "schedule", sched.ID.String(), "error", err)

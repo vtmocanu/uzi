@@ -817,4 +817,238 @@ func TestScheduleEditNotFound(t *testing.T) {
 	}
 }
 
+// TestScheduleGetLastFireBlock (PRD #308 M5): a schedule carrying a LastFire renders the
+// human "Last fire" block — a summary line, per-started run lines, per-skip reason-label
+// lines, and (for a capped fire that reached nobody) the raise-the-cap hint.
+func TestScheduleGetLastFireBlock(t *testing.T) {
+	firedAt := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
+	lf := &apitypes.LastFire{
+		FiredAt: firedAt,
+		Matched: 3,
+		Capped:  true,
+		Started: []apitypes.LastFireStarted{
+			{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"},
+		},
+		Skips: []apitypes.LastFireSkip{
+			{IssueIID: ptrInt64(96), Title: "A raw bug report", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(97), Title: "Already in flight", Reason: "already_running"},
+		},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_lf": {ID: "sch_lf", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_lf")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"Last fire:",
+		"fired 2026-08-13T09:00:00Z · matched 3 · started 1 · skipped 2",
+		"#158 → run run_c81a  Fix the thing",
+		"#96  no PRD link  A raw bug report", // reason LABEL, not the raw wire string
+		"#97  already running  Already in flight",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("last-fire block missing %q\n%s", want, out)
+		}
+	}
+	// Capped fire with skips but no starts would show the hint; here it started one, so the
+	// hint must be ABSENT (the capped-and-reached-nobody guard).
+	if strings.Contains(out, "newer issues not reached") {
+		t.Errorf("capped hint shown despite a started run\n%s", out)
+	}
+	// The raw wire strings must never reach the user in the human block.
+	if strings.Contains(out, "no_prd_link") || strings.Contains(out, "already_running") {
+		t.Errorf("raw wire reason leaked into human output\n%s", out)
+	}
+}
+
+// TestScheduleGetLastFireCappedHint: a capped fire that started nothing and skipped every
+// matched candidate shows the raise-the-cap hint.
+func TestScheduleGetLastFireCappedHint(t *testing.T) {
+	lf := &apitypes.LastFire{
+		FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
+		Matched: 2,
+		Capped:  true,
+		Started: []apitypes.LastFireStarted{},
+		Skips: []apitypes.LastFireSkip{
+			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(97), Title: "another raw bug", Reason: "no_prd_link"},
+		},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_cap": {ID: "sch_cap", Target: "sweep", Labels: []string{"bug"}, Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_cap")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "newer issues not reached — raise --max-issues or add PRDLESS / a PRD link") {
+		t.Errorf("capped fire missing the raise-the-cap hint\n%s", out)
+	}
+}
+
+// TestScheduleGetLastFireNeverFired: a nil LastFire renders "never fired" and no block.
+func TestScheduleGetLastFireNeverFired(t *testing.T) {
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_nf": {ID: "sch_nf", Target: "prompt", Prompt: "x", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: nil},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_nf")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "Last fire: never fired") {
+		t.Errorf("nil last-fire should read 'never fired'\n%s", out)
+	}
+}
+
+// TestScheduleGetLastFirePromptMarker: a prompt schedule's last fire (nil issue iid on a
+// started run) renders the "prompt" marker instead of "#<iid>".
+func TestScheduleGetLastFirePromptMarker(t *testing.T) {
+	lf := &apitypes.LastFire{
+		FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
+		Matched: 1,
+		Started: []apitypes.LastFireStarted{{IssueIID: nil, RunID: "run_p1", Title: "hunt flaky tests"}},
+		Skips:   []apitypes.LastFireSkip{},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_pf": {ID: "sch_pf", Target: "prompt", Prompt: "x", Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_pf")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "prompt → run run_p1  hunt flaky tests") {
+		t.Errorf("prompt-target started line should use the prompt marker\n%s", out)
+	}
+}
+
+// TestScheduleGetLastFireJSON: --json still dumps the DTO with .last_fire intact (the
+// human block is a rendering concern only, not a wire change).
+func TestScheduleGetLastFireJSON(t *testing.T) {
+	lf := &apitypes.LastFire{
+		FiredAt: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC),
+		Matched: 1,
+		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
+		Skips:   []apitypes.LastFireSkip{},
+	}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"sch_lf": {ID: "sch_lf", Target: "issue", IssueIID: ptrInt64(158), Timing: "recurring", CronExpr: "0 9 * * 1", Status: "active", Enabled: true, LastFire: lf},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_lf", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var got apitypes.ScheduleDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not a JSON object: %v\n%s", err, out)
+	}
+	if got.LastFire == nil || got.LastFire.Matched != 1 || len(got.LastFire.Started) != 1 || got.LastFire.Started[0].RunID != "run_c81a" {
+		t.Errorf("--json did not carry .last_fire intact: %+v", got.LastFire)
+	}
+}
+
+// TestScheduleRunNowBreakdown (PRD #308 M5): run-now human output prints the started run
+// ids, per-started lines, and the matched/skipped tally with human reason labels and the
+// remediation hint.
+func TestScheduleRunNowBreakdown(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 1,
+		RunIDs:  []string{"run_c81a"},
+		Matched: 3,
+		Capped:  true,
+		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
+		Skips: []apitypes.LastFireSkip{
+			{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"},
+			{IssueIID: ptrInt64(97), Title: "in flight", Reason: "already_running"},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"Started 1 run(s) from sch_rn: run_c81a",
+		"#158 → run run_c81a  Fix the thing",
+		"Matched 3 candidate(s), skipped 2:",
+		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues", // LABEL + hint
+		"#97  already running",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run-now breakdown missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "no_prd_link") || strings.Contains(out, "already_running") {
+		t.Errorf("raw wire reason leaked into run-now output\n%s", out)
+	}
+}
+
+// TestScheduleRunNowStartedNothing: the flagship case — a sweep fire that started zero
+// runs but skipped candidates. It leads with "Started 0 runs from <id>." (a clean clause,
+// not the run-started wording) followed by the per-candidate skip breakdown and hint.
+func TestScheduleRunNowStartedNothing(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 0,
+		RunIDs:  []string{},
+		Matched: 1,
+		Capped:  true,
+		Started: []apitypes.LastFireStarted{},
+		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"Started 0 runs from sch_rn.",
+		"Matched 1 candidate(s), skipped 1:",
+		"#96  no PRD link   # add PRDLESS / a prds link, or raise --max-issues",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("started-nothing run-now missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "no run started") {
+		t.Errorf("a fire that skipped candidates must NOT report 'no run started'\n%s", out)
+	}
+	if strings.Contains(out, "no_prd_link") {
+		t.Errorf("raw wire reason leaked\n%s", out)
+	}
+}
+
+// TestScheduleRunNowBreakdownJSON: --json dumps the raw widened RunNowResponse unchanged.
+func TestScheduleRunNowBreakdownJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{
+		Created: 1,
+		RunIDs:  []string{"run_c81a"},
+		Matched: 2,
+		Started: []apitypes.LastFireStarted{{IssueIID: ptrInt64(158), RunID: "run_c81a", Title: "Fix the thing"}},
+		Skips:   []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "raw bug", Reason: "no_prd_link"}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	var res apitypes.RunNowResponse
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if res.Matched != 2 || len(res.Skips) != 1 || res.Skips[0].Reason != "no_prd_link" {
+		t.Errorf("--json did not carry the widened response intact: %+v", res)
+	}
+}
+
+// TestScheduleRunNowNoneStarted: a fire that started nothing and skipped nothing (a benign
+// dedup) reports "no run started" rather than "Started 0".
+func TestScheduleRunNowNoneStarted(t *testing.T) {
+	fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{Created: 0, RunIDs: []string{}, Started: []apitypes.LastFireStarted{}, Skips: []apitypes.LastFireSkip{}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_rn")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "no run started from sch_rn") {
+		t.Errorf("empty fire should report 'no run started'\n%s", out)
+	}
+}
+
 func ptrInt64(n int64) *int64 { return &n }
