@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Run, RunMessage } from "../lib/api";
 import { prefs } from "../lib/prefs";
+import { stripUnsafeChars } from "../lib/safeText";
 import type { PhaseUsage } from "../lib/runUsage";
 import { useReconnectingBanner, useTailOnAppend } from "../lib/useFollowScroll";
 import {
@@ -178,7 +179,16 @@ const LABEL_MAX = 48;
 // half of it hides the anomaly too.
 function laneLabelText(label: string | null): string {
   if (!label) return "";
-  return truncate(label.replace(/\s+/g, " ").trim(), LABEL_MAX);
+  // `agent_label` is model-authored, attacker-influenceable free text (issue #124), and
+  // it reaches the DOM as a plain text child plus the header's aria-label/title — none of
+  // which strip Unicode Cf. Strip Cc/Cf FIRST (before the whitespace-collapse and the
+  // truncate, so a removed char can't be split around), the same render-site transform
+  // every other untrusted sink on this page uses. It spares \n/\t, which the \s+ collapse
+  // below already folds, so multi-line flattening is unchanged.
+  return truncate(
+    stripUnsafeChars(label).replace(/\s+/g, " ").trim(),
+    LABEL_MAX,
+  );
 }
 
 // ── View toggle (Decision 2) ──────────────────────────────────────────────────
