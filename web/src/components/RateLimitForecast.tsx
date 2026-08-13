@@ -66,8 +66,11 @@ export function RateLimitForecastMeter({
       {showMarker && (
         <span
           aria-hidden
+          // -translate-y-[62%], not -1/2: the » ink is bottom-heavy in its line box
+          // under leading-none, so centering the BOX leaves the glyph ~1.24px low on
+          // the bar midline. -62% (≈-6.2px on the 10px box) re-centers the ink.
           className={cx(
-            "pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-[10px] font-bold leading-none",
+            "pointer-events-none absolute right-0 top-1/2 -translate-y-[62%] text-[10px] font-bold leading-none",
             over ? "text-danger" : "text-warn",
           )}
         >
