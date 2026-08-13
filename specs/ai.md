@@ -20140,3 +20140,52 @@ only bites once the agent image is current (see Decision 2).
   the run model, on the plan turn too); workersvc claim-delivery test (off omitted / on true);
   live-DB round-trip & freeze under `./e2e/run-store-it.sh`
   (`TestRunScheduleOverrideSubagentModelRoundTripLiveDB`, `TestRunOverrideSubagentModelFrozenLiveDB`).
+
+# PRD #308 — Schedule fire outcomes (surface why a fire started nothing)
+
+Decision Log with the richer rationale: `prds/308-schedule-fire-outcome.md`.
+
+## 523. PRD #308 Decision 1 — last fire only, a single JSONB column, not a history table
+
+Shipped a single nullable `run_schedules.last_fire jsonb` that overwrites each fire, not a
+`schedule_fires` history table. This is the minimal surface that answers the only question the PRD
+asks — "why did the last tick start nothing" — without a second table, its indexes, and a retention
+policy. A per-fire history table remains a clean future extension: the outcome payload is already a
+self-contained struct, so adding an append-only log later does not reshape what a fire records.
+
+## 524. PRD #308 Decision 2 — typed skip reasons from one Go enum, pinned cross-language by a contract test
+
+Shipped a closed `schedsvc.SkipReason` set (`no_prd_link`, `not_eligible`, `already_running`,
+`description_too_large`, `fetch_failed`) as the only vocabulary on the wire — no free text. The first
+four map from the run-creation gate's existing sentinels/pre-checks (`already_running` is a pre-check
+bool, so it is recorded at the pre-check site, not by swallowing a returned sentinel); `fetch_failed`
+is added for a per-candidate transient sweep error that today is logged-and-`continue`d. The Go const
+literals are the source of truth, pinned by a contract test (`web/src/lib/scheduleSkipReasons.test.ts`
+parses them) so a Go reason with no TS counterpart reddens CI rather than reaching a user as an
+unlabelled code.
+
+## 525. PRD #308 Decision 3 — `run-now` reports its full outcome but never persists `last_fire`
+
+A manual `run-now` fire returns the complete matched/started/skipped breakdown in its HTTP and CLI
+response, but never writes `last_fire`. It never reaches `advance()`, which is where the scheduled
+path both moves the cadence and persists the outcome, so this preserves the PRD #241 contract that a
+manual fire does not disturb the schedule's cadence — and, by the same token, does not overwrite the
+record of the last *scheduled* fire. The operator still gets the per-candidate answer immediately;
+it just is not durable.
+
+## 526. PRD #308 Decision 4 — `matched == started + skipped` is an enforced invariant; `matched: 0` is a valid outcome
+
+Every matched candidate lands in exactly one bucket — started or skipped — and the two must sum to
+`matched` on every fire. Per-candidate transient sweep failures are therefore recorded as
+`fetch_failed` rather than dropped, closing the silent-loss gap that made the counts untrustworthy.
+`matched: 0` (an empty label set, or nothing eligible) is a legitimate, observable outcome the surface
+reports plainly, not an error or a null.
+
+## 527. PRD #308 Decision 5 — `last_fire` records the scheduled fire only; the park and transient-error paths do not write it
+
+Only the scheduled-fire path (through `advance()`) writes `last_fire`. Parking a schedule
+(`SetRunScheduleStatus`) and a transient fire error that does not advance both leave the column
+untouched, so a parked or transient schedule shows its prior fire or none rather than a misleading
+empty record. The transient-vs-terminal framing is target-dependent: the same forge/DB error retries
+on an issue target (it does not advance) but is recorded as a per-candidate `fetch_failed` on a sweep
+target, where the fan-out continues past the failed candidate.

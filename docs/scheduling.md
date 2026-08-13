@@ -97,6 +97,55 @@ already is the instruction.
 - **CLI**: `uzi schedule create | list | get | pause | resume | run-now |
   delete` — see [the CLI reference](./cli.md#commands) for the full flag list.
 
+## Fire outcomes
+
+A schedule can fire right on time and still start **zero** runs — every
+candidate can be benign-skipped by the same gate a manual start goes
+through. The motivating case: a `bug` label sweep with `max_issues: 1`
+whose single oldest candidate has no `prds/*.md` link and no `PRDLESS`
+label — the fire runs every night, `Last run` keeps advancing, and
+nothing ever starts. Without a fire outcome, that looks identical to a
+healthy schedule.
+
+Each fire records how many candidates it **matched**, which ones
+**started** (paired with the run they produced), and which were
+**skipped**, each with a typed reason — never free text:
+
+- `no_prd_link` — the candidate issue has no `prds/*.md` link and no
+  [PRDLESS](./prdless.md) label.
+- `not_eligible` — the candidate isn't a run-eligible issue at all.
+- `already_running` — an active run already exists for that issue (or,
+  for the schedule itself, a dedup at fire time).
+- `description_too_large` — the composed run instruction (issue body
+  plus any [guidance](#guidance)) exceeds the size limit.
+- `fetch_failed` — a transient forge or database error while checking
+  a sweep candidate. The same underlying error is handled differently
+  by target: on a **pinned issue**, it's transient and the fire retries
+  next tick with nothing recorded; on a **sweep**, one bad candidate
+  can't stall the rest of the fan-out, so that candidate is bucketed
+  `fetch_failed` and the sweep continues.
+
+`matched == started + skipped` always holds — every candidate lands in
+exactly one bucket, so the tally never silently drops one.
+
+The outcome surfaces everywhere a schedule's status does: the
+Schedules page's `Last run` cell (an outcome badge — started work vs.
+started nothing) with an expandable **Last fire** panel giving the
+per-issue breakdown; `uzi schedule get`'s **Last fire** block (and its
+`--json` `.last_fire`); and `uzi schedule run-now`'s per-candidate
+summary. A sweep fire that was truncated by the [cap](#sweep-cap) and
+started nothing also carries the actionable hint — raise `max_issues`
+or add PRDLESS / a PRD link to the issues behind it.
+
+Only the **last** fire is kept, and only the last *scheduled* one:
+`last_fire` is written on the same path that advances the schedule, so
+a **parked** schedule (bad repo or config) or a fire that hit a
+transient error (retried next tick, see `fetch_failed` above) leaves
+`last_fire` untouched — it shows whatever fired before, or nothing. A
+`run-now` fire reports its own outcome in the response without
+touching `last_fire` at all, since a manual fire must not disturb the
+cadence. A schedule that has never fired reads `last_fire: null`.
+
 ## Restarts and missed fires
 
 A recurring schedule survives an api restart: its next fire time is stored,
