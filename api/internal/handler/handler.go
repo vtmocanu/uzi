@@ -935,6 +935,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// PUT sets the enabling admin (session, never the body) as the run owner and
 				// requires a repo the admin owns.
 				r.Put("/selfimprove", h.PutSelfimproveConfig)
+				// Admin per-repo guardrail override (PRD #66 D8, M8): allow/revoke ONE named
+				// repo through the guardrail, with a reason, audited. Deliberately a dedicated
+				// admin-only route (NOT a branch in PatchRepo, which has a member path) using
+				// the unscoped-by-id set/clear queries — a member self-allowing is the R6
+				// route-around D8 forbids. Actor + timestamp from the session, never the body.
+				r.Post("/repos/{id}/guardrail-override", h.SetRepoGuardrailOverride)
+				r.Delete("/repos/{id}/guardrail-override", h.ClearRepoGuardrailOverride)
 			})
 		})
 

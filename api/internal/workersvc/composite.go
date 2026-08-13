@@ -73,8 +73,10 @@ var (
 // when the bot can reach the default branch or that could not be verified.
 //
 // A nil guard is a no-op: see the RepoGuard doc — the claim backstop (M6, layer 3)
-// is the security net, so a wiring gap never fails all runs. Overridden is false
-// here; M8 threads the real per-repo override.
+// is the security net, so a wiring gap never fails all runs. Overridden comes from
+// the live guardrail_override_reason column (M8): a non-NULL reason means the admin
+// per-repo override is active, so GuardRepo downgrades the waivable findings
+// post-evaluation — never protection_unreadable (D8/D3).
 func (s *Service) guardDefaultBranch(ctx context.Context, row store.GetRepoForUserRow) error {
 	if s.guard == nil {
 		return nil // see RepoGuard doc: layer 3 is the net
@@ -89,7 +91,8 @@ func (s *Service) guardDefaultBranch(ctx context.Context, row store.GetRepoForUs
 			ForgeProjectID: row.ForgeProjectID,
 			DefaultBranch:  row.DefaultBranch.String,
 		},
-		Overridden: false, // M8 threads the real per-repo override
+		// Live per-repo override (M8): NULL reason ⇒ no override.
+		Overridden: row.GuardrailOverrideReason.Valid,
 	})
 	if res.Blocked {
 		return &GuardrailBlockedError{Findings: res.BlockMessages()}

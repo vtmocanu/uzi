@@ -25,6 +25,20 @@ type RepoDTO struct {
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
 	Pipeline *PipelineDTO `json:"pipeline"`
+	// GuardrailOverride is the admin per-repo #66 guardrail override metadata (D8),
+	// null when no override is active (guardrail_override_reason IS NULL). M8 exposes
+	// it so M9 can render the badge; M8 itself adds no new UI control.
+	GuardrailOverride *GuardrailOverrideDTO `json:"guardrail_override"`
+}
+
+// GuardrailOverrideDTO is the audit metadata for an active admin per-repo guardrail
+// override (PRD #66 D8): the reason the admin gave, the actor's user id, and when it
+// was set. By is the raw actor uuid string — M9 may resolve a display name; M8 keeps
+// it simple.
+type GuardrailOverrideDTO struct {
+	Reason string    `json:"reason"`
+	By     string    `json:"by"`
+	At     time.Time `json:"at"`
 }
 
 // PipelineDTO is the CI-badge payload (PRD #6) a repo row, board header, or card

@@ -63,11 +63,12 @@ var limiterNames = [...]string{
 	limBoardOrder,
 }
 
-// The limiter names, as constants so a typo in the 143-row table below is a compile
+// The limiter names, as constants so a typo in the 146-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 144 as of this commit; it was 143 until PRD #66 M3 added GET
+// 146 as of this commit; it was 144 until PRD #66 M8 added POST and DELETE
+// /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
 // /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
 // /api/admin/cli-tokens.
@@ -133,6 +134,9 @@ type routeMount struct {
 // across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
 // and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
+	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
+	// unscoped-by-id DB write, no forge call → noLimiter.
+	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
@@ -256,6 +260,9 @@ var wantRouteMounts = []routeMount{
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
+	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
+	// unscoped-by-id DB write, no forge call → noLimiter.
+	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},

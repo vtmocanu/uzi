@@ -347,6 +347,10 @@ export interface Repo {
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
+  // Admin per-repo guardrail override metadata (PRD #66 D8), null when no override
+  // is active. Display-only surfacing shipped by M8 so M9 can render the badge; M8
+  // itself adds no UI control.
+  guardrail_override?: { reason: string; by: string; at: string } | null;
 }
 
 export interface BoardColumn {

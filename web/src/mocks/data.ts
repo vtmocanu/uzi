@@ -835,6 +835,8 @@ export const mockRepos: Repo[] = [
       pipeline_id: 4242,
       synced_at: minsAgo(1),
     },
+    // PRD #66 M8 (D8): no admin guardrail override active. The M9 UI renders off this.
+    guardrail_override: null,
   },
   {
     id: "repo-atlas",
@@ -854,6 +856,7 @@ export const mockRepos: Repo[] = [
       pipeline_id: 3311,
       synced_at: minsAgo(2),
     },
+    guardrail_override: null,
   },
   {
     id: "repo-www",
@@ -867,6 +870,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
+    guardrail_override: null,
   },
 ];
 

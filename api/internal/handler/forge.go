@@ -106,6 +106,19 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
 	}
+	// #66 M8 (D8): expose the admin per-repo override metadata when active. The
+	// reason NULL is the discriminator — a non-NULL reason means the override is on.
+	// Display-only surfacing for M9's badge; no findings downgrade happens here.
+	if r.GuardrailOverrideReason.Valid {
+		ov := &apitypes.GuardrailOverrideDTO{Reason: r.GuardrailOverrideReason.String}
+		if r.GuardrailOverrideBy.Valid {
+			ov.By = uuid.UUID(r.GuardrailOverrideBy.Bytes).String()
+		}
+		if r.GuardrailOverrideAt.Valid {
+			ov.At = r.GuardrailOverrideAt.Time
+		}
+		dto.GuardrailOverride = ov
+	}
 	return dto
 }
 
@@ -600,7 +613,10 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 				ForgeProjectID: row.ForgeProjectID,
 				DefaultBranch:  row.DefaultBranch.String,
 			},
-			Overridden: false, // M8 threads the real per-repo override; M4 is always false.
+			// Live per-repo override (M8): a non-NULL guardrail_override_reason means
+			// the admin override is active, so GuardRepo downgrades the waivable
+			// findings post-evaluation — never protection_unreadable (D8/D3).
+			Overridden: row.GuardrailOverrideReason.Valid,
 		})
 		if res.Blocked {
 			// 422 mirroring the save-time token gate's body shape (forge.go, key

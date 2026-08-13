@@ -79,10 +79,15 @@ func (r selfimproveScanRow) Scan(dest ...any) error {
 		*dest[4].(*string) = r.repo.WebUrl
 		*dest[5].(*pgtype.Text) = r.repo.DefaultBranch
 		*dest[6].(*bool) = r.repo.Enabled
-		*dest[7].(*string) = r.repo.ForgeType
-		*dest[8].(*string) = r.repo.BaseUrl
-		*dest[9].(*[]byte) = r.repo.TokenCiphertext
-		*dest[10].(*uuid.UUID) = r.repo.UserID
+		// #66 M8: the three guardrail-override columns sit between enabled and the
+		// connection fields in GetRepoForUser's SELECT — left zero here.
+		*dest[7].(*pgtype.Text) = r.repo.GuardrailOverrideReason
+		*dest[8].(*pgtype.UUID) = r.repo.GuardrailOverrideBy
+		*dest[9].(*pgtype.Timestamptz) = r.repo.GuardrailOverrideAt
+		*dest[10].(*string) = r.repo.ForgeType
+		*dest[11].(*string) = r.repo.BaseUrl
+		*dest[12].(*[]byte) = r.repo.TokenCiphertext
+		*dest[13].(*uuid.UUID) = r.repo.UserID
 	case r.count != nil:
 		*dest[0].(*int64) = *r.count
 	}

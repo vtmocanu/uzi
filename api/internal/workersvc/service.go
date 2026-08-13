@@ -1609,8 +1609,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// a run queued while main was protected and claimed after protection was removed
 	// is refused HERE rather than pushing. Placed before box.Open so a blocked run is
 	// never decrypted. A nil guard skips (same nil-safety as layer 2; production wires
-	// it via SetRepoGuard). Overridden is false here — M8 threads the real per-repo
-	// override (and adds its columns to GetRunClaimContext).
+	// it via SetRepoGuard). Overridden comes from the live guardrail_override_reason
+	// column GetRunClaimContext now carries (M8): a non-NULL reason means the admin
+	// per-repo override is active, so GuardRepo downgrades the waivable findings
+	// post-evaluation — never protection_unreadable (D8/D3), so a queued-then-claimed
+	// run whose protection read errors is still refused even on an overridden repo.
 	if s.guard != nil {
 		res := s.guard.GuardRepo(ctx, privcheck.GuardInput{
 			ForgeType:       rc.ForgeType,
@@ -1622,7 +1625,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 				ForgeProjectID: rc.ForgeProjectID,
 				DefaultBranch:  rc.DefaultBranch.String,
 			},
-			Overridden: false, // M8 threads the real override (and adds the columns to this query)
+			// Live per-repo override (M8): NULL reason ⇒ no override.
+			Overridden: rc.GuardrailOverrideReason.Valid,
 		})
 		if res.Blocked {
 			return nil, fmt.Errorf("%w: %s", errGuardrailBlockedClaim, strings.Join(res.BlockMessages(), "; "))

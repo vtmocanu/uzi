@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -17,12 +18,14 @@ import (
 // GuardRepo was called, so a test can assert the gate ran and stopped the create
 // path before any deeper store write.
 type fakeGuard struct {
-	res    privcheck.GuardResult
-	called int
+	res       privcheck.GuardResult
+	called    int
+	lastInput privcheck.GuardInput // the most recent GuardInput, for asserting Overridden threading (M8)
 }
 
-func (g *fakeGuard) GuardRepo(_ context.Context, _ privcheck.GuardInput) privcheck.GuardResult {
+func (g *fakeGuard) GuardRepo(_ context.Context, in privcheck.GuardInput) privcheck.GuardResult {
 	g.called++
+	g.lastInput = in
 	return g.res
 }
 
@@ -296,6 +299,72 @@ func TestClaimNilGuardBackstopSkips(t *testing.T) {
 	}
 	if f.fs.markedFailed != nil {
 		t.Fatalf("a nil guard must not fail the run, got %+v", f.fs.markedFailed)
+	}
+}
+
+// TestCreateRunThreadsOverriddenFromRow (PRD #66 M8): when GetRepoForUser reports a
+// non-NULL guardrail_override_reason, the service-layer gate passes Overridden=true to
+// GuardRepo so the shared evaluator can downgrade the waivable findings. A NULL reason
+// passes Overridden=false. The gate only flips the input bool — it never itself waives
+// protection_unreadable (that stays the evaluator's job, preserved by construction).
+func TestCreateRunThreadsOverriddenFromRow(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reason    pgtype.Text
+		wantOverr bool
+	}{
+		{"override active", pgtype.Text{String: "admin accepted the risk", Valid: true}, true},
+		{"no override", pgtype.Text{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, repo := uuid.New(), uuid.New()
+			row := aValidRepoRow()
+			row.GuardrailOverrideReason = tc.reason
+			fs := &fakeStore{
+				repoRow:         row,
+				issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
+				createRunResult: store.Run{ID: uuid.New()},
+			}
+			guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
+			svc := New(fs, newBox(t), testParams())
+			svc.SetRepoGuard(guard)
+
+			if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false, nil, nil); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			if guard.lastInput.Overridden != tc.wantOverr {
+				t.Fatalf("GuardInput.Overridden = %v, want %v", guard.lastInput.Overridden, tc.wantOverr)
+			}
+		})
+	}
+}
+
+// TestClaimThreadsOverriddenFromContext (PRD #66 M8): the claim backstop reads the
+// override off GetRunClaimContext's guardrail_override_reason and threads it into the
+// GuardInput. A cleared guard is used so the claim proceeds; the assertion is purely
+// that the bool crossed over correctly.
+func TestClaimThreadsOverriddenFromContext(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reason    pgtype.Text
+		wantOverr bool
+	}{
+		{"override active", pgtype.Text{String: "admin accepted the risk", Valid: true}, true},
+		{"no override", pgtype.Text{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClaimFixture(t)
+			f.fs.claimCtx.GuardrailOverrideReason = tc.reason
+			guard := &fakeGuard{res: privcheck.GuardResult{Blocked: false}}
+			f.svc.SetRepoGuard(guard)
+
+			if _, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}); err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if guard.lastInput.Overridden != tc.wantOverr {
+				t.Fatalf("GuardInput.Overridden = %v, want %v", guard.lastInput.Overridden, tc.wantOverr)
+			}
+		})
 	}
 }
 

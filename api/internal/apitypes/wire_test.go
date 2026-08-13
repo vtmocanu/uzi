@@ -370,7 +370,15 @@ func TestSecretDTOTags(t *testing.T) {
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
-		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline")
+		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in", "pipeline",
+		// PRD #66 M8 (D8): admin per-repo guardrail override metadata, null when no
+		// override is active. Display-only surfacing for M9's badge.
+		"guardrail_override")
+}
+
+func TestGuardrailOverrideDTOTags(t *testing.T) {
+	assertTags(t, "GuardrailOverrideDTO", GuardrailOverrideDTO{},
+		"reason", "by", "at")
 }
 
 func TestPipelineDTOTags(t *testing.T) {

@@ -1517,6 +1517,11 @@ SELECT rp.web_url             AS repo_web_url,
        rp.repo_skills_enabled,
        rp.repo_claudemd_enabled,
        rp.repo_devbox_opt_in,
+       -- #66 M8 (D8): the admin per-repo guardrail override discriminator for the
+       -- claim backstop (M6, layer 3). A non-NULL reason means Overridden=true, so
+       -- the shared evaluator downgrades the waivable "bot is too strong" findings —
+       -- never protection_unreadable, which still refuses even an overridden repo.
+       rp.guardrail_override_reason,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -1532,18 +1537,19 @@ WHERE r.id = $1
 `
 
 type GetRunClaimContextRow struct {
-	RepoWebUrl          string      `json:"repo_web_url"`
-	RepoPath            string      `json:"repo_path"`
-	ForgeProjectID      int64       `json:"forge_project_id"`
-	DefaultBranch       pgtype.Text `json:"default_branch"`
-	RepoSkillsEnabled   bool        `json:"repo_skills_enabled"`
-	RepoClaudemdEnabled bool        `json:"repo_claudemd_enabled"`
-	RepoDevboxOptIn     bool        `json:"repo_devbox_opt_in"`
-	ForgeType           string      `json:"forge_type"`
-	BaseUrl             string      `json:"base_url"`
-	BotUsername         string      `json:"bot_username"`
-	TokenCiphertext     []byte      `json:"token_ciphertext"`
-	HumanPlanApproved   bool        `json:"human_plan_approved"`
+	RepoWebUrl              string      `json:"repo_web_url"`
+	RepoPath                string      `json:"repo_path"`
+	ForgeProjectID          int64       `json:"forge_project_id"`
+	DefaultBranch           pgtype.Text `json:"default_branch"`
+	RepoSkillsEnabled       bool        `json:"repo_skills_enabled"`
+	RepoClaudemdEnabled     bool        `json:"repo_claudemd_enabled"`
+	RepoDevboxOptIn         bool        `json:"repo_devbox_opt_in"`
+	GuardrailOverrideReason pgtype.Text `json:"guardrail_override_reason"`
+	ForgeType               string      `json:"forge_type"`
+	BaseUrl                 string      `json:"base_url"`
+	BotUsername             string      `json:"bot_username"`
+	TokenCiphertext         []byte      `json:"token_ciphertext"`
+	HumanPlanApproved       bool        `json:"human_plan_approved"`
 }
 
 // The repo + connection facts the claim payload needs, alongside the run. The
@@ -1606,6 +1612,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoSkillsEnabled,
 		&i.RepoClaudemdEnabled,
 		&i.RepoDevboxOptIn,
+		&i.GuardrailOverrideReason,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,
