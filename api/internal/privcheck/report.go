@@ -100,6 +100,13 @@ const (
 	// SeverityWarn is an advisory finding — drift worth surfacing that does not, on
 	// its own, mean the bot can reach the default branch.
 	SeverityWarn Severity = "warn"
+	// SeverityOverridden is a non-blocking tier a BLOCK finding is downgraded to
+	// when an admin has allowed the repo through the guardrail (PRD #66 D8). It is
+	// produced only by DowngradeOverridden, never looked up in findingSeverity, and
+	// RepoReport.Blocks() (which tests == SeverityBlock) treats it as non-blocking —
+	// so an overridden finding is recorded, rendered, and audited, but does not
+	// refuse a run.
+	SeverityOverridden Severity = "overridden"
 )
 
 // findingSeverity is the SINGLE source of a finding's severity (D5). A Code
@@ -180,6 +187,52 @@ func (rr RepoReport) Blocks() bool {
 		}
 	}
 	return false
+}
+
+// waivableCodes is exactly the six "bot is too strong" BLOCK codes an admin
+// per-repo override may downgrade (PRD #66 D8). CodeProtectionUnreadable is
+// deliberately NOT here: a read error / unreadable protection is never waivable
+// (D3/D8/R8) — a hostile or erroring forge must still refuse even an allowed
+// repo. The warn codes are absent too: they never blocked, so there is nothing
+// to downgrade.
+var waivableCodes = map[Code]bool{
+	CodeDefaultBranchUnprotected: true,
+	CodeWriteRoleCanPush:         true,
+	CodeBotCanPush:               true,
+	CodeWriteRoleCanMerge:        true,
+	CodeBotCanMerge:              true,
+	CodeUnprotectedFilePatterns:  true,
+}
+
+// DowngradeOverridden applies an admin per-repo guardrail override (PRD #66 D8)
+// as a POST-evaluation severity downgrade. This is the SINGLE downgrade function
+// both the live gate (Service.GuardRepo) and M8/M9's render path call, so the
+// "what an override waives" contract lives in exactly one place and cannot drift.
+//
+// Contract:
+//   - overridden == false: findings is returned UNCHANGED (a no-op).
+//   - overridden == true: a NEW slice is returned; the input slice and its
+//     Finding elements are never mutated. Each finding whose Code is in
+//     waivableCodes AND whose current Severity is SeverityBlock has its Severity
+//     set to SeverityOverridden in the copy. Every other finding —
+//     CodeProtectionUnreadable (never waivable, D3/R8) and the warns — is copied
+//     through untouched.
+//
+// It is a downgrade, never a skip: evaluateRepo must have already run
+// (Protected-first, R3/R8) and produced its findings, so an unprotected main is
+// seen as a default_branch_unprotected BLOCK and only then waived — never elided.
+func DowngradeOverridden(findings []Finding, overridden bool) []Finding {
+	if !overridden {
+		return findings
+	}
+	out := make([]Finding, len(findings))
+	for i, f := range findings {
+		out[i] = f
+		if f.Severity == SeverityBlock && waivableCodes[f.Code] {
+			out[i].Severity = SeverityOverridden
+		}
+	}
+	return out
 }
 
 // Report is one connection's full privilege picture: the token plus every

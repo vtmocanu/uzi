@@ -288,6 +288,285 @@ func TestGuardrailImpactNoDefaultBranchIsUnevaluable(t *testing.T) {
 	}
 }
 
+// guardRepo helper: a Repo view for the guard, defaulting to project 1 / "main".
+func aGuardRepo(branch string) Repo {
+	return Repo{ID: uuid.New().String(), Path: "g/p", ForgeProjectID: 1, DefaultBranch: branch}
+}
+
+// hasFinding reports whether findings contains a finding with the given code, and
+// returns it.
+func findFinding(findings []Finding, code Code) (Finding, bool) {
+	for _, f := range findings {
+		if f.Code == code {
+			return f, true
+		}
+	}
+	return Finding{}, false
+}
+
+// TestGuardRepoClientBuildErrorBlocks: a client that won't build fails closed with
+// protection_unreadable, never waived.
+func TestGuardRepoClientBuildErrorBlocks(t *testing.T) {
+	svc := NewService(newFakeStore(), &fakeBuilder{buildErr: errors.New("cipher: message authentication failed")})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if !res.Blocked {
+		t.Fatalf("client-build error must block, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeProtectionUnreadable); !ok {
+		t.Fatalf("want protection_unreadable, got %+v", res.Findings)
+	}
+}
+
+// TestGuardRepoVerifyTokenErrorBlocks: a token that cannot be verified fails closed.
+func TestGuardRepoVerifyTokenErrorBlocks(t *testing.T) {
+	f := &fakeForge{verifyErr: errors.New("401 token revoked")}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if !res.Blocked {
+		t.Fatalf("VerifyToken error must block, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeProtectionUnreadable); !ok {
+		t.Fatalf("want protection_unreadable, got %+v", res.Findings)
+	}
+}
+
+// TestGuardRepoUnprotectedBranchBlocksProtectedFirst: an unprotected branch blocks
+// with exactly default_branch_unprotected — the push/merge codes are NOT present,
+// asserting Protected-first (R3): false,false is never read as safe.
+func TestGuardRepoUnprotectedBranchBlocksProtectedFirst(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {bp: forge.BranchProtection{Protected: false}}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if !res.Blocked {
+		t.Fatalf("unprotected branch must block, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeDefaultBranchUnprotected); !ok {
+		t.Fatalf("want default_branch_unprotected, got %+v", res.Findings)
+	}
+	for _, c := range []Code{CodeWriteRoleCanPush, CodeBotCanPush, CodeWriteRoleCanMerge, CodeBotCanMerge} {
+		if _, ok := findFinding(res.Findings, c); ok {
+			t.Fatalf("push/merge code %q must NOT be present on an unprotected branch (R3), got %+v", c, res.Findings)
+		}
+	}
+}
+
+// TestGuardRepoProtectedGrantsBlock: each of the four protected-branch push/merge
+// grants blocks with its own code.
+func TestGuardRepoProtectedGrantsBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		bp   forge.BranchProtection
+		code Code
+	}{
+		{"write_role_can_push", forge.BranchProtection{Protected: true, WriteRoleCanPush: true}, CodeWriteRoleCanPush},
+		{"bot_can_push", forge.BranchProtection{Protected: true, BotCanPush: true}, CodeBotCanPush},
+		{"write_role_can_merge", forge.BranchProtection{Protected: true, WriteRoleCanMerge: true}, CodeWriteRoleCanMerge},
+		{"bot_can_merge", forge.BranchProtection{Protected: true, BotCanMerge: true}, CodeBotCanMerge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeForge{
+				identity: forge.BotIdentity{ForgeUserID: 42},
+				roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+				prots:    map[int64]protResult{1: {bp: tc.bp}},
+			}
+			svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+			res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+			if !res.Blocked {
+				t.Fatalf("%s must block, got %+v", tc.name, res)
+			}
+			if _, ok := findFinding(res.Findings, tc.code); !ok {
+				t.Fatalf("want %q, got %+v", tc.code, res.Findings)
+			}
+		})
+	}
+}
+
+// TestGuardRepoProtectedCleanNotBlocked: a protected branch with nothing granted
+// does not block.
+func TestGuardRepoProtectedCleanNotBlocked(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if res.Blocked {
+		t.Fatalf("clean protected repo must not block, got %+v", res)
+	}
+	for _, fnd := range res.Findings {
+		if fnd.Severity == SeverityBlock {
+			t.Fatalf("clean repo carries a block finding: %+v", fnd)
+		}
+	}
+}
+
+// TestGuardRepoBranchProtectionErrorBlocks: a DefaultBranchProtection read error
+// becomes protection_unreadable BLOCK inside evaluateRepo.
+func TestGuardRepoBranchProtectionErrorBlocks(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {err: errors.New("403 from protected-branches")}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if !res.Blocked {
+		t.Fatalf("branch-protection read error must block, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeProtectionUnreadable); !ok {
+		t.Fatalf("want protection_unreadable, got %+v", res.Findings)
+	}
+}
+
+// TestGuardRepoProtectionUnverifiedBlocks: protected + nil error but unverified
+// (GitHub legacy case) is fail-closed protection_unreadable.
+func TestGuardRepoProtectionUnverifiedBlocks(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, ProtectionUnverified: true}}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main")})
+	if !res.Blocked {
+		t.Fatalf("ProtectionUnverified must block, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeProtectionUnreadable); !ok {
+		t.Fatalf("want protection_unreadable, got %+v", res.Findings)
+	}
+}
+
+// TestGuardRepoNoDefaultBranchNotBlocked: an empty repo (no default branch) is not
+// blocked — evaluateRepo emits no_default_branch (warn) and returns.
+func TestGuardRepoNoDefaultBranchNotBlocked(t *testing.T) {
+	f := &fakeForge{identity: forge.BotIdentity{ForgeUserID: 42}}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("")})
+	if res.Blocked {
+		t.Fatalf("no-default-branch repo must not block, got %+v", res)
+	}
+}
+
+// TestGuardRepoOverrideWaivesPushGrant: Overridden + WriteRoleCanPush → not
+// blocked, and the finding survives with Severity overridden (waived, not skipped).
+func TestGuardRepoOverrideWaivesPushGrant(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: true}}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main"), Overridden: true})
+	if res.Blocked {
+		t.Fatalf("overridden push grant must not block, got %+v", res)
+	}
+	fnd, ok := findFinding(res.Findings, CodeWriteRoleCanPush)
+	if !ok {
+		t.Fatalf("finding must survive the override (waived, not skipped), got %+v", res.Findings)
+	}
+	if fnd.Severity != SeverityOverridden {
+		t.Fatalf("finding severity = %q, want overridden", fnd.Severity)
+	}
+}
+
+// TestGuardRepoOverrideWaivesUnprotectedProtectedFirst: Overridden + unprotected
+// branch → not blocked, but evaluateRepo still SAW it (Protected-first not
+// reintroduced): the default_branch_unprotected finding exists with severity
+// overridden — evidence it was evaluated and waived, not skipped.
+func TestGuardRepoOverrideWaivesUnprotectedProtectedFirst(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {bp: forge.BranchProtection{Protected: false}}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main"), Overridden: true})
+	if res.Blocked {
+		t.Fatalf("overridden unprotected branch must not block, got %+v", res)
+	}
+	fnd, ok := findFinding(res.Findings, CodeDefaultBranchUnprotected)
+	if !ok {
+		t.Fatalf("unprotected finding must be present (seen then waived, not skipped), got %+v", res.Findings)
+	}
+	if fnd.Severity != SeverityOverridden {
+		t.Fatalf("finding severity = %q, want overridden", fnd.Severity)
+	}
+}
+
+// TestGuardRepoOverrideNeverWaivesUnreadable: Overridden + DefaultBranchProtection
+// error → STILL blocked (protection_unreadable is never waived, R8).
+func TestGuardRepoOverrideNeverWaivesUnreadable(t *testing.T) {
+	f := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42},
+		roles:    map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:    map[int64]protResult{1: {err: errors.New("403 from protected-branches")}},
+	}
+	svc := NewService(newFakeStore(), &fakeBuilder{forge: f})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main"), Overridden: true})
+	if !res.Blocked {
+		t.Fatalf("override must NOT waive protection_unreadable (R8), got %+v", res)
+	}
+	fnd, ok := findFinding(res.Findings, CodeProtectionUnreadable)
+	if !ok || fnd.Severity != SeverityBlock {
+		t.Fatalf("protection_unreadable must stay BLOCK under override, got %+v", res.Findings)
+	}
+}
+
+// TestGuardRepoOverrideNeverWaivesClientBuildError: Overridden + client-build error
+// → STILL blocked.
+func TestGuardRepoOverrideNeverWaivesClientBuildError(t *testing.T) {
+	svc := NewService(newFakeStore(), &fakeBuilder{buildErr: errors.New("cipher: message authentication failed")})
+	res := svc.GuardRepo(context.Background(), GuardInput{Repo: aGuardRepo("main"), Overridden: true})
+	if !res.Blocked {
+		t.Fatalf("override must NOT waive a client-build failure, got %+v", res)
+	}
+	if _, ok := findFinding(res.Findings, CodeProtectionUnreadable); !ok {
+		t.Fatalf("want protection_unreadable, got %+v", res.Findings)
+	}
+}
+
+// TestDowngradeOverridden covers the primitive directly: waivable BLOCK→overridden;
+// protection_unreadable stays BLOCK; warns unchanged; overridden=false is a no-op;
+// the input slice and its elements are not mutated.
+func TestDowngradeOverridden(t *testing.T) {
+	in := []Finding{
+		newFinding(CodeWriteRoleCanPush, "push"),        // waivable BLOCK
+		newFinding(CodeDefaultBranchUnprotected, "unp"), // waivable BLOCK
+		newFinding(CodeProtectionUnreadable, "unread"),  // BLOCK, never waivable
+		newFinding(CodeBotNotMember, "weak"),            // warn
+	}
+
+	// overridden=false is a no-op returning the same slice.
+	if got := DowngradeOverridden(in, false); &got[0] != &in[0] {
+		t.Fatalf("overridden=false must return the input slice unchanged")
+	}
+
+	out := DowngradeOverridden(in, true)
+	if f, _ := findFinding(out, CodeWriteRoleCanPush); f.Severity != SeverityOverridden {
+		t.Fatalf("waivable BLOCK write_role_can_push not downgraded: %+v", f)
+	}
+	if f, _ := findFinding(out, CodeDefaultBranchUnprotected); f.Severity != SeverityOverridden {
+		t.Fatalf("waivable BLOCK default_branch_unprotected not downgraded: %+v", f)
+	}
+	if f, _ := findFinding(out, CodeProtectionUnreadable); f.Severity != SeverityBlock {
+		t.Fatalf("protection_unreadable must stay BLOCK: %+v", f)
+	}
+	if f, _ := findFinding(out, CodeBotNotMember); f.Severity != SeverityWarn {
+		t.Fatalf("warn finding must be unchanged: %+v", f)
+	}
+
+	// Input not mutated.
+	if f, _ := findFinding(in, CodeWriteRoleCanPush); f.Severity != SeverityBlock {
+		t.Fatalf("DowngradeOverridden mutated its input: %+v", f)
+	}
+}
+
 // TestSweepToleratesDeletedMidSweep: a 0-row write-back (connection deleted mid
 // -sweep) is not an error.
 func TestSweepToleratesDeletedMidSweep(t *testing.T) {
