@@ -38,8 +38,9 @@ Knobs (env vars):
 - `UZI_E2E_EXECUTOR=sdk` — the OPTIONAL live capstone (see below).
 - `E2E_FORGE_POLL_INTERVAL=<dur>` — the api's poll cadence (overlay default `24h`;
   the MR-close phase sets `2s` internally — together with `FORGE_RECONCILE_EVERY=2` —
-  and recreates the api; do not go below 2s: the interval doubles as the whole-tick
-  deadline and a cancelled tick can permanently lose an autopilot comment).
+  and recreates the api). The per-tick deadline is floored at 2x the forge HTTP
+  timeout (issue #139), so it no longer collapses to the interval: a short cadence
+  keeps its speed without cancelling an in-flight sync or losing an autopilot comment.
   Overlay-only; the production default is untouched.
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)

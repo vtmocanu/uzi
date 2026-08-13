@@ -441,6 +441,11 @@ func run() error {
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	// Floor the per-tick deadline at the forge HTTP timeout so a poll interval shorter
+	// than a single forge call (the e2e harness pins 2s, under the 15s default) can't
+	// cancel an in-flight sync call — decouples the tick DEADLINE from the poll cadence
+	// (issue #139).
+	engine.SetForgeTimeout(cfg.ForgeHTTPTimeout)
 	// Autopilot (PRD #19 M4): the poller's post-sync detector turns an autopilot-label
 	// application on a PRD issue into an auto_approve run for the mapped consenting
 	// user (or one explanatory issue comment). Wired post-construction like the other

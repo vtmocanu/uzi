@@ -2624,10 +2624,12 @@ pass "live plan reject: status=failed, failure_reason=verbatim through the worke
 say "PRD #24: MR-close watcher (Human Review ⇄ In Progress on MR close/reopen)"
 
 # The watcher only ticks inside the poller; the overlay default is 24h. Switch to
-# ~2s and recreate the api so the MR-state watcher actually runs. NOT faster than
-# 2s: the poll interval doubles as the whole-tick deadline (poller.go tickCtx),
-# and at 1s a slow tick gets cancelled mid-pass — observed losing an autopilot
-# record-then-comment (the comment is never retried by design). The reconcile
+# ~2s and recreate the api so the MR-state watcher actually runs. 2s is the
+# practical floor for cadence sanity (with FORGE_RECONCILE_EVERY=2 a ~4s reconcile
+# period), but the mid-pass-cancellation hazard that used to force it is gone: since
+# issue #139 the whole-tick deadline is floored at 2x the forge HTTP timeout
+# (poller.go tickBudget), so a short interval no longer cancels a slow tick or loses
+# the autopilot record-then-comment (the comment is never retried by design). The reconcile
 # cadence (FORGE_RECONCILE_EVERY, the PRD #19 FullSync-eviction dedup's bounded
 # wait) is set in the SAME recreate: a full reconcile only mirrors the forge the
 # watcher already wrote forge-first (FullSync writes the issue cache, never moves
