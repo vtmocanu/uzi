@@ -9,7 +9,7 @@
 // the atom's aria-valuetext and the container title, never printed inline.
 import { clampPct, MeterTrack } from "./Meter";
 import { cx } from "./ui";
-import type { BurnForecast } from "../lib/rateLimits";
+import type { PaceForecast } from "../lib/rateLimits";
 
 // Ghost tone per forecast state — translucent so the track shows through, mirroring
 // the atom's bg-warn / bg-danger fills (Meter.tsx): gold on pace, coral over.
@@ -29,7 +29,7 @@ export function RateLimitForecastMeter({
   label: string;
   pct: number;
   valueText: string;
-  forecast: BurnForecast;
+  forecast: PaceForecast;
   className?: string;
   dim?: boolean;
 }) {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { AdminRateLimits } from "./AdminRateLimits";
 import { api, type AdminRateLimitUser, type MyRateLimits } from "../lib/api";
 
@@ -147,56 +147,77 @@ describe("AdminRateLimits", () => {
   });
 
   it("renders the four-column header and no Updated/window columns (PRD #240 regression)", async () => {
-    // Pin the fix's intent: the table is User · Token · Utilization · Status. If a
-    // future change re-splits Utilization back into two window columns (or re-adds a
-    // standalone Updated column), the horizontal-scroll bug this PRD fixed returns —
-    // so this asserts the collapsed shape, not just that the headers render.
+    // Pin the fix's intent: the table is User · Token · Utilization & Forecast ·
+    // Status. If a future change re-splits Utilization back into two window columns
+    // (or re-adds a standalone Updated column), the horizontal-scroll bug this PRD
+    // fixed returns — so this asserts the collapsed shape, not just that the headers
+    // render. The Utilization column carries the anchored forecast (PRD #310), hence
+    // its renamed header.
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
     render(<AdminRateLimits />);
     await screen.findByText("ana");
 
     const headers = screen.getAllByRole("columnheader").map((h) => h.textContent);
-    expect(headers).toEqual(["User", "Token", "Utilization", "Status"]);
+    expect(headers).toEqual(["User", "Token", "Utilization & Forecast", "Status"]);
     expect(screen.queryByRole("columnheader", { name: "Updated" })).toBeNull();
     expect(screen.queryByRole("columnheader", { name: "5-hour window" })).toBeNull();
     expect(screen.queryByRole("columnheader", { name: "7-day window" })).toBeNull();
   });
 });
 
-// PRD #309 M4 — the burn-rate forecast wired through the admin table (its primary
-// target). Drives the real accumulation across polls on the row's own series.
-describe("AdminRateLimits forecast (PRD #309)", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-  const flush = (ms = 0) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
-
-  it("draws a forecast ghost + » on a row whose rising trailing series projects over the cap", async () => {
-    let poll = 0;
-    // 40, 48, 56 … capped below 100; far-out reset so the projection blows past 100.
-    mockApi.getAdminRateLimits.mockImplementation(async () => {
-      const pct5 = Math.min(40 + poll * 8, 96);
-      poll += 1;
-      return { users: [row("ana", ok(pct5, 20))] };
-    });
+// PRD #310 — the anchored forecast wired through the admin table (its primary
+// target). The projection comes from a SINGLE reading, so one render of a row
+// heading past the cap already shows the ghost/marker — no sample warm-up.
+describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
+  it("draws a forecast ghost + » on a row heading past the cap, with no warm-up", async () => {
+    // ana's 5h window at 90% with a near reset (elapsed ≈ 13000s ⇒ projected ≈ 125).
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("ana", ok(90, 20))] });
     render(<AdminRateLimits />);
-    await flush(); // initial read (40%)
-    for (let k = 0; k < 6; k++) await flush(60_000); // rising polls, >3-min span accrues
 
-    const ana = screen.getByText("ana").closest("tr")!;
+    const ana = (await screen.findByText("ana")).closest("tr")!;
     const bar5h = within(ana).getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
     expect(within(ana).getByText("»")).toBeTruthy();
   });
 
-  it("stays silent (plain bar) on a FLAT series — reads the slope, not presence", async () => {
-    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("vlad", ok(62, 20))] });
+  it("stays a plain bar on a low reading with headroom", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("vlad", ok(20, 20))] });
     render(<AdminRateLimits />);
-    await flush();
-    for (let k = 0; k < 6; k++) await flush(60_000);
 
-    const vlad = screen.getByText("vlad").closest("tr")!;
+    const vlad = (await screen.findByText("vlad")).closest("tr")!;
     const bar5h = within(vlad).getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
     expect(within(vlad).queryByText("»")).toBeNull();
+  });
+
+  it("draws no forecast on a stale row heading past the cap", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("mihai", ok(90, 20, { stale: true }))] });
+    render(<AdminRateLimits />);
+
+    const mihai = (await screen.findByText("mihai")).closest("tr")!;
+    expect(within(mihai).queryByText("»")).toBeNull();
+  });
+});
+
+// PRD #310 M3 — the absolute "resets <Day HH:MM>" line under the token name in the
+// Token cell, from the 7-day reset. The utilization column shows a bare countdown
+// ("1h 23m"), not a "resets …" string, so the label regex is unambiguous.
+describe("AdminRateLimits reset label (PRD #310 M3)", () => {
+  const RESET_LABEL = /resets [A-Za-z]{3} \d{2}:\d{2}/;
+
+  it("renders the 7-day reset label under the token name", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("ana", ok(90, 20))] }); // 7d set
+    render(<AdminRateLimits />);
+    const ana = (await screen.findByText("ana")).closest("tr")!;
+    expect(ana.textContent).toMatch(RESET_LABEL);
+  });
+
+  it("omits the label when the 7-day resets_at is null", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({
+      users: [row("vlad", ok(20, 20, { seven_day: { pct: 20, resets_at: null } }))],
+    });
+    render(<AdminRateLimits />);
+    const vlad = (await screen.findByText("vlad")).closest("tr")!;
+    expect(vlad.textContent).not.toMatch(RESET_LABEL);
   });
 });

@@ -4,7 +4,7 @@
 // countdowns tick between the 60s polls. Kept free of the api client so it unit-
 // tests without the mock; types are imported type-only (erased at build).
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { toneFor } from "../components/Meter";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits, RateLimitSource, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
@@ -23,6 +23,28 @@ export function formatCountdown(resetsAt: number | null, nowMs = Date.now()): st
   if (h >= 1) return `${h}h ${m}m`;
   if (m >= 1) return `${m}m`;
   return "<1m";
+}
+
+// formatResetLabel renders a 7-day window's absolute reset as "resets <Day HH:MM>"
+// in the VIEWER'S LOCAL timezone (weekday included so it is unambiguous), the mock's
+// line under each token name (PRD #310 M3 / D4 — the weekly quota users plan around;
+// the per-window relative countdowns stay in the utilization column). null / non-
+// finite resets_at → null (the caller omits the line). resetsAt is a SECONDS epoch,
+// like resets_at everywhere else in this module. Built via Intl.DateTimeFormat +
+// formatToParts (not getHours) so the weekday abbrev and 24h HH:MM come out locale/
+// tz-correct and we compose exactly "resets <Weekday> <HH:MM>" with no locale
+// separator. Absolute, so it takes no nowMs — unlike its formatCountdown sibling.
+export function formatResetLabel(resetsAt: number | null): string | null {
+  if (resetsAt == null || !Number.isFinite(resetsAt)) return null;
+  const parts = new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    hourCycle: "h23", // midnight is "00:00", never "24:00" (some ICU builds render h24 otherwise)
+  }).formatToParts(new Date(resetsAt * 1000));
+  const at = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? "";
+  return `resets ${at("weekday")} ${at("hour")}:${at("minute")}`;
 }
 
 // formatAgo renders an ISO timestamp as "2m ago" / "3h ago" / "1d ago" — the
@@ -313,203 +335,104 @@ export function autoStatusChip(status: AutoStatus | string): AutoStatusChip {
   );
 }
 
-// ── Burn-rate forecast (PRD #309) ────────────────────────────────────────────
+// ── Anchored pace forecast (PRD #310) ────────────────────────────────────────
 //
-// A window-model-AGNOSTIC trajectory hint: is a window on track to exhaust BEFORE
-// it resets, at the CURRENT observed rate? The rate is measured from a short
-// in-session sample of the window's own pct readings (see the accumulation hook,
-// PRD M2), NOT from `elapsed = now − (resets_at − duration)` — that anchored term
-// is only valid if the window resets at a fixed boundary, which is undocumented and
-// the evidence leans sliding (see the PRD Resolution + specs/ai.md §523). Deriving
-// the rate from observed Δpct is correct whether the window is anchored or sliding.
+// Is a window on track to exhaust BEFORE it resets? The unified 5h/7d windows are
+// ANCHORED — a fixed boundary that fully resets — measured 2026-08-13 against the
+// live `anthropic_rate_limits` headers (see specs/ai.md §523). That makes the
+// projection valid from a SINGLE reading (no in-session sample series), so the
+// forecast is ALWAYS visible, on idle and slow-moving 7-day windows alike:
 //
-// DISPLAY-ONLY (PRD D2): this drives no backend decision and must NEVER become an
-// input to auto-selection or any gate — it is imported only by rendering code.
+//   nowSec    = nowMs / 1000                                   // nowMs is MILLISECONDS
+//   elapsed   = nowSec − (resetsAtSec − windowDurationSec)     // resets/duration in SECONDS
+//   projected = pct × windowDurationSec / elapsed
+//
+// Feeding raw nowMs (not nowMs/1000) into elapsed collapses projected to ~0 and the
+// forecast is silent forever — the exact failure #310 exists to fix. formatCountdown
+// divides nowMs by 1000 the same way (rateLimits.ts:17).
+//
+// DISPLAY-ONLY (PRD #309 D2, #310 D6): this drives no backend decision and must
+// NEVER become an input to auto-selection or any gate — it is imported only by
+// rendering code.
 
-// BurnSample is one poll's reading of ONE window: a wall-clock stamp (ms) and the
-// integer pct it carried. The accumulation hook keeps a bounded, non-decreasing run
-// of these per (secret_id, window); the forecast reads their slope.
-export interface BurnSample {
-  tMs: number;
-  pct: number;
-}
+// The anchored window lengths in SECONDS (PRD #310 D1): 5h = 18000 (confirmed by the
+// measured +5h reset jump), 7d = 604800. The surfaces index this by the literal
+// window key to feed rowForecast.
+export const WINDOW_DURATION = { "5h": 18000, "7d": 604800 } as const;
 
 // Not exported: consumers compare `forecast.state === "over"` structurally; the
-// M3 wrapper needs no named import. Keeping it local avoids an orphaned export.
-type BurnState = "over" | "on_pace" | "safe";
+// wrapper needs no named import. Keeping it local avoids an orphaned export.
+type PaceState = "over" | "on_pace" | "safe";
 
-export interface BurnForecast {
+export interface PaceForecast {
   // over: projected past the cap before reset; on_pace: lands ~at the cap; safe:
-  // headroom to spare OR not enough signal to say (silence = safe, PRD D3).
-  state: BurnState;
-  // The projected utilization AT reset, rounded and capped to a sane display range.
+  // headroom to spare OR suppressed (silence = safe, PRD #309 D3).
+  state: PaceState;
+  // The projected utilization AT reset, rounded and clamped to a sane display range.
   // Meaningful only when state !== "safe"; 0 on the safe/silent path.
   projectedPct: number;
 }
 
-// Below this sample span a single early burst dominates the slope, so the forecast
-// stays silent. This is also the cold-start floor (a freshly loaded page has no span
-// yet) and the reason the slow-moving 7-day window is usually silent — its pct
-// rarely clears the integer noise floor within a few minutes. PRD D5's intent, in
-// model-agnostic form.
-const MIN_SAMPLE_SPAN_MS = 3 * 60_000;
-
-// Cap the projected % to a sane display range: an early burst over a short span can
-// extrapolate to absurd magnitudes ("projected 1600%"), which the bands already read
-// as "over" — the number past the cap is a rough hint, not a precise promise (D6, no
-// smoothing). The ghost width is clamped to 100 separately by the wrapper.
+// Cap the projected % to a sane display range: a tiny elapsed early in a window
+// extrapolates to absurd magnitudes ("projected 1600%"), which the bands already
+// read as "over" — the number past the cap is a rough hint, not a precise promise.
+// The ghost width is clamped to 100 separately by the wrapper.
 const MAX_PROJECTED_PCT = 999;
 
-// burnForecast projects a single window's landing utilization from its observed
-// trailing samples. PURE and wall-clock-free — nowMs is injected. Returns a silent
-// "safe" whenever the projection would be meaningless or misleading:
-//   - fewer than 2 samples, or a span below MIN_SAMPLE_SPAN_MS (cold start / noise);
-//   - a flat or DECAYING slope (rate ≤ 0) — not approaching the cap (a sliding
-//     window idles DOWNWARD, which reads as safe, correctly);
-//   - pct already ≥ 100, or a `limit_report` source — a park-time inference that is
-//     AT the cap, not "on track to be" (PRD D8);
-//   - resets_at null, or already passed (clock skew) — no horizon to project onto.
-// Otherwise projectedPct = pct + rate × secondsToReset, banded strictly (PRD D7):
-// > 115 → over, > 85 → on_pace, else safe.
-export function burnForecast(
-  samples: BurnSample[],
+// paceForecast projects a single window's landing utilization from ONE reading via
+// the anchored formula above. PURE and wall-clock-free — nowMs is injected. Returns
+// a silent "safe" whenever the projection would be meaningless or misleading:
+//   - pct already ≥ 100, or a `limit_report` source — AT the cap / a park-time
+//     inference, not "on track to be" (PRD #309 D8);
+//   - resets_at null — no horizon to anchor to;
+//   - !(elapsed > 0) — a passed reset, clock skew, or a NaN nowMs (the `!(x > 0)`
+//     form rejects the non-finite case a bare `<=` would not);
+//   - elapsed ≤ floor = max(windowDurationSec/50, 900) — early-window suppression (a
+//     tiny elapsed extrapolates wildly), checked BEFORE the divide so it doubles as
+//     the divide-by-zero guard: floor is always ≥ 900, so the divide only runs at
+//     elapsed > 900 (PRD #310 D3);
+//   - projected ≤ 85 — headroom to spare (strict lower band, PRD #309 D7).
+// Otherwise banded strictly on the RAW projection (PRD #309 D7): > 115 → over, else
+// on_pace. The returned projectedPct is the CLAMPED, rounded value for display.
+export function paceForecast(
+  pct: number,
   resetsAtSec: number | null,
+  windowDurationSec: number,
   nowMs: number,
   source?: RateLimitSource,
-): BurnForecast {
-  const SAFE: BurnForecast = { state: "safe", projectedPct: 0 };
-  if (samples.length < 2) return SAFE;
-  const latest = samples[samples.length - 1];
-  if (latest.pct >= 100) return SAFE; // D8: already at the cap, not heading there
+): PaceForecast {
+  const SAFE: PaceForecast = { state: "safe", projectedPct: 0 };
+  if (pct >= 100) return SAFE; // D8: already at the cap, not heading there
   if (source === "limit_report") return SAFE; // D8: park-time inference
   if (resetsAtSec == null) return SAFE;
-  const secondsToReset = resetsAtSec - nowMs / 1000;
-  // `!(x > 0)` rather than `x <= 0` so a non-finite horizon (NaN from a bad nowMs /
-  // resets_at) is also rejected, never propagating to a NaN projectedPct.
-  if (!(secondsToReset > 0)) return SAFE; // reset passed / clock skew / non-finite
-  const oldest = samples[0];
-  const spanMs = latest.tMs - oldest.tMs;
-  if (spanMs < MIN_SAMPLE_SPAN_MS) return SAFE; // cold start / insufficient span
-  const ratePerSec = (latest.pct - oldest.pct) / (spanMs / 1000);
-  if (ratePerSec <= 0) return SAFE; // flat or decaying → not approaching the cap
-  const projectedPct = Math.round(
-    Math.max(0, Math.min(MAX_PROJECTED_PCT, latest.pct + ratePerSec * secondsToReset)),
-  );
-  if (projectedPct <= 85) return SAFE; // headroom to spare (strict lower band, D7)
-  return { state: projectedPct > 115 ? "over" : "on_pace", projectedPct };
+  const nowSec = nowMs / 1000; // nowMs is MILLISECONDS; resets/duration are SECONDS
+  const elapsed = nowSec - (resetsAtSec - windowDurationSec);
+  // `!(x > 0)` rather than `x <= 0` so a non-finite elapsed (NaN from a bad nowMs)
+  // is also rejected, never propagating to a NaN projectedPct.
+  if (!(elapsed > 0)) return SAFE; // passed reset / clock skew / non-finite
+  // Floor BEFORE the divide: always ≥ 900, so the divide only runs at elapsed > 900.
+  const floor = Math.max(windowDurationSec / 50, 900);
+  if (elapsed <= floor) return SAFE; // early-window suppression (PRD #310 D3)
+  const projected = (pct * windowDurationSec) / elapsed;
+  const projectedPct = Math.round(Math.max(0, Math.min(MAX_PROJECTED_PCT, projected)));
+  if (projected <= 85) return SAFE; // headroom to spare (strict lower band, D7)
+  return { state: projected > 115 ? "over" : "on_pace", projectedPct };
 }
 
-// rowForecast is burnForecast with the stale short-circuit the three surfaces share.
-// A stale reading draws NO forecast on the SAME render it goes stale, rather than
-// waiting for useReadingSeries' deferred clear (the accumulation clears an ok→stale
-// key in an effect, one render later — so without this gate a just-frozen row could
-// carry a ghost for up to a clock tick). Centralised so a new surface can't forget
-// it. Silent = safe (D3); projecting off a frozen number is misleading (D8 kin).
+// rowForecast is paceForecast with the stale short-circuit the three surfaces share.
+// A stale reading draws NO forecast (projecting off a frozen number is misleading —
+// PRD #309 D8 kin). Centralised so a new surface can't forget it: the three surfaces
+// call ONLY rowForecast, never paceForecast directly.
 export function rowForecast(
   stale: boolean,
-  samples: BurnSample[],
+  pct: number,
   resetsAtSec: number | null,
+  windowDurationSec: number,
   nowMs: number,
   source?: RateLimitSource,
-): BurnForecast {
+): PaceForecast {
   if (stale) return { state: "safe", projectedPct: 0 };
-  return burnForecast(samples, resetsAtSec, nowMs, source);
-}
-
-// ── Trailing-sample accumulation (PRD #309 M2) ───────────────────────────────
-//
-// burnForecast reads a slope, but the API ships one point-in-time reading per poll
-// and NOTHING is retained (the server keeps one gauge row per token, overwritten
-// each tick — D4; the web replaces the reading each 60s poll). So the trailing
-// sample is accumulated CLIENT-SIDE, IN SESSION, per (secret_id, window) key. This
-// is why the forecast is silent for the first few minutes after a page load (no
-// span yet) and why a reload starts cold — the honest cost of not retaining history.
-
-// Keep roughly the last 15 minutes of readings: recent enough that the rate tracks
-// current burn, long enough that a real rise clears the integer noise floor.
-export const SERIES_MAX_AGE_MS = 15 * 60_000;
-// Hard cap on retained points (a fast poll cadence should never grow the run without
-// bound); the oldest are dropped first.
-export const SERIES_MAX_SAMPLES = 30;
-// Collapse re-render storms: a flat reading is re-sampled at most this often, so the
-// buffer measures the passage of time without one sample per React render. A CHANGED
-// pct always samples immediately.
-const SERIES_MIN_APPEND_INTERVAL_MS = 20_000;
-
-// pushSample folds one reading into a window's bounded, non-decreasing sample run —
-// PURE, so the retention rules unit-test without a renderer. Rules:
-//   - a pct DECREASE (an anchored window resetting, or a sliding window decaying)
-//     DISCARDS the prior run and restarts from this reading: a trailing rate must
-//     never span a reset, or it would read a drop as negative burn and mask the rise
-//     after it.
-//   - otherwise append, but at most once per SERIES_MIN_APPEND_INTERVAL_MS unless
-//     the pct changed (dedupe re-renders while still recording elapsed time).
-//   - prune points older than SERIES_MAX_AGE_MS, then cap the count (drop oldest).
-export function pushSample(prev: BurnSample[], pct: number, nowMs: number): BurnSample[] {
-  const last = prev[prev.length - 1];
-  if (last && pct < last.pct) return [{ tMs: nowMs, pct }]; // reset / decay → restart
-  let next = prev;
-  if (!last) {
-    next = [{ tMs: nowMs, pct }];
-  } else if (pct !== last.pct || nowMs - last.tMs >= SERIES_MIN_APPEND_INTERVAL_MS) {
-    next = [...prev, { tMs: nowMs, pct }];
-  }
-  const cutoff = nowMs - SERIES_MAX_AGE_MS;
-  const pruned = next.filter((s) => s.tMs >= cutoff);
-  return pruned.length > SERIES_MAX_SAMPLES ? pruned.slice(pruned.length - SERIES_MAX_SAMPLES) : pruned;
-}
-
-// SeriesReading is one window's current reading for accumulation: a stable key
-// (`${secret_id}:${window}`) and its pct — or null to CLEAR the run (a stale, non-ok,
-// or otherwise gated reading must not feed a sample, and a token that goes
-// unavailable then ok again should start fresh rather than bridge the gap).
-export interface SeriesReading {
-  key: string;
-  pct: number | null;
-}
-
-// useReadingSeries accumulates a trailing BurnSample run per key across polls, held
-// in a ref so it survives re-renders. Feed it the CURRENT readings each render plus a
-// nowMs clock (e.g. useNow); it folds each via pushSample and returns a getter. Keys
-// absent from `readings` are dropped, so a deleted token stops accumulating. The
-// accrual runs in an effect, so a brand-new reading is reflected on the next render
-// (≤ one useNow tick) — immaterial at a 60s poll cadence. StrictMode's double-run is
-// a no-op: pushSample dedupes a same-(nowMs,pct) re-append.
-export function useReadingSeries(readings: SeriesReading[], nowMs: number): (key: string) => BurnSample[] {
-  const ref = useRef<Map<string, BurnSample[]>>(new Map());
-  useEffect(() => {
-    const next = new Map<string, BurnSample[]>();
-    for (const r of readings) {
-      const prev = ref.current.get(r.key) ?? [];
-      next.set(r.key, r.pct == null ? [] : pushSample(prev, r.pct, nowMs));
-    }
-    ref.current = next;
-  }, [readings, nowMs]);
-  return useCallback((key: string) => ref.current.get(key) ?? [], []);
-}
-
-// forecastKey names a window's accumulation slot. `secret_id` is the user_secrets
-// PRIMARY KEY, so `${secret_id}:${window}` is globally unique — the keys do not
-// collide even on the cross-user admin view (one accumulation store, all tokens).
-export function forecastKey(secretId: string, window: "5h" | "7d"): string {
-  return `${secretId}:${window}`;
-}
-
-// forecastReadingsFor flattens a token list into the per-window SeriesReading rows
-// useReadingSeries folds. A non-ok OR stale reading contributes `null` (clears the
-// run): a stale/frozen reading must never accrue a sample, and the forecast is gated
-// to ok+!stale rows anyway (a stale row draws a plain, dimmed bar). Shared by both
-// surfaces so their keys — and thus what burnForecast reads — cannot drift apart.
-export function forecastReadingsFor(tokens: TokenRateLimits[]): SeriesReading[] {
-  const out: SeriesReading[] = [];
-  for (const t of tokens) {
-    const l = t.limits;
-    const five = l.status === "ok" && !l.stale ? l.five_hour.pct : null;
-    const seven = l.status === "ok" && !l.stale ? l.seven_day.pct : null;
-    out.push({ key: forecastKey(t.secret_id, "5h"), pct: five });
-    out.push({ key: forecastKey(t.secret_id, "7d"), pct: seven });
-  }
-  return out;
+  return paceForecast(pct, resetsAtSec, windowDurationSec, nowMs, source);
 }
 
 // useNow ticks a Date.now() clock so a rendered countdown re-derives between the

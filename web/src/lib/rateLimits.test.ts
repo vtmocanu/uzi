@@ -1,24 +1,18 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { renderHook } from "@testing-library/react";
 import {
   autoChipFor,
   autoStatusChip,
-  burnForecast,
   formatAgo,
   formatCountdown,
-  pushSample,
+  formatResetLabel,
+  paceForecast,
   rowForecast,
   rowState,
-  SERIES_MAX_AGE_MS,
-  SERIES_MAX_SAMPLES,
   sortAdminRows,
   statusBadge,
-  useReadingSeries,
   worstWindow,
-  type BurnSample,
   type RowState,
-  type SeriesReading,
 } from "./rateLimits";
 import type { AdminRateLimitUser, AutoStatus, MyRateLimits } from "./api";
 // ?raw rather than node:fs — the web tsconfig carries no node types, and the same
@@ -76,6 +70,35 @@ describe("formatCountdown (Decision 7)", () => {
     expect(formatCountdown(NOW_SECS + 44 * 60, NOW)).toBe("44m");
     expect(formatCountdown(NOW_SECS + 30, NOW)).toBe("<1m");
     expect(formatCountdown(NOW_SECS - 10, NOW)).toBe("now");
+  });
+});
+
+describe("formatResetLabel (PRD #310 M3 — 7-day reset label)", () => {
+  it("renders 'resets <Weekday> <HH:MM>' in the viewer's local tz", () => {
+    const resetsAt = Math.floor(Date.parse("2026-07-18T19:00:00Z") / 1000); // a Saturday
+    const label = formatResetLabel(resetsAt);
+    // Shape: a 3-letter weekday abbrev + 24h HH:MM. Not a hardcoded "Sat 19:00" —
+    // the wall-clock value depends on the CI machine's tz, so we assert the shape…
+    expect(label).toMatch(/^resets [A-Za-z]{3} \d{2}:\d{2}$/);
+    // …and that it reflects the LOCAL Intl rendering of that same epoch (whatever tz
+    // the runner is in), composed with no locale separator.
+    const parts = new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(resetsAt * 1000));
+    const at = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)!.value;
+    expect(label).toBe(`resets ${at("weekday")} ${at("hour")}:${at("minute")}`);
+  });
+
+  it("returns null for a null resets_at (caller omits the line)", () => {
+    expect(formatResetLabel(null)).toBeNull();
+  });
+
+  it("returns null for a non-finite resets_at (guarded defensively)", () => {
+    expect(formatResetLabel(Number.NaN)).toBeNull();
+    expect(formatResetLabel(Number.POSITIVE_INFINITY)).toBeNull();
   });
 });
 
@@ -283,162 +306,92 @@ describe("autoStatusChip", () => {
   });
 });
 
-describe("burnForecast (PRD #309 — model-agnostic trailing burn)", () => {
-  // Two samples spanning `spanMs` and ending at NOW. With RESET_5MIN the horizon
-  // (secondsToReset) equals a 5-min span, so projected = pct1 + (pct1 − pct0) =
-  // 2·pct1 − pct0 — which is how the boundary fixtures below land on exact integers.
-  function samples(pct0: number, pct1: number, spanMs = 5 * 60_000): BurnSample[] {
-    return [
-      { tMs: NOW - spanMs, pct: pct0 },
-      { tMs: NOW, pct: pct1 },
-    ];
+describe("paceForecast (PRD #310 — anchored single-reading projection)", () => {
+  const W5 = 18_000; // 5h window, seconds
+  const RESET = 1_000_000; // an arbitrary anchored reset boundary, seconds
+
+  // pace() builds a reading whose ELAPSED (nowSec − windowStart) is exactly `E`
+  // seconds, then feeds paceForecast a MILLISECOND nowMs — so a stub that forgets to
+  // divide nowMs by 1000 sees a wildly different elapsed and cannot pass these.
+  function pace(pct: number, E: number, source?: Parameters<typeof paceForecast>[4], w = W5, reset = RESET) {
+    const nowSec = reset - w + E; // ⇒ elapsed = nowSec − (reset − w) = E
+    return paceForecast(pct, reset, w, nowSec * 1000, source);
   }
-  const RESET_5MIN = NOW_SECS + 300; // secondsToReset == 300s == the default span
 
-  it("bands strictly at the 85/86/115/116 boundaries (D7)", () => {
-    expect(burnForecast(samples(15, 50), RESET_5MIN, NOW).state).toBe("safe"); // projected 85 → safe
-    expect(burnForecast(samples(14, 50), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 86 });
-    expect(burnForecast(samples(5, 60), RESET_5MIN, NOW)).toEqual({ state: "on_pace", projectedPct: 115 });
-    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW)).toEqual({ state: "over", projectedPct: 116 });
+  it("bands strictly on the projection at 85/86/115/116 (D7)", () => {
+    // elapsed = W5/2 ⇒ factor 2 ⇒ projected = 2·pct, exact at the boundaries.
+    const half = W5 / 2;
+    expect(pace(42.5, half).state).toBe("safe"); // projected 85 → safe (strict lower band)
+    expect(pace(43, half)).toEqual({ state: "on_pace", projectedPct: 86 });
+    expect(pace(57.5, half)).toEqual({ state: "on_pace", projectedPct: 115 });
+    expect(pace(58, half)).toEqual({ state: "over", projectedPct: 116 });
   });
 
-  it("is silent on too-few samples or too-short a span (cold start, slow 7d window)", () => {
-    expect(burnForecast([], RESET_5MIN, NOW).state).toBe("safe");
-    expect(burnForecast(samples(4, 60).slice(0, 1), RESET_5MIN, NOW).state).toBe("safe");
-    // A steep rise measured over only 2 min is below MIN_SAMPLE_SPAN_MS → silent.
-    expect(burnForecast(samples(4, 60, 2 * 60_000), RESET_5MIN, NOW).state).toBe("safe");
+  it("projects the anchored math for a known (pct, elapsed, window)", () => {
+    // pct 80 at 80% elapsed (14400/18000) ⇒ 80 × 18000 / 14400 = 100.
+    expect(pace(80, 14_400)).toEqual({ state: "on_pace", projectedPct: 100 });
+    // pct 50 at half-elapsed ⇒ 100.
+    expect(pace(50, W5 / 2)).toEqual({ state: "on_pace", projectedPct: 100 });
   });
 
-  it("is silent on a flat or decaying slope (a sliding window idles downward → safe)", () => {
-    expect(burnForecast(samples(50, 50), RESET_5MIN, NOW).state).toBe("safe"); // flat
-    expect(burnForecast(samples(60, 40), RESET_5MIN, NOW).state).toBe("safe"); // decaying
+  it("divides a MILLISECOND nowMs by 1000 — a real-scale nowMs projects, not collapse to 0", () => {
+    // The regression this PRD exists to fix: a Date.now()-scale nowMs (~1.78e12 ms)
+    // fed raw into elapsed makes projected ≈ 0 (silent forever). Here elapsed comes
+    // out 14400s (1h from reset on an 18000s window) ⇒ projected 100.
+    const nowMs = Date.parse("2026-07-15T12:00:00Z"); // ~1.78e12 ms
+    const reset = Math.floor(nowMs / 1000) + 3_600; // 1h out, SECONDS
+    expect(paceForecast(80, reset, W5, nowMs)).toEqual({ state: "on_pace", projectedPct: 100 });
   });
 
-  it("suppresses a pct≥100 window and a limit_report inference, but not a live rise (D8)", () => {
-    expect(burnForecast(samples(90, 100), RESET_5MIN, NOW).state).toBe("safe"); // already at the cap
-    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "limit_report").state).toBe("safe");
-    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW, "usage_endpoint").state).toBe("over");
+  it("suppresses the early window at/below the floor, projects just above it", () => {
+    // floor = max(18000/50, 900) = 900. elapsed 900 → safe; 901 → projects.
+    expect(pace(50, 900).state).toBe("safe"); // at the floor → suppressed
+    expect(pace(50, 899).state).toBe("safe"); // below the floor → suppressed
+    expect(pace(50, 901).state).not.toBe("safe"); // just past the floor → projects
   });
 
-  it("is silent past the reset horizon or with no reset (clock skew / null)", () => {
-    expect(burnForecast(samples(4, 60), NOW_SECS - 10, NOW).state).toBe("safe"); // reset already passed
-    expect(burnForecast(samples(4, 60), null, NOW).state).toBe("safe");
-    // A non-finite horizon (bad nowMs / resets_at) must not leak a NaN projection.
-    expect(burnForecast(samples(4, 60), RESET_5MIN, Number.NaN)).toEqual({ state: "safe", projectedPct: 0 });
+  it("clamps an absurd early projection to MAX_PROJECTED_PCT (999)", () => {
+    // pct 90 at elapsed 901 ⇒ 90 × 18000 / 901 ≈ 1798 → clamped to 999.
+    expect(pace(90, 901)).toEqual({ state: "over", projectedPct: 999 });
   });
 
-  it("discriminates on the SLOPE, not the latest pct (fails a stub that ignores elapsed)", () => {
-    // Latest pct is 60 in both; only the earlier sample — hence the slope — differs.
-    expect(burnForecast(samples(4, 60), RESET_5MIN, NOW).state).toBe("over"); // steep rise
-    expect(burnForecast(samples(58, 60), RESET_5MIN, NOW).state).toBe("safe"); // gentle rise
-  });
-});
-
-describe("rowForecast (PRD #309 M4 — render-side stale short-circuit)", () => {
-  // A would-be "over" series: pct 4→60 over a 5-min span, reset 5 min out → projected 116.
-  const rising: BurnSample[] = [
-    { tMs: NOW - 5 * 60_000, pct: 4 },
-    { tMs: NOW, pct: 60 },
-  ];
-  const RESET = NOW_SECS + 300;
-
-  it("delegates to burnForecast for a live (non-stale) row", () => {
-    expect(rowForecast(false, rising, RESET, NOW, "usage_endpoint").state).toBe("over");
+  it("is silent at/over the cap, on a limit_report source, and with a null reset", () => {
+    expect(pace(100, W5 / 2).state).toBe("safe"); // already at the cap (would else project)
+    expect(pace(58, W5 / 2, "limit_report").state).toBe("safe"); // park-time inference
+    expect(paceForecast(58, null, W5, (RESET - W5 / 2) * 1000).state).toBe("safe"); // no horizon
   });
 
-  it("is silent for a stale row even with a would-be-over series (no forecast off a frozen reading)", () => {
-    // Guards the ok→stale transient: the accumulation clears one render late, so the
-    // render-side gate must suppress the forecast immediately on the stale render.
-    expect(rowForecast(true, rising, RESET, NOW, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
-  });
-});
-
-describe("pushSample (PRD #309 M2 — bounded non-decreasing trailing run)", () => {
-  it("seeds from empty, appends a changed pct immediately", () => {
-    expect(pushSample([], 10, 0)).toEqual([{ tMs: 0, pct: 10 }]);
-    expect(pushSample([{ tMs: 0, pct: 10 }], 12, 1_000)).toEqual([
-      { tMs: 0, pct: 10 },
-      { tMs: 1_000, pct: 12 },
-    ]);
+  it("is silent on a passed reset (elapsed exceeds the window ⇒ under-reads) and on a NaN nowMs", () => {
+    // reset already behind now: elapsed 21000 > 18000, so 90 × 18000 / 21000 ≈ 77 → safe.
+    // A stub that ignored elapsed and banded pct 90 alone would wrongly fire here.
+    expect(pace(90, 21_000).state).toBe("safe");
+    // A non-finite nowMs must not leak a NaN projection: !(elapsed > 0) rejects it.
+    expect(paceForecast(58, RESET, W5, Number.NaN)).toEqual({ state: "safe", projectedPct: 0 });
+    // Clock skew — reset far enough in the FUTURE that now precedes the window start
+    // (elapsed ≤ 0) — is rejected the same way.
+    expect(paceForecast(58, RESET, W5, (RESET - W5 - 100) * 1000).state).toBe("safe");
   });
 
-  it("dedupes a flat reading within the min interval, but records elapsed time past it", () => {
-    const seed = [{ tMs: 0, pct: 10 }];
-    expect(pushSample(seed, 10, 5_000)).toEqual(seed); // same pct, <20s → no append
-    expect(pushSample(seed, 10, 25_000)).toEqual([
-      { tMs: 0, pct: 10 },
-      { tMs: 25_000, pct: 10 },
-    ]); // same pct, ≥20s → records the passage of time
-  });
-
-  it("restarts the run on a pct decrease (window reset / sliding decay)", () => {
-    const prev = [
-      { tMs: 0, pct: 40 },
-      { tMs: 60_000, pct: 55 },
-    ];
-    expect(pushSample(prev, 5, 120_000)).toEqual([{ tMs: 120_000, pct: 5 }]);
-  });
-
-  it("prunes points older than the max age window", () => {
-    const prev = [
-      { tMs: 0, pct: 10 },
-      { tMs: 100_000, pct: 12 },
-    ];
-    // cutoff = now − SERIES_MAX_AGE_MS = 60_000, so the t=0 point falls out.
-    const now = SERIES_MAX_AGE_MS + 60_000;
-    const out = pushSample(prev, 12, now);
-    expect(out[0].tMs).toBe(100_000);
-    expect(out.every((s) => s.tMs >= now - SERIES_MAX_AGE_MS)).toBe(true);
-  });
-
-  it("caps the retained count, dropping the oldest", () => {
-    const prev: BurnSample[] = Array.from({ length: SERIES_MAX_SAMPLES }, (_, i) => ({
-      tMs: i * 25_000,
-      pct: i,
-    }));
-    const out = pushSample(prev, SERIES_MAX_SAMPLES, SERIES_MAX_SAMPLES * 25_000);
-    expect(out.length).toBe(SERIES_MAX_SAMPLES);
-    expect(out[0]).toEqual({ tMs: 25_000, pct: 1 }); // original[0] dropped
+  it("uses the 7-day window duration when handed it (the slow window now projects)", () => {
+    const W7 = 604_800;
+    // floor = max(604800/50, 900) = 12096. A 7d window at 99% one day out:
+    // elapsed = 604800 − 86400 = 518400 ⇒ 99 × 604800 / 518400 ≈ 115.5 → over.
+    const nowSec = RESET - W7 + (W7 - 86_400);
+    expect(paceForecast(99, RESET, W7, nowSec * 1000).state).toBe("over");
   });
 });
 
-describe("useReadingSeries (PRD #309 M2)", () => {
-  const hook = (readings: SeriesReading[], now: number) =>
-    renderHook(
-      ({ r, n }: { r: SeriesReading[]; n: number }) => useReadingSeries(r, n),
-      { initialProps: { r: readings, n: now } },
-    );
+describe("rowForecast (PRD #310 — render-side stale short-circuit)", () => {
+  const W5 = 18_000;
+  const RESET = 1_000_000;
+  const nowMs = (RESET - W5 / 2) * 1000; // elapsed = W5/2 ⇒ factor 2
 
-  it("accumulates per key across polls and drops keys no longer present", () => {
-    const { result, rerender } = hook([{ key: "a:5h", pct: 10 }], 0);
-    expect(result.current("a:5h")).toEqual([{ tMs: 0, pct: 10 }]);
-
-    rerender({
-      r: [
-        { key: "a:5h", pct: 20 },
-        { key: "b:5h", pct: 5 },
-      ],
-      n: 30_000,
-    });
-    expect(result.current("a:5h")).toEqual([
-      { tMs: 0, pct: 10 },
-      { tMs: 30_000, pct: 20 },
-    ]);
-    expect(result.current("b:5h")).toEqual([{ tMs: 30_000, pct: 5 }]); // isolated per key
-
-    rerender({ r: [{ key: "b:5h", pct: 6 }], n: 60_000 });
-    expect(result.current("a:5h")).toEqual([]); // 'a' absent → run dropped
-    expect(result.current("b:5h")).toEqual([
-      { tMs: 30_000, pct: 5 },
-      { tMs: 60_000, pct: 6 },
-    ]);
+  it("delegates to paceForecast for a live (non-stale) row", () => {
+    // pct 58 at half-elapsed ⇒ projected 116 → over.
+    expect(rowForecast(false, 58, RESET, W5, nowMs, "usage_endpoint").state).toBe("over");
   });
 
-  it("clears a run on a null (stale / non-ok / gated) reading", () => {
-    const { result, rerender } = hook([{ key: "a:5h", pct: 40 }], 0);
-    rerender({ r: [{ key: "a:5h", pct: 60 }], n: 30_000 });
-    expect(result.current("a:5h").length).toBe(2);
-    rerender({ r: [{ key: "a:5h", pct: null }], n: 60_000 });
-    expect(result.current("a:5h")).toEqual([]);
+  it("is silent for a stale row even with a would-be-over reading (no forecast off a frozen bar)", () => {
+    expect(rowForecast(true, 58, RESET, W5, nowMs, "usage_endpoint")).toEqual({ state: "safe", projectedPct: 0 });
   });
 });

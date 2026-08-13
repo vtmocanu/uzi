@@ -7,27 +7,22 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type AdminRateLimitUser, type MyRateLimits, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
-  forecastKey,
-  forecastReadingsFor,
   formatAgo,
   formatCountdown,
+  formatResetLabel,
   rowForecast,
   sortAdminRows,
   statusBadge,
   useNow,
-  useReadingSeries,
-  type BurnForecast,
+  WINDOW_DURATION,
+  type PaceForecast,
 } from "../lib/rateLimits";
 import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
 import { RateLimitForecastMeter } from "../components/RateLimitForecast";
 
-// Series is the accumulation getter useReadingSeries returns, threaded to each
-// window row for burnForecast (the admin view accumulates across ALL users' tokens).
-type Series = ReturnType<typeof useReadingSeries>;
-
 // One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
-// the RateLimitForecastMeter (the shared MeterTrack plus the PRD #309 burn-rate
-// ghost overlay), its percent, and the reset countdown. The visible chip is
+// the RateLimitForecastMeter (the shared MeterTrack plus the PRD #309/#310 anchored
+// forecast ghost overlay), its percent, and the reset countdown. The visible chip is
 // short, but MeterTrack's aria-label carries the FULL window name ("5-hour window"
 // / "7-day window") for screen readers (Decision 4 — the test selects bars by that
 // name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
@@ -48,7 +43,7 @@ function WindowRow({
   label: string;
   stale: boolean;
   now: number;
-  forecast: BurnForecast;
+  forecast: PaceForecast;
 }) {
   const reset = stale ? "stale" : (formatCountdown(win.resets_at, now) ?? "—");
   return (
@@ -78,7 +73,7 @@ function WindowRow({
 // (PRD #240): what used to be two ~280px side-by-side columns, halving the table's
 // width so it fits its card. A non-ok reading collapses to a single em-dash — never
 // two — so the row stays one Utilization cell.
-function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: number; series: Series }) {
+function UtilizationCell({ token, now }: { token: TokenRateLimits; now: number }) {
   const { limits } = token;
   if (limits.status !== "ok") return <span className="text-faint">—</span>;
   return (
@@ -89,7 +84,7 @@ function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: 
         label="5-hour window"
         stale={limits.stale}
         now={now}
-        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
       />
       <WindowRow
         win={limits.seven_day}
@@ -97,7 +92,7 @@ function UtilizationCell({ token, now, series }: { token: TokenRateLimits; now: 
         label="7-day window"
         stale={limits.stale}
         now={now}
-        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, limits.seven_day.pct, limits.seven_day.resets_at, WINDOW_DURATION["7d"], now, limits.source)}
       />
     </div>
   );
@@ -133,9 +128,6 @@ export function AdminRateLimits() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const now = useNow();
-  // One accumulation store across every user's tokens — secret_id keys are globally
-  // unique, so cross-user rows never collide (forecastKey).
-  const series = useReadingSeries(forecastReadingsFor(users.flatMap((u) => u.tokens)), now);
 
   const load = useCallback(() => {
     api
@@ -179,7 +171,7 @@ export function AdminRateLimits() {
                 <tr>
                   <th className="px-4 py-3 font-medium">User</th>
                   <th className="px-4 py-3 font-medium">Token</th>
-                  <th className="px-4 py-3 font-medium">Utilization</th>
+                  <th className="px-4 py-3 font-medium">Utilization &amp; Forecast</th>
                   <th className="px-4 py-3 font-medium">Status</th>
                 </tr>
               </thead>
@@ -208,6 +200,13 @@ export function AdminRateLimits() {
                       ]
                     : u.tokens.map((t, i) => {
                         const badge = statusBadge(t.limits, u.vault_locked);
+                        // The mock's absolute "resets <Day HH:MM>" line under the token
+                        // name (PRD #310 M3), from the 7-day reset — the weekly quota
+                        // users plan around. The map also runs for non-ok tokens (which
+                        // carry no seven_day), so the status guard is required; omitted
+                        // when the 7-day resets_at is null.
+                        const resetLabel =
+                          t.limits.status === "ok" ? formatResetLabel(t.limits.seven_day.resets_at) : null;
                         return (
                           <tr key={`${u.id}:${t.secret_id}`} className="transition-colors hover:bg-raised/30">
                             {/* The identity cell renders on the user's FIRST token
@@ -220,9 +219,12 @@ export function AdminRateLimits() {
                                 <span className="text-xs font-medium text-fg">{t.label}</span>
                                 {t.is_default && <Badge tone="neutral">default</Badge>}
                               </div>
+                              {resetLabel && (
+                                <div className="mt-0.5 text-xs text-faint">{resetLabel}</div>
+                              )}
                             </td>
                             <td className="px-4 py-3 align-top">
-                              <UtilizationCell token={t} now={now} series={series} />
+                              <UtilizationCell token={t} now={now} />
                             </td>
                             <td className="px-4 py-3 align-top">
                               <Badge tone={badge.tone} dot={badge.dot}>

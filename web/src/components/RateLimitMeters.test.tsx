@@ -323,74 +323,84 @@ describe("RateLimitAnnouncer (aria-live)", () => {
   });
 });
 
-// PRD #309 M4 — the burn-rate forecast, wired end to end through the Settings card.
-// These drive the real accumulation (useReadingSeries) across polls, so they prove
-// the WIRING (series → burnForecast → RateLimitForecastMeter), not just the helper.
-describe("RateLimitCard forecast (PRD #309)", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-  const flush = (ms = 0) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+// PRD #310 — the anchored forecast, wired end to end through the Settings card. The
+// projection is computed from a SINGLE reading (no sample warm-up), so one render
+// with a window heading past the cap must already show the ghost/marker.
+// PRD #310 M3 — the absolute "resets <Day HH:MM>" line under the token name,
+// derived from the 7-day reset. The countdown ("resets in …") in the utilization
+// column is a different string; the label regex matches only "resets <Wd> HH:MM".
+describe("RateLimitCard reset label (PRD #310 M3)", () => {
+  const RESET_LABEL = /resets [A-Za-z]{3} \d{2}:\d{2}/;
 
-  // A 5-hour reading at pct5 with a far-out reset, so a rising trailing series
-  // projects well past the cap. Not stale → it accrues a sample.
-  const fiveHourAt = (pct5: number): MyRateLimits => ({
+  it("renders the 7-day reset label under the token name", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading)); // 7d resets_at set
+    const { container } = render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(container.textContent).toMatch(RESET_LABEL);
+  });
+
+  it("omits the label when the 7-day resets_at is null", async () => {
+    const noSevenReset: MyRateLimits = {
+      ...okReading,
+      seven_day: { pct: 27, resets_at: null },
+    };
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(noSevenReset));
+    const { container } = render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(container.textContent).not.toMatch(RESET_LABEL);
+  });
+});
+
+describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
+  // A 5-hour window at 90% with a near reset (elapsed ≈ 13000s on the 18000s window
+  // ⇒ factor ≈ 1.385 ⇒ projected ≈ 125): heading well past the cap from one reading.
+  const overReading: MyRateLimits = {
     status: "ok",
-    five_hour: { pct: pct5, resets_at: nowSecs + 5000 },
+    five_hour: { pct: 90, resets_at: nowSecs + 5000 },
     seven_day: { pct: 20, resets_at: nowSecs + 200_000 },
     source: "usage_endpoint",
     synced_at: new Date().toISOString(),
     stale: false,
-  });
+  };
 
-  it("draws a coral ghost + » once a rising trailing series projects over the cap", async () => {
-    let poll = 0;
-    // 40, 48, 56 … capped below 100 so late polls are flat (no reset/decay restart).
-    mockApi.getMyRateLimits.mockImplementation(async () => {
-      const pct5 = Math.min(40 + poll * 8, 96);
-      poll += 1;
-      return tokens(fiveHourAt(pct5));
-    });
+  it("draws a coral ghost + » from a SINGLE reading heading past the cap (no warm-up)", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(overReading));
     render(<RateLimitCard />);
-    await flush(); // initial read (40%)
-    for (let k = 0; k < 6; k++) await flush(60_000); // rising polls, >3-min span accrues
+    await screen.findByText("Claude limits");
 
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
     expect(screen.getByText("»")).toBeTruthy();
-    // The projected % is NEVER inline visible text (D4): the row shows only the
-    // current pct, not the projection.
+    // The projected % is NEVER inline visible text (D4): the row shows the current
+    // pct only, not the projection.
     expect(screen.getByText("»").closest("div")?.parentElement?.textContent).not.toMatch(/projected/);
   });
 
-  it("stays silent (plain bar) on a FLAT series — proving it reads the slope, not presence", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(tokens(fiveHourAt(62))); // constant 62%
+  it("stays a plain bar on a low reading with headroom", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading)); // 8% / 27%
     render(<RateLimitCard />);
-    await flush();
-    for (let k = 0; k < 6; k++) await flush(60_000);
+    await screen.findByText("Claude limits");
 
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
     expect(screen.queryByText("»")).toBeNull();
   });
 
-  it("clears the forecast the moment a forecasting row goes stale (no ghost on a frozen bar)", async () => {
-    let poll = 0;
-    mockApi.getMyRateLimits.mockImplementation(async () => {
-      const pct5 = Math.min(40 + poll * 8, 88);
-      const stale = poll >= 7; // polls 0..6 rise live; 7+ freeze the same reading stale
-      poll += 1;
-      const r = fiveHourAt(pct5);
-      return tokens(r.status === "ok" ? { ...r, stale } : r);
-    });
+  it("draws no forecast on a stale row even when it would head past the cap", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens({ ...overReading, stale: true }));
     render(<RateLimitCard />);
-    await flush(); // 40%
-    for (let k = 0; k < 6; k++) await flush(60_000); // rising, live → forecast appears
-    expect(screen.getByText("»")).toBeTruthy();
+    await screen.findByText("Claude limits");
 
-    await flush(60_000); // poll 7 → same pct, stale=true
-    await flush(60_000); // settle
-    expect(screen.queryByText("»")).toBeNull(); // ghost gone immediately (rowForecast gate)
+    expect(screen.queryByText("»")).toBeNull();
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
+  });
+
+  it("draws no forecast on a limit_report reading (park-time inference, not a trajectory)", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens({ ...overReading, source: "limit_report" }));
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+
+    expect(screen.queryByText("»")).toBeNull();
   });
 });
