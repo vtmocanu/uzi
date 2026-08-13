@@ -6,6 +6,24 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-08-13
+
+### Changed
+
+- **The rate-limit burn-rate forecast meter was reworked after a live design
+  review.** The projection "ghost" used to be a translucent bar painted over the
+  fill, which left a dark notch between the two when their tones matched and an
+  orange blend when they differed (a gold current-usage fill under a coral
+  projection). It now draws the ghost from zero to the projected point as the
+  bottom layer with the opaque fill on top, so current usage flows into the
+  projection with no seam at any bar size. The overflow marker changed from a `»`
+  text glyph (which needed a platform-specific vertical nudge) to a viewBox-centered
+  inline SVG chevron, and its placement now reads the trajectory: an "over"
+  projection sits just outside the bar's right edge (overshooting past the cap),
+  while an "on pace" one sits flush at the end of the current fill, pointing toward
+  the projection. The shared meter atom and the worker CPU/memory gauges are
+  unchanged. Web-only, and it supersedes the 0.33.0 marker fix. (#309)
+
 ## [0.33.0] - 2026-08-13
 
 ### Fixed
