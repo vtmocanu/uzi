@@ -143,8 +143,11 @@ describe("RateLimitCard (Settings)", () => {
     expect(screen.queryByText(/resets in/)).toBeNull();
     // Both meter bars grey out on a stale reading (Decision 3), like the sidebar
     // and admin table.
+    // NOTE: the forecast wrapper paints the fill LAST (opaque, over the projection
+    // ghost), so the fill is the progressbar's lastChild — unlike MeterTrack used
+    // directly (Meter/WorkerStats tests), where the fill is the only child.
     const fills = ["5-hour window", "7-day window"].map(
-      (name) => screen.getByRole("progressbar", { name }).firstChild as HTMLElement,
+      (name) => screen.getByRole("progressbar", { name }).lastChild as HTMLElement,
     );
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
   });
@@ -156,7 +159,7 @@ describe("RateLimitCard (Settings)", () => {
     expect(screen.getByText("5h nearly out")).toBeTruthy();
     expect(screen.queryByText("Live")).toBeNull();
     // The 5h window bar is red (bg-danger) — NOT amber (bg-warn, which is warn).
-    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" }).firstChild as HTMLElement;
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" }).lastChild as HTMLElement;
     expect(bar5h.className).toMatch(/bg-danger/);
     expect(bar5h.className).not.toMatch(/bg-warn/);
   });
@@ -166,7 +169,7 @@ describe("RateLimitCard (Settings)", () => {
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("Live")).toBeTruthy();
-    const bar7d = screen.getByRole("progressbar", { name: "7-day window" }).firstChild as HTMLElement;
+    const bar7d = screen.getByRole("progressbar", { name: "7-day window" }).lastChild as HTMLElement;
     expect(bar7d.className).toMatch(/bg-warn/);
   });
 });
@@ -193,7 +196,7 @@ describe("SidebarRateLimits", () => {
     mockApi.getMyRateLimits.mockResolvedValue(tokens(staleReading));
     render(<SidebarRateLimits />);
     await screen.findByLabelText("Claude rate limits");
-    const fills = screen.getAllByRole("progressbar").map((b) => b.firstChild as HTMLElement);
+    const fills = screen.getAllByRole("progressbar").map((b) => b.lastChild as HTMLElement);
     expect(fills).toHaveLength(2);
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
   });
@@ -370,10 +373,12 @@ describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
 
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
-    expect(screen.getByText("»")).toBeTruthy();
+    expect(screen.getByTestId("forecast-overflow-marker")).toBeTruthy();
     // The projected % is NEVER inline visible text (D4): the row shows the current
     // pct only, not the projection.
-    expect(screen.getByText("»").closest("div")?.parentElement?.textContent).not.toMatch(/projected/);
+    expect(
+      screen.getByTestId("forecast-overflow-marker").closest("div")?.parentElement?.textContent,
+    ).not.toMatch(/projected/);
   });
 
   it("stays a plain bar on a low reading with headroom", async () => {
@@ -383,7 +388,7 @@ describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
 
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
-    expect(screen.queryByText("»")).toBeNull();
+    expect(screen.queryByTestId("forecast-overflow-marker")).toBeNull();
   });
 
   it("draws no forecast on a stale row even when it would head past the cap", async () => {
@@ -391,7 +396,7 @@ describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
 
-    expect(screen.queryByText("»")).toBeNull();
+    expect(screen.queryByTestId("forecast-overflow-marker")).toBeNull();
     const bar5h = screen.getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
   });
@@ -401,6 +406,6 @@ describe("RateLimitCard forecast (PRD #310 — anchored, always-on)", () => {
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
 
-    expect(screen.queryByText("»")).toBeNull();
+    expect(screen.queryByTestId("forecast-overflow-marker")).toBeNull();
   });
 });

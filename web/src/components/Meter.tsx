@@ -26,7 +26,10 @@ export function clampPct(pct: number): number {
   return Math.max(0, Math.min(100, pct));
 }
 
-const FILL: Record<MeterTone, string> = {
+// Exported so the rate-limit forecast wrapper (RateLimitForecast.tsx) can paint its
+// own fill layer over a projection ghost with the SAME tone vocabulary, rather than
+// re-declaring the map (the atom itself still owns the plain track+fill).
+export const FILL: Record<MeterTone, string> = {
   ok: "bg-ok",
   warn: "bg-warn",
   danger: "bg-danger",

@@ -92,8 +92,10 @@ describe("AdminRateLimits", () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("sorin", ok(88, 76))] });
     render(<AdminRateLimits />);
     const sorin = (await screen.findByText("sorin")).closest("tr")!;
+    // Forecast wrapper paints the fill LAST (opaque, over the ghost), so it is the
+    // progressbar's lastChild (MeterTrack used directly has the fill as its only child).
     const bar5h = within(sorin).getByRole("progressbar", { name: "5-hour window" })
-      .firstChild as HTMLElement;
+      .lastChild as HTMLElement;
     expect(bar5h.className).toMatch(/bg-danger/);
     expect(within(sorin).getByText("Live")).toBeTruthy();
     expect(within(sorin).queryByText(/nearly out/)).toBeNull();
@@ -177,7 +179,7 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
     const ana = (await screen.findByText("ana")).closest("tr")!;
     const bar5h = within(ana).getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).toMatch(/projected \d+% by reset, over$/);
-    expect(within(ana).getByText("»")).toBeTruthy();
+    expect(within(ana).getByTestId("forecast-overflow-marker")).toBeTruthy();
   });
 
   it("stays a plain bar on a low reading with headroom", async () => {
@@ -187,7 +189,7 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
     const vlad = (await screen.findByText("vlad")).closest("tr")!;
     const bar5h = within(vlad).getByRole("progressbar", { name: "5-hour window" });
     expect(bar5h.getAttribute("aria-valuetext")).not.toMatch(/projected/);
-    expect(within(vlad).queryByText("»")).toBeNull();
+    expect(within(vlad).queryByTestId("forecast-overflow-marker")).toBeNull();
   });
 
   it("draws no forecast on a stale row heading past the cap", async () => {
@@ -195,7 +197,7 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
     render(<AdminRateLimits />);
 
     const mihai = (await screen.findByText("mihai")).closest("tr")!;
-    expect(within(mihai).queryByText("»")).toBeNull();
+    expect(within(mihai).queryByTestId("forecast-overflow-marker")).toBeNull();
   });
 });
 
