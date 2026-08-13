@@ -205,7 +205,22 @@ var (
 	// read from) → 409 (PRD #158 M1). Distinct from ErrRunNotOwned (404): the run
 	// exists and is held by this worker, it just has nothing to read against.
 	ErrForgeNoRepo = errors.New("run has no repo for forge read")
+
+	// ErrGuardrailBlocked is the sentinel the #66 default-branch guardrail refuses a
+	// run with (D1 layer 2). Returned wrapped in a *GuardrailBlockedError so callers
+	// can errors.Is it for the 422 mapping and errors.As it to read the block
+	// findings.
+	ErrGuardrailBlocked = errors.New("run refused by the default-branch guardrail")
 )
+
+// GuardrailBlockedError is returned by the run-create paths when the #66 default-
+// branch guardrail refuses (D1 layer 2). Findings carries the block-finding
+// messages for the 422 body. It wraps ErrGuardrailBlocked so callers can errors.Is
+// it, and errors.As it to read Findings.
+type GuardrailBlockedError struct{ Findings []string }
+
+func (e *GuardrailBlockedError) Error() string { return ErrGuardrailBlocked.Error() }
+func (e *GuardrailBlockedError) Unwrap() error { return ErrGuardrailBlocked }
 
 // Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
 // single Go source of truth the SDK tool schema mirrors: at most
@@ -766,6 +781,11 @@ type Service struct {
 	// composite ops return ErrForgesUnavailable rather than panic (the pre-#191
 	// deployments and every test that never wires it are unaffected).
 	forges ForgeBuilder
+	// guard is the #66 default-branch guardrail (D1 layer 2), a narrow RepoGuard
+	// interface *privcheck.Service satisfies; set via SetRepoGuard. Nil ⇒ the
+	// service-layer gate is skipped (guardDefaultBranch is a no-op) and layer 3 (the
+	// claim backstop) remains the security net, so a wiring gap never fails all runs.
+	guard RepoGuard
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -778,6 +798,11 @@ func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 // startup, before serving; pass the same *forgesvc.Service the handlers hold. A nil
 // builder leaves the composite ops returning ErrForgesUnavailable.
 func (s *Service) SetForges(fb ForgeBuilder) { s.forges = fb }
+
+// SetRepoGuard wires the #66 default-branch guardrail (D1 layer 2). Late-injected
+// in main.go because the privcheck.Service is built after this Service. A nil guard
+// leaves guardDefaultBranch a no-op — the claim backstop (M6, layer 3) is the net.
+func (s *Service) SetRepoGuard(g RepoGuard) { s.guard = g }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted
@@ -3708,10 +3733,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		requireBaseMatch = seed.RequireBase
 	}
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// #66 D1 layer 2: the service-layer guardrail, shared across the PAT-bearing
+	// inserts (issue lane, CI-fix, self-improve, scheduled prompt). Reached by the UI
+	// AND autopilot, so gating here (not the handler) is what covers the unattended path.
+	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
 	issue, err := s.q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: issueIID})

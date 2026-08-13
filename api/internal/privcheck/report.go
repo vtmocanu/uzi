@@ -189,6 +189,21 @@ func (rr RepoReport) Blocks() bool {
 	return false
 }
 
+// BlockMessages returns the human messages of exactly this result's SeverityBlock
+// findings — the reasons a run is refused, for the 422 "violations" array (PRD #66
+// D1). Overridden and warn findings are excluded: only findings that actually
+// refuse report as the reason. Provided here so the run-create service and the
+// handlers do not each re-filter res.Findings. Never nil.
+func (r GuardResult) BlockMessages() []string {
+	msgs := make([]string, 0, len(r.Findings))
+	for _, f := range r.Findings {
+		if f.Severity == SeverityBlock {
+			msgs = append(msgs, f.Message)
+		}
+	}
+	return msgs
+}
+
 // waivableCodes is exactly the six "bot is too strong" BLOCK codes an admin
 // per-repo override may downgrade (PRD #66 D8). CodeProtectionUnreadable is
 // deliberately NOT here: a read error / unreadable protection is never waivable

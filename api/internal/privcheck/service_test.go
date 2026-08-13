@@ -567,6 +567,33 @@ func TestDowngradeOverridden(t *testing.T) {
 	}
 }
 
+// TestGuardResultBlockMessages: BlockMessages returns exactly the SeverityBlock
+// findings' messages, in order — warn and overridden findings are excluded, and the
+// result is never nil (PRD #66 M5, D1).
+func TestGuardResultBlockMessages(t *testing.T) {
+	res := GuardResult{Findings: []Finding{
+		{Code: CodeWriteRoleCanPush, Severity: SeverityBlock, Message: "push"},
+		{Code: CodeBotNotMember, Severity: SeverityWarn, Message: "weak"},
+		{Code: CodeBotCanMerge, Severity: SeverityBlock, Message: "merge"},
+		{Code: CodeDefaultBranchUnprotected, Severity: SeverityOverridden, Message: "allowed"},
+	}}
+	got := res.BlockMessages()
+	want := []string{"push", "merge"}
+	if len(got) != len(want) {
+		t.Fatalf("BlockMessages = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("BlockMessages[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Never nil, even with no findings — the 422 body serializes [] not null.
+	if msgs := (GuardResult{}).BlockMessages(); msgs == nil {
+		t.Fatal("BlockMessages must be non-nil")
+	}
+}
+
 // TestSweepToleratesDeletedMidSweep: a 0-row write-back (connection deleted mid
 // -sweep) is not an error.
 func TestSweepToleratesDeletedMidSweep(t *testing.T) {

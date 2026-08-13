@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -23,6 +24,15 @@ import (
 // narrow interface, wired via SetForges in main.go.
 type ForgeBuilder interface {
 	ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
+}
+
+// RepoGuard is the #66 default-branch guardrail (privcheck.Service satisfies it).
+// workersvc holds it as a narrow interface (not *privcheck.Service) to keep the
+// dependency one-way. Nil ⇒ the service-layer gate (D1 layer 2) is skipped; layer 3
+// (the claim backstop, M6) is the security net, so a wiring gap does not fail all
+// runs. main.go always wires it via SetRepoGuard.
+type RepoGuard interface {
+	GuardRepo(ctx context.Context, in privcheck.GuardInput) privcheck.GuardResult
 }
 
 // CreatedIssue is the forge issue a confirmed proposal created — the subset the
@@ -54,6 +64,38 @@ var (
 	// → 502.
 	ErrForgeIssueRead = errors.New("could not read the issue from the forge")
 )
+
+// guardDefaultBranch is the #66 service-layer guardrail (D1 layer 2), the ONE
+// shared helper the PAT-bearing run-create paths (issue lane, CI-fix,
+// self-improve, and scheduled prompt) call right after fetching the repo with
+// GetRepoForUser. It runs the live, fail-closed guard and returns a
+// *GuardrailBlockedError (carrying the block-finding messages for the 422 body)
+// when the bot can reach the default branch or that could not be verified.
+//
+// A nil guard is a no-op: see the RepoGuard doc — the claim backstop (M6, layer 3)
+// is the security net, so a wiring gap never fails all runs. Overridden is false
+// here; M8 threads the real per-repo override.
+func (s *Service) guardDefaultBranch(ctx context.Context, row store.GetRepoForUserRow) error {
+	if s.guard == nil {
+		return nil // see RepoGuard doc: layer 3 is the net
+	}
+	res := s.guard.GuardRepo(ctx, privcheck.GuardInput{
+		ForgeType:       row.ForgeType,
+		BaseURL:         row.BaseUrl,
+		TokenCiphertext: row.TokenCiphertext,
+		Repo: privcheck.Repo{
+			ID:             row.ID.String(),
+			Path:           row.PathWithNamespace,
+			ForgeProjectID: row.ForgeProjectID,
+			DefaultBranch:  row.DefaultBranch.String,
+		},
+		Overridden: false, // M8 threads the real per-repo override
+	})
+	if res.Blocked {
+		return &GuardrailBlockedError{Findings: res.BlockMessages()}
+	}
+	return nil
+}
 
 // ConfirmProposalForUser executes a proposed issue on the forge (PRD #191 Decision
 // 8): the ONLY path that turns a pending proposal into a real forge issue, lifted

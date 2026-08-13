@@ -823,6 +823,18 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 // (StartChatRun, PRD #191 M5) so both surfaces refuse an issue for the SAME reason with
 // the SAME words — the PRD-gate hint especially, which names the instance's own labels.
 func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err error) {
+	// #66 D1 layer 2: the service-layer guardrail refused. 422 with the forge.go:191
+	// body shape (error + violations) so the existing web 422 handling applies. Checked
+	// before the switch because it carries a typed payload (the block-finding messages),
+	// not just a status.
+	var ge *workersvc.GuardrailBlockedError
+	if errors.As(err, &ge) {
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":      "this run was refused: the bot can push or merge to the repo's default branch, or that could not be verified (main is never touched). Fix branch protection on the forge, then retry.",
+			"violations": ge.Findings,
+		})
+		return
+	}
 	switch {
 	case errors.Is(err, workersvc.ErrForgeBuild):
 		slog.Error("start run: build forge for connection", "error", err)

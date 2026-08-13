@@ -28,10 +28,17 @@ var ErrActiveSelfImproveExists = errors.New("a self-improvement run is already a
 // backlog, which the worker frames as untrusted data). A second active run is
 // rejected by the partial unique index → ErrActiveSelfImproveExists.
 func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string) (store.Run, error) {
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// #66 D1 layer 2: the shared service-layer guardrail. The self-improve engine tick
+	// has no user in the loop, so a refusal here just skips the cycle (logged upstream),
+	// which is the desired outcome — never a run against an unguarded default branch.
+	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}
 	run, err := s.q.CreateSelfImproveRun(ctx, store.CreateSelfImproveRunParams{
