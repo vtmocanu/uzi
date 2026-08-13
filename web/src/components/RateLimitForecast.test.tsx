@@ -3,16 +3,16 @@ import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { RateLimitForecastMeter } from "./RateLimitForecast";
 import { MeterTrack } from "./Meter";
-import type { BurnForecast } from "../lib/rateLimits";
+import type { PaceForecast } from "../lib/rateLimits";
 
 afterEach(cleanup);
 
-const OVER: BurnForecast = { state: "over", projectedPct: 130 };
-const ON_PACE_HIGH: BurnForecast = { state: "on_pace", projectedPct: 108 };
-const ON_PACE_LOW: BurnForecast = { state: "on_pace", projectedPct: 95 };
-const SAFE: BurnForecast = { state: "safe", projectedPct: 0 };
+const OVER: PaceForecast = { state: "over", projectedPct: 130 };
+const ON_PACE_HIGH: PaceForecast = { state: "on_pace", projectedPct: 108 };
+const ON_PACE_LOW: PaceForecast = { state: "on_pace", projectedPct: 95 };
+const SAFE: PaceForecast = { state: "safe", projectedPct: 0 };
 
-function renderMeter(forecast: BurnForecast, pct = 56) {
+function renderMeter(forecast: PaceForecast, pct = 56) {
   return render(
     <RateLimitForecastMeter label="5-hour window" pct={pct} valueText={`${pct}%, resets in 2h`} forecast={forecast} className="mt-1.5 h-2" />,
   );

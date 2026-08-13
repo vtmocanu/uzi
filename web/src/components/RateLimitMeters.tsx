@@ -7,25 +7,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
-  forecastKey,
-  forecastReadingsFor,
   formatAgo,
   formatCountdown,
   rowForecast,
   statusBadge,
   useNow,
-  useReadingSeries,
+  WINDOW_DURATION,
   worstTokenReading,
   worstWindow,
-  type BurnForecast,
+  type PaceForecast,
 } from "../lib/rateLimits";
 import { Badge, Card, SectionTitle } from "./ui";
 import { MeterTrack, toneFor, type MeterTone } from "./Meter";
 import { RateLimitForecastMeter } from "./RateLimitForecast";
-
-// Series is the accumulation getter useReadingSeries returns, threaded to each
-// window row so it can read its trailing samples for burnForecast.
-type Series = ReturnType<typeof useReadingSeries>;
 
 // useMyRateLimits polls GET /me/rate-limits while the tab is visible. A failed
 // fetch keeps the last reading (never blanks the meters); the surfaces decide what
@@ -72,7 +66,7 @@ function SettingsWindowRow({
   label: string;
   win: RateLimitWindow;
   now: number;
-  forecast: BurnForecast;
+  forecast: PaceForecast;
   dim?: boolean;
 }) {
   const countdown = formatCountdown(win.resets_at, now);
@@ -87,8 +81,8 @@ function SettingsWindowRow({
       </div>
       {/* dim greys the bar on a stale reading (Decision 3), matching the sidebar
           micro-meters and the admin table. The forecast ghost/» draws only when the
-          trailing samples project past the safe band; otherwise this is the plain
-          bar (PRD #309 D3). */}
+          anchored projection heads past the safe band; otherwise this is the plain
+          bar (PRD #309 D3, #310). */}
       <RateLimitForecastMeter
         className="mt-1.5 h-2"
         label={label}
@@ -121,12 +115,10 @@ function TokenMeters({
   token,
   now,
   showLabel,
-  series,
 }: {
   token: TokenRateLimits;
   now: number;
   showLabel: boolean;
-  series: Series;
 }) {
   const { limits } = token;
   const heading = showLabel ? (
@@ -165,14 +157,14 @@ function TokenMeters({
           win={limits.five_hour}
           now={now}
           dim={limits.stale}
-          forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+          forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
         />
         <SettingsWindowRow
           label="7-day window"
           win={limits.seven_day}
           now={now}
           dim={limits.stale}
-          forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+          forecast={rowForecast(limits.stale, limits.seven_day.pct, limits.seven_day.resets_at, WINDOW_DURATION["7d"], now, limits.source)}
         />
       </div>
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
@@ -206,7 +198,6 @@ function TokenMeters({
 export function RateLimitCard() {
   const { tokens, loading } = useMyRateLimits(60_000);
   const now = useNow();
-  const series = useReadingSeries(forecastReadingsFor(tokens ?? []), now);
 
   if (loading || !tokens || tokens.length === 0) return null;
   const showLabels = tokens.length > 1;
@@ -219,7 +210,7 @@ export function RateLimitCard() {
       </div>
       <div className="space-y-4">
         {tokens.map((t) => (
-          <TokenMeters key={t.secret_id} token={t} now={now} showLabel={showLabels} series={series} />
+          <TokenMeters key={t.secret_id} token={t} now={now} showLabel={showLabels} />
         ))}
       </div>
     </Card>
@@ -309,7 +300,7 @@ function MicroRow({
   label: string;
   win: RateLimitWindow;
   dim: boolean;
-  forecast: BurnForecast;
+  forecast: PaceForecast;
 }) {
   return (
     <div className="grid grid-cols-[1.4rem_1fr_2.6rem] items-center gap-2 text-[11px]">
@@ -333,12 +324,10 @@ function TokenMicroMeters({
   token,
   showLabel,
   now,
-  series,
 }: {
   token: TokenRateLimits;
   showLabel: boolean;
   now: number;
-  series: Series;
 }) {
   const { limits } = token;
   if (limits.status !== "ok") return null;
@@ -362,13 +351,13 @@ function TokenMicroMeters({
         label="5h"
         win={limits.five_hour}
         dim={limits.stale}
-        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "5h")), limits.five_hour.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
       />
       <MicroRow
         label="7d"
         win={limits.seven_day}
         dim={limits.stale}
-        forecast={rowForecast(limits.stale, series(forecastKey(token.secret_id, "7d")), limits.seven_day.resets_at, now, limits.source)}
+        forecast={rowForecast(limits.stale, limits.seven_day.pct, limits.seven_day.resets_at, WINDOW_DURATION["7d"], now, limits.source)}
       />
     </div>
   );
@@ -381,7 +370,6 @@ function TokenMicroMeters({
 export function SidebarRateLimits() {
   const { tokens } = useMyRateLimits(60_000);
   const now = useNow();
-  const series = useReadingSeries(forecastReadingsFor(tokens ?? []), now);
   if (!tokens || tokens.length === 0) return null;
   const readable = tokens.filter((t) => t.limits.status === "ok");
   if (readable.length === 0) return null;
@@ -389,7 +377,7 @@ export function SidebarRateLimits() {
   return (
     <div className="mt-2 space-y-2.5" aria-label="Claude rate limits">
       {readable.map((t) => (
-        <TokenMicroMeters key={t.secret_id} token={t} showLabel={showLabels} now={now} series={series} />
+        <TokenMicroMeters key={t.secret_id} token={t} showLabel={showLabels} now={now} />
       ))}
     </div>
   );
