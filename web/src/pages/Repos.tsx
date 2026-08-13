@@ -5,11 +5,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
-import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Toggle } from "../components/ui";
+import { useAuth } from "../auth/AuthContext";
+import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
-import { BoardIcon } from "../components/icons";
+import { Modal } from "../components/Modal";
+import { BoardIcon, XIcon } from "../components/icons";
 
 export function Repos() {
+  // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
+  // and a pointer to ask an admin, never an Allow/Revoke control.
+  const { user } = useAuth();
+  const isAdmin = user?.is_admin ?? false;
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [connectionId, setConnectionId] = useState("");
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -37,6 +43,15 @@ export function Repos() {
   const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
   const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
   const [toolsBusy, setToolsBusy] = useState(false);
+  // The guardrail Allow-anyway modal (PRD #66 M9, D8): the repo whose modal is open,
+  // the admin's reason, and the in-flight POST. Revoke reuses overrideBusyId.
+  const [allowRepoId, setAllowRepoId] = useState<string | null>(null);
+  const [allowReason, setAllowReason] = useState("");
+  const [allowBusy, setAllowBusy] = useState(false);
+  // Submit error for the Allow-anyway modal, rendered INSIDE the dialog (a page-level
+  // Alert would sit behind the backdrop, unseen). Distinct from the page `error`.
+  const [allowError, setAllowError] = useState("");
+  const [overrideBusyId, setOverrideBusyId] = useState<string | null>(null);
   // Focus management: remember the cell trigger so focus returns to it when the
   // panel closes, and move focus into the panel (its master switch) when it opens.
   const trustTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -226,6 +241,58 @@ export function Repos() {
     }
   };
 
+  // Open the Allow-anyway modal for a blocked repo (admin only). Resets the reason.
+  const openAllow = (repo: Repo) => {
+    setError("");
+    setAllowReason("");
+    setAllowError("");
+    setAllowRepoId(repo.id);
+  };
+
+  // Close the Allow-anyway modal. A no-op while a POST is in flight so neither Escape
+  // nor a backdrop click can dismiss a submitting form (matching the disabled ×).
+  const closeAllow = () => {
+    if (allowBusy) return;
+    setAllowRepoId(null);
+    setAllowError("");
+  };
+
+  // POST the admin per-repo override with the typed reason, then refetch so the
+  // server-recomputed guardrail_blocked / guardrail_override drive the badge (the web
+  // never re-derives the block rule). A blank reason is rejected client- and
+  // server-side (D8).
+  const submitAllow = async (repoId: string) => {
+    const reason = allowReason.trim();
+    if (!reason) return;
+    setAllowError("");
+    setAllowBusy(true);
+    try {
+      await api.setRepoGuardrailOverride(repoId, reason);
+      setAllowRepoId(null);
+      setAllowReason("");
+      await loadProjects(connectionId);
+    } catch (err) {
+      setAllowError(err instanceof ApiError ? err.message : "Failed to allow the repo");
+    } finally {
+      setAllowBusy(false);
+    }
+  };
+
+  // Revoke an active override (admin only): re-arms the guardrail immediately, then
+  // refetch so the badge flips back to blocked/clean per the fresh server state.
+  const revokeOverride = async (repo: Repo) => {
+    setError("");
+    setOverrideBusyId(repo.id);
+    try {
+      await api.clearRepoGuardrailOverride(repo.id);
+      await loadProjects(connectionId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to revoke the override");
+    } finally {
+      setOverrideBusyId(null);
+    }
+  };
+
   // The selected connection's latest privilege report drives the per-repo
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
@@ -242,6 +309,11 @@ export function Repos() {
     (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id);
   // The repo whose tool-profile picker is expanded (rendered below the table).
   const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
+  // The repo whose Allow-anyway modal is open, and the exact block findings it will
+  // accept — read from the connection report for DISPLAY only (the STATE decision is
+  // r.guardrail_blocked; the block rule is never re-implemented here).
+  const allowRepo = repos.find((r) => r.id === allowRepoId) ?? null;
+  const allowFindings = allowRepo ? repoFindings(privilegeReport, allowRepo.id)?.violations ?? [] : [];
 
   return (
     <div className="space-y-6">
@@ -336,25 +408,72 @@ export function Repos() {
                             </Badge>
                             {(() => {
                               const f = repoFindings(privilegeReport, r.id);
-                              if (!f) return null;
-                              // D4 (PRD #66 M4): a block-severity finding means uzi
-                              // REFUSES runs on this repo (the bot can push/merge to
-                              // main). That is a distinct, actionable state from the
-                              // advisory "N privilege issue" wording, which does not
-                              // tell the user their runs are refused — so it gets its
-                              // own "runs blocked" danger badge, the sign on the wall.
-                              // Warn-only repos keep the existing advisory badge.
-                              if (f.violations.length > 0) {
+                              // PRD #66 M9 (D8): the badge STATE reads the SERVER's
+                              // guardrail_blocked (the single Go block rule, override
+                              // already applied) — never re-derived here. Three states:
+                              // blocked, allowed-by-admin, and (fall-through) warn-only.
+                              if (r.guardrail_blocked) {
+                                // uzi REFUSES runs on this repo (the bot can push/merge
+                                // to main, or it could not be verified). The sign on the
+                                // wall (D4). Admins get an inline Allow-anyway; members
+                                // get a pointer to ask an admin (they cannot self-allow).
                                 return (
-                                  <Badge
-                                    tone="danger"
-                                    dot
-                                    title={f.violations.map((x) => x.message).join("\n")}
-                                  >
-                                    runs blocked
-                                  </Badge>
+                                  <>
+                                    <Badge
+                                      tone="danger"
+                                      dot
+                                      title={(f?.violations ?? []).map((x) => x.message).join("\n")}
+                                    >
+                                      runs blocked
+                                    </Badge>
+                                    {isAdmin ? (
+                                      <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        onClick={() => openAllow(r)}
+                                      >
+                                        Allow anyway
+                                      </Button>
+                                    ) : (
+                                      <span
+                                        className="text-xs text-faint"
+                                        title="Only an instance admin can allow a repo through this guardrail."
+                                      >
+                                        ask an admin to allow this repo
+                                      </span>
+                                    )}
+                                  </>
                                 );
                               }
+                              if (r.guardrail_override) {
+                                // An admin explicitly allowed this repo (D8): a distinct,
+                                // neutral-warning tone, with the reason/actor/when in the
+                                // title. Admins can Revoke, re-arming the guardrail.
+                                const ov = r.guardrail_override;
+                                return (
+                                  <>
+                                    <Badge
+                                      tone="warning"
+                                      dot
+                                      title={`Allowed by ${ov.by} on ${new Date(ov.at).toLocaleString()}\nReason: ${ov.reason}`}
+                                    >
+                                      allowed by admin
+                                    </Badge>
+                                    {isAdmin && (
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        disabled={overrideBusyId === r.id}
+                                        onClick={() => revokeOverride(r)}
+                                      >
+                                        {overrideBusyId === r.id ? "Revoking…" : "Revoke"}
+                                      </Button>
+                                    )}
+                                  </>
+                                );
+                              }
+                              // Warn-only repos keep the existing advisory badge.
+                              if (!f || f.warnings.length === 0) return null;
                               const n = f.warnings.length;
                               return (
                                 <Badge
@@ -660,6 +779,81 @@ export function Repos() {
             )}
           </Card>
         </>
+      )}
+
+      {/* Allow-anyway modal (PRD #66 M9, D8): admin-only. It names the EXACT block
+          findings being accepted (display-only, read from the connection report) and
+          requires a non-empty reason before it will POST the override. */}
+      {allowRepo && (
+        <Modal
+          label={`Allow runs on ${allowRepo.path_with_namespace}`}
+          onClose={closeAllow}
+          closeOnBackdrop={!allowBusy}
+        >
+          <div className="my-8 w-full max-w-lg overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
+            <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
+              <div>
+                <h2 className="text-base font-semibold">Allow runs on this repo?</h2>
+                <p className="mt-0.5 text-xs text-muted">{allowRepo.path_with_namespace}</p>
+              </div>
+              <button
+                type="button"
+                onClick={closeAllow}
+                disabled={allowBusy}
+                aria-label="Close"
+                className="rounded-md p-1 text-muted hover:bg-raised hover:text-fg"
+              >
+                <XIcon />
+              </button>
+            </div>
+            <div className="space-y-4 px-5 py-5">
+              {allowError && <Alert message={allowError} />}
+              <p className="text-sm text-muted">
+                uzi refuses runs on this repo because the bot can reach the default branch. Allowing it is a
+                per-repo, recorded exception — it accepts the risk; it does <span className="font-medium text-fg">not</span>{" "}
+                change branch protection, and it never waives a protection that could not be read.
+              </p>
+              {allowFindings.length > 0 ? (
+                <div className="rounded-md border border-danger/40 bg-danger/5 p-3">
+                  <h3 className="mb-1.5 text-sm font-semibold text-fg">You are accepting these findings</h3>
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted">
+                    {allowFindings.map((v) => (
+                      <li key={v.code}>{v.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <p className="text-xs text-faint">
+                  The specific findings are not in the last sync; the run gates enforce them live regardless.
+                </p>
+              )}
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium text-fg">
+                  Reason <span className="text-danger">*</span>
+                </span>
+                <Textarea
+                  rows={3}
+                  value={allowReason}
+                  disabled={allowBusy}
+                  placeholder="Why this repo is allowed through the guardrail (recorded with your name)"
+                  onChange={(e) => setAllowReason(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-edge bg-bg/40 px-5 py-3.5">
+              <Button variant="ghost" size="sm" disabled={allowBusy} onClick={closeAllow}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={allowBusy || allowReason.trim() === ""}
+                onClick={() => submitAllow(allowRepo.id)}
+              >
+                {allowBusy ? "Allowing…" : "Allow anyway"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

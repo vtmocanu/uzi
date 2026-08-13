@@ -124,6 +124,27 @@ RETURNING *;
 SELECT * FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC;
 
+-- name: AdminListReposWithPrivilege :many
+-- PRD #66 M9 (D8): the admin cross-user blocked-repos list. Every repo across ALL
+-- connections joined to its connection (for the stored privilege_report, status,
+-- checked_at and forge_type) and its owning user (email/id), plus the per-repo
+-- guardrail_override_* columns and — via a LEFT JOIN — the override actor's email
+-- when resolvable. UNSCOPED (admin-only, gated in the handler, precedent
+-- ListActiveRunsAll). The handler computes Blocks() from the report and returns
+-- only the blocked-or-overridden rows; the query returns all so the handler can
+-- also flag connections that were never checked (privilege_status NULL, R1).
+SELECT r.id, r.path_with_namespace, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       c.id AS connection_id, c.forge_type, c.privilege_report,
+       c.privilege_status, c.privilege_checked_at,
+       u.id AS owner_id, u.email AS owner_email,
+       ab.email AS override_by_email
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+JOIN users u ON u.id = c.user_id
+LEFT JOIN users ab ON ab.id = r.guardrail_override_by
+ORDER BY u.email ASC, r.path_with_namespace ASC;
+
 -- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1

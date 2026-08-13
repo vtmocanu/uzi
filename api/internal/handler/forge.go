@@ -71,22 +71,52 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 		t := c.PrivilegeCheckedAt.Time
 		dto.PrivilegeCheckedAt = &t
 	}
-	if len(c.PrivilegeReport) > 0 {
-		var rep privcheck.Report
-		if err := json.Unmarshal(c.PrivilegeReport, &rep); err == nil {
-			dto.PrivilegeReport = &rep
-		} else {
-			// D7: rows written before PRD #65 hold "role" as a number, which no
-			// longer unmarshals against the Role string field. The report blanks
-			// until the next privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default
-			// 24h) re-stamps it in the new shape. This log is deliberate — the
-			// pre-#65 code discarded the error, which would hide a real corruption
-			// behind the same silent blank as this expected one-time migration miss.
-			slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
-				"connection", c.ID, "error", err)
+	dto.PrivilegeReport = parsePrivilegeReport(c.PrivilegeReport, c.ID)
+	return dto
+}
+
+// parsePrivilegeReport unmarshals a connection's stored privilege_report jsonb into
+// a *privcheck.Report, or nil when the column is empty or fails to unmarshal (a
+// pre-#65 blob holding "role" as a number). Shared by connToDTO's report surfacing
+// and M9's guardrail_blocked / admin blocked-repos computations so all three read the
+// blob exactly one way.
+func parsePrivilegeReport(raw []byte, connID uuid.UUID) *privcheck.Report {
+	if len(raw) == 0 {
+		return nil
+	}
+	var rep privcheck.Report
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		// D7: rows written before PRD #65 hold "role" as a number, which no longer
+		// unmarshals against the Role string field. The report blanks until the next
+		// privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default 24h) re-stamps it in
+		// the new shape. This log is deliberate — the pre-#65 code discarded the
+		// error, which would hide a real corruption behind the same silent blank as
+		// this expected one-time migration miss.
+		slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
+			"connection", connID, "error", err)
+		return nil
+	}
+	return &rep
+}
+
+// guardrailBlockedForRepo computes the authoritative "would a run be refused on this
+// repo right now" from its OWNING connection's STORED privilege_report (PRD #66 M9,
+// D8). It applies the admin per-repo override via the SINGLE shared
+// privcheck.DowngradeOverridden — the same primitive the live gates use — so the web
+// never re-derives the waivable set. A nil report (connection never swept, or
+// UZI_PRIVILEGE_CHECK_INTERVAL=0) yields false, which is "unknown, not safe": the
+// enable/run gates still fail closed live (M4-M6), and the admin blocked-repos list
+// surfaces the unknown explicitly (R1).
+func guardrailBlockedForRepo(rep *privcheck.Report, repoID string, overridden bool) bool {
+	if rep == nil {
+		return false
+	}
+	for _, rr := range rep.Repos {
+		if rr.RepoID == repoID {
+			return privcheck.RepoReport{Findings: privcheck.DowngradeOverridden(rr.Findings, overridden)}.Blocks()
 		}
 	}
-	return dto
+	return false
 }
 
 // repoDTO (apitypes.RepoDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
@@ -510,9 +540,13 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		// Non-fatal: badges are enrichment, not the payload. Render without them.
 		slog.Warn("list projects: default-branch pipelines", "error", err)
 	}
+	// The badge STATE (PRD #66 M9) comes from this connection's stored report, run
+	// through the single shared downgrade — parsed once for the whole page.
+	report := parsePrivilegeReport(conn.PrivilegeReport, conn.ID)
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
+		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
@@ -542,9 +576,22 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Warn("list repos: default-branch pipelines", "error", err)
 	}
+	// The badge STATE (PRD #66 M9) reads each repo's OWNING connection's stored
+	// report. These repos span the user's connections, so parse each connection's
+	// blob once into a map keyed by connection id. Non-fatal on error — the badge is
+	// enrichment, and a missing report reads as "unknown" (false), never as "safe".
+	reports := map[uuid.UUID]*privcheck.Report{}
+	if conns, err := h.q.ListForgeConnectionsByUser(r.Context(), user.ID); err != nil {
+		slog.Warn("list repos: connections for guardrail badge", "error", err)
+	} else {
+		for _, c := range conns {
+			reports[c.ID] = parsePrivilegeReport(c.PrivilegeReport, c.ID)
+		}
+	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
 		d.Pipeline = pipelines[rp.ID]
+		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})

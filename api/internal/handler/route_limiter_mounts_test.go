@@ -67,7 +67,8 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 146 as of this commit; it was 144 until PRD #66 M8 added POST and DELETE
+// 147 as of this commit; it was 146 until PRD #66 M9 added GET
+// /api/admin/blocked-repos, 144 until PRD #66 M8 added POST and DELETE
 // /api/admin/repos/{id}/guardrail-override, 143 until PRD #66 M3 added GET
 // /api/admin/guardrail-impact, 142 until PRD #122 M8 added POST
 // /api/worker/runs/{id}/publish, and 141 until `c309e8a0` added GET
@@ -153,6 +154,9 @@ var wantRouteMounts = []routeMount{
 	// credentials, so it rides the credential-surface limiter. Its bucket is keyed by
 	// (pattern, user) and is therefore disjoint from the other authLimiter mounts.
 	{"GET", "/api/admin/cli-tokens", limAuth},
+	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
+	// privilege_report (no forge call) → noLimiter.
+	{"GET", "/api/admin/blocked-repos", noLimiter},
 	// PRD #66 M3: the live guardrail impact scan carries the per-user forge budget,
 	// like POST /{id}/privilege-check — it makes the same class of upstream forge
 	// reads (2 + 2×repos), so it draws from the forge pocket rather than none.

@@ -58,6 +58,7 @@ function repoOpt(id: string, path: string): Repo {
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     pipeline: null,
+    guardrail_blocked: false,
   };
 }
 

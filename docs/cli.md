@@ -103,7 +103,7 @@ uzi review undo <id> <rec> | stats [--json]
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
 uzi version
@@ -293,6 +293,14 @@ A few worth knowing:
   `enabled=… blocked=… unevaluable=…`. `UNEVALUABLE` is counted apart from
   `BLOCKED` and is **not** safe: a forge error or a repo with no default branch
   means uzi could not tell — read it as unknown, never as zero affected.
+- **`admin blocked-repos` is the cross-user allow/deny list** (PRD #66 D8) — every
+  user's repos the guardrail refuses right now, plus any an admin has explicitly
+  allowed. Unlike `guardrail-impact` it reads the **stored** privilege report
+  (cheap, no forge call), so a repo whose connection was never checked
+  (`UZI_PRIVILEGE_CHECK_INTERVAL=0`) is **invisible** here: a `note:` line then
+  warns and the JSON `checks_unknown` is true, so an empty list means "unknown",
+  not "none blocked". The table has `OWNER`, `PATH`, `BLOCKED`, `ALLOWED BY`
+  (the admin who allowed it, or `—`). Allowing/revoking is done from the web UI.
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).

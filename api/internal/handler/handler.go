@@ -886,6 +886,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Agents-status overview: every user's workers + active runs.
 				r.Get("/workers", h.AdminListWorkers)
 				r.Get("/runs", h.AdminListRuns)
+				// PRD #66 M9 (D8): the admin cross-user blocked-repos list. A read of the
+				// STORED privilege_report across all users (no forge call), so it carries no
+				// per-user limiter — same shape as /runs and /workers.
+				r.Get("/blocked-repos", h.AdminListBlockedRepos)
 				// PRD #66 M3: the live, non-persisting guardrail pre-flight impact count.
 				// It fans out a 1 + 2×repos forge scan across every user's connections,
 				// so it wears the per-user forge budget — forgeLimiter is a Routes

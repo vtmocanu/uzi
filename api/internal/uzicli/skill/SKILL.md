@@ -154,6 +154,7 @@ uzi admin usage
 uzi admin rate-limits
 uzi admin cli-tokens
 uzi admin guardrail-impact
+uzi admin blocked-repos
 uzi skill status
 uzi skill install [--force]
 uzi skill install-hook

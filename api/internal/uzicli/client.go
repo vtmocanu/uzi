@@ -119,6 +119,9 @@ type Client interface {
 	// GuardrailImpact reads the live, non-persisting guardrail pre-flight impact
 	// count (PRD #66 M3): GET /api/admin/guardrail-impact.
 	GuardrailImpact(ctx context.Context) (apitypes.GuardrailImpactDTO, error)
+	// AdminBlockedRepos reads the admin cross-user blocked-repos list from the
+	// stored privilege report (PRD #66 M9): GET /api/admin/blocked-repos.
+	AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlockedReposDTO, error)
 
 	// StartCLIAuth begins a browser-brokered login: POST /api/auth/cli/start with the
 	// PKCE S256 challenge and a client description. UNAUTH by design (the CLI has no
@@ -881,6 +884,17 @@ func (c *HTTPClient) GuardrailImpact(ctx context.Context) (apitypes.GuardrailImp
 	var out apitypes.GuardrailImpactDTO
 	if err := c.get(ctx, "/api/admin/guardrail-impact", &out); err != nil {
 		return apitypes.GuardrailImpactDTO{}, err
+	}
+	return out, nil
+}
+
+// AdminBlockedRepos reads the admin cross-user blocked-repos list from the STORED
+// privilege report (PRD #66 M9). ChecksUnknown on the envelope is true when a
+// connection was never checked — an empty list is then "unknown", not "none blocked".
+func (c *HTTPClient) AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlockedReposDTO, error) {
+	var out apitypes.AdminBlockedReposDTO
+	if err := c.get(ctx, "/api/admin/blocked-repos", &out); err != nil {
+		return apitypes.AdminBlockedReposDTO{}, err
 	}
 	return out, nil
 }

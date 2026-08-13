@@ -12,6 +12,80 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminListReposWithPrivilege = `-- name: AdminListReposWithPrivilege :many
+SELECT r.id, r.path_with_namespace, r.enabled,
+       r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       c.id AS connection_id, c.forge_type, c.privilege_report,
+       c.privilege_status, c.privilege_checked_at,
+       u.id AS owner_id, u.email AS owner_email,
+       ab.email AS override_by_email
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+JOIN users u ON u.id = c.user_id
+LEFT JOIN users ab ON ab.id = r.guardrail_override_by
+ORDER BY u.email ASC, r.path_with_namespace ASC
+`
+
+type AdminListReposWithPrivilegeRow struct {
+	ID                      uuid.UUID          `json:"id"`
+	PathWithNamespace       string             `json:"path_with_namespace"`
+	Enabled                 bool               `json:"enabled"`
+	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	ConnectionID            uuid.UUID          `json:"connection_id"`
+	ForgeType               string             `json:"forge_type"`
+	PrivilegeReport         []byte             `json:"privilege_report"`
+	PrivilegeStatus         pgtype.Text        `json:"privilege_status"`
+	PrivilegeCheckedAt      pgtype.Timestamptz `json:"privilege_checked_at"`
+	OwnerID                 uuid.UUID          `json:"owner_id"`
+	OwnerEmail              string             `json:"owner_email"`
+	OverrideByEmail         pgtype.Text        `json:"override_by_email"`
+}
+
+// PRD #66 M9 (D8): the admin cross-user blocked-repos list. Every repo across ALL
+// connections joined to its connection (for the stored privilege_report, status,
+// checked_at and forge_type) and its owning user (email/id), plus the per-repo
+// guardrail_override_* columns and — via a LEFT JOIN — the override actor's email
+// when resolvable. UNSCOPED (admin-only, gated in the handler, precedent
+// ListActiveRunsAll). The handler computes Blocks() from the report and returns
+// only the blocked-or-overridden rows; the query returns all so the handler can
+// also flag connections that were never checked (privilege_status NULL, R1).
+func (q *Queries) AdminListReposWithPrivilege(ctx context.Context) ([]AdminListReposWithPrivilegeRow, error) {
+	rows, err := q.db.Query(ctx, adminListReposWithPrivilege)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminListReposWithPrivilegeRow{}
+	for rows.Next() {
+		var i AdminListReposWithPrivilegeRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PathWithNamespace,
+			&i.Enabled,
+			&i.GuardrailOverrideReason,
+			&i.GuardrailOverrideBy,
+			&i.GuardrailOverrideAt,
+			&i.ConnectionID,
+			&i.ForgeType,
+			&i.PrivilegeReport,
+			&i.PrivilegeStatus,
+			&i.PrivilegeCheckedAt,
+			&i.OwnerID,
+			&i.OwnerEmail,
+			&i.OverrideByEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const clearBoardOrderExcept = `-- name: ClearBoardOrderExcept :exec
 UPDATE issues
 SET board_position = NULL

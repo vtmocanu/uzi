@@ -17,6 +17,7 @@ import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
 import { Skills } from "./pages/Skills";
 import { ToolAllowlist } from "./pages/ToolAllowlist";
+import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -260,6 +261,14 @@ export default function App() {
           element={
             <AdminRoute>
               <ToolAllowlist />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="/admin/blocked-repos"
+          element={
+            <AdminRoute>
+              <AdminBlockedRepos />
             </AdminRoute>
           }
         />

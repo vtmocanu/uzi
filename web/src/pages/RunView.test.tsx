@@ -1567,6 +1567,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
       repo_claudemd_enabled: false,
       repo_devbox_opt_in: false,
       pipeline: null,
+      guardrail_blocked: false,
     };
   }
   function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {
