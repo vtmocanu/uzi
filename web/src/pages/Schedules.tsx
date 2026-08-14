@@ -375,12 +375,7 @@ function LastRunOutcome({
         className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
         Last fire
-        <ChevronDownIcon
-          className={cx(
-            "h-3 w-3 transition-transform motion-reduce:transition-none",
-            expanded && "rotate-180",
-          )}
-        />
+        <ChevronDownIcon className={cx("h-3 w-3 transition-transform", expanded && "rotate-180")} />
       </button>
     </div>
   );
