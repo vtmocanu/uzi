@@ -6,6 +6,34 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-08-14
+
+### Changed
+
+- **Web UX information-architecture restructure (PRD #315).** Workers becomes a
+  first-class `/workers` page (out of Settings; `/settings/workers` redirects, and
+  the `excludeSubpath` active-state hack is deleted). Admin consolidates into one
+  5-tab shell reached from a single sidebar entry, and Settings splits into
+  Account & tokens / Run defaults. The sidebar rate-limit meters become a per-user
+  explicit choice: a "Show in sidebar" checkbox per token, the default token
+  always pinned, persisted as a new additive `users.sidebar_token_ids` column
+  (migration 00123, nullable, so an older server reads as default-only). Tab
+  strips no longer jump on a tab switch (constant per-shell header), and the full
+  admin nav fits a 1440x900 laptop with boards still expanded. No new service and
+  no new trust boundary. (#315)
+
+### Fixed
+
+- **The hosted worker's golangci-lint ratchet base is clamped to the true branch
+  base.** On resume legs the base could resolve through the frozen
+  `refs/heads/main` mirror, a stale ancestor of the branch's real base; #262 then
+  advanced the clone's `origin/main` to that stale commit, so the
+  new-from-merge-base ratchet regressed below the fork point and false-reddened
+  pre-existing backlog in untouched files. When the default-branch commit is an
+  ancestor-or-equal of the base SHA, `origin/<default>` is now pointed at the base
+  SHA the lead computes, so the ratchet compares against the true fork point.
+  `.golangci.yml` is untouched. (#313)
+
 ## [0.35.0] - 2026-08-14
 
 ### Fixed
