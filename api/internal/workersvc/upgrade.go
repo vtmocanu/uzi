@@ -521,6 +521,12 @@ type RollHealthReport struct {
 // for a non-match because "the controller reported a worker we do not host" is not an
 // error condition: it is a skew or a lie, both of which are handled by ignoring the row.
 func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (int64, error) {
+	// The SAME semver.IsValid(normSemver(...)) gate classifyWithTarget uses to decide
+	// whether to trust the tag as the roll target, so the arm guard and the classifier
+	// agree on which tags are usable. An invalid tag is passed as false so the SQL arms
+	// fail-closed (NOT @tag_valid): that is exactly where the classifier falls back to
+	// CPVersion and can say `outdated`, so the ceiling must engage.
+	tagValid := semver.IsValid(normSemver(rep.WorkerImageTag))
 	return s.q.UpsertWorkerRollHealth(ctx, store.UpsertWorkerRollHealthParams{
 		WorkerID:             rep.WorkerID,
 		Phase:                rep.Phase,
@@ -535,6 +541,7 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 		ObservedAt:           pgtype.Timestamptz{Time: rep.ObservedAt, Valid: true},
 		PollIntervalSeconds:  pgInt4(rep.PollIntervalSeconds),
 		WorkerImageTag:       pgText(rep.WorkerImageTag),
+		TagValid:             tagValid,
 	})
 }
 

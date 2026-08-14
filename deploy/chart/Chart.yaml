@@ -8,8 +8,8 @@ type: application
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
 # follows appVersion. Bump both per release; dev-cluster's ArgoCD auto-tracks the chart
 # (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
-version: 0.34.0
-appVersion: "0.34.0"
+version: 0.35.0
+appVersion: "0.35.0"
 
 # Umbrella chart (same pattern example-app uses): the CloudNativePG upstream `cluster`
 # chart ships as a subchart (aliased `postgres`) so one release brings up the api,

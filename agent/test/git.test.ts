@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 import { GitCache, bareDirName, gitEnv } from "../src/git.js";
 
 let fx: Fixture;
@@ -237,6 +237,161 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
       gitIn(rc.path, ["merge-base", "refs/remotes/origin/main", "HEAD"]),
       freshHead,
       "merge-base(origin/main, HEAD) must be the fresh head so new-from-merge-base gates only branch findings",
+    );
+  });
+
+  // Issue #313 — the RESIDUAL frozen-mirror false-red that survives the #262 fix. On a resume
+  // leg, `defaultBranchCommit` flows through `defaultBranchSha` → `defaultBranchRef`, whose
+  // fallback chain drops to the FROZEN `refs/heads/main` rung when the fresh tracking refs
+  // (`refs/remotes/origin/HEAD` / `refs/remotes/origin/main`) are absent. #262 then advances the
+  // clone's `origin/main` to that STALE commit — a strict ancestor of the branch's real base —
+  // so `merge-base(origin/main, HEAD)` regresses below the fork point and false-reds the whole
+  // backlog. The clamp (issue #313) never lets the ratchet base be a strict ancestor of the
+  // branch base: it points `origin/main` at `baseSha` instead. This test builds that exact
+  // stale-ancestor topology; it is RED before the clamp and GREEN after (it asserts the desired
+  // post-fix state, not the pre-fix stale value).
+  const CLAMP_MSG = "runner clone: clamped ratchet base to branch base (stale default ref)";
+
+  it("clamps the clone's origin/main to the branch base when the default ref is a stale ancestor (#313)", async () => {
+    // Recording logger so we can also prove the clamp log fires ONLY on the actual-change path.
+    const { logger, lines } = recordingLogger();
+    const git = new GitCache(fx.dataDir, logger);
+    // First clone pins the bare's refs/heads/main (the frozen mirror) at the initial commit.
+    const bare = await git.ensureClone(fx.originPath);
+    const initialHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+
+    // Advance the fixture ORIGIN's default branch, so the branch's real base will be FRESH.
+    fs.writeFileSync(path.join(fx.originPath, "ADVANCE.txt"), "moved on\n");
+    gitIn(fx.originPath, ["add", "ADVANCE.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "advance default"]);
+    const freshHead = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.notStrictEqual(freshHead, initialHead, "precondition: fresh head differs from initial");
+
+    // Seed a first runner clone off the FRESH default, commit, and push agent/issue-313 to
+    // origin — so on the reseed the branch tip descends from freshHead (its real base is fresh).
+    await git.ensureClone(fx.originPath); // origin-tracking learns freshHead
+    const first = await git.createOrAttachRunnerClone(bare, 313);
+    assert.strictEqual(first.baseCommit, freshHead, "precondition: first seed is off the fresh default");
+    fs.writeFileSync(path.join(first.path, "WORK.txt"), "w\n");
+    gitIn(first.path, ["add", "WORK.txt"]);
+    gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
+    const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-313", "run-fixture");
+    await git.pushBranch(bare, "agent/issue-313", "", fx.originPath);
+    await git.removeRunnerClone(first.path);
+
+    // Refresh the bare so origin-tracking learns agent/issue-313, then STALE the fresh default
+    // tracking refs so defaultBranchRef falls through to the frozen refs/heads/main rung. Delete
+    // origin/HEAD (the symbolic-ref rung) and origin/main (the remote-tracking rung); refs/heads/main
+    // (the frozen mirror, still initialHead) then wins the chain, so defaultBranchName stays "main"
+    // (update-ref still fires) while defaultBranchSha resolves the STALE initial commit.
+    await git.ensureClone(fx.originPath);
+    gitIn(bare, ["symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
+    gitIn(bare, ["update-ref", "-d", "refs/remotes/origin/main"]);
+    assert.strictEqual(gitIn(bare, ["rev-parse", "refs/heads/main"]), initialHead, "precondition: frozen mirror is the initial commit");
+
+    // Reseed: a resume off origin/agent/issue-313 (baseCommit fresh) whose defaultBranchCommit
+    // resolves through the frozen rung to the stale initial commit.
+    const rc = await git.createOrAttachRunnerClone(bare, 313);
+    assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the fresh branch tip");
+
+    // PRECONDITION: the topology is genuinely the stale-ANCESTOR case — defaultBranchCommit is a
+    // STRICT ancestor of baseCommit (ancestor, and not equal), i.e. exactly the #262-residual bug.
+    assert.doesNotThrow(
+      () => gitIn(bare, ["merge-base", "--is-ancestor", rc.defaultBranchCommit!, rc.baseCommit]),
+      "precondition: defaultBranchCommit is an ancestor of baseCommit",
+    );
+    assert.notStrictEqual(rc.defaultBranchCommit, rc.baseCommit, "precondition: it is a STRICT ancestor (stale), not equal");
+
+    // POST-FIX state (RED before the clamp, GREEN after): the clone's origin/main is the branch
+    // base, so the ratchet gates only branch-reachable findings.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "clone origin/main must be clamped to the branch base, not the stale frozen ancestor (#313)",
+    );
+    assert.strictEqual(
+      gitIn(rc.path, ["merge-base", "refs/remotes/origin/main", "HEAD"]),
+      rc.baseCommit,
+      "merge-base(origin/main, HEAD) must be the branch base so the ratchet spans no third-party backlog",
+    );
+
+    // The clamp log fires here (an ACTUAL change: ratchetBase !== defaultBranchCommit).
+    assert.ok(
+      lines.some((l) => (l as { msg?: string }).msg === CLAMP_MSG),
+      "the clamp log must fire when the ratchet base was clamped off a stale ancestor",
+    );
+  });
+
+  // Issue #313 — no-op path A: a FRESH run where defaultBranchCommit === baseCommit. isAncestor is
+  // true at equality so the clamp branch is entered, but ratchetBase stays === defaultBranchCommit,
+  // so the write is byte-for-byte what #262 would have written and the clamp log does NOT fire.
+  it("is a no-op on a fresh run (defaultBranchCommit === baseCommit): clone origin/main unchanged, no clamp log (#313)", async () => {
+    const { logger, lines } = recordingLogger();
+    const git = new GitCache(fx.dataDir, logger);
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 3131);
+
+    // Fresh seed: the base IS the default tip, so the two coincide (see the fresh-seed test above).
+    assert.strictEqual(rc.defaultBranchCommit, rc.baseCommit, "precondition: fresh run, the two commits coincide");
+    // The clone's origin/main is the same value #262 would have written — baseCommit (== defaultBranchCommit).
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.baseCommit,
+      "fresh run: clone origin/main is the (identical) #262 value, not clamped away",
+    );
+    // …and the clamp log does NOT fire, because ratchetBase === defaultBranchCommit (no change).
+    assert.ok(
+      !lines.some((l) => (l as { msg?: string }).msg === CLAMP_MSG),
+      "the clamp log must NOT fire on a fresh run where nothing was clamped",
+    );
+  });
+
+  // Issue #313 — no-op path B: a RESUME where main moved forward on a DIVERGENT line, so
+  // defaultBranchCommit is NOT an ancestor of baseSha. GENUINE divergence, built for real: the
+  // branch is pushed off the initial commit, THEN origin's main advances on its own line. Neither
+  // the fresh main nor the branch tip descends the other (their only common ancestor is the initial
+  // commit), so the clamp is a no-op and origin/main keeps defaultBranchCommit — preserving vs-main
+  // merge-base semantics.
+  it("keeps defaultBranchCommit on a resume where main diverged forward (not an ancestor of baseSha) (#313)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+
+    // Seed the branch off the INITIAL commit, commit, and push agent/issue-3132 to origin.
+    const first = await git.createOrAttachRunnerClone(bare, 3132);
+    fs.writeFileSync(path.join(first.path, "BRANCH.txt"), "b\n");
+    gitIn(first.path, ["add", "BRANCH.txt"]);
+    gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
+    const branchTip = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-3132", "run-fixture");
+    await git.pushBranch(bare, "agent/issue-3132", "", fx.originPath);
+    await git.removeRunnerClone(first.path);
+
+    // Advance origin's main on ITS OWN line (a sibling of the branch off the initial commit).
+    fs.writeFileSync(path.join(fx.originPath, "MAIN.txt"), "m\n");
+    gitIn(fx.originPath, ["add", "MAIN.txt"]);
+    gitIn(fx.originPath, [...IDENT, "commit", "-m", "advance main on a divergent line"]);
+    const freshMain = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+
+    // Refresh the bare so origin-tracking learns both the fresh main and agent/issue-3132.
+    await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 3132);
+
+    // Resume: base is the branch tip; defaultBranchCommit is the fresh main.
+    assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the branch tip");
+    assert.strictEqual(rc.defaultBranchCommit, freshMain, "precondition: defaultBranchCommit is the fresh divergent main");
+
+    // PRECONDITION: genuine divergence — defaultBranchCommit is NOT an ancestor of baseCommit
+    // (and they are not equal), so the clamp must be a no-op.
+    assert.throws(
+      () => gitIn(bare, ["merge-base", "--is-ancestor", rc.defaultBranchCommit!, rc.baseCommit]),
+      "precondition: defaultBranchCommit is NOT an ancestor of baseCommit (divergent)",
+    );
+
+    // The clamp is a no-op: origin/main keeps defaultBranchCommit, so vs-main semantics stand.
+    assert.strictEqual(
+      gitIn(rc.path, ["rev-parse", "refs/remotes/origin/main"]),
+      rc.defaultBranchCommit,
+      "divergent resume: clone origin/main keeps defaultBranchCommit (clamp is a no-op)",
     );
   });
 

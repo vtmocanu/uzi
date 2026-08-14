@@ -29,10 +29,14 @@ Fetch every MR branch so review agents can read whole files: `git fetch origin '
 
 **Detect migration collisions now.** Two MRs adding the same `NNNNN_*.sql` under `api/internal/store/migrations/` will both land as distinct files (git sees no conflict) and brick strict-goose boot. Find the live head (`ls api/internal/store/migrations/ | sort | tail -1`) and note which MRs add migrations at or below it. They get renumbered at merge (step 3).
 
+**Check in-flight uzi runs before you start.** `uzi run list`. uzi's auto-CI-fix opens a `ci_fix` run for every failed MR pipeline (often parked at the plan-approval gate, `awaiting_approval`) and can auto-open an MR mid-release (e.g. a flake fix on a re-created branch). Read a run's plan first (`uzi run get <id>`, `uzi run logs <id>`) so you don't re-diagnose what it already found; `uzi run reject <id> -m "<why>"` any whose fix you supersede.
+
+**Triage a red head-pipeline: is it the MR's fault?** Often it is NOT — the absolute vuln gates (`vulncheck:api`/`vulncheck:controller` govulncheck on *called* Go stdlib/dep CVEs, `vulncheck:web` npm audit) re-evaluate against the LIVE advisory DB, so a branch green when cut goes red when a new CVE lands, with no code change, and `main` fails the same way. Read the failing job trace (step 4). If it's repo-wide (new CVE, toolchain-currency), the fix is a dependency bump, not an MR change: land it on `main` directly (`chore(deps): ...` — e.g. re-pin the CI `golang:1.26@sha256:...` digest to the current go1.26.x found via `crane config golang:1.26 --platform linux/amd64`, and bump the npm lockfile), push `main`, then `git merge origin/main` into each MR branch and push so their pipelines re-run green. If reviews are already dispatched the branch head will advance — reviewers should re-derive at the new head.
+
 ## 2. Review each MR (gate: no objections)
 Spawn one `reviewer` agent per MR, in parallel (one message, multiple Agent calls). Each agent must answer, concisely, ending with a one-line verdict `MERGE` / `MERGE-WITH-NOTES` / `OBJECT`:
 1. **Milestones.** Read the PRD (`git show origin/agent/issue-N:prds/done/<file>.md`); enumerate milestones and mark each IMPLEMENTED / PARTIAL / SKIPPED with backing files. Flag any in-scope milestone with no code. A milestone deliberately *reframed* and documented is not "skipped" — say which it is.
-2. **Correctness.** Red flags that block merge (CI is already green; read code, do not re-run tests).
+2. **Correctness.** Red flags that block merge (read code, do not re-run tests). If the pipeline is red for a reason unrelated to the diff (step-1 triage: a vuln-gate CVE, a known flake), tell the reviewer so explicitly and have them review the code only, not the red CI.
 3. **Migration** (if it adds one): is it standalone/safe to renumber filename-only, or does it depend on ordering?
 
 Do not merge anything until every verdict is MERGE or MERGE-WITH-NOTES. Surface any OBJECT to the user.
@@ -63,6 +67,8 @@ env -u GITLAB_TOKEN glab api "projects/$enc/pipelines/<id>/jobs?per_page=100" \
   | python3 -c "import sys,json;[print(j['status'].upper().ljust(9),j['stage'].ljust(10),j['name']) for j in json.load(sys.stdin)]"
 ```
 Run the poll as a background command (loop until the pipeline status is terminal). If a job fails, read its log (`env -u GITLAB_TOKEN glab ci trace <job-id>` or the job web_url), fix, and re-push.
+
+**Real failure vs flake.** A timing/resource-sensitive test failing under CI CPU contention is a flake, not a defect — confirm it (assertion is timing-based, failing test unrelated to the diff, same job passed on another pipeline off the same base), then **retry the single job** instead of re-pushing: `env -u GITLAB_TOKEN glab api --method POST "projects/$enc/jobs/<job-id>/retry"`. File the flake as a `bug` issue. The **tag pipeline re-runs the full gate**, so a flake can block the `publish:*` stage even after every MR merged green — retry the job, do not re-tag. Cancel a redundant `main` pipeline to free runners for the tag: `... --method POST "projects/$enc/pipelines/<id>/cancel"`.
 
 ## 5. Cut the release — follow deploy/README.md, do not improvise
 Read `deploy/README.md` section **"Release procedure"** and follow it. In brief (verify against the doc each time, it is authoritative):

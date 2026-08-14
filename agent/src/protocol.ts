@@ -169,14 +169,19 @@ export interface AnswerBody {
 }
 
 /** runs.kind (PRD #6; PRD #46 adds "judge" and "self_improve"; PRD #241 adds
- *  "prompt"). self_improve is issue-shaped and runs the ordinary run lane
- *  (RunRunner), with a fixed branch and its own MR evidence (Decision 10).
+ *  "prompt"). "chat" is the chat lane's kind (see `ChatClaimResponse.kind: "chat"`):
+ *  repo-less and issue-less. self_improve is issue-shaped and runs the ordinary run
+ *  lane (RunRunner), with a fixed branch and its own MR evidence (Decision 10).
  *  "prompt" is an ad-hoc SCHEDULED run (PRD #241 Decision 10): repo-ful and
  *  ISSUE-LESS — the `ci_fix` shape, not `self_improve` (which carries a real
  *  tracking issue). For a `prompt` claim `issue_iid` is null (like ci_fix),
  *  `repo` is set, and `issue_description` carries the schedule's stored task
- *  text; it opens a repo→MR run with no issue to close. */
-export type RunKind = "issue" | "ci_fix" | "judge" | "self_improve" | "prompt";
+ *  text; it opens a repo→MR run with no issue to close.
+ *
+ *  RUN_KINDS is mirrored from the DB `runs_kind_check` constraint (in DB CHECK
+ *  order); agent/test/run-kind-db-parity.test.ts keeps the two in sync. */
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt"] as const;
+export type RunKind = (typeof RUN_KINDS)[number];
 
 /** How a run's plan_md was produced (PRD #209 D4). "agent": the worker's own Phase-1
  *  planning turn — today's only case and the DEFAULT. "seeded": the user supplied the

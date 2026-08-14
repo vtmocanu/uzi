@@ -66,6 +66,45 @@ func TestControllerStatusAnswers204WithNoBody(t *testing.T) {
 	}
 }
 
+// Issue #155, security audit HIGH — RecordRollHealth must compute TagValid api-side as
+// semver.IsValid(normSemver(worker_image_tag)), so the SQL arm guard can fail-closed on an
+// unparseable target. This pins the Go computation + wiring INDEPENDENTLY of a database: the
+// captured upsert param must carry TagValid=false for a tag the classifier would discard, and
+// true for one it would trust. If these diverge, a compromised controller can report a
+// split_part-equal-but-invalid tag and suppress `outdated` forever (the audit's finding).
+func TestControllerStatusComputesTagValidFromSemver(t *testing.T) {
+	post := func(tag string) store.UpsertWorkerRollHealthParams {
+		st := &statusStore{rows: 1}
+		h := newProtocolHandler(t, st)
+		body := `{"reported_at":"2026-07-26T10:00:00Z","worker_image_tag":"` + tag + `","workers":[` +
+			`{"id":"11111111-1111-1111-1111-111111111111","phase":"rolling","restart_count":0}]}`
+		rec := httptest.NewRecorder()
+		h.ControllerStatus(rec, httptest.NewRequest(http.MethodPost, "/api/controller/status", strings.NewReader(body)))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d for tag %q, want 204. Body: %q", rec.Code, tag, rec.Body.String())
+		}
+		if len(st.upserts) != 1 {
+			t.Fatalf("recorded %d upserts for tag %q, want 1", len(st.upserts), tag)
+		}
+		return st.upserts[0]
+	}
+
+	// INVALID: split_part strips "+_x" to "0.11.7", which a raw guard reads as a same-release
+	// blip — but semver.IsValid(normSemver("0.11.7+_x")) is false, so the classifier discards
+	// it and falls back to CPVersion. TagValid must be false so the SQL arms fail-closed.
+	if got := post("0.11.7+_x"); got.TagValid {
+		t.Errorf("TagValid = true for the unparseable tag \"0.11.7+_x\"; it must be false so the arm guard " +
+			"engages the ceiling. The classifier discards this tag and compares against CPVersion, so a " +
+			"true here lets a raw split_part read it as a same-release blip and suppress `outdated` forever.")
+	}
+
+	// VALID: a real release coordinate the classifier trusts as the target.
+	if got := post("0.11.9"); !got.TagValid {
+		t.Errorf("TagValid = false for the valid semver tag \"0.11.9\"; it must be true so a genuine " +
+			"same-release blip is still recognised as one and does not spuriously arm the ceiling.")
+	}
+}
+
 // A phase outside the closed enum drops that ENTRY and still answers 204. One garbage row
 // must never blind the whole fleet's report, and it must never be persisted and rendered as
 // a free string, since this value selects a badge.

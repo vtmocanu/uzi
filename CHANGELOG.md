@@ -6,6 +6,42 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-08-14
+
+### Fixed
+
+- **A healthy worker roll no longer badges "outdated".** The upgrade forecast's
+  `upgrading_since` anchor was effectively per-release rather than per-incident:
+  any transient not-Ready blip stamped it (set-if-NULL on a `rolling`/`stuck`
+  report), and it only cleared when the registered version actually moved, so the
+  blip's own restart re-registered at the same version and the anchor never
+  cleared. The stale anchor then rode into the next upgrade and ceiling-gated the
+  R2 check, making a perfectly healthy roll show "outdated" with attention set. The
+  roll-health arm now also requires the reported tag to differ from the worker's
+  own registered version, and it fails closed on an unparseable tag (the audited
+  suppression hole where a `+_x`-style invalid build-metadata tag would strip-equal
+  the version and never arm). Keyed on the worker's authenticated `version`, not
+  the forgeable target tag. (#155)
+
+- **The worker's `RunKind` TypeScript union now includes `chat`.** The DB CHECK on
+  `runs.kind` allows six kinds (`issue`, `ci_fix`, `chat`, `judge`,
+  `self_improve`, `prompt`) but `agent/src/protocol.ts` omitted `chat`, so a
+  `switch` on `RunKind` was non-exhaustive at runtime while typechecking as
+  exhaustive: a real `chat` row would walk straight into a `default:
+  assertNever(kind)` the compiler had certified. `RunKind` is now derived from a
+  `RUN_KINDS` tuple, and a new parity test asserts the union matches the live DB
+  constraint set both ways so the two cannot silently drift again. (#142)
+
+### Security
+
+- **CI Go image bumped to go1.26.6 and nanoid to 3.3.18.** The absolute vulncheck
+  gates went red on freshly-published advisories rather than on any change:
+  govulncheck flagged six (api) and four (controller) called Go standard-library
+  vulnerabilities, all fixed in go1.26.6, and npm audit flagged nanoid 3.3.17
+  (high, GHSA-2v37-7h3g-55p8). The `golang:1.26` CI image is re-pinned to its
+  go1.26.6 digest and nanoid is bumped in the web lockfile (transitive via
+  postcss); react-router stays as a below-threshold moderate. (f2deab30)
+
 ## [0.34.0] - 2026-08-13
 
 ### Changed
