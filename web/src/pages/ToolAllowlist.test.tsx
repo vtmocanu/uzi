@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { ToolAllowlist } from "./ToolAllowlist";
 import { api, type ToolAllowlistEntry } from "../lib/api";
 
@@ -46,7 +47,11 @@ afterEach(() => {
 
 describe("ToolAllowlist admin page", () => {
   it("lists the allowed packages with their version policy", async () => {
-    render(<ToolAllowlist />);
+    render(
+    <MemoryRouter>
+      <ToolAllowlist />
+    </MemoryRouter>,
+  );
     expect(await screen.findByText("kubectl")).toBeTruthy();
     expect(screen.getByText("terraform")).toBeTruthy();
     // The pinned version renders; the any-version entry shows "any".
@@ -55,7 +60,11 @@ describe("ToolAllowlist admin page", () => {
   });
 
   it("adds a package via the form", async () => {
-    render(<ToolAllowlist />);
+    render(
+    <MemoryRouter>
+      <ToolAllowlist />
+    </MemoryRouter>,
+  );
     await screen.findByText("kubectl");
     fireEvent.change(screen.getByPlaceholderText("e.g. kubectl"), { target: { value: "jq" } });
     fireEvent.click(screen.getByRole("button", { name: /add package/i }));
@@ -65,7 +74,11 @@ describe("ToolAllowlist admin page", () => {
   });
 
   it("removes a package", async () => {
-    render(<ToolAllowlist />);
+    render(
+    <MemoryRouter>
+      <ToolAllowlist />
+    </MemoryRouter>,
+  );
     await screen.findByText("kubectl");
     fireEvent.click(screen.getAllByRole("button", { name: /remove/i })[0]!);
     await waitFor(() => expect(mockApi.deleteToolAllowlistEntry).toHaveBeenCalledWith("t-kubectl"));

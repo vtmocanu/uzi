@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { AdminRateLimits } from "./AdminRateLimits";
 import { api, type AdminRateLimitUser, type MyRateLimits } from "../lib/api";
 
@@ -67,7 +68,11 @@ const USERS = [
 describe("AdminRateLimits", () => {
   it("renders every user, badges each state, and sorts danger-first", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     await screen.findByText("ana");
 
     // Sort: danger → warn → ok → stale → unavailable → no_token.
@@ -90,7 +95,11 @@ describe("AdminRateLimits", () => {
     // red via the danger fill while the status pill stays a green "Live" — the
     // badge stays decoupled at ≥95.
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("sorin", ok(88, 76))] });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     const sorin = (await screen.findByText("sorin")).closest("tr")!;
     // Forecast wrapper paints the fill LAST (opaque, over the ghost), so it is the
     // progressbar's lastChild (MeterTrack used directly has the fill as its only child).
@@ -111,7 +120,11 @@ describe("AdminRateLimits", () => {
         row("vlad", ok(8, 27)),
       ],
     });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     const nadia = (await screen.findByText("nadia")).closest("tr")!;
     expect(within(nadia).getByText("Recorded at usage limit")).toBeTruthy();
     // The updated line still renders alongside the disclosure.
@@ -123,7 +136,11 @@ describe("AdminRateLimits", () => {
 
   it("renders a faint 'no name' placeholder for a user with an empty name (PRD #54)", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("", ok(8, 27))] });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     await screen.findByText("no name");
     // The placeholder must be the first div's textContent (the sort test reads the
     // name via querySelector("div")), so the email below never floats an empty line.
@@ -134,7 +151,11 @@ describe("AdminRateLimits", () => {
 
   it("shows a dim 'stale' reset on the vault-locked row and dashes for no-reading rows", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     const mihai = (await screen.findByText("mihai")).closest("tr")!;
     expect(within(mihai).getAllByText("stale").length).toBe(2); // both windows read "stale"
     expect(within(mihai).getByText("31%")).toBeTruthy(); // pct still shown, just dimmed
@@ -156,7 +177,11 @@ describe("AdminRateLimits", () => {
     // render. The Utilization column carries the anchored forecast (PRD #310), hence
     // its renamed header.
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     await screen.findByText("ana");
 
     const headers = screen.getAllByRole("columnheader").map((h) => h.textContent);
@@ -174,7 +199,11 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
   it("draws a forecast ghost + » on a row heading past the cap, with no warm-up", async () => {
     // ana's 5h window at 90% with a near reset (elapsed ≈ 13000s ⇒ projected ≈ 125).
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("ana", ok(90, 20))] });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
 
     const ana = (await screen.findByText("ana")).closest("tr")!;
     const bar5h = within(ana).getByRole("progressbar", { name: "5-hour window" });
@@ -184,7 +213,11 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
 
   it("stays a plain bar on a low reading with headroom", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("vlad", ok(20, 20))] });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
 
     const vlad = (await screen.findByText("vlad")).closest("tr")!;
     const bar5h = within(vlad).getByRole("progressbar", { name: "5-hour window" });
@@ -194,7 +227,11 @@ describe("AdminRateLimits forecast (PRD #310 — anchored, always-on)", () => {
 
   it("draws no forecast on a stale row heading past the cap", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("mihai", ok(90, 20, { stale: true }))] });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
 
     const mihai = (await screen.findByText("mihai")).closest("tr")!;
     expect(within(mihai).queryByTestId("forecast-overflow-marker")).toBeNull();
@@ -209,7 +246,11 @@ describe("AdminRateLimits reset label (PRD #310 M3)", () => {
 
   it("renders the 7-day reset label under the token name", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("ana", ok(90, 20))] }); // 7d set
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     const ana = (await screen.findByText("ana")).closest("tr")!;
     expect(ana.textContent).toMatch(RESET_LABEL);
   });
@@ -218,7 +259,11 @@ describe("AdminRateLimits reset label (PRD #310 M3)", () => {
     mockApi.getAdminRateLimits.mockResolvedValue({
       users: [row("vlad", ok(20, 20, { seven_day: { pct: 20, resets_at: null } }))],
     });
-    render(<AdminRateLimits />);
+    render(
+    <MemoryRouter>
+      <AdminRateLimits />
+    </MemoryRouter>,
+  );
     const vlad = (await screen.findByText("vlad")).closest("tr")!;
     expect(vlad.textContent).not.toMatch(RESET_LABEL);
   });

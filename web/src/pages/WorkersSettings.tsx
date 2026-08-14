@@ -1,13 +1,14 @@
-// Settings → Workers: register workers, show the one-time join token, and list
-// the fleet with live status. Inside SettingsShell.
+// Workers (/workers): register workers, show the one-time join token, and list
+// the fleet with live status. A first-class Factory page — it lived under
+// Settings as /settings/workers until the IA restructure; it is operations
+// (fleet status, upgrade rolls, the sidebar attention badge), not a preference.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
-import { SettingsShell } from "../components/SettingsShell";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
 import { ServerIcon } from "../components/icons";
@@ -290,7 +291,11 @@ export function WorkersSettings() {
   };
 
   return (
-    <SettingsShell description="Workers are your uzi-agent containers: they claim your runs and stream them back.">
+    <div className="space-y-6">
+      <PageHeader
+        title="Workers"
+        description="Workers are your uzi-agent containers: they claim your runs and stream them back."
+      />
       {error && <Alert message={error} />}
 
       {newToken && (
@@ -697,6 +702,6 @@ export function WorkersSettings() {
           </>
         )}
       </Card>
-    </SettingsShell>
+    </div>
   );
 }

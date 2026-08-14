@@ -7,7 +7,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type BlockedRepo } from "../lib/api";
-import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Textarea } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, Textarea } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
 
@@ -95,11 +96,7 @@ export function AdminBlockedRepos() {
   };
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Blocked repos"
-        description="Every user's repos the push/merge guardrail refuses right now, plus any an admin has explicitly allowed. Fixing branch protection on the forge clears the block on the next sync; an override persists until revoked."
-      />
+    <AdminShell description="Every user's repos the push/merge guardrail refuses right now, plus any an admin has explicitly allowed. Fixing branch protection on the forge clears the block on the next sync; an override persists until revoked.">
 
       {error && <Alert message={error} />}
 
@@ -274,6 +271,6 @@ export function AdminBlockedRepos() {
           </div>
         </Modal>
       )}
-    </div>
+    </AdminShell>
   );
 }

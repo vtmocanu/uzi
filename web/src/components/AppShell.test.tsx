@@ -183,12 +183,19 @@ describe("AppShell navigation", () => {
     // Board children arrive from listRepos; await one before asserting.
     const uziBoard = await screen.findByRole("link", { name: "vtmocanu/uzi" });
 
-    for (const group of ["Work", "Factory", "Configure", "Help"]) {
+    for (const group of ["Work", "Factory"]) {
       expect(screen.getByText(group)).toBeTruthy();
+    }
+    // The old one-item groups are gone: Settings and Docs live in the unlabeled
+    // bottom cluster, grouped by a rule rather than a header row each.
+    for (const retired of ["Configure", "Help"]) {
+      expect(screen.queryByText(retired)).toBeNull();
     }
     for (const item of ["Overview", "Boards", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
       expect(screen.getByRole("link", { name: item })).toBeTruthy();
     }
+    // Admin is a single tabbed destination and only for admins; this user is not one.
+    expect(screen.queryByRole("link", { name: "Admin" })).toBeNull();
 
     // Every board child renders an inline forge glyph.
     expect(uziBoard.querySelector("svg")).not.toBeNull();
@@ -240,22 +247,24 @@ describe("AppShell navigation", () => {
     expect(uziBoard.querySelector("svg")).not.toBeNull();
   });
 
-  it("keeps Settings lit across /settings/* except /settings/workers (owned by the Workers entry)", async () => {
+  it("keeps Settings lit across /settings/* and gives Workers its own /workers home", async () => {
     // /settings itself → Settings active.
     renderShell("/settings");
     await waitFor(() => expect(mockApi.listConnections).toHaveBeenCalled());
     expect(screen.getByRole("link", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
     cleanup();
 
-    // A forge tab lands under /settings/forge → Settings stays lit.
+    // A forge tab lands under /settings/forge → Settings stays lit, Workers does not.
+    // Workers is no longer a Settings tab, so no excludeSubpath carve-out exists any more.
     renderShell("/settings/forge");
     await waitFor(() => expect(mockApi.listConnections).toHaveBeenCalled());
     expect(screen.getByRole("link", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Workers" }).getAttribute("aria-current")).toBeNull();
     cleanup();
 
-    // /settings/workers belongs to the Factory "Workers" entry, not Settings.
-    renderShell("/settings/workers");
+    // /workers belongs to the Factory "Workers" entry alone. (The old
+    // /settings/workers URL redirects there in App.tsx, outside this shell.)
+    renderShell("/workers");
     await waitFor(() => expect(mockApi.listConnections).toHaveBeenCalled());
     expect(screen.getByRole("link", { name: "Workers" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Settings" }).getAttribute("aria-current")).toBeNull();

@@ -46,7 +46,7 @@ function WorkerOfflineBanner() {
   return (
     <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn">
       No worker connected — chat needs your worker running. Messages queue until one comes online.{" "}
-      <Link to="/settings/workers" className="font-medium underline underline-offset-2">
+      <Link to="/workers" className="font-medium underline underline-offset-2">
         Set up a worker
       </Link>
       .

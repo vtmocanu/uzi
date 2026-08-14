@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { AdminBlockedRepos } from "./AdminBlockedRepos";
 import { api, type BlockedRepo } from "../lib/api";
 
@@ -65,7 +66,11 @@ afterEach(() => {
 });
 
 function renderPage() {
-  return render(<AdminBlockedRepos />);
+  return render(
+    <MemoryRouter>
+      <AdminBlockedRepos />
+    </MemoryRouter>,
+  );
 }
 
 describe("AdminBlockedRepos", () => {

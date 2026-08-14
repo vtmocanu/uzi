@@ -89,8 +89,11 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* Workers moved out of the Settings tabs to a first-class Factory page;
+            the old URL keeps working for bookmarks and stale deep links. */}
+        <Route path="/settings/workers" element={<Navigate to="/workers" replace />} />
         <Route
-          path="/settings/workers"
+          path="/workers"
           element={
             <ProtectedRoute>
               <WorkersSettings />
@@ -232,6 +235,8 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* The sidebar's single Admin entry lands on the first AdminShell tab. */}
+        <Route path="/admin" element={<Navigate to="/admin/users" replace />} />
         <Route
           path="/admin/users"
           element={

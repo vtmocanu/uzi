@@ -24,11 +24,11 @@ import {
   Card,
   Field,
   Input,
-  PageHeader,
   SectionTitle,
   Select,
   Skeleton,
 } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
 import { THEMES, THEME_LABELS } from "../lib/theme";
 
 // slackStatusChip renders the live Slack connection state (PRD #25 M2) as a
@@ -375,11 +375,7 @@ export function AdminSettings() {
   };
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Instance settings"
-        description="Configuration shared across every user of this uzi instance."
-      />
+    <AdminShell description="Configuration shared across every user of this uzi instance.">
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -593,7 +589,7 @@ export function AdminSettings() {
       {!loading && saved && (
         <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
       )}
-    </div>
+    </AdminShell>
   );
 }
 

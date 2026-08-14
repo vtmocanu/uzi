@@ -54,7 +54,7 @@ export function ChatComposer({
         <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn">
           No worker connected — chat needs your worker running. Your message will be answered once
           one comes online.{" "}
-          <Link to="/settings/workers" className="font-medium underline underline-offset-2">
+          <Link to="/workers" className="font-medium underline underline-offset-2">
             Set up a worker
           </Link>
           .

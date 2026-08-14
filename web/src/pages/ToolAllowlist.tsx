@@ -4,7 +4,8 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, type ToolAllowlistEntry } from "../lib/api";
-import { Alert, Button, Card, EmptyState, Field, Input, ListSkeleton, PageHeader } from "../components/ui";
+import { Alert, Button, Card, EmptyState, Field, Input, ListSkeleton } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
 import { PackageIcon } from "../components/icons";
 
 export function ToolAllowlist() {
@@ -63,11 +64,7 @@ export function ToolAllowlist() {
   };
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Tool allowlist"
-        description="Packages a user may add to a repo's tool profile. The worker installs them with devbox before a run. Never add a pre-authenticated, credential-bearing CLI."
-      />
+    <AdminShell description="Packages a user may add to a repo's tool profile. The worker installs them with devbox before a run. Never add a pre-authenticated, credential-bearing CLI.">
 
       {error && <Alert message={error} />}
 
@@ -134,6 +131,6 @@ export function ToolAllowlist() {
           </div>
         </Card>
       )}
-    </div>
+    </AdminShell>
   );
 }

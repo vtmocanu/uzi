@@ -108,6 +108,13 @@ export const GearIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// The sidebar's single Admin entry (the five admin surfaces are AdminShell tabs).
+export const ShieldIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </Icon>
+);
+
 export const BranchIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <circle cx="6" cy="6" r="3" />

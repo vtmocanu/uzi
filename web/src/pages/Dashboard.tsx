@@ -215,7 +215,7 @@ export function Dashboard() {
             label="Workers online"
             value={`${data.workersOnline}/${data.workersTotal}`}
             hint="your fleet"
-            to="/settings/workers"
+            to="/workers"
           />
           <StatTile label="Boards" value={data.reposEnabled} hint="enabled repos" to="/repos" />
           <StatTile label="Agent templates" value={data.templates} hint="roles available" to="/agents" />
@@ -229,7 +229,7 @@ export function Dashboard() {
         <Card>
           <div className="flex items-center justify-between">
             <SectionTitle>Worker load</SectionTitle>
-            <Link to="/settings/workers" className="text-xs font-medium text-brand hover:text-brand-hover">
+            <Link to="/workers" className="text-xs font-medium text-brand hover:text-brand-hover">
               Workers →
             </Link>
           </div>
@@ -287,7 +287,7 @@ export function Dashboard() {
               index={4}
               title="Bring a worker online"
               hint="Generate a join token and start the uzi-agent container with it."
-              to="/settings/workers"
+              to="/workers"
               cta="Workers"
             />
           </ol>
