@@ -18935,7 +18935,7 @@ unchanged; this only adds a way to narrow which groups come back.
   `CountJudgeGroupsByCategoryForUser` aggregate (`/me/judge/category-stats`) and the chips now
   carry counts — the count is still NEVER tallied off `groups`.
 
-## 490. PRD #239 — the Runs nav badge counts the caller's NON-terminal, non-chat/judge runs: a strict SUBSET of the /runs page, its own endpoint, and no CLI subcommand
+## 490. PRD #239 — the Runs nav badge counts the caller's NON-terminal, non-chat/judge runs: a SUBSET of the /runs page (and now equal to its Active list — see Decision 4), its own endpoint, and no CLI subcommand
 
 Serves the live-run-visibility surface of human.md Feature #4 ("which agents are live/idle") as
 ambient navigation, alongside the existing Judge (§482) and Workers (§Feature #113 M6) nav badges.
@@ -18954,15 +18954,26 @@ in-flight runs on the Runs `NavItem`; no new product contract beyond one owner-s
   key off the same three-value terminal set). Source of truth: `CountInProgressRunsForUser` in
   `api/internal/store/queries/runtime.sql` — one `count(*)`, no join.
 
-- **Kind scope = the /runs page's own predicate, so the badge is a strict SUBSET of the page (Decision 4).**
+- **Kind scope = the /runs page's own predicate, so the badge is a SUBSET of the page (Decision 4).**
   The query additionally filters `kind NOT IN ('chat','judge')`, the same kind guard `ListRunsForUser`
   applies (which writes it aliased as `r.kind NOT IN (...)`; semantically identical), so the badge
-  counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat` or `judge` meta-run. The invariant is **same scope predicate (owner + kind-set)**, deliberately NOT
-  numeric equality with what the page renders: the /runs page also lists TERMINAL runs, so the badge
-  is a non-terminal subset of the page's list, never equal to its row count. Framed as a subset
-  because that is the property a reader can check (a badge count can never exceed, or include a kind
-  absent from, the page) — a fragile "equals the page" claim would be false the moment any run
-  completes.
+  counts exactly `issue` + `ci_fix` + `self_improve` runs and never a `chat` or `judge` meta-run. The
+  durable invariant is **same scope predicate (owner + kind-set)**, deliberately NOT a numeric-equality
+  contract with what the page renders — that is the property a reader can check (a badge count can
+  never exceed, nor include a kind absent from, the page), and it must not break if the page's
+  membership rule ever changes.
+  **Updated 2026-08-14 (Runs IA restructure, §531):** the original reasoning here — *"the /runs page
+  also lists TERMINAL runs, so the badge is a non-terminal subset of the page's list, never equal to
+  its row count… a fragile 'equals the page' claim would be false the moment any run completes"* — is
+  now FALSE and was corrected in place. After the IA split, `/runs` (the live console) lists ONLY
+  non-terminal runs; terminal runs moved to the separate `/runs/history` tab. The console's Active
+  section is `runs.filter(!isTerminalRun)` over the caller's own `ListRunsForUser`, i.e. exactly the
+  badge's predicate (owner + non-terminal + `kind∉{chat,judge}`; `isTerminalRun` = `completed`/`failed`/
+  `cancelled`, the badge's complement), so the badge now DOES equal that Active list's row count.
+  Equality is against the caller's own Active **section**, not the whole rendered page: an admin also
+  sees a Factory card of OTHER users' active runs, which the badge's `user_id = caller` scope excludes,
+  so the subset relation over the full page still holds. The badge stays DESIGNED as a subset (the
+  invariant above), only its old terminal-runs justification retired.
 
 - **Endpoint: `GET /api/me/runs/in-progress-count` → `{ "count": <int> }`, on `RequireUser`.**
   Handler `RunsInProgressCount` (`api/internal/handler/runs_in_progress_count.go`); mounted under a
@@ -19535,8 +19546,14 @@ derived client-side from timestamps already on the run.
   row has no dedicated state-entry timestamp; a `state_since` column was considered and left out of
   scope); terminal→static `finished_at − started_at`. The CLI twin mirrors these exactly.
 - **Runs page (M3): token joins the meta line ALONGSIDE the existing timestamp** (owner decision), not
-  replacing it. Live via the reused `useNow(1000)` tick since the page loads once. A single shared
-  `RunRow` covers the owner Active/Past lists and the admin all-users list.
+  replacing it, via a single shared `RunRow` on every run surface. **Updated 2026-08-14 (Runs IA
+  restructure, §531):** the Runs page split into two routed tabs, so the token now renders on both —
+  the live console (`/runs`, `useNow(1000)`: running rows need a per-second tick) and the history
+  archive (`/runs/history`, `useNow(60_000)`: every row is terminal so the token is a static `ran …`
+  and a minute cadence suffices). The single shared `RunRow` still covers the console's Active list,
+  the history tab, and the admin factory list. (The pre-split note read: "Live via the reused
+  `useNow(1000)` tick since the page loads once. A single shared `RunRow` covers the owner Active/Past
+  lists and the admin all-users list.")
 - **Board (M4): web-only and DEGRADED by owner decision (Decision 6).** The same helper renders on
   every card, and the running elapsed moved OUT of the status badge (now a bare `running`) into the
   uniform meta-line token to avoid doubling (Decision 4). The board's `LatestRun` projection lacks
@@ -20430,3 +20447,66 @@ point, so pre-existing backlog in files the branch never touched cannot false-re
   does not expand env vars and the ref must also resolve in GitLab's detached-HEAD CI. Real CI still ratchets
   against current `main` and is unaffected — the clamp lives only in the worker's clone setup. The
   no-resolvable-default-branch edge keeps today's skip, governed by the Taskfile merge-base pre-flight.
+
+# Runs IA restructure — /runs split into a live console + a searchable history tab
+
+## 531. Runs IA restructure — `/runs` becomes a live console (non-terminal only) with a separate `/runs/history` archive, one shared fetch behind a layout route
+
+Serves the user-stated Runs requirements (see [specs/human.md](./human.md), pending confirmation):
+a separate tab for past runs; search over past runs; date-grouped past runs (day / week / month by
+recency); progressive "show more" reveal like the board; the admin Factory status showing only OTHER
+users' runs. Realized on `web/src/pages/RunsList.tsx`, `web/src/lib/runGroups.ts`, `web/src/App.tsx`,
+`web/src/components/AppShell.tsx`. This is the branch that made §490's terminal-runs reasoning false;
+that correction is recorded in §490 Decision 4 and the clock-cadence consequence in §504 M3.
+
+- **One sidebar "Runs" destination, two routed tabs under a LAYOUT ROUTE.** `App.tsx` nests `/runs`
+  (the live console) and `/runs/history` (the archive) under a `RunsLayout` route. Chosen over two
+  independent pages, or client-side tab state, because it gives native deep-linking and back/forward
+  (the SettingsShell/AdminShell `NavLink` pattern) AND lets one fetch serve both tabs. React Router
+  ranks the static `/runs/history` above the dynamic `/runs/:id` by construction, and run ids are
+  `run-*`/UUIDs besides, so there is no route ambiguity.
+- **One `listRuns()` fetch, shared via the router's `Outlet` context — the load-bearing reason the
+  layout route exists.** `RunsLayout` owns `runs`/`loading`/`error`/`tokenCount` and passes them to
+  both tabs through `useOutletContext`. When each tab fetched for itself, every tab switch remounted
+  the page, refetched, and blanked the counted "Past runs · N" label until the load returned. With the
+  shared fetch a switch neither refetches nor resets the count; while the first load is in flight the
+  Past-runs tab shows the bare label (past-count `null`) rather than a flashing `0`.
+- **The split predicate is `isTerminalRun`.** `/runs` shows `runs.filter(!isTerminalRun)` (Active),
+  `/runs/history` shows `runs.filter(isTerminalRun)` (Past). `isTerminalRun` = `completed`/`failed`/
+  `cancelled`; the caller's `listRuns()` (`GET /runs` → `ListRunsForUser`) is already owner-scoped and
+  `kind∉{chat,judge}`. Consequence for the nav badge: the console's Active list now equals the Runs
+  badge's predicate exactly (see §490).
+- **Factory admin card filters to OTHER users only, via `owner_email`.** The card (admin-only, on the
+  live console) drops rows where `owner_email === user.email` — heading "Active runs · other users" —
+  because the admin's own runs already appear in the Active section directly above, so including them
+  made the card read as a duplicate. `owner_email` is the discriminator because `RunListItem` carries
+  no `is_mine`; a row without an `owner_email` stays visible. The full factory picture is the union of
+  the two adjacent sections. Admin runs/workers are fetched HERE (`adminListRuns`/`adminListWorkers`),
+  not in the layout, so the non-admin majority never pays for them and the layout stays role-agnostic;
+  a factory-fetch failure alerts INSIDE the card rather than blanking the personal sections.
+- **Archive date grouping — grain follows recency (`web/src/lib/runGroups.ts`, pure + clock-explicit).**
+  A past run buckets from its anchor: Today / Yesterday by name; earlier days of the CURRENT week by
+  weekday ("Monday"); earlier weeks of the CURRENT month as "Week of Aug 3"; anything older by calendar
+  month ("July 2026"). Boundaries are LOCAL time (the reader's "today", matching the `toLocaleString`
+  timestamps already rendered), weeks are ISO (Monday start). A timestamp at/ahead of `now` (clock skew,
+  a just-finished run) folds into Today, never a future bucket. Every function takes `now` as a parameter
+  so tests pin the wall clock (the `runBadge.ts`/`runDuration.ts` discipline). `groupRuns` relies on the
+  input being time-sorted newest-first, so buckets come out in that order with no explicit sort of groups.
+- **The past anchor is `finished_at ?? updated_at`, one function (`pastAnchor`) shared by the sort and
+  the group headers** so they can never disagree about where a run belongs. Sort is newest-anchor-first,
+  tie-broken by multica's `PAST_STATUS_RANK` (failed ≺ cancelled ≺ completed).
+- **Progressive reveal reuses the board's `lanePaging` (PRD #304): cap 10, page 50.** Membership → search
+  → slice → group, transposing the board's order: grouping runs over the SLICED list, so a group never
+  shows half its rows under a header claiming more while the reveal button carries the honest remainder.
+  An active search lifts the baseline to a full page (lanePaging owns that rule) and re-baselines the
+  reveal; reveal grows the slice one page per "Show N more". `lanePaging` is display state only, never
+  membership.
+- **Archive search — `runMatchesQuery`, the board's `matchesQuery` transposed to run rows.** Case-
+  insensitive substring over issue title, repo path, worker name, status, plus the board's `#iid` arm
+  (a single leading `#` stripped; partial issue numbers match). `indexOf`-based, never `new RegExp(q)`
+  (q is user input). Search state lives in `?q=` (shareable filtered view) with `replace:true` so typing
+  does not fill the history stack; `/` focuses the search box (the board's M5 shortcut, same guard);
+  Escape clears and blurs.
+- **The two smaller ux tweaks that shipped on this branch** (realizations of the same pending human.md
+  items): the sidebar collapse control was reworked so it no longer consumes a full sidebar row
+  (`AppShell.tsx`), and the Schedules "Last fire" caret now renders correctly (`web/src/pages/Schedules.tsx`).
