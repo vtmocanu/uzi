@@ -533,6 +533,32 @@ describe("RunsList — past section search, grouping and reveal (ux-tweaks)", ()
     fireEvent.click(screen.getByText("Collapse"));
     expect(screen.queryByText("Past run 10")).toBeNull();
   });
+
+  // Page order (amendment 2026-08-14): the admin Factory card sits ABOVE the past
+  // archive, so the one section that grows (Show 50 more) is always the page's tail.
+  it("renders the admin Factory status card before the Past runs archive", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [pastRun("t", "Finished run", "2026-07-05T12:00:00Z")],
+    });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
+    const factory = screen.getByText("Factory status (admin)");
+    const pastHeading = screen.getByText("Past runs");
+    // DOCUMENT_POSITION_FOLLOWING (4): pastHeading comes after factory in the DOM.
+    expect(factory.compareDocumentPosition(pastHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(4);
+  });
 });
 
 // PRD #295: the compact credential badge on the Runs list, gated on the viewer
