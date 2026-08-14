@@ -28,7 +28,7 @@ import {
   Toggle,
   cx,
 } from "../components/ui";
-import { ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
+import { ChevronDownIcon, ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
 
 // The COLSPAN of the schedules table, so the expandable "Last fire" detail row
 // stretches the full width (Target · When · Next run · Last run · Options · On).
@@ -288,6 +288,7 @@ function ScheduleRow({
             fire={s.last_fire}
             expanded={expanded}
             onToggle={() => setExpanded((v) => !v)}
+            panelId={`last-fire-${s.id}`}
           />
         ) : s.last_fired_at ? (
           <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
@@ -332,7 +333,10 @@ function ScheduleRow({
     </tr>
     {s.last_fire && expanded && (
       <tr className="border-t border-edge">
-        <td colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-0">
+        {/* The id pairs with the disclosure's aria-controls (review-wave fix 4).
+            Conditionally rendered, so the reference only exists while expanded —
+            which is when aria-controls has anything to say. */}
+        <td id={`last-fire-${s.id}`} colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-0">
           <LastFireDetail s={s} fire={s.last_fire} />
         </td>
       </tr>
@@ -348,10 +352,13 @@ function LastRunOutcome({
   fire,
   expanded,
   onToggle,
+  panelId,
 }: {
   fire: LastFire;
   expanded: boolean;
   onToggle: () => void;
+  // The detail row's element id, for the disclosure's aria-controls.
+  panelId: string;
 }) {
   return (
     <div className="flex flex-col gap-1">
@@ -361,16 +368,22 @@ function LastRunOutcome({
       <span className="text-[11px] text-faint tabular-nums">
         {formatStamp(fire.fired_at)} · matched {fire.matched}
       </span>
+      {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
+          place, so it must not wear the app's link costume (text-info + underline
+          promises navigation). Muted text + a chevron is the vocabulary every other
+          expander here uses. The chevron is the SVG icon, not the ▾ font glyph — the
+          glyph's metrics drift per font and its rotated open state rendered as thin
+          stray lines; the SVG is viewBox-centred and crisp in both themes (the same
+          trade ChevronsRightIcon records in icons.tsx). */}
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="inline-flex items-center gap-1 text-[11px] font-medium text-info hover:underline"
+        aria-controls={panelId}
+        className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
         Last fire
-        <span aria-hidden="true" className={cx("transition-transform", expanded && "rotate-180")}>
-          ▾
-        </span>
+        <ChevronDownIcon className={cx("h-3 w-3 transition-transform", expanded && "rotate-180")} />
       </button>
     </div>
   );

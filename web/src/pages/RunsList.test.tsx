@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { RunsList } from "./RunsList";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { RunsHistory, RunsLayout, RunsList } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -35,13 +35,39 @@ vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 // Issue #256 M3: useNow is the single clock the duration token reads. Pin it so the
 // live buckets ("running 1h 30m") are deterministic — the real hook returns Date.now().
-const FIXED_NOW = Date.parse("2026-07-05T13:30:00Z");
+// Built through the LOCAL-time Date constructor, like every date fixture below (the
+// runGroups.test.ts pattern): runBucket's day boundaries are local, so a Z-parsed
+// instant here lands on a different local DAY than the fixtures in timezones far
+// from UTC — measured: TZ=Pacific/Norfolk turned "Today" into "Yesterday" (review-
+// wave fix 2, which also retired a comment falsely claiming Z-margins were enough).
+const FIXED_NOW = new Date(2026, 6, 5, 13, 30).getTime(); // 2026-07-05 13:30 local
+
+// Local-clock ISO fixture helper: same LOCAL day as FIXED_NOW in every timezone.
+const atLocal = (y: number, mo: number, d: number, h = 12, min = 0) =>
+  new Date(y, mo, d, h, min).toISOString();
 vi.mock("../lib/rateLimits", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/rateLimits")>();
   return { ...actual, useNow: () => FIXED_NOW };
 });
 
 const mockApi = vi.mocked(api);
+
+// Every test renders through the layout route (amendment 3 + the tab-count nit):
+// RunsList/RunsHistory read the layout's Outlet context, so rendering them bare
+// would throw — and the layout owning the ONE runs fetch is itself the behavior
+// the tab tests pin.
+function renderRuns(initialPath = "/runs") {
+  return render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Routes>
+        <Route element={<RunsLayout />}>
+          <Route path="/runs" element={<RunsList />} />
+          <Route path="/runs/history" element={<RunsHistory />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
@@ -139,11 +165,7 @@ describe("RunsList — the admin fleet list carries no format characters (#124)"
       ],
     } as never);
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
     // Anchored on the owner email, which the mutation cannot move.
     await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
@@ -161,11 +183,7 @@ describe("RunsList — the run title carries no format characters (#124)", () =>
       runs: [aRun({ id: "r", issue_title: "Fix the \u202Eparser\u200B bug", status: "running" })],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
@@ -183,11 +201,7 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
     expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
@@ -195,7 +209,12 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.queryByText("queued")).toBeNull();
   });
 
-  it("admin all-users list: only the admin's OWN queued row shows waiting-for-unlock", async () => {
+  // Amendment 2026-08-14 (2): the factory card hides the admin's own runs (they are
+  // already the Active section above), so the waiting-for-unlock badge — which only
+  // ever applied to the admin's OWN queued rows — cannot appear on this list at all,
+  // and another owner's queued row stays a plain "queued" pill (their vault state is
+  // unknown here, PRD #32).
+  it("admin factory list hides the admin's own runs; other users' queued rows read plain", async () => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: true, email: "me@uzi.test" },
       vaultUnlocked: false,
@@ -209,16 +228,16 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
-    await waitFor(() => expect(screen.getByText("My queued")).toBeTruthy());
-    // Exactly one waiting badge — the admin's own row; the other owner's row stays
-    // a plain "queued" pill (their vault state is unknown here).
-    expect(screen.getAllByText(/waiting for vault unlock/)).toHaveLength(1);
+    await waitFor(() => expect(screen.getByText("Their queued")).toBeTruthy());
+    // The heading says what the list now is; the old all-users copy is retired.
+    expect(screen.getByText("Active runs · other users")).toBeTruthy();
+    expect(screen.queryByText("Active runs · all users")).toBeNull();
+    // The admin's own row is gone from the card (it lives in Active above)…
+    expect(screen.queryByText("My queued")).toBeNull();
+    // …and no waiting badge can render here; the other owner's row reads plain.
+    expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
     expect(screen.getByText("queued")).toBeTruthy();
   });
 
@@ -231,11 +250,7 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
     expect(screen.getByText("queued")).toBeTruthy();
@@ -252,11 +267,7 @@ describe("RunsList — autopilot badge", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Autopilot run")).toBeTruthy());
     expect(screen.getByText("Manual run")).toBeTruthy();
@@ -279,11 +290,7 @@ describe("RunsList — usage meta line (PRD #40)", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Has usage")).toBeTruthy());
     // total = 114.4k + 1.17M + 0 + 48.2k = 1,332,600 → "1.33M tok so far" (running).
@@ -298,11 +305,7 @@ describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", 
   it("no longer renders the aggregate strip (its home is now the Judge page header)", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "A run" })] });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("A run")).toBeTruthy());
     expect(screen.queryByText("Judge recommendations · all your runs")).toBeNull();
@@ -342,11 +345,7 @@ describe("RunsList milestone badge (PRD #122)", () => {
         }),
       ],
     });
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
     await waitFor(() => expect(screen.getByText("Milestone run")).toBeTruthy());
     expect(screen.getByText("M2/3")).toBeTruthy();
   });
@@ -355,11 +354,7 @@ describe("RunsList milestone badge (PRD #122)", () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [aRun({ id: "n", issue_title: "Plain run", status: "running", milestones: null })],
     });
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
     await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
   });
@@ -376,28 +371,19 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
   });
 
   it("shows a running run's live age (started_at 90m before the fixed now)", async () => {
+    // Derived FROM FIXED_NOW rather than written as an instant, so the 90-minute
+    // difference — all the duration token reads — holds in any timezone.
+    const started = new Date(FIXED_NOW - 90 * 60_000).toISOString();
     mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({
-          id: "act",
-          issue_title: "Active run",
-          status: "running",
-          // 90 minutes before FIXED_NOW (2026-07-05T13:30:00Z) → "running 1h 30m".
-          started_at: "2026-07-05T12:00:00Z",
-        }),
-      ],
+      runs: [aRun({ id: "act", issue_title: "Active run", status: "running", started_at: started })],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Active run")).toBeTruthy());
     expect(screen.getByText(/running 1h 30m/)).toBeTruthy();
     // The updated_at timestamp is kept alongside the token, not replaced (owner decision).
-    expect(container.textContent ?? "").toContain(new Date("2026-07-05T12:00:00Z").toLocaleString());
+    expect(container.textContent ?? "").toContain(new Date(aRun().updated_at).toLocaleString());
   });
 
   it("shows a terminal run's static ran-span (finished_at − started_at = 42m)", async () => {
@@ -407,21 +393,15 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
           id: "term",
           issue_title: "Terminal run",
           status: "completed",
-          started_at: "2026-07-05T12:00:00Z",
-          finished_at: "2026-07-05T12:42:00Z",
+          started_at: atLocal(2026, 6, 5, 12, 0),
+          finished_at: atLocal(2026, 6, 5, 12, 42),
         }),
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    // Terminal runs live on the archive tab (amendment 3).
+    renderRuns("/runs/history");
 
-    // Terminal runs live behind the collapsed "Show past runs" toggle.
-    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
-    fireEvent.click(screen.getByText(/Show past runs/));
     await waitFor(() => expect(screen.getByText("Terminal run")).toBeTruthy());
     expect(screen.getByText(/ran 42m/)).toBeTruthy();
   });
@@ -432,16 +412,180 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       runs: [aRun({ id: "none", issue_title: "Never started", status: "completed", started_at: null, finished_at: null })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
-    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
-    fireEvent.click(screen.getByText(/Show past runs/));
     await waitFor(() => expect(screen.getByText("Never started")).toBeTruthy());
     expect(screen.queryByText(/\bran\b/)).toBeNull();
+  });
+});
+
+// ux-tweaks item 3 (+ amendment 3): the archive tab is searchable, date-grouped
+// (lib/runGroups.ts) and render-sliced through the board's lanePaging (cap 10,
+// page 50). It lives at /runs/history — these render RunsHistory directly.
+describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  // Timestamps come from atLocal (the local-clock Date constructor, same as
+  // FIXED_NOW), so fixture and clock share a local DAY in every test timezone —
+  // runBucket's boundaries are local, and Z-instant fixtures with "wide margins"
+  // demonstrably were not enough (review-wave fix 2).
+  const pastRun = (id: string, title: string, finishedAt: string) =>
+    aRun({ id, issue_title: title, status: "completed", started_at: finishedAt, finished_at: finishedAt });
+
+  it("groups past runs under date headers (Today vs an older month)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("t", "Fresh run", atLocal(2026, 6, 5, 12, 42)),
+        pastRun("old", "Ancient run", atLocal(2026, 4, 20, 10)),
+      ],
+    });
+
+    renderRuns("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Fresh run")).toBeTruthy());
+    expect(screen.getByText("Today")).toBeTruthy();
+    // The month label is locale-derived, so derive the expectation the same way.
+    const monthLabel = new Date(2026, 4, 20).toLocaleDateString(undefined, {
+      month: "long",
+      year: "numeric",
+    });
+    expect(screen.getByText(monthLabel)).toBeTruthy();
+  });
+
+  it("filters past runs by the search box and reports the match count", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("a", "Fix the parser", atLocal(2026, 6, 5, 12)),
+        pastRun("b", "Ship the exporter", atLocal(2026, 6, 5, 11)),
+      ],
+    });
+
+    renderRuns("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Search past runs"), { target: { value: "parser" } });
+    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    expect(screen.queryByText("Ship the exporter")).toBeNull();
+    expect(screen.getByText(/1 result/)).toBeTruthy();
+
+    // No match: an explanatory empty state with a working clear affordance.
+    fireEvent.change(screen.getByLabelText("Search past runs"), { target: { value: "zzz" } });
+    expect(screen.getByText(/No past runs match/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Clear search"));
+    expect(screen.getByText("Ship the exporter")).toBeTruthy();
+  });
+
+  it("caps the initial render at 10 and reveals the remainder via Show more / Collapse", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: Array.from({ length: 12 }, (_, i) =>
+        // Distinct minutes keep the sort deterministic; all land in one Today bucket.
+        pastRun(`p${i}`, `Past run ${i}`, atLocal(2026, 6, 5, 12, 59 - i)),
+      ),
+    });
+
+    renderRuns("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Past run 0")).toBeTruthy());
+    // 10 of 12 render; the two newest-minus-nine are cut, the count label says so.
+    expect(screen.getByText("Past run 9")).toBeTruthy();
+    expect(screen.queryByText("Past run 10")).toBeNull();
+    expect(screen.getByText("10/12")).toBeTruthy();
+
+    fireEvent.click(screen.getByText(/Show 2 more/));
+    expect(screen.getByText("Past run 11")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Collapse"));
+    expect(screen.queryByText("Past run 10")).toBeNull();
+  });
+
+  // (Retired here: the amendment-1 Factory-before-Past DOM-order test. Amendment 3
+  // moved the archive to its own /runs/history route, so the two sections no longer
+  // share a page and the ordering it pinned has no referent — the stronger form of
+  // the same decision is the split itself, pinned by the tab tests below.)
+
+  // Amendment 3: both pages render the shared tab strip; the archive tab carries
+  // the past-run count once loaded, and each page routes to the other.
+  it("the live console renders the tab strip with a counted archive tab", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
+      ],
+    });
+
+    renderRuns();
+
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    // The past run does NOT render here — it lives on the archive tab…
+    expect(screen.queryByText("Finished run")).toBeNull();
+    // …which the strip links to, carrying the count from the same fetch.
+    const archiveTab = screen.getByRole("link", { name: "Past runs · 1" });
+    expect(archiveTab.getAttribute("href")).toBe("/runs/history");
+    expect(screen.getByRole("link", { name: "Active" }).getAttribute("href")).toBe("/runs");
+  });
+
+  it("the archive renders no active runs and links back to the live console", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
+      ],
+    });
+
+    renderRuns("/runs/history");
+
+    await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
+    expect(screen.queryByText("In flight")).toBeNull();
+    expect(screen.getByRole("link", { name: "Active" }).getAttribute("href")).toBe("/runs");
+  });
+
+  // Amendment 3, the ?q= deep link: a shared archive URL arrives already filtered.
+  it("initialises the archive search from ?q=", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("a", "Fix the parser", atLocal(2026, 6, 5, 12)),
+        pastRun("b", "Ship the exporter", atLocal(2026, 6, 5, 11)),
+      ],
+    });
+
+    renderRuns("/runs/history?q=parser");
+
+    await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
+    expect(screen.queryByText("Ship the exporter")).toBeNull();
+    expect((screen.getByLabelText("Search past runs") as HTMLInputElement).value).toBe("parser");
+  });
+
+  // The 2026-08-14 nit: switching tabs must not blank the counted archive tab.
+  // The layout route owns the one runs fetch and survives switches, so the count
+  // neither refetches nor resets — pinned by the call count, which a per-page
+  // fetch would put at 3 here (mount + two switches), each with a bare-label flash.
+  it("keeps the archive tab count across tab switches without refetching", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
+      ],
+    });
+
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+
+    // To the archive: the counted label is there the moment the tab renders…
+    fireEvent.click(screen.getByRole("link", { name: "Past runs · 1" }));
+    await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+
+    // …and back again.
+    fireEvent.click(screen.getByRole("link", { name: "Active" }));
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -494,11 +638,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     });
     mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun()] });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
     if (shown) {
@@ -521,11 +661,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       runs: [aRun({ id: "bare", issue_title: "Pre-#111 run", status: "running", anthropic_secret_label: null })],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Pre-#111 run")).toBeTruthy());
     expect(container.querySelector('span.max-w-\\[12rem\\]')).toBeNull();
@@ -550,11 +686,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       ],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Pool-empty run")).toBeTruthy());
     // The badge renders with its label…
@@ -591,11 +723,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       ],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Other's run")).toBeTruthy());
     // The badge renders (admin still sees provenance despite holding zero tokens).

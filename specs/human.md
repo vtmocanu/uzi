@@ -222,9 +222,21 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-s
 
 - Dashboard updates live: a run reaching `awaiting_approval` must show without a manual refresh.
 - Desktop sidebar is collapsible.
+  - The collapse control must not consume a full sidebar row. [user 2026-08-14]
 - Empty board columns can be hidden.
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
+
+## Feature — Runs page IA (live console + past-runs archive)
+
+Web-only; no API/schema/agent changes. [user 2026-08-14]
+
+- Past runs live on a separate tab from active runs.
+- Past runs are searchable: by title, repo, issue number (#iid), worker, and status.
+- Past runs are grouped by date: by day within the current week, by week within the current month, by month beyond.
+- Past runs reveal progressively ("show next 50"), like the board.
+- Admin Factory status shows only other users' runs — the admin's own runs are not repeated there.
+- Alongside (same batch): the Schedules "Last fire" caret must render correctly.
 
 ## Feature #24 — MR closed without merging → card back to In Progress
 

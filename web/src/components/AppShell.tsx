@@ -556,26 +556,13 @@ function SidebarContent({
       </nav>
 
       <div className="border-t border-edge">
-        {/* Desktop-only collapse toggle, pinned at the footer edge (persistent, not
-            hover-only). aria-expanded tracks the sidebar, not a popup, so screen
-            readers announce the rail's state. */}
-        {onToggleCollapse && (
-          <div className={cx("hidden lg:flex px-3 pt-1", collapsed ? "justify-center" : "justify-end")}>
-            <button
-              type="button"
-              onClick={onToggleCollapse}
-              aria-expanded={!collapsed}
-              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-              className="rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg"
-            >
-              <span className={cx("inline-flex transition-transform", !collapsed && "rotate-180")}>
-                <ChevronRightIcon />
-              </span>
-            </button>
-          </div>
-        )}
-
+        {/* The desktop collapse toggle used to be its own full-width row pinned above
+            this footer — a whole row spent on one chevron (ux-tweaks item 1). It now
+            rides the footer's user cluster as its last element in both states, past a
+            hairline divider so it reads as chrome, not as part of the user's identity.
+            Still persistent (not hover-only), still keyboard-reachable, and
+            aria-expanded tracks the sidebar, not a popup, so screen readers announce
+            the rail's state. */}
         {user &&
           (collapsed ? (
             <div className="flex flex-col items-center gap-2 px-3 py-3">
@@ -596,6 +583,21 @@ function SidebarContent({
               >
                 <LogOutIcon />
               </button>
+              {onToggleCollapse && (
+                <>
+                  <span aria-hidden="true" className="hidden h-px w-4 bg-edge lg:block" />
+                  <button
+                    type="button"
+                    onClick={onToggleCollapse}
+                    aria-expanded={false}
+                    aria-label="Expand sidebar"
+                    title="Expand sidebar"
+                    className="hidden rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg lg:inline-flex"
+                  >
+                    <ChevronRightIcon />
+                  </button>
+                </>
+              )}
             </div>
           ) : (
             <div className="px-3 py-3 lg:py-2">
@@ -617,10 +619,28 @@ function SidebarContent({
                 <button
                   onClick={handleLogout}
                   title="Log out"
+                  aria-label="Log out"
                   className="rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg"
                 >
                   <LogOutIcon />
                 </button>
+                {onToggleCollapse && (
+                  <>
+                    <span aria-hidden="true" className="hidden h-4 w-px bg-edge lg:block" />
+                    <button
+                      type="button"
+                      onClick={onToggleCollapse}
+                      aria-expanded={true}
+                      aria-label="Collapse sidebar"
+                      title="Collapse sidebar"
+                      className="hidden rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg lg:inline-flex"
+                    >
+                      <span className="inline-flex rotate-180">
+                        <ChevronRightIcon />
+                      </span>
+                    </button>
+                  </>
+                )}
               </div>
               {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
                   user block. Self-gates — renders nothing without a live reading. */}
