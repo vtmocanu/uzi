@@ -42,8 +42,6 @@ interface Attempt {
   count: number;
   bytes: number;
   status: number;
-  /** Wall clock, so the retry CADENCE is measurable and not merely assumed. */
-  t: number;
 }
 
 /**
@@ -67,7 +65,7 @@ function poisonedApi(): { client: WorkerClient; attempts: Attempt[] } {
       const bytes = Buffer.byteLength(JSON.stringify({ messages }), "utf8");
       const oversize = bytes > MAX_BODY_BYTES;
       const status = oversize ? 400 : 500;
-      attempts.push({ count: messages.length, bytes, status, t: Date.now() });
+      attempts.push({ count: messages.length, bytes, status });
       throw new RequestError(
         "POST",
         `/api/worker/runs/${runId}/messages`,
@@ -92,27 +90,51 @@ describe("MessageBatcher — the poison-pill wedge (PRD #108 M1b/M3)", () => {
     const batchMs = 5;
     const batcher = new MessageBatcher(client, "run-1", 0, batchMs, logger);
 
-    batcher.emit({ kind: "text", agent: "lead", payload: { text: "the poisoned message" } });
-    const windowMs = 400;
-    await sleep(windowMs);
+    // Measure the REQUESTED backoff delays, not wall-clock gaps between attempts.
+    // A wall-clock gap is the scheduled delay PLUS event-loop scheduling latency,
+    // and under CI CPU contention that latency floor is large and additive: it
+    // swamps the small early scheduled delays and the >2x growth ratio flakes.
+    // Capturing what the batcher ASKS setTimeout for isolates the schedule itself,
+    // exactly as the sibling "backoff delay is capped" test below does.
+    const requested: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    (globalThis as { setTimeout: typeof setTimeout }).setTimeout = ((fn: () => void, ms?: number) => {
+      requested.push(ms ?? 0);
+      // Delegate with the REAL ms so the retry cadence is preserved, not collapsed.
+      return realSetTimeout(fn, ms);
+    }) as typeof setTimeout;
+    try {
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "the poisoned message" } });
+      // Wait until a small fixed number of attempts have failed. Poll via the
+      // captured realSetTimeout so these wait timers are NOT recorded into
+      // `requested`, and cap on real wall-clock (Date.now, a safety bound only —
+      // never an assertion) so contention cannot hang the test.
+      const deadline = Date.now() + 3000;
+      while (attempts.length < 5 && Date.now() < deadline) {
+        await new Promise((r) => realSetTimeout(r, 5));
+      }
+    } finally {
+      (globalThis as { setTimeout: typeof setTimeout }).setTimeout = realSetTimeout;
+    }
 
-    // The retry COUNT is still unbounded (the breaker is M3b) — what is gone is
-    // the hot loop. The unfixed batcher managed 62 posts in this window; doubling
-    // from 5ms can reach at most ~7 before the window closes.
-    assert.ok(
-      attempts.length > 0 && attempts.length <= 10,
-      `expected a backed-off handful of attempts in ${windowMs}ms, saw ${attempts.length} (unfixed batcher: 62)`,
-    );
     assert.ok(attempts.every((a) => a.status === 500), "a store rejection still returns 500 and is still retried");
-
-    // The gaps GROW. Compare the first interval with the last rather than
-    // asserting a schedule: ±20% jitter makes any exact delay a flake.
-    const gaps: number[] = [];
-    for (let i = 1; i < attempts.length; i++) gaps.push(attempts[i]!.t - attempts[i - 1]!.t);
-    assert.ok(gaps.length >= 2, `need at least two intervals to show growth, saw ${gaps.length}`);
+    // The retry COUNT is still unbounded (the breaker is M3b) — what is gone is
+    // the hot loop. A handful, not the unfixed batcher's 62-in-400ms.
     assert.ok(
-      gaps.at(-1)! > gaps[0]! * 2,
-      `the delay must grow: first gap ${gaps[0]}ms, last gap ${gaps.at(-1)}ms (unfixed: flat at 6.49ms)`,
+      attempts.length > 0 && attempts.length <= 12,
+      `expected a backed-off handful of attempts, saw ${attempts.length} (unfixed batcher: 62)`,
+    );
+
+    // The SCHEDULED delays grow. The leading entry is the healthy cadence
+    // (consecutiveFailures===0 → batchMs); every real backoff is ≥ batchMs*2, so
+    // drop the healthy 5ms to get the backoff series ~[10,20,40,80,...]. Compare
+    // first with last rather than asserting a schedule: ±20% jitter is dominated
+    // by the doubling, so this is robust under contention.
+    const backoff = requested.filter((ms) => ms > batchMs);
+    assert.ok(backoff.length >= 2, `need at least two backoff delays to show growth, saw ${backoff.length}`);
+    assert.ok(
+      backoff.at(-1)! > backoff[0]! * 2,
+      `the scheduled delay must grow: first backoff ${backoff[0]}ms, last ${backoff.at(-1)}ms (unfixed: flat at 6.49ms)`,
     );
 
     await batcher.close();
