@@ -195,7 +195,12 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.queryByText("queued")).toBeNull();
   });
 
-  it("admin all-users list: only the admin's OWN queued row shows waiting-for-unlock", async () => {
+  // Amendment 2026-08-14 (2): the factory card hides the admin's own runs (they are
+  // already the Active section above), so the waiting-for-unlock badge — which only
+  // ever applied to the admin's OWN queued rows — cannot appear on this list at all,
+  // and another owner's queued row stays a plain "queued" pill (their vault state is
+  // unknown here, PRD #32).
+  it("admin factory list hides the admin's own runs; other users' queued rows read plain", async () => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: true, email: "me@uzi.test" },
       vaultUnlocked: false,
@@ -215,10 +220,14 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText("My queued")).toBeTruthy());
-    // Exactly one waiting badge — the admin's own row; the other owner's row stays
-    // a plain "queued" pill (their vault state is unknown here).
-    expect(screen.getAllByText(/waiting for vault unlock/)).toHaveLength(1);
+    await waitFor(() => expect(screen.getByText("Their queued")).toBeTruthy());
+    // The heading says what the list now is; the old all-users copy is retired.
+    expect(screen.getByText("Active runs · other users")).toBeTruthy();
+    expect(screen.queryByText("Active runs · all users")).toBeNull();
+    // The admin's own row is gone from the card (it lives in Active above)…
+    expect(screen.queryByText("My queued")).toBeNull();
+    // …and no waiting badge can render here; the other owner's row reads plain.
+    expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
     expect(screen.getByText("queued")).toBeTruthy();
   });
 

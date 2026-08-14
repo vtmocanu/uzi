@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from "vitest";
 import { isTerminalRun, type Run } from "../lib/api";
-import { mockChatRuns, mockCrewRuns, mockHistoryRuns, mockLaneRuns, mockRuns } from "./data";
+import {
+  mockChatRuns,
+  mockCrewRuns,
+  mockHistoryRuns,
+  mockLaneRuns,
+  mockOtherRunOwners,
+  mockOtherUserRuns,
+  mockRuns,
+} from "./data";
 
 // Each test re-imports a fresh mockApi so its in-memory run state starts from the seed.
 async function freshApi() {
@@ -15,13 +23,24 @@ async function freshApi() {
 // fixture gaining a run must not turn this red for a reason that is not about the mock.
 const seeded: Run[] = (() => {
   const m = new Map<string, Run>();
-  for (const r of [...mockRuns, ...mockChatRuns, ...mockCrewRuns, ...mockLaneRuns, ...mockHistoryRuns]) m.set(r.id, r);
+  for (const r of [
+    ...mockRuns,
+    ...mockChatRuns,
+    ...mockCrewRuns,
+    ...mockLaneRuns,
+    ...mockHistoryRuns,
+    ...mockOtherUserRuns,
+  ])
+    m.set(r.id, r);
   return [...m.values()];
 })();
 
 // The badge's predicate (PRD #239 Decision 1 + Decision 4): non-terminal, kind NOT IN
-// ('chat','judge') — the same scope the real ListRunsForUser uses.
-const inProgress = (r: Run) => !isTerminalRun(r.status) && r.kind !== "chat" && r.kind !== "judge";
+// ('chat','judge') — the same scope the real ListRunsForUser uses. Other demo users'
+// runs (mockOtherRunOwners) are excluded too: the real endpoint is caller-scoped
+// (/me/runs/in-progress-count), and the mock's owner column is that map.
+const inProgress = (r: Run) =>
+  !isTerminalRun(r.status) && r.kind !== "chat" && r.kind !== "judge" && !(r.id in mockOtherRunOwners);
 const expected = seeded.filter(inProgress).length;
 
 describe("mockApi.runsInProgressCount parity (PRD #239 M2)", () => {
@@ -36,6 +55,9 @@ describe("mockApi.runsInProgressCount parity (PRD #239 M2)", () => {
     // The excluded kinds must be present AND non-terminal, or excluding them changes nothing.
     expect(seeded.some((r) => r.kind === "chat" && !isTerminalRun(r.status))).toBe(true);
     expect(seeded.some((r) => r.kind === "judge" && !isTerminalRun(r.status))).toBe(true);
+    // Ditto ownership (ux-tweaks amendment 2): at least one OTHER user's run must be
+    // non-terminal, or the caller-scoping the count claims would be vacuous.
+    expect(seeded.some((r) => r.id in mockOtherRunOwners && !isTerminalRun(r.status))).toBe(true);
     expect(expected).toBeGreaterThan(0); // the demo shows a real, non-zero number
   });
 

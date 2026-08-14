@@ -22,6 +22,7 @@ import {
   mockLaneRuns,
   mockLimitWaitMessages,
   mockLiveTokensMessages,
+  mockOtherUserRuns,
   mockProposals,
   mockRuns,
   mockSeededMessages,
@@ -64,6 +65,10 @@ function seed(): MockState {
   // grouping + "Show 50 more" reveal exhibitable. The distinct run-hist- prefix
   // cannot collide with a hand-written fixture id.
   for (const r of mockHistoryRuns) runs.set(r.id, { ...r });
+  // Other users' active runs (ux-tweaks amendment 2): in state.runs so an admin can
+  // open them, but owned by other demo users — mockApi excludes them from the
+  // caller-scoped listRuns/runsInProgressCount via mockOtherRunOwners.
+  for (const r of mockOtherUserRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -104,6 +109,10 @@ function seed(): MockState {
   // above): opening one from the past list shows a full run view, not a 404 alert.
   // Shared row objects, same as run-closed — nothing mutates a seeded message.
   for (const r of mockHistoryRuns) messages.set(r.id, [...mockDoneMessages]);
+  // Other users' runs: the running one shows the busy stream, the queued one an
+  // empty log (a queued run has no transcript yet) — both open without a 404.
+  messages.set("run-mira-embed", mockBusyMessages.map((m) => ({ ...m })));
+  messages.set("run-andrei-queued", []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });

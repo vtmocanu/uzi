@@ -87,6 +87,7 @@ import {
   mockMyRateLimitsByUser,
   mockMyTokenRateLimits,
   mockNotifications,
+  mockOtherRunOwners,
   type MockNotification,
   mockRepos,
   mockPendingJudges,
@@ -1584,8 +1585,14 @@ export const mockApi = {
   // chat/judge kinds (Decision 1 + Decision 4), so the demo build shows a real number
   // that moves as runs start and finish rather than a hardcoded constant.
   runsInProgressCount: async () => {
+    // Other users' runs are excluded exactly as the real /me/runs/in-progress-count
+    // is caller-scoped — the badge counts YOUR queue, not the factory's.
     const count = [...state.runs.values()].filter(
-      (r) => !isTerminalRun(r.status) && r.kind !== "chat" && r.kind !== "judge",
+      (r) =>
+        !isTerminalRun(r.status) &&
+        r.kind !== "chat" &&
+        r.kind !== "judge" &&
+        !(r.id in mockOtherRunOwners),
     ).length;
     return delay({ count }, 40);
   },
@@ -2746,6 +2753,9 @@ export const mockApi = {
         // is a repo-less meta-run — both are excluded here exactly as the real
         // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
         .filter((r) => r.kind !== "chat" && r.kind !== "judge")
+        // Caller-scoped, like the real ListRunsForUser: other demo users' runs
+        // (mockOtherRunOwners) belong to the admin all-users list only.
+        .filter((r) => !(r.id in mockOtherRunOwners))
         .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
         .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
         .map((r) => runListItem(r)),
@@ -3129,7 +3139,11 @@ export const mockApi = {
       runs: listRunsFor()
         .filter((r) => r.kind !== "chat")
         .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
-        .map((r) => runListItem(r, requireSession().email)),
+        // Owner attribution: the mock's owner column is mockOtherRunOwners; every
+        // other run belongs to the session admin. Before this map existed, EVERY
+        // row here was stamped with the session email — the demo factory list was
+        // 100% "mine", the exact duplication amendment 2 removes.
+        .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email)),
     }),
 
   // ── Chat (PRD #39) — real M1 wire ─────────────────────────────────────────

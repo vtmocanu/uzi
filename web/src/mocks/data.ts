@@ -3014,6 +3014,125 @@ const HIST_OFFSETS_MIN: number[] = (() => {
 
 export const mockHistoryRuns: Run[] = HIST_OFFSETS_MIN.map((m, i) => histRun(i, m));
 
+// ── Other users' active runs (ux-tweaks amendment 2026-08-14 (2)) ─────────────
+// The factory card shows OTHER users' runs only — the admin's own runs live in the
+// Active section above it — so the demo needs runs the session admin does NOT own,
+// or the filtered card would render permanently empty (before this, adminListRuns
+// stamped every run with the session email: the demo factory list was 100% "mine",
+// which is exactly the duplication the amendment is about). The mock Run has no
+// owner column; mockOtherRunOwners IS that column: these runs are seeded into
+// state.runs (so an admin can open them), excluded from the caller-scoped
+// listRuns / runsInProgressCount, and attributed by adminListRuns from this map.
+export const mockOtherRunOwners: Record<string, string> = {
+  "run-mira-embed": "mira@uzi.local",
+  "run-andrei-queued": "andrei@uzi.local",
+};
+
+export const mockOtherUserRuns: Run[] = [
+  {
+    id: "run-mira-embed",
+    repo_id: "repo-atlas",
+    issue_iid: 61,
+    issue_title: "Embed the changelog in the release email",
+    issue_description: "Another user's in-flight run — factory-card demo fixture.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "running",
+    requeue_count: 0,
+    iteration_count: 2,
+    auto_approve: false,
+    worker_id: "w-mira",
+    branch: "agent/issue-61",
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-mira",
+    anthropic_secret_label: "mira-key",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(18),
+    started_at: minsAgo(18),
+    finished_at: null,
+    created_at: minsAgo(20),
+    updated_at: minsAgo(2),
+  },
+  {
+    // Queued and NOT the viewer's own: the factory card must render this as a plain
+    // "queued" pill — another owner's vault state is unknown to the viewing admin
+    // (PRD #32), and with own rows filtered out the waiting-for-unlock badge has no
+    // business on this list at all.
+    id: "run-andrei-queued",
+    repo_id: "repo-uzi",
+    issue_iid: 77,
+    issue_title: "Add retry budget to the seed sync",
+    issue_description: "Another user's queued run — factory-card demo fixture.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "queued",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: null,
+    branch: null,
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: null,
+    started_at: null,
+    finished_at: null,
+    created_at: minsAgo(7),
+    updated_at: minsAgo(7),
+  },
+];
+
 export function SAMPLE_PLAN(): string {
   return [
     "## Plan",

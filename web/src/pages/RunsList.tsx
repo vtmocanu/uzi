@@ -270,6 +270,10 @@ export function RunsList() {
     searchActive,
   });
   const pastGroups = groupRuns(pastFiltered.slice(0, paging.render), pastAnchor, now);
+  // The factory card shows OTHER users' runs only (amendment 2026-08-14 (2)): the
+  // admin's own runs already appear in Active above. owner_email is the admin-list
+  // discriminator (RunListItem carries no is_mine); a row without one stays visible.
+  const factoryRuns = adminRuns.filter((r) => r.owner_email !== user?.email);
 
   return (
     <div className="space-y-6">
@@ -322,13 +326,20 @@ export function RunsList() {
           <SectionTitle className="text-brand">Factory status (admin)</SectionTitle>
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-faint">
-              Active runs · all users
+              Active runs · other users
             </h3>
-            {adminRuns.length === 0 ? (
-              <p className="text-sm text-faint">No active runs across the factory.</p>
+            {/* The admin's OWN runs are hidden here (amendment 2026-08-14 (2)): they
+                already sit in the Active section directly above, so repeating them
+                made this card read as a duplicate. The full factory picture is the
+                union of the two adjacent sections — nothing is lost, nothing repeats.
+                No waitingForVault prop on these rows: with own rows gone, every row
+                is another owner's, whose vault state is unknown here (PRD #32), so a
+                queued row renders as a plain "queued" pill by construction. */}
+            {factoryRuns.length === 0 ? (
+              <p className="text-sm text-faint">No active runs from other users.</p>
             ) : (
               <ul className="space-y-2">
-                {adminRuns.map((r) => (
+                {factoryRuns.map((r) => (
                   <RunRow
                     key={r.id}
                     run={r}
@@ -341,12 +352,6 @@ export function RunsList() {
                     // row <Link>), so it never points the admin at their own /settings for
                     // another user's token — no linkable=false is needed.
                     showCredential
-                    // Only the current admin's OWN queued rows can show the vault state —
-                    // another owner's vault status is unknown here (PRD #32), so theirs
-                    // render as plain "queued".
-                    waitingForVault={
-                      !vaultUnlocked && r.status === "queued" && r.owner_email === user?.email
-                    }
                   />
                 ))}
               </ul>
