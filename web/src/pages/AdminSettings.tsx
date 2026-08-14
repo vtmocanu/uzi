@@ -374,13 +374,53 @@ export function AdminSettings() {
     }
   };
 
+  // The on-page section index. Built from the SAME conditions that render each
+  // card below, so a hidden card never leaves a dead jump link. Plain hash
+  // anchors (not router Links): the browser's own jump behavior is exactly what
+  // an in-page index wants, and react-router does not intercept bare <a> tags.
+  const sections: { id: string; label: string }[] = [
+    ...(masterSealed !== null && masterSealed > 0
+      ? [{ id: "vault-migration", label: "Vault migration" }]
+      : []),
+    { id: "forge-labels", label: "Forge labels" },
+    ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
+    ...(!loading ? [{ id: "self-improvement", label: "Self-improvement" }] : []),
+    ...(!loading && oidcStatus !== "disabled"
+      ? [{ id: "sso", label: "Single sign-on" }]
+      : []),
+    ...(!loading && saved
+      ? [
+          { id: "slack", label: "Slack" },
+          { id: "run-health", label: "Run health" },
+          { id: "docker-allowlist", label: "Docker workers" },
+        ]
+      : []),
+  ];
+
   return (
     <AdminShell description="Configuration shared across every user of this uzi instance.">
+      {/* The section index: this tab is eight cards deep, and without an index the
+          only way to learn what it holds is to scroll all of it. Quiet pill links,
+          not a second tab row — tabs switch content, these just scroll it. */}
+      {!loading && sections.length > 1 && (
+        <nav aria-label="Sections on this page" className="flex flex-wrap gap-1.5">
+          {sections.map((s) => (
+            <a
+              key={s.id}
+              href={`#${s.id}`}
+              className="rounded-full border border-edge px-2.5 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg"
+            >
+              {s.label}
+            </a>
+          ))}
+        </nav>
+      )}
+
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 
       {masterSealed !== null && masterSealed > 0 && (
-        <Card className="space-y-2 border-warn/30">
+        <Card id="vault-migration" className="scroll-mt-6 space-y-2 border-warn/30">
           <SectionTitle>Vault migration</SectionTitle>
           <p className="text-sm text-muted">
             <strong className="text-fg">
@@ -395,7 +435,7 @@ export function AdminSettings() {
         </Card>
       )}
 
-      <Card className="space-y-5">
+      <Card id="forge-labels" className="scroll-mt-6 space-y-5">
         <div>
           <SectionTitle>Forge labels</SectionTitle>
           <p className="mt-2 text-sm text-muted">
@@ -551,12 +591,20 @@ export function AdminSettings() {
         )}
       </Card>
 
-      {!loading && saved && <JudgeSettingsCard settings={saved} onSaved={applyResponse} />}
+      {!loading && saved && (
+        <section id="run-judge" className="scroll-mt-6">
+          <JudgeSettingsCard settings={saved} onSaved={applyResponse} />
+        </section>
+      )}
 
-      {!loading && <SelfImproveSettingsCard />}
+      {!loading && (
+        <section id="self-improvement" className="scroll-mt-6">
+          <SelfImproveSettingsCard />
+        </section>
+      )}
 
       {!loading && oidcStatus !== "disabled" && (
-        <Card className="space-y-2">
+        <Card id="sso" className="scroll-mt-6 space-y-2">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <SectionTitle>Single sign-on ({oidcProviderName})</SectionTitle>
@@ -573,21 +621,27 @@ export function AdminSettings() {
       )}
 
       {!loading && saved && (
-        <SlackSettingsCard
-          settings={saved}
-          secrets={secrets}
-          sources={sources}
-          status={slackStatus}
-          onSaved={applyResponse}
-        />
+        <section id="slack" className="scroll-mt-6">
+          <SlackSettingsCard
+            settings={saved}
+            secrets={secrets}
+            sources={sources}
+            status={slackStatus}
+            onSaved={applyResponse}
+          />
+        </section>
       )}
 
       {!loading && saved && (
-        <HealthSettingsCard settings={saved} sources={sources} onSaved={applyResponse} />
+        <section id="run-health" className="scroll-mt-6">
+          <HealthSettingsCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
       )}
 
       {!loading && saved && (
-        <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+        <section id="docker-allowlist" className="scroll-mt-6">
+          <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
       )}
     </AdminShell>
   );

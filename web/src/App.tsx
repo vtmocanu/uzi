@@ -9,6 +9,7 @@ import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
+import { RunDefaults } from "./pages/RunDefaults";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
@@ -78,6 +79,15 @@ export default function App() {
           element={
             <ProtectedRoute>
               <Settings />
+            </ProtectedRoute>
+          }
+        />
+        {/* Run-behavior defaults, split out of the overloaded Account tab. */}
+        <Route
+          path="/settings/run-defaults"
+          element={
+            <ProtectedRoute>
+              <RunDefaults />
             </ProtectedRoute>
           }
         />

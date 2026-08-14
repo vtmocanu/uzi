@@ -4,6 +4,7 @@
 // shared MeterTrack + toneFor thresholds. The admin table is a separate page.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
@@ -370,21 +371,42 @@ function TokenMicroMeters({
 }
 
 // SidebarRateLimits is the micro-bars under the signed-in user block (mockup frame
-// B) — one PAIR PER TOKEN since PRD #104, each named when the user holds several.
-// Hidden while loading and for a token-less user (no dead chrome); a token with no
-// reading renders nothing rather than an empty bar, and a stale one is dimmed.
+// B). Hidden while loading and for a token-less user (no dead chrome); a token with
+// no reading renders nothing rather than an empty bar, and a stale one is dimmed.
+//
+// ONE pair of bars, not one pair per token. It rendered every readable token
+// (PRD #104) until that grew the footer past the nav itself — measured 8 meter
+// rows on a four-token account, pushing the Factory group under the nav's scroll
+// fold at 1440x900. The rail shows the MOST CONSTRAINED token (highest window
+// utilization): this is an early-warning instrument, so the worst reading is the
+// only one that matters ambiently — if the worst is fine, all are fine. Capping
+// to the DEFAULT token instead would hide a nearly-spent secondary at 93% behind
+// a default at 8%, which inverts the instrument's purpose. The full per-token
+// meters stay on Settings (RateLimitCard); the "+N more" link goes there.
 export function SidebarRateLimits() {
   const { tokens } = useMyRateLimits(60_000);
   const now = useNow();
   if (!tokens || tokens.length === 0) return null;
   const readable = tokens.filter((t) => t.limits.status === "ok");
   if (readable.length === 0) return null;
-  const showLabels = readable.length > 1;
+  // Rank by the hotter of the token's two windows. Staleness does not demote:
+  // a stale 93% is still the reading to worry about, and the bars dim it.
+  // The filter above guarantees status === "ok"; the guard re-narrows for TS
+  // (Array.filter without a predicate does not carry the narrowing).
+  const peak = (t: (typeof readable)[number]) =>
+    t.limits.status === "ok" ? Math.max(t.limits.five_hour.pct, t.limits.seven_day.pct) : 0;
+  const worst = readable.reduce((a, b) => (peak(b) > peak(a) ? b : a));
   return (
-    <div className="mt-2 space-y-2.5" aria-label="Claude rate limits">
-      {readable.map((t) => (
-        <TokenMicroMeters key={t.secret_id} token={t} showLabel={showLabels} now={now} />
-      ))}
+    <div className="mt-2 space-y-1.5" aria-label="Claude rate limits">
+      <TokenMicroMeters token={worst} showLabel={readable.length > 1} now={now} />
+      {readable.length > 1 && (
+        <Link
+          to="/settings"
+          className="block text-[10px] font-medium text-faint transition-colors hover:text-fg"
+        >
+          +{readable.length - 1} more token{readable.length - 1 === 1 ? "" : "s"} in Settings
+        </Link>
+      )}
     </div>
   );
 }

@@ -394,7 +394,9 @@ describe("AdminSettings — run judge (PRD #46)", () => {
 describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
   it("shows the token-consent copy and the connected repo in the picker", async () => {
     renderPage();
-    await screen.findByText("Self-improvement");
+    // The jump-link pill in the section index also says "Self-improvement", so target
+    // the card heading by role.
+    await screen.findByRole("heading", { name: "Self-improvement" });
     // The standing token-consent warning must be present.
     expect(screen.getByText(/your own Anthropic token/i)).toBeTruthy();
     expect(screen.getByText(/never merges to/i)).toBeTruthy();
@@ -407,7 +409,9 @@ describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
       selfimprove: selfimproveConfig({ enabled: true, repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", user_email: "vlad@uzi.local" }),
     });
     renderPage();
-    await screen.findByText("Self-improvement");
+    // The jump-link pill in the section index also says "Self-improvement", so target
+    // the card heading by role.
+    await screen.findByRole("heading", { name: "Self-improvement" });
 
     fireEvent.click(screen.getByLabelText(/Enable the self-improvement job/i));
     fireEvent.change(screen.getByLabelText("Repository"), { target: { value: "repo-uzi" } });
@@ -424,7 +428,9 @@ describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
 
   it("blocks enabling without a repo, client-side, without calling the API", async () => {
     renderPage();
-    await screen.findByText("Self-improvement");
+    // The jump-link pill in the section index also says "Self-improvement", so target
+    // the card heading by role.
+    await screen.findByRole("heading", { name: "Self-improvement" });
     fireEvent.click(screen.getByLabelText(/Enable the self-improvement job/i));
     fireEvent.click(screen.getByRole("button", { name: /save self-improvement settings/i }));
     expect(await screen.findByText(/Choose a repository/i)).toBeTruthy();

@@ -1,5 +1,5 @@
 // SettingsShell: one header + tab bar shared by the user-scoped settings
-// surfaces (Account & token, Forge, Access, Memory). Kills the old
+// surfaces (Account & tokens, Run defaults, Forge, Access, Memory). Kills the old
 // discoverability problem where the /settings/* pages were URL siblings wired
 // together only by hand-placed corner links — the drift multica's unified
 // layout headers exist to prevent (packages/views/layout/).
@@ -14,7 +14,8 @@ import type { ReactNode } from "react";
 import { cx, PageHeader } from "./ui";
 
 const TABS = [
-  { to: "/settings", label: "Account & token", end: true },
+  { to: "/settings", label: "Account & tokens", end: true },
+  { to: "/settings/run-defaults", label: "Run defaults", end: false },
   { to: "/settings/forge", label: "Forge", end: false },
   { to: "/settings/access", label: "Access", end: false },
   { to: "/settings/memory", label: "Memory", end: false },

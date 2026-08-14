@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { RateLimitAnnouncer, RateLimitCard, SidebarRateLimits } from "./RateLimitMeters";
 import { api, type MyRateLimits } from "../lib/api";
 
@@ -199,6 +200,39 @@ describe("SidebarRateLimits", () => {
     const fills = screen.getAllByRole("progressbar").map((b) => b.lastChild as HTMLElement);
     expect(fills).toHaveLength(2);
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
+  });
+
+  // The footer-crowding cap: several tokens render ONE pair of bars — the most
+  // constrained token's — plus a link to the full per-token meters in Settings.
+  // The worst is picked by peak window utilization, NOT by is_default: here the
+  // default sits at 8/27 while a secondary runs 62/83, and the secondary wins.
+  it("shows only the most constrained token plus a '+N more' link when several are readable", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        { ...tokens(okReading).tokens[0], secret_id: "sec-1", label: "default", is_default: true },
+        {
+          ...tokens(warnReading).tokens[0],
+          secret_id: "sec-2",
+          label: "console-key",
+          is_default: false,
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <SidebarRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Claude rate limits");
+    // One pair of bars, labeled with the WORST token's name.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+    expect(screen.getByText("console-key")).toBeTruthy();
+    expect(screen.getByText("62%")).toBeTruthy();
+    // The cooler default token's numbers are not on the rail…
+    expect(screen.queryByText("8%")).toBeNull();
+    // …but the link to the full meters says how many more there are.
+    const more = screen.getByRole("link", { name: "+1 more token in Settings" });
+    expect(more.getAttribute("href")).toBe("/settings");
   });
 });
 

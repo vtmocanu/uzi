@@ -1,6 +1,6 @@
 // Settings → Access: programmatic access to uzi (the CLI-token lifecycle today;
 // the home for any future access credential). Inside SettingsShell so it sits
-// beside Account & token / Forge / Workers.
+// beside Account & tokens / Run defaults / Forge / Memory.
 
 import { SettingsShell } from "../components/SettingsShell";
 import { CliTokens } from "../components/CliTokens";

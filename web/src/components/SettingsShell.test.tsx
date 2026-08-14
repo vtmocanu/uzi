@@ -16,23 +16,23 @@ function renderAt(path: string) {
   );
 }
 
-// NavLink flags the active tab with aria-current="page"; the "Account & token"
+// NavLink flags the active tab with aria-current="page"; the "Account & tokens"
 // tab uses end so it does not stay lit on the nested /settings/* routes.
 function current(name: string): string | null {
   return screen.getByRole("link", { name }).getAttribute("aria-current");
 }
 
 describe("SettingsShell tabs", () => {
-  it("lights Account & token on /settings only (end match)", () => {
+  it("lights Account & tokens on /settings only (end match)", () => {
     renderAt("/settings");
-    expect(current("Account & token")).toBe("page");
+    expect(current("Account & tokens")).toBe("page");
     expect(current("Forge")).toBeNull();
   });
 
-  it("lights Forge on /settings/forge without keeping Account & token active", () => {
+  it("lights Forge on /settings/forge without keeping Account & tokens active", () => {
     renderAt("/settings/forge");
     expect(current("Forge")).toBe("page");
-    expect(current("Account & token")).toBeNull();
+    expect(current("Account & tokens")).toBeNull();
   });
 
   // Workers moved to /workers (a Factory page); it must not resurface as a tab.
@@ -43,19 +43,27 @@ describe("SettingsShell tabs", () => {
     expect(screen.queryByRole("link", { name: "Workers" })).toBeNull();
   });
 
-  // Issue #204: with five tabs, at 390px the full strip overflowed (scrollWidth 401 vs
-  // clientWidth 390) and used to scroll the whole page body sideways. jsdom has no layout
-  // engine, so this asserts the class contract that fixes it rather than a measured width:
-  // the tab ROW scrolls within itself (overflow-x-auto) and the tabs keep their size
-  // (shrink-0 / whitespace-nowrap) so they overflow-and-scroll instead of compressing to
-  // fit. Kept at four tabs so the next added tab cannot regress the page body.
+  // The Run defaults tab (split out of the overloaded Account & tokens tab) is a
+  // real destination of its own.
+  it("lights Run defaults on /settings/run-defaults", () => {
+    renderAt("/settings/run-defaults");
+    expect(current("Run defaults")).toBe("page");
+    expect(current("Account & tokens")).toBeNull();
+  });
+
+  // Issue #204: at 390px a five-tab strip overflows (measured scrollWidth 401 vs
+  // clientWidth 390 on the original five) and used to scroll the whole page body
+  // sideways. jsdom has no layout engine, so this asserts the class contract that
+  // fixes it rather than a measured width: the tab ROW scrolls within itself
+  // (overflow-x-auto) and the tabs keep their size (shrink-0 / whitespace-nowrap)
+  // so they overflow-and-scroll instead of compressing to fit.
   it("lets the tab row scroll within itself so the page body never scrolls sideways (#204)", () => {
     renderAt("/settings");
     const row = screen.getByRole("link", { name: "Forge" }).parentElement as HTMLElement;
     expect(row.className).toContain("overflow-x-auto");
     // The underline still spans the row.
     expect(row.className).toMatch(/\bborder-b\b/);
-    for (const name of ["Account & token", "Forge", "Access", "Memory"]) {
+    for (const name of ["Account & tokens", "Run defaults", "Forge", "Access", "Memory"]) {
       const tab = screen.getByRole("link", { name });
       expect(tab.className).toMatch(/\bshrink-0\b/);
       expect(tab.className).toContain("whitespace-nowrap");
