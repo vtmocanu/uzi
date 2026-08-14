@@ -20,7 +20,13 @@ const TABS = [
 export function AdminShell({ description, children }: { description: string; children: ReactNode }) {
   return (
     <div className="space-y-6">
-      <PageHeader title="Admin" description={description} />
+      {/* The header description is CONSTANT across tabs, deliberately: the per-tab
+          description used to render here, and its varying line count moved the tab
+          strip up and down on every switch (round-3 feedback: "the tabs jump").
+          Everything above the strip is now byte-identical whichever tab is active;
+          the per-tab sentence renders below the strip, where varying height is
+          ordinary content flow. */}
+      <PageHeader title="Admin" description="Configuration and controls for this uzi instance." />
       {/* Same overflow contract as SettingsShell (issue #204): the tab row scrolls
           within its own container so the page body never scrolls horizontally. */}
       <div className="flex gap-1 overflow-x-auto border-b border-edge">
@@ -41,6 +47,7 @@ export function AdminShell({ description, children }: { description: string; chi
           </NavLink>
         ))}
       </div>
+      {description && <p className="text-sm text-muted">{description}</p>}
       {children}
     </div>
   );

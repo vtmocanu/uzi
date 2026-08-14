@@ -17,6 +17,7 @@ import { RateLimitCard } from "../components/RateLimitMeters";
 import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
+import { emitSidebarTokensChanged } from "../lib/sidebarTokens";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
@@ -43,10 +44,19 @@ export function Settings() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
+  // Which non-default tokens also show on the sidebar rail (the default always
+  // does). Owned here beside `secrets` so the checkbox column and the token list
+  // load and reload together.
+  const [sidebarTokenIds, setSidebarTokenIds] = useState<string[]>([]);
+
   const load = useCallback(async () => {
     try {
-      const { secrets: rows } = await api.listSecrets();
+      const [{ secrets: rows }, { settings }] = await Promise.all([
+        api.listSecrets(),
+        api.getMySettings(),
+      ]);
       setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
+      setSidebarTokenIds(settings.sidebar_token_ids ?? []);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -57,6 +67,22 @@ export function Settings() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Whole-set replace over PUT /me/settings, then tell the sidebar rail (a
+  // separate mount) to refetch now rather than on its next poll.
+  const toggleSidebarToken = async (id: string, shown: boolean) => {
+    setError("");
+    const next = shown
+      ? [...new Set([...sidebarTokenIds, id])]
+      : sidebarTokenIds.filter((x) => x !== id);
+    try {
+      const { settings } = await api.putMySettings({ sidebar_token_ids: next });
+      setSidebarTokenIds(settings.sidebar_token_ids ?? next);
+      emitSidebarTokensChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to update the sidebar meters");
+    }
+  };
 
   // Appearance: the per-user theme override. "" = use the instance default. The
   // change is applied live (optimistic) then persisted; a failed save re-syncs
@@ -82,7 +108,7 @@ export function Settings() {
   };
 
   return (
-    <SettingsShell description="Your personal uzi configuration.">
+    <SettingsShell description="Your Anthropic tokens, vault, appearance, and account.">
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -94,6 +120,8 @@ export function Settings() {
         onError={setError}
         onNotice={setNotice}
         judgeSecretId={user?.judge_anthropic_secret_id ?? null}
+        sidebarTokenIds={sidebarTokenIds}
+        onToggleSidebarToken={toggleSidebarToken}
       />
 
       {/* The rotate-your-legacy-token reminder (PRD #32): password protection

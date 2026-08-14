@@ -126,7 +126,7 @@ function requireSession(): User {
 // Bumped to v2 for PRD #47 (the six health_* keys joined AppSettings): a stale v1
 // blob lacks them, so discarding it re-seeds a complete shape.
 const MOCK_SETTINGS_KEY = "uzi.mock.v2";
-const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null };
+const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null, sidebar_token_ids: [] };
 const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
   autopilot_label: "autopilot",
@@ -180,7 +180,11 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const a = as as Record<string, unknown>;
   const okUser =
     (u.default_model === null || typeof u.default_model === "string") &&
-    (u.theme === null || typeof u.theme === "string");
+    (u.theme === null || typeof u.theme === "string") &&
+    // Optional so a pre-feature blob stays valid; absent reads as default-only.
+    (u.sidebar_token_ids === undefined ||
+      (Array.isArray(u.sidebar_token_ids) &&
+        u.sidebar_token_ids.every((id) => typeof id === "string")));
   const okApp =
     typeof a.prd_label === "string" &&
     typeof a.autopilot_label === "string" &&
@@ -1798,6 +1802,12 @@ export const mockApi = {
       const t = patch.theme?.trim() ?? "";
       if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
       userSettings = { ...userSettings, theme: t === "" ? null : t };
+    }
+    if (patch.sidebar_token_ids !== undefined) {
+      // Whole-set replace, mirroring how the real handler would treat a list
+      // value; null clears back to default-only. Ids are stored as given — a
+      // stale id (deleted token) is harmless, it just matches nothing.
+      userSettings = { ...userSettings, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
     }
     persistSettings();
     return delay({ settings: { ...userSettings } });

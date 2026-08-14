@@ -98,6 +98,8 @@ function TokenRow({
   judgeBound,
   autoStatus,
   autoFetchState,
+  sidebarShown,
+  onToggleSidebar,
   onChanged,
   onError,
   onNotice,
@@ -116,6 +118,12 @@ function TokenRow({
   // healthy one, which is the silent no-op D11 exists to prevent, arriving through a
   // spinner and an error path rather than through the poller.
   autoFetchState: "pending" | "ready" | "failed";
+  // Whether this token's meters ride the sidebar rail. The default token is
+  // always shown, so its box renders checked and disabled; for the rest this is
+  // the user's explicit choice (round-3 feedback: control, not an automatic
+  // hottest-token pick).
+  sidebarShown: boolean;
+  onToggleSidebar: (id: string, shown: boolean) => Promise<void>;
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -306,6 +314,24 @@ function TokenRow({
           />
           <span aria-hidden="true">Auto-select from this token</span>
         </label>
+        {/* Sidebar rail opt-in. Same control conventions as the pool toggle above
+            (h-4 w-4, per-token accessible name). The DEFAULT token is pinned: the
+            rail always shows it, so the box is checked and disabled rather than
+            hidden — hiding it would make the pinning unreadable. */}
+        <label
+          className="flex items-center gap-2 text-sm text-muted"
+          title={secret.is_default ? "The default token always shows in the sidebar." : undefined}
+        >
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={secret.is_default || sidebarShown}
+            disabled={disabled || secret.is_default}
+            aria-label={`Show ${sanitizeLabel(secret.label)} in the sidebar`}
+            onChange={(e) => void onToggleSidebar(secret.id, e.target.checked)}
+          />
+          <span aria-hidden="true">Show in sidebar</span>
+        </label>
         {/* The chip, decided by autoChipFor rather than here: a pooled token whose
             status says `not_pooled` is two sources DISAGREEING, and showing a checked
             box beside "not in pool" asserts a contradiction (web-ux F1). Pending and
@@ -364,6 +390,8 @@ export function AnthropicTokens({
   onError,
   onNotice,
   judgeSecretId,
+  sidebarTokenIds,
+  onToggleSidebarToken,
 }: {
   secrets: SecretMeta[];
   loading: boolean;
@@ -374,6 +402,10 @@ export function AnthropicTokens({
   // The owner's judge-lane binding, so a delete can say the judge moves too (D5
   // covers "workers AND the judge"). From Settings, which already holds the user.
   judgeSecretId: string | null;
+  // Which non-default tokens also show on the sidebar rail, plus the save
+  // handler. Owned by Settings alongside `secrets` (one load, one reload).
+  sidebarTokenIds: string[];
+  onToggleSidebarToken: (id: string, shown: boolean) => Promise<void>;
 }) {
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
@@ -526,6 +558,8 @@ export function AnthropicTokens({
               judgeBound={judgeSecretId === s.id}
               autoStatus={autoStatuses[s.id]}
               autoFetchState={autoFetchState}
+              sidebarShown={sidebarTokenIds.includes(s.id)}
+              onToggleSidebar={onToggleSidebarToken}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}

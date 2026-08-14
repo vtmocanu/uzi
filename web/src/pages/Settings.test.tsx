@@ -181,6 +181,63 @@ describe("Settings — Appearance theme picker (PRD #21)", () => {
   });
 });
 
-// ── Judge → token binding (PRD #104 M4/M6) ──────────────────────────────────
-// Without this control the success criterion "the judge lane can burn a different
-// token, set from the web UI" is unreachable, which is why it is required.
+// ── Sidebar meter opt-in (round-3 IA feedback) ───────────────────────────────
+describe("Settings — per-token 'Show in sidebar' toggle", () => {
+  const twoSecrets = [
+    {
+      id: "sec-1",
+      kind: "anthropic_token",
+      label: "default",
+      is_default: true,
+      auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    },
+    {
+      id: "sec-2",
+      kind: "anthropic_token",
+      label: "console-key",
+      is_default: false,
+      auto_eligible: false,
+      created_at: "2026-01-02T00:00:00Z",
+      updated_at: "2026-01-02T00:00:00Z",
+    },
+  ];
+
+  it("pins the default token's box checked and disabled, others unchecked and live", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoSecrets });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const pinned = (await screen.findByLabelText(
+      "Show default in the sidebar",
+    )) as HTMLInputElement;
+    expect(pinned.checked).toBe(true);
+    expect(pinned.disabled).toBe(true);
+    const extra = screen.getByLabelText("Show console-key in the sidebar") as HTMLInputElement;
+    expect(extra.checked).toBe(false);
+    expect(extra.disabled).toBe(false);
+  });
+
+  it("checking an extra saves the whole set over PUT /me/settings", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoSecrets });
+    mockApi.putMySettings.mockResolvedValue({
+      settings: { default_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
+    });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const extra = (await screen.findByLabelText(
+      "Show console-key in the sidebar",
+    )) as HTMLInputElement;
+    fireEvent.click(extra);
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({ sidebar_token_ids: ["sec-2"] }),
+    );
+    await waitFor(() => expect(extra.checked).toBe(true));
+  });
+});

@@ -161,7 +161,7 @@ export function RunDefaults() {
   };
 
   return (
-    <SettingsShell description="Your personal uzi configuration.">
+    <SettingsShell description="How your runs behave: autopilot, usage limits, the judge, CI fixes, and the model.">
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 

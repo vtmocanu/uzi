@@ -24,7 +24,10 @@ const TABS = [
 export function SettingsShell({ description, children }: { description: string; children: ReactNode }) {
   return (
     <div className="space-y-6">
-      <PageHeader title="Settings" description={description} />
+      {/* Constant across tabs so the strip never jumps on a switch — the per-tab
+          `description` renders BELOW the strip instead (see AdminShell, which
+          documents the mechanism; both shells keep the same treatment). */}
+      <PageHeader title="Settings" description="Your personal uzi configuration." />
       {/* Issue #204: the tab row scrolls WITHIN its own container so the page body never
           scrolls horizontally. Measured when this row held five tabs: at 390px the strip
           overflowed (scrollWidth 401 vs clientWidth 390). Four tabs likely fit today, but
@@ -50,6 +53,7 @@ export function SettingsShell({ description, children }: { description: string; 
           </NavLink>
         ))}
       </div>
+      {description && <p className="text-sm text-muted">{description}</p>}
       {children}
     </div>
   );

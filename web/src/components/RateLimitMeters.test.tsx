@@ -7,10 +7,20 @@ import { api, type MyRateLimits } from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { getMyRateLimits: vi.fn() } };
+  // getMySettings feeds SidebarRateLimits' chosen-token set; default-only unless a
+  // test overrides it.
+  return { ...actual, api: { getMyRateLimits: vi.fn(), getMySettings: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
+
+beforeEach(() => {
+  // Default-only chosen set unless a test overrides it; SidebarRateLimits fetches
+  // this on mount, so an unstubbed mock would throw inside the effect.
+  mockApi.getMySettings.mockResolvedValue({
+    settings: { default_model: null, theme: null, sidebar_token_ids: [] },
+  });
+});
 
 afterEach(() => {
   cleanup();
@@ -202,11 +212,13 @@ describe("SidebarRateLimits", () => {
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
   });
 
-  // The footer-crowding cap: several tokens render ONE pair of bars — the most
-  // constrained token's — plus a link to the full per-token meters in Settings.
-  // The worst is picked by peak window utilization, NOT by is_default: here the
-  // default sits at 8/27 while a secondary runs 62/83, and the secondary wins.
-  it("shows only the most constrained token plus a '+N more' link when several are readable", async () => {
+  // The rail shows the USER'S chosen set (round 3): the default token always,
+  // plus checked extras — never an automatic pick. Two tokens, nothing checked:
+  // only the default renders, however hot the other one runs.
+  it("shows only the default token plus a '+N more' link when nothing else is checked", async () => {
+    mockApi.getMySettings.mockResolvedValue({
+      settings: { default_model: null, theme: null, sidebar_token_ids: [] },
+    });
     mockApi.getMyRateLimits.mockResolvedValue({
       tokens: [
         { ...tokens(okReading).tokens[0], secret_id: "sec-1", label: "default", is_default: true },
@@ -224,15 +236,43 @@ describe("SidebarRateLimits", () => {
       </MemoryRouter>,
     );
     await screen.findByLabelText("Claude rate limits");
-    // One pair of bars, labeled with the WORST token's name.
+    // One pair of bars: the default's numbers, even though console-key is hotter.
     expect(screen.getAllByRole("progressbar")).toHaveLength(2);
-    expect(screen.getByText("console-key")).toBeTruthy();
-    expect(screen.getByText("62%")).toBeTruthy();
-    // The cooler default token's numbers are not on the rail…
-    expect(screen.queryByText("8%")).toBeNull();
-    // …but the link to the full meters says how many more there are.
-    const more = screen.getByRole("link", { name: "+1 more token in Settings" });
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.getByText("8%")).toBeTruthy();
+    expect(screen.queryByText("62%")).toBeNull();
+    // The link to the full meters says how many more there are.
+    const more = await screen.findByRole("link", { name: "+1 more token in Settings" });
     expect(more.getAttribute("href")).toBe("/settings");
+  });
+
+  it("also shows a checked extra token, and drops the link when nothing is hidden", async () => {
+    mockApi.getMySettings.mockResolvedValue({
+      settings: { default_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
+    });
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        { ...tokens(okReading).tokens[0], secret_id: "sec-1", label: "default", is_default: true },
+        {
+          ...tokens(warnReading).tokens[0],
+          secret_id: "sec-2",
+          label: "console-key",
+          is_default: false,
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <SidebarRateLimits />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Claude rate limits");
+    // Both pairs render once the chosen set arrives…
+    await waitFor(() => expect(screen.getAllByRole("progressbar")).toHaveLength(4));
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.getByText("console-key")).toBeTruthy();
+    // …and with every readable token shown, there is no "+N more" link.
+    expect(screen.queryByRole("link")).toBeNull();
   });
 });
 

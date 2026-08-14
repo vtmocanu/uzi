@@ -54,6 +54,8 @@ vi.mock("../lib/api", () => ({
     listNotifications: vi.fn(),
     markNotificationRead: vi.fn(),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+    // SidebarRateLimits fetches the chosen sidebar-token set on mount.
+    getMySettings: vi.fn().mockResolvedValue({ settings: { default_model: null, theme: null } }),
     version: vi.fn().mockResolvedValue({ version: "9.9.9-test" }),
   },
 }));
