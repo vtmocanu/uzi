@@ -171,7 +171,7 @@ plan gate**; the clamp is written above as the default because it is the minimal
 
 ## Milestones
 
-- [ ] **M1: Offline reproduction (red before the fix).** In `agent/test/git.test.ts` (the existing
+- [x] **M1: Offline reproduction (red before the fix).** In `agent/test/git.test.ts` (the existing
   `#262` frozen-mirror test at ~208-241 and the resume test at ~158-197 are the pattern; scratch
   bare origins come from `agent/test/fixture-repo.ts`, no network/auth), build the residual-bug
   topology: a branch whose real base `baseSha` is fresh, while the bare's **fresh tracking refs are
@@ -183,14 +183,14 @@ plan gate**; the clamp is written above as the default because it is the minimal
   == baseSha` — so the test is red before M2 and green after (do **not** assert the pre-fix stale
   value, which would lock in the bug).
 
-- [ ] **M2: Clamp the ratchet base.** In `runnerCloneForBranch`, at the issue #262 update-ref site,
+- [x] **M2: Clamp the ratchet base.** In `runnerCloneForBranch`, at the issue #262 update-ref site,
   add the clamp exactly as in Solution: read `isAncestor(barePath, defaultBranchCommit, baseSha)`
   with the existing **worker-uid** helper; when true, `update-ref` the clone's
   `refs/remotes/origin/<default>` to `baseSha` (write stays `runGitAsRunner`); `log.info` only when
   the value actually changed. Preserve the existing skip for an unresolvable default branch and note
   that edge in the comment.
 
-- [ ] **M3: Prove the fix and both no-op paths.** Make the M1 test pass after M2, and add the two
+- [x] **M3: Prove the fix and both no-op paths.** Make the M1 test pass after M2, and add the two
   no-op cases from Success Criteria 2 and 3: a fresh run (`defaultBranchCommit === baseSha`, write
   unchanged, no clamp log) and a resume where main moved forward on a divergent line
   (`defaultBranchCommit` not an ancestor of `baseSha`, `origin/main` keeps `defaultBranchCommit`).

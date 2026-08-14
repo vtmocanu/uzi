@@ -540,9 +540,37 @@ export class GitCache {
       // as RUNNER, matching the surrounding runner-owned writes. `defaultBranchCommit` may be
       // undefined (a repo with no resolvable default branch); guard and skip so we never mask
       // the existing merge-base pre-flight in the Taskfile.
+      // Issue #313 — never let the ratchet base be a STRICT ANCESTOR of the branch base. On a
+      // resume leg `defaultBranchCommit` can resolve (via defaultBranchSha → defaultBranchRef's
+      // fallback chain) to the FROZEN refs/heads/main mirror, a stale ancestor of baseSha; #262
+      // then advances origin/main to that stale commit, so merge-base(origin/main, HEAD) regresses
+      // below the fork point and false-reds other people's backlog. Clamp to baseSha — the exact
+      // base the lead computes by hand (--new-from-merge-base=<baseSha> returns 0 issues).
+      // isAncestor is TRUE at equality, so a fresh run (defaultBranchCommit === baseSha) and an
+      // ordinary resume both clamp to baseSha with NO behaviour change from #262 on the fresh run
+      // (the same value is written); only the frozen-mirror case is corrected. When
+      // defaultBranchCommit is NOT an ancestor of baseSha (a resume where main moved forward on a
+      // divergent line) keep defaultBranchCommit so vs-main merge-base semantics are preserved.
+      // Read ancestry against the worker-owned BARE with the existing worker-uid isAncestor helper
+      // (both commits are bare-reachable); the WRITE stays runGitAsRunner into the runner-owned
+      // clone, exactly as #262. The no-resolvable-default-branch edge keeps today's skip (origin/main
+      // keeps whatever the plain clone copied); it is governed by the Taskfile merge-base pre-flight,
+      // out of scope here.
       const defaultBranch = await this.defaultBranchName(barePath);
-      if (defaultBranch && defaultBranchCommit) {
-        await this.runGitAsRunner(clonePath, ["update-ref", `refs/remotes/origin/${defaultBranch}`, defaultBranchCommit]);
+      let ratchetBase = defaultBranchCommit;
+      if (ratchetBase && (await this.isAncestor(barePath, ratchetBase, baseSha))) {
+        ratchetBase = baseSha;
+      }
+      if (defaultBranch && ratchetBase) {
+        await this.runGitAsRunner(clonePath, ["update-ref", `refs/remotes/origin/${defaultBranch}`, ratchetBase]);
+        if (ratchetBase !== defaultBranchCommit) {
+          this.log.info("runner clone: clamped ratchet base to branch base (stale default ref)", {
+            branch,
+            baseSha,
+            defaultBranchCommit,
+            clamped_to: ratchetBase,
+          });
+        }
       }
       return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit, seededFrom, checkpointSetAside };
     });
