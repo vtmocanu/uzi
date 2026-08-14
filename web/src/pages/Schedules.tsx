@@ -28,7 +28,7 @@ import {
   Toggle,
   cx,
 } from "../components/ui";
-import { ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
+import { ChevronDownIcon, ClockIcon, PencilIcon, PlayIcon, PlusIcon } from "../components/icons";
 
 // The COLSPAN of the schedules table, so the expandable "Last fire" detail row
 // stretches the full width (Target · When · Next run · Last run · Options · On).
@@ -361,16 +361,26 @@ function LastRunOutcome({
       <span className="text-[11px] text-faint tabular-nums">
         {formatStamp(fire.fired_at)} · matched {fire.matched}
       </span>
+      {/* A DISCLOSURE, not a link (ux-tweaks item 2): it expands the detail row in
+          place, so it must not wear the app's link costume (text-info + underline
+          promises navigation). Muted text + a chevron is the vocabulary every other
+          expander here uses. The chevron is the SVG icon, not the ▾ font glyph — the
+          glyph's metrics drift per font and its rotated open state rendered as thin
+          stray lines; the SVG is viewBox-centred and crisp in both themes (the same
+          trade ChevronsRightIcon records in icons.tsx). */}
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="inline-flex items-center gap-1 text-[11px] font-medium text-info hover:underline"
+        className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
         Last fire
-        <span aria-hidden="true" className={cx("transition-transform", expanded && "rotate-180")}>
-          ▾
-        </span>
+        <ChevronDownIcon
+          className={cx(
+            "h-3 w-3 transition-transform motion-reduce:transition-none",
+            expanded && "rotate-180",
+          )}
+        />
       </button>
     </div>
   );

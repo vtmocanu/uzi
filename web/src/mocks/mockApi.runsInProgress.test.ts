@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from "vitest";
 import { isTerminalRun, type Run } from "../lib/api";
-import { mockChatRuns, mockCrewRuns, mockLaneRuns, mockRuns } from "./data";
+import { mockChatRuns, mockCrewRuns, mockHistoryRuns, mockLaneRuns, mockRuns } from "./data";
 
 // Each test re-imports a fresh mockApi so its in-memory run state starts from the seed.
 async function freshApi() {
@@ -15,7 +15,7 @@ async function freshApi() {
 // fixture gaining a run must not turn this red for a reason that is not about the mock.
 const seeded: Run[] = (() => {
   const m = new Map<string, Run>();
-  for (const r of [...mockRuns, ...mockChatRuns, ...mockCrewRuns, ...mockLaneRuns]) m.set(r.id, r);
+  for (const r of [...mockRuns, ...mockChatRuns, ...mockCrewRuns, ...mockLaneRuns, ...mockHistoryRuns]) m.set(r.id, r);
   return [...m.values()];
 })();
 

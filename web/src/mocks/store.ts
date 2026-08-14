@@ -17,6 +17,7 @@ import {
   mockDegradedMessages,
   mockDoneMessages,
   mockFailedMessages,
+  mockHistoryRuns,
   mockLaneMessages,
   mockLaneRuns,
   mockLimitWaitMessages,
@@ -59,6 +60,10 @@ function seed(): MockState {
   // agent_instance, so they are the only ones that render the By-agent lane view as
   // anything other than legacy role lanes.
   for (const r of mockLaneRuns) runs.set(r.id, { ...r });
+  // Generated terminal history (ux-tweaks item 3): what makes the runs page's date
+  // grouping + "Show 50 more" reveal exhibitable. The distinct run-hist- prefix
+  // cannot collide with a hand-written fixture id.
+  for (const r of mockHistoryRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -95,6 +100,10 @@ function seed(): MockState {
   // carries a scheduled judge. An empty log rather than no entry: getRunMessages 404s on
   // an unseeded id, which the real API does not do for a run that exists.
   messages.set("run-unjudged", []);
+  // Generated history runs reuse the done transcript (the run-closed precedent
+  // above): opening one from the past list shows a full run view, not a 404 alert.
+  // Shared row objects, same as run-closed — nothing mutates a seeded message.
+  for (const r of mockHistoryRuns) messages.set(r.id, [...mockDoneMessages]);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });

@@ -1,17 +1,21 @@
-// Runs index. Active runs are always visible; past (terminal) runs collapse
-// behind "Show past runs (N)" — the pattern multica uses for per-issue
-// execution logs (packages/views/issues/components/execution-log-section.tsx),
-// including its sort rule that failed outranks cancelled outranks completed at
-// equal timestamps (PAST_STATUS_RANK there). The row status pill keeps PRD #12's
-// "a deliberate stop is not a failure" nuance: isStoppedRun collapses cancelled /
-// stop_kind-stamped-failed runs (PRD #33) to a calm "stopped" pill, not "failed".
+// Runs index. Active runs are always visible up top; past (terminal) runs read
+// like the board (PRD #304): searchable, grouped by date at a recency-graded
+// grain (days this week → weeks this month → months beyond, lib/runGroups.ts),
+// and render-sliced through the board's own lanePaging (cap 10, page 50 — the
+// slice decides display, never membership). The sort keeps multica's rule that
+// failed outranks cancelled outranks completed at equal timestamps
+// (PAST_STATUS_RANK). The row status pill keeps PRD #12's "a deliberate stop is
+// not a failure" nuance: isStoppedRun collapses cancelled / stop_kind-stamped-
+// failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
-import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
-import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
+import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { ActivityIcon } from "../components/icons";
+import { lanePaging } from "../lib/boardColumns";
+import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
@@ -29,6 +33,21 @@ import { anthropicTokenCount } from "../lib/hasToken";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
+// The past section's render slice, borrowing the board's constants (PRD #304):
+// PAST_CAP rows up front, one PAGE per "Show 50 more", and an active search lifts
+// the baseline to a full page (lanePaging owns that rule).
+const PAST_CAP = 10;
+const PAGE = 50;
+// The search input's stable id, so `/` can focus it (the board's M5 shortcut).
+const SEARCH_INPUT_ID = "runs-search";
+
+// When a past run HAPPENED, for both sorting and date grouping: finished_at is the
+// honest anchor, updated_at the pre-feature fallback — one function so the sort and
+// the group headers can never disagree about where a run belongs.
+function pastAnchor(r: RunListItem): string {
+  return r.finished_at ?? r.updated_at;
+}
+
 // The meta line's "tok" figure is the run's ALL-token total (fresh + cached + cache
 // creation + output), matching the mock's single "1.33M tok".
 function runUsageTotalTokens(u: RunUsage): number {
@@ -36,7 +55,7 @@ function runUsageTotalTokens(u: RunUsage): number {
 }
 
 function sortPast(a: RunListItem, b: RunListItem): number {
-  const t = b.updated_at.localeCompare(a.updated_at);
+  const t = pastAnchor(b).localeCompare(pastAnchor(a));
   if (t !== 0) return t;
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
 }
@@ -175,7 +194,12 @@ export function RunsList() {
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [showPast, setShowPast] = useState(false);
+  // Past-section search + progressive reveal (ux-tweaks item 3, the board's PRD #304
+  // pattern). shownCount is a render-only slice size the reveal button grows;
+  // lanePaging clamps it up to the baseline (PAST_CAP, or PAGE while a search is
+  // active), so 0 means "at baseline".
+  const [query, setQuery] = useState("");
+  const [shownCount, setShownCount] = useState(0);
   // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
   // computed once from the viewer's secrets. A single-token user sees no badge.
   const [tokenCount, setTokenCount] = useState(0);
@@ -208,8 +232,44 @@ export function RunsList() {
     load();
   }, [load]);
 
+  // `/` focuses the past-runs search — the board's M5 shortcut, same guard: never
+  // steal a literal slash the user is typing into another field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "/") return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
+      e.preventDefault();
+      document.getElementById(SEARCH_INPUT_ID)?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  const q = query.trim();
+  const searchActive = q.length > 0;
+  // Starting or clearing a search re-baselines the reveal (the board does the same on
+  // its searchActive toggle): a slice grown while browsing must not leak into search
+  // results, nor the reverse.
+  useEffect(() => {
+    setShownCount(0);
+  }, [searchActive]);
+
   const active = runs.filter((r) => !isTerminalRun(r.status));
   const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
+  // Membership → search → slice → group (the board's Decision 6 order, transposed):
+  // grouping runs over the SLICED list so a group never renders half its rows with a
+  // header count claiming more, while the reveal button carries the honest remainder.
+  const pastFiltered = searchActive ? past.filter((r) => runMatchesQuery(r, q)) : past;
+  const paging = lanePaging({
+    total: pastFiltered.length,
+    shownCount,
+    cap: PAST_CAP,
+    page: PAGE,
+    searchActive,
+  });
+  const pastGroups = groupRuns(pastFiltered.slice(0, paging.render), pastAnchor, now);
 
   return (
     <div className="space-y-6">
@@ -256,22 +316,104 @@ export function RunsList() {
               </div>
 
               {past.length > 0 && (
-                <div className="space-y-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowPast((v) => !v)}
-                    aria-expanded={showPast}
-                    className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-faint transition-colors hover:text-muted"
-                  >
-                    {showPast ? <ChevronDownIcon /> : <ChevronRightIcon />}
-                    {showPast ? "Past runs" : `Show past runs (${past.length})`}
-                  </button>
-                  {showPast && (
-                    <ul className="space-y-2">
-                      {past.map((r) => (
-                        <RunRow key={r.id} run={r} now={now} showCredential={tokenCount > 1} />
-                      ))}
-                    </ul>
+                <div className="space-y-3">
+                  {/* Past runs are no longer hidden behind a "Show past runs" click:
+                      the render slice already keeps the page short, and a search box
+                      over invisible content would be a control pointing at nothing. */}
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                    <SectionTitle>Past runs</SectionTitle>
+                    <span className="text-xs tabular-nums text-faint">
+                      {paging.countLabel || String(pastFiltered.length)}
+                    </span>
+                    <div className="ml-auto">
+                      <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
+                        Search past runs
+                      </label>
+                      <Input
+                        id={SEARCH_INPUT_ID}
+                        type="search"
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            setQuery("");
+                            e.currentTarget.blur();
+                          }
+                        }}
+                        placeholder="Search past runs…"
+                        className="w-52 py-1 text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Result count only while searching (the board's rule) — a status
+                      region so assistive tech hears the count settle, not each key. */}
+                  {searchActive && (
+                    <p role="status" className="text-xs text-faint">
+                      {pastFiltered.length} result{pastFiltered.length === 1 ? "" : "s"} for “{q}”
+                    </p>
+                  )}
+
+                  {pastGroups.map((g) => (
+                    <div key={g.key} className="space-y-2">
+                      {/* Date group header (lib/runGroups.ts): days this week, weeks
+                          this month, months beyond. The hairline carries the eye across
+                          without a boxed subheader. */}
+                      <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+                        {g.label}
+                        <span aria-hidden="true" className="h-px flex-1 bg-edge" />
+                      </h3>
+                      <ul className="space-y-2">
+                        {g.runs.map((r) => (
+                          <RunRow key={r.id} run={r} now={now} showCredential={tokenCount > 1} />
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+
+                  {searchActive && pastFiltered.length === 0 && (
+                    <p className="text-sm text-faint">
+                      No past runs match “{q}”.{" "}
+                      <button
+                        type="button"
+                        onClick={() => setQuery("")}
+                        className="font-medium text-brand hover:text-brand-hover"
+                      >
+                        Clear search
+                      </button>
+                    </p>
+                  )}
+
+                  {/* The reveal rail, copy-for-copy the board lane's (PRD #304): Show
+                      more grows the slice a page; Collapse returns to baseline. */}
+                  {(paging.showMoreBy > 0 || paging.canCollapse) && (
+                    <div className="flex flex-col items-start gap-1.5">
+                      {paging.showMoreBy > 0 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShownCount((c) => Math.max(c, searchActive ? PAGE : PAST_CAP) + PAGE)
+                          }
+                          aria-label={`Show ${paging.showMoreBy} more past runs, ${paging.remaining} hidden`}
+                          className="rounded-md border border-edge bg-raised px-2 py-1 text-xs text-muted transition-colors hover:text-fg"
+                        >
+                          Show {paging.showMoreBy} more · {paging.remaining} left
+                        </button>
+                      )}
+                      {paging.canCollapse && (
+                        <button
+                          type="button"
+                          onClick={() => setShownCount(0)}
+                          aria-label="Collapse past runs"
+                          className="text-xs text-faint transition-colors hover:text-muted"
+                        >
+                          Collapse
+                        </button>
+                      )}
+                      {paging.nudgeSearch && !searchActive && (
+                        <p className="text-[11px] text-faint">Too many to show — use search to narrow.</p>
+                      )}
+                    </div>
                   )}
                 </div>
               )}

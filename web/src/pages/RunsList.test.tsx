@@ -419,9 +419,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       </MemoryRouter>,
     );
 
-    // Terminal runs live behind the collapsed "Show past runs" toggle.
-    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
-    fireEvent.click(screen.getByText(/Show past runs/));
+    // Terminal runs render in the always-visible, date-grouped past section.
     await waitFor(() => expect(screen.getByText("Terminal run")).toBeTruthy());
     expect(screen.getByText(/ran 42m/)).toBeTruthy();
   });
@@ -438,10 +436,102 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText(/Show past runs/)).toBeTruthy());
-    fireEvent.click(screen.getByText(/Show past runs/));
     await waitFor(() => expect(screen.getByText("Never started")).toBeTruthy());
     expect(screen.queryByText(/\bran\b/)).toBeNull();
+  });
+});
+
+// ux-tweaks item 3: the past section is searchable, date-grouped (lib/runGroups.ts)
+// and render-sliced through the board's lanePaging (cap 10, page 50).
+describe("RunsList — past section search, grouping and reveal (ux-tweaks)", () => {
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+  });
+
+  // Timestamps are chosen relative to FIXED_NOW (2026-07-05T13:30:00Z) with margins
+  // wide enough that the local-time bucketing lands the same in any test timezone.
+  const pastRun = (id: string, title: string, finishedAt: string) =>
+    aRun({ id, issue_title: title, status: "completed", started_at: finishedAt, finished_at: finishedAt });
+
+  it("groups past runs under date headers (Today vs an older month)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("t", "Fresh run", "2026-07-05T12:42:00Z"),
+        pastRun("old", "Ancient run", "2026-05-20T10:00:00Z"),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Fresh run")).toBeTruthy());
+    expect(screen.getByText("Today")).toBeTruthy();
+    // The month label is locale-derived, so derive the expectation the same way.
+    const monthLabel = new Date("2026-05-20T10:00:00Z").toLocaleDateString(undefined, {
+      month: "long",
+      year: "numeric",
+    });
+    expect(screen.getByText(monthLabel)).toBeTruthy();
+  });
+
+  it("filters past runs by the search box and reports the match count", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("a", "Fix the parser", "2026-07-05T12:00:00Z"),
+        pastRun("b", "Ship the exporter", "2026-07-05T11:00:00Z"),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Search past runs"), { target: { value: "parser" } });
+    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    expect(screen.queryByText("Ship the exporter")).toBeNull();
+    expect(screen.getByText(/1 result/)).toBeTruthy();
+
+    // No match: an explanatory empty state with a working clear affordance.
+    fireEvent.change(screen.getByLabelText("Search past runs"), { target: { value: "zzz" } });
+    expect(screen.getByText(/No past runs match/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Clear search"));
+    expect(screen.getByText("Ship the exporter")).toBeTruthy();
+  });
+
+  it("caps the initial render at 10 and reveals the remainder via Show more / Collapse", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: Array.from({ length: 12 }, (_, i) =>
+        // Distinct minutes keep the sort deterministic; all land in one Today bucket.
+        pastRun(`p${i}`, `Past run ${i}`, `2026-07-05T12:${String(59 - i).padStart(2, "0")}:00Z`),
+      ),
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Past run 0")).toBeTruthy());
+    // 10 of 12 render; the two newest-minus-nine are cut, the count label says so.
+    expect(screen.getByText("Past run 9")).toBeTruthy();
+    expect(screen.queryByText("Past run 10")).toBeNull();
+    expect(screen.getByText("10/12")).toBeTruthy();
+
+    fireEvent.click(screen.getByText(/Show 2 more/));
+    expect(screen.getByText("Past run 11")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Collapse"));
+    expect(screen.queryByText("Past run 10")).toBeNull();
   });
 });
 

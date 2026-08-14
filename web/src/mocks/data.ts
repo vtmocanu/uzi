@@ -2901,6 +2901,119 @@ export const mockRuns: Run[] = [
   },
 ];
 
+// ── Past-run history (ux-tweaks item 3) ──────────────────────────────────────
+// The runs page's past section groups by date (days this week → weeks this month →
+// months beyond) and reveals progressively ("Show 50 more"), and seven hand-written
+// terminal fixtures cannot exhibit either. mockHistoryRuns generates ~150 terminal
+// runs DETERMINISTICALLY — titles, repos, workers, statuses and MR states cycle;
+// timestamps walk back from NOW through the current week, the current month's
+// weeks, then six prior months — so the demo shows every grouping grain and needs
+// three reveals to exhaust, and looks the same on every refresh (a demo that
+// reshuffles is worse than no demo). All terminal on purpose: the runs-in-progress
+// badge count and the judge fixtures' reachable-state coverage are unaffected.
+
+const HIST_TITLES = [
+  "Deduplicate webhook deliveries on retry",
+  "Add index for the runs-by-owner query",
+  "Fix flaky worker heartbeat test",
+  "Surface pipeline status on the MR chip",
+  "Rotate forge PAT without downtime",
+  "Batch notification inserts per fire",
+  "Add CSV export to the usage table",
+  "Harden the SSRF allowlist parser",
+  "Retry claim on serialization failure",
+  "Trim stale branches after merge",
+  "Cache repo metadata for the board",
+  "Fix timezone drift in schedule fires",
+  "Add per-model cost breakdown",
+  "Migrate secrets to envelope v2",
+  "Reduce bundle size of the run view",
+  "Add keyboard shortcuts to the board",
+  "Fix orphaned tool_result pairing",
+  "Speed up the seed sync fan-out",
+  "Add health probe to the controller",
+  "Label sync races the poller — fix",
+  "Document the vault unlock flow",
+  "Add rate-limit forecast to dashboard",
+  "Fix double-count in phase folding",
+  "Prune completed judge meta-runs",
+] as const;
+const HIST_REPOS = ["repo-uzi", "repo-atlas", "repo-payments"] as const;
+const HIST_WORKERS = ["w-laptop", "w-ci", "w-nas", "w-hosted-eu", "w-mira"] as const;
+
+function histRun(i: number, minsBack: number): Run {
+  // Mostly completed, a steady trickle of failed and (deliberately) cancelled rows so
+  // the calm "stopped" pill and the danger "failed" pill both appear down the history.
+  const status = i % 9 === 4 ? "failed" : i % 13 === 7 ? "cancelled" : "completed";
+  const cancelled = status === "cancelled";
+  const ranMins = 23 + (i % 6) * 17; // 23–108 minutes of work
+  const merged = status === "completed" && i % 4 !== 3;
+  const hasMr = status === "completed" || i % 3 === 0;
+  return {
+    id: `run-hist-${i}`,
+    repo_id: HIST_REPOS[i % HIST_REPOS.length],
+    issue_iid: 400 + i,
+    issue_title: HIST_TITLES[i % HIST_TITLES.length],
+    issue_description: "Generated demo history — see mockHistoryRuns in mocks/data.ts.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status,
+    requeue_count: 0,
+    iteration_count: 1 + (i % 4),
+    auto_approve: i % 5 === 0,
+    worker_id: HIST_WORKERS[i % HIST_WORKERS.length],
+    branch: `agent/issue-${400 + i}`,
+    model: null,
+    override_subagent_model: false,
+    forge_type: "gitlab",
+    mr_web_url: hasMr ? `https://gitlab.example.com/demo/-/merge_requests/${900 + i}` : null,
+    mr_iid: hasMr ? 900 + i : null,
+    mr_state: hasMr ? (merged ? "merged" : status === "completed" ? "opened" : "closed") : null,
+    failure_reason: status === "failed" ? "gate red: vitest — 2 failed" : null,
+    stop_kind: cancelled ? "cancelled" : null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    claimed_at: minsAgo(minsBack + ranMins),
+    started_at: minsAgo(minsBack + ranMins),
+    finished_at: minsAgo(minsBack),
+    created_at: minsAgo(minsBack + ranMins + 8),
+    updated_at: minsAgo(minsBack),
+  };
+}
+
+// Minutes-back offsets, walked oldest-last: a run every ~9h across the last 7 days
+// (today, yesterday and the current week's weekday buckets), every ~26h out to day
+// 28 (the current month's week buckets), then every ~40h across six prior months
+// (the month buckets). The small modular jitter keeps timestamps off round hours.
+const HIST_OFFSETS_MIN: number[] = (() => {
+  const out: number[] = [];
+  for (let h = 3; h < 7 * 24; h += 9) out.push(h * 60 + (h % 5) * 7);
+  for (let d = 7; d < 28; d++) out.push(d * 1440 + (d % 7) * 300);
+  for (let h = 28 * 24; h < 210 * 24; h += 40) out.push(h * 60 + (h % 11) * 13);
+  return out;
+})();
+
+export const mockHistoryRuns: Run[] = HIST_OFFSETS_MIN.map((m, i) => histRun(i, m));
+
 export function SAMPLE_PLAN(): string {
   return [
     "## Plan",
@@ -2939,7 +3052,11 @@ export function SEEDED_PLAN(): string {
 // pre-feature "never a fake 0" behavior. A running run shows a smaller "so far".
 function demoRunUsage(r: Run): RunUsage | null {
   if (r.status === "queued" || r.status === "claimed" || r.status === "awaiting_approval") return null;
-  const scale = r.status === "running" ? 0.4 : 1;
+  // History rows (ux-tweaks item 3) spread deterministically across 0.3x–2.8x so a
+  // 150-run past list doesn't repeat one implausible figure down the page. The
+  // hand-written fixtures keep their documented 1.33M/$1.87 exactly as before.
+  const histScale = r.id.startsWith("run-hist-") ? 0.3 + (hashCode(r.id) % 100) / 40 : 1;
+  const scale = (r.status === "running" ? 0.4 : 1) * histScale;
   const round = (n: number) => Math.round(n * scale);
   return {
     input_tokens: round(114_400),
