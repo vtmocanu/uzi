@@ -288,6 +288,7 @@ function ScheduleRow({
             fire={s.last_fire}
             expanded={expanded}
             onToggle={() => setExpanded((v) => !v)}
+            panelId={`last-fire-${s.id}`}
           />
         ) : s.last_fired_at ? (
           <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
@@ -332,7 +333,10 @@ function ScheduleRow({
     </tr>
     {s.last_fire && expanded && (
       <tr className="border-t border-edge">
-        <td colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-0">
+        {/* The id pairs with the disclosure's aria-controls (review-wave fix 4).
+            Conditionally rendered, so the reference only exists while expanded —
+            which is when aria-controls has anything to say. */}
+        <td id={`last-fire-${s.id}`} colSpan={COLS} className="bg-raised/30 px-4 pb-4 pt-0">
           <LastFireDetail s={s} fire={s.last_fire} />
         </td>
       </tr>
@@ -348,10 +352,13 @@ function LastRunOutcome({
   fire,
   expanded,
   onToggle,
+  panelId,
 }: {
   fire: LastFire;
   expanded: boolean;
   onToggle: () => void;
+  // The detail row's element id, for the disclosure's aria-controls.
+  panelId: string;
 }) {
   return (
     <div className="flex flex-col gap-1">
@@ -372,6 +379,7 @@ function LastRunOutcome({
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
+        aria-controls={panelId}
         className="inline-flex w-fit items-center gap-1 rounded text-[11px] font-medium text-muted transition-colors hover:text-fg"
       >
         Last fire

@@ -619,6 +619,7 @@ function SidebarContent({
                 <button
                   onClick={handleLogout}
                   title="Log out"
+                  aria-label="Log out"
                   className="rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg"
                 >
                   <LogOutIcon />

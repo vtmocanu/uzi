@@ -198,7 +198,11 @@ function RunRow({
         to={`/runs/${run.id}`}
         className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
       >
-        <div className="min-w-0 flex-1">
+        {/* w-full below sm stacks the badge cluster UNDER the title (review-wave
+            fix 1): with min-w-0 alone the title column could shrink to nothing, so
+            at 390px the unshrinkable badges starved it to a few characters before
+            flex-wrap ever fired. From sm up the old one-row layout is unchanged. */}
+        <div className="w-full min-w-0 sm:w-auto sm:flex-1">
           {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
               can open an issue on the target repo, so it is untrusted free text on the same
               footing as judge output. Display-only here; the raw value stays the identity. */}
@@ -476,7 +480,10 @@ export function RunsList() {
 // point of the route split (replace:true keeps typing out of the history stack, so
 // Back leaves the page rather than un-typing).
 export function RunsHistory() {
-  const now = useNow(1000);
+  // Every row here is terminal, so the duration token is static ("ran 42m") — a
+  // minute-cadence clock keeps the "N minutes ago"-class derivations honest without
+  // the live console's 1s tick, which only running rows need (review-wave fix 5).
+  const now = useNow(60_000);
 
   // Runs, secrets gate, load/error state all come from the layout's one fetch —
   // this page owns only its search + reveal state.

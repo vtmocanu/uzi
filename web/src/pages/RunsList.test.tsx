@@ -35,7 +35,16 @@ vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 // Issue #256 M3: useNow is the single clock the duration token reads. Pin it so the
 // live buckets ("running 1h 30m") are deterministic — the real hook returns Date.now().
-const FIXED_NOW = Date.parse("2026-07-05T13:30:00Z");
+// Built through the LOCAL-time Date constructor, like every date fixture below (the
+// runGroups.test.ts pattern): runBucket's day boundaries are local, so a Z-parsed
+// instant here lands on a different local DAY than the fixtures in timezones far
+// from UTC — measured: TZ=Pacific/Norfolk turned "Today" into "Yesterday" (review-
+// wave fix 2, which also retired a comment falsely claiming Z-margins were enough).
+const FIXED_NOW = new Date(2026, 6, 5, 13, 30).getTime(); // 2026-07-05 13:30 local
+
+// Local-clock ISO fixture helper: same LOCAL day as FIXED_NOW in every timezone.
+const atLocal = (y: number, mo: number, d: number, h = 12, min = 0) =>
+  new Date(y, mo, d, h, min).toISOString();
 vi.mock("../lib/rateLimits", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/rateLimits")>();
   return { ...actual, useNow: () => FIXED_NOW };
@@ -362,16 +371,11 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
   });
 
   it("shows a running run's live age (started_at 90m before the fixed now)", async () => {
+    // Derived FROM FIXED_NOW rather than written as an instant, so the 90-minute
+    // difference — all the duration token reads — holds in any timezone.
+    const started = new Date(FIXED_NOW - 90 * 60_000).toISOString();
     mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({
-          id: "act",
-          issue_title: "Active run",
-          status: "running",
-          // 90 minutes before FIXED_NOW (2026-07-05T13:30:00Z) → "running 1h 30m".
-          started_at: "2026-07-05T12:00:00Z",
-        }),
-      ],
+      runs: [aRun({ id: "act", issue_title: "Active run", status: "running", started_at: started })],
     });
 
     const { container } = renderRuns();
@@ -379,7 +383,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
     await waitFor(() => expect(screen.getByText("Active run")).toBeTruthy());
     expect(screen.getByText(/running 1h 30m/)).toBeTruthy();
     // The updated_at timestamp is kept alongside the token, not replaced (owner decision).
-    expect(container.textContent ?? "").toContain(new Date("2026-07-05T12:00:00Z").toLocaleString());
+    expect(container.textContent ?? "").toContain(new Date(aRun().updated_at).toLocaleString());
   });
 
   it("shows a terminal run's static ran-span (finished_at − started_at = 42m)", async () => {
@@ -389,8 +393,8 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
           id: "term",
           issue_title: "Terminal run",
           status: "completed",
-          started_at: "2026-07-05T12:00:00Z",
-          finished_at: "2026-07-05T12:42:00Z",
+          started_at: atLocal(2026, 6, 5, 12, 0),
+          finished_at: atLocal(2026, 6, 5, 12, 42),
         }),
       ],
     });
@@ -426,16 +430,18 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     } as unknown as ReturnType<typeof useAuth>);
   });
 
-  // Timestamps are chosen relative to FIXED_NOW (2026-07-05T13:30:00Z) with margins
-  // wide enough that the local-time bucketing lands the same in any test timezone.
+  // Timestamps come from atLocal (the local-clock Date constructor, same as
+  // FIXED_NOW), so fixture and clock share a local DAY in every test timezone —
+  // runBucket's boundaries are local, and Z-instant fixtures with "wide margins"
+  // demonstrably were not enough (review-wave fix 2).
   const pastRun = (id: string, title: string, finishedAt: string) =>
     aRun({ id, issue_title: title, status: "completed", started_at: finishedAt, finished_at: finishedAt });
 
   it("groups past runs under date headers (Today vs an older month)", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
-        pastRun("t", "Fresh run", "2026-07-05T12:42:00Z"),
-        pastRun("old", "Ancient run", "2026-05-20T10:00:00Z"),
+        pastRun("t", "Fresh run", atLocal(2026, 6, 5, 12, 42)),
+        pastRun("old", "Ancient run", atLocal(2026, 4, 20, 10)),
       ],
     });
 
@@ -444,7 +450,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     await waitFor(() => expect(screen.getByText("Fresh run")).toBeTruthy());
     expect(screen.getByText("Today")).toBeTruthy();
     // The month label is locale-derived, so derive the expectation the same way.
-    const monthLabel = new Date("2026-05-20T10:00:00Z").toLocaleDateString(undefined, {
+    const monthLabel = new Date(2026, 4, 20).toLocaleDateString(undefined, {
       month: "long",
       year: "numeric",
     });
@@ -454,8 +460,8 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
   it("filters past runs by the search box and reports the match count", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
-        pastRun("a", "Fix the parser", "2026-07-05T12:00:00Z"),
-        pastRun("b", "Ship the exporter", "2026-07-05T11:00:00Z"),
+        pastRun("a", "Fix the parser", atLocal(2026, 6, 5, 12)),
+        pastRun("b", "Ship the exporter", atLocal(2026, 6, 5, 11)),
       ],
     });
 
@@ -478,7 +484,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     mockApi.listRuns.mockResolvedValue({
       runs: Array.from({ length: 12 }, (_, i) =>
         // Distinct minutes keep the sort deterministic; all land in one Today bucket.
-        pastRun(`p${i}`, `Past run ${i}`, `2026-07-05T12:${String(59 - i).padStart(2, "0")}:00Z`),
+        pastRun(`p${i}`, `Past run ${i}`, atLocal(2026, 6, 5, 12, 59 - i)),
       ),
     });
 
@@ -508,7 +514,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "act", issue_title: "In flight", status: "running" }),
-        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
       ],
     });
 
@@ -527,7 +533,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "act", issue_title: "In flight", status: "running" }),
-        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
       ],
     });
 
@@ -542,8 +548,8 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
   it("initialises the archive search from ?q=", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
-        pastRun("a", "Fix the parser", "2026-07-05T12:00:00Z"),
-        pastRun("b", "Ship the exporter", "2026-07-05T11:00:00Z"),
+        pastRun("a", "Fix the parser", atLocal(2026, 6, 5, 12)),
+        pastRun("b", "Ship the exporter", atLocal(2026, 6, 5, 11)),
       ],
     });
 
@@ -562,7 +568,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({ id: "act", issue_title: "In flight", status: "running" }),
-        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+        pastRun("t", "Finished run", atLocal(2026, 6, 5, 12)),
       ],
     });
 
