@@ -23,7 +23,7 @@ import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
-import { RunsList } from "./pages/RunsList";
+import { RunsHistory, RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
 import { Schedules } from "./pages/Schedules";
 import { Judge } from "./pages/Judge";
@@ -135,6 +135,17 @@ export default function App() {
           element={
             <ProtectedRoute>
               <RunsList />
+            </ProtectedRoute>
+          }
+        />
+        {/* The archive tab (ux-tweaks amendment 3). A static segment, so React
+            Router ranks it above /runs/:id by construction — and run ids are
+            "run-…" prefixes or UUIDs besides, never the literal "history". */}
+        <Route
+          path="/runs/history"
+          element={
+            <ProtectedRoute>
+              <RunsHistory />
             </ProtectedRoute>
           }
         />

@@ -1,21 +1,26 @@
-// Runs index. Active runs are always visible up top; past (terminal) runs read
-// like the board (PRD #304): searchable, grouped by date at a recency-graded
-// grain (days this week → weeks this month → months beyond, lib/runGroups.ts),
-// and render-sliced through the board's own lanePaging (cap 10, page 50 — the
-// slice decides display, never membership). The sort keeps multica's rule that
-// failed outranks cancelled outranks completed at equal timestamps
+// Runs index — two routed tabs under the ONE sidebar "Runs" destination
+// (ux-tweaks amendment 3): /runs is the live console (your Active runs, plus the
+// admin Factory card showing OTHER users' runs — amendment 2), /runs/history is
+// the archive (search + date grouping + progressive reveal). The strip is the
+// SettingsShell/AdminShell NavLink pattern, so deep links and back/forward work
+// natively — React Router ranks the static /runs/history above /runs/:id by
+// construction, and run ids are run-*/UUIDs besides.
+//
+// Archive mechanics: grouping grain is days this week → weeks this month →
+// months beyond (lib/runGroups.ts, pure + clock-explicit); the render slice
+// reuses the board's own lanePaging (PRD #304: cap 10, page 50, an active search
+// lifts the baseline — display, never membership). The sort keeps multica's rule
+// that failed outranks cancelled outranks completed at equal timestamps
 // (PAST_STATUS_RANK). The row status pill keeps PRD #12's "a deliberate stop is
 // not a failure" nuance: isStoppedRun collapses cancelled / stop_kind-stamped-
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
-import { useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Link, NavLink, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
-import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
 import { ActivityIcon } from "../components/icons";
-import { lanePaging } from "../lib/boardColumns";
-import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { isStoppedRun, milestoneBadge, milestoneBadgeText, mrChipState } from "../lib/runBadge";
@@ -30,10 +35,12 @@ import { RunCredential } from "../components/RunCredential";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { anthropicTokenCount } from "../lib/hasToken";
+import { lanePaging } from "../lib/boardColumns";
+import { groupRuns, runMatchesQuery } from "../lib/runGroups";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
-// The past section's render slice, borrowing the board's constants (PRD #304):
+// The archive's render slice, borrowing the board's constants (PRD #304):
 // PAST_CAP rows up front, one PAGE per "Show 50 more", and an active search lifts
 // the baseline to a full page (lanePaging owns that rule).
 const PAST_CAP = 10;
@@ -48,16 +55,52 @@ function pastAnchor(r: RunListItem): string {
   return r.finished_at ?? r.updated_at;
 }
 
+function sortPast(a: RunListItem, b: RunListItem): number {
+  const t = pastAnchor(b).localeCompare(pastAnchor(a));
+  if (t !== 0) return t;
+  return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
+}
+
 // The meta line's "tok" figure is the run's ALL-token total (fresh + cached + cache
 // creation + output), matching the mock's single "1.33M tok".
 function runUsageTotalTokens(u: RunUsage): number {
   return u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens + u.output_tokens;
 }
 
-function sortPast(a: RunListItem, b: RunListItem): number {
-  const t = pastAnchor(b).localeCompare(pastAnchor(a));
-  if (t !== 0) return t;
-  return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
+// One constant header + tab strip across both tabs — the SettingsShell treatment,
+// so nothing jumps on a switch. pastCount rides the archive tab so it answers "is
+// there anything in there?" before being visited; null (still loading) renders the
+// bare label rather than a flashing 0.
+function RunsShell({ pastCount, children }: { pastCount: number | null; children: ReactNode }) {
+  const tabs = [
+    { to: "/runs", label: "Active", end: true },
+    { to: "/runs/history", label: pastCount == null ? "Past runs" : `Past runs · ${pastCount}`, end: false },
+  ];
+  return (
+    <div className="space-y-6">
+      <PageHeader title="Runs" description="Your agent runs. Open one to watch it live." />
+      <div className="flex gap-1 overflow-x-auto border-b border-edge">
+        {tabs.map((t) => (
+          <NavLink
+            key={t.to}
+            to={t.to}
+            end={t.end}
+            className={({ isActive }) =>
+              cx(
+                "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                isActive
+                  ? "border-brand text-fg"
+                  : "border-transparent text-muted hover:border-edge-strong hover:text-fg",
+              )
+            }
+          >
+            {t.label}
+          </NavLink>
+        ))}
+      </div>
+      {children}
+    </div>
+  );
 }
 
 function RunRow({
@@ -182,6 +225,7 @@ function RunRow({
   );
 }
 
+// The live console: your active runs, and (admin) the factory's other-user runs.
 export function RunsList() {
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
@@ -194,12 +238,6 @@ export function RunsList() {
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  // Past-section search + progressive reveal (ux-tweaks item 3, the board's PRD #304
-  // pattern). shownCount is a render-only slice size the reveal button grows;
-  // lanePaging clamps it up to the baseline (PAST_CAP, or PAGE while a search is
-  // active), so 0 means "at baseline".
-  const [query, setQuery] = useState("");
-  const [shownCount, setShownCount] = useState(0);
   // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
   // computed once from the viewer's secrets. A single-token user sees no badge.
   const [tokenCount, setTokenCount] = useState(0);
@@ -232,53 +270,15 @@ export function RunsList() {
     load();
   }, [load]);
 
-  // `/` focuses the past-runs search — the board's M5 shortcut, same guard: never
-  // steal a literal slash the user is typing into another field.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "/") return;
-      const el = document.activeElement as HTMLElement | null;
-      const tag = el?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
-      e.preventDefault();
-      document.getElementById(SEARCH_INPUT_ID)?.focus();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
-
-  const q = query.trim();
-  const searchActive = q.length > 0;
-  // Starting or clearing a search re-baselines the reveal (the board does the same on
-  // its searchActive toggle): a slice grown while browsing must not leak into search
-  // results, nor the reverse.
-  useEffect(() => {
-    setShownCount(0);
-  }, [searchActive]);
-
   const active = runs.filter((r) => !isTerminalRun(r.status));
-  const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
-  // Membership → search → slice → group (the board's Decision 6 order, transposed):
-  // grouping runs over the SLICED list so a group never renders half its rows with a
-  // header count claiming more, while the reveal button carries the honest remainder.
-  const pastFiltered = searchActive ? past.filter((r) => runMatchesQuery(r, q)) : past;
-  const paging = lanePaging({
-    total: pastFiltered.length,
-    shownCount,
-    cap: PAST_CAP,
-    page: PAGE,
-    searchActive,
-  });
-  const pastGroups = groupRuns(pastFiltered.slice(0, paging.render), pastAnchor, now);
+  const past = runs.filter((r) => isTerminalRun(r.status));
   // The factory card shows OTHER users' runs only (amendment 2026-08-14 (2)): the
   // admin's own runs already appear in Active above. owner_email is the admin-list
   // discriminator (RunListItem carries no is_mine); a row without one stays visible.
   const factoryRuns = adminRuns.filter((r) => r.owner_email !== user?.email);
 
   return (
-    <div className="space-y-6">
-      <PageHeader title="Runs" description="Your agent runs. Open one to watch it live." />
-
+    <RunsShell pastCount={loading ? null : past.length}>
       {/* The global judge-recommendation strip moved to the Judge page header (PRD #98
           Decision 7); each run row now carries its own verdict badge (JudgeRunBadge). */}
 
@@ -415,42 +415,132 @@ export function RunsList() {
           </div>
         </Card>
       )}
+    </RunsShell>
+  );
+}
 
-      {/* Past runs come LAST, after the admin factory card (user decision, amendment
-          2026-08-14): the page reads live-to-archival — your active runs, then (admin)
-          the factory's live state, then history. The archive is the one section that
-          GROWS (Show 50 more), so anything below it would sit under an unbounded
-          scroll; for non-admins there is no factory card and this was already the
-          tail, so the order is now the same story for both roles. */}
+// The archive: every finished run, searchable, date-grouped, progressively
+// revealed. Search state lives in ?q= so a filtered view is shareable — the whole
+// point of the route split (replace:true keeps typing out of the history stack, so
+// Back leaves the page rather than un-typing).
+export function RunsHistory() {
+  const now = useNow(1000);
+
+  const [runs, setRuns] = useState<RunListItem[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  // PRD #295: same ">1 token" credential-badge gate as the live console.
+  const [tokenCount, setTokenCount] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const query = searchParams.get("q") ?? "";
+  const setQuery = useCallback(
+    (v: string) => setSearchParams(v ? { q: v } : {}, { replace: true }),
+    [setSearchParams],
+  );
+  // The render slice the reveal button grows; lanePaging clamps it up to the
+  // baseline (PAST_CAP, or PAGE while a search is active), so 0 means "at baseline".
+  const [shownCount, setShownCount] = useState(0);
+
+  useEffect(() => {
+    (async () => {
+      setError("");
+      try {
+        const [{ runs }, { secrets }] = await Promise.all([
+          api.listRuns(),
+          api.listSecrets().catch(() => ({ secrets: [] })),
+        ]);
+        setRuns(runs);
+        setTokenCount(anthropicTokenCount(secrets));
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Failed to load runs");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // `/` focuses the archive search — the board's M5 shortcut, same guard: never
+  // steal a literal slash the user is typing into another field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "/") return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
+      e.preventDefault();
+      document.getElementById(SEARCH_INPUT_ID)?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  const q = query.trim();
+  const searchActive = q.length > 0;
+  // Starting or clearing a search re-baselines the reveal (the board does the same
+  // on its searchActive toggle): a slice grown while browsing must not leak into
+  // search results, nor the reverse.
+  useEffect(() => {
+    setShownCount(0);
+  }, [searchActive]);
+
+  const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
+  // Membership → search → slice → group (the board's Decision 6 order, transposed):
+  // grouping runs over the SLICED list so a group never renders half its rows with a
+  // header count claiming more, while the reveal button carries the honest remainder.
+  const pastFiltered = searchActive ? past.filter((r) => runMatchesQuery(r, q)) : past;
+  const paging = lanePaging({
+    total: pastFiltered.length,
+    shownCount,
+    cap: PAST_CAP,
+    page: PAGE,
+    searchActive,
+  });
+  const pastGroups = groupRuns(pastFiltered.slice(0, paging.render), pastAnchor, now);
+
+  return (
+    <RunsShell pastCount={loading ? null : past.length}>
+      {error && <Alert message={error} />}
+      {loading && <ListSkeleton rows={4} />}
+
+      {!loading && past.length === 0 && (
+        <EmptyState
+          icon={<ActivityIcon />}
+          title="No finished runs yet"
+          description="Finished runs collect here — completed, failed, and stopped alike. Start one from a board and it lands in this archive when it's done."
+          action={
+            <Link to="/repos" className="text-sm font-medium text-brand hover:text-brand-hover">
+              Go to boards →
+            </Link>
+          }
+        />
+      )}
+
       {!loading && past.length > 0 && (
         <div className="space-y-3">
-          {/* Past runs are no longer hidden behind a "Show past runs" click: the
-              render slice already keeps the page short, and a search box over
-              invisible content would be a control pointing at nothing. */}
+          {/* Archive toolbar, the board's shape: search first (the primary action),
+              the slice state right-aligned. The tab strip above already names the
+              page, so no repeated "Past runs" heading. */}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <SectionTitle>Past runs</SectionTitle>
-            <span className="text-xs tabular-nums text-faint">
+            <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
+              Search past runs
+            </label>
+            <Input
+              id={SEARCH_INPUT_ID}
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setQuery("");
+                  e.currentTarget.blur();
+                }
+              }}
+              placeholder="Search past runs…"
+              className="w-72 py-1 text-xs"
+            />
+            <span className="ml-auto text-xs tabular-nums text-faint">
               {paging.countLabel || String(pastFiltered.length)}
             </span>
-            <div className="ml-auto">
-              <label htmlFor={SEARCH_INPUT_ID} className="sr-only">
-                Search past runs
-              </label>
-              <Input
-                id={SEARCH_INPUT_ID}
-                type="search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    setQuery("");
-                    e.currentTarget.blur();
-                  }
-                }}
-                placeholder="Search past runs…"
-                className="w-52 py-1 text-xs"
-              />
-            </div>
           </div>
 
           {/* Result count only while searching (the board's rule) — a status
@@ -524,6 +614,6 @@ export function RunsList() {
           )}
         </div>
       )}
-    </div>
+    </RunsShell>
   );
 }

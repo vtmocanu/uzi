@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { RunsList } from "./RunsList";
+import { RunsHistory, RunsList } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -422,13 +422,13 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       ],
     });
 
+    // Terminal runs live on the archive tab (amendment 3).
     render(
       <MemoryRouter>
-        <RunsList />
+        <RunsHistory />
       </MemoryRouter>,
     );
 
-    // Terminal runs render in the always-visible, date-grouped past section.
     await waitFor(() => expect(screen.getByText("Terminal run")).toBeTruthy());
     expect(screen.getByText(/ran 42m/)).toBeTruthy();
   });
@@ -441,7 +441,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
 
     render(
       <MemoryRouter>
-        <RunsList />
+        <RunsHistory />
       </MemoryRouter>,
     );
 
@@ -450,9 +450,10 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
   });
 });
 
-// ux-tweaks item 3: the past section is searchable, date-grouped (lib/runGroups.ts)
-// and render-sliced through the board's lanePaging (cap 10, page 50).
-describe("RunsList — past section search, grouping and reveal (ux-tweaks)", () => {
+// ux-tweaks item 3 (+ amendment 3): the archive tab is searchable, date-grouped
+// (lib/runGroups.ts) and render-sliced through the board's lanePaging (cap 10,
+// page 50). It lives at /runs/history — these render RunsHistory directly.
+describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () => {
   beforeEach(() => {
     vi.mocked(useAuth).mockReturnValue({
       user: { is_admin: false },
@@ -475,7 +476,7 @@ describe("RunsList — past section search, grouping and reveal (ux-tweaks)", ()
 
     render(
       <MemoryRouter>
-        <RunsList />
+        <RunsHistory />
       </MemoryRouter>,
     );
 
@@ -499,7 +500,7 @@ describe("RunsList — past section search, grouping and reveal (ux-tweaks)", ()
 
     render(
       <MemoryRouter>
-        <RunsList />
+        <RunsHistory />
       </MemoryRouter>,
     );
 
@@ -526,7 +527,7 @@ describe("RunsList — past section search, grouping and reveal (ux-tweaks)", ()
 
     render(
       <MemoryRouter>
-        <RunsList />
+        <RunsHistory />
       </MemoryRouter>,
     );
 
@@ -543,30 +544,73 @@ describe("RunsList — past section search, grouping and reveal (ux-tweaks)", ()
     expect(screen.queryByText("Past run 10")).toBeNull();
   });
 
-  // Page order (amendment 2026-08-14): the admin Factory card sits ABOVE the past
-  // archive, so the one section that grows (Show 50 more) is always the page's tail.
-  it("renders the admin Factory status card before the Past runs archive", async () => {
-    vi.mocked(useAuth).mockReturnValue({
-      user: { is_admin: true, email: "me@uzi.test" },
-      vaultUnlocked: true,
-    } as unknown as ReturnType<typeof useAuth>);
+  // (Retired here: the amendment-1 Factory-before-Past DOM-order test. Amendment 3
+  // moved the archive to its own /runs/history route, so the two sections no longer
+  // share a page and the ordering it pinned has no referent — the stronger form of
+  // the same decision is the split itself, pinned by the tab tests below.)
+
+  // Amendment 3: both pages render the shared tab strip; the archive tab carries
+  // the past-run count once loaded, and each page routes to the other.
+  it("the live console renders the tab strip with a counted archive tab", async () => {
     mockApi.listRuns.mockResolvedValue({
-      runs: [pastRun("t", "Finished run", "2026-07-05T12:00:00Z")],
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+      ],
     });
-    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
-    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
 
     render(
-      <MemoryRouter>
+      <MemoryRouter initialEntries={["/runs"]}>
         <RunsList />
       </MemoryRouter>,
     );
 
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    // The past run does NOT render here — it lives on the archive tab…
+    expect(screen.queryByText("Finished run")).toBeNull();
+    // …which the strip links to, carrying the count from the same fetch.
+    const archiveTab = screen.getByRole("link", { name: "Past runs · 1" });
+    expect(archiveTab.getAttribute("href")).toBe("/runs/history");
+    expect(screen.getByRole("link", { name: "Active" }).getAttribute("href")).toBe("/runs");
+  });
+
+  it("the archive renders no active runs and links back to the live console", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/runs/history"]}>
+        <RunsHistory />
+      </MemoryRouter>,
+    );
+
     await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
-    const factory = screen.getByText("Factory status (admin)");
-    const pastHeading = screen.getByText("Past runs");
-    // DOCUMENT_POSITION_FOLLOWING (4): pastHeading comes after factory in the DOM.
-    expect(factory.compareDocumentPosition(pastHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(4);
+    expect(screen.queryByText("In flight")).toBeNull();
+    expect(screen.getByRole("link", { name: "Active" }).getAttribute("href")).toBe("/runs");
+  });
+
+  // Amendment 3, the ?q= deep link: a shared archive URL arrives already filtered.
+  it("initialises the archive search from ?q=", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        pastRun("a", "Fix the parser", "2026-07-05T12:00:00Z"),
+        pastRun("b", "Ship the exporter", "2026-07-05T11:00:00Z"),
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/runs/history?q=parser"]}>
+        <RunsHistory />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
+    expect(screen.queryByText("Ship the exporter")).toBeNull();
+    expect((screen.getByLabelText("Search past runs") as HTMLInputElement).value).toBe("parser");
   });
 });
 
