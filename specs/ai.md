@@ -20401,7 +20401,7 @@ already in the DTOs. This reverses the load-bearing window-model decision record
 
 ## 530. Issue #313 — the worker CLAMPS the Go lint ratchet base so `origin/main` in the runner clone is never a strict ancestor of the branch's true base
 
-Design record [prds/313-worker-ratchet-true-base.md](../prds/313-worker-ratchet-true-base.md). This is a
+Design record [prds/done/313-worker-ratchet-true-base.md](../prds/done/313-worker-ratchet-true-base.md). This is a
 WORKER-GATE-ONLY ergonomics fix, layered on top of the issue #262 ratchet-base advance: in `agent/src/git.ts`
 `runnerCloneForBranch`, at the `update-ref` site that #262 added, the value written to the runner clone's
 `refs/remotes/origin/<default>` is now clamped to the branch's real base `baseSha` when — and only when —
