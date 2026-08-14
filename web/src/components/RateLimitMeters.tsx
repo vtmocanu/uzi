@@ -4,6 +4,8 @@
 // shared MeterTrack + toneFor thresholds. The admin table is a separate page.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
+import { isShownInSidebar, onSidebarTokensChanged } from "../lib/sidebarTokens";
 import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import {
@@ -370,21 +372,63 @@ function TokenMicroMeters({
 }
 
 // SidebarRateLimits is the micro-bars under the signed-in user block (mockup frame
-// B) — one PAIR PER TOKEN since PRD #104, each named when the user holds several.
-// Hidden while loading and for a token-less user (no dead chrome); a token with no
-// reading renders nothing rather than an empty bar, and a stale one is dimmed.
+// B). Hidden while loading and for a token-less user (no dead chrome); a token with
+// no reading renders nothing rather than an empty bar, and a stale one is dimmed.
+//
+// WHICH tokens ride the rail is the USER'S choice, not a heuristic. This slot has
+// now been all three things: every readable token (PRD #104 — 8 meter rows on a
+// four-token account, pushing the Factory nav group under the scroll fold at
+// 1440x900), then an automatic most-constrained pick (round 2), and now the
+// explicit set (round-3 feedback): the DEFAULT token always, plus any token the
+// user checked "Show in sidebar" on in Settings (UserSettings.sidebar_token_ids).
+// Everything else stays reachable through the "+N more" link to the full
+// per-token meters on Settings. Note the rail no longer self-escalates when an
+// UNCHECKED token runs hot — that is the deliberate trade for control, and the
+// app-wide RateLimitAnnouncer still announces tone crossings for every token.
 export function SidebarRateLimits() {
   const { tokens } = useMyRateLimits(60_000);
   const now = useNow();
+  // The chosen extras. Fetched on mount and again on the Settings toggle's change
+  // event, so a save on the Settings page reaches this separate mount immediately.
+  const [sidebarIds, setSidebarIds] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      api
+        .getMySettings()
+        .then(({ settings }) => {
+          if (alive) setSidebarIds(settings.sidebar_token_ids ?? []);
+        })
+        // A failed fetch keeps the last known set — degrading to default-only on a
+        // transient error would look like the user's choice being reverted.
+        .catch(() => {});
+    load();
+    const off = onSidebarTokensChanged(load);
+    return () => {
+      alive = false;
+      off();
+    };
+  }, []);
   if (!tokens || tokens.length === 0) return null;
   const readable = tokens.filter((t) => t.limits.status === "ok");
   if (readable.length === 0) return null;
-  const showLabels = readable.length > 1;
+  const shown = readable.filter((t) => isShownInSidebar(t, sidebarIds));
+  const hidden = readable.length - shown.length;
   return (
-    <div className="mt-2 space-y-2.5" aria-label="Claude rate limits">
-      {readable.map((t) => (
-        <TokenMicroMeters key={t.secret_id} token={t} showLabel={showLabels} now={now} />
-      ))}
+    <div className="mt-2 space-y-1.5" aria-label="Claude rate limits">
+      <div className="space-y-2.5">
+        {shown.map((t) => (
+          <TokenMicroMeters key={t.secret_id} token={t} showLabel={readable.length > 1} now={now} />
+        ))}
+      </div>
+      {hidden > 0 && (
+        <Link
+          to="/settings"
+          className="block text-[11px] font-medium text-faint transition-colors hover:text-fg"
+        >
+          +{hidden} more token{hidden === 1 ? "" : "s"} in Settings
+        </Link>
+      )}
     </div>
   );
 }

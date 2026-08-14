@@ -26,12 +26,17 @@ export function cx(...parts: (string | false | null | undefined)[]): string {
 export function Card({
   children,
   className = "",
+  id,
 }: {
   children: ReactNode;
   className?: string;
+  // Anchor target for in-page section indexes (Admin → Instance); pair it with a
+  // scroll-mt-* class so a jump does not clip the card's title.
+  id?: string;
 }) {
   return (
     <div
+      id={id}
       className={cx("rounded-xl border border-edge bg-surface p-5", className)}
     >
       {children}

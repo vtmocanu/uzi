@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type User } from "../lib/api";
-import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
+import { Alert, Badge, Button, Card, ListSkeleton } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
 
 export function AdminUsers() {
   const { user: me } = useAuth();
@@ -73,11 +74,7 @@ export function AdminUsers() {
   };
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Users"
-        description="Deactivating a user blocks their login and immediately ends every active session."
-      />
+    <AdminShell description="Deactivating a user blocks their login and immediately ends every active session.">
       {error && <Alert message={error} />}
       {loading ? (
         <ListSkeleton rows={4} />
@@ -170,6 +167,6 @@ export function AdminUsers() {
           </div>
         </Card>
       )}
-    </div>
+    </AdminShell>
   );
 }

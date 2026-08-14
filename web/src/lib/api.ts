@@ -76,6 +76,10 @@ export interface SecretMeta {
 export interface UserSettings {
   default_model: string | null;
   theme: string | null;
+  /** Ids of NON-default tokens whose rate meters the user also wants on the
+   *  sidebar rail. The default token always shows and is never listed here.
+   *  Absent (older server) reads as []: default-only, the pre-feature look. */
+  sidebar_token_ids?: string[];
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -84,6 +88,8 @@ export interface UserSettings {
 export interface UserSettingsPatch {
   default_model?: string | null;
   theme?: string | null;
+  /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
+  sidebar_token_ids?: string[] | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),

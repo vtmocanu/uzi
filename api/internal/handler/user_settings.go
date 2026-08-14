@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,12 +19,16 @@ import (
 )
 
 // userSettingsDTO is the current user's own (non-secret) settings: the default
-// worker model (PRD #17) and the UI theme override (PRD #21). null default_model
-// means inherit (the lead template's model, else the account/SDK default); null
-// theme means "use the instance default".
+// worker model (PRD #17), the UI theme override (PRD #21), and the sidebar
+// token-meter choice (migration 00123). null default_model means inherit (the
+// lead template's model, else the account/SDK default); null theme means "use
+// the instance default". sidebar_token_ids lists the NON-default Anthropic
+// tokens whose rate meters the user surfaced on the sidebar rail — the default
+// token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
-	DefaultModel *string `json:"default_model"`
-	Theme        *string `json:"theme"`
+	DefaultModel    *string  `json:"default_model"`
+	Theme           *string  `json:"theme"`
+	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }
 
 // userSettingsResponse reads both columns and writes the settings body, shared by
@@ -35,8 +42,9 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
-			DefaultModel: textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
-			Theme:        textPtrValue(s.Theme.Valid, s.Theme.String),
+			DefaultModel:    textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
+			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
+			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
 		},
 	})
 }
@@ -70,8 +78,9 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// RawMessage distinguishes an absent field (nil) from a present null (the
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
-		DefaultModel json.RawMessage `json:"default_model"`
-		Theme        json.RawMessage `json:"theme"`
+		DefaultModel    json.RawMessage `json:"default_model"`
+		Theme           json.RawMessage `json:"theme"`
+		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -120,7 +129,100 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if req.SidebarTokenIds != nil {
+		var raw *[]string
+		if err := json.Unmarshal(req.SidebarTokenIds, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid sidebar_token_ids")
+			return
+		}
+		ids, err := h.validateSidebarTokenIds(r.Context(), user.ID, raw)
+		if err != nil {
+			// A store fault during the ownership check is OUR failure, not the
+			// client's: 500, like every other store-error path in this handler.
+			// The 400 arm is reserved for genuine request defects (a non-UUID
+			// entry, an oversized list).
+			if errors.Is(err, errSidebarStore) {
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+			} else {
+				httpx.Error(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
+		if _, err := h.q.SetUserSidebarTokens(r.Context(), store.SetUserSidebarTokensParams{
+			ID:              user.ID,
+			SidebarTokenIds: ids,
+		}); err != nil {
+			slog.Error("set user sidebar tokens", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
 	h.userSettingsResponse(w, r, user.ID)
+}
+
+// maxSidebarTokenIds bounds the request list before any per-id work; nobody
+// legitimately holds hundreds of tokens, and an unbounded list is an invitation.
+const maxSidebarTokenIds = 100
+
+// errSidebarStore marks a store fault inside validateSidebarTokenIds, so the
+// caller can answer 500 for it while every other validation error stays a 400.
+// The message is what a 500 body would say anyway; the identity is what matters.
+var errSidebarStore = errors.New("internal error")
+
+// validateSidebarTokenIds maps the request list to the stored set: nil or empty
+// clears back to default-only; each entry must parse as a UUID, and any id that
+// is not one of the CALLER'S OWN anthropic_token secrets is silently dropped
+// rather than rejected — the web sends ids it read moments ago, and a token
+// deleted from another tab must not fail the whole save. Duplicates collapse.
+// The default token's id is dropped with the rest of the non-matching set left
+// intact if present — storing it would be harmless, but the contract is that
+// the stored list holds only non-default extras.
+func (h *Handler) validateSidebarTokenIds(ctx context.Context, userID uuid.UUID, raw *[]string) ([]uuid.UUID, error) {
+	if raw == nil || len(*raw) == 0 {
+		return []uuid.UUID{}, nil
+	}
+	if len(*raw) > maxSidebarTokenIds {
+		return nil, fmt.Errorf("sidebar_token_ids: at most %d entries", maxSidebarTokenIds)
+	}
+	secrets, err := h.q.ListUserSecretsForKind(ctx, store.ListUserSecretsForKindParams{
+		UserID: userID,
+		Kind:   "anthropic_token",
+	})
+	if err != nil {
+		slog.Error("list secrets for sidebar-token filter", "error", err)
+		return nil, errSidebarStore
+	}
+	owned := make(map[uuid.UUID]bool, len(secrets))
+	for _, s := range secrets {
+		// Only non-default tokens are storable; the default always shows.
+		if !s.IsDefault {
+			owned[s.ID] = true
+		}
+	}
+	ids := make([]uuid.UUID, 0, len(*raw))
+	seen := make(map[uuid.UUID]bool, len(*raw))
+	for _, v := range *raw {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("sidebar_token_ids: %q is not a valid id", v)
+		}
+		if owned[id] && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// uuidStrings renders a stored uuid[] for the DTO; a NULL column arrives as a
+// nil slice and reads as the empty (default-only) choice.
+func uuidStrings(ids []uuid.UUID) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = id.String()
+	}
+	return out
 }
 
 // validateTheme maps a nullable theme override to its storage type: a nil

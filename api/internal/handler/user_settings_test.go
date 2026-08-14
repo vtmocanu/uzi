@@ -19,14 +19,17 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeSettingsDB is a store.DBTX holding one user's default_model and theme, so
-// the GetMySettings/PutMySettings handlers run end to end (decode -> validate ->
-// store -> respond) without a real database. The SetUser* UPDATEs QueryRow a
-// single RETURNING column; GetUserSettings QueryRows two (default_model, theme).
-// The UPDATE paths record the written value so the round-trip is observable.
+// fakeSettingsDB is a store.DBTX holding one user's default_model, theme, and
+// sidebar token set, so the GetMySettings/PutMySettings handlers run end to end
+// (decode -> validate -> store -> respond) without a real database. The
+// SetUserDefaultModel/SetUserTheme UPDATEs QueryRow a single Text RETURNING
+// column and SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows three
+// (default_model, theme, sidebar_token_ids). The UPDATE paths record the
+// written value so the round-trip is observable.
 type fakeSettingsDB struct {
-	model pgtype.Text
-	theme pgtype.Text
+	model      pgtype.Text
+	theme      pgtype.Text
+	sidebarIDs []uuid.UUID
 }
 
 func (f *fakeSettingsDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -47,13 +50,18 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if t, ok := args[0].(pgtype.Text); ok {
 			f.theme = t // SetUserTheme: $1 = theme
 		}
+	case strings.Contains(sql, "UPDATE users SET sidebar_token_ids") && len(args) >= 1:
+		if ids, ok := args[0].([]uuid.UUID); ok {
+			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
+		}
 	}
-	return fakeSettingsRow{model: f.model, theme: f.theme}
+	return fakeSettingsRow{model: f.model, theme: f.theme, sidebarIDs: f.sidebarIDs}
 }
 
 type fakeSettingsRow struct {
-	model pgtype.Text
-	theme pgtype.Text
+	model      pgtype.Text
+	theme      pgtype.Text
+	sidebarIDs []uuid.UUID
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -64,13 +72,16 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
-	case 2:
-		// GetUserSettings: SELECT default_model, theme.
+	case 3:
+		// GetUserSettings: SELECT default_model, theme, sidebar_token_ids.
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
 		if p, ok := dest[1].(*pgtype.Text); ok {
 			*p = r.theme
+		}
+		if p, ok := dest[2].(*[]uuid.UUID); ok {
+			*p = r.sidebarIDs
 		}
 	}
 	return nil

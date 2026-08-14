@@ -67,15 +67,6 @@ export const ActivityIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
-// Gauge (lucide) — the Admin → Rate limits nav glyph (PRD #53): a needle in a dial,
-// reading "utilization".
-export const GaugeIcon = (p: SVGProps<SVGSVGElement>) => (
-  <Icon {...p}>
-    <path d="m12 14 4-4" />
-    <path d="M3.34 19a10 10 0 1 1 17.32 0" />
-  </Icon>
-);
-
 export const BotIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <rect x="4" y="8" width="16" height="12" rx="2" />
@@ -108,6 +99,13 @@ export const GearIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// The sidebar's single Admin entry (the five admin surfaces are AdminShell tabs).
+export const ShieldIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </Icon>
+);
+
 export const BranchIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <circle cx="6" cy="6" r="3" />
@@ -137,14 +135,6 @@ export const BookIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-  </Icon>
-);
-
-export const UsersIcon = (p: SVGProps<SVGSVGElement>) => (
-  <Icon {...p}>
-    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-    <circle cx="9" cy="7" r="4" />
-    <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
   </Icon>
 );
 

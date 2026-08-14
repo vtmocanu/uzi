@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { AdminUsers } from "./AdminUsers";
 import { api, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -48,7 +49,11 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
     mockApi.listUsers.mockResolvedValue({ users: [aUser({ judge_enabled: false })] });
     mockApi.setUserJudgeEnabled.mockResolvedValue({ user: aUser({ judge_enabled: true }) });
 
-    render(<AdminUsers />);
+    render(
+    <MemoryRouter>
+      <AdminUsers />
+    </MemoryRouter>,
+  );
 
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
     // Cells: 0 Email, 1 Name, 2 Role, 3 Status, 4 Judge, 5 CI autofix, 6 Last
@@ -70,7 +75,11 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
     mockApi.listUsers.mockResolvedValue({ users: [aUser({ judge_enabled: true })] });
     mockApi.setUserJudgeEnabled.mockResolvedValue({ user: aUser({ judge_enabled: false }) });
 
-    render(<AdminUsers />);
+    render(
+    <MemoryRouter>
+      <AdminUsers />
+    </MemoryRouter>,
+  );
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
     // Judge is cell index 4; scope to it so the CI-autofix column's own
     // Off/Enable (PRD #71 M1) doesn't match a bare within(row) text query.
@@ -84,7 +93,11 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
 describe("AdminUsers name fallback (PRD #54)", () => {
   it("renders an em-dash for an empty-string display_name (?? missed it)", async () => {
     mockApi.listUsers.mockResolvedValue({ users: [aUser({ display_name: "" })] });
-    render(<AdminUsers />);
+    render(
+    <MemoryRouter>
+      <AdminUsers />
+    </MemoryRouter>,
+  );
     const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
     // Cell 0 is the email, cell 1 the name column: an empty name shows "—".
     expect(within(row).getAllByRole("cell")[1].textContent).toBe("—");

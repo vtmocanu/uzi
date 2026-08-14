@@ -31,6 +31,8 @@ vi.mock("../lib/api", () => ({
     listSchedules: vi.fn().mockResolvedValue([]),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+    // SidebarRateLimits fetches the chosen sidebar-token set on mount.
+    getMySettings: vi.fn().mockResolvedValue({ settings: { default_model: null, theme: null } }),
     version: vi.fn(),
   },
 }));

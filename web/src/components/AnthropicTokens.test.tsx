@@ -71,6 +71,8 @@ function renderList(secrets: SecretMeta[], reload = noop, judgeSecretId: string 
       onError={() => {}}
       onNotice={() => {}}
       judgeSecretId={judgeSecretId}
+      sidebarTokenIds={[]}
+      onToggleSidebarToken={async () => {}}
     />,
   );
 }
@@ -270,6 +272,8 @@ describe("AnthropicTokens", () => {
         onError={() => {}}
         onNotice={() => {}}
         judgeSecretId={null}
+        sidebarTokenIds={[]}
+        onToggleSidebarToken={async () => {}}
       />,
     );
     fireEvent.change(screen.getByLabelText("Token name"), { target: { value: "staging-key" } });
@@ -283,6 +287,8 @@ describe("AnthropicTokens", () => {
         onError={() => {}}
         onNotice={() => {}}
         judgeSecretId={null}
+        sidebarTokenIds={[]}
+        onToggleSidebarToken={async () => {}}
       />,
     );
     expect(screen.queryByLabelText("Token name")).toBeNull();
@@ -306,6 +312,8 @@ describe("AnthropicTokens", () => {
         onError={() => {}}
         onNotice={() => {}}
         judgeSecretId={null}
+        sidebarTokenIds={[]}
+        onToggleSidebarToken={async () => {}}
       />,
     );
     fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), {
@@ -320,6 +328,8 @@ describe("AnthropicTokens", () => {
         onError={() => {}}
         onNotice={() => {}}
         judgeSecretId={null}
+        sidebarTokenIds={[]}
+        onToggleSidebarToken={async () => {}}
       />,
     );
     expect(

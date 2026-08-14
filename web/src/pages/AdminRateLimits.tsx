@@ -17,7 +17,8 @@ import {
   WINDOW_DURATION,
   type PaceForecast,
 } from "../lib/rateLimits";
-import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
+import { Alert, Badge, Card, cx, EmptyState, ListSkeleton } from "../components/ui";
+import { AdminShell } from "../components/AdminShell";
 import { RateLimitForecastMeter } from "../components/RateLimitForecast";
 
 // One stacked meter row inside the Utilization cell: a mono window chip (5h/7d),
@@ -150,11 +151,7 @@ export function AdminRateLimits() {
   const rows = sortAdminRows(users);
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Rate limits"
-        description="Each token's Claude 5-hour and 7-day utilization, read server-side with the owner's own credentials. Anthropic meters per credential, so a user with several tokens has a row each. Users nearest a limit sort first."
-      />
+    <AdminShell description="Each token's Claude 5-hour and 7-day utilization, read server-side with the owner's own credentials. Anthropic meters per credential, so a user with several tokens has a row each. Users nearest a limit sort first.">
       {error && <Alert message={error} />}
       {loading ? (
         <ListSkeleton rows={5} />
@@ -260,6 +257,6 @@ export function AdminRateLimits() {
           </div>
         </Card>
       )}
-    </div>
+    </AdminShell>
   );
 }

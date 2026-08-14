@@ -9,6 +9,7 @@ import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
+import { RunDefaults } from "./pages/RunDefaults";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
@@ -81,6 +82,15 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* Run-behavior defaults, split out of the overloaded Account tab. */}
+        <Route
+          path="/settings/run-defaults"
+          element={
+            <ProtectedRoute>
+              <RunDefaults />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="/settings/forge"
           element={
@@ -89,8 +99,11 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* Workers moved out of the Settings tabs to a first-class Factory page;
+            the old URL keeps working for bookmarks and stale deep links. */}
+        <Route path="/settings/workers" element={<Navigate to="/workers" replace />} />
         <Route
-          path="/settings/workers"
+          path="/workers"
           element={
             <ProtectedRoute>
               <WorkersSettings />
@@ -232,6 +245,8 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* The sidebar's single Admin entry lands on the first AdminShell tab. */}
+        <Route path="/admin" element={<Navigate to="/admin/users" replace />} />
         <Route
           path="/admin/users"
           element={

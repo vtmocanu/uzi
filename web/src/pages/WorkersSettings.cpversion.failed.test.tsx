@@ -121,7 +121,9 @@ describe("a FAILED /api/version reaches the fleet panel as settled-unknown", () 
     expect(screen.queryByText(/target release v/)).toBeNull();
 
     // The rejection was swallowed, not rethrown: the page around it still rendered.
-    expect(screen.getByRole("heading", { name: /Workers/i })).toBeTruthy();
+    // Exact name: the page's own h1 is "Workers" now that it left the Settings
+    // tabs, and /Workers/i would also match the "Your workers" section heading.
+    expect(screen.getByRole("heading", { name: "Workers" })).toBeTruthy();
 
     expect(mockApi.version).toHaveBeenCalledTimes(1);
   });

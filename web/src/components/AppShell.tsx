@@ -1,9 +1,10 @@
 // The app shell: a persistent grouped sidebar + content pane, adapted from
 // multica's dashboard shell (packages/views/layout/app-sidebar.tsx +
 // dashboard-layout.tsx). Three tiers the old single-row topbar could not
-// express: product identity up top, grouped destinations (Work / Factory /
-// Settings / Admin) in the middle — with enabled repos' boards as real nav
-// children instead of a <select> — and the signed-in user pinned to the footer.
+// express: product identity up top, grouped destinations (Work / Factory, then
+// an unlabeled Settings / Admin / Docs cluster) in the middle — with enabled
+// repos' boards as real nav children instead of a <select> — and the signed-in
+// user pinned to the footer.
 // Active-state logic keeps a parent lit on child routes (multica's isNavActive).
 
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -28,9 +29,7 @@ import {
   ClockIcon,
   ChevronRightIcon,
   FactoryIcon,
-  GaugeIcon,
   GearIcon,
-  PackageIcon,
   GitIcon,
   GitLabIcon,
   HomeIcon,
@@ -38,8 +37,8 @@ import {
   MenuIcon,
   ScaleIcon,
   ServerIcon,
+  ShieldIcon,
   SkillIcon,
-  UsersIcon,
   XIcon,
 } from "./icons";
 
@@ -196,7 +195,6 @@ function NavItem({
   icon,
   label,
   exactOnly = false,
-  excludeSubpath,
   indent = false,
   onNavigate,
   collapsed = false,
@@ -208,10 +206,6 @@ function NavItem({
   icon?: ReactNode;
   label: string;
   exactOnly?: boolean;
-  // excludeSubpath yields active state to a sibling that owns a nested route:
-  // "Settings" (/settings) stays lit on /settings/forge but hands /settings/workers
-  // to the Factory "Workers" entry, so the two never light up together.
-  excludeSubpath?: string;
   indent?: boolean;
   onNavigate?: () => void;
   // When collapsed the item is an icon-only rail button; the label moves to a
@@ -240,8 +234,7 @@ function NavItem({
   badgeLabel?: string;
 }) {
   const { pathname } = useLocation();
-  let active = exactOnly ? pathname === to : isNavActive(pathname, to);
-  if (active && excludeSubpath && isNavActive(pathname, excludeSubpath)) active = false;
+  const active = exactOnly ? pathname === to : isNavActive(pathname, to);
   const hasBadge = badge > 0;
   const alert = badgeTone === "alert";
   // The accessible noun: explicit override, else the per-tone default.
@@ -254,7 +247,17 @@ function NavItem({
       title={collapsed ? label : undefined}
       className={cx(
         "group flex items-center rounded-lg text-sm transition-colors",
-        collapsed ? "justify-center px-2.5 py-2" : "gap-2.5 px-2.5 py-1.5",
+        // lg:py-1 tightens the desktop rail only (the mobile drawer keeps its
+        // 36px touch rows): 4px per row, plus the lg: chrome trims on the nav
+        // container, group headers, divider and footer, is what lets an admin's
+        // full nav — both groups, three board children and the bottom cluster —
+        // fit a 900px-tall laptop. Measured 2026-08-14 at 1440x900, demo data,
+        // default one-pair footer: content 574px in a 597px nav (23px slack);
+        // before the trims the same nav needed ~660px. Each extra pinned token
+        // meter costs ~66px of footer and can push the nav back into scroll —
+        // that is the user's explicit choice (sidebar_token_ids), not a layout
+        // regression.
+        collapsed ? "justify-center px-2.5 py-2" : "gap-2.5 px-2.5 py-1.5 lg:py-1",
         indent && !collapsed && "ml-4",
         active ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60 hover:text-fg",
       )}
@@ -311,17 +314,22 @@ function NavGroup({
   children,
   collapsed = false,
 }: {
-  label: string;
+  // Optional: the bottom cluster (Settings / Admin / Docs) is grouped by a rule
+  // alone — naming it would just restate its members, and the old single-item
+  // "Configure" and "Help" headers were labels costing a row each to introduce
+  // one entry each.
+  label?: string;
   children: ReactNode;
   collapsed?: boolean;
 }) {
   return (
     <div className="space-y-0.5">
-      {collapsed ? (
-        // No room for a group label on the rail; a thin rule keeps the grouping.
-        <div className="mx-2.5 my-2 border-t border-edge" aria-hidden="true" />
+      {collapsed || !label ? (
+        // No room for a group label on the rail (and none wanted for an
+        // unlabeled group); a thin rule keeps the grouping.
+        <div className="mx-2.5 my-2 border-t border-edge lg:my-1.5" aria-hidden="true" />
       ) : (
-        <p className="px-2.5 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-faint/80">
+        <p className="px-2.5 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-faint/80 lg:pt-3">
           {label}
         </p>
       )}
@@ -445,8 +453,8 @@ function SidebarContent({
         )}
       </Link>
 
-      <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4">
-        <div className="space-y-0.5 pt-3">
+      <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
+        <div className="space-y-0.5 pt-3 lg:pt-2">
           <NavItem to="/dashboard" icon={<HomeIcon />} label="Overview" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem
             to="/notifications"
@@ -504,8 +512,11 @@ function SidebarContent({
         <NavGroup label="Factory" collapsed={collapsed}>
           <NavItem to="/agents" icon={<BotIcon />} label="Agents" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/skills" icon={<SkillIcon />} label="Skills" onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Workers' ONE nav home. It was also a Settings tab (as /settings/workers),
+              which needed the excludeSubpath active-state hack to keep the two entries
+              from lighting together — the fleet is operations, so it lives here alone. */}
           <NavItem
-            to="/settings/workers"
+            to="/workers"
             icon={<ServerIcon />}
             label="Workers"
             badge={workersAttention}
@@ -520,56 +531,26 @@ function SidebarContent({
           <NavItem to="/judge" icon={<ScaleIcon />} label="Judge" badge={judgeTodo} onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 
-        <NavGroup label="Configure" collapsed={collapsed}>
+        {/* The bottom cluster: system destinations, grouped by a rule rather than a
+            label. Settings and Docs used to each carry a one-item labeled group
+            ("Configure", "Help"), and the five admin pages each held a sidebar row —
+            they are now one tabbed Admin destination (AdminShell), the same treatment
+            the Settings tabs give the user-scoped surfaces. */}
+        <NavGroup collapsed={collapsed}>
           {/* Forge has no standalone entry (Decision 3): it lives only under the
-              Settings tabs. Settings therefore stays lit across /settings/* —
-              except /settings/workers, which the Factory "Workers" entry owns. */}
+              Settings tabs, so Settings stays lit across /settings/*. */}
           <NavItem
             to="/settings"
             icon={<GearIcon />}
             label="Settings"
-            excludeSubpath="/settings/workers"
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
-        </NavGroup>
-
-        {user?.is_admin && (
-          <NavGroup label="Admin" collapsed={collapsed}>
-            <NavItem to="/admin/users" icon={<UsersIcon />} label="Users" onNavigate={onNavigate} collapsed={collapsed} />
-            <NavItem
-              to="/admin/rate-limits"
-              icon={<GaugeIcon />}
-              label="Rate limits"
-              onNavigate={onNavigate}
-              collapsed={collapsed}
-            />
-            <NavItem
-              to="/admin/tool-allowlist"
-              icon={<PackageIcon />}
-              label="Tool allowlist"
-              onNavigate={onNavigate}
-              collapsed={collapsed}
-            />
-            {/* PRD #66 M9 (D8): the cross-user guardrail blocked/allowed repos list. */}
-            <NavItem
-              to="/admin/blocked-repos"
-              icon={<GitIcon />}
-              label="Blocked repos"
-              onNavigate={onNavigate}
-              collapsed={collapsed}
-            />
-            <NavItem
-              to="/admin/settings"
-              icon={<GearIcon />}
-              label="Instance settings"
-              onNavigate={onNavigate}
-              collapsed={collapsed}
-            />
-          </NavGroup>
-        )}
-
-        <NavGroup label="Help" collapsed={collapsed}>
+          {user?.is_admin && (
+            /* /admin redirects to the first tab; the prefix match keeps this entry
+               lit on every /admin/* tab. */
+            <NavItem to="/admin" icon={<ShieldIcon />} label="Admin" onNavigate={onNavigate} collapsed={collapsed} />
+          )}
           <NavItem to="/docs" icon={<BookIcon />} label="Docs" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
       </nav>
@@ -579,7 +560,7 @@ function SidebarContent({
             hover-only). aria-expanded tracks the sidebar, not a popup, so screen
             readers announce the rail's state. */}
         {onToggleCollapse && (
-          <div className={cx("hidden lg:flex px-3 pt-2", collapsed ? "justify-center" : "justify-end")}>
+          <div className={cx("hidden lg:flex px-3 pt-1", collapsed ? "justify-center" : "justify-end")}>
             <button
               type="button"
               onClick={onToggleCollapse}
@@ -617,8 +598,8 @@ function SidebarContent({
               </button>
             </div>
           ) : (
-            <div className="px-3 py-3">
-              <div className="mb-2">
+            <div className="px-3 py-3 lg:py-2">
+              <div className="mb-2 lg:mb-1.5">
                 <VaultBadge />
               </div>
               <div className="flex items-center gap-2">
