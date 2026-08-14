@@ -165,7 +165,14 @@ In worker runner clones the clone setup now advances `origin/main` to the real
 default-branch head before any gate runs (issue #262), so `new-from-merge-base`
 gates only branch-introduced findings rather than a stale backlog — without it the
 clone's `origin/main` inherited the bare's frozen mirror and the ratchet
-false-red the whole pre-existing backlog. If a Go lint target exits with
+false-red the whole pre-existing backlog. On a resume leg, though, the value
+#262 advances to can itself be that frozen mirror — a stale commit strictly
+behind the branch's real base — so issue #313 clamps it further: whenever the
+resolved default-branch commit is a strict ancestor of the branch base
+`baseSha`, the runner clone's `origin/main` is set to `baseSha` instead, so
+the ratchet base can never regress below the branch's true fork point; this
+only removes false positives, and `.golangci.yml` is unchanged. If a Go lint
+target exits with
 `origin/main is unresolvable`, run `git fetch origin main`; that guard is
 unchanged and still fires when the ref genuinely does not resolve. The guard
 exists because without the ref golangci-lint does not skip the ratchet — it

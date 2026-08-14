@@ -190,9 +190,14 @@ export interface RunnerClone {
    *  MIRROR. `cloneBare` rewrites the refspec to `+refs/heads/*:refs/remotes/origin/*`, so the
    *  bare's own `refs/heads/*` never move after the first clone, and the runner clone inherits
    *  that frozen head as its local `main`. Its `origin/main` used to inherit the same frozen
-   *  head, but `runnerCloneForBranch` now `update-ref`s `refs/remotes/origin/<default>` to the
-   *  fresh default head (`defaultBranchCommit`) after checkout (issue #262), so the ratchet
-   *  base is fresh; the clone's local `refs/heads/main` is left untouched and stays frozen.
+   *  head, but `runnerCloneForBranch` now `update-ref`s `refs/remotes/origin/<default>` after
+   *  checkout (issue #262) so the ratchet base is fresh; on a fresh run or ordinary resume that
+   *  write is the fresh default head (`defaultBranchCommit`). Issue #313 CLAMPS it: on a resume
+   *  leg where `defaultBranchCommit` resolves through the frozen `refs/heads/main` rung to a
+   *  stale ancestor of `baseSha`, the ref is set to `baseSha` instead, so the ratchet base is
+   *  never a strict ancestor of the branch base; a divergent-forward resume (main moved ahead)
+   *  keeps `defaultBranchCommit`. The clone's local `refs/heads/main` is left untouched and
+   *  stays frozen.
    *
    *  The drift therefore has no predictable direction — the mirror can sit at, behind, or
    *  ahead of this commit, one per topology — so neither `main..HEAD` nor `main...HEAD` is

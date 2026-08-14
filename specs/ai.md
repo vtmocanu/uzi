@@ -20398,3 +20398,35 @@ already in the DTOs. This reverses the load-bearing window-model decision record
   (`RateLimitMeters.tsx`); the sidebar micro-meters degrade gracefully if it does not fit. The admin column
   header is renamed "Utilization" → "Utilization & Forecast". The per-window relative countdowns stay in the
   utilization column.
+
+## 530. Issue #313 — the worker CLAMPS the Go lint ratchet base so `origin/main` in the runner clone is never a strict ancestor of the branch's true base
+
+Design record [prds/313-worker-ratchet-true-base.md](../prds/313-worker-ratchet-true-base.md). This is a
+WORKER-GATE-ONLY ergonomics fix, layered on top of the issue #262 ratchet-base advance: in `agent/src/git.ts`
+`runnerCloneForBranch`, at the `update-ref` site that #262 added, the value written to the runner clone's
+`refs/remotes/origin/<default>` is now clamped to the branch's real base `baseSha` when — and only when —
+`defaultBranchCommit` is an ancestor-or-equal of `baseSha`. The intent is that the base golangci-lint ratchets
+against (§468: `new-from-merge-base: origin/main` in `.golangci.yml`) is never a STRICT ANCESTOR of the fork
+point, so pre-existing backlog in files the branch never touched cannot false-red the worker gate.
+
+- **The predicate and the write, kept on their existing ownership split.** The ancestry test is a worker-uid
+  `isAncestor(defaultBranchCommit, baseSha)` read against the worker-owned bare repo; when it holds, the ref is
+  `update-ref`'d to `baseSha`, with the write staying `runGitAsRunner` into the runner-owned clone (unchanged
+  from #262). Otherwise `defaultBranchCommit` is kept as #262 wrote it.
+- **Why the clamp is needed — a RESUME-only regression #262 could not see.** #262 advanced the ratchet base
+  from a frozen `refs/heads/main` mirror to `defaultBranchCommit`, but on resume legs that value can itself
+  resolve, via `defaultBranchRef`'s fallback chain, back to the frozen `refs/heads/main` mirror — a stale
+  ancestor of the true base. `merge-base(origin/main, HEAD)` then regressed BELOW the fork point and untouched
+  backlog re-appeared. The clamp pins the base to what the lead computes by hand: `--new-from-merge-base=<baseSha>`
+  returned 0 issues on run `9ad22852`.
+- **The three legs, and why the clamp only ever removes false positives.** On a FRESH run
+  (`defaultBranchCommit === baseSha`) the write is byte-identical to #262 and the clamp log does not fire; on an
+  ORDINARY resume it collapses into always-`baseSha`; on a resume where main moved forward on a DIVERGENT line
+  (`defaultBranchCommit` NOT an ancestor of `baseSha`) the clamp is a no-op and `defaultBranchCommit` is kept, so
+  vs-main semantics are preserved. Because the clone is checked out at `baseSha`, HEAD always descends from it, so
+  moving the base UP to `baseSha` can only drop findings that predate the fork — it can never hide a
+  branch-introduced finding.
+- **What is intentionally NOT touched.** `.golangci.yml`'s `origin/main` stays a static literal (§468): golangci-lint
+  does not expand env vars and the ref must also resolve in GitLab's detached-HEAD CI. Real CI still ratchets
+  against current `main` and is unaffected — the clamp lives only in the worker's clone setup. The
+  no-resolvable-default-branch edge keeps today's skip, governed by the Taskfile merge-base pre-flight.

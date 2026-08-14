@@ -2,7 +2,7 @@
 
 **Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/313
 **Priority**: Medium
-**Status**: Draft
+**Status**: Complete (2026-08-14)
 
 > Self-contained for an offline worker. This change lives entirely inside uzi's own
 > `agent/` package plus local `git` behaviour. It needs **no** open-web access: no external
@@ -196,7 +196,7 @@ plan gate**; the clamp is written above as the default because it is the minimal
   (`defaultBranchCommit` not an ancestor of `baseSha`, `origin/main` keeps `defaultBranchCommit`).
   Also assert the clamp log fires only on the actual-change path.
 
-- [ ] **M4: Update the docs and specs that describe this behaviour.** Correct the `git.ts`
+- [x] **M4: Update the docs and specs that describe this behaviour.** Correct the `git.ts`
   `RunnerClone.baseCommit` / issue-#262 comment block (git.ts:167-206, 529-542) to state the clamp,
   the invariant it enforces, and the no-default-branch edge; update `docs/dev-conventions.md`'s
   frozen-mirror ratchet note (docs/dev-conventions.md:154-172); add a `specs/ai.md` decision entry.
