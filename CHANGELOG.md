@@ -6,6 +6,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-08-14
+
+### Changed
+
+- **Runs page IA + UX tweaks (PRD #316).** `/runs` becomes a live console (your
+  Active runs plus, for admins, the Factory card), with past runs moved to a
+  searchable, date-grouped `/runs/history` tab that reveals 50 at a time like the
+  board. The admin Factory card now lists other users' active runs only (your own
+  already appear in Active). The sidebar collapse toggle folds into the footer
+  cluster instead of consuming a full row, and the Schedules "Last fire"
+  disclosure renders a proper SVG chevron rather than a broken glyph. Web-only; no
+  new service and no new trust boundary. (#316)
+
 ## [0.36.0] - 2026-08-14
 
 ### Changed
