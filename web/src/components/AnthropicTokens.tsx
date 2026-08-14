@@ -11,6 +11,7 @@ import { api, ApiError, type AutoStatus, type SecretMeta, type Worker } from "..
 import { isVaultLocked } from "../lib/api";
 import { autoChipFor } from "../lib/rateLimits";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
+import { isShownInSidebar } from "../lib/sidebarTokens";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 
 const DOC_URL =
@@ -325,7 +326,7 @@ function TokenRow({
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
-            checked={secret.is_default || sidebarShown}
+            checked={sidebarShown}
             disabled={disabled || secret.is_default}
             aria-label={`Show ${sanitizeLabel(secret.label)} in the sidebar`}
             onChange={(e) => void onToggleSidebar(secret.id, e.target.checked)}
@@ -558,7 +559,7 @@ export function AnthropicTokens({
               judgeBound={judgeSecretId === s.id}
               autoStatus={autoStatuses[s.id]}
               autoFetchState={autoFetchState}
-              sidebarShown={sidebarTokenIds.includes(s.id)}
+              sidebarShown={isShownInSidebar(s, sidebarTokenIds)}
               onToggleSidebar={onToggleSidebarToken}
               onChanged={reload}
               onError={onError}

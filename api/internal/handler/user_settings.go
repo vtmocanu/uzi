@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -136,7 +137,15 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 		ids, err := h.validateSidebarTokenIds(r.Context(), user.ID, raw)
 		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+			// A store fault during the ownership check is OUR failure, not the
+			// client's: 500, like every other store-error path in this handler.
+			// The 400 arm is reserved for genuine request defects (a non-UUID
+			// entry, an oversized list).
+			if errors.Is(err, errSidebarStore) {
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+			} else {
+				httpx.Error(w, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		if _, err := h.q.SetUserSidebarTokens(r.Context(), store.SetUserSidebarTokensParams{
@@ -155,6 +164,11 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 // maxSidebarTokenIds bounds the request list before any per-id work; nobody
 // legitimately holds hundreds of tokens, and an unbounded list is an invitation.
 const maxSidebarTokenIds = 100
+
+// errSidebarStore marks a store fault inside validateSidebarTokenIds, so the
+// caller can answer 500 for it while every other validation error stays a 400.
+// The message is what a 500 body would say anyway; the identity is what matters.
+var errSidebarStore = errors.New("internal error")
 
 // validateSidebarTokenIds maps the request list to the stored set: nil or empty
 // clears back to default-only; each entry must parse as a UUID, and any id that
@@ -176,7 +190,8 @@ func (h *Handler) validateSidebarTokenIds(ctx context.Context, userID uuid.UUID,
 		Kind:   "anthropic_token",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("internal error")
+		slog.Error("list secrets for sidebar-token filter", "error", err)
+		return nil, errSidebarStore
 	}
 	owned := make(map[uuid.UUID]bool, len(secrets))
 	for _, s := range secrets {

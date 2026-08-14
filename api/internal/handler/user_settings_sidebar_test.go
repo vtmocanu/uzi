@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,9 +23,15 @@ import (
 type fakeSidebarDB struct {
 	fakeSettingsDB
 	secrets []store.ListUserSecretsForKindRow
+	// queryErr, when set, fails the secrets listing — the store-fault path that
+	// must answer 500, not 400.
+	queryErr error
 }
 
 func (f *fakeSidebarDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	if f.queryErr != nil {
+		return nil, f.queryErr
+	}
 	if strings.Contains(sql, "FROM user_secrets") {
 		return &fakeSecretRows{rows: f.secrets}, nil
 	}
@@ -113,6 +120,41 @@ func TestPutMySettingsSidebarTokensFiltersToOwnedNonDefault(t *testing.T) {
 	}
 	if got := decodeSidebarIds(t, rec.Body.Bytes()); len(got) != 1 || got[0] != extra.String() {
 		t.Fatalf("response sidebar_token_ids = %v, want [%s]", got, extra)
+	}
+}
+
+// A store fault during the ownership check is the SERVER failing, and must not
+// be blamed on the request: 500, never 400 (review finding, round-4 wave).
+func TestPutMySettingsSidebarTokensStoreFaultIs500(t *testing.T) {
+	db := &fakeSidebarDB{queryErr: errors.New("connection refused")}
+	rec := putSidebar(t, db, `{"sidebar_token_ids":["`+uuid.NewString()+`"]}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(db.sidebarIDs) != 0 {
+		t.Fatalf("stored ids = %v, want nothing written on a store fault", db.sidebarIDs)
+	}
+}
+
+// The cap is exclusive at 100: entry 101 is the first rejected one. Boundary
+// pinned so a future off-by-one cannot silently widen or narrow it.
+func TestPutMySettingsSidebarTokensCapBoundary(t *testing.T) {
+	mkBody := func(n int) string {
+		ids := make([]string, n)
+		for i := range ids {
+			ids[i] = `"` + uuid.NewString() + `"`
+		}
+		return `{"sidebar_token_ids":[` + strings.Join(ids, ",") + `]}`
+	}
+	// 100 unowned ids: passes the cap, everything filters away, stored empty.
+	rec := putSidebar(t, &fakeSidebarDB{}, mkBody(100))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("100 entries: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// 101: rejected before any per-id work.
+	rec = putSidebar(t, &fakeSidebarDB{}, mkBody(101))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("101 entries: status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

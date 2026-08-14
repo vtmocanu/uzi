@@ -424,7 +424,7 @@ export function SidebarRateLimits() {
       {hidden > 0 && (
         <Link
           to="/settings"
-          className="block text-[10px] font-medium text-faint transition-colors hover:text-fg"
+          className="block text-[11px] font-medium text-faint transition-colors hover:text-fg"
         >
           +{hidden} more token{hidden === 1 ? "" : "s"} in Settings
         </Link>

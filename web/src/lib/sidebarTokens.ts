@@ -9,7 +9,7 @@
 // threading state through the router. The rail also refetches on its own poll,
 // so this is a responsiveness nicety, not the source of truth.
 
-export const SIDEBAR_TOKENS_CHANGED_EVENT = "uzi:sidebar-tokens-changed";
+const SIDEBAR_TOKENS_CHANGED_EVENT = "uzi:sidebar-tokens-changed";
 
 export function emitSidebarTokensChanged(): void {
   window.dispatchEvent(new Event(SIDEBAR_TOKENS_CHANGED_EVENT));
