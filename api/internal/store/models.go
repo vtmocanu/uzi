@@ -492,6 +492,7 @@ type User struct {
 	JudgeAnthropicSecretID pgtype.UUID        `json:"judge_anthropic_secret_id"`
 	WaitOnLimit            bool               `json:"wait_on_limit"`
 	CiAutofixEnabled       bool               `json:"ci_autofix_enabled"`
+	SidebarTokenIds        []uuid.UUID        `json:"sidebar_token_ids"`
 }
 
 type UserSecret struct {

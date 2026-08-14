@@ -247,7 +247,17 @@ function NavItem({
       title={collapsed ? label : undefined}
       className={cx(
         "group flex items-center rounded-lg text-sm transition-colors",
-        collapsed ? "justify-center px-2.5 py-2" : "gap-2.5 px-2.5 py-1.5",
+        // lg:py-1 tightens the desktop rail only (the mobile drawer keeps its
+        // 36px touch rows): 4px per row, plus the lg: chrome trims on the nav
+        // container, group headers, divider and footer, is what lets an admin's
+        // full nav — both groups, three board children and the bottom cluster —
+        // fit a 900px-tall laptop. Measured 2026-08-14 at 1440x900, demo data,
+        // default one-pair footer: content 574px in a 597px nav (23px slack);
+        // before the trims the same nav needed ~660px. Each extra pinned token
+        // meter costs ~66px of footer and can push the nav back into scroll —
+        // that is the user's explicit choice (sidebar_token_ids), not a layout
+        // regression.
+        collapsed ? "justify-center px-2.5 py-2" : "gap-2.5 px-2.5 py-1.5 lg:py-1",
         indent && !collapsed && "ml-4",
         active ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60 hover:text-fg",
       )}
@@ -317,9 +327,9 @@ function NavGroup({
       {collapsed || !label ? (
         // No room for a group label on the rail (and none wanted for an
         // unlabeled group); a thin rule keeps the grouping.
-        <div className="mx-2.5 my-2 border-t border-edge" aria-hidden="true" />
+        <div className="mx-2.5 my-2 border-t border-edge lg:my-1.5" aria-hidden="true" />
       ) : (
-        <p className="px-2.5 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-faint/80">
+        <p className="px-2.5 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-faint/80 lg:pt-3">
           {label}
         </p>
       )}
@@ -443,8 +453,8 @@ function SidebarContent({
         )}
       </Link>
 
-      <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4">
-        <div className="space-y-0.5 pt-3">
+      <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
+        <div className="space-y-0.5 pt-3 lg:pt-2">
           <NavItem to="/dashboard" icon={<HomeIcon />} label="Overview" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem
             to="/notifications"
@@ -550,7 +560,7 @@ function SidebarContent({
             hover-only). aria-expanded tracks the sidebar, not a popup, so screen
             readers announce the rail's state. */}
         {onToggleCollapse && (
-          <div className={cx("hidden lg:flex px-3 pt-2", collapsed ? "justify-center" : "justify-end")}>
+          <div className={cx("hidden lg:flex px-3 pt-1", collapsed ? "justify-center" : "justify-end")}>
             <button
               type="button"
               onClick={onToggleCollapse}
@@ -588,8 +598,8 @@ function SidebarContent({
               </button>
             </div>
           ) : (
-            <div className="px-3 py-3">
-              <div className="mb-2">
+            <div className="px-3 py-3 lg:py-2">
+              <div className="mb-2 lg:mb-1.5">
                 <VaultBadge />
               </div>
               <div className="flex items-center gap-2">

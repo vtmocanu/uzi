@@ -108,15 +108,24 @@ RETURNING default_model;
 
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
--- (PRD #17) and UI theme override (PRD #21). Both NULL = inherit / use the
--- instance default. Own-user only; the caller passes the session user's id.
-SELECT default_model, theme FROM users WHERE id = $1;
+-- (PRD #17), UI theme override (PRD #21), and the sidebar token-meter choice
+-- (00123). NULL = inherit / use the instance default / default-token-only.
+-- Own-user only; the caller passes the session user's id.
+SELECT default_model, theme, sidebar_token_ids FROM users WHERE id = $1;
 
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.
 -- NULL falls the user back to the instance default. Own-user only.
 UPDATE users SET theme = @theme WHERE id = @id
 RETURNING theme;
+
+-- name: SetUserSidebarTokens :one
+-- Replaces the user's whole sidebar token-meter set (00123): the non-default
+-- Anthropic tokens whose rate meters ride the sidebar rail. The handler has
+-- already filtered the ids to the caller's own anthropic_token secrets; an
+-- empty array is a valid "default-only" choice. Own-user only.
+UPDATE users SET sidebar_token_ids = @sidebar_token_ids::uuid[] WHERE id = @id
+RETURNING sidebar_token_ids;
 
 -- name: BumpTokenVersion :one
 UPDATE users SET token_version = token_version + 1 WHERE id = $1
