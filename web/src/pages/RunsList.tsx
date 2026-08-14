@@ -15,8 +15,8 @@
 // not a failure" nuance: isStoppedRun collapses cancelled / stop_kind-stamped-
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Link, NavLink, useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useState } from "react";
+import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
@@ -67,11 +67,62 @@ function runUsageTotalTokens(u: RunUsage): number {
   return u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens + u.output_tokens;
 }
 
+// The data both tabs read, owned by the persistent layout below and delivered
+// through the router's Outlet context — the one-fetch seam the tab-count nit
+// exposed: when each tab page fetched for itself, every switch remounted the
+// page, refetched, and blanked the counted tab label until the load returned.
+interface RunsData {
+  runs: RunListItem[];
+  loading: boolean;
+  error: string;
+  tokenCount: number;
+}
+
+function useRunsData(): RunsData {
+  return useOutletContext<RunsData>();
+}
+
 // One constant header + tab strip across both tabs — the SettingsShell treatment,
-// so nothing jumps on a switch. pastCount rides the archive tab so it answers "is
-// there anything in there?" before being visited; null (still loading) renders the
-// bare label rather than a flashing 0.
-function RunsShell({ pastCount, children }: { pastCount: number | null; children: ReactNode }) {
+// so nothing jumps on a switch. This is a LAYOUT ROUTE (App.tsx nests /runs and
+// /runs/history under it), so it survives tab switches: the runs fetch lives here,
+// both tabs read it via Outlet context, and the archive tab's count neither
+// refetches nor resets on a switch. While the first load is in flight the tab
+// shows the bare label rather than a flashing 0 (past-count null); after that the
+// count exists for the layout's whole life.
+export function RunsLayout() {
+  const [runs, setRuns] = useState<RunListItem[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
+  // computed once from the viewer's secrets. A single-token user sees no badge.
+  const [tokenCount, setTokenCount] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const [{ runs }, { secrets }] = await Promise.all([
+          api.listRuns(),
+          // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
+          // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint
+          // failure must not blank the whole Runs area. Fall back to no badge.
+          api.listSecrets().catch(() => ({ secrets: [] })),
+        ]);
+        if (!alive) return;
+        setRuns(runs);
+        setTokenCount(anthropicTokenCount(secrets));
+      } catch (err) {
+        if (alive) setError(err instanceof ApiError ? err.message : "Failed to load runs");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const pastCount = loading ? null : runs.filter((r) => isTerminalRun(r.status)).length;
   const tabs = [
     { to: "/runs", label: "Active", end: true },
     { to: "/runs/history", label: pastCount == null ? "Past runs" : `Past runs · ${pastCount}`, end: false },
@@ -98,7 +149,7 @@ function RunsShell({ pastCount, children }: { pastCount: number | null; children
           </NavLink>
         ))}
       </div>
-      {children}
+      <Outlet context={{ runs, loading, error, tokenCount } satisfies RunsData} />
     </div>
   );
 }
@@ -226,6 +277,9 @@ function RunRow({
 }
 
 // The live console: your active runs, and (admin) the factory's other-user runs.
+// Runs/secrets come from the layout's one fetch (Outlet context); only the
+// admin-scoped lists are fetched here, since the non-admin majority never needs
+// them and the layout must stay role-agnostic.
 export function RunsList() {
   const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
@@ -233,42 +287,31 @@ export function RunsList() {
   // otherwise loads once (no poll), so the token would freeze without this clock.
   const now = useNow(1000);
 
-  const [runs, setRuns] = useState<RunListItem[]>([]);
+  const { runs, loading, error, tokenCount } = useRunsData();
   const [adminRuns, setAdminRuns] = useState<RunListItem[]>([]);
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  // PRD #295: the ">1 Anthropic token" gate for the personal credential badge,
-  // computed once from the viewer's secrets. A single-token user sees no badge.
-  const [tokenCount, setTokenCount] = useState(0);
-
-  const load = useCallback(async () => {
-    setError("");
-    try {
-      const [{ runs }, { secrets }, admin] = await Promise.all([
-        api.listRuns(),
-        // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
-        // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint failure
-        // must not blank the whole Runs page. Fall back to no tokens → no badge.
-        api.listSecrets().catch(() => ({ secrets: [] })),
-        isAdmin ? Promise.all([api.adminListRuns(), api.adminListWorkers()]) : Promise.resolve(null),
-      ]);
-      setRuns(runs);
-      setTokenCount(anthropicTokenCount(secrets));
-      if (admin) {
-        setAdminRuns(admin[0].runs);
-        setAdminWorkers(admin[1].workers);
-      }
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to load runs");
-    } finally {
-      setLoading(false);
-    }
-  }, [isAdmin]);
+  const [adminError, setAdminError] = useState("");
+  const [adminLoading, setAdminLoading] = useState(true);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (!isAdmin) return;
+    let alive = true;
+    Promise.all([api.adminListRuns(), api.adminListWorkers()])
+      .then(([r, w]) => {
+        if (!alive) return;
+        setAdminRuns(r.runs);
+        setAdminWorkers(w.workers);
+      })
+      .catch((err) => {
+        if (alive) setAdminError(err instanceof ApiError ? err.message : "Failed to load factory status");
+      })
+      .finally(() => {
+        if (alive) setAdminLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [isAdmin]);
 
   const active = runs.filter((r) => !isTerminalRun(r.status));
   const past = runs.filter((r) => isTerminalRun(r.status));
@@ -278,7 +321,7 @@ export function RunsList() {
   const factoryRuns = adminRuns.filter((r) => r.owner_email !== user?.email);
 
   return (
-    <RunsShell pastCount={loading ? null : past.length}>
+    <>
       {/* The global judge-recommendation strip moved to the Judge page header (PRD #98
           Decision 7); each run row now carries its own verdict badge (JudgeRunBadge). */}
 
@@ -321,9 +364,16 @@ export function RunsList() {
         </>
       )}
 
-      {isAdmin && !loading && (
+      {isAdmin && !adminLoading && (
         <Card className="space-y-4 border-brand/20">
           <SectionTitle className="text-brand">Factory status (admin)</SectionTitle>
+          {/* A factory-fetch failure alerts INSIDE the card rather than blanking the
+              page: the personal sections above come from the layout's own fetch and
+              are unaffected. Rendering empty lists here on a failed fetch would be a
+              silent lie ("no runs across the factory"). */}
+          {adminError && <Alert message={adminError} />}
+          {!adminError && (
+          <>
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-faint">
               Active runs · other users
@@ -413,9 +463,11 @@ export function RunsList() {
               </ul>
             )}
           </div>
+          </>
+          )}
         </Card>
       )}
-    </RunsShell>
+    </>
   );
 }
 
@@ -426,11 +478,9 @@ export function RunsList() {
 export function RunsHistory() {
   const now = useNow(1000);
 
-  const [runs, setRuns] = useState<RunListItem[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  // PRD #295: same ">1 token" credential-badge gate as the live console.
-  const [tokenCount, setTokenCount] = useState(0);
+  // Runs, secrets gate, load/error state all come from the layout's one fetch —
+  // this page owns only its search + reveal state.
+  const { runs, loading, error, tokenCount } = useRunsData();
   const [searchParams, setSearchParams] = useSearchParams();
   const query = searchParams.get("q") ?? "";
   const setQuery = useCallback(
@@ -440,24 +490,6 @@ export function RunsHistory() {
   // The render slice the reveal button grows; lanePaging clamps it up to the
   // baseline (PAST_CAP, or PAGE while a search is active), so 0 means "at baseline".
   const [shownCount, setShownCount] = useState(0);
-
-  useEffect(() => {
-    (async () => {
-      setError("");
-      try {
-        const [{ runs }, { secrets }] = await Promise.all([
-          api.listRuns(),
-          api.listSecrets().catch(() => ({ secrets: [] })),
-        ]);
-        setRuns(runs);
-        setTokenCount(anthropicTokenCount(secrets));
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Failed to load runs");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
 
   // `/` focuses the archive search — the board's M5 shortcut, same guard: never
   // steal a literal slash the user is typing into another field.
@@ -498,7 +530,7 @@ export function RunsHistory() {
   const pastGroups = groupRuns(pastFiltered.slice(0, paging.render), pastAnchor, now);
 
   return (
-    <RunsShell pastCount={loading ? null : past.length}>
+    <>
       {error && <Alert message={error} />}
       {loading && <ListSkeleton rows={4} />}
 
@@ -614,6 +646,6 @@ export function RunsHistory() {
           )}
         </div>
       )}
-    </RunsShell>
+    </>
   );
 }

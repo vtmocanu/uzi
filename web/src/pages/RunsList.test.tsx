@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { RunsHistory, RunsList } from "./RunsList";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { RunsHistory, RunsLayout, RunsList } from "./RunsList";
 import { api, type RunListItem, type SecretMeta } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -42,6 +42,23 @@ vi.mock("../lib/rateLimits", async (importOriginal) => {
 });
 
 const mockApi = vi.mocked(api);
+
+// Every test renders through the layout route (amendment 3 + the tab-count nit):
+// RunsList/RunsHistory read the layout's Outlet context, so rendering them bare
+// would throw — and the layout owning the ONE runs fetch is itself the behavior
+// the tab tests pin.
+function renderRuns(initialPath = "/runs") {
+  return render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Routes>
+        <Route element={<RunsLayout />}>
+          <Route path="/runs" element={<RunsList />} />
+          <Route path="/runs/history" element={<RunsHistory />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
@@ -139,11 +156,7 @@ describe("RunsList — the admin fleet list carries no format characters (#124)"
       ],
     } as never);
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
     // Anchored on the owner email, which the mutation cannot move.
     await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
@@ -161,11 +174,7 @@ describe("RunsList — the run title carries no format characters (#124)", () =>
       runs: [aRun({ id: "r", issue_title: "Fix the \u202Eparser\u200B bug", status: "running" })],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
@@ -183,11 +192,7 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
     expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
@@ -214,11 +219,7 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Their queued")).toBeTruthy());
     // The heading says what the list now is; the old all-users copy is retired.
@@ -240,11 +241,7 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
       runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
     expect(screen.getByText("queued")).toBeTruthy();
@@ -261,11 +258,7 @@ describe("RunsList — autopilot badge", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Autopilot run")).toBeTruthy());
     expect(screen.getByText("Manual run")).toBeTruthy();
@@ -288,11 +281,7 @@ describe("RunsList — usage meta line (PRD #40)", () => {
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Has usage")).toBeTruthy());
     // total = 114.4k + 1.17M + 0 + 48.2k = 1,332,600 → "1.33M tok so far" (running).
@@ -307,11 +296,7 @@ describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", 
   it("no longer renders the aggregate strip (its home is now the Judge page header)", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "A run" })] });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("A run")).toBeTruthy());
     expect(screen.queryByText("Judge recommendations · all your runs")).toBeNull();
@@ -351,11 +336,7 @@ describe("RunsList milestone badge (PRD #122)", () => {
         }),
       ],
     });
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
     await waitFor(() => expect(screen.getByText("Milestone run")).toBeTruthy());
     expect(screen.getByText("M2/3")).toBeTruthy();
   });
@@ -364,11 +345,7 @@ describe("RunsList milestone badge (PRD #122)", () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [aRun({ id: "n", issue_title: "Plain run", status: "running", milestones: null })],
     });
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
     await waitFor(() => expect(screen.getByText("Plain run")).toBeTruthy());
     expect(screen.queryByText(/^M\d+\/\d+$/)).toBeNull();
   });
@@ -397,11 +374,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       ],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Active run")).toBeTruthy());
     expect(screen.getByText(/running 1h 30m/)).toBeTruthy();
@@ -423,11 +396,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
     });
 
     // Terminal runs live on the archive tab (amendment 3).
-    render(
-      <MemoryRouter>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Terminal run")).toBeTruthy());
     expect(screen.getByText(/ran 42m/)).toBeTruthy();
@@ -439,11 +408,7 @@ describe("RunsList — live duration token (issue #256 M3)", () => {
       runs: [aRun({ id: "none", issue_title: "Never started", status: "completed", started_at: null, finished_at: null })],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Never started")).toBeTruthy());
     expect(screen.queryByText(/\bran\b/)).toBeNull();
@@ -474,11 +439,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Fresh run")).toBeTruthy());
     expect(screen.getByText("Today")).toBeTruthy();
@@ -498,11 +459,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ],
     });
 
-    render(
-      <MemoryRouter>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
     fireEvent.change(screen.getByLabelText("Search past runs"), { target: { value: "parser" } });
@@ -525,11 +482,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ),
     });
 
-    render(
-      <MemoryRouter>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Past run 0")).toBeTruthy());
     // 10 of 12 render; the two newest-minus-nine are cut, the count label says so.
@@ -559,11 +512,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ],
     });
 
-    render(
-      <MemoryRouter initialEntries={["/runs"]}>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
     // The past run does NOT render here — it lives on the archive tab…
@@ -582,11 +531,7 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ],
     });
 
-    render(
-      <MemoryRouter initialEntries={["/runs/history"]}>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
     expect(screen.queryByText("In flight")).toBeNull();
@@ -602,15 +547,39 @@ describe("RunsHistory — archive search, grouping and reveal (ux-tweaks)", () =
       ],
     });
 
-    render(
-      <MemoryRouter initialEntries={["/runs/history?q=parser"]}>
-        <RunsHistory />
-      </MemoryRouter>,
-    );
+    renderRuns("/runs/history?q=parser");
 
     await waitFor(() => expect(screen.getByText("Fix the parser")).toBeTruthy());
     expect(screen.queryByText("Ship the exporter")).toBeNull();
     expect((screen.getByLabelText("Search past runs") as HTMLInputElement).value).toBe("parser");
+  });
+
+  // The 2026-08-14 nit: switching tabs must not blank the counted archive tab.
+  // The layout route owns the one runs fetch and survives switches, so the count
+  // neither refetches nor resets — pinned by the call count, which a per-page
+  // fetch would put at 3 here (mount + two switches), each with a bare-label flash.
+  it("keeps the archive tab count across tab switches without refetching", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "act", issue_title: "In flight", status: "running" }),
+        pastRun("t", "Finished run", "2026-07-05T12:00:00Z"),
+      ],
+    });
+
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+
+    // To the archive: the counted label is there the moment the tab renders…
+    fireEvent.click(screen.getByRole("link", { name: "Past runs · 1" }));
+    await waitFor(() => expect(screen.getByText("Finished run")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+
+    // …and back again.
+    fireEvent.click(screen.getByRole("link", { name: "Active" }));
+    await waitFor(() => expect(screen.getByText("In flight")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Past runs · 1" })).toBeTruthy();
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -663,11 +632,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     });
     mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun()] });
 
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    renderRuns();
 
     await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
     if (shown) {
@@ -690,11 +655,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       runs: [aRun({ id: "bare", issue_title: "Pre-#111 run", status: "running", anthropic_secret_label: null })],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Pre-#111 run")).toBeTruthy());
     expect(container.querySelector('span.max-w-\\[12rem\\]')).toBeNull();
@@ -719,11 +680,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       ],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Pool-empty run")).toBeTruthy());
     // The badge renders with its label…
@@ -760,11 +717,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       ],
     });
 
-    const { container } = render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
+    const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Other's run")).toBeTruthy());
     // The badge renders (admin still sees provenance despite holding zero tokens).

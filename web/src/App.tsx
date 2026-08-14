@@ -23,7 +23,7 @@ import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
-import { RunsHistory, RunsList } from "./pages/RunsList";
+import { RunsHistory, RunsLayout, RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
 import { Schedules } from "./pages/Schedules";
 import { Judge } from "./pages/Judge";
@@ -130,25 +130,23 @@ export default function App() {
             handles its own auth so it can preserve ?request= across the login
             redirect (ProtectedRoute would drop the query on the way to /login). */}
         <Route path="/cli-auth" element={<CliAuth />} />
+        {/* The Runs tabs (ux-tweaks amendment 3) nest under a LAYOUT route: the
+            shared header + tab strip + the one runs fetch live in RunsLayout, which
+            survives tab switches — so the counted "Past runs · N" tab neither
+            refetches nor blanks on a switch (the 2026-08-14 nit). The archive path
+            is a static segment, so React Router ranks it above /runs/:id by
+            construction — and run ids are "run-…" prefixes or UUIDs besides, never
+            the literal "history". */}
         <Route
-          path="/runs"
           element={
             <ProtectedRoute>
-              <RunsList />
+              <RunsLayout />
             </ProtectedRoute>
           }
-        />
-        {/* The archive tab (ux-tweaks amendment 3). A static segment, so React
-            Router ranks it above /runs/:id by construction — and run ids are
-            "run-…" prefixes or UUIDs besides, never the literal "history". */}
-        <Route
-          path="/runs/history"
-          element={
-            <ProtectedRoute>
-              <RunsHistory />
-            </ProtectedRoute>
-          }
-        />
+        >
+          <Route path="/runs" element={<RunsList />} />
+          <Route path="/runs/history" element={<RunsHistory />} />
+        </Route>
         <Route
           path="/runs/:id"
           element={
