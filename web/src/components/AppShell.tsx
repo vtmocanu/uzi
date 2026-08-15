@@ -922,7 +922,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       )}
 
       <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-        <div className={cx(!fullBleed && "mx-auto w-full max-w-5xl")}>
+        <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
           <VaultLockedBanner />
