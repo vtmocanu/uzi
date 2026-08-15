@@ -838,6 +838,99 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 	}
 }
 
+// Issue #159 — THE REPORTED SUBJECT MUST BE THE FLAPPING CONTAINER, NOT THE
+// MOST-RESTARTED ONE.
+//
+// flappingContainer decides the VERDICT (whether the pod is stuck) from the first
+// container flapping right now. Before #159, deriveRollHealth then took the reported
+// name/count/reason/exit from mostRestartedContainer, which picks whichever container
+// has the highest LIFETIME count — a DIFFERENT container on a Ready-flapping pod, where
+// every container is Running so blockingContainer returns nil. The verdict came from one
+// container and the whole report described another, so stuckDetail rendered a reason and
+// exit code from a termination hours old on a currently-healthy container.
+//
+// The fixture is ASYMMETRIC on purpose: the flapping container is NOT the most-restarted
+// one. A two-container fixture where the two agree passes against the unfixed code and
+// proves nothing.
+func TestFlappingSubjectIsTheFlappingContainerNotTheMostRestarted(t *testing.T) {
+	const want = "hash-new"
+
+	// worker: 4 restarts, this instance up 30s (inside flapWindow) — the FLAPPING one,
+	// so it decides the stuck verdict. Its own last termination is exit 1 / Error.
+	workerTerm := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+	// dind: 7 LIFETIME restarts but up 2h (past flapWindow) — NOT flapping, yet it
+	// out-restarts the worker, so mostRestartedContainer would name it. Its termination
+	// is exit 137 / OOMKilled, hours old and irrelevant to why the pod is stuck.
+	dindTerm := &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}
+
+	// worker appended FIRST so flappingContainer's scan finds it before dind.
+	pod := ready(
+		runningFor(
+			runningFor(workerPod("w1", want, 4*time.Hour), "worker", 4, 30*time.Second, workerTerm, false),
+			"dind", 7, 2*time.Hour, dindTerm, false),
+		testNow.Add(-2*time.Hour))
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+
+	if h.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. worker has 4 restarts and its current instance is 30s old — "+
+			"it is the flapping container and the verdict must be stuck.", h.Phase, protocol.PhaseStuck)
+	}
+	if h.BlockingContainer != "worker" {
+		t.Errorf("BlockingContainer = %q, want %q. The verdict comes from the flapping worker, but the "+
+			"unfixed code takes the subject from mostRestartedContainer and names %q — the quiet dind "+
+			"that has more LIFETIME restarts but has been up 2h and is not flapping.",
+			h.BlockingContainer, "worker", "dind")
+	}
+	if h.RestartCount != 4 {
+		t.Errorf("RestartCount = %d, want 4 — the flapping worker's count. The unfixed code reports 7, "+
+			"dind's lifetime count, so the verdict and the number an operator reads describe two "+
+			"different containers.", h.RestartCount)
+	}
+	if h.LastExitCode == nil || *h.LastExitCode != 1 {
+		t.Errorf("LastExitCode = %v, want 1 from the flapping worker's last termination. The unfixed code "+
+			"reads dind's termination and reports 137, an OOM hours old on a healthy container.",
+			h.LastExitCode)
+	}
+	if h.BlockingReason != "Error" {
+		t.Errorf("BlockingReason = %q, want %q — the worker's own last-termination reason via the "+
+			"\"Restarting\" fallback. The unfixed code reports %q from dind's stale OOM.",
+			h.BlockingReason, "Error", "OOMKilled")
+	}
+}
+
+// Issue #159, init-first ordering — the flapping subject may be a native-sidecar INIT
+// container with a LOWER lifetime count than a stable app container. flappingContainer
+// scans init containers before app containers, and the subject selection must carry that
+// ordering through: naming the app container (higher lifetime count) would put the wrong
+// name on a verdict the init container justified.
+func TestFlappingSubjectIsTheInitSidecarNotTheHigherCountApp(t *testing.T) {
+	const want = "hash-new"
+
+	initTerm := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+	appTerm := &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}
+
+	// seed-worker is a native sidecar (stays Running); 3 restarts, up 20s — flapping.
+	// dind has 9 lifetime restarts but is up 2h and not flapping.
+	pod := ready(
+		runningFor(
+			runningFor(workerPod("w1", want, 4*time.Hour), "seed-worker", 3, 20*time.Second, initTerm, true),
+			"dind", 9, 2*time.Hour, appTerm, false),
+		testNow.Add(-2*time.Hour))
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+
+	if h.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q", h.Phase, protocol.PhaseStuck)
+	}
+	if h.BlockingContainer != "seed-worker" {
+		t.Errorf("BlockingContainer = %q, want %q — the flapping init sidecar. The unfixed code names the "+
+			"app container dind on its higher lifetime count, dropping the init-first ordering the verdict used.",
+			h.BlockingContainer, "seed-worker")
+	}
+	if h.RestartCount != 3 {
+		t.Errorf("RestartCount = %d, want 3 — the flapping init sidecar's count, not dind's 9.", h.RestartCount)
+	}
+}
+
 // 🔴 A NON-RUNNING CONTAINER WITH A HIGH RESTART COUNT MUST NOT FLAG. This is the
 // counterfactual for flappingContainer's `State.Running == nil` skip, and it is the
 // normal case on every worker pod rather than an edge.

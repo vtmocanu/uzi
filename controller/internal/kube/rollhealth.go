@@ -300,6 +300,9 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 	// and no container name, so it looked pristine to whoever was trying to fix it.
 	subject := blockingContainer(current)
 	if subject == nil {
+		subject = flapping // the Ready-flapping arm's container; nil on the not-Ready path, so this is a no-op there
+	}
+	if subject == nil {
 		subject = mostRestartedContainer(current)
 	}
 	if subject != nil {
@@ -476,30 +479,14 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // change, stated out loud because nobody asked for it. A flapping dind sidecar will
 // withhold `settled` for the WHOLE POD, so the worker reports failed on its account.
 //
-// ⚠ THE CONTAINER NAMED IS NOT NECESSARILY THIS ONE. This function decides the VERDICT;
-// the name, restart count and exit code in the report still come from the
-// mostRestartedContainer fall-through below, which picks whichever container has the
-// highest LIFETIME count. Those disagree whenever a quiet container out-restarts the
-// flapping one — measured: dind flapping (4 restarts, up 2m) beside a stable worker (7
-// lifetime restarts, up 72h) reports stuck, correctly, but names `worker` with 7
-// restarts, and stuckDetail then renders a reason and exit code from a termination hours
-// old, on a currently-healthy container, with no timestamp. The init-first ordering here
-// does not carry through either, for the same reason. Do not read this function's choice
-// as the one an operator sees: the verdict and the subject are computed from two
-// different containers by construction.
-//
-// The divergence runs BOTH ways, so neither container is the guaranteed subject. This
-// function answers WHETHER (first container flapping now); the fall-through answers WHO
-// (highest LIFETIME count). A flapping dind beside a quiet-but-worn worker names the
-// worker, as measured; a flapping worker beside a dind with more lifetime restarts that
-// has been up past flapWindow names the dind. Both are the same #159 defect from
-// opposite ends.
-//
-// TRACKED AS ISSUE #159, deliberately not fixed here — it changes rendered output on a
-// path no measurement covers, so it wants its own fixture and its own measurement. Note
-// what such a fixture needs: TWO containers where the flapping one is NOT the
-// most-restarted one. A two-container fixture where the two agree passes against the
-// unfixed code.
+// THIS FUNCTION DECIDES THE VERDICT (whether the pod is stuck), NOT necessarily the
+// reported name on its own. On the Ready-flapping path, deriveRollHealth now takes the
+// SUBJECT — the reported name, restart count, reason and exit code — from the container
+// this function returns, so the verdict and the report agree, including the init-first
+// ordering this loop applies. Issue #159 fixed that at the `subject := blockingContainer(...)`
+// site in deriveRollHealth: when nothing is currently blocking, the subject falls to this
+// flapping container before falling to mostRestartedContainer, so a quiet container with a
+// higher LIFETIME count no longer supplies the name for a verdict this container justified.
 //
 // Honest (docker runs really are broken) and it matches how blockingContainer and
 // mostRestartedContainer already treat the pod, but it
