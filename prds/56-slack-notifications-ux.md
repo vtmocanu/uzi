@@ -50,7 +50,7 @@ said why.
    view. PUT responses carry the field for free — the component's
    `setLink(slack)` replaces the whole object. The admin chip's dedicated poll
    (`GET /api/admin/slack/status`) is unaffected (its accessor is wired at
-   `cmd/server/main.go:448`, so the new field is live in prod, not stuck at
+   `cmd/server/main.go:669` (`h.SetSlackStatus(slackManager.State)`), so the new field is live in prod, not stuck at
    `disabled`). A per-user poll or WS push for this was rejected as
    disproportionate.
 2. **Collapse the manager states; never leak error class to non-admins.** The
@@ -59,7 +59,7 @@ said why.
    `error:auth` / `error:connection` → `error`. Whether the admin's token was
    rejected vs. a network drop is an admin-only diagnostic (it stays on the
    admin DTO); users only need "Slack isn't available right now". Source is
-   the existing `h.slackState()` (`handler/handler.go:129`) — nil-manager-safe,
+   the existing `h.slackState()` (`handler/handler.go:206`) — nil-manager-safe,
    already returns `disabled` when Slack was never wired.
 3. **UI states are derived from `workspace` × `link.state`, alert-first.**
    - `unconfigured`: info alert "Slack isn't connected on this uzi instance
@@ -130,14 +130,14 @@ said why.
   is in this PRD's file list, so typecheck flushes out stragglers).
 - `web/src/components/SlackNotifications.tsx`: state derivation per Decision
   3; the `unconfigured` alert reuses the existing `Alert` component
-  (`tone="info"`, supported at `ui.tsx:132-141`); hint lines use the existing
+  (`tone="info"`, `Alert` at `ui.tsx:233`); hint lines use the existing
   muted/faint text classes. No new components.
 - `web/src/mocks/mockApi.ts` + `SlackNotifications.test.tsx` +
   `Settings.test.tsx` updated per Decision 5.
 
 ### Docs + specs
 
-- `docs/slack.md` §4 "Link your own account" (`docs/slack.md:97`): one short
+- `docs/slack.md` §4 "Link your own account" (`docs/slack.md:101`): one short
   paragraph — what the card shows when the instance has no Slack configured,
   and that only an admin can connect it.
 - `specs/ai.md`: Decisions 1–4 recorded, including the accepted health-oracle
@@ -163,7 +163,7 @@ said why.
 - [ ] **M4 — Release: version bump + tag + argo deploy + verify on
   dev-cluster** (three steps, `deploy/README.md:53-85` — ↳review 1, MAJOR):
   (a) bump `deploy/chart/Chart.yaml` `version` **and** `appVersion` to the
-  next release version (currently `0.2.0`) in the feature MR, merge; (b) tag
+  next release version (currently `0.37.0`) in the feature MR, merge; (b) tag
   `vX.Y.Z` on the merged commit — the tag pipeline asserts version equality
   and publishes images + OCI chart; (c) **second MR to `argo-apps`
   bumping `targetRevision` in `apps/uzi/app.uzi.yaml`** — deploy is an
