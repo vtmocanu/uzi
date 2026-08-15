@@ -1,6 +1,7 @@
 package main
 
 import (
+	"image/color"
 	"strings"
 
 	"charm.land/glamour/v2"
@@ -109,6 +110,16 @@ type palette struct {
 	box      lipgloss.Style
 	boxTitle lipgloss.Style
 	states   map[crewState]lipgloss.Style
+
+	// The RUN-STATUS colour axis (PRD #325 M2), a SEPARATE axis from the crew-lane
+	// `states` dots above. statuses maps a run status to its bucket colour; statusStalled
+	// is the health override; statusDefault covers unrecognised statuses; chipFg is the
+	// text drawn on a solid status chip. Read (never re-populated) by M3's detail header
+	// chips and M6's verdict severity via statusColor/chip.
+	statuses      map[string]color.Color
+	statusStalled color.Color
+	statusDefault color.Color
+	chipFg        color.Color
 }
 
 func newPalette(dark bool) palette {
@@ -128,6 +139,24 @@ func newPalette(dark bool) palette {
 		crewIdle:    p.faint,
 		crewDone:    p.faint,
 	}
+
+	// Run-status colour buckets (PRD #325 M2). Light value first (dark bg gets the
+	// brighter second value), matching the `ld(light, dark)` convention above.
+	p.statuses = map[string]color.Color{
+		"running":           ld(lipgloss.Color("#1a7f4b"), lipgloss.Color("#4ade80")),
+		"queued":            ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+		"claimed":           ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+		"awaiting_approval": ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
+		"awaiting_input":    ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
+		"limit_wait":        ld(lipgloss.Color("#0369a1"), lipgloss.Color("#38bdf8")),
+		"completed":         ld(lipgloss.Color("#0f766e"), lipgloss.Color("#5eead4")),
+		"failed":            ld(lipgloss.Color("#b91c1c"), lipgloss.Color("#f87171")),
+		"cancelled":         ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+	}
+	p.statusStalled = ld(lipgloss.Color("#c2410c"), lipgloss.Color("#fb923c"))
+	p.statusDefault = ld(lipgloss.Color("#6c6c6c"), lipgloss.Color("#8a8a8a"))
+	p.chipFg = ld(lipgloss.Color("#ffffff"), lipgloss.Color("#0e1016"))
+
 	return p
 }
 
@@ -136,4 +165,29 @@ func (p palette) state(s crewState) lipgloss.Style {
 		return st
 	}
 	return p.faint
+}
+
+// statusColor resolves a run's spine/chip colour (PRD #325 M2 seam), applying the
+// status→bucket map and the status-vs-health precedence: health "stalled" overrides the
+// status bucket (a stalled run is what triage is FOR), so it wins → orange. Non-stalled
+// health does not override. An unrecognised status falls to the default grey bucket, per
+// the forward-compat note in docs/cli.md (a newer server may ship a status this CLI has
+// no colour for).
+func (p palette) statusColor(status, health string) color.Color {
+	if health == "stalled" {
+		return p.statusStalled
+	}
+	if c, ok := p.statuses[status]; ok {
+		return c
+	}
+	return p.statusDefault
+}
+
+// chip renders text as a solid status tag: a filled block of bg with near-background
+// text on it, so a status reads as a physical tag rather than coloured prose. Under
+// NO_COLOR / an Ascii profile lipgloss strips the fill and the chip degrades to its bold
+// text (still legible) — the caller supplies the NO_COLOR-independent signal (the spine
+// glyph, a bordered banner) separately.
+func (p palette) chip(text string, bg color.Color) string {
+	return lipgloss.NewStyle().Background(bg).Foreground(p.chipFg).Bold(true).Padding(0, 1).Render(text)
 }

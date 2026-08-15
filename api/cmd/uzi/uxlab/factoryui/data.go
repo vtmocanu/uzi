@@ -51,23 +51,23 @@ func fullCrew() []Lane {
 func SeedRuns() []Run {
 	return []Run{
 		{ID: "a1b2c3d4", Kind: "issue", Status: "running", Title: "Add rate-limit headroom to the scheduler poll",
-			Age: "4m", Owner: "dana", Lanes: fullCrew(), Transcript: crewTranscript()},
+			Age: "4m", Owner: "dana@example.com", Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "b2c3d4e5", Kind: "ci_fix", Status: "awaiting_approval", Title: "Fix flaky pipeline on main",
-			Age: "2m", Owner: "dana", Lanes: []Lane{{"lead", "", "", "waiting"}}, Transcript: leadPlan()},
+			Age: "2m", Owner: "dana@example.com", Lanes: []Lane{{"lead", "", "", "waiting"}}, Transcript: leadPlan()},
 		{ID: "c3d4e5f6", Kind: "issue", Status: "running", Title: "Refactor the forge sync loop for the GitHub driver",
-			Health: "stalled", Age: "51m", Owner: "priya", Lanes: []Lane{
+			Health: "stalled", Age: "51m", Owner: "priya@example.com", Lanes: []Lane{
 				{"lead", "", "", "working"}, {"coder", "9xk2mq", "driver port", "stalled"}}, Transcript: crewTranscript()},
 		{ID: "d4e5f6a7", Kind: "chat", Status: "running", Title: "Explain the run lifecycle state machine",
-			Age: "1m", Owner: "dana", Lanes: []Lane{{"lead", "", "", "working"}}, Transcript: crewTranscript()},
+			Age: "1m", Owner: "dana@example.com", Lanes: []Lane{{"lead", "", "", "working"}}, Transcript: crewTranscript()},
 		{ID: "e5f6a7b8", Kind: "issue", Status: "completed", Title: "Wire the OIDC login button into the header",
-			Age: "3h", Owner: "sam", Verdict: "ideal", Lanes: fullCrew(), Transcript: crewTranscript()},
+			Age: "3h", Owner: "sam@example.com", Verdict: "ideal", Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "f6a7b8c9", Kind: "issue", Status: "limit_wait", Title: "Port the judge to per-model usage folding",
-			Age: "22m", Owner: "dana", ParkLine: "paused: Anthropic usage limit (five_hour) · resumes in 41m · attempt 2",
+			Age: "22m", Owner: "dana@example.com", ParkLine: "paused: Anthropic usage limit (five_hour) · resumes in 41m · attempt 2",
 			Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "a7b8c9d0", Kind: "issue", Status: "failed", Title: "Migrate per-user secrets into the vault hierarchy",
-			Age: "5h", Owner: "sam", Verdict: "issues", Lanes: fullCrew(), Transcript: crewTranscript()},
+			Age: "5h", Owner: "sam@example.com", Verdict: "issues", Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "b8c9d0e1", Kind: "ci_fix", Status: "completed", Title: "Repair the changelog assertion gate",
-			Age: "1d", Owner: "priya", Verdict: "ok", Lanes: fullCrew(), Transcript: crewTranscript()},
+			Age: "1d", Owner: "priya@example.com", Verdict: "ok", Lanes: fullCrew(), Transcript: crewTranscript()},
 	}
 }
 

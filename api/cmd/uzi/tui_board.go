@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"image/color"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -145,56 +148,191 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 
 func (m tuiModel) renderBoard() string {
 	var sb strings.Builder
+	rows := m.board.visible()
 
-	title := "runs"
+	title := "factory floor"
 	if m.board.admin {
 		// The admin view is NOT symmetric with own-runs: AdminListRuns returns
 		// non-terminal runs only, capped, with no judge/usage columns. Labelling it
-		// "active runs" is the honest header — promising completed rows here would be
-		// a lie the API cannot satisfy.
+		// "active runs (factory-wide)" is the honest header — promising completed rows,
+		// or calling it "all crews", is a claim the API cannot satisfy.
 		title = "active runs (factory-wide)"
 	}
-	sb.WriteString(m.pal.title.Render("uzi · " + title))
+	// Wordmark + a summary bar that answers "does anything need me?" before the eye
+	// reaches a row (PRD #325 M2). The summary is over the WHOLE board, not the filtered
+	// view, so it stays a stable factory read while you filter.
+	brand := m.pal.title.Render("▚ uzi") + m.pal.faint.Render("  "+title)
 	if m.board.filter != "" || m.board.filtering {
-		sb.WriteString(m.pal.faint.Render("   /" + cellText(m.board.filter)))
+		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))
 		if m.board.filtering {
-			sb.WriteString(m.pal.faint.Render("▌"))
+			brand += m.pal.faint.Render("▌")
 		}
 	}
-	sb.WriteString("\n\n")
+	summary := m.boardSummary()
+	sb.WriteString(padVisual(brand, m.width-visualWidth(summary)-1) + summary + "\n")
+	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
 
 	if m.board.adminDenied {
-		sb.WriteString(m.pal.faint.Render("the factory-wide board needs an admin (uza_) token — showing your runs\n\n"))
+		sb.WriteString(m.pal.faint.Render("the factory-wide board needs an admin (uza_) token — showing your runs") + "\n")
 	}
 	if m.board.err != nil {
-		sb.WriteString(m.pal.faint.Render("could not refresh: "+fmtErr(m.board.err)) + "\n\n")
+		sb.WriteString(m.pal.faint.Render("could not refresh: "+fmtErr(m.board.err)) + "\n")
 	}
 
-	rows := m.board.visible()
+	// Column header. The 2-col spine+gutter is a blank prefix here; the 4 spaces between
+	// STATUS and AGE cover the row's " " + 2-col health + " ".
+	ownerHdr := ""
+	if m.board.admin {
+		ownerHdr = "  " + padCell("OWNER", boardOwnerWidth)
+	}
+	sb.WriteString("  " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"    "+padCell("AGE", 5)+"  TITLE") + "\n")
+
 	if len(rows) == 0 {
-		sb.WriteString(m.pal.faint.Render("no runs to show"))
-		return sb.String()
+		sb.WriteString(m.boardEmptyState())
+	} else {
+		for i, r := range rows {
+			sb.WriteString(m.boardRow(r, i == m.board.cursor) + "\n")
+		}
 	}
 
-	// Fixed-width cells: every untrusted value goes through the Plain path (cellText +
-	// rune cap), never sanitizeTTY alone, or a newline in a title breaks the column.
-	sb.WriteString(m.pal.faint.Render(padCell("RUN", 10)+"  "+padCell("KIND", 12)+"  "+
-		padCell("STATUS", 18)+"  "+padCell("HEALTH", 10)+"  TITLE") + "\n")
-	for i, r := range rows {
-		line := padCell(shortRunID(r.ID), 10) + "  " +
-			padCell(m.renderer.Plain(r.Kind, 12), 12) + "  " +
-			padCell(m.renderer.Plain(r.Status, 18), 18) + "  " +
-			padCell(m.renderer.Plain(boardHealth(r), 10), 10) + "  " +
-			m.renderer.Plain(runTitle(r.RunDTO), 60)
-		if i == m.board.cursor {
-			sb.WriteString(m.pal.sel.Render("▸ " + line))
-		} else {
-			sb.WriteString("  " + line)
-		}
-		sb.WriteString("\n")
-	}
-	sb.WriteString("\n" + m.pal.faint.Render("enter open · / filter · a admin · r refresh · ? keys · q quit"))
+	sb.WriteString(m.pal.faint.Render(strings.Repeat("─", boardRuleWidth(m.width))) + "\n")
+	sb.WriteString(m.pal.faint.Render("enter open · / filter · a admin · r refresh · ? keys · q quit"))
 	return sb.String()
+}
+
+const (
+	boardStatusWidth = 19 // status chip cell (fits the longest status, "awaiting_approval" + chip padding)
+	boardOwnerWidth  = 18 // admin OWNER cell
+)
+
+func boardRuleWidth(w int) int {
+	if w < 2 {
+		return 1
+	}
+	return w - 1
+}
+
+// boardSummary is the "N runs · N needs you · N stalled" bar. Predicates (PRD #325 M2):
+// needs you = awaiting_approval + awaiting_input; stalled = health "stalled"; N runs =
+// the whole board. Computed over m.board.runs so it does not shrink under a filter.
+func (m tuiModel) boardSummary() string {
+	needs, stalled := 0, 0
+	for _, r := range m.board.runs {
+		if r.Status == "awaiting_approval" || r.Status == "awaiting_input" {
+			needs++
+		}
+		if r.Health == "stalled" {
+			stalled++
+		}
+	}
+	s := m.pal.faint.Render(fmt.Sprintf("%d runs", len(m.board.runs)))
+	if needs > 0 {
+		s += m.pal.faint.Render(" · ") + m.pal.chip(fmt.Sprintf("%d needs you", needs), m.pal.statusColor("awaiting_approval", ""))
+	}
+	if stalled > 0 {
+		s += m.pal.faint.Render(" · ") + lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render(fmt.Sprintf("%d stalled", stalled))
+	}
+	return s
+}
+
+// boardEmptyState replaces the old dead-end "no runs to show": it keeps the footer (added
+// by the caller) and, on the own board, guides the user to start a run. The guidance
+// deliberately does NOT name a `uzi <subcommand>` — a printed command reference in a view
+// would need a knownInstructions entry (TestPrintedInstructionsAreRegistered) it cannot
+// earn, since a lipgloss Render site classifies as neither an emitter nor a cobra field.
+func (m tuiModel) boardEmptyState() string {
+	if m.board.admin {
+		return m.pal.faint.Render("No active runs across the factory right now.") + "\n"
+	}
+	return m.pal.faint.Render("No runs yet. Start one from the web board or the command line.") + "\n"
+}
+
+// boardRow renders one run: a status-coloured spine (with a NO_COLOR-safe glyph), the id,
+// OWNER on the admin board, a status chip, a health marker, AGE, and the title with an
+// own-board-only judge marker.
+func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
+	sc := m.pal.statusColor(r.Status, r.Health)
+
+	// The spine carries the status GLYPH in the chip foreground on the status-colour
+	// background. Under NO_COLOR / an Ascii profile the fill is stripped but the glyph
+	// survives, so the spine's signal (D3) does not depend on colour.
+	spine := lipgloss.NewStyle().Background(sc).Foreground(m.pal.chipFg).Render(statusGlyph(r.Status))
+	gutter := " "
+	id := m.pal.faint.Render(padCell(shortRunID(r.ID), 9))
+	if sel {
+		gutter = m.pal.sel.Render("▸")
+		id = m.pal.sel.Render(padCell(shortRunID(r.ID), 9))
+	}
+
+	owner := ""
+	if m.board.admin {
+		// D7 (PRD #325 M2, B1): OwnerEmail is forge-authored untrusted text — route it
+		// through renderer.Plain (= capCell(cellText(...))); bare capCell would not strip
+		// control bytes. OwnerEmail is in d7UntrustedFields.
+		owner = "  " + m.pal.faint.Render(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth))
+	}
+
+	statusCell := padVisual(m.pal.chip(m.renderer.Plain(r.Status, boardStatusWidth-2), sc), boardStatusWidth)
+
+	title := m.renderer.Plain(runTitle(r.RunDTO), 60)
+	// The judge marker is own-board-only: AdminListRuns carries no JudgeVerdict.
+	if !m.board.admin && r.JudgeVerdict != nil {
+		title += "  " + m.verdictMarker(*r.JudgeVerdict)
+	}
+
+	return spine + gutter + " " + id + owner + "  " + statusCell + " " + m.boardHealthCell(r) + " " +
+		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + title
+}
+
+// boardHealthCell is a 2-col health marker beside the status chip. "stalled" (which also
+// turns the spine/chip orange via statusColor) gets an orange ▲; any other non-ok health
+// (slow/looping/waiting_worker) gets a faint attention mark; ok/empty is blank.
+func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
+	switch boardHealth(r) {
+	case "":
+		return "  "
+	case "stalled":
+		return lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲") + " "
+	default:
+		return m.pal.faint.Render("!") + " "
+	}
+}
+
+// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → red,
+// ideal/ok → teal). The verdict is a closed enum, but it is rendered through Plain so an
+// unrecognised value from a newer server cannot inject control bytes.
+func (m tuiModel) verdictMarker(verdict string) string {
+	var c color.Color
+	switch verdict {
+	case "ideal", "ok":
+		c = m.pal.statusColor("completed", "")
+	case "issues":
+		c = m.pal.statusColor("failed", "")
+	default:
+		c = m.pal.statusDefault
+	}
+	return lipgloss.NewStyle().Foreground(c).Render("⚖ " + m.renderer.Plain(verdict, 8))
+}
+
+// statusGlyph is the per-status spine marker. It is the NO_COLOR fallback (D3), so it must
+// read without colour and be a single terminal cell wide.
+func statusGlyph(status string) string {
+	switch status {
+	case "running":
+		return "●"
+	case "awaiting_approval":
+		return "!"
+	case "awaiting_input":
+		return "?"
+	case "limit_wait":
+		return "~"
+	case "completed":
+		return "✓"
+	case "failed":
+		return "✗"
+	default: // queued, claimed, cancelled, unknown
+		return "·"
+	}
 }
 
 // boardHealth renders the PRD #47 health flag, blank when healthy so the column is

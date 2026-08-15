@@ -416,6 +416,52 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	})
 	detail = next.(tuiModel)
 	assertNoRawControls(t, "detail", detail.View().Content)
+
+	// The ADMIN board is the only view that draws OwnerEmail (PRD #325 M2, B1). A hostile
+	// OwnerEmail must not emit control bytes into the frame. The clean-fixture screenshots
+	// cannot catch this, so this is the guard. OwnerEmail is *string, so bind a local.
+	owner := nasty
+	adminRuns := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty}, OwnerEmail: &owner},
+	}
+	adm := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	adm = press(t, adm, keyAdmin)
+	next, _ = adm.Update(boardRunsMsg{admin: true, runs: adminRuns})
+	adm = next.(tuiModel)
+	admOut := adm.View().Content
+	if !strings.Contains(admOut, "OWNER") {
+		t.Fatalf("the admin board is not showing the OWNER column, so this test is not exercising the OwnerEmail render path\n%s", admOut)
+	}
+	assertNoRawControls(t, "admin board", admOut)
+}
+
+// M2: the board encodes run status as a colour chip + spine and a summary bar. Automatable
+// via the View() substring / SGR seam so CI gates the semantics per milestone (B2).
+func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "two"}},
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "three"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	for _, want := range []string{"3 runs", "1 needs you", "1 stalled"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary bar missing %q\n%s", want, out)
+		}
+	}
+	// The status chip + spine are solid colour fills: a truecolor background SGR (48;2;…).
+	// Plain status text alone (the old board) would carry no background fill.
+	if !strings.Contains(out, "\x1b[48;2;") {
+		t.Errorf("board has no background-fill SGR; the status chip/spine colour is missing\n%s", out)
+	}
+	// The NO_COLOR-safe spine glyph for a running run survives independent of colour.
+	if !strings.Contains(out, statusGlyph("running")) {
+		t.Errorf("running spine glyph %q absent from the board\n%s", statusGlyph("running"), out)
+	}
 }
 
 // assertNoRawControls fails on anything in a rendered frame that is not printable text

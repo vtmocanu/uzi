@@ -120,9 +120,12 @@ func TestGenerateUXLabFrames(t *testing.T) {
 // ---- board fixtures -------------------------------------------------------
 
 func boardRuns(now time.Time) []apitypes.RunListItemDTO {
-	mk := func(id, kind, status, title, health string, verdict *string, todo int) apitypes.RunListItemDTO {
+	// age is set via CreatedAt so relAge renders a realistic AGE column (M2). The offsets
+	// are chosen to land on relAge's buckets (Nm / Nh / Nd) and mirror the mock's ages.
+	mk := func(id, kind, status, title, health string, verdict *string, todo int, age time.Duration) apitypes.RunListItemDTO {
 		r := apitypes.RunListItemDTO{
-			RunDTO:       apitypes.RunDTO{ID: id, Kind: kind, Status: status, IssueTitle: title, Health: health},
+			RunDTO: apitypes.RunDTO{ID: id, Kind: kind, Status: status, IssueTitle: title, Health: health,
+				CreatedAt: now.Add(-age)},
 			JudgeVerdict: verdict, JudgeTodoCount: todo,
 		}
 		if kind == "chat" {
@@ -132,14 +135,14 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 		return r
 	}
 	return []apitypes.RunListItemDTO{
-		mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0),
-		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0),
-		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0),
-		mk("d4e5f6a7-1111-2222-3333-444444444444", "chat", "running", "Explain the run lifecycle state machine", "", nil, 0),
-		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0),
-		mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0),
-		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3),
-		mk("b8c9d0e1-1111-2222-3333-444444444444", "ci_fix", "completed", "Repair the changelog assertion gate", "", sp("ok"), 0),
+		mk("a1b2c3d4-1111-2222-3333-444444444444", "issue", "running", "Add rate-limit headroom to the scheduler poll", "", nil, 0, 4*time.Minute),
+		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
+		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
+		mk("d4e5f6a7-1111-2222-3333-444444444444", "chat", "running", "Explain the run lifecycle state machine", "", nil, 0, time.Minute),
+		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour),
+		mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute),
+		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour),
+		mk("b8c9d0e1-1111-2222-3333-444444444444", "ci_fix", "completed", "Repair the changelog assertion gate", "", sp("ok"), 0, 25*time.Hour),
 	}
 }
 
@@ -159,11 +162,12 @@ func boardEmpty(dark bool) string {
 func boardAdmin(dark bool) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
+	now := time.Now()
 	m = key(m, keyAdmin)
 	m = step(m, boardRunsMsg{admin: true, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll"}, OwnerEmail: sp("dana@example.com")},
-		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111", Kind: "issue", Status: "claimed", IssueTitle: "Refactor the forge sync loop", Health: "stalled"}, OwnerEmail: sp("priya@example.com")},
-		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main"}, OwnerEmail: sp("sam@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}, OwnerEmail: sp("dana@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "c3d4e5f6-1111", Kind: "issue", Status: "claimed", IssueTitle: "Refactor the forge sync loop", Health: "stalled", CreatedAt: now.Add(-51 * time.Minute)}, OwnerEmail: sp("priya@example.com")},
+		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}, OwnerEmail: sp("sam@example.com")},
 	}})
 	return m.View().Content
 }

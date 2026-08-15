@@ -97,6 +97,11 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// OwnerEmail is forge-authored and shown on the admin board (PRD #325 M2, B1). It
+	// must be drawn only through a sanitizer (renderer.Plain); the clean-fixture
+	// screenshots cannot catch a raw draw, so this guard + the hostile-OwnerEmail render
+	// test in TestTUIViewsStripControlBytesFromUntrustedText are the defence.
+	"OwnerEmail",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

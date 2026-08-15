@@ -91,6 +91,16 @@ func (p Palette) statusColor(s string) color.Color {
 	return p.muted
 }
 
+// rowColor applies the status-vs-health precedence for the spine/chip: health "stalled"
+// overrides the status bucket → orange (mirrors the shipped palette.statusColor(status,
+// health)).
+func (p Palette) rowColor(status, health string) color.Color {
+	if health == "stalled" {
+		return p.status["stalled"]
+	}
+	return p.statusColor(status)
+}
+
 func (p Palette) fg(c color.Color) lipgloss.Style { return lipgloss.NewStyle().Foreground(c) }
 
 // chip is the signature element: a solid block of colour with near-background text on it,

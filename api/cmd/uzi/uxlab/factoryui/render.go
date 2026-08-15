@@ -27,7 +27,9 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 	}
 	title := "factory floor"
 	if admin {
-		title = "factory floor · all crews"
+		// Admin honesty label — AdminListRuns returns non-terminal runs only, so it is
+		// "active runs (factory-wide)", never "all crews" (matches the shipped board).
+		title = "active runs (factory-wide)"
 	}
 	brand := p.fg(p.brand).Bold(true).Render("▚ uzi") + p.fg(p.muted).Render("  "+title)
 	summary := p.fg(p.muted).Render(fmt.Sprintf("%d runs", len(rows)))
@@ -51,24 +53,24 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 
 	ownerCol := ""
 	if admin {
-		ownerCol = "  " + padCell("OWNER", 8)
+		ownerCol = "  " + padCell("OWNER", 18)
 	}
 	sb.WriteString("  " + p.eyebrow(padCell("RUN", 9)+ownerCol+"  "+padCell("STATUS", 19)+"    "+padCell("AGE", 5)+"  TITLE") + "\n")
 
 	if len(visible) == 0 {
-		sb.WriteString("\n  " + p.fg(p.muted).Render("No runs yet.") + "\n  " +
-			p.fg(p.faint).Render("Start one from the web board, or with ") + p.fg(p.brand).Render("uzi run create") +
-			p.fg(p.faint).Render(" / ") + p.fg(p.brand).Render("uzi schedule create") + p.fg(p.faint).Render(".") + "\n")
+		sb.WriteString("  " + p.fg(p.muted).Render("No runs yet. Start one from the web board or the command line.") + "\n")
 	}
 
 	for i, r := range visible {
 		sel := i == cursor
-		sc := p.statusColor(r.Status)
+		sc := p.rowColor(r.Status, r.Health)
 
-		spine := lipgloss.NewStyle().Background(sc).Render(" ")
+		// The spine carries the status glyph on the status-colour bg; the glyph is the
+		// NO_COLOR fallback (survives when lipgloss strips the fill). Spine stays status-
+		// coloured on the selected row so its status is never hidden.
+		spine := lipgloss.NewStyle().Background(sc).Foreground(p.chipFg).Render(statusGlyph(r.Status))
 		gutter := " "
 		if sel {
-			spine = lipgloss.NewStyle().Background(p.brand).Render(" ")
 			gutter = p.fg(p.brand).Bold(true).Render("▸")
 		}
 
@@ -83,12 +85,16 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 
 		statusCell := padVisual(p.chip(r.Status, sc), 19)
 		health := "  "
-		if r.Health == "stalled" {
+		switch r.Health {
+		case "stalled":
 			health = p.fg(p.statusColor("stalled")).Render("▲") + " "
+		case "":
+		default:
+			health = p.fg(p.faint).Render("!") + " "
 		}
 		owner := ""
 		if admin {
-			owner = "  " + p.fg(p.muted).Render(padCell(r.Owner, 8))
+			owner = "  " + p.fg(p.muted).Render(padCell(r.Owner, 18))
 		}
 
 		title := titleStyle.Render(capCell(r.Title, 44))
@@ -109,9 +115,29 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 	}
 
 	sb.WriteString(p.fg(p.rule).Render(strings.Repeat("─", width-1)) + "\n")
-	sb.WriteString(p.hintbar(p.hint("enter", "open"), p.hint("/", "filter"), p.hint("a", "all crews"),
-		p.hint("r", "refresh"), p.hint("?", "keys"), p.hint("q", "quit")))
+	sb.WriteString(p.fg(p.faint).Render("enter open · / filter · a admin · r refresh · ? keys · q quit"))
 	return sb.String()
+}
+
+// statusGlyph is the per-status spine marker, the NO_COLOR fallback — single-cell, reads
+// without colour. Mirrors the shipped board's statusGlyph.
+func statusGlyph(status string) string {
+	switch status {
+	case "running":
+		return "●"
+	case "awaiting_approval":
+		return "!"
+	case "awaiting_input":
+		return "?"
+	case "limit_wait":
+		return "~"
+	case "completed":
+		return "✓"
+	case "failed":
+		return "✗"
+	default:
+		return "·"
+	}
 }
 
 // filterRows applies the board's `/` filter over the fields a human searches by. Shared by
@@ -175,7 +201,7 @@ func TranscriptExtent(p Palette, r Run, selLane, height int) (total, viewport in
 // the run needs a human it adds the amber PLAN GATE banner with promoted action keys. The
 // transcript follows live (auto-tails) unless the reader has scrolled back.
 func RenderDetail(p Palette, r Run, focus, selLane, scroll int, following bool, width, height int) string {
-	sc := p.statusColor(r.Status)
+	sc := p.rowColor(r.Status, r.Health)
 	needsHuman := r.Status == "awaiting_approval" || r.Status == "awaiting_input"
 
 	var sb strings.Builder
