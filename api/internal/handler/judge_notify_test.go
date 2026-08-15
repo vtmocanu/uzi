@@ -171,10 +171,10 @@ func TestReviewSlackFactsChipsAndCount(t *testing.T) {
 	}
 	// Many recommendations drawn from the closed enum collapse to exactly the DISTINCT
 	// categories present — dedup, not the cap, is what bounds the chips for in-enum data
-	// (the enum has 6 members, so a review can never carry more than 6 distinct ones).
+	// (the enum has 7 members, so a review can never carry more than 7 distinct ones).
 	// A submission that repeats every category many times must yield one chip per
 	// distinct category, in first-seen order.
-	distinct := []string{"enable_tool", "install_worker_tool", "adjust_template", "improve_agent", "add_agent", "improve_uzi"}
+	distinct := []string{"enable_tool", "install_worker_tool", "adjust_template", "improve_agent", "add_agent", "improve_uzi", "cost_efficiency"}
 	many := make([]workersvc.ReviewRecommendation, 0, len(distinct)*4)
 	for i := 0; i < 4; i++ {
 		for _, cat := range distinct {

@@ -650,7 +650,8 @@ export interface ReviewRecommendation {
     | "adjust_template"
     | "improve_agent"
     | "add_agent"
-    | "improve_uzi";
+    | "improve_uzi"
+    | "cost_efficiency";
   target: string;
   rationale: string;
   confidence?: "" | "low" | "medium" | "high";

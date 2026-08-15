@@ -615,11 +615,11 @@ func TestBulkDispositionRejectsBodyCoordinateLiveDB(t *testing.T) {
 		   JOIN run_reviews rv ON rv.id = d.review_id
 		  WHERE rv.user_id = $1
 		    AND d.category NOT IN ('enable_tool','install_worker_tool','adjust_template',
-		                           'improve_agent','add_agent','improve_uzi')`, userID).Scan(&n); err != nil {
+		                           'improve_agent','add_agent','improve_uzi','cost_efficiency')`, userID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("%d disposition row(s) carry a category outside the six-enum set — a request body "+
+		t.Fatalf("%d disposition row(s) carry a category outside the seven-enum set — a request body "+
 			"reached the coordinate columns, which is exactly what 00071/00073 assume cannot happen", n)
 	}
 	// Exactly the resolved coordinate was written, under its OWN category/target.

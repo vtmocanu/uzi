@@ -462,7 +462,7 @@ to show groups in *any* of the named labels — and server-validated: an unknown
 label is a usage error (exit 2), never a silently empty list, exactly like an
 unknown `--bucket`. An empty or omitted `--category` means all labels. The valid
 labels are `enable_tool`, `install_worker_tool`, `adjust_template`, `improve_agent`,
-`add_agent` and `improve_uzi`. Like `--run` (and unlike `--bucket`), the label
+`add_agent`, `improve_uzi` and `cost_efficiency`. Like `--run` (and unlike `--bucket`), the label
 predicate is applied *before* the server's row cap, so narrowing by label makes
 truncation less likely to bite; it composes cleanly with `--bucket`. Note this
 `backlog --category` is a **distinct** flag from the `--category` on

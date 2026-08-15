@@ -5746,7 +5746,7 @@ with the review/audit findings folded in.
   can't be replayed wholesale (audit L2).
 - **The review POST (`POST /api/worker/runs/{id}/review`) treats worker input as attacker-suppliable** (the worker
   is a user-controlled container): hard validation at ingest — category against the enum
-  (`enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi`), length caps +
+  (`enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi | cost_efficiency`), length caps +
   control-char strip on target/rationale/summary (the `sanitizeSelfReported` pattern), and `ScrubSecrets` over free
   text before persistence. Provenance (producing run + user) is stamped server-side, never from the body. Persist
   is an **atomic CTE UPSERT** keyed on `run_reviews` UNIQUE(target_run_id) — replace-on-re-judge semantics, so a
@@ -8607,13 +8607,14 @@ without the human re-deriving it.
 
 - **A category→repo default map, resolved server-side.** `improve_agent`/`add_agent` → the judged
   run's repo (repo agents live in that repo's `.claude/agents/`); `improve_uzi`/
-  `install_worker_tool`/`adjust_template` → `selfimprove_repo` (uzi's own code / the worker image /
-  `go:embed`-shipped builtins); `enable_tool` → `selfimprove_repo` (weakest fit, accepted).
+  `install_worker_tool`/`adjust_template`/`cost_efficiency` → `selfimprove_repo` (uzi's own code / the
+  worker image / `go:embed`-shipped builtins — a cost-efficiency finding usually names a template or
+  the lead's orchestration, which live there); `enable_tool` → `selfimprove_repo` (weakest fit, accepted).
 - **The default is a pre-selection, not a constraint.** The picker lists every repo the *caller* has
   connected; Create enables once any is chosen.
   - **Honest framing:** `selfimprove_repo` is a doubly weak default — usually unset, and even when
     set it is one admin's connected repo (per D8's caller-scoping it resolves only for that admin).
-    So for a non-admin, 4 of 6 categories are expected to open with an **empty picker**; the map's
+    So for a non-admin, 5 of 7 categories are expected to open with an **empty picker**; the map's
     real payload is the `improve_agent`/`add_agent` → judged-run's-repo default, which is cheap and
     usually resolvable. When the default cannot be resolved, the draft opens with the picker empty
     and says why rather than guessing (mock state D). There is no "judged run's repo is gone" case:
@@ -8621,7 +8622,7 @@ without the human re-deriving it.
 - **Every category gets the button, including the two that fit badly (D5).** `enable_tool` (usually
   an admin toggle) and `adjust_template` (splits builtins-vs-DB-rows) can be a category error, but
   the user's ask is a button on *each* improvement and the human reads the draft first;
-  special-casing two of six buys a rule to learn against a mis-click already visible and cancelable.
+  special-casing two of seven buys a rule to learn against a mis-click already visible and cancelable.
   Revisit if the filed-issue mix shows these two dominating and closed-invalid.
 
 ## 310. `recommendation_filed_issues` — a coordinate-keyed table that survives a re-judge, and the self-improve exclusion it feeds (D6, D12)

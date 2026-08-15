@@ -169,7 +169,7 @@ func (h *Handler) resolveDefaultRepo(ctx context.Context, callerID uuid.UUID, ca
 			candidate, have = uuid.UUID(runRepo.Bytes), true
 		}
 		okNote = "Defaulted to the judged run's repo — repo agents live in its .claude/agents/. Pick any repo you have connected."
-	default: // improve_uzi, install_worker_tool, adjust_template, enable_tool
+	default: // improve_uzi, install_worker_tool, adjust_template, enable_tool, cost_efficiency
 		if repoStr, err := h.settings.SelfimproveRepo(ctx); err == nil {
 			if id, perr := uuid.Parse(strings.TrimSpace(repoStr)); perr == nil && id != uuid.Nil {
 				candidate, have = id, true

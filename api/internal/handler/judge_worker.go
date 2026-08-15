@@ -317,7 +317,7 @@ func recCountFact(n int) string {
 // the context block stays bounded even for a many-recommendation review. The category
 // is the closed enum (validated at ingest), so it is safe to surface raw as a chip.
 func recommendationCategoryChips(recs []workersvc.ReviewRecommendation) []string {
-	const maxChips = 6 // len(workersvc.RecommendationCategories)
+	const maxChips = 7 // len(workersvc.RecommendationCategories)
 	seen := make(map[string]struct{}, maxChips)
 	chips := make([]string, 0, maxChips)
 	for _, r := range recs {
