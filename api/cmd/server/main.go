@@ -44,6 +44,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/tlsx"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolseed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/usagepoller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -173,6 +174,27 @@ func run() error {
 	// their default shared allocations (PRD #72 M2).
 	if err := store.ReconcileBuiltinSkills(ctx, store.PoolTxer{Pool: pool, Q: q}, templatesDone); err != nil {
 		return err
+	}
+
+	// Boot-time offender report (PRD #123 M3): name any tool_allowlist rows that
+	// are NOT in the baked worker toolchain, so an admin can fix them deliberately.
+	// A run requesting such a package would hang then fail behind the worker egress
+	// block; the write-time gates (CreateToolAllowlistEntry / SetRepoToolProfile)
+	// block new ones, and this surfaces rows that predate the gate. Non-fatal: a
+	// query error is logged and boot continues. This replaces the PRD's "reporting
+	// migration" — toolseed is the single source of truth, so this cannot drift.
+	if rows, err := q.ListToolAllowlist(ctx); err != nil {
+		slog.Warn("tool_allowlist coverage report skipped (list failed)", "error", err)
+	} else {
+		var unbaked []string
+		for _, row := range rows {
+			if !toolseed.Covered(row.Name) {
+				unbaked = append(unbaked, row.Name)
+			}
+		}
+		if len(unbaked) > 0 {
+			slog.Warn("tool_allowlist entries are not in the baked worker toolchain; runs requesting them will fail until the image is rolled or the rows removed", "packages", unbaked)
+		}
 	}
 
 	box, err := secretbox.New(cfg.SecretKey)

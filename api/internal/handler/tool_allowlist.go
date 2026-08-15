@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolseed"
 )
 
 // maxToolNoteBytes bounds the optional admin note on an allowlist entry.
@@ -128,6 +130,14 @@ func (h *Handler) CreateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 	// admin — it would give the agent a pre-authenticated tool.
 	if toolprofile.Denied(name) {
 		httpx.Error(w, http.StatusBadRequest, "that package ships a credential-bearing CLI and may not be allowlisted")
+		return
+	}
+	// PRD #123 M3 (SC2): gate the allowlist to the baked worker toolchain. A
+	// package that is not baked is permitted but unprovisionable behind the worker
+	// egress block, so allowlisting it would surface as a run-time hang. Reject at
+	// admin time instead.
+	if !toolseed.Covered(name) {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("%q is not in the baked worker toolchain; it must be added to the image (agent/devbox-global/devbox.json) and the image rolled before it can be allowlisted", name))
 		return
 	}
 	pinned, note, err := validateAllowlistWrite(req)

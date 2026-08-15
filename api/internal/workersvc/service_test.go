@@ -1225,6 +1225,29 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 	}
 }
 
+func TestResolveToolingRejectsAllowlistedButUnbakedPackage(t *testing.T) {
+	// PRD #123 M3 (Decision 4c): a package that is on the allowlist but NOT in the
+	// baked worker toolchain (a grandfathered row that predates the write-time
+	// gate) fails the claim here rather than hanging the run behind the egress
+	// block. `terraform` is allowlist-shaped but not baked (swapped off for
+	// opentofu, and unfree anyway), so it is not toolseed.Covered.
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["jq","terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "jq"}, {Name: "terraform"}},
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	if !errors.Is(err, errToolPackagesRejected) {
+		t.Fatalf("err = %v, want errToolPackagesRejected", err)
+	}
+	if !strings.Contains(err.Error(), "terraform") {
+		t.Fatalf("error should name the unbaked package: %v", err)
+	}
+	if !strings.Contains(err.Error(), "baked toolchain") {
+		t.Fatalf("error should explain the unbaked reason: %v", err)
+	}
+}
+
 func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
 	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())

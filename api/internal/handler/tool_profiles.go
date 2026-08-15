@@ -16,6 +16,7 @@ import (
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolseed"
 )
 
 // maxProfilePackages bounds a repo tool profile's package list.
@@ -107,6 +108,20 @@ func (h *Handler) SetRepoToolProfile(w http.ResponseWriter, r *http.Request) {
 	allowed, rejected := toolprofile.Resolve(req.Packages, rules)
 	if len(rejected) > 0 {
 		httpx.Error(w, http.StatusBadRequest, "these packages are not on the allowlist: "+strings.Join(rejected, ", "))
+		return
+	}
+	// PRD #123 M3 (Decision 4c): even an allowlisted package must be in the baked
+	// worker toolchain, or the run that requests it hangs then fails behind the
+	// egress block. This second pass catches grandfathered allowlist rows a profile
+	// still requests (rows that predate the CreateToolAllowlistEntry gate).
+	var unbaked []string
+	for _, p := range allowed {
+		if !toolseed.Covered(p) {
+			unbaked = append(unbaked, p)
+		}
+	}
+	if len(unbaked) > 0 {
+		httpx.Error(w, http.StatusBadRequest, "these packages are allowlisted but not in the baked worker toolchain (an image roll is required): "+strings.Join(unbaked, ", "))
 		return
 	}
 	if allowed == nil {
