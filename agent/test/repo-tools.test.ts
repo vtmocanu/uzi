@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import fssync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractRepoDevboxPackages, mergeToolPackages } from "../src/repo-tools.js";
+import { extractRepoDevboxPackages, mergeToolPackages, filterDeniedPackages } from "../src/repo-tools.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -138,5 +138,34 @@ describe("mergeToolPackages (tier-1 wins conflicts)", () => {
     // Both entries share base "node"; only the first survives, so provisioning
     // never gets two conflicting versions of one package.
     assert.deepStrictEqual(mergeToolPackages([], ["node@20", "node@22", "jq"]), ["node@20", "jq"]);
+  });
+});
+
+describe("filterDeniedPackages (tier-2 credential-CLI denylist, PRD #123 M1b)", () => {
+  it("drops a denied package by BASE NAME even when version-pinned", () => {
+    const { kept, dropped } = filterDeniedPackages(["glab@1.2", "jq", "ripgrep"], ["glab", "vault"]);
+    assert.deepStrictEqual(dropped, ["glab@1.2"]);
+    assert.deepStrictEqual(kept, ["jq", "ripgrep"]);
+  });
+
+  it("keeps every package when none is denied", () => {
+    const { kept, dropped } = filterDeniedPackages(["jq", "ripgrep@14"], ["glab", "vault"]);
+    assert.deepStrictEqual(kept, ["jq", "ripgrep@14"]);
+    assert.deepStrictEqual(dropped, []);
+  });
+
+  it("preserves input order in both outputs", () => {
+    const { kept, dropped } = filterDeniedPackages(
+      ["a", "vault@1", "b", "glab", "c"],
+      ["glab", "vault"],
+    );
+    assert.deepStrictEqual(kept, ["a", "b", "c"]);
+    assert.deepStrictEqual(dropped, ["vault@1", "glab"]);
+  });
+
+  it("empty denied list keeps everything (older server ⇒ no filtering)", () => {
+    const { kept, dropped } = filterDeniedPackages(["glab@1.2", "jq"], []);
+    assert.deepStrictEqual(kept, ["glab@1.2", "jq"]);
+    assert.deepStrictEqual(dropped, []);
   });
 });

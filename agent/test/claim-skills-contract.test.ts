@@ -91,6 +91,12 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.deepEqual(claim.config?.tool_packages, ["kubectl@1.31", "jq"]);
   assert.equal(claim.config?.repo_devbox_opt_in, false);
 
+  // PRD #123 M1b: the Decision 6 denylist base names ride the same config so the worker
+  // can filter tier-2 (repo devbox.json) packages by base name. Pinned across the
+  // language boundary; typing the parse as ClaimResponse also makes `npm run typecheck`
+  // fail if denied_tool_packages is dropped from protocol.ts.
+  assert.deepEqual(claim.config?.denied_tool_packages, ["glab", "vault"]);
+
   // The per-run skill union: name + description + body per entry.
   assert.ok(Array.isArray(claim.skills));
   assert.deepEqual(

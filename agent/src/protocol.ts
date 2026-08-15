@@ -407,6 +407,14 @@ export interface ClaimConfig {
    *  the repo's own devbox.json packages (packages-only) into the provisioned set.
    *  Delivered from M3 but always false until M5 wires the per-repo toggle. */
   repo_devbox_opt_in?: boolean;
+  /** The server's Decision 6 denylist BASE NAMES (PRD #123 M1b), delivered so the
+   *  worker applies the same credential-CLI policy to TIER-2 (repo devbox.json opt-in)
+   *  packages — the server filters those by shape only, so they are never
+   *  denylist-checked server-side. The worker drops any tier-2 package whose base name
+   *  is in this set before provisioning (repo-tools.ts filterDeniedPackages). Tier-1
+   *  (tool_packages) is already denylist-checked server-side and is NEVER filtered
+   *  locally. Absent on an older server ⇒ undefined ⇒ no filtering (today's behavior). */
+  denied_tool_packages?: string[];
 }
 
 /**

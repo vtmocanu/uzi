@@ -157,4 +157,30 @@ describe("provisionRunTools tier-2 best-effort fallback (PRD #278 M2)", () => {
     assert.deepStrictEqual(result, { toolEnv: {} });
     assert.strictEqual(calls.length, 0, "provision never called");
   });
+
+  it("(g) TIER-2 DENYLIST: a denied repo package is dropped by policy; tier-1 untouched (PRD #123 M1b)", async () => {
+    // The repo's devbox.json ships a credential CLI (glab) plus a benign tool (jq).
+    // With glab denied, glab must never reach provisioning while tier-1 (kubectl) and
+    // the non-denied repo extra (jq) do.
+    await writeDevbox(["glab@1.2", "jq"]);
+    const h = makeCtx({ tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: true, denied_tool_packages: ["glab", "vault"] });
+    const env = { PATH: "/merged/bin" };
+    const { fn, calls } = recordingProvision(() => env);
+
+    const result = await provisionRunTools(h.ctx, makeDeps(fn));
+
+    assert.deepStrictEqual(result.toolEnv, env);
+    assert.strictEqual(calls.length, 1, "provision called once");
+    // (a) the denied package never appears in any provision call's package list.
+    for (const call of calls) {
+      assert.ok(!call.some((p) => p === "glab@1.2" || p === "glab"), "glab must never be provisioned");
+    }
+    // (b) tier-1 is untouched and the non-denied repo extra survives the merge.
+    assert.deepStrictEqual(calls[0], ["kubectl@1.31", "jq"], "tier-1 kept, jq merged, glab dropped");
+    // (c) the "dropped ... blocked by policy" status text is emitted, naming glab.
+    assert.ok(
+      h.statusTexts().some((t) => t.includes("blocked by policy") && t.includes("glab@1.2")),
+      "a blocked-by-policy status naming the dropped tool was emitted",
+    );
+  });
 });

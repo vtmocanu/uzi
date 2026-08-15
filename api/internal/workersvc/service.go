@@ -1859,6 +1859,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			SkillsMaxPerRun:       s.p.SkillsMaxPerRun,
 			ToolPackages:          toolPackages,
 			RepoDevboxOptIn:       rc.RepoDevboxOptIn,
+			// PRD #123 M1b: ship the Decision 6 denylist base names so the worker applies
+			// the same credential-CLI policy to TIER-2 (repo devbox.json opt-in) packages,
+			// which are shape-filtered server-side and so never denylist-checked there.
+			// Compile-time constant list (no new DB read); always a non-nil slice.
+			DeniedToolPackages: toolprofile.DenylistNames(),
 			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
 			CIConfigPaths: run.CiConfigPaths,
 		},

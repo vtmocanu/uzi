@@ -28,9 +28,36 @@ const MAX_REPO_PACKAGES = 64;
 const MAX_DEVBOX_BYTES = 1024 * 1024;
 
 /** The base package name (before any @version). */
-function baseName(pkg: string): string {
+export function baseName(pkg: string): string {
   const at = pkg.indexOf("@");
   return at >= 0 ? pkg.slice(0, at) : pkg;
+}
+
+/**
+ * Partition tier-2 (repo devbox.json) packages by the server's Decision 6 denylist
+ * (PRD #123 M1b). A package is DROPPED when its base name (before any @version) is in
+ * `denied`; otherwise it is KEPT. The denylist ships in the claim
+ * (ClaimConfig.denied_tool_packages) so the worker enforces the same credential-CLI
+ * policy the server already applies to tier-1 — closing the tier-2 bypass where a
+ * repo's own devbox.json could install a logged-in glab/gh/aws/vault/….
+ *
+ * Base-name matching so a pinned `glab@1.2` is caught when `glab` is denied. Input
+ * order is preserved in both outputs. An empty `denied` keeps everything (an older
+ * server ships no list ⇒ today's behavior). Apply to TIER-2 ONLY — tier-1 is already
+ * denylist-checked server-side and must never be filtered here.
+ */
+export function filterDeniedPackages(
+  repoPackages: string[],
+  denied: readonly string[],
+): { kept: string[]; dropped: string[] } {
+  const deniedSet = new Set(denied);
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const pkg of repoPackages) {
+    if (deniedSet.has(baseName(pkg))) dropped.push(pkg);
+    else kept.push(pkg);
+  }
+  return { kept, dropped };
 }
 
 /**

@@ -55,7 +55,29 @@
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,
     "tool_packages": [],
-    "repo_devbox_opt_in": false
+    "repo_devbox_opt_in": false,
+    "denied_tool_packages": [
+      "_1password-cli",
+      "aws-sam-cli",
+      "awscli",
+      "awscli2",
+      "azure-cli",
+      "bitwarden-cli",
+      "bw",
+      "doctl",
+      "flyctl",
+      "gcloud",
+      "gh",
+      "glab",
+      "google-cloud-sdk",
+      "heroku",
+      "hub",
+      "kubelogin",
+      "oci-cli",
+      "op",
+      "tea",
+      "vault"
+    ]
   },
   "skills": [],
   "skills_dropped": []

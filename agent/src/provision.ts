@@ -21,11 +21,12 @@
 // admin allowlist bounds WHICH packages install ONLY on the tier-1 path (their build hooks
 // run in this scrubbed env). CORRECTION (2026-07-25, PRD #123 §6): this line used to claim
 // the allowlist bounds them full stop. It does not. Under `repo_devbox_opt_in` the tier-2
-// list comes from the CLONED REPO's devbox.json and is filtered by SHAPE ONLY — no
-// allowlist, and no `toolprofile.Denied()`, so the credential-bearing CLIs that check
-// exists to bar (toolprofile.go, the `denylist` var) install unimpeded. The worker cannot do better today:
-// ClaimConfig ships it no rule set (workersvc/claim.go:160-183). PRD #123 M1b closes it.
-// Stated plainly because this sentence is the recorded mitigation for the residual above.
+// list comes from the CLONED REPO's devbox.json and is filtered by SHAPE (no allowlist).
+// PRD #123 M1b (landed) closes the credential-CLI gap on that path: the server ships the
+// denylist base names in the claim (ClaimConfig.denied_tool_packages) and the worker drops
+// any denied tier-2 package by base name before provisioning (repo-tools.ts
+// filterDeniedPackages, provision-run.ts), so a logged-in glab/gh/aws/vault/… in a repo's
+// devbox.json no longer installs. Tier-1 is never filtered worker-side (still server-only).
 // On a #58 single-uid (non-root) start there is no split and the hook runs
 // as the sole uid (that PRD's accepted posture); the cross-container k8s form is mapped in
 // docs/proc-hardening.md.

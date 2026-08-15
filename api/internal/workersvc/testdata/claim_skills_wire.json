@@ -75,7 +75,11 @@
       "kubectl@1.31",
       "jq"
     ],
-    "repo_devbox_opt_in": false
+    "repo_devbox_opt_in": false,
+    "denied_tool_packages": [
+      "glab",
+      "vault"
+    ]
   },
   "skills": [
     {
