@@ -4,7 +4,7 @@
 **Status**: Complete (2026-08-10) — all seven milestones implemented, tested
 (1940 web tests green), and documented in `docs/board.md`.
 **Priority**: Medium
-**Labels**: `PRD`, `Night` (nightly 02:00 sweep)
+**Labels**: `PRD`, `Night-Shift` (nightly 02:00 sweep)
 **Related**: PRD #102 (the kanban board and its render/freeze split — `payloadCards` vs `renderCards`, Decision 7b — which this PRD must not break). PRD #196 (board membership `primary ∪ extras` and the render-time `visibleCards` filter this search filters *after*). The `hideEmpty` and `sortMode` view preferences (`web/src/pages/Board.tsx`) are the persistence pattern the new per-lane default copies.
 
 ## Problem
