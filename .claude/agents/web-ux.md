@@ -1,6 +1,6 @@
 ---
 name: web-ux
-version: 5
+version: 6
 description: Web UX expert. Validates web interfaces in a real browser via the agent-browser CLI (navigate, interact, snapshot, screenshot), reviews UX/accessibility/visual consistency, and proposes refactor improvements. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: claude-opus-4-8
@@ -35,6 +35,30 @@ running, ask the lead how to reach a running instance (dev server,
 container, mock/demo build) BEFORE falling back to code reading.
 
 agent-browser operational notes (hard-won; save yourself the debugging):
+- ISOLATE YOUR SESSION; the DEFAULT agent-browser session is a SHARED
+  singleton on the host. With no `--session`, your `open`/`eval`/
+  `screenshot` all target the active tab of that one shared browser,
+  which another agent or the user's own browser can be driving to an
+  unrelated site (observed: a validator's readings landed on a foreign
+  page a different session kept navigating that shared tab to). Derive a
+  stable id ONCE and pass it on EVERY command:
+    SESSION="$(agent-browser session id --scope worktree --prefix web-ux)"
+    agent-browser --session "$SESSION" open <url>
+  (or export `AGENT_BROWSER_SESSION` for the shell). Each `--session` is
+  isolated: its own cookies, tabs, and refs. Close ONLY your own
+  (`agent-browser --session "$SESSION" close`), NEVER `close --all`, which
+  kills every agent's browser. `session list` / `tab list` diagnose a
+  collision when a reading looks wrong.
+- ASSERT THE PAGE IS YOURS before trusting a reading: include
+  `path: location.pathname` in every `eval` payload and confirm it is your
+  target route. A foreign path means the shared tab was navigated away
+  under you, so re-`open` in your own `--session` rather than trusting the
+  eval (or the screenshot, which silently captures whatever the active tab
+  now holds).
+- PICK A UNIQUE PORT when you launch the dev/mock server yourself: this
+  host is shared and default ports collide (a taken port answers 200 from
+  someone else's server rather than erroring). Choose a non-default
+  `--port <n>` and report the port you actually bound.
 - Screenshots/PDFs: pass an ABSOLUTE output path. agent-browser ignores
   your shell `cd` and writes relative paths to its own cwd (often the
   repo root), littering the repo.
