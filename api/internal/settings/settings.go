@@ -134,10 +134,12 @@ const (
 	DefaultPublicBaseURL = "http://127.0.0.1:8080"
 	// PRD #46. The judge is OFF until an admin enables it (it spends user tokens), so
 	// the whole feature is a strict no-op on a fresh instance. The default model is
-	// the cheap haiku alias — a retrospective is a single compacted-trace round-trip,
-	// so the cheapest capable model is the right default (Decision 7).
+	// opus (PRD #69 Decision 1): the recommendation half feeds self-improvement, so
+	// the strongest model is wanted by default. The per-user override (M2) is the
+	// cost lever down to haiku/sonnet; opus is ~5–15× haiku per run, which is why
+	// M5's spend guards and the per-user override exist.
 	DefaultJudgeEnabled = "false"
-	DefaultJudgeModel   = "haiku"
+	DefaultJudgeModel   = "opus"
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
@@ -550,7 +552,7 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 }
 
 // JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
-// back to the cheap DefaultJudgeModel ("haiku").
+// back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
 func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyJudgeModel)
 }

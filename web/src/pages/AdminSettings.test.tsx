@@ -36,7 +36,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
-  judge_model: "haiku",
+  judge_model: "opus",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",

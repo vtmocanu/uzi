@@ -724,13 +724,16 @@ function JudgeSettingsCard({
               value={model}
               maxLength={100}
               autoComplete="off"
-              placeholder="haiku"
+              placeholder="opus"
               onChange={(e) => setModel(e.target.value)}
             />
           </Field>
           <p className="text-xs text-faint">
-            The Claude model the judge runs on. A retrospective is a single trace round-trip, so the cheap
-            default (<code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code>) is usually right.
+            The Claude model the judge runs on. The default is{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> — the strongest model, since
+            judge recommendations feed self-improvement. Admins and users can pin{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> or{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> to spend less.
           </p>
         </div>
 

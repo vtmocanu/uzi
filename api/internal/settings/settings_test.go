@@ -105,13 +105,18 @@ func TestPrdlessAccessors(t *testing.T) {
 }
 
 func TestJudgeAccessors(t *testing.T) {
-	// Empty table → compiled-in defaults: OFF, cheap haiku model.
+	// Empty table → compiled-in defaults: OFF, strong opus model (PRD #69 Decision 1).
 	c := New(&fakeStore{}, time.Minute)
 	if got, err := c.JudgeEnabled(context.Background()); err != nil || got != false {
 		t.Fatalf("JudgeEnabled default = %v, %v; want false", got, err)
 	}
 	if got, err := c.JudgeModel(context.Background()); err != nil || got != DefaultJudgeModel {
 		t.Fatalf("JudgeModel default = %q, %v; want %q", got, err, DefaultJudgeModel)
+	}
+	// Pin the literal default so an accidental flip of DefaultJudgeModel is caught
+	// (PRD #69 Decision 1: opus, not the superseded haiku/sonnet).
+	if DefaultJudgeModel != "opus" {
+		t.Fatalf("DefaultJudgeModel = %q, want \"opus\"", DefaultJudgeModel)
 	}
 
 	// "true"/"false" honored; any other value falls back to the default (false) —

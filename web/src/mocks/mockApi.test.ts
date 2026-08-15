@@ -51,7 +51,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           slack_enabled: "true",
           public_base_url: "https://uzi.example",
           judge_enabled: "false",
-          judge_model: "haiku",
+          judge_model: "opus",
           health_enabled: "false",
           health_stall_seconds: "120",
           health_slow_seconds: "2700",
