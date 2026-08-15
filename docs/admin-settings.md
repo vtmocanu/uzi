@@ -85,8 +85,9 @@ refresh (in practice, their next login or reload — there's no push). See
 ## Run judge
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
-on (**Judge model**, a cheap alias like `haiku` by default — a retrospective
-is a single trace round-trip, so a cheap model is usually right). This switch
+on (**Judge model**, `opus` by default — the judge's recommendations feed
+self-improvement, so the strongest model is the default; pin a cheaper alias
+like `haiku` or `sonnet` to spend less). This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
 the admin's.

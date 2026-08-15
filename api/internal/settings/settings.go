@@ -53,9 +53,9 @@ const (
 	KeySlackBotToken = "slack_bot_token"
 	KeySlackAppToken = "slack_app_token"
 	// Run-judge keys (PRD #46 Decision 7). judge_enabled is the global kill-switch
-	// (text "true"/"false"); judge_model is the cheap model the judge runs on
-	// (a model alias, validated with the PRD #17 rules). Both are admin-writable and
-	// carry compiled-in defaults.
+	// (text "true"/"false"); judge_model is the model the judge runs on (opus by
+	// default since PRD #69; a model alias, validated with the PRD #17 rules).
+	// Both are admin-writable and carry compiled-in defaults.
 	KeyJudgeEnabled = "judge_enabled"
 	KeyJudgeModel   = "judge_model"
 	// KeyJudgeEnforceAll (PRD #69) is an admin bool ("true"/"false"). When true it

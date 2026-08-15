@@ -568,7 +568,8 @@ export interface AppSettings {
   slack_enabled: string;
   public_base_url: string;
   // Run-judge keys (PRD #46). judge_enabled is the global kill-switch (text
-  // "true"/"false"); judge_model is the cheap model alias the judge runs on. The
+  // "true"/"false"); judge_model is the model alias the judge runs on (opus by
+  // default, PRD #69). The
   // self-improvement keys are engine-managed and NOT surfaced here.
   judge_enabled: string;
   judge_model: string;
