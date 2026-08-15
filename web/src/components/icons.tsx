@@ -275,6 +275,21 @@ export const MenuIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// GripVerticalIcon: the lucide "grip-vertical" glyph — a 2×3 grid of dots, the
+// drag-handle affordance on the board column editor rows (PRD #318). The dots
+// need `fill="currentColor"` to render, since the shared Icon wrapper is
+// fill:none stroke-only.
+export const GripVerticalIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <circle cx="9" cy="5" r="1" fill="currentColor" />
+    <circle cx="9" cy="12" r="1" fill="currentColor" />
+    <circle cx="9" cy="19" r="1" fill="currentColor" />
+    <circle cx="15" cy="5" r="1" fill="currentColor" />
+    <circle cx="15" cy="12" r="1" fill="currentColor" />
+    <circle cx="15" cy="19" r="1" fill="currentColor" />
+  </Icon>
+);
+
 export const FactoryIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="M2 20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8l-7 5V8l-7 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2z" />

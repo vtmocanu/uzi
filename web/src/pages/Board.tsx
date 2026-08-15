@@ -60,7 +60,7 @@ import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle,
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
-import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
+import { ExternalLinkIcon, GripVerticalIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 
@@ -2261,6 +2261,11 @@ function ColumnSettings({
   const [names, setNames] = useState<string[]>(board.columns.map((c) => c.label_name));
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
+  // DnD reorder state (mirrors the board cards' idiom). Visuals are driven from
+  // this state, never from reading e.dataTransfer during onDragOver (the drag
+  // data store is protected during dragover).
+  const [dragName, setDragName] = useState<string | null>(null);
+  const [insertion, setInsertion] = useState<{ name: string; edge: "top" | "bottom" } | null>(null);
 
   // Suggest labels seen on cards that are not already columns and not the
   // configured PRD/autopilot/PRDLESS labels (those are workflow markers, never
@@ -2285,10 +2290,13 @@ function ColumnSettings({
   };
 
   const removeAt = (i: number) => setNames(names.filter((_, idx) => idx !== i));
-  const swap = (i: number, j: number) => {
-    if (j < 0 || j >= names.length) return;
+  // THE single order-computing path for reorder: array-move `from` -> `to` over
+  // `names`. A no-op (moveTo(i, i)) leaves the array unchanged.
+  const moveTo = (from: number, to: number) => {
+    if (from === to) return;
     const next = [...names];
-    [next[i], next[j]] = [next[j], next[i]];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
     setNames(next);
   };
 
@@ -2315,7 +2323,56 @@ function ColumnSettings({
       </p>
       <ul className="mt-3 space-y-2">
         {names.map((name, i) => (
-          <li key={name} className="flex items-center gap-2">
+          <li
+            key={name}
+            draggable
+            onDragStart={(e) => {
+              setDragName(name);
+              e.dataTransfer.setData("text/plain", name);
+              e.dataTransfer.effectAllowed = "move";
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              const r = e.currentTarget.getBoundingClientRect();
+              setInsertion({ name, edge: insertionEdgeFor(r.top, r.height, e.clientY) });
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const from = names.indexOf(e.dataTransfer.getData("text/plain"));
+              const r = e.currentTarget.getBoundingClientRect();
+              // Recompute the edge at drop time (like the cards' onCardDrop) so a
+              // drop with no preceding dragOver still resolves.
+              const edge = insertionEdgeFor(r.top, r.height, e.clientY);
+              // `to` is the insertion index in the ORIGINAL array. Dragging
+              // downward (from < to) removes the source first, shifting every
+              // later index down by one, so decrement to compensate.
+              let to = i + (edge === "bottom" ? 1 : 0);
+              if (from < to) to -= 1;
+              if (from >= 0) moveTo(from, to);
+              setDragName(null);
+              setInsertion(null);
+            }}
+            onDragEnd={() => {
+              setDragName(null);
+              setInsertion(null);
+            }}
+            className={cx(
+              "flex items-center gap-2 cursor-grab active:cursor-grabbing",
+              name === dragName && "opacity-40",
+              insertion?.name === name &&
+                insertion.edge === "top" &&
+                "shadow-[inset_0_2px_0_0_rgb(var(--brand))]",
+              insertion?.name === name &&
+                insertion.edge === "bottom" &&
+                "shadow-[inset_0_-2px_0_0_rgb(var(--brand))]",
+            )}
+          >
+            <span
+              aria-hidden="true"
+              className="flex items-center text-faint hover:text-fg cursor-grab active:cursor-grabbing"
+            >
+              <GripVerticalIcon />
+            </span>
             <span className="flex flex-1 items-center gap-2 rounded-md border border-edge bg-raised px-3 py-1.5 text-sm">
               <span
                 aria-hidden="true"
@@ -2323,19 +2380,7 @@ function ColumnSettings({
               />
               {name}
             </span>
-            <Button variant="ghost" size="sm" onClick={() => swap(i, i - 1)} disabled={i === 0} aria-label={`Move ${name} up`}>
-              ↑
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => swap(i, i + 1)}
-              disabled={i === names.length - 1}
-              aria-label={`Move ${name} down`}
-            >
-              ↓
-            </Button>
-            <Button variant="danger" size="sm" onClick={() => removeAt(i)}>
+            <Button variant="danger" size="sm" draggable={false} onClick={() => removeAt(i)}>
               Remove
             </Button>
           </li>
