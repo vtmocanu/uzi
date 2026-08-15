@@ -7,5 +7,5 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 api="$(cd "$here/../../.." && pwd)"   # api/cmd/uzi/uxlab -> api
 
 cd "$api"
-UZI_UXLAB_GEN=1 go test ./cmd/uzi/ -run 'TestGenerateUXLab(Frames|Mocks)' -count=1
+UZI_UXLAB_GEN=1 go test ./cmd/uzi/ -run TestGenerateUXLabFrames -count=1
 echo "frames written to $here/frames"

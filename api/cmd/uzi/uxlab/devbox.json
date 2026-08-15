@@ -6,7 +6,7 @@
   "shell": {
     "scripts": {
       "demo": [
-        "go run ./demo"
+        "cd ../../.. && go run ./cmd/uzi tui --demo"
       ],
       "gen": [
         "./gen.sh"

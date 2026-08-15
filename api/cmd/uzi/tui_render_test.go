@@ -6,6 +6,7 @@ import (
 	"unicode"
 
 	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 )
 
@@ -21,18 +22,27 @@ func TestTUIInlineCodeIsNotErrorRed(t *testing.T) {
 		return strings.Contains(s, "38;5;203") || strings.Contains(s, "38;2;255;95;95")
 	}
 
-	// Control: the stock dark style DOES render inline code in that red, so the assertion
-	// below can actually detect the fix (a green test over an undetectable red is vacuous).
-	stock, err := glamour.NewTermRenderer(glamour.WithStyles(styles.DarkStyleConfig), glamour.WithWordWrap(80))
-	if err != nil {
-		t.Fatalf("stock renderer: %v", err)
-	}
-	rawStock, err := stock.Render(md)
-	if err != nil {
-		t.Fatalf("stock render: %v", err)
-	}
-	if !codeRed(rawStock) {
-		t.Fatalf("control failed: stock glamour did not emit the error red for inline code, so this test cannot prove the retune removed it\n%q", rawStock)
+	// Control: BOTH stock styles render inline code in that red, so each half of the
+	// dark/light loop below can actually detect its fix (a green test over an undetectable
+	// red is vacuous — and the light half is only non-vacuous if the light stock is red too).
+	for _, c := range []struct {
+		name string
+		cfg  ansi.StyleConfig
+	}{
+		{"dark", styles.DarkStyleConfig},
+		{"light", styles.LightStyleConfig},
+	} {
+		stock, err := glamour.NewTermRenderer(glamour.WithStyles(c.cfg), glamour.WithWordWrap(80))
+		if err != nil {
+			t.Fatalf("stock %s renderer: %v", c.name, err)
+		}
+		rawStock, err := stock.Render(md)
+		if err != nil {
+			t.Fatalf("stock %s render: %v", c.name, err)
+		}
+		if !codeRed(rawStock) {
+			t.Fatalf("control failed: stock %s glamour did not emit the error red for inline code, so this test cannot prove the retune removed it\n%q", c.name, rawStock)
+		}
 	}
 
 	for _, dark := range []bool{true, false} {

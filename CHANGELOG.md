@@ -18,6 +18,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Changed
 
+- **`uzi tui` redesigned as a factory shift board (PRD #325).** The run board
+  now colours each row by status, glyphs it NO_COLOR-safe, and leads with a
+  summary bar (`N runs · N needs you · N stalled`) and a HEALTH column that
+  calls out stalled runs. Run detail gains two **focusable panes** — the crew
+  rail and the transcript, moved between with `←`/`→` (or `tab`), `↑`/`↓`
+  acting within the focused one — and a **follow-live** transcript (`● FOLLOWING`
+  / `⏸ PAUSED ↓N new`, re-attach with `g`). Plan gates and clarifying questions
+  each get their own attention banner, the judge review overlay shows a verdict
+  severity chip, and the keybinding footer now fits one line. New: a hidden
+  `uzi tui --demo` boots the real TUI over seeded fixtures with no server, and
+  an offline screenshot harness (`api/cmd/uzi/uxlab/`) renders every state to
+  PNG in light and dark. (#325)
 - **Diagnostic env reads `printenv PATH` / `printenv TMPDIR` are now allowed
   (PRD #319 M2).** The Bash guardrail permits a targeted read of the two
   non-secret diagnostic variables (allow iff the call has ≥1 argument and every
