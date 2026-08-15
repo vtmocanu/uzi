@@ -50,14 +50,14 @@ func (f fakeSettings) PrdlessLabel(context.Context) (string, error) { return f.p
 // -------------------------------------------------------------------------
 
 func TestScanCommandNotFound(t *testing.T) {
-	// kubectl/helm/terraform arrive via high-confidence forms and need no corroboration;
+	// kubectl/helm/tofu arrive via high-confidence forms and need no corroboration;
 	// jq is the low-confidence `X: not found` form, so a tool_use invoking jq is appended
 	// to corroborate it — exercising the low-confidence path rather than bypassing it (a
 	// run sees `jq: not found` precisely because it RAN jq).
 	payloads := append(rawResultRows(
 		`{"text":"bash: kubectl: command not found"}`,
 		`{"text":"zsh: command not found: helm"}`,
-		`{"text":"exec: \"terraform\": executable file not found in $PATH"}`,
+		`{"text":"exec: \"tofu\": executable file not found in $PATH"}`,
 		`{"text":"/bin/sh: 1: jq: not found"}`,
 		`{"text":"kubectl: command not found"}`, // duplicate → deduped
 		`{"text":"all good here, tests passed"}`,
@@ -70,7 +70,7 @@ func TestScanCommandNotFound(t *testing.T) {
 			t.Errorf("hit for %q has empty evidence", m.Command)
 		}
 	}
-	for _, want := range []string{"kubectl", "helm", "terraform", "jq"} {
+	for _, want := range []string{"kubectl", "helm", "tofu", "jq"} {
 		if !cmds[want] {
 			t.Errorf("expected %q flagged; got %v", want, cmds)
 		}

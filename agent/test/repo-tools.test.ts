@@ -124,9 +124,9 @@ describe("extractRepoDevboxPackages (packages-only, hooks never run)", () => {
 
 describe("mergeToolPackages (tier-1 wins conflicts)", () => {
   it("unions, with tier-1 winning a version conflict on the same base name", () => {
-    const merged = mergeToolPackages(["kubectl@1.31", "jq"], ["kubectl@9.9", "terraform@1.7", "jq@1.6"]);
-    // kubectl + jq are tier-1's; terraform is the only surviving tier-2 add.
-    assert.deepStrictEqual(merged, ["kubectl@1.31", "jq", "terraform@1.7"]);
+    const merged = mergeToolPackages(["kubectl@1.31", "jq"], ["kubectl@9.9", "opentofu@1.7", "jq@1.6"]);
+    // kubectl + jq are tier-1's; opentofu is the only surviving tier-2 add.
+    assert.deepStrictEqual(merged, ["kubectl@1.31", "jq", "opentofu@1.7"]);
   });
 
   it("returns tier-1 unchanged when tier-2 is empty, and tier-2 when tier-1 is empty", () => {

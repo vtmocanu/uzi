@@ -101,7 +101,7 @@ func assertReported(t *testing.T, rows []store.ListToolTraceForRunRow, want []st
 // table cannot be run as a single trace: case 1 (tsc suppressed via script echo) and
 // case 7 (tsc reported because the wrapper errored) name the SAME tool with OPPOSITE
 // expected outcomes, and its stated totals — suppressed {tsc,vitest}, reported
-// {kubectl,helm,eslint,jq,terraform} — cover seven tools across eight cases, which is
+// {kubectl,helm,eslint,jq,tofu} — cover seven tools across eight cases, which is
 // where the collision shows. Isolation is also strictly more discriminating: a
 // regression in one case cannot be masked by another case's rows.
 // TestPrescanSuppressionFixtureCombined below runs the seven non-colliding cases as
@@ -193,14 +193,14 @@ func TestPrescanSuppressionFixture(t *testing.T) {
 			name: "8_invocation_without_result",
 			why:  "a tool_use with NO matching tool_result proves an attempt, never an execution",
 			// No tool_use for the MISS deliberately: the row window can start mid-run,
-			// and an earlier terraform invocation would put a green at a seq below the
+			// and an earlier tofu invocation would put a green at a seq below the
 			// miss, masking the very mutation this case exists to catch (an
 			// invocation-counts-as-execution fold records min-seq too).
 			rows: []store.ListToolTraceForRunRow{
-				traceResult(10, "u1", "exec: \"terraform\": executable file not found in $PATH", true),
-				traceUse(30, "u2", "terraform plan -out tf.plan"),
+				traceResult(10, "u1", "exec: \"tofu\": executable file not found in $PATH", true),
+				traceUse(30, "u2", "tofu plan -out tf.plan"),
 			},
-			want: []string{"terraform"},
+			want: []string{"tofu"},
 		},
 		{
 			name: "9_heredoc_body_is_data_not_invocation",
@@ -285,12 +285,12 @@ func TestPrescanSuppressionFixtureCombined(t *testing.T) {
 		traceResult(610, "c6a", "sh: 1: jq: not found", true),
 		traceUse(629, "c6b", "grep jq package.json"),
 		traceResult(630, "c6b", "  \"scripts\": { \"x\": \"jq .\" }", false),
-		// 8 — terraform, invoked again with no result (see the case note above for why
+		// 8 — tofu, invoked again with no result (see the case note above for why
 		// the miss deliberately has no originating tool_use in the window)
-		traceResult(810, "c8a", "exec: \"terraform\": executable file not found in $PATH", true),
-		traceUse(830, "c8b", "terraform plan -out tf.plan"),
+		traceResult(810, "c8a", "exec: \"tofu\": executable file not found in $PATH", true),
+		traceUse(830, "c8b", "tofu plan -out tf.plan"),
 	}
-	assertReported(t, rows, []string{"eslint", "helm", "jq", "kubectl", "terraform"})
+	assertReported(t, rows, []string{"eslint", "helm", "jq", "kubectl", "tofu"})
 }
 
 // TestExecutablesInParsesExecutablePosition pins the matcher directly, so a
@@ -785,7 +785,7 @@ func TestPrescanHighConfidenceFormsSurviveWithoutInvocation(t *testing.T) {
 	for _, tc := range []struct{ name, content string }{
 		{"bash", "foo: command not found"},
 		{"zsh", "command not found: foo"},
-		// Watch the quote escaping, as case-8's terraform fixture does: the jsonb
+		// Watch the quote escaping, as case-8's tofu fixture does: the jsonb
 		// payload carries \" and payloadText unescapes it before reExecNotFound runs.
 		{"exec", "exec: \"foo\": executable file not found in $PATH"},
 	} {

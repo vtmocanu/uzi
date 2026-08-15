@@ -75,7 +75,7 @@ func TestRepoToolProfileOwnershipLiveDB(t *testing.T) {
 
 	// A non-owner writes NOTHING: the ownership join matches no row.
 	if _, err := q.UpsertRepoToolProfileForOwner(ctx, store.UpsertRepoToolProfileForOwnerParams{
-		UserID: other, RepoID: repoID, Packages: []byte(`["terraform"]`),
+		UserID: other, RepoID: repoID, Packages: []byte(`["opentofu"]`),
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("non-owner upsert err = %v, want pgx.ErrNoRows", err)
 	}

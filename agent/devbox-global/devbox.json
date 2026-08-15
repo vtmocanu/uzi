@@ -304,6 +304,36 @@
   //     is no eslint anywhere in the tree. eslint is otherwise a repo-pinned dev dependency,
   //     the same class as typescript/vitest above (js-deps.ts installs those from the clone's
   //     own lockfile), so baking it globally would help nothing here.
+  //
+  // `ripgrep` + `opentofu` (2026-08-15, PRD #123 M2). These close the remaining
+  // `live_allowlist ∖ seed` gap: both are allowlisted (opentofu after the M2 migration swap,
+  // see below) but were not baked, so a tier-1 profile requesting them would be permitted yet
+  // fail to provision behind the egress block. Same "bake what the allowlist promises" argument
+  // that drove the earlier promotions; the allowlist SWAP itself (drop `terraform`, add
+  // `opentofu`) is a separate data-only migration (00124), NOT a change to this file.
+  //   * `ripgrep` — fast recursive grep, near-universal for code search. The attr is bare
+  //     `ripgrep`; its mainProgram is `rg`, so it lands bin/rg (the guard row is `ripgrep  rg
+  //     rg --version`). MIT-licensed (free), so no allowUnfree concern.
+  //   * `opentofu` — the OpenTofu IaC CLI, baked to REPLACE `terraform`. terraform is NOT baked:
+  //     it is unfree (BUSL since 1.6), so baking it would require a fleet-wide `allowUnfree` flip
+  //     in both worker Dockerfiles' `devbox global install` step, which the owner declined
+  //     (Decision T, 2026-08-15). OpenTofu is the free (MPL-2.0) drop-in fork. The nixpkgs attr /
+  //     allowlist name is `opentofu`; the binary it puts on PATH is `tofu` (mainProgram), so the
+  //     guard row is `opentofu  tofu  tofu version` — note `tofu version`, OpenTofu's version
+  //     subcommand, not `--version`. The product name is OpenTofu.
+  // Neither hits the openssl.bin/file.out split-output trap, VERIFIED at the pinned rev (not
+  // assumed): both are SINGLE-output (`outputs` == ["out"], so the bare attr carries the CLI and
+  // no `.bin`/`.out` selector is needed or correct). ripgrep-15.2.0 (binary `rg`) and
+  // opentofu-1.12.4 (binary `tofu`); both narinfos are HTTP 200 on cache.nixos.org for
+  // x86_64-linux at the pinned rev, so CI's amd64-only kaniko build SUBSTITUTES them rather than
+  // compiling from source — the non-negotiable condition for baking a tool in. Verify against the
+  // PROFILE (readlink -f .devbox/nix/profile/default then `ls bin/`), never `command -v` inside
+  // `devbox run` — the check that would have caught the `file` regression.
+  // Both closures are small, so per Decision 6a this rides an existing marker-changing reseed
+  // rather than spending a standalone roll. Written BARE of any version/`@latest` suffix and added
+  // by hand-editing this file + the sibling devbox.lock entry (never `devbox add`, which pins each
+  // to its own nixpkgs rev and writes a fat `systems:` block); both lock as `source: "nixpkg"` at
+  // 20535e48…, matching every entry above.
   "packages": [
     "go",
     "gcc",
@@ -323,6 +353,8 @@
     "shellcheck.bin",
     "fd",
     "yq-go",
-    "gnumake"
+    "gnumake",
+    "ripgrep",
+    "opentofu"
   ]
 }

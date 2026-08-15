@@ -7,7 +7,7 @@ audience: user
 # Per-repo tools
 
 Beyond a worker image's baked-in tools (see [Worker setup](./worker-setup.md)),
-a run can install extra CLI tools on demand — `kubectl`, `terraform`, `jq`, and
+a run can install extra CLI tools on demand — `kubectl`, `opentofu`, `jq`, and
 so on — with [devbox](https://www.jetify.com/devbox) (nix underneath). Tools
 belong to the **work**, not the person: two users' workers picking up the same
 issue install the same tools, so runs behave identically.
@@ -26,7 +26,7 @@ A run's tool set is resolved from three sources, highest precedence first:
 
 1. Open **Boards**, pick a repo, and open its **Tools** panel.
 2. Add packages from the allowlist-backed picker (e.g. `kubectl@1.31`,
-   `terraform`). Pin a version with `name@version`.
+   `opentofu`). Pin a version with `name@version`.
 3. Save. Your next run on that repo has those tools on `PATH` inside the
    agent's shell; the **same worker's** later runs warm-start from cache.
 
