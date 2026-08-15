@@ -28,7 +28,7 @@ const MAX_REPO_PACKAGES = 64;
 const MAX_DEVBOX_BYTES = 1024 * 1024;
 
 /** The base package name (before any @version). */
-export function baseName(pkg: string): string {
+function baseName(pkg: string): string {
   const at = pkg.indexOf("@");
   return at >= 0 ? pkg.slice(0, at) : pkg;
 }
@@ -41,20 +41,23 @@ export function baseName(pkg: string): string {
  * policy the server already applies to tier-1 — closing the tier-2 bypass where a
  * repo's own devbox.json could install a logged-in glab/gh/aws/vault/….
  *
- * Base-name matching so a pinned `glab@1.2` is caught when `glab` is denied. Input
- * order is preserved in both outputs. An empty `denied` keeps everything (an older
- * server ships no list ⇒ today's behavior). Apply to TIER-2 ONLY — tier-1 is already
- * denylist-checked server-side and must never be filtered here.
+ * Base-name matching so a pinned `glab@1.2` is caught when `glab` is denied.
+ * Case-INSENSITIVE on the base name so a repo declaring `Glab@1.2` / `GH` is dropped
+ * too rather than relying on nixpkgs resolution to fail. The returned tokens keep
+ * their original casing — only the comparison is lowercased. Input order is preserved
+ * in both outputs. An empty `denied` keeps everything (an older server ships no list ⇒
+ * today's behavior). Apply to TIER-2 ONLY — tier-1 is already denylist-checked
+ * server-side and must never be filtered here.
  */
 export function filterDeniedPackages(
   repoPackages: string[],
   denied: readonly string[],
 ): { kept: string[]; dropped: string[] } {
-  const deniedSet = new Set(denied);
+  const deniedSet = new Set(denied.map((d) => d.toLowerCase()));
   const kept: string[] = [];
   const dropped: string[] = [];
   for (const pkg of repoPackages) {
-    if (deniedSet.has(baseName(pkg))) dropped.push(pkg);
+    if (deniedSet.has(baseName(pkg).toLowerCase())) dropped.push(pkg);
     else kept.push(pkg);
   }
   return { kept, dropped };

@@ -946,6 +946,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 			QuestionMax:            s.p.QuestionMax,
 			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
 			ToolPackages:           []string{},
+			DeniedToolPackages:     toolprofile.DenylistNames(),
 		},
 	}, nil
 }

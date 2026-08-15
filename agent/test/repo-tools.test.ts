@@ -163,6 +163,12 @@ describe("filterDeniedPackages (tier-2 credential-CLI denylist, PRD #123 M1b)", 
     assert.deepStrictEqual(dropped, ["vault@1", "glab"]);
   });
 
+  it("matches case-insensitively on the base name (keeps original casing)", () => {
+    const { kept, dropped } = filterDeniedPackages(["Glab@1.2", "GH", "jq"], ["glab", "gh"]);
+    assert.deepStrictEqual(dropped, ["Glab@1.2", "GH"]);
+    assert.deepStrictEqual(kept, ["jq"]);
+  });
+
   it("empty denied list keeps everything (older server ⇒ no filtering)", () => {
     const { kept, dropped } = filterDeniedPackages(["glab@1.2", "jq"], []);
     assert.deepStrictEqual(kept, ["glab@1.2", "jq"]);
