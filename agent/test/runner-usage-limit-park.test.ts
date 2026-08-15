@@ -345,6 +345,9 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
       // rateLimitType into the run row as free text.
       assert.strictEqual(failed.body.rate_limit_type, "five_hour");
       assert.strictEqual(typeof failed.body.limit_resets_at, "number");
+      // PRD #69 M7a: a rate-limit opt-out failure carries the trusted origin so the
+      // judge can key on the class instead of parsing the server-composed sentence.
+      assert.strictEqual(failed.body.fail_origin, "rate_limited");
       assert.strictEqual(
         failed.body.failure_reason,
         undefined,

@@ -1211,6 +1211,14 @@ export interface StateRequest {
    *  feed or Slack. Doing the allowlisting here as well would put the authoritative
    *  copy of the vocabulary on the untrusted side. */
   rate_limit_type?: string;
+  /** failed (PRD #69 M7a): the worker's structured guess at WHY this run is failing,
+   *  mapped from the known reason CONSTANT at the report site — e.g.
+   *  "provisioning_failed", "credential_unavailable" or "rate_limited". Additive +
+   *  optional and OMITTED for an ordinary agent failure (the server then defaults it
+   *  to 'agent_failure'). Sent UNVALIDATED on purpose, exactly like `rate_limit_type`:
+   *  the server allowlists it against its own closed enum and drops anything else,
+   *  so the authoritative copy of the vocabulary stays on the trusted side. */
+  fail_origin?: string;
 }
 
 /**

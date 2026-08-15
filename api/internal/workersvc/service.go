@@ -1094,9 +1094,24 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
 		// errCredentialUnavailable rather than the transient errVaultLocked requeue.
+		//
+		// PRD #69 M7a: these three infra sentinels used to collapse into one failed
+		// write, LOSING the origin. Split the class per sentinel so the judge sees a
+		// TRUSTED origin (errVaultLocked never reaches here — it requeues above — and
+		// errRunVanished is not a failed write, so neither owes a fail_origin).
+		var failOrigin string
+		switch {
+		case errors.Is(err, errCredentialUnavailable):
+			failOrigin = "credential_unavailable"
+		case errors.Is(err, errToolPackagesRejected):
+			failOrigin = "provisioning_failed"
+		case errors.Is(err, errGuardrailBlockedClaim):
+			failOrigin = "guardrail_blocked"
+		}
 		if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 			ID:            run.ID,
 			FailureReason: pgText(err.Error()),
+			FailOrigin:    pgText(failOrigin),
 		}); ferr != nil {
 			return ferr
 		}
@@ -2817,6 +2832,13 @@ type StateRequest struct {
 	// length and control-char concerns in one move — unlike the register path, the
 	// state path has no sanitizeSelfReported.
 	RateLimitType *string `json:"rate_limit_type"`
+	// FailOrigin is the worker's structured guess at WHY a `failed` report is failing
+	// (PRD #69 M7a): the reason CONSTANT the report site mapped to an origin, e.g.
+	// "provisioning_failed" or "rate_limited". UNTRUSTED free text on arrival — the
+	// server allowlists it through CoerceFailOrigin (unknown → nil) before it reaches
+	// the DB, exactly as it does RateLimitType. Ordinary agent failures omit it and the
+	// server defaults them to 'agent_failure'. Ignored on every non-`failed` state.
+	FailOrigin *string `json:"fail_origin"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2913,6 +2935,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
+		// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
+		// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
+		// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
+		// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
+		// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
+		// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
+		failOrigin := "agent_failure"
+		if o := CoerceFailOrigin(req.FailOrigin); o != nil {
+			failOrigin = *o
+		}
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
 			// the SERVER composes the sentence from its own allowlisted enum and replaces
@@ -2923,6 +2955,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// server" would then be false on exactly the path a human reads. When the
 			// fields are absent this is nil and every other failure path is untouched.
 			FailureReason: limitAwareFailureReason(req),
+			FailOrigin:    pgText(failOrigin),
 			SessionID:     sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:

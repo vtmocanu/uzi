@@ -348,6 +348,7 @@ type Run struct {
 	CiConfigPaths         []string           `json:"ci_config_paths"`
 	Model                 pgtype.Text        `json:"model"`
 	OverrideSubagentModel bool               `json:"override_subagent_model"`
+	FailOrigin            pgtype.Text        `json:"fail_origin"`
 }
 
 type RunMessage struct {

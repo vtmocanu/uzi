@@ -684,6 +684,18 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   proving a pre-start provisioning failure yields a non-"transient", non-retry
   recommendation, a 0-iteration infra failure is notified not judged, and an
   agent-crash-at-iteration-0 is still judged.
+  - *Pass A (the SEAM) landed 2026-08-15 — box stays unchecked pending Pass B.* Added
+    the `runs.fail_origin` closed-enum column (migration `00126_run_fail_origin.sql`;
+    nullable, 9 members, CHECK-closed), a `CoerceFailOrigin` allowlist + `AllFailOrigins`
+    in `workersvc/failorigin.go` mirroring `limitwait.go`'s `rate_limit_type`, and stamping
+    at all 7 terminal-`failed` writers (`SetRunFailed`/`MarkRunFailedByID` from Go;
+    `run_timeout`/`worker_lost`×2/`auto_stopped`/`plan_rejected` as SQL literals). The
+    claim-assembly infra sentinels now split per-origin, the worker-reported `failed` arm
+    defaults a classless failure to `agent_failure`, and the worker sends `fail_origin`
+    (protocol.ts + runner.ts) for provisioning / no-token / rate-limit failures. **Pass B
+    still owed:** the derived `failure_class` signal + trusted-block render, the
+    `JUDGE_SYSTEM_PROMPT` transient≠permanent rule, and the pre-start-infra gate in
+    `maybeEnqueueJudge`.
 - [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
   a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value because the
   durable fix (pin nixpkgs / pre-seed, issue #82) removes the underlying failure mode.
