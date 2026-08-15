@@ -85,13 +85,19 @@ function fakeGitlab(): GitLabClient {
 
 function runnerFor(
   executor: Executor,
-  opts: { questionTimeoutMs?: number } = {},
+  opts: {
+    questionTimeoutMs?: number;
+    now?: () => number;
+    setTimer?: (cb: () => void, ms: number) => () => void;
+  } = {},
 ): RunRunner {
   return new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0, // disabled — the gate resolves from injected inputs
     questionTimeoutMs: opts.questionTimeoutMs ?? QUESTION_TIMEOUT_MS,
     gitlab: fakeGitlab(),
+    now: opts.now,
+    setTimer: opts.setTimer,
   });
 }
 
@@ -387,42 +393,65 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
 
   /**
    * D-S mutation 4: make the deadline per-question instead of per-run, i.e. drop the
-   * `questionDeadlines.get(runId)` reuse and compute `Date.now() + timeoutMs` at
-   * every park.
+   * `questionDeadlines.get(runId)` reuse and compute `now() + timeoutMs` at every park.
    *
    * The documented bound is one budget for the RUN — N questions must not extend a
    * parked run indefinitely. A per-question clock is the plausible misreading, and
    * it is the shape a later "optimisation" would reach for.
    *
-   * Timing-based, so the margins are wide and the measured numbers are reported
-   * rather than a tight bound asserted. With a 1500ms budget and Q1 answered at
-   * ~900ms, a correct run dies ~1500ms after the FIRST park; a per-question run gets
-   * a fresh 1500ms at the second park and dies ~2400ms after the first. The
-   * threshold sits between them with ~450ms of slack on each side.
+   * DETERMINISTIC, not wall-clock. The per-run-vs-per-question distinction is a fact
+   * about the `remaining` the SECOND park arms, so it is asserted directly on the
+   * armed values through the injected `now`/`setTimer` seams — no real time elapses
+   * and no bound is raced. (The old form measured `Date.now()` elapsed against a
+   * ~1500ms bound and flaked under CI CPU contention: a documented CPU-contention
+   * flake source inflated the measurement past even the ~2400ms per-question marker.)
+   *
+   * With a 1500ms budget and 900ms "spent" answering Q1: a correct run arms the full
+   * 1500ms at the first park and the REMAINING 600ms at the second (one shared clock);
+   * a per-question run would re-arm a fresh 1500ms at the second park. The two are
+   * distinguished by the exact armed value, with zero timing slack to flake on.
    */
   it("spends ONE answer deadline across the whole run, not one per question", async () => {
     const budgetMs = 1500;
-    const answerDelayMs = 900;
+    const answerDelayMs = 900; // logical time charged to the shared budget answering Q1
     const log: AskLog = { asked: [], verdicts: [] };
     const claim = claimFor(44);
+
+    // Manual clock + manual deadline timer. `arms` records the `remaining` each park
+    // arms; nothing here depends on real wall-clock time.
+    let clockMs = 0;
+    const arms: number[] = [];
+    const setTimer = (cb: () => void, ms: number): (() => void) => {
+      arms.push(ms);
+      if (arms.length === 1) {
+        // Q1's remaining is already recorded above; advancing the shared clock now
+        // models the wall time spent answering Q1 and changes ONLY what the second
+        // park computes for `remaining`.
+        clockMs += answerDelayMs;
+      } else if (arms.length === 2) {
+        // Q2 is deliberately never answered — fire its deadline deterministically so
+        // the run ends on the shared budget instead of waiting real time. Deferred so
+        // the Promise.race around this timer is established first.
+        setImmediate(cb);
+      }
+      return () => {}; // Q1's timer is disarmed by its answer; it never fires.
+    };
+
     let parks = 0;
-    let firstParkAt = 0;
     api.onState(claim.run_id, (body) => {
       if (body.status !== "awaiting_input" || !body.open_question_id) return;
       parks++;
       if (parks !== 1) return; // Q2 is deliberately never answered.
-      firstParkAt = Date.now();
-      const qid = body.open_question_id;
-      setTimeout(
-        () => api.setInputs(claim.run_id, [answerInput(qid, "answer to Q1")]),
-        answerDelayMs,
-      );
+      api.setInputs(claim.run_id, [
+        answerInput(body.open_question_id, "answer to Q1"),
+      ]);
     });
 
     await runnerFor(askingExecutor(2, log), {
       questionTimeoutMs: budgetMs,
+      now: () => clockMs,
+      setTimer,
     }).execute(claim);
-    const elapsedMs = Date.now() - firstParkAt;
 
     assert.strictEqual(parks, 2, "the run must park twice");
     assert.strictEqual(
@@ -430,11 +459,22 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
       REASON_QUESTION_TIMEOUT,
       "the unanswered second question must expire the run",
     );
-    assert.ok(
-      elapsedMs < budgetMs + answerDelayMs / 2,
-      `the whole run must die within ONE ${budgetMs}ms budget measured from the ` +
-        `FIRST park, not ${budgetMs}ms from each park; measured ${elapsedMs}ms ` +
-        `(a per-question deadline would land near ${budgetMs + answerDelayMs}ms)`,
+    assert.strictEqual(
+      arms.length,
+      2,
+      "the answer deadline is armed exactly once per park",
+    );
+    assert.strictEqual(
+      arms[0],
+      budgetMs,
+      "the first park arms the FULL run budget",
+    );
+    assert.strictEqual(
+      arms[1],
+      budgetMs - answerDelayMs,
+      "the second park arms the REMAINING budget (budget minus the time Q1 spent), " +
+        "proving ONE clock measured from the first park; a per-question deadline " +
+        `would re-arm the full ${budgetMs}ms here`,
     );
   });
 

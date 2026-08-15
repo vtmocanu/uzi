@@ -181,6 +181,12 @@ export interface RunnerOptions {
   checkpointIntervalMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
+  /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
+   *  paired with a clearTimeout canceller. Lets a test arm and OBSERVE the per-run
+   *  answer budget deterministically — the per-run-vs-per-question distinction is a
+   *  fact about the `remaining` the second park arms — instead of racing a wall-clock
+   *  bound that flakes under CPU contention. Returns a canceller. */
+  setTimer?: (cb: () => void, ms: number) => () => void;
 }
 
 /**
@@ -215,8 +221,13 @@ export class RunRunner {
   /** PRD #267: min interval between time-based origin checkpoint publishes on the
    *  reap:false path; 0 disables. */
   private readonly checkpointIntervalMs: number;
-  /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable. */
+  /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
+   *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
+   *  on the same clock. */
   private readonly now: () => number;
+  /** PRD #88: injectable answer-deadline timer (defaults to setTimeout/clearTimeout),
+   *  so a test can arm and observe the per-run answer budget without a wall-clock race. */
+  private readonly setTimer: (cb: () => void, ms: number) => () => void;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -284,6 +295,13 @@ export class RunRunner {
     this.checkRunner = opts.checkRunner;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.now = opts.now ?? (() => Date.now());
+    this.setTimer =
+      opts.setTimer ??
+      ((cb, ms) => {
+        const t = setTimeout(cb, ms);
+        t.unref?.();
+        return () => clearTimeout(t);
+      });
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -2083,24 +2101,23 @@ export class RunRunner {
 
     let deadlineAt = this.questionDeadlines.get(runId);
     if (deadlineAt === undefined) {
-      deadlineAt = Date.now() + timeoutMs;
+      deadlineAt = this.now() + timeoutMs;
       this.questionDeadlines.set(runId, deadlineAt);
     }
-    const remaining = Math.max(0, deadlineAt - Date.now());
-    let timer: NodeJS.Timeout | undefined;
+    const remaining = Math.max(0, deadlineAt - this.now());
+    let cancel: (() => void) | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(
+      cancel = this.setTimer(
         () => reject(new Error(REASON_QUESTION_TIMEOUT)),
         remaining,
       );
-      timer.unref?.();
     });
     try {
       return settle(
         await Promise.race([steering.awaitAnswer(questionId), timeout]),
       );
     } finally {
-      if (timer) clearTimeout(timer);
+      cancel?.();
     }
   }
 }
