@@ -20,6 +20,25 @@ Re-checked against `main @ e5ed9161`, ~1 month after drafting. **Nothing here la
 
 **Citations below have rotted — re-derive at implementation time, do not trust them.** As the judge subsystem absorbed #104/#111/#121/#232, roughly a dozen `file.go:NN` references drifted 20–700 lines (e.g. `DefaultJudgeModel` :109→:135, still `"haiku"`; `settings.go:748`→:911; `workersvc/judge.go:138`→:855; `service.go:295/297`→:663/665). One is a *mechanism* change, not just a moved line: Decision 1/5 describe the judge claim reading the owner's OAuth token directly at `judge.go:177`, but PRD #104 made that vault-aware (`openAnthropic`/`cred.Token`). Per the repo's re-derive-at-assertion convention, line numbers are re-resolved when a milestone is picked up, not maintained here.
 
+## Build directive (2026-08-15)
+
+This PRD is ready to implement as-is; an implementing run needs no external guidance — this section is the instruction. Build the milestones below, in this order, then stop.
+
+**Scope — build every milestone EXCEPT M7b.** M7b is deferred and effectively dead (Decision 11 and the revalidation note above); do not build it and do not add its `WORKER_EGRESS_ALLOW_FQDNS` plumbing.
+
+**Order** (from the Milestones dependency notes further down):
+1. **M1 first** — it widens the `SettingsReader` interface and every fake that implements it (a package-wide compile event); every other milestone rebases on it.
+2. **M2, M3, M6** — after M1 (M6 is independent of M1, but sequence it here in a single-branch run).
+3. **M5** — after M2 (shares the enqueue surface and needs `sqlc generate`, like M2).
+4. **M7a** — after M5 (shares `maybeEnqueueJudge`).
+5. **M4 last** — consent surface + web + docs + specs; depends on M1+M2+M3+M5.
+
+**Hard constraints:**
+- **M3 and M5 MUST land together.** The opus default without the spend guards recreates the runaway-loop cost risk (Decisions 1 and 9). Never ship M3 without M5.
+- **M7a follows the re-scoped Decisions 11/12:** compute the closed-enum `failure_class` from the server-owned trusted axes (`status` + `iteration_count` + the terminal transition's origin), mirroring `limitwait.go`'s `rate_limit_type` coercion — **never by parsing `failure_reason`** (documented never-parse free text). The pre-start gate targets the general pre-start infra class, not the #78 egress case.
+- **Re-derive every `file.go:NN` citation against the current tree** as you implement each milestone; they have drifted (see the revalidation note) and are not maintained inline.
+- Standard uzi guardrails apply: never touch `main`; land the work on an `agent/*` branch and open one MR.
+
 ## Problem
 
 The run judge (PRD #46) has three rigid points that admins and users have asked
