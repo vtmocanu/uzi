@@ -34,10 +34,15 @@ type detailState struct {
 	frames []laneFrame
 	seen   map[int32]bool
 
-	lanes     []agentLane
-	laneIdx   int
+	lanes   []agentLane
+	laneIdx int
+	// scroll is the transcript window's TOP line index (M5, bottom-anchored). When follow
+	// is true the window is pinned to the bottom (auto-tail) and scroll is recomputed on
+	// render; when paused, scroll is the fixed top so the view does not jump as frames
+	// arrive below it.
 	scroll    int
-	focus     int // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
+	focus     int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
+	follow    bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
 	loaded    bool
 	loadErr   error
 	stream    *uzicli.RunStream
@@ -53,7 +58,7 @@ type detailState struct {
 }
 
 func newDetailState(runID string) detailState {
-	return detailState{runID: runID, seen: map[int32]bool{}}
+	return detailState{runID: runID, seen: map[int32]bool{}, follow: true}
 }
 
 func (d *detailState) applyLoaded(msg detailLoadedMsg) {
@@ -165,26 +170,54 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	case "l", keyRight:
 		m.detail.focus = focusTranscript
 		return m, nil
+	case keyGoLive:
+		// g: re-attach follow and jump to the newest output (M5). f is already follow-up.
+		m.detail.follow = true
+		return m, nil
 	}
 	if d := motionDelta(k); d != 0 {
 		if m.detail.focus == focusRail {
 			// Move between agents. One step per press regardless of the motion size
-			// (page keys are meaningless for a short lane list).
+			// (page keys are meaningless for a short lane list). Switching lanes re-arms
+			// follow so the new lane opens tailing its newest output.
 			if n := len(m.detail.lanes); n > 0 {
 				step := 1
 				if d < 0 {
 					step = -1
 				}
 				m.detail.laneIdx = (m.detail.laneIdx + step + n) % n
-				m.detail.scroll = 0
+				m.detail.scroll, m.detail.follow = 0, true
 			}
 			return m, nil
 		}
-		// Transcript focused: scroll (top-anchored for now; M5 inverts to bottom-anchored
-		// follow, so this stays intentionally minimal).
-		m.detail.scroll += d
+		// Transcript focused: bottom-anchored scroll (M5). Scrolling UP detaches follow and
+		// moves the window's top up; scrolling DOWN moves it toward the bottom and re-arms
+		// follow on a LIVE run once it reaches the newest line.
+		total, vp := m.transcriptExtent()
+		maxTop := total - vp
+		if maxTop < 0 {
+			maxTop = 0
+		}
+		if d < 0 { // up, toward older
+			if m.detail.follow {
+				m.detail.follow = false
+				m.detail.scroll = maxTop
+			}
+			m.detail.scroll += d // d is negative
+		} else { // down, toward newest
+			if m.detail.follow {
+				return m, nil // already at the bottom
+			}
+			m.detail.scroll += d
+		}
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
+		}
+		if m.detail.scroll >= maxTop {
+			m.detail.scroll = maxTop
+			if isLiveRunStatus(m.detail.run.Status) {
+				m.detail.follow = true
+			}
 		}
 		return m, nil
 	}
@@ -295,6 +328,11 @@ func (m tuiModel) detailFooter() string {
 			m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
 	} else {
 		parts = append(parts, m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+		if isLiveRunStatus(m.detail.run.Status) {
+			// g re-attaches the transcript follow (M5); it is a view affordance, so it shows
+			// for owner and non-owner alike, but only when there is live output to follow.
+			parts = append(parts, m.keyHint("g", "live"))
+		}
 		if owner {
 			parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("v", "review"), m.keyHint("x", "cancel"))
 		}
@@ -382,27 +420,100 @@ func (m tuiModel) renderLaneRail() string {
 	return sb.String()
 }
 
-func (m tuiModel) renderTranscript() string {
-	title := m.paneTitle("transcript", m.detail.focus == focusTranscript)
-	lane, ok := m.detail.selectedLane()
-	if !ok {
-		return title + "\n" + m.pal.faint.Render("no lane selected")
-	}
+// buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
+// so the follow/scroll windowing and the line-count extent share one layout.
+func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 	var sb strings.Builder
 	for _, f := range lane.Frames {
 		sb.WriteString(m.pal.faint.Render("#"+itoa(int(f.Seq))+" "+m.renderer.Plain(f.Kind, 16)) + "\n")
 		sb.WriteString(m.renderer.Markdown(transcriptText(f)) + "\n\n")
 	}
-	out := strings.Split(sb.String(), "\n")
-	if m.detail.scroll < len(out) {
-		out = out[m.detail.scroll:]
+	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+}
+
+// transcriptViewport is the transcript's visible line budget (the pane title is a fixed
+// header above it, so it is one row shorter than the pane).
+func (m tuiModel) transcriptViewport() int {
+	if h := m.height - 11; h > 3 {
+		return h
 	}
-	// The pane title is a fixed header above the scrolled body, so the viewport is one row
-	// shorter than before.
-	if h := m.height - 11; h > 0 && len(out) > h {
-		out = out[:h]
+	return 3
+}
+
+// transcriptExtent gives the selected lane's total line count and the viewport, so the key
+// handler can clamp the scroll offset against the same layout renderTranscript uses.
+func (m tuiModel) transcriptExtent() (total, viewport int) {
+	viewport = m.transcriptViewport()
+	if lane, ok := m.detail.selectedLane(); ok {
+		total = len(m.buildTranscriptLines(lane))
 	}
-	return title + "\n" + strings.Join(out, "\n")
+	return total, viewport
+}
+
+func (m tuiModel) renderTranscript() string {
+	focused := m.detail.focus == focusTranscript
+	lane, ok := m.detail.selectedLane()
+	if !ok {
+		return m.paneTitleBadge("transcript", focused, "") + "\n" + m.pal.faint.Render("no lane selected")
+	}
+	lines := m.buildTranscriptLines(lane)
+	vp := m.transcriptViewport()
+
+	// Bottom-anchored window (PRD #325 M5). Following pins the window to the bottom
+	// (auto-tail); paused holds a fixed top line so the view does not jump as frames land
+	// below it, and the count of lines below the fold is what the badge reports.
+	maxTop := len(lines) - vp
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	top := m.detail.scroll
+	if m.detail.follow || top > maxTop {
+		top = maxTop
+	}
+	if top < 0 {
+		top = 0
+	}
+	end := top + vp
+	if end > len(lines) {
+		end = len(lines)
+	}
+	window := strings.Join(lines[top:end], "\n")
+
+	return m.paneTitleBadge("transcript", focused, m.followBadge(top, maxTop)) + "\n" + window
+}
+
+// followBadge is the transcript's live-follow affordance (M5) — distinct from the transport
+// line, which is about THIS CLIENT's connection. Only a LIVE run tails: a terminal run's
+// transcript is complete, so it carries no badge. FOLLOWING while auto-tailing; PAUSED with
+// a "↓N new" count (N = lines below the fold) once the reader has scrolled back.
+func (m tuiModel) followBadge(top, maxTop int) string {
+	if !isLiveRunStatus(m.detail.run.Status) {
+		return ""
+	}
+	if m.detail.follow {
+		return lipgloss.NewStyle().Foreground(m.pal.statusColor("running", "")).Bold(true).Render("● FOLLOWING")
+	}
+	badge := lipgloss.NewStyle().Foreground(m.pal.statusColor("awaiting_approval", "")).Bold(true).Render("⏸ PAUSED")
+	if below := maxTop - top; below > 0 {
+		badge += m.pal.faint.Render(" ↓" + itoa(below) + " new")
+	}
+	return badge
+}
+
+// paneTitleBadge is paneTitle with a right-aligned badge (the follow indicator) padded to
+// the transcript column width.
+func (m tuiModel) paneTitleBadge(title string, focused bool, badge string) string {
+	t := m.paneTitle(title, focused)
+	if badge == "" {
+		return t
+	}
+	return padVisual(t, m.transcriptWidth()-visualWidth(badge)) + badge
+}
+
+// isLiveRunStatus reports whether a run is actively producing output, so follow-live
+// applies. `claimed` is live like `running` (a worker has it and is about to speak).
+func isLiveRunStatus(status string) bool {
+	return status == "running" || status == "claimed"
 }
 
 // transcriptText pulls the human-readable body out of a frame's payload. The payload

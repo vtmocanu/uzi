@@ -83,6 +83,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-filter":             func(d bool) string { return boardFilter(d, now) },
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
 		"detail-focus-transcript":  func(d bool) string { return detailFocusTranscript(d, now) },
+		"detail-paused":            func(d bool) string { return detailPaused(d, now) },
 		"detail-stalled":           func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval": func(d bool) string { return detailAwaitingApproval(d, now) },
 		"detail-awaiting-input":    func(d bool) string { return detailAwaitingInput(d, now) },
@@ -229,6 +230,36 @@ func detailFocusTranscript(dark bool, now time.Time) string {
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
 	m = key(m, "l") // focus the transcript pane
+	return m.View().Content
+}
+
+func detailPaused(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+	lines := []string{
+		"Planning the change: a scheduler backoff plus a near-cap test.",
+		"Dispatched a coder and a tester; watching for the first diff.",
+		"Coder reports the backoff is in. Reviewing the near-cap branch.",
+		"Asked the tester to add a boundary case before I sign off.",
+		"Tester is green on the near-cap case. Reading the full diff.",
+		"The constant should be shared with the poller; sending it back.",
+		"Coder extracted the shared constant. Re-running the sweep.",
+		"Sweep green. Preparing the MR against a feature branch.",
+	}
+	var msgs []apitypes.MessageDTO
+	for i, ln := range lines {
+		msgs = append(msgs, msgDTO(int32(i+1), "text", "lead", "", "", ln, now.Add(-time.Duration(len(lines)-i)*time.Minute)))
+	}
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, detailRunID, dark)
+	m.height = 22 // smaller viewport so the transcript overflows and can be scrolled back
+	m = step(m, detailLoadedMsg{run: run, msgs: msgs})
+	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
+	m = withLiveStream(m)
+	m = key(m, "l") // focus the transcript
+	for i := 0; i < 4; i++ {
+		m = key(m, "k") // scroll up → detach follow → PAUSED ↓4 new
+	}
 	return m.View().Content
 }
 

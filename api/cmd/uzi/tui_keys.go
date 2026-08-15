@@ -23,6 +23,7 @@ const (
 	keyRefresh   = "r"
 	keyConfirmY  = "y"
 	keyConfirmN  = "n"
+	keyGoLive    = "g" // M5: re-attach the transcript follow (f is already follow-up)
 	keyPageUp    = "pgup"
 	keyPageDown  = "pgdown"
 	keyHome      = "home"
@@ -72,6 +73,7 @@ func helpLines(inDetail bool) []string {
 			"← / →      focus the crew rail / the transcript",
 			"tab        cycle the focused pane",
 			"↑ / ↓      move within the focused pane (agents · scroll)",
+			"g          follow live: re-attach and jump to newest (live runs)",
 		}, common...)
 	}
 	return append([]string{

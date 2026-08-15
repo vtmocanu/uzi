@@ -466,18 +466,17 @@ func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 		t.Errorf("j on the rail scrolled the transcript (scroll=%d); it should move agents", m.detail.scroll)
 	}
 
-	// → focuses the transcript; now j scrolls and does NOT change the agent.
+	// → focuses the transcript; now ↑/↓ drive the transcript and do NOT change the agent.
+	// (Scroll amount is M5's concern and needs a transcript taller than the viewport; here
+	// the point is only that the agent selection no longer responds to ↑/↓.)
 	m = press(t, m, keyRight)
 	if m.detail.focus != focusTranscript {
 		t.Fatal("→ did not focus the transcript")
 	}
 	lane := m.detail.laneIdx
-	m = press(t, m, "j")
-	if m.detail.scroll == 0 {
-		t.Error("j on the focused transcript did not scroll")
-	}
+	m = press(t, m, "k")
 	if m.detail.laneIdx != lane {
-		t.Error("j on the transcript changed the selected agent; it should scroll")
+		t.Error("↑ on the transcript changed the selected agent; it should scroll the transcript")
 	}
 
 	// ← returns focus to the rail; moving agents resets the scroll and wraps.
@@ -524,6 +523,68 @@ func TestTUIDetailFooterIsOneLine(t *testing.T) {
 		if !strings.Contains(last, want) {
 			t.Errorf("the detail footer is not one combined line (missing %q)\nlast line: %q", want, last)
 		}
+	}
+}
+
+// M5: a live run's transcript follows (tail -f, bottom-anchored) with ● FOLLOWING; a new
+// frame auto-tails; scrolling up detaches to ⏸ PAUSED with a "↓N new" count; g re-attaches.
+func TestTUIDetailFollowLive(t *testing.T) {
+	now := time.Now()
+	runID := "live-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.height = 16 // small viewport (vp = height-11 = 5) so a handful of frames overflow
+
+	var msgs []apitypes.MessageDTO
+	for i := int32(1); i <= 8; i++ {
+		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
+	}
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
+	m = next.(tuiModel)
+	m = press(t, m, keyRight) // focus the transcript so ↑/↓ scroll it
+
+	// A live run opens FOLLOWING, bottom-anchored: the newest frame shows, the oldest does not.
+	if !m.detail.follow {
+		t.Fatal("a live run should open following")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "FOLLOWING") {
+		t.Errorf("the FOLLOWING indicator is not shown while tailing\n%s", out)
+	}
+	if !strings.Contains(out, "frame 8") || strings.Contains(out, "frame 1 body") {
+		t.Errorf("following is not bottom-anchored (newest visible, oldest hidden)\n%s", out)
+	}
+
+	// A new frame while following auto-tails to the newest.
+	agent, at := "lead", now
+	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"frame 9 body"}`),
+	}}})
+	m = next.(tuiModel)
+	if !m.detail.follow || !strings.Contains(m.View().Content, "frame 9") {
+		t.Error("a new frame while following did not auto-tail to the newest")
+	}
+
+	// Scrolling up detaches to PAUSED, reporting the lines below the fold.
+	m = press(t, m, "k")
+	if m.detail.follow {
+		t.Error("scrolling up did not detach follow")
+	}
+	paused := m.View().Content
+	if !strings.Contains(paused, "PAUSED") {
+		t.Errorf("the PAUSED indicator is not shown after scrolling up\n%s", paused)
+	}
+	if !strings.Contains(paused, "↓1 new") {
+		t.Errorf("PAUSED does not report one line below the fold\n%s", paused)
+	}
+
+	// g re-attaches follow and jumps to the newest.
+	m = press(t, m, keyGoLive)
+	if !m.detail.follow {
+		t.Error("g did not re-attach follow")
+	}
+	if !strings.Contains(m.View().Content, "FOLLOWING") {
+		t.Error("g did not restore the FOLLOWING indicator")
 	}
 }
 
