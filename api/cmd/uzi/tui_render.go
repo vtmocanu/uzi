@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 	lipgloss "charm.land/lipgloss/v2"
 )
@@ -35,21 +36,39 @@ type tuiRenderer struct {
 // BackgroundColorMsg, and a second independent detection could disagree with the
 // palette the rest of the frame is drawn in.
 func newTUIRenderer(width int, dark bool) (*tuiRenderer, error) {
-	style := styles.LightStyle
-	if dark {
-		style = styles.DarkStyle
-	}
 	if width < 20 {
 		width = 20
 	}
 	md, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle(style),
+		glamour.WithStyles(tuiGlamourStyle(dark)),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return &tuiRenderer{md: md}, nil
+}
+
+// tuiGlamourStyle is the stock dark/light glamour style with ONE retune (PRD #325 M6):
+// inline `code` ships as xterm colour 203 (#ff5f5f) in BOTH themes, which reads as an
+// ERROR in a status UI. Recolour it to a calm, cool neutral on the same code background so
+// a code span reads as code, not as a failure. Only the inline Code foreground is touched;
+// CodeBlock (fenced) and everything else are left as glamour ships them.
+//
+// The StyleConfig is a value copy of the package default, and Code is a value field, so
+// reassigning cfg.Code.Color mutates only this copy — the shared styles.*Config global is
+// untouched.
+func tuiGlamourStyle(dark bool) ansi.StyleConfig {
+	if dark {
+		cfg := styles.DarkStyleConfig
+		c := "#b9c0cb" // cool light grey on the #303030-ish code bg
+		cfg.Code.Color = &c
+		return cfg
+	}
+	cfg := styles.LightStyleConfig
+	c := "#334155" // slate on the light code bg
+	cfg.Code.Color = &c
+	return cfg
 }
 
 // Markdown renders untrusted markdown for the transcript: sanitize, THEN Glamour.
@@ -181,6 +200,20 @@ func (p palette) statusColor(status, health string) color.Color {
 		return c
 	}
 	return p.statusDefault
+}
+
+// verdictColor maps a judge verdict to a severity colour (PRD #325 M6): issues → red,
+// ideal/ok → the completed teal, anything else → the default grey. Shared by the board's
+// ⚖ marker and the review overlay's verdict chip so the two cannot disagree.
+func (p palette) verdictColor(verdict string) color.Color {
+	switch verdict {
+	case "ideal", "ok":
+		return p.statusColor("completed", "")
+	case "issues":
+		return p.statusColor("failed", "")
+	default:
+		return p.statusDefault
+	}
 }
 
 // chip renders text as a solid status tag: a filled block of bg with near-background

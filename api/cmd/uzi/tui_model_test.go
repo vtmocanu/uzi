@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"image/color"
 	"strings"
 	"testing"
 	"time"
@@ -266,6 +268,40 @@ func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
 	if !strings.Contains(out, "read-only") {
 		t.Errorf("the non-owner steer bar should explain it is read-only\n%s", out)
 	}
+}
+
+// M6: the review overlay colours the verdict chip by SEVERITY (issues red, ideal teal) via
+// the shared verdictColor, not the old uniform brand-blue. Asserted through the chip's
+// background-fill SGR, and that the two verdicts resolve to different colours.
+func TestTUIReviewVerdictSeverityColour(t *testing.T) {
+	render := func(verdict string) string {
+		runID := "rv-" + verdict
+		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+		next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "completed"}})
+		m = next.(tuiModel)
+		m = press(t, m, "v")
+		next, _ = m.Update(reviewLoadedMsg{runID: runID, review: &apitypes.ReviewDTO{Verdict: verdict}})
+		m = next.(tuiModel)
+		return m.View().Content
+	}
+	pal := newPalette(true)
+	issuesBg := bgFillSGR(pal.verdictColor("issues"))
+	idealBg := bgFillSGR(pal.verdictColor("ideal"))
+	if issuesBg == idealBg {
+		t.Fatal("issues and ideal resolve to the same colour; the severity test cannot distinguish them")
+	}
+	if out := render("issues"); !strings.Contains(out, issuesBg) {
+		t.Errorf("the issues verdict chip is not the failed (red) colour %q\n%s", issuesBg, out)
+	}
+	if out := render("ideal"); !strings.Contains(out, idealBg) {
+		t.Errorf("the ideal verdict chip is not the completed (teal) colour %q\n%s", idealBg, out)
+	}
+}
+
+// bgFillSGR is the truecolor background SGR lipgloss emits for a chip's fill.
+func bgFillSGR(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("48;2;%d;%d;%d", r>>8, g>>8, b>>8)
 }
 
 // The detail view: replay builds lanes, and a live frame extends them.

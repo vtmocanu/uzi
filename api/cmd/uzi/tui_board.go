@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"image/color"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -330,15 +329,7 @@ func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
 // (JudgeTodoCount, apitypes/run.go), so a healthy or fully-triaged run shows just the
 // verdict.
 func (m tuiModel) verdictMarker(verdict string, todo int) string {
-	var c color.Color
-	switch verdict {
-	case "ideal", "ok":
-		c = m.pal.statusColor("completed", "")
-	case "issues":
-		c = m.pal.statusColor("failed", "")
-	default:
-		c = m.pal.statusDefault
-	}
+	c := m.pal.verdictColor(verdict)
 	label := "⚖ " + m.renderer.Plain(verdict, 8)
 	if todo > 0 {
 		label += " · " + itoa(todo)
