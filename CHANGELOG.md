@@ -4,7 +4,7 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-## [Unreleased]
+## [0.38.0] - 2026-08-15
 
 ### Added
 
@@ -54,6 +54,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   started (0 iterations, a pre-start infra origin) skips the judge entirely
   and gets a deterministic failure notification instead of an opus
   retrospective. (#69)
+- **Judge `cost_efficiency` recommendation category (PRD #325).** The
+  retrospective judge can now surface quality-first cost-efficiency
+  recommendations: ways a run could have reached the same outcome for fewer
+  tokens, turns, or agents, without reducing correctness, verification depth, or
+  code quality. It is triage-only (it appears in the backlog for
+  resolve/dismiss/file-issue) and does not feed the self-improvement loop. Wired
+  across the agent prompt, server validation, the DB CHECK, the CLI `--category`
+  filter, and the web filter chip. (#325)
+- **Per-run tool provisioning without GitHub egress (PRD #123).** A tier-1 seed
+  gate restricts a worker's tool allowlist to the baked toolchain and aliases
+  baked binary-name mismatches, with the tier-2 denylist decision documented, so
+  the provisioning path no longer depends on GitHub egress. (#123)
 
 ### Changed
 
@@ -93,6 +105,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   token, an opus judge also spends plan/rate-limit quota rather than
   dollars, which can eat into what your real runs need — this matters most
   under the new enforced mode above. (#69)
+- **Web main content column widened to 1088px (`max-w-[68rem]`)**, alongside
+  agent-browser session isolation for the web-ux and ux-designer dev agents.
+  (ec65d87d)
+
+### Fixed
+
+- **Schedules: dropped the stray play glyph from the last-fire run chip.**
+  (14411306)
+- **The agent `ask_user` per-run deadline test is now deterministic**, removing a
+  flaky-test source in the run harness. (71f6f6ca)
 
 ### Security
 
