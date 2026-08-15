@@ -482,7 +482,7 @@ function LastFireDetail({ s, fire }: { s: Schedule; fire: LastFire }) {
                 to={`/runs/${r.run_id}`}
                 className="inline-flex shrink-0 items-center gap-1 rounded-md border border-ok/35 bg-ok/[0.08] px-2 py-0.5 font-mono text-[11.5px] text-ok hover:bg-ok/15"
               >
-                ▶ run {r.run_id.slice(0, 4)}…
+                run {r.run_id.slice(0, 8)}…
               </Link>
             </div>
           ))}
