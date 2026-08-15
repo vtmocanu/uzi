@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
@@ -567,9 +568,20 @@ func joinColumns(left, right string, width int) string {
 		if i < len(r) {
 			rv = r[i]
 		}
-		sb.WriteString(padVisual(lv, width) + " │ " + rv + "\n")
+		sb.WriteString(padVisual(clampVisual(lv, width), width) + " │ " + rv + "\n")
 	}
 	return sb.String()
+}
+
+// clampVisual truncates s to n visual columns (ANSI- and wide-rune-aware),
+// appending an ellipsis when it cuts. It is padVisual's dual: together they hold
+// a column to exactly n columns regardless of content, so joinColumns' divider
+// sits at one fixed column on every row.
+func clampVisual(s string, n int) string {
+	if n < 1 {
+		return ""
+	}
+	return ansi.Truncate(s, n, "…")
 }
 
 // padVisual pads to n columns ignoring ANSI escapes, which lipgloss has already added
