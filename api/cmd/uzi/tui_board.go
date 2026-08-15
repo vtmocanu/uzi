@@ -185,7 +185,7 @@ func (m tuiModel) renderBoard() string {
 	if m.board.admin {
 		ownerHdr = "  " + padCell("OWNER", boardOwnerWidth)
 	}
-	sb.WriteString("  " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"    "+padCell("AGE", 5)+"  TITLE") + "\n")
+	sb.WriteString("  " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
 
 	if len(rows) == 0 {
 		sb.WriteString(m.boardEmptyState())
@@ -202,6 +202,7 @@ func (m tuiModel) renderBoard() string {
 
 const (
 	boardStatusWidth = 19 // status chip cell (fits the longest status, "awaiting_approval" + chip padding)
+	boardHealthWidth = 10 // HEALTH cell (stalled ▲, or a non-stalled health word, truncated)
 	boardOwnerWidth  = 18 // admin OWNER cell
 )
 
@@ -280,21 +281,25 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 		title += "  " + m.verdictMarker(*r.JudgeVerdict)
 	}
 
-	return spine + gutter + " " + id + owner + "  " + statusCell + " " + m.boardHealthCell(r) + " " +
+	return spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
 		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + title
 }
 
-// boardHealthCell is a 2-col health marker beside the status chip. "stalled" (which also
-// turns the spine/chip orange via statusColor) gets an orange ▲; any other non-ok health
-// (slow/looping/waiting_worker) gets a faint attention mark; ok/empty is blank.
+// boardHealthCell is the HEALTH column. "stalled" (which also turns the spine/chip orange
+// via statusColor and is counted in the summary) keeps its ▲ glyph; every other non-ok
+// health (slow / looping / waiting_worker) shows its WORD, as the pre-redesign board did,
+// truncated to the column. ok/empty is blank. The cell is always boardHealthWidth wide so
+// AGE and TITLE stay aligned.
 func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
-	switch boardHealth(r) {
+	switch h := boardHealth(r); h {
 	case "":
-		return "  "
+		return strings.Repeat(" ", boardHealthWidth)
 	case "stalled":
-		return lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲") + " "
+		return padVisual(lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲"), boardHealthWidth)
 	default:
-		return m.pal.faint.Render("!") + " "
+		// The word, sanitized + capped (Health is server-controlled, but drawn defensively
+		// like every other cell), in the default colour — visible, not faint.
+		return padCell(m.renderer.Plain(h, boardHealthWidth), boardHealthWidth)
 	}
 }
 

@@ -139,6 +139,7 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
 		mk("c3d4e5f6-1111-2222-3333-444444444444", "issue", "running", "Refactor the forge sync loop for the GitHub driver", "stalled", nil, 0, 51*time.Minute),
 		mk("d4e5f6a7-1111-2222-3333-444444444444", "chat", "running", "Explain the run lifecycle state machine", "", nil, 0, time.Minute),
+		mk("c9d0e1f2-1111-2222-3333-444444444444", "issue", "running", "Tighten the retry backoff jitter", "looping", nil, 0, 12*time.Minute),
 		mk("e5f6a7b8-1111-2222-3333-444444444444", "issue", "completed", "Wire the OIDC login button into the header", "", sp("ideal"), 0, 3*time.Hour),
 		mk("f6a7b8c9-1111-2222-3333-444444444444", "issue", "limit_wait", "Port the judge to per-model usage folding", "", nil, 0, 22*time.Minute),
 		mk("a7b8c9d0-1111-2222-3333-444444444444", "issue", "failed", "Migrate per-user secrets into the vault hierarchy", "", sp("issues"), 3, 5*time.Hour),

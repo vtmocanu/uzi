@@ -55,7 +55,7 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 	if admin {
 		ownerCol = "  " + padCell("OWNER", 18)
 	}
-	sb.WriteString("  " + p.eyebrow(padCell("RUN", 9)+ownerCol+"  "+padCell("STATUS", 19)+"    "+padCell("AGE", 5)+"  TITLE") + "\n")
+	sb.WriteString("  " + p.eyebrow(padCell("RUN", 9)+ownerCol+"  "+padCell("STATUS", 19)+"  "+padCell("HEALTH", 10)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
 
 	if len(visible) == 0 {
 		sb.WriteString("  " + p.fg(p.muted).Render("No runs yet. Start one from the web board or the command line.") + "\n")
@@ -84,13 +84,15 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 		}
 
 		statusCell := padVisual(p.chip(r.Status, sc), 19)
-		health := "  "
+		// HEALTH column: stalled keeps its ▲; other non-ok health shows its WORD (as the
+		// shipped board does), in the default/ink colour; ok is blank.
+		health := strings.Repeat(" ", 10)
 		switch r.Health {
 		case "stalled":
-			health = p.fg(p.statusColor("stalled")).Render("▲") + " "
+			health = padVisual(p.fg(p.statusColor("stalled")).Render("▲"), 10)
 		case "":
 		default:
-			health = p.fg(p.faint).Render("!") + " "
+			health = padVisual(p.fg(p.ink).Render(capCell(r.Health, 10)), 10)
 		}
 		owner := ""
 		if admin {
@@ -110,7 +112,7 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 		}
 
 		line := spine + gutter + " " + idStyle.Render(padCell(r.ID, 9)) + owner + "  " +
-			statusCell + " " + health + " " + p.fg(p.faint).Render(padCell(r.Age, 5)) + "  " + title
+			statusCell + "  " + health + "  " + p.fg(p.faint).Render(padCell(r.Age, 5)) + "  " + title
 		sb.WriteString(line + "\n")
 	}
 

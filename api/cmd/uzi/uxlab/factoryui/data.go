@@ -59,6 +59,8 @@ func SeedRuns() []Run {
 				{"lead", "", "", "working"}, {"coder", "9xk2mq", "driver port", "stalled"}}, Transcript: crewTranscript()},
 		{ID: "d4e5f6a7", Kind: "chat", Status: "running", Title: "Explain the run lifecycle state machine",
 			Age: "1m", Owner: "dana@example.com", Lanes: []Lane{{"lead", "", "", "working"}}, Transcript: crewTranscript()},
+		{ID: "c9d0e1f2", Kind: "issue", Status: "running", Title: "Tighten the retry backoff jitter",
+			Health: "looping", Age: "12m", Owner: "dana@example.com", Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "e5f6a7b8", Kind: "issue", Status: "completed", Title: "Wire the OIDC login button into the header",
 			Age: "3h", Owner: "sam@example.com", Verdict: "ideal", Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "f6a7b8c9", Kind: "issue", Status: "limit_wait", Title: "Port the judge to per-model usage folding",

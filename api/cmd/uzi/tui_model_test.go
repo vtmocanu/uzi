@@ -442,15 +442,18 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one"}},
 		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "two"}},
 		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "three"}},
+		{RunDTO: apitypes.RunDTO{ID: "dddddddd-4", Kind: "issue", Status: "running", Health: "looping", IssueTitle: "four"}},
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
 	m = next.(tuiModel)
 	out := m.View().Content
 
-	for _, want := range []string{"3 runs", "1 needs you", "1 stalled"} {
+	// "looping" is NOT stalled, so it is not counted as stalled — but its WORD must show in
+	// the HEALTH column (restored, not reduced to a faint marker).
+	for _, want := range []string{"4 runs", "1 needs you", "1 stalled", "looping"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("summary bar missing %q\n%s", want, out)
+			t.Errorf("board missing %q\n%s", want, out)
 		}
 	}
 	// The status chip + spine are solid colour fills: a truecolor background SGR (48;2;…).
