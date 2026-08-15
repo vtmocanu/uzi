@@ -20738,3 +20738,86 @@ Reuses the proven work-run accounting path rather than a judge-specific cost fie
   the new read query `GetJudgeRunUsageForTarget`; `JudgePanel` renders a 4-tile strip (Tokens in · Tokens out ·
   Duration · Cost) mirroring the work-run `RunUsagePanel`. A judge run predating the feature (no `run_usage` row)
   renders no strip — never a fabricated 0 (PRD #40's pre-feature rule). The judge run stays hidden from every run list.
+
+## 541. PRD #325 — TUI "factory shift board" redesign: one semantic-status seam, a design-only port that preserves the shipped invariants, and a demo rebuilt on the shipped model
+
+Redesign of the shipped `uzi tui` (PRD #112, §368-§372) from undifferentiated grey text into a
+colour-coded status board. TUI/CLI-only — no API, DB, worker or web change; blast radius is the
+`uzi` binary's interactive views.
+
+- **One colour seam, read-only downstream (M2).** `tui_render.go` owns
+  `statusColor(status, health) color.Color`, `chip(text, bg) string` + a `chipFg`, and
+  `verdictColor(verdict) color.Color`; the board (M2), the detail header chips (M3) and the judge
+  overlay severity (M6) only **read** them, never reaching back into `tui_render.go`. One seam so
+  the same status→colour rule cannot be duplicated and drift — the §370/D6 "TUI and plain commands
+  cannot drift" discipline. Status→bucket map: `running`=green, `awaiting_approval`/`awaiting_input`
+  =amber, `limit_wait`=cyan, `completed`=teal, `failed`=red, `queued`/`claimed`=blue-or-grey, every
+  other value=grey default (an unrecognised status renders as data, never a placeholder — same
+  posture as §369). `statusColor` returns `color.Color`, not a `Style`: the chip background and the
+  M6 foreground both want a colour.
+- **Status-vs-health precedence — one colour per spine.** A run with `Health` "stalled" (PRD #47)
+  resolves to **orange**, overriding its status bucket, because the spine exists for triage and a
+  stalled run is what needs attention; non-stalled health does not override. The summary-bar
+  predicates use the same rule: `needs you` = `awaiting_approval` + `awaiting_input`; `stalled` =
+  stalled-health count; `N runs` = total shown (`N runs · N needs you · N stalled`).
+- **Design-only port, NOT a code swap (D2).** The `factoryui` prototype was a fixture-only
+  re-implementation missing every shipped invariant — the steer state machine, the D8 ownership
+  gate (§372), D8 degradation, seq-dedup, the limit-wait park line, and (load-bearing) D7
+  control-byte sanitization (§371). The design (layout/colour/interaction) was ported into the
+  shipped `tui_*.go` incrementally per milestone; a literal port would have deleted
+  security-load-bearing code.
+- **D7 extended to the new OWNER column (blocking).** The admin board's `OwnerEmail` is
+  attacker-influenceable, so it routes through `cellText`+`capCell` (the control-byte stripper of
+  §371) — bare `capCell` is insufficient — and `OwnerEmail` is added to `d7UntrustedFields`. The
+  clean-fixture screenshots pass whether or not the sanitization survives the port (golden-fixture
+  trap), so the hostile-`OwnerEmail` admin-board render test is the only guard, not the PNGs. The ⚖
+  judge-verdict marker shows on the **own-runs board only** (admin rows carry no `JudgeVerdict`);
+  the admin board keeps its honest "active runs (factory-wide)" label rather than being relabelled.
+- **Two distinct gate banners (M3).** `awaiting_approval` → amber `PLAN GATE` banner with promoted
+  `[y]`/`[n]` keycaps; `awaiting_input` (PRD #88 clarification park) → a distinct follow-up banner
+  with **no** y/n. factoryui conflated them (`needsHuman = approval || input`), which would tell
+  `awaiting_input` users to press inert keys. The banner is informational and shows regardless of
+  ownership; the promoted keycaps are owner-gated (`steerAccess`, defense-in-depth with the
+  `steerKey` gate so leaked keycaps are inert anyway).
+- **NO_COLOR fallback is scope, not polish (D3).** The spine and the plan-gate banner carry
+  colour-only fill that lipgloss strips under `NO_COLOR`/an Ascii profile. Fallbacks:
+  `statusGlyph(status)` puts a per-status marker in the spine column, and the banner is bordered
+  independent of fill; chip *text* survives on its own. The success criteria "the spine is
+  scannable in one pass" and "the gate is unmissable" depend on these, so `NO_COLOR` is honoured.
+  The detail header also keeps a stalled **word** cue (folded from an M3 nit), matching the board
+  keeping the health words.
+- **Follow-live windowing inverted (M5).** The transcript went from top-anchored (`out[scroll:]`)
+  to bottom-anchored + follow, mirroring the web's `useFollowScroll`: `● FOLLOWING` auto-tail,
+  `⏸ PAUSED ↓N new` on scroll-up (N = `maxTop − top`, exactly the lines below the fold), `g`
+  re-attaches and jumps to newest (`g` chosen because `f` is already follow-up), scroll-to-bottom
+  also re-attaches, and only live runs follow. Render and the key-handler clamp share ONE layout
+  (`buildTranscriptLines` + `transcriptViewport`) so a stale scroll can't blank the view; the
+  scroll delta is reclamped to `[0,maxTop]` before it is applied, so a resize-while-paused cannot
+  spuriously re-arm follow. It rides the live `/api/ws` stream that already existed — no ingestion
+  change.
+- **Focusable-pane detail nav (M4).** `←`/`→`/`tab` select/cycle the focused pane (crew rail ↔
+  transcript); `↑`/`↓`/`j`/`k` act within the focused pane (move between agents when the rail is
+  focused, scroll when the transcript is focused); default focus = crew rail; the focused pane is
+  visually distinguished; the keybinding footer is one line. Steer/overlay keep first-refusal on
+  keys (`steerTyping` swallows `tab`/`←`/`→`), so pane nav never steals a typed steer.
+- **Verdict severity + inline-code retune (M6).** `verdictColor` (teal ideal/ok, red issues, grey
+  default) colours the overlay verdict; the board ⚖ marker is refactored onto the **same**
+  `verdictColor` so board and overlay cannot disagree. The glamour inline-code style is retuned off
+  the alarm-red (xterm 203, both themes) via a value-copy of `StyleConfig` + pointer reassignment,
+  so it does not mutate the shared package-global other renderers use. Confidence renders neutral
+  (`faint`) by design — M6 colours the verdict only.
+- **Demo rebuilt on the shipped model (D1, user decision).** `factoryui` and `uxlab/demo` are
+  retired; the interactive demo is now `uzi tui --demo` (a hidden flag on `tui`, `demo.go`) that
+  wraps the real shipped `tuiModel` in a `demoModel`, swapping the API client for an in-memory
+  `uzicli.FakeClient` and injecting live frames via a ticker — so follow-live is drivable and the
+  demo always mirrors what ships. The `api/cmd/uzi/uxlab/` render harness (charmbracelet/freeze)
+  drives the same shipped `tuiModel` offline into light/dark PNGs as the agent-reviewable surface
+  (`png/`/`frames/` gitignored). Chosen over "lean retire" and "keep factoryui as a sandbox": a
+  second unbound view implementation with no differential test would drift and mislead.
+- **Gate discipline.** `uxlab/` lands in the api Go module (deadcode-ZERO baseline, whole-files
+  lint ratchet), so each milestone's acceptance is `task gate:api` (build + lint + deadcode + test)
+  and every exported harness symbol stays reachable — not `go build`.
+
+See [prds/325-tui-redesign.md](../prds/325-tui-redesign.md) for the milestone/decision record and
+the review-wave amendments; §368-§372 for the PRD #112 base this builds on (D7 §371, D8 ownership
+§372, package layout §370).

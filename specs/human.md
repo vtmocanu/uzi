@@ -363,6 +363,11 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
   mechanism (`?mock=truncated-backlog` / `uzi_mock_scenario`), never a build flag
   and never by accident: it is the one state where the screen is not the truth,
   so a person needs to be able to see it. [user 2026-07-25]
+- A dedicated `cost_efficiency` judge recommendation category: surface quality-first
+  cost-efficiency findings — recommend cost cuts only where they don't reduce
+  correctness, verification depth, or code quality. [user 2026-08-15]
+- `cost_efficiency` is triage-only: it does NOT feed the self-improvement job.
+  [user 2026-08-15]
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 
@@ -687,6 +692,19 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
 - The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
 - The server's version is probed on a cache, never once per command. [user 2026-08-03]
 - The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
+
+## Feature #325 — TUI redesign ("factory shift board")
+
+Tracked as GitLab issue vtmocanu/uzi#325; PRD at `prds/325-tui-redesign.md`.
+Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
+
+- The shipped TUI looked bad; redesign it to convey run status and support live-following legibly. [user 2026-08-15]
+- Direction is a "factory shift board": a colour-coded status board. [user]
+- Agents can review the TUI's look on both light and dark themes. [user]
+- Detail nav is a focusable-pane model: up/down navigate agents, left/right select the pane; default focus is the crew rail. [user]
+- One-line keybinding footer. [user]
+- Keep the health words visible on the board (not colour-only). [user]
+- The interactive demo is rebuilt on the shipped views (not retired, not a separate prototype). [user, D1]
 
 ## Startup admin seed
 
