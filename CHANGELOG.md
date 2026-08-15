@@ -4,6 +4,20 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [0.38.1] - 2026-08-15
+
+### Fixed
+
+- **TUI: the crew/transcript `│` separator no longer zigzags (#327).** In the
+  `uzi tui` run-detail view, a crew-rail line longer than the fixed rail width
+  (a long lane label such as "Sweep terraform occurrences + seed mapping", or a
+  wide-rune role name) was left unpadded, so the column divider was pushed right
+  and landed at a different position on each row. `joinColumns` now clamps every
+  left cell to `laneRailWidth` visual columns (ANSI- and wide-rune-aware, via
+  `ansi.Truncate` with an ellipsis) before padding, so the `│` sits at one fixed
+  column on every row regardless of label or name length. Display-only fix; the
+  `laneLabelCap` rune sanitation cap is unchanged. (#327)
+
 ## [0.38.0] - 2026-08-15
 
 ### Added
