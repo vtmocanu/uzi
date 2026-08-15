@@ -96,9 +96,6 @@ type tuiModel struct {
 	quitting  bool
 	ctrlCSeen bool
 	showHelp  bool
-
-	// err is the last fatal-ish error, rendered as a line rather than a crash (D8).
-	err error
 }
 
 func newTUIModel(ctx context.Context, c uzicli.Client, startRun string) tuiModel {
@@ -406,6 +403,7 @@ func (m tuiModel) renderHelp() string {
 
 // newTUICmd wires `uzi tui [run-id]`.
 func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
+	var demo bool
 	cmd := &cobra.Command{
 		Use:   "tui [run-id]",
 		Short: "Watch runs live in a full-screen terminal UI",
@@ -420,6 +418,11 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 				return uzicli.Exitf(uzicli.ExitUsage,
 					"this command needs an interactive terminal (stdout is not a TTY). "+
 						"For scripting use `uzi run list --json` and `uzi run logs <id> --follow`.")
+			}
+			// --demo runs the interactive TUI over seeded fixtures with no server (PRD #325
+			// M7): a hidden showcase that drives the SHIPPED views, so it cannot drift.
+			if demo {
+				return runTUIDemo(cmd.Context(), env)
 			}
 			c, err := env.client(gf)
 			if err != nil {
@@ -438,6 +441,8 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&demo, "demo", false, "run a self-contained demo over seeded fixtures (no server)")
+	_ = cmd.Flags().MarkHidden("demo")
 	return cmd
 }
 

@@ -174,9 +174,11 @@ func (m tuiModel) renderReviewOverlay() string {
 	}
 
 	rv := r.review
-	// verdict is a CLOSED enum, so it is safe to branch on and safe to render as a
-	// chip. triageLine is the shared tally renderer.
-	sb.WriteString(m.pal.title.Render("verdict: "+m.renderer.Plain(rv.Verdict, 16)) +
+	// verdict is a CLOSED enum, so it is safe to branch on and safe to render as a chip.
+	// PRD #325 M6: the chip is coloured by SEVERITY (issues → red, ideal/ok → teal) via the
+	// shared verdictColor, so it no longer reads in the same brand-blue as everything else.
+	// triageLine is the shared tally renderer (also used by `uzi review show`).
+	sb.WriteString(m.pal.faint.Render("verdict ") + m.pal.chip(m.renderer.Plain(rv.Verdict, 16), m.pal.verdictColor(rv.Verdict)) +
 		"   " + m.pal.faint.Render(cellText(triageLine(rv.Triage))) + "\n\n")
 
 	if rv.SummaryMd != "" {

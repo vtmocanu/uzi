@@ -15,6 +15,14 @@ import (
 // laneRailWidth is the left rail's fixed column budget.
 const laneRailWidth = 26
 
+// The detail view has two focusable panes (PRD #325 M4). ←/→ (and tab) move focus between
+// them; ↑/↓ act WITHIN the focused pane — between agents on the rail, scrolling the
+// transcript. The zero value is focusRail, so a run opens focused on the crew rail.
+const (
+	focusRail = iota
+	focusTranscript
+)
+
 // detailState is one run's live view: the lane rail plus the selected lane's
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
@@ -26,9 +34,15 @@ type detailState struct {
 	frames []laneFrame
 	seen   map[int32]bool
 
-	lanes     []agentLane
-	laneIdx   int
+	lanes   []agentLane
+	laneIdx int
+	// scroll is the transcript window's TOP line index (M5, bottom-anchored). When follow
+	// is true the window is pinned to the bottom (auto-tail) and scroll is recomputed on
+	// render; when paused, scroll is the fixed top so the view does not jump as frames
+	// arrive below it.
 	scroll    int
+	focus     int  // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
+	follow    bool // M5: auto-tail the transcript (tail -f). Reset true on open / lane switch.
 	loaded    bool
 	loadErr   error
 	stream    *uzicli.RunStream
@@ -44,7 +58,7 @@ type detailState struct {
 }
 
 func newDetailState(runID string) detailState {
-	return detailState{runID: runID, seen: map[int32]bool{}}
+	return detailState{runID: runID, seen: map[int32]bool{}, follow: true}
 }
 
 func (d *detailState) applyLoaded(msg detailLoadedMsg) {
@@ -120,8 +134,8 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	// The overlay and the steer bar get first refusal, in that order: while either is
-	// in an input/confirm mode it must swallow keys that would otherwise be lane
-	// navigation, or typing "l" into a follow-up would switch lanes underneath it.
+	// in an input/confirm mode it must swallow keys that would otherwise be pane
+	// navigation, or typing "l" into a follow-up would move pane focus underneath it.
 	if nm, cmd, handled := m.reviewKey(k); handled {
 		return nm, cmd
 	}
@@ -146,23 +160,75 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, m.fetchRunsCmd(m.board.admin)
 	case keyRefresh:
 		return m, m.loadDetailCmd(m.detail.runID)
-	case keyTab, "l", keyRight:
-		if n := len(m.detail.lanes); n > 0 {
-			m.detail.laneIdx = (m.detail.laneIdx + 1) % n
-			m.detail.scroll = 0
-		}
+	case keyTab:
+		// tab cycles focus between the two panes.
+		m.detail.focus = 1 - m.detail.focus
 		return m, nil
 	case "h", keyLeft:
-		if n := len(m.detail.lanes); n > 0 {
-			m.detail.laneIdx = (m.detail.laneIdx - 1 + n) % n
-			m.detail.scroll = 0
-		}
+		m.detail.focus = focusRail
+		return m, nil
+	case "l", keyRight:
+		m.detail.focus = focusTranscript
+		return m, nil
+	case keyGoLive:
+		// g: re-attach follow and jump to the newest output (M5). f is already follow-up.
+		m.detail.follow = true
 		return m, nil
 	}
 	if d := motionDelta(k); d != 0 {
-		m.detail.scroll += d
+		if m.detail.focus == focusRail {
+			// Move between agents. One step per press regardless of the motion size
+			// (page keys are meaningless for a short lane list). Switching lanes re-arms
+			// follow so the new lane opens tailing its newest output.
+			if n := len(m.detail.lanes); n > 0 {
+				step := 1
+				if d < 0 {
+					step = -1
+				}
+				m.detail.laneIdx = (m.detail.laneIdx + step + n) % n
+				m.detail.scroll, m.detail.follow = 0, true
+			}
+			return m, nil
+		}
+		// Transcript focused: bottom-anchored scroll (M5). Scrolling UP detaches follow and
+		// moves the window's top up; scrolling DOWN moves it toward the bottom and re-arms
+		// follow on a LIVE run once it reaches the newest line.
+		total, vp := m.transcriptExtent()
+		maxTop := total - vp
+		if maxTop < 0 {
+			maxTop = 0
+		}
+		// F-M5a: reclamp the stored top against the CURRENT extent BEFORE applying the
+		// delta. A resize (WindowSizeMsg) since it was set can leave scroll above the new
+		// maxTop; applying the delta to that stale value would push it past the bottom clamp
+		// below and wrongly re-arm follow on the next key instead of scrolling to older
+		// output.
+		if m.detail.scroll > maxTop {
+			m.detail.scroll = maxTop
+		}
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
+		}
+		if d < 0 { // up, toward older
+			if m.detail.follow {
+				m.detail.follow = false
+				m.detail.scroll = maxTop
+			}
+			m.detail.scroll += d // d is negative
+		} else { // down, toward newest
+			if m.detail.follow {
+				return m, nil // already at the bottom
+			}
+			m.detail.scroll += d
+		}
+		if m.detail.scroll < 0 {
+			m.detail.scroll = 0
+		}
+		if m.detail.scroll >= maxTop {
+			m.detail.scroll = maxTop
+			if isLiveRunStatus(m.detail.run.Status) {
+				m.detail.follow = true
+			}
 		}
 		return m, nil
 	}
@@ -173,18 +239,31 @@ func (m tuiModel) renderDetail() string {
 	d := &m.detail
 	var sb strings.Builder
 
-	head := "run " + shortRunID(d.runID)
+	// Header: id + a kind chip + a semantic STATUS chip (PRD #325 M3, reading M2's
+	// statusColor/chip seam). "stalled" already turns the status chip orange via the
+	// precedence rule; because that colour vanishes under NO_COLOR, M4 appends a
+	// NO_COLOR-safe cue for it (▲ + "stalled") as well as the word for any other non-ok
+	// health, so no health state is lost when colour is stripped.
+	head := m.pal.faint.Render("run ") + m.pal.title.Render(shortRunID(d.runID))
 	if d.run.ID != "" {
-		head += " · " + m.renderer.Plain(d.run.Status, 20)
-		if h := d.run.Health; h != "" && h != "ok" {
-			head += " · " + m.renderer.Plain(h, 20)
+		if d.run.Kind != "" {
+			head += "  " + m.pal.chip(m.renderer.Plain(d.run.Kind, 10), m.pal.title.GetForeground())
 		}
+		head += "  " + m.pal.chip(m.renderer.Plain(d.run.Status, 18), m.pal.statusColor(d.run.Status, d.run.Health))
+		if h := d.run.Health; h != "" && h != "ok" {
+			// A NO_COLOR-safe health cue (M4 review nit): without it a stalled run's only
+			// header signal is the orange chip colour, which vanishes under an Ascii
+			// profile. "stalled" gets a ▲ glyph + word (the glyph survives the colour
+			// strip); any other non-ok health shows its word, as the board does.
+			if h == "stalled" {
+				head += "  " + lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲ "+m.renderer.Plain(h, 14))
+			} else {
+				head += "  " + m.renderer.Plain(h, 14)
+			}
+		}
+		head += "  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60))
 	}
-	sb.WriteString(m.pal.title.Render(head))
-	if d.run.ID != "" {
-		sb.WriteString("  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60)))
-	}
-	sb.WriteString("\n")
+	sb.WriteString(head + "\n")
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -231,9 +310,88 @@ func (m tuiModel) renderDetail() string {
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(joinColumns(rail, body, laneRailWidth))
-	sb.WriteString(m.renderSteerBar() + "\n")
-	sb.WriteString(m.pal.faint.Render("tab/h/l lane · j/k scroll · r refresh · esc back · ? keys"))
+	// The attention banner (PRD #325 M3) shows regardless of ownership — it is
+	// informational. The owner-gated action keys live in the footer below it.
+	if b := m.detailBanner(); b != "" {
+		sb.WriteString(b + "\n")
+	}
+	// Steer status (queue indicator, notice, typing input, confirm box, or the read-only
+	// reason) renders above the footer when present. When the bar is mid-input it owns the
+	// key hints, so the single combined footer is drawn only when the bar is idle (M4).
+	if steer := m.renderSteerBar(); steer != "" {
+		sb.WriteString(steer + "\n")
+	}
+	if m.detail.steer.mode == steerIdle {
+		sb.WriteString(m.detailFooter())
+	}
 	return sb.String()
+}
+
+// detailFooter is the single-line keymap (PRD #325 M4): pane/scroll navigation combined
+// with the owner's steer actions, with approve/reject leading at a plan gate. The steer
+// bar's interactive modes draw their own hints, so this is only emitted when idle.
+func (m tuiModel) detailFooter() string {
+	owner := m.detail.steer.access == steerAllowed
+	var parts []string
+	if owner && atPlanGate(m.detail.run) {
+		parts = append(parts, m.keyHint("y", "approve"), m.keyHint("n", "reject"),
+			m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"),
+			m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+	} else {
+		parts = append(parts, m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+		if isLiveRunStatus(m.detail.run.Status) {
+			// g re-attaches the transcript follow (M5); it is a view affordance, so it shows
+			// for owner and non-owner alike, but only when there is live output to follow.
+			parts = append(parts, m.keyHint("g", "live"))
+		}
+		if owner {
+			parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("v", "review"), m.keyHint("x", "cancel"))
+		}
+	}
+	parts = append(parts, m.keyHint("esc", "back"), m.keyHint("?", "keys"))
+	return strings.Join(parts, m.pal.faint.Render(" · "))
+}
+
+// keyHint is a compact bright-key / muted-label footer hint.
+func (m tuiModel) keyHint(k, label string) string {
+	return m.pal.title.Render(k) + m.pal.faint.Render(" "+label)
+}
+
+// paneTitle renders a detail pane's title with a focus indicator: a bright brand bar + bold
+// title when focused, a dim title otherwise (M4).
+func (m tuiModel) paneTitle(title string, focused bool) string {
+	if focused {
+		return m.pal.title.Render("▎" + strings.ToUpper(title))
+	}
+	return " " + m.pal.faint.Render(strings.ToUpper(title))
+}
+
+// detailBanner is the S3 two-banner treatment: awaiting_approval gets the PLAN GATE banner
+// (approve/reject, owner-gated keys in the steer bar); awaiting_input gets a DISTINCT
+// needs-input banner that does NOT offer y/n — those keys do nothing at a clarification
+// park, which is answered off-TUI (run answer / web / Slack). It shows for owner and
+// non-owner alike; only the promoted keys below are gated.
+func (m tuiModel) detailBanner() string {
+	switch m.detail.run.Status {
+	case "awaiting_approval":
+		return m.attentionBanner("⚑  PLAN GATE", "this run is waiting on your approval")
+	case "awaiting_input":
+		return m.attentionBanner("✎  NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack")
+	}
+	return ""
+}
+
+// attentionBanner draws a BORDERED amber banner. The border is the NO_COLOR fallback (D3):
+// under an Ascii profile the amber fill/foreground is stripped but the box and its bold
+// text survive, so the gate stays structurally unmissable (SC2) without colour.
+func (m tuiModel) attentionBanner(head, body string) string {
+	c := m.pal.statusColor("awaiting_approval", "") // the needs-you colour (amber)
+	inner := m.width - 4
+	if inner < 20 {
+		inner = 20
+	}
+	text := lipgloss.NewStyle().Bold(true).Foreground(c).Render(head) + m.pal.faint.Render("  ·  ") + body
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c).Padding(0, 1).Width(inner).Render(text)
 }
 
 func (m tuiModel) renderLaneRail() string {
@@ -242,7 +400,7 @@ func (m tuiModel) renderLaneRail() string {
 	active := activeLaneKey(d.run.Status, d.frames)
 
 	var sb strings.Builder
-	sb.WriteString(m.pal.faint.Render("AGENTS") + "\n")
+	sb.WriteString(m.paneTitle("crew", d.focus == focusRail) + "\n")
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
 		return sb.String()
@@ -273,24 +431,100 @@ func (m tuiModel) renderLaneRail() string {
 	return sb.String()
 }
 
-func (m tuiModel) renderTranscript() string {
-	lane, ok := m.detail.selectedLane()
-	if !ok {
-		return m.pal.faint.Render("no lane selected")
-	}
+// buildTranscriptLines renders the selected lane's frames to display lines (no windowing),
+// so the follow/scroll windowing and the line-count extent share one layout.
+func (m tuiModel) buildTranscriptLines(lane agentLane) []string {
 	var sb strings.Builder
 	for _, f := range lane.Frames {
 		sb.WriteString(m.pal.faint.Render("#"+itoa(int(f.Seq))+" "+m.renderer.Plain(f.Kind, 16)) + "\n")
 		sb.WriteString(m.renderer.Markdown(transcriptText(f)) + "\n\n")
 	}
-	out := strings.Split(sb.String(), "\n")
-	if m.detail.scroll < len(out) {
-		out = out[m.detail.scroll:]
+	return strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+}
+
+// transcriptViewport is the transcript's visible line budget (the pane title is a fixed
+// header above it, so it is one row shorter than the pane).
+func (m tuiModel) transcriptViewport() int {
+	if h := m.height - 11; h > 3 {
+		return h
 	}
-	if h := m.height - 10; h > 0 && len(out) > h {
-		out = out[:h]
+	return 3
+}
+
+// transcriptExtent gives the selected lane's total line count and the viewport, so the key
+// handler can clamp the scroll offset against the same layout renderTranscript uses.
+func (m tuiModel) transcriptExtent() (total, viewport int) {
+	viewport = m.transcriptViewport()
+	if lane, ok := m.detail.selectedLane(); ok {
+		total = len(m.buildTranscriptLines(lane))
 	}
-	return strings.Join(out, "\n")
+	return total, viewport
+}
+
+func (m tuiModel) renderTranscript() string {
+	focused := m.detail.focus == focusTranscript
+	lane, ok := m.detail.selectedLane()
+	if !ok {
+		return m.paneTitleBadge("transcript", focused, "") + "\n" + m.pal.faint.Render("no lane selected")
+	}
+	lines := m.buildTranscriptLines(lane)
+	vp := m.transcriptViewport()
+
+	// Bottom-anchored window (PRD #325 M5). Following pins the window to the bottom
+	// (auto-tail); paused holds a fixed top line so the view does not jump as frames land
+	// below it, and the count of lines below the fold is what the badge reports.
+	maxTop := len(lines) - vp
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	top := m.detail.scroll
+	if m.detail.follow || top > maxTop {
+		top = maxTop
+	}
+	if top < 0 {
+		top = 0
+	}
+	end := top + vp
+	if end > len(lines) {
+		end = len(lines)
+	}
+	window := strings.Join(lines[top:end], "\n")
+
+	return m.paneTitleBadge("transcript", focused, m.followBadge(top, maxTop)) + "\n" + window
+}
+
+// followBadge is the transcript's live-follow affordance (M5) — distinct from the transport
+// line, which is about THIS CLIENT's connection. Only a LIVE run tails: a terminal run's
+// transcript is complete, so it carries no badge. FOLLOWING while auto-tailing; PAUSED with
+// a "↓N new" count (N = lines below the fold) once the reader has scrolled back.
+func (m tuiModel) followBadge(top, maxTop int) string {
+	if !isLiveRunStatus(m.detail.run.Status) {
+		return ""
+	}
+	if m.detail.follow {
+		return lipgloss.NewStyle().Foreground(m.pal.statusColor("running", "")).Bold(true).Render("● FOLLOWING")
+	}
+	badge := lipgloss.NewStyle().Foreground(m.pal.statusColor("awaiting_approval", "")).Bold(true).Render("⏸ PAUSED")
+	if below := maxTop - top; below > 0 {
+		badge += m.pal.faint.Render(" ↓" + itoa(below) + " new")
+	}
+	return badge
+}
+
+// paneTitleBadge is paneTitle with a right-aligned badge (the follow indicator) padded to
+// the transcript column width.
+func (m tuiModel) paneTitleBadge(title string, focused bool, badge string) string {
+	t := m.paneTitle(title, focused)
+	if badge == "" {
+		return t
+	}
+	return padVisual(t, m.transcriptWidth()-visualWidth(badge)) + badge
+}
+
+// isLiveRunStatus reports whether a run is actively producing output, so follow-live
+// applies. `claimed` is live like `running` (a worker has it and is about to speak).
+func isLiveRunStatus(status string) bool {
+	return status == "running" || status == "claimed"
 }
 
 // transcriptText pulls the human-readable body out of a frame's payload. The payload

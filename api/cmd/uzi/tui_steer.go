@@ -188,11 +188,10 @@ func (m tuiModel) renderSteerBar() string {
 		sb.WriteString(m.pal.title.Render("follow-up> ") + cellText(s.input) + "▌")
 		sb.WriteString("\n" + m.pal.faint.Render("enter send · esc cancel"))
 	default:
-		keys := []string{"f follow-up", "x cancel run", "v review"}
-		if atPlanGate(m.detail.run) {
-			keys = append([]string{"y approve", "n reject"}, keys...)
-		}
-		sb.WriteString(m.pal.faint.Render(strings.Join(keys, " · ")))
+		// Idle: the action keys (follow-up, cancel, review, and approve/reject at a plan
+		// gate) live in the detail footer now (PRD #325 M4), so this case emits only the
+		// queue indicator and notice already written above. The ownership gate still holds
+		// — a non-owner returned above with the read-only reason and never reaches here.
 	}
 	return sb.String()
 }

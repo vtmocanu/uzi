@@ -3947,7 +3947,7 @@ say "PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed a
 
 # THE CATEGORY IS NOT FREE-FORM, and this cost a rewrite: review_recommendations carries
 # CHECK (category IN ('enable_tool','install_worker_tool','adjust_template','improve_agent',
-# 'add_agent','improve_uzi')), so the invented `e2e_b4` this block first used would have
+# 'add_agent','improve_uzi','cost_efficiency')), so the invented `e2e_b4` this block first used would have
 # aborted the run on its very first INSERT. Measured against a throwaway Postgres before
 # committing, not discovered by a 30-minute harness run.
 #

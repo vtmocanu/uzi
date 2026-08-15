@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"image/color"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +200,111 @@ func TestTUIQuitIsConfirmed(t *testing.T) {
 	}
 }
 
+// M3: the plan gate shows the amber PLAN GATE banner and, for the OWNER, promoted
+// approve/reject keycaps; the detail header carries a semantic status chip.
+func TestTUIDetailPlanGateBanner(t *testing.T) {
+	runID := "pg-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // err nil → owner → steerAllowed
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "PLAN GATE") {
+		t.Errorf("plan-gate banner missing\n%s", out)
+	}
+	// The owner's footer leads with approve/reject at the gate (M4 one-line footer).
+	for _, want := range []string{"approve", "reject"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan gate does not offer %q for the owner\n%s", want, out)
+		}
+	}
+	// The header status chip is a solid colour fill (a truecolor background SGR).
+	if !strings.Contains(out, "\x1b[48;2;") {
+		t.Errorf("detail header has no status chip fill\n%s", out)
+	}
+}
+
+// M3 S3: awaiting_input gets a DISTINCT banner and NEVER offers y/n — those keys do
+// nothing at a clarification park (which is answered off-TUI).
+func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
+	runID := "in-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_input"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // owner
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "NEEDS INPUT") {
+		t.Errorf("awaiting_input banner missing\n%s", out)
+	}
+	if strings.Contains(out, "PLAN GATE") {
+		t.Errorf("awaiting_input must NOT show the plan-gate banner\n%s", out)
+	}
+	if strings.Contains(out, "[y]") || strings.Contains(out, "approve") {
+		t.Errorf("awaiting_input offered approve/reject, which does nothing at a clarification park\n%s", out)
+	}
+}
+
+// M3 N1: the plan-gate banner shows for a NON-OWNER (informational), but the promoted
+// approve/reject keys are ownership-gated and must not appear.
+func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
+	runID := "pg-2"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
+	m = next.(tuiModel)
+	// RunInputs 404 → steerNotOwner (an admin observing another user's run).
+	next, _ = m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "PLAN GATE") {
+		t.Errorf("the plan-gate banner must show even for a non-owner\n%s", out)
+	}
+	if strings.Contains(out, "[y]") || strings.Contains(out, "approve") {
+		t.Errorf("a non-owner must not be offered approve/reject keys\n%s", out)
+	}
+	if !strings.Contains(out, "read-only") {
+		t.Errorf("the non-owner steer bar should explain it is read-only\n%s", out)
+	}
+}
+
+// M6: the review overlay colours the verdict chip by SEVERITY (issues red, ideal teal) via
+// the shared verdictColor, not the old uniform brand-blue. Asserted through the chip's
+// background-fill SGR, and that the two verdicts resolve to different colours.
+func TestTUIReviewVerdictSeverityColour(t *testing.T) {
+	render := func(verdict string) string {
+		runID := "rv-" + verdict
+		m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+		next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "completed"}})
+		m = next.(tuiModel)
+		m = press(t, m, "v")
+		next, _ = m.Update(reviewLoadedMsg{runID: runID, review: &apitypes.ReviewDTO{Verdict: verdict}})
+		m = next.(tuiModel)
+		return m.View().Content
+	}
+	pal := newPalette(true)
+	issuesBg := bgFillSGR(pal.verdictColor("issues"))
+	idealBg := bgFillSGR(pal.verdictColor("ideal"))
+	if issuesBg == idealBg {
+		t.Fatal("issues and ideal resolve to the same colour; the severity test cannot distinguish them")
+	}
+	if out := render("issues"); !strings.Contains(out, issuesBg) {
+		t.Errorf("the issues verdict chip is not the failed (red) colour %q\n%s", issuesBg, out)
+	}
+	if out := render("ideal"); !strings.Contains(out, idealBg) {
+		t.Errorf("the ideal verdict chip is not the completed (teal) colour %q\n%s", idealBg, out)
+	}
+}
+
+// bgFillSGR is the truecolor background SGR lipgloss emits for a chip's fill.
+func bgFillSGR(c color.Color) string {
+	r, g, b, _ := c.RGBA()
+	return fmt.Sprintf("48;2;%d;%d;%d", r>>8, g>>8, b>>8)
+}
+
 // The detail view: replay builds lanes, and a live frame extends them.
 func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	now := time.Now()
@@ -329,9 +436,10 @@ func TestTUIDetailIgnoresRepliesForAnotherRun(t *testing.T) {
 	}
 }
 
-// Lane switching cycles both ways and resets the scroll, so a long lane does not
-// leave the next one scrolled past its start.
-func TestTUIDetailLaneSwitching(t *testing.T) {
+// M4: the detail view has two focusable panes. ←/→ (and tab) select the pane; ↑/↓ act
+// WITHIN it — moving between agents on the rail, scrolling the transcript. Default focus is
+// the crew rail; the focused pane title carries the ▎ marker.
+func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 	now := time.Now()
 	runID := "77777777-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
@@ -345,26 +453,180 @@ func TestTUIDetailLaneSwitching(t *testing.T) {
 	})
 	m = next.(tuiModel)
 
-	m = press(t, m, "j") // scroll down within the lane
-	if m.detail.scroll == 0 {
-		t.Fatal("j did not scroll the transcript")
+	// Detail opens focused on the crew rail.
+	if m.detail.focus != focusRail {
+		t.Fatalf("detail opened focused on pane %d, want the crew rail", m.detail.focus)
 	}
-	m = press(t, m, keyTab)
+	// With the rail focused, j moves BETWEEN agents (it does not scroll).
+	m = press(t, m, "j")
 	if m.detail.laneIdx != 1 {
-		t.Errorf("tab moved to lane %d, want 1", m.detail.laneIdx)
+		t.Errorf("j on the focused rail moved to lane %d, want 1", m.detail.laneIdx)
 	}
 	if m.detail.scroll != 0 {
-		t.Error("switching lanes did not reset the scroll; the new lane opens mid-transcript")
+		t.Errorf("j on the rail scrolled the transcript (scroll=%d); it should move agents", m.detail.scroll)
 	}
-	// Wrap-around in both directions.
-	m = press(t, m, keyTab)
-	m = press(t, m, keyTab)
+
+	// → focuses the transcript; now ↑/↓ drive the transcript and do NOT change the agent.
+	// (Scroll amount is M5's concern and needs a transcript taller than the viewport; here
+	// the point is only that the agent selection no longer responds to ↑/↓.)
+	m = press(t, m, keyRight)
+	if m.detail.focus != focusTranscript {
+		t.Fatal("→ did not focus the transcript")
+	}
+	lane := m.detail.laneIdx
+	m = press(t, m, "k")
+	if m.detail.laneIdx != lane {
+		t.Error("↑ on the transcript changed the selected agent; it should scroll the transcript")
+	}
+
+	// ← returns focus to the rail; moving agents resets the scroll and wraps.
+	m = press(t, m, keyLeft)
+	if m.detail.focus != focusRail {
+		t.Fatal("← did not focus the crew rail")
+	}
+	m = press(t, m, "k")
 	if m.detail.laneIdx != 0 {
-		t.Errorf("tab did not wrap to lane 0, got %d", m.detail.laneIdx)
+		t.Errorf("k on the rail moved to lane %d, want 0", m.detail.laneIdx)
 	}
-	m = press(t, m, "h")
+	if m.detail.scroll != 0 {
+		t.Error("moving agents did not reset the scroll")
+	}
+	m = press(t, m, "k") // wrap backwards past the first lane
 	if m.detail.laneIdx != 2 {
-		t.Errorf("h did not wrap backwards to the last lane, got %d", m.detail.laneIdx)
+		t.Errorf("k did not wrap to the last lane, got %d", m.detail.laneIdx)
+	}
+
+	// tab cycles focus, and the focused pane title carries the ▎ marker.
+	m = press(t, m, keyTab)
+	if m.detail.focus != focusTranscript {
+		t.Errorf("tab did not cycle focus to the transcript (got %d)", m.detail.focus)
+	}
+	if !strings.Contains(m.View().Content, "▎") {
+		t.Error("no focus indicator (▎) rendered on the focused pane")
+	}
+}
+
+// M4: the detail keymap is a SINGLE line — navigation and the owner's actions combined,
+// not the pre-M4 two-line (steer key list + separate nav footer) region.
+func TestTUIDetailFooterIsOneLine(t *testing.T) {
+	runID := "foot-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // owner → steerAllowed
+	m = next.(tuiModel)
+
+	lines := strings.Split(strings.TrimRight(m.View().Content, "\n"), "\n")
+	last := lines[len(lines)-1]
+	// Navigation ("pane"/"move") and an action ("follow-up") share the ONE footer line.
+	for _, want := range []string{"pane", "move", "follow-up"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("the detail footer is not one combined line (missing %q)\nlast line: %q", want, last)
+		}
+	}
+}
+
+// M5: a live run's transcript follows (tail -f, bottom-anchored) with ● FOLLOWING; a new
+// frame auto-tails; scrolling up detaches to ⏸ PAUSED with a "↓N new" count; g re-attaches.
+func TestTUIDetailFollowLive(t *testing.T) {
+	now := time.Now()
+	runID := "live-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.height = 16 // small viewport (vp = height-11 = 5) so a handful of frames overflow
+
+	var msgs []apitypes.MessageDTO
+	for i := int32(1); i <= 8; i++ {
+		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
+	}
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
+	m = next.(tuiModel)
+	m = press(t, m, keyRight) // focus the transcript so ↑/↓ scroll it
+
+	// A live run opens FOLLOWING, bottom-anchored: the newest frame shows, the oldest does not.
+	if !m.detail.follow {
+		t.Fatal("a live run should open following")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "FOLLOWING") {
+		t.Errorf("the FOLLOWING indicator is not shown while tailing\n%s", out)
+	}
+	if !strings.Contains(out, "frame 8") || strings.Contains(out, "frame 1 body") {
+		t.Errorf("following is not bottom-anchored (newest visible, oldest hidden)\n%s", out)
+	}
+	// F-M5b: the window shows EXACTLY the viewport's worth of lines — a whole-frame
+	// bottom-anchored check alone would miss an end-side ±1 in the window height.
+	trLines := strings.Split(m.renderTranscript(), "\n")
+	if body := len(trLines) - 1; body != m.transcriptViewport() { // line 0 is the pane title
+		t.Errorf("transcript window has %d lines, want the viewport %d", body, m.transcriptViewport())
+	}
+
+	// A new frame while following auto-tails to the newest.
+	agent, at := "lead", now
+	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"frame 9 body"}`),
+	}}})
+	m = next.(tuiModel)
+	if !m.detail.follow || !strings.Contains(m.View().Content, "frame 9") {
+		t.Error("a new frame while following did not auto-tail to the newest")
+	}
+
+	// Scrolling up detaches to PAUSED, reporting the lines below the fold.
+	m = press(t, m, "k")
+	if m.detail.follow {
+		t.Error("scrolling up did not detach follow")
+	}
+	paused := m.View().Content
+	if !strings.Contains(paused, "PAUSED") {
+		t.Errorf("the PAUSED indicator is not shown after scrolling up\n%s", paused)
+	}
+	if !strings.Contains(paused, "↓1 new") {
+		t.Errorf("PAUSED does not report one line below the fold\n%s", paused)
+	}
+
+	// g re-attaches follow and jumps to the newest.
+	m = press(t, m, keyGoLive)
+	if !m.detail.follow {
+		t.Error("g did not re-attach follow")
+	}
+	if !strings.Contains(m.View().Content, "FOLLOWING") {
+		t.Error("g did not restore the FOLLOWING indicator")
+	}
+}
+
+// F-M5a: a paused scroll that a resize leaves ABOVE the new maxTop must not re-arm follow
+// on the next UP. Repro: pause near the bottom (scroll = maxTop-1), resize TALLER (bigger
+// viewport → smaller maxTop, so the stored scroll is now stale), then UP — follow must stay
+// detached and the window must scroll toward OLDER output, not jump to the live tail.
+func TestTUIDetailPausedScrollSurvivesResize(t *testing.T) {
+	now := time.Now()
+	runID := "resize-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.height = 16 // vp = 5
+	var msgs []apitypes.MessageDTO
+	for i := int32(1); i <= 8; i++ {
+		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
+	}
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
+	m = next.(tuiModel)
+	m = press(t, m, keyRight) // focus the transcript
+
+	m = press(t, m, "k") // one scroll up → paused, scroll = maxTop-1
+	if m.detail.follow {
+		t.Fatal("scrolling up did not detach follow")
+	}
+	pausedScroll := m.detail.scroll
+
+	// Resize taller: the viewport grows, so maxTop shrinks below the stored scroll.
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	m = next.(tuiModel)
+
+	m = press(t, m, "k") // UP: scroll toward older output, stay paused
+	if m.detail.follow {
+		t.Errorf("UP after resizing taller wrongly re-armed follow; the stale paused scroll %d was not reclamped to the new maxTop", pausedScroll)
+	}
+	if m.detail.scroll >= pausedScroll {
+		t.Errorf("UP did not scroll toward older output after the resize (scroll %d, was %d)", m.detail.scroll, pausedScroll)
 	}
 }
 
@@ -416,6 +678,58 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	})
 	detail = next.(tuiModel)
 	assertNoRawControls(t, "detail", detail.View().Content)
+
+	// The ADMIN board is the only view that draws OwnerEmail (PRD #325 M2, B1). A hostile
+	// OwnerEmail must not emit control bytes into the frame. The clean-fixture screenshots
+	// cannot catch this, so this is the guard. OwnerEmail is *string, so bind a local.
+	owner := nasty
+	adminRuns := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty}, OwnerEmail: &owner},
+	}
+	adm := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	adm = press(t, adm, keyAdmin)
+	next, _ = adm.Update(boardRunsMsg{admin: true, runs: adminRuns})
+	adm = next.(tuiModel)
+	admOut := adm.View().Content
+	if !strings.Contains(admOut, "OWNER") {
+		t.Fatalf("the admin board is not showing the OWNER column, so this test is not exercising the OwnerEmail render path\n%s", admOut)
+	}
+	assertNoRawControls(t, "admin board", admOut)
+}
+
+// M2: the board encodes run status as a colour chip + spine and a summary bar. Automatable
+// via the View() substring / SGR seam so CI gates the semantics per milestone (B2).
+func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
+	issues := "issues"
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "two"}},
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "three"}},
+		{RunDTO: apitypes.RunDTO{ID: "dddddddd-4", Kind: "issue", Status: "running", Health: "looping", IssueTitle: "four"}},
+		{RunDTO: apitypes.RunDTO{ID: "eeeeeeee-5", Kind: "issue", Status: "completed", IssueTitle: "five"}, JudgeVerdict: &issues, JudgeTodoCount: 2},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	// "looping" is NOT stalled, so it is not counted as stalled — but its WORD must show in
+	// the HEALTH column (restored, not reduced to a faint marker). F4: the judge marker
+	// carries the todo count ("issues · 2") when JudgeTodoCount > 0.
+	for _, want := range []string{"5 runs", "1 needs you", "1 stalled", "looping", "issues · 2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("board missing %q\n%s", want, out)
+		}
+	}
+	// The status chip + spine are solid colour fills: a truecolor background SGR (48;2;…).
+	// Plain status text alone (the old board) would carry no background fill.
+	if !strings.Contains(out, "\x1b[48;2;") {
+		t.Errorf("board has no background-fill SGR; the status chip/spine colour is missing\n%s", out)
+	}
+	// The NO_COLOR-safe spine glyph for a running run survives independent of colour.
+	if !strings.Contains(out, statusGlyph("running")) {
+		t.Errorf("running spine glyph %q absent from the board\n%s", statusGlyph("running"), out)
+	}
 }
 
 // assertNoRawControls fails on anything in a rendered frame that is not printable text

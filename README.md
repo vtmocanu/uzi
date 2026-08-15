@@ -80,6 +80,7 @@ browsable in-app under **Docs**:
 - [Auth design](docs/auth-design.md)
 - [Proc hardening](docs/proc-hardening.md)
 - [Developer conventions](docs/dev-conventions.md)
+- [Why a hosted run costs less](docs/run-cost.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 

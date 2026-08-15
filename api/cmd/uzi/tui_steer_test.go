@@ -129,9 +129,26 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	if m.detail.steer.input != wantBody {
 		t.Fatalf("typed input = %q, want %q", m.detail.steer.input, wantBody)
 	}
-	// Lane-navigation keys must NOT fire while typing — "h" and "l" are lane keys.
-	if m.detail.laneIdx != 0 {
-		t.Error("typing into the follow-up moved the lane selection; the input must swallow lane keys")
+	// Now press the ACTUAL focus-change keys while still typing. steerTyping must swallow
+	// them (M4 N2), so the pane focus and lane stay put and the typed body is untouched.
+	// Pressing them is what BINDS this: single-rune typing alone never challenges focus, so
+	// without these presses the assertions are vacuous — a mutation leaking focus keys
+	// during typing left this test green until it did. Assert after EACH press: →left then
+	// tab would toggle the focus back to the rail and hide a leak.
+	for _, k := range []string{keyRight, keyLeft, keyTab} {
+		m = press(t, m, k)
+		if m.detail.steer.mode != steerTyping {
+			t.Fatalf("%q ended the follow-up typing; steerTyping must swallow focus keys", k)
+		}
+		if m.detail.focus != focusRail {
+			t.Errorf("%q changed the pane focus while typing a follow-up (focus=%d); steerTyping must swallow it", k, m.detail.focus)
+		}
+		if m.detail.laneIdx != 0 {
+			t.Errorf("%q moved the lane selection while typing a follow-up", k)
+		}
+	}
+	if m.detail.steer.input != wantBody {
+		t.Errorf("a swallowed focus key altered the typed input: %q", m.detail.steer.input)
 	}
 
 	_, cmd := m.handleKey(keyEnter)
@@ -244,8 +261,11 @@ func TestSteerApproveOnlyAtThePlanGate(t *testing.T) {
 	gate := ownedRun(runID)
 	gate.Status = "awaiting_approval"
 	m := ownerModel(t, &uzicli.FakeClient{}, runID, gate)
-	if !strings.Contains(m.View().Content, "y approve") {
-		t.Error("the approve key is not offered at the plan gate")
+	// M4: the plan-gate keys live in the one-line footer as bright-key hints (y approve /
+	// n reject), so assert on the labels the footer draws.
+	content := m.View().Content
+	if !strings.Contains(content, "approve") || !strings.Contains(content, "reject") {
+		t.Errorf("approve/reject are not offered at the plan gate\n%s", content)
 	}
 	_, cmd := m.handleKey(keyConfirmY)
 	if cmd == nil {
@@ -345,13 +365,15 @@ func TestSteerBarSuppressedOnATerminalRun(t *testing.T) {
 				t.Fatalf("access on a %s run = %v, want steerTerminal even though the caller owns it", status, m.detail.steer.access)
 			}
 			out := m.View().Content
-			// Assert on the KEY HINTS the bar draws, not on bare words: the suppression
-			// message itself says "follow-ups, approvals and cancel are refused", so a
-			// Contains(out, "follow-up") matches the explanation and fails on correct
-			// code. It did. The hints are what a user could actually press.
-			for _, hint := range []string{"f follow-up", "x cancel run", "y approve", "n reject"} {
-				if strings.Contains(out, hint) {
-					t.Errorf("a %s run still offers %q; every steer verb is refused server-side with ErrRunTerminal\n%s", status, hint, out)
+			// The suppression message itself says "follow-ups, approvals and cancel are
+			// refused", so a whole-frame Contains matches the explanation. Assert on the
+			// FOOTER line instead (M4 one-line footer): a terminal run's footer is
+			// navigation-only, so none of the action LABELS may appear there.
+			lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+			footer := lines[len(lines)-1]
+			for _, label := range []string{"follow-up", "cancel", "review", "approve", "reject"} {
+				if strings.Contains(footer, label) {
+					t.Errorf("a %s run's footer still offers %q; every steer verb is refused server-side with ErrRunTerminal\nfooter: %q", status, label, footer)
 				}
 			}
 			if !strings.Contains(out, "has finished") {

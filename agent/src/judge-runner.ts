@@ -61,6 +61,7 @@ const VALID_CATEGORIES = new Set<ReviewRecommendation["category"]>([
   "improve_agent",
   "add_agent",
   "improve_uzi",
+  "cost_efficiency",
 ]);
 const VALID_VERDICTS = new Set(["ideal", "ok", "issues"]);
 const VALID_CONFIDENCE = new Set(["", "low", "medium", "high"]);
@@ -96,6 +97,19 @@ Produce a verdict and recommendations. A recommendation's "category" is one of e
 - improve_agent        — improve a specific agent, including a repo agent file (name it in "target")
 - add_agent            — propose a missing agent for the repo (name a proposed agent in "target")
 - improve_uzi          — improve uzi itself (a bug, feature, or refactor)
+- cost_efficiency      — a way this run could have reached the SAME outcome for fewer tokens, turns,
+                         or agents, WITHOUT reducing correctness, verification depth, or code quality.
+                         Code quality and best-practice patterns come FIRST: a cost cut that would
+                         weaken a real check is never a valid recommendation — e.g. do NOT propose
+                         dropping the adversarial/security pass on a trust-boundary change, skipping a
+                         gate a change actually needed, or thinning review on risky code. Only flag
+                         waste that costs tokens and buys nothing: a full gate re-run duplicated across
+                         separate validator sessions when one shared result would do; routing a
+                         mechanical or trivial validator to the strong model where a cheap model was
+                         sufficient; over-validating a trivial change (a many-agent wave on a one-line
+                         doc fix); an agent burning turns re-deriving context it was already handed; or
+                         idle round-trips that added no information. Name what should change in
+                         "target" (a template, the lead's orchestration, a specific agent, etc.).
 
 FAILURE CLASS: a network timeout or connection error is NOT automatically transient. When the
 run's failure class is a policy/config-denied class (provisioning_failed, credential_unavailable,

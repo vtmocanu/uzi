@@ -1,9 +1,11 @@
 package main
 
 import (
+	"image/color"
 	"strings"
 
 	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 	lipgloss "charm.land/lipgloss/v2"
 )
@@ -34,21 +36,39 @@ type tuiRenderer struct {
 // BackgroundColorMsg, and a second independent detection could disagree with the
 // palette the rest of the frame is drawn in.
 func newTUIRenderer(width int, dark bool) (*tuiRenderer, error) {
-	style := styles.LightStyle
-	if dark {
-		style = styles.DarkStyle
-	}
 	if width < 20 {
 		width = 20
 	}
 	md, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle(style),
+		glamour.WithStyles(tuiGlamourStyle(dark)),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return &tuiRenderer{md: md}, nil
+}
+
+// tuiGlamourStyle is the stock dark/light glamour style with ONE retune (PRD #325 M6):
+// inline `code` ships as xterm colour 203 (#ff5f5f) in BOTH themes, which reads as an
+// ERROR in a status UI. Recolour it to a calm, cool neutral on the same code background so
+// a code span reads as code, not as a failure. Only the inline Code foreground is touched;
+// CodeBlock (fenced) and everything else are left as glamour ships them.
+//
+// The StyleConfig is a value copy of the package default, and Code is a value field, so
+// reassigning cfg.Code.Color mutates only this copy — the shared styles.*Config global is
+// untouched.
+func tuiGlamourStyle(dark bool) ansi.StyleConfig {
+	if dark {
+		cfg := styles.DarkStyleConfig
+		c := "#b9c0cb" // cool light grey on the #303030-ish code bg
+		cfg.Code.Color = &c
+		return cfg
+	}
+	cfg := styles.LightStyleConfig
+	c := "#334155" // slate on the light code bg
+	cfg.Code.Color = &c
+	return cfg
 }
 
 // Markdown renders untrusted markdown for the transcript: sanitize, THEN Glamour.
@@ -109,6 +129,16 @@ type palette struct {
 	box      lipgloss.Style
 	boxTitle lipgloss.Style
 	states   map[crewState]lipgloss.Style
+
+	// The RUN-STATUS colour axis (PRD #325 M2), a SEPARATE axis from the crew-lane
+	// `states` dots above. statuses maps a run status to its bucket colour; statusStalled
+	// is the health override; statusDefault covers unrecognised statuses; chipFg is the
+	// text drawn on a solid status chip. Read (never re-populated) by M3's detail header
+	// chips and M6's verdict severity via statusColor/chip.
+	statuses      map[string]color.Color
+	statusStalled color.Color
+	statusDefault color.Color
+	chipFg        color.Color
 }
 
 func newPalette(dark bool) palette {
@@ -128,6 +158,24 @@ func newPalette(dark bool) palette {
 		crewIdle:    p.faint,
 		crewDone:    p.faint,
 	}
+
+	// Run-status colour buckets (PRD #325 M2). Light value first (dark bg gets the
+	// brighter second value), matching the `ld(light, dark)` convention above.
+	p.statuses = map[string]color.Color{
+		"running":           ld(lipgloss.Color("#1a7f4b"), lipgloss.Color("#4ade80")),
+		"queued":            ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+		"claimed":           ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+		"awaiting_approval": ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
+		"awaiting_input":    ld(lipgloss.Color("#b45309"), lipgloss.Color("#fbbf24")),
+		"limit_wait":        ld(lipgloss.Color("#0369a1"), lipgloss.Color("#38bdf8")),
+		"completed":         ld(lipgloss.Color("#0f766e"), lipgloss.Color("#5eead4")),
+		"failed":            ld(lipgloss.Color("#b91c1c"), lipgloss.Color("#f87171")),
+		"cancelled":         ld(lipgloss.Color("#6b7280"), lipgloss.Color("#7c8698")),
+	}
+	p.statusStalled = ld(lipgloss.Color("#c2410c"), lipgloss.Color("#fb923c"))
+	p.statusDefault = ld(lipgloss.Color("#6c6c6c"), lipgloss.Color("#8a8a8a"))
+	p.chipFg = ld(lipgloss.Color("#ffffff"), lipgloss.Color("#0e1016"))
+
 	return p
 }
 
@@ -136,4 +184,43 @@ func (p palette) state(s crewState) lipgloss.Style {
 		return st
 	}
 	return p.faint
+}
+
+// statusColor resolves a run's spine/chip colour (PRD #325 M2 seam), applying the
+// status→bucket map and the status-vs-health precedence: health "stalled" overrides the
+// status bucket (a stalled run is what triage is FOR), so it wins → orange. Non-stalled
+// health does not override. An unrecognised status falls to the default grey bucket, per
+// the forward-compat note in docs/cli.md (a newer server may ship a status this CLI has
+// no colour for).
+func (p palette) statusColor(status, health string) color.Color {
+	if health == "stalled" {
+		return p.statusStalled
+	}
+	if c, ok := p.statuses[status]; ok {
+		return c
+	}
+	return p.statusDefault
+}
+
+// verdictColor maps a judge verdict to a severity colour (PRD #325 M6): issues → red,
+// ideal/ok → the completed teal, anything else → the default grey. Shared by the board's
+// ⚖ marker and the review overlay's verdict chip so the two cannot disagree.
+func (p palette) verdictColor(verdict string) color.Color {
+	switch verdict {
+	case "ideal", "ok":
+		return p.statusColor("completed", "")
+	case "issues":
+		return p.statusColor("failed", "")
+	default:
+		return p.statusDefault
+	}
+}
+
+// chip renders text as a solid status tag: a filled block of bg with near-background
+// text on it, so a status reads as a physical tag rather than coloured prose. Under
+// NO_COLOR / an Ascii profile lipgloss strips the fill and the chip degrades to its bold
+// text (still legible) — the caller supplies the NO_COLOR-independent signal (the spine
+// glyph, a bordered banner) separately.
+func (p palette) chip(text string, bg color.Color) string {
+	return lipgloss.NewStyle().Background(bg).Foreground(p.chipFg).Bold(true).Padding(0, 1).Render(text)
 }

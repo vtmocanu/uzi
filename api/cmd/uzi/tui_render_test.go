@@ -4,7 +4,61 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+
+	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
+	"charm.land/glamour/v2/styles"
 )
+
+// PRD #325 M6: inline `code` must not render in the error red (glamour's stock 203/#ff5f5f
+// in both themes). The control proves the red is detectable in the stock style, then the
+// retuned renderer must be free of it in BOTH themes.
+func TestTUIInlineCodeIsNotErrorRed(t *testing.T) {
+	const md = "use `pollInterval` here"
+
+	// codeRed is glamour's stock inline-code colour, xterm 203 == #ff5f5f, in either the
+	// 256-colour or the truecolor encoding a profile might emit.
+	codeRed := func(s string) bool {
+		return strings.Contains(s, "38;5;203") || strings.Contains(s, "38;2;255;95;95")
+	}
+
+	// Control: BOTH stock styles render inline code in that red, so each half of the
+	// dark/light loop below can actually detect its fix (a green test over an undetectable
+	// red is vacuous — and the light half is only non-vacuous if the light stock is red too).
+	for _, c := range []struct {
+		name string
+		cfg  ansi.StyleConfig
+	}{
+		{"dark", styles.DarkStyleConfig},
+		{"light", styles.LightStyleConfig},
+	} {
+		stock, err := glamour.NewTermRenderer(glamour.WithStyles(c.cfg), glamour.WithWordWrap(80))
+		if err != nil {
+			t.Fatalf("stock %s renderer: %v", c.name, err)
+		}
+		rawStock, err := stock.Render(md)
+		if err != nil {
+			t.Fatalf("stock %s render: %v", c.name, err)
+		}
+		if !codeRed(rawStock) {
+			t.Fatalf("control failed: stock %s glamour did not emit the error red for inline code, so this test cannot prove the retune removed it\n%q", c.name, rawStock)
+		}
+	}
+
+	for _, dark := range []bool{true, false} {
+		r, err := newTUIRenderer(80, dark)
+		if err != nil {
+			t.Fatalf("newTUIRenderer(dark=%v): %v", dark, err)
+		}
+		out := r.Markdown(md)
+		if codeRed(out) {
+			t.Errorf("dark=%v: inline code still renders in the error red\n%q", dark, out)
+		}
+		if !strings.Contains(out, "pollInterval") {
+			t.Errorf("dark=%v: the inline code content was lost\n%q", dark, out)
+		}
+	}
+}
 
 // PRD #112 D7. Three separable properties: what sanitizeTTY strips, the ORDER it runs
 // in relative to Glamour, and what neither can fix.

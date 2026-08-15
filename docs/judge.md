@@ -115,7 +115,11 @@ places you see it.
 Recommendations use a fixed taxonomy: enable an existing tool or skill,
 install a missing worker tool, adjust an agent template or prompt, improve an
 existing agent (including a repo agent living in git), propose a missing
-agent for the repo, or improve uzi itself. That last category feeds the
+agent for the repo, improve uzi itself, or flag a cost-efficiency improvement
+— a way the run could have reached the same outcome for fewer tokens, turns,
+or agents without weakening any check (quality and correctness come first, so
+a saving that would drop a real verification pass is never recommended). The
+improve-uzi category feeds the
 [self-improvement job](./self-improvement.md), if your admin has it enabled.
 
 ## The deterministic fallback

@@ -363,8 +363,9 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Keybindings
 
 ```
-j/k, ↓/↑     move (board: row · detail: scroll the transcript)
-tab, h/l     switch lane (detail view only; h/← previous, tab/l/→ next)
+←/→, h/l, tab detail: focus the crew rail / the transcript (h/← rail, l/→ transcript; tab cycles). Detail opens focused on the crew rail.
+j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
+g            detail: follow live — re-attach and jump to the newest output (live runs only)
 enter        open the selected run (board)
 /            filter the board
 a            toggle the factory-wide admin board (board only)
@@ -377,6 +378,19 @@ esc          back out / dismiss
 ?            this help
 q            quit — asks to confirm; a second ctrl+c quits at once
 ```
+
+The run detail view has **two focusable panes**: the crew rail (one lane per
+agent) and the transcript. `←`/`→` (or `tab`) move focus between them; the
+focused pane is drawn bright, the other dimmed. `↑`/`↓` then act *within* the
+focused pane — moving the agent selection when the rail is focused, scrolling
+the transcript when it is. A run opens focused on the crew rail.
+
+The transcript **follows live** (tail -f): while a run is producing output the
+transcript auto-tails the newest frame and shows a `● FOLLOWING` badge.
+Scrolling up detaches it — the badge becomes `⏸ PAUSED ↓N new` (N is how many
+lines are below the fold) and the view holds still so you can read — and `g`
+(or scrolling back to the bottom) re-attaches and jumps to the newest output.
+Only a live run follows; a finished run's transcript is static.
 
 Note what isn't here: there's no `[a]`-for-approve and no bare `[q]`-quits —
 early drafts of this feature used both, but `[a]` doubling as admin-toggle
@@ -462,7 +476,7 @@ to show groups in *any* of the named labels — and server-validated: an unknown
 label is a usage error (exit 2), never a silently empty list, exactly like an
 unknown `--bucket`. An empty or omitted `--category` means all labels. The valid
 labels are `enable_tool`, `install_worker_tool`, `adjust_template`, `improve_agent`,
-`add_agent` and `improve_uzi`. Like `--run` (and unlike `--bucket`), the label
+`add_agent`, `improve_uzi` and `cost_efficiency`. Like `--run` (and unlike `--bucket`), the label
 predicate is applied *before* the server's row cap, so narrowing by label makes
 truncation less likely to bite; it composes cleanly with `--bucket`. Note this
 `backlog --category` is a **distinct** flag from the `--category` on
