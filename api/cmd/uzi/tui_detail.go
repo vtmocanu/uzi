@@ -198,6 +198,17 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if maxTop < 0 {
 			maxTop = 0
 		}
+		// F-M5a: reclamp the stored top against the CURRENT extent BEFORE applying the
+		// delta. A resize (WindowSizeMsg) since it was set can leave scroll above the new
+		// maxTop; applying the delta to that stale value would push it past the bottom clamp
+		// below and wrongly re-arm follow on the next key instead of scrolling to older
+		// output.
+		if m.detail.scroll > maxTop {
+			m.detail.scroll = maxTop
+		}
+		if m.detail.scroll < 0 {
+			m.detail.scroll = 0
+		}
 		if d < 0 { // up, toward older
 			if m.detail.follow {
 				m.detail.follow = false

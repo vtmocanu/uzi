@@ -553,6 +553,12 @@ func TestTUIDetailFollowLive(t *testing.T) {
 	if !strings.Contains(out, "frame 8") || strings.Contains(out, "frame 1 body") {
 		t.Errorf("following is not bottom-anchored (newest visible, oldest hidden)\n%s", out)
 	}
+	// F-M5b: the window shows EXACTLY the viewport's worth of lines — a whole-frame
+	// bottom-anchored check alone would miss an end-side ±1 in the window height.
+	trLines := strings.Split(m.renderTranscript(), "\n")
+	if body := len(trLines) - 1; body != m.transcriptViewport() { // line 0 is the pane title
+		t.Errorf("transcript window has %d lines, want the viewport %d", body, m.transcriptViewport())
+	}
 
 	// A new frame while following auto-tails to the newest.
 	agent, at := "lead", now
@@ -585,6 +591,42 @@ func TestTUIDetailFollowLive(t *testing.T) {
 	}
 	if !strings.Contains(m.View().Content, "FOLLOWING") {
 		t.Error("g did not restore the FOLLOWING indicator")
+	}
+}
+
+// F-M5a: a paused scroll that a resize leaves ABOVE the new maxTop must not re-arm follow
+// on the next UP. Repro: pause near the bottom (scroll = maxTop-1), resize TALLER (bigger
+// viewport → smaller maxTop, so the stored scroll is now stale), then UP — follow must stay
+// detached and the window must scroll toward OLDER output, not jump to the live tail.
+func TestTUIDetailPausedScrollSurvivesResize(t *testing.T) {
+	now := time.Now()
+	runID := "resize-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m.height = 16 // vp = 5
+	var msgs []apitypes.MessageDTO
+	for i := int32(1); i <= 8; i++ {
+		msgs = append(msgs, msgDTO(i, "text", "lead", "", "", fmt.Sprintf("frame %d body", i), now))
+	}
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}, msgs: msgs})
+	m = next.(tuiModel)
+	m = press(t, m, keyRight) // focus the transcript
+
+	m = press(t, m, "k") // one scroll up → paused, scroll = maxTop-1
+	if m.detail.follow {
+		t.Fatal("scrolling up did not detach follow")
+	}
+	pausedScroll := m.detail.scroll
+
+	// Resize taller: the viewport grows, so maxTop shrinks below the stored scroll.
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	m = next.(tuiModel)
+
+	m = press(t, m, "k") // UP: scroll toward older output, stay paused
+	if m.detail.follow {
+		t.Errorf("UP after resizing taller wrongly re-armed follow; the stale paused scroll %d was not reclamped to the new maxTop", pausedScroll)
+	}
+	if m.detail.scroll >= pausedScroll {
+		t.Errorf("UP did not scroll toward older output after the resize (scroll %d, was %d)", m.detail.scroll, pausedScroll)
 	}
 }
 

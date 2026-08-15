@@ -367,3 +367,42 @@ Accepted nits and dispositions:
   proves the markdown renders); no action.
 - The §M2 seam line's "verdict/confidence severity" was corrected to "verdict severity" — M6 colours
   the verdict only; confidence renders neutral (`faint`) by design.
+
+### D1 resolved + M5 done + doc landed (2026-08-15)
+
+- **D1 resolved (user decision): rebuild the demo on the shipped views.** Not "lean retire" (the
+  draft default) and not "keep factoryui as a sandbox". M7 **retires `factoryui`** and **rewires
+  `go run ./demo` to drive the real shipped `tuiModel`** with seeded fixtures + a simulated stream
+  (so follow-live is drivable), so the interactive demo always mirrors what actually ships and the
+  unbound-duplicate drift risk is removed. This grows M7's scope beyond the draft text (which said
+  retire-only): M7 owns the demo rebuild, not just deletion of `uxlab_mock_test.go`/`factoryui`.
+- **M5 landed** (`9e80c89f`): transcript is bottom-anchored with follow — `● FOLLOWING` auto-tail,
+  `⏸ PAUSED ↓N new` on scroll-up (view held stable), `g` re-attach, terminal runs static. Windowing
+  is a pure function of (lines, scroll, viewport) so the clamp matches the render. Under review.
+- **Run-cost doc landed on this branch** (`5f3eb0e8`, cherry-picked): `docs/run-cost.md` +
+  README/ARCHITECTURE pointers, explaining why hosted uzi runs cost less than a local agent-team
+  run (structural, not model tier). Unrelated to the TUI change; bundled here at the user's request.
+
+### M5 review outcome + fix (2026-08-15)
+
+M5 (`9e80c89f`) passed a single reviewer pass (cost-conscious: follow-live is correctness, not a
+trust boundary). Windowing verified sound — render and key-handler clamp share ONE layout
+(`buildTranscriptLines` + `transcriptViewport`), so a stale scroll can't blank the view; `N` =
+`maxTop − top` is exactly the lines below the fold (not off by one); re-attach is inclusive at
+bottom; only live runs follow. One should-fix WITH a failing-execution repro, to land as a
+follow-up commit:
+
+- **F-M5a (resize-while-paused re-attach bug).** `detailKey` applies the scroll delta to the stale
+  stored `m.detail.scroll` without clamping to the current `[0,maxTop]`, and the `WindowSizeMsg`
+  handler (`tui.go`) never reclamps. Repro: 8 frames, height 16 (maxTop 26) → `k` → paused
+  scroll=25 → resize height 20 (maxTop 22) → `k` (UP) → **follow re-arms (scroll jumps to 22, the
+  live tail)** instead of scrolling to older output; also shows a bare `⏸ PAUSED` (N=0) until then.
+  Fix: clamp `m.detail.scroll` to `[0,maxTop]` at the top of the transcript-scroll branch before
+  applying the delta (or reclamp in `WindowSizeMsg`). Add a test for exactly this sequence
+  (resize-taller while paused, then UP → follow stays false, scroll decreases).
+- **F-M5b (test robustness, folded).** `TestTUIDetailFollowLive`'s bottom-anchored assertion is
+  coarse — it pins `N`/`top` exactly (catches a top-side off-by-one) but wouldn't catch an end-side
+  ±1 in the visible-line count. Add an assertion counting visible frames.
+
+Nits left as-is: `g` on a terminal (non-live) run sets follow but renders no badge (harmless);
+`paneTitleBadge` right-align can overflow at ~20 cols (unreachable in practice).
