@@ -79,6 +79,19 @@ an "install a worker tool" recommendation naming the tool, guaranteed — so a
 finding still lands even when the LLM doesn't run. When that happens the run
 page shows a "judge incomplete" badge next to the verdict.
 
+## The failure-class signal
+
+When the reviewed run **failed**, the judge is also handed a trusted
+**failure class** — a single closed-vocabulary label for *why* the run failed
+(for example `provisioning_failed`, `credential_unavailable`,
+`guardrail_blocked`, `agent_failure`, `run_timeout`). It is derived from the
+run's own structured state at the moment it failed, never by reading the
+free-text failure reason, so the judge weighs a fact rather than a string. The
+practical effect: a network timeout or connection error is **not** treated as
+automatically transient, and a policy- or config-denied failure does not draw a
+"just retry / add backoff" recommendation — that class of block stays until the
+configuration or policy is fixed.
+
 ## Reading a review from the CLI
 
 `uzi review show <run-id>` prints the same verdict, summary,
@@ -249,6 +262,15 @@ cleared for good if the review itself is deleted (e.g. the run is deleted).
 Only finished **issue** and **CI-fix** runs are eligible. Chat runs, judge
 runs, and self-improvement runs are never judged — there's no recursive
 judging, and no self-feeding loop.
+
+One more run is deliberately skipped: a run that **failed before its agent ever
+started** — a provisioning, credential, or guardrail block that stopped the run
+at zero iterations. There is no agent behaviour to retrospect on such a run, and
+judging it would only spend the (strongest, most expensive) model on a run that
+did nothing, so the judge is skipped. **The failure notification still lands** —
+the skip drops only the retrospective, never the "your run failed" alert. (A run
+that started and then crashed early is *not* in this set; it carries agent
+behaviour and is still judged.)
 
 ## The inbox
 

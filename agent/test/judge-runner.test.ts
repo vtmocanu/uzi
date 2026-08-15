@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../src/judge-runner.js";
@@ -457,6 +458,26 @@ describe("buildJudgePrompt", () => {
     assert.ok(!withEmpty.includes("used before for this user"), "no dangling reuse instruction when the menu is empty");
   });
 
+  // PRD #69 M7a Pass B: the TRUSTED failure class (runs.fail_origin enum VALUE) is
+  // rendered in the pre-fence TRUSTED header — server-computed, so safe alongside
+  // status/iterations rather than inside the untrusted trace fence. Enum value only.
+  it("renders the failure class in the trusted pre-fence header", () => {
+    const prompt = buildJudgePrompt(emptyTrace, null, [], "provisioning_failed");
+    assert.match(prompt, /Failure class: provisioning_failed/);
+    // It must sit in the TRUSTED region — before the untrusted-trace fence opens, next to
+    // the other header axes, never inside the untrusted data frame.
+    const classIdx = prompt.indexOf("Failure class: provisioning_failed");
+    const fenceIdx = prompt.indexOf("<untrusted_trace_");
+    assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
+    assert.ok(classIdx >= 0 && classIdx < fenceIdx, "the failure class must render before the untrusted fence (trusted header region)");
+  });
+
+  // Null failure class omits the line entirely — no dangling "Failure class:" header.
+  it("omits the failure class line when the class is null", () => {
+    const prompt = buildJudgePrompt(emptyTrace, null, [], null);
+    assert.ok(!prompt.includes("Failure class:"), "no failure-class line when the class is null");
+  });
+
   // A target string that itself contains a would-be closing tag cannot break the fence:
   // the nonce is minted AFTER the targets are known, so the real close tag is unguessable.
   it("keeps a target containing a would-be closing tag inside the nonce fence", () => {
@@ -466,6 +487,35 @@ describe("buildJudgePrompt", () => {
     // The real close tag carries the random nonce, not the attacker's static string.
     assert.notEqual(menu![1], "deadbeef");
     assert.match(prompt, new RegExp(`</known_improve_uzi_targets_${menu![1]}>`));
+  });
+});
+
+// PRD #69 M7a Pass B: the system prompt carries the ONE prompt-behavior rule this PRD
+// adds — a network timeout/connection error is not automatically transient, and a
+// policy/config-denied failure class must NOT draw a retry/backoff recommendation. Read
+// the literal out of source (isolated to the JUDGE_SYSTEM_PROMPT template, same approach
+// as judge-denylist-prompt.test.ts) so a match in a comment elsewhere cannot pass it.
+describe("judge system prompt carries the no-retry-for-policy-failure rule (PRD #69 M7a)", () => {
+  const promptSrc = fs.readFileSync(new URL("../src/judge-runner.ts", import.meta.url), "utf8");
+
+  function judgeSystemPrompt(): string {
+    const start = promptSrc.indexOf("const JUDGE_SYSTEM_PROMPT = `");
+    assert.ok(start >= 0, "JUDGE_SYSTEM_PROMPT not found — did it move or get renamed?");
+    const body = promptSrc.slice(start + "const JUDGE_SYSTEM_PROMPT = `".length);
+    const end = body.indexOf("`;");
+    assert.ok(end > 0, "could not find the end of the JUDGE_SYSTEM_PROMPT template literal");
+    return body.slice(0, end);
+  }
+
+  it("names the three policy/config-denied classes and forbids retry/backoff for them", () => {
+    const prompt = judgeSystemPrompt();
+    assert.match(prompt, /not automatically transient/i);
+    // The three pre-start policy/config-denied classes must be named.
+    for (const cls of ["provisioning_failed", "credential_unavailable", "guardrail_blocked"]) {
+      assert.ok(prompt.includes(cls), `the rule must name the ${cls} class`);
+    }
+    // And it must tell the judge not to recommend a retry / backoff for them.
+    assert.match(prompt, /do NOT recommend a retry or exponential backoff/i);
   });
 });
 

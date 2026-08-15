@@ -97,6 +97,11 @@ Produce a verdict and recommendations. A recommendation's "category" is one of e
 - add_agent            — propose a missing agent for the repo (name a proposed agent in "target")
 - improve_uzi          — improve uzi itself (a bug, feature, or refactor)
 
+FAILURE CLASS: a network timeout or connection error is NOT automatically transient. When the
+run's failure class is a policy/config-denied class (provisioning_failed, credential_unavailable,
+guardrail_blocked), do NOT recommend a retry or exponential backoff — the block is permanent until
+the configuration or policy is fixed, and retrying only wastes another run.
+
 Respond with a SINGLE JSON object and nothing else, of the shape:
 {"verdict":"ideal|ok|issues","summary":"<markdown>","recommendations":[{"category":"...","target":"...","rationale":"<markdown>","confidence":"low|medium|high"}]}
 Use verdict "ideal" when the run was exemplary, "ok" when fine with minor notes, "issues" when something
@@ -219,7 +224,12 @@ export class JudgeRunner {
   ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
     const model = (claim.judge_model ?? "").trim();
     try {
-      const prompt = buildJudgePrompt(trace, claim.judge_signal ?? null, claim.known_improve_uzi_targets ?? []);
+      const prompt = buildJudgePrompt(
+        trace,
+        claim.judge_signal ?? null,
+        claim.known_improve_uzi_targets ?? [],
+        claim.failure_class ?? null,
+      );
       const { text, result } = await this.runModel(token, model, prompt);
       return { review: parseReview(text, model), usageMessage: result };
     } catch (err) {
@@ -389,6 +399,7 @@ export function buildJudgePrompt(
   trace: JudgeTraceResponse,
   signal: JudgeSignal | null,
   knownTargets: string[] = [],
+  failureClass: string | null = null,
 ): string {
   const t = trace.target;
   const header = [
@@ -396,6 +407,11 @@ export function buildJudgePrompt(
     `Title: ${t.issue_title}`,
     t.fix_verdict ? `Fix verdict: ${t.fix_verdict}` : "",
     t.failure_reason ? `Failure reason: ${t.failure_reason}` : "",
+    // The TRUSTED failure ORIGIN (runs.fail_origin closed enum, PRD #69 M7a Pass B),
+    // rendered in this pre-fence header — it is server-computed, not trace-derived, so
+    // it is safe alongside status/iterations rather than inside the untrusted fence. The
+    // ENUM VALUE ONLY (never failure_reason free text); omitted when null.
+    failureClass ? `Failure class: ${failureClass}` : "",
     `Iterations: ${t.iteration_count}. MR: ${t.mr_iid ?? "none"}.`,
     t.plan_md ? `\nPlan:\n${clip(t.plan_md, 6000)}` : "",
   ]

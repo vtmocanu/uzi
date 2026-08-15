@@ -886,10 +886,24 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 
 	var targetRunID *string
 	var signal *JudgeSignal
+	var failureClass *string
 	if run.TargetRunID.Valid {
 		id := uuid.UUID(run.TargetRunID.Bytes).String()
 		targetRunID = &id
 		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes))
+		// PRD #69 M7a Pass B: surface the reviewed run's TRUSTED failure ORIGIN
+		// (runs.fail_origin, the closed enum stamped at each failed write) so the judge
+		// can weigh the failure CLASS — e.g. no retry/backoff advice for a policy/config
+		// block. The claim carries the JUDGE run, not the reviewed row, so load the
+		// target. Best-effort, mirroring judgeSignal's posture above: a load error logs
+		// and proceeds with no class (never fails the claim). A NULL/blank origin (a
+		// completed run, or a failure with no recognised origin) leaves it nil.
+		if target, terr := s.q.GetRunByID(ctx, uuid.UUID(run.TargetRunID.Bytes)); terr != nil {
+			slog.Warn("judge claim: load target run for failure class", "target", uuid.UUID(run.TargetRunID.Bytes).String(), "error", terr)
+		} else if target.FailOrigin.Valid && strings.TrimSpace(target.FailOrigin.String) != "" {
+			fc := target.FailOrigin.String
+			failureClass = &fc
+		}
 	}
 
 	// Judge model resolution is user-value-wins (PRD #69 M2, Decision 5): the run
@@ -937,6 +951,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		TargetRunID:            targetRunID,
 		JudgeModel:             judgeModel,
 		JudgeSignal:            signal,
+		FailureClass:           failureClass,
 		KnownImproveUziTargets: knownTargets,
 		SessionID:              textPtr(run.SessionID),
 		LastSeq:                run.LastSeq,

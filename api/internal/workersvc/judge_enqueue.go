@@ -19,6 +19,19 @@ import (
 // improvement loop; audit M4).
 var judgeEligibleKinds = map[string]bool{RunKindIssue: true, RunKindCIFix: true}
 
+// preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
+// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
+// provisioning/credential/guardrail block that is permanent until the config or policy
+// is fixed. Gate 4b skips the judge for such a run at iteration_count == 0 — there is no
+// agent behavior to retrospect. Deliberately EXACTLY these three: not
+// rate_limited/worker_lost/run_timeout (transient) and not agent_failure (judgeable).
+// The members are a strict subset of failorigin.go's vocabulary.
+var preStartInfraFailOrigins = map[string]bool{
+	"provisioning_failed":    true,
+	"credential_unavailable": true,
+	"guardrail_blocked":      true,
+}
+
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the
 // sweeper, whose swept rows do not carry the full run shape the gate needs.
 func (s *Service) maybeEnqueueJudgeByID(ctx context.Context, runID uuid.UUID) {
@@ -91,6 +104,36 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
+	}
+	// Gate 4b (PRD #69 M7a Pass B, Decision 12): skip the judge for a PRE-START INFRA
+	// failure — a run that failed BEFORE the agent did anything worth retrospecting.
+	// The set is EXACTLY the three policy/config-denied origins, AND only at
+	// iteration_count == 0. An agent that started and crashed at iteration 0 carries
+	// 'agent_failure' (the worker-reported default), stays out of this set, and is still
+	// judged (SC3); the iteration conjunct is the PRD's defensive guard for that. NOT
+	// rate_limited/worker_lost/run_timeout (transient) and NOT agent_failure (judgeable).
+	// This is the ACCURACY+SPEND fix: a pre-start infra failure has no agent behavior to
+	// review, and skipping avoids the most expensive per-run call (opus) on a run that
+	// did nothing.
+	//
+	// DETERMINISTIC INFRA NOTIFICATION — delivered here by the EXISTING RunFailureNotifier,
+	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they
+	// still owe a failure notification. Every path that can reach this gate carrying one
+	// of these three origins is the worker-reported SetState terminal transition, which
+	// fires s.bcast.PublishState(runID,"failed") BEFORE calling maybeEnqueueJudge; the
+	// RunFailureNotifier subscribes to that PublishState and notifies every
+	// non-cancelled/non-plan_rejected failure (infra included), so the notification has
+	// already been delivered on the SAME transition and this gate need only skip the
+	// judge. (The server-side claim-assembly failer that also stamps these three origins
+	// via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
+	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is
+	// possible anyway — notifysvc imports workersvc (RunFailureNotifier is a
+	// workersvc.Broadcaster), so injecting it would create an import cycle.
+	if run.Status == "failed" && run.IterationCount == 0 &&
+		run.FailOrigin.Valid && preStartInfraFailOrigins[run.FailOrigin.String] {
+		slog.Debug("judge enqueue: pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
+			"run", run.ID, "fail_origin", run.FailOrigin.String)
+		return
 	}
 	// Gate 5: per-user spend guards (PRD #69 M5, Decision 9). Count-based, best-effort,
 	// applied in EVERY mode (a runaway loop is a footgun even for an opted-in user). On

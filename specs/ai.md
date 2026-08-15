@@ -20578,3 +20578,50 @@ existing `notifysvc` (in-app inbox row + best-effort Slack DM). New notification
 - **Deliberately minimal surface.** No new wire field, no migration (`notifications.kind` is a generic text column), no
   web change (the web renders kinds generically), no CLI change — the kind rides the existing generic notification
   plumbing end to end.
+
+## 534. PRD #69 M7a — judge accuracy: a TRUSTED failure class from server-owned axes, and a pre-start-infra gate that skips the judge but keeps the notification
+
+The judge misjudged the #78 provisioning case because the only failure signal it had was `failure_reason` free
+text. M7a gives it a TRUSTED failure ORIGIN instead, and stops it running at all on a run that never started. Two
+mechanisms, both built on `runs.fail_origin` — the closed-enum column Pass A (§ migration `00126`) stamps at every
+terminal-failed write site, modelled on `limitwait.go`'s `rate_limit_type` coercion.
+
+- **The class is computed from TRUSTED axes, never `failure_reason`.** The reviewed run's class is its
+  `fail_origin` VALUE — an allowlisted closed enum (`provisioning_failed`, `credential_unavailable`,
+  `guardrail_blocked`, `rate_limited`, `run_timeout`, `worker_lost`, `agent_failure`, `plan_rejected`,
+  `auto_stopped`) — read alongside the server-owned `status` and `iteration_count`. `failure_reason` is documented
+  never-parse free text in three places (`notifysvc/run_failure_notifier.go`, `workersvc/autostop.go`,
+  `00050_run_stop_kind.sql`) and is NOT read for this. `assembleJudgeClaim` loads the target run and puts the value
+  on the judge claim as `ClaimPayload.FailureClass` (wire `failure_class`); best-effort — a load error logs and the
+  claim proceeds classless. The agent renders it in the judge prompt's TRUSTED pre-fence header (server-computed, so
+  safe outside the untrusted-trace fence), enum value only. `JUDGE_SYSTEM_PROMPT` gains the one prompt-behaviour rule
+  this PRD makes: a network timeout / connection error is NOT automatically transient, and a policy/config-denied
+  class (`provisioning_failed`, `credential_unavailable`, `guardrail_blocked`) must NOT draw a retry / exponential-
+  backoff recommendation — that block is permanent until the config or policy is fixed. (The `failure_class` name
+  collides with an unrelated slog key in `autostop.go`; the claim/DTO field is a distinct symbol.)
+
+- **The pre-start gate skips the judge for a run that never started.** A new sibling of Gate 5 in
+  `maybeEnqueueJudge`, placed after the kill-switch/opt-in/token gates and before the spend guards: if
+  `status='failed'` **AND** `iteration_count=0` **AND** `fail_origin ∈ {provisioning_failed, credential_unavailable,
+  guardrail_blocked}`, skip the judge (debug-logged). This is the accuracy+spend fix (Decision 12) — a pre-start
+  infra failure has no agent behaviour to retrospect, and skipping avoids the most expensive per-run call (opus) on a
+  run that did nothing. The set is EXACTLY those three pre-start policy/config-denied origins:
+  `rate_limited`/`worker_lost`/`run_timeout` are transient and `agent_failure` is judgeable, so none of them gate. The
+  `iteration_count=0` conjunct is the PRD's defensive guard — an agent that started and crashed at iteration 0 carries
+  the worker-reported default `agent_failure`, stays out of the set, and is still judged (SC3).
+
+- **The deterministic infra notification is delivered by the EXISTING notifier, not injected.** A pre-start-gated run
+  is a judge REPLACEMENT, not a silent drop — it still owes a "your run failed" notification. `notifysvc` imports
+  `workersvc` (`RunFailureNotifier` is a `workersvc.Broadcaster`), so injecting it would be an import cycle. Instead:
+  every gate-reachable path that can carry one of these three origins is the worker-reported `SetState` terminal
+  transition, which fires `Broadcaster.PublishState(runID,"failed")` BEFORE calling `maybeEnqueueJudge`; the
+  `RunFailureNotifier` subscribes to that and notifies every non-`cancelled`/non-`plan_rejected` failure (infra
+  included). So the notification is already delivered on the SAME transition and the gate need only skip the judge —
+  no `PublishState` was added. (The server-side claim-assembly failer — `recoverClaimAssembly` → `MarkRunFailedByID`
+  — that ALSO stamps these three origins never calls `maybeEnqueueJudge` at all, so it is not gate-reachable; it
+  notifies through its own `s.notify`.)
+
+- **What M7a does NOT touch.** The audit-H3 enforced-mode invariant note (a user cannot force another user's token to
+  be spent, weakened deliberately at the instance level by enforced mode) stays as recorded — it is an M2/M4 concern,
+  untouched here. M7b (host-naming) stays dead/deferred: #123 retired host-naming and #290 already classifies
+  transient-vs-permanent, so M7a's class-only signal is the whole accuracy delta.
