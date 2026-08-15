@@ -49,6 +49,12 @@ type ReviewWithRecommendations struct {
 	// keyed like the filed links so they survive a re-judge; the DTO matches them to the
 	// current recommendations by (category, target) and flags stale via the rationale hash.
 	Dispositions []store.RecommendationDisposition
+	// JudgeRun is the judge run's own timing + token/cost usage (PRD #69 M6, Decision 10):
+	// the claim/start/finish stamps and the run_usage_totals rollup for the judge run.
+	// nil only when there is no judge run row for the review's judge_run_id (not expected
+	// while a review exists); its usage columns are NULL for a pre-feature judge that
+	// posted no result frame, which the DTO renders as an absent strip.
+	JudgeRun *store.GetJudgeRunUsageForTargetRow
 }
 
 // PendingJudge is the ACTIVE judge run for a target (PRD #119 M1) — the fact that a
@@ -105,6 +111,16 @@ func (s *Service) GetRunReviewPanel(ctx context.Context, userID uuid.UUID, isAdm
 	if err != nil {
 		return nil, nil, err
 	}
+	// The judge run's own timing + usage strip (PRD #69 M6) is a PANEL-only concern, so it
+	// is fetched here rather than in the shared reviewForTarget. Only when a review exists
+	// (a judged run): an unjudged run has no judge_run_id to look up.
+	if review != nil {
+		judgeRun, jerr := s.judgeRunUsageForTarget(ctx, targetRunID)
+		if jerr != nil {
+			return nil, nil, jerr
+		}
+		review.JudgeRun = judgeRun
+	}
 	pending, err := s.pendingJudgeForTarget(ctx, targetRunID)
 	if err != nil {
 		return nil, nil, err
@@ -159,6 +175,25 @@ func (s *Service) reviewForTarget(ctx context.Context, targetRunID uuid.UUID) (*
 		return nil, err
 	}
 	return &ReviewWithRecommendations{Review: review, Recommendations: recs, FiledIssues: filed, Dispositions: dispositions}, nil
+}
+
+// judgeRunUsageForTarget reads the judge run's own timing + usage for the review panel
+// (PRD #69 M6, Decision 10). A review always has a judge_run_id, so this returns a row;
+// its usage columns are NULL for a pre-feature judge (no result frame → no run_usage
+// row). pgx.ErrNoRows would mean the judge run row itself is gone — treated as "no
+// judge-run detail" (nil) rather than failing the panel read. It is fetched ONLY by the
+// panel path (not the shared reviewForTarget), so the disposition/issue-draft/issue-file
+// callers of GetReviewForTarget do not pay for a query they never render.
+func (s *Service) judgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (*store.GetJudgeRunUsageForTargetRow, error) {
+	jr, err := s.q.GetJudgeRunUsageForTarget(ctx, targetRunID)
+	switch {
+	case err == nil:
+		return &jr, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, nil
+	default:
+		return nil, err
+	}
 }
 
 // RerunJudge enqueues a fresh judge run for a terminal run at the OWNER's explicit

@@ -53,10 +53,25 @@ import {
 import { installJsDeps } from "./js-deps.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { REASON_PROVISION_FAILED } from "./provision-run.js";
+import { REASON_NO_TOKEN } from "./sdk-executor.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** Map a known failure-reason CONSTANT to the server's fail_origin enum (PRD #69
+ *  M7a). Authored WORKER-SIDE from the reason constant the throw site used — it never
+ *  parses free text: it matches only the fixed prefixes the two fatal pre-start
+ *  throwers emit (provision-run appends `: <detail>` after REASON_PROVISION_FAILED;
+ *  sdk-executor throws REASON_NO_TOKEN verbatim). Ordinary agent failures return
+ *  undefined, so `fail_origin` is omitted and the server defaults them to
+ *  'agent_failure'. Sent unvalidated; the server allowlists it. */
+export function failOriginForReason(rawReason: string): string | undefined {
+  if (rawReason.startsWith(REASON_PROVISION_FAILED)) return "provisioning_failed";
+  if (rawReason.startsWith(REASON_NO_TOKEN)) return "credential_unavailable";
+  return undefined;
+}
 
 /**
  * Thrown when a SEEDED run's clone was cut from a commit that diverges from the one the
@@ -1350,9 +1365,14 @@ export class RunRunner {
         // path — so scrub it here with the run's own secret set. A plan rejection
         // carries the user's verbatim reason; scrubbing it too is harmless for plain
         // text and a safety net if the user pasted a secret.
-        const reason = redactText(
-          err instanceof PlanRejectedError ? err.reason : errMessage(err),
-        );
+        const rawReason =
+          err instanceof PlanRejectedError ? err.reason : errMessage(err);
+        const reason = redactText(rawReason);
+        // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
+        // redaction) so a fatal pre-start failure (provisioning / no token) carries a
+        // structured origin the judge can key on; an ordinary agent failure maps to
+        // undefined and the server defaults it to 'agent_failure'.
+        const failOrigin = failOriginForReason(rawReason);
         runLog.error("run failed", { error: reason });
         batcher.emit({
           kind: "error",
@@ -1364,6 +1384,7 @@ export class RunRunner {
         await reportState({
           status: "failed",
           failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+          fail_origin: failOrigin,
         }).catch((e) =>
           runLog.error("could not report failed state", {
             error: errMessage(e),
@@ -1659,7 +1680,15 @@ export class RunRunner {
         payload: { ...feedPayload },
       });
       await batcher.close().catch(() => undefined);
-      await reportState({ status: "failed", ...limitFields }).catch((e) =>
+      // PRD #69 M7a: this opt-out failure is definitionally rate-limit-caused, so
+      // stamp the trusted class alongside the structured limit fields. (The server
+      // also stamps 'rate_limited' on the parallel limit_wait→non-park path, so the
+      // class is recorded regardless of which report shape reached it.)
+      await reportState({
+        status: "failed",
+        fail_origin: "rate_limited",
+        ...limitFields,
+      }).catch((e) =>
         runLog.error("could not report limit failure", {
           error: errMessage(e),
         }),

@@ -23,17 +23,28 @@ import (
 // waivesPRDLink is likewise zero (false) by default; a test that exercises the
 // PRD #196 waiver sets it explicitly.
 type fakeSettings struct {
-	enabled        bool
-	model          string
-	prdLabel       string
-	eligibleLabels []string
-	waivesPRDLink  bool
-	prdlessEnabled bool
-	prdlessLabel   string
-	err            error
+	enabled         bool
+	enforceAll      bool
+	cooldownSeconds int
+	dailyBudget     int
+	spendGuardErr   error // read error for the PRD #69 M5 spend-guard accessors (fail-open)
+	model           string
+	prdLabel        string
+	eligibleLabels  []string
+	waivesPRDLink   bool
+	prdlessEnabled  bool
+	prdlessLabel    string
+	err             error
 }
 
-func (f fakeSettings) JudgeEnabled(context.Context) (bool, error) { return f.enabled, f.err }
+func (f fakeSettings) JudgeEnabled(context.Context) (bool, error)    { return f.enabled, f.err }
+func (f fakeSettings) JudgeEnforceAll(context.Context) (bool, error) { return f.enforceAll, f.err }
+func (f fakeSettings) JudgeCooldownSeconds(context.Context) (int, error) {
+	return f.cooldownSeconds, f.spendGuardErr
+}
+func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
+	return f.dailyBudget, f.spendGuardErr
+}
 func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
 func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
 func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
@@ -213,6 +224,40 @@ func TestEnqueueJudgeGatesBlock(t *testing.T) {
 				t.Fatalf("%s: no judge run should be enqueued, got %+v", tc.name, fs.createdJudgeRun)
 			}
 		})
+	}
+}
+
+// TestEnqueueJudgeEnforceAllBypassesOptIn pins PRD #69: when the admin enforces the
+// judge for every run, the per-user judge_enabled opt-in is bypassed — but the
+// kill-switch and token presence still govern, so a token-less user stays silently
+// skipped even in enforced mode.
+func TestEnqueueJudgeEnforceAllBypassesOptIn(t *testing.T) {
+	// Opted-out owner WITH a token: enforced mode judges them anyway.
+	fs, svc, run := eligibleFixture(t)
+	fs.userByID = store.User{JudgeEnabled: false}
+	svc.SetSettings(fakeSettings{enabled: true, enforceAll: true, model: "haiku"})
+	svc.maybeEnqueueJudge(context.Background(), run)
+	if fs.createdJudgeRun == nil {
+		t.Fatal("enforceAll should bypass the per-user opt-in and enqueue a judge")
+	}
+
+	// Opted-out, token-LESS owner: still skipped even under enforcement (token gate).
+	fs, svc, run = eligibleFixture(t)
+	fs.userByID = store.User{JudgeEnabled: false}
+	fs.anthropicErr = pgx.ErrNoRows
+	svc.SetSettings(fakeSettings{enabled: true, enforceAll: true, model: "haiku"})
+	svc.maybeEnqueueJudge(context.Background(), run)
+	if fs.createdJudgeRun != nil {
+		t.Fatal("a token-less user must not be judged even under enforceAll")
+	}
+
+	// Kill-switch off wins over enforceAll: nothing is judged.
+	fs, svc, run = eligibleFixture(t)
+	fs.userByID = store.User{JudgeEnabled: false}
+	svc.SetSettings(fakeSettings{enabled: false, enforceAll: true, model: "haiku"})
+	svc.maybeEnqueueJudge(context.Background(), run)
+	if fs.createdJudgeRun != nil {
+		t.Fatal("the kill-switch (judge_enabled=false) must override enforceAll")
 	}
 }
 

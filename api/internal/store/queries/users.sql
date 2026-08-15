@@ -106,12 +106,27 @@ SELECT default_model FROM users WHERE id = $1;
 UPDATE users SET default_model = @default_model WHERE id = @id
 RETURNING default_model;
 
+-- name: GetUserJudgeModel :one
+-- The current user's per-user judge model override (PRD #69 M2); NULL = inherit
+-- the instance judge_model. Read at judge-claim assembly, keyed on the run owner.
+-- Selects only the column: the judge claim needs no other user field, and a
+-- narrow read keeps resolution self-contained and cheap (Decision 5).
+SELECT judge_model FROM users WHERE id = $1;
+
+-- name: SetUserJudgeModel :one
+-- Sets (or clears, when @judge_model is NULL) the current user's per-user judge
+-- model. NULL inherits the instance judge_model. Own-user only; caller passes the
+-- session user's id.
+UPDATE users SET judge_model = @judge_model WHERE id = @id
+RETURNING judge_model;
+
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
--- (PRD #17), UI theme override (PRD #21), and the sidebar token-meter choice
--- (00123). NULL = inherit / use the instance default / default-token-only.
--- Own-user only; the caller passes the session user's id.
-SELECT default_model, theme, sidebar_token_ids FROM users WHERE id = $1;
+-- (PRD #17), per-user judge model override (PRD #69), UI theme override
+-- (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit / use
+-- the instance default / default-token-only. Own-user only; the caller passes
+-- the session user's id.
+SELECT default_model, judge_model, theme, sidebar_token_ids FROM users WHERE id = $1;
 
 -- name: SetUserTheme :one
 -- Sets (or clears, when @theme is NULL) the current user's theme override.

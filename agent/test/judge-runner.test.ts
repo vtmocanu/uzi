@@ -1,24 +1,42 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../src/judge-runner.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
-import type { ClaimResponse, JudgeTraceResponse, ReviewRequest, StateRequest } from "../src/protocol.js";
+import type {
+  ClaimResponse,
+  JudgeTraceResponse,
+  OutgoingMessage,
+  ReviewRequest,
+  StateRequest,
+} from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
-// A fake worker client recording the review + state the judge posts.
+// A fake worker client recording the review, EVERY state, and the messages the judge
+// posts. `states` records all reportState calls in order (PRD #69 M6 stamps a `running`
+// report before `completed`); `state` stays the LAST call for the pre-M6 assertions.
 function fakeClient(trace: JudgeTraceResponse) {
-  const calls: { review?: { id: string; review: ReviewRequest }; state?: { id: string; body: StateRequest } } = {};
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    state?: { id: string; body: StateRequest };
+    states: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[] }[];
+  } = { states: [], messages: [] };
   const client = {
     getTrace: async () => trace,
     postReview: async (id: string, review: ReviewRequest) => {
       calls.review = { id, review };
     },
     reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
       calls.state = { id, body };
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[]) => {
+      calls.messages.push({ id, messages });
     },
   } as unknown as WorkerClient;
   return { client, calls };
@@ -69,6 +87,23 @@ function replyingQueryFn(text: string, error = false): SdkQueryFn {
   } as unknown as SdkQueryFn;
 }
 
+// Like replyingQueryFn but the success frame carries per-model usage, as a real judge
+// call's terminal result-frame does — so the mapped run message the judge posts carries
+// the modelUsage the API's foldRunUsage folds into a run_usage row (PRD #69 M6).
+function replyingQueryFnWithUsage(text: string): SdkQueryFn {
+  return async function* () {
+    yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+    yield {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_ms: 1234,
+      total_cost_usd: 0.42,
+      modelUsage: { "claude-opus-4": { inputTokens: 100, outputTokens: 50, costUSD: 0.42 } },
+    };
+  } as unknown as SdkQueryFn;
+}
+
 describe("JudgeRunner", () => {
   it("posts the parsed verdict + recommendations and completes the run", async () => {
     const { client, calls } = fakeClient(emptyTrace);
@@ -87,6 +122,49 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
     assert.equal(calls.state?.id, "judge-1");
     assert.equal(calls.state?.body.status, "completed");
+  });
+
+  it("reports running before completed and posts the result frame's usage (PRD #69 M6)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim());
+
+    // A `running` report precedes the terminal `completed` one — this is what stamps the
+    // judge run's started_at, giving the reviewed run's panel a duration to show.
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "completed"],
+      "the judge must report running before completed",
+    );
+    // Exactly one usage frame posted, on the judge run, carrying a result event and the
+    // non-empty per-model usage the API folds into run_usage.
+    assert.equal(calls.messages.length, 1, "one usage frame is posted on the success path");
+    assert.equal(calls.messages[0]?.id, "judge-1");
+    assert.equal(calls.messages[0]?.messages.length, 1);
+    const payload = calls.messages[0]?.messages[0]?.payload as {
+      event?: string;
+      modelUsage?: Record<string, unknown>;
+    };
+    assert.equal(payload.event, "result", "the posted frame is the terminal result frame");
+    assert.ok(
+      payload.modelUsage && Object.keys(payload.modelUsage).length > 0,
+      "the frame carries non-empty per-model usage (usage reaches the API)",
+    );
+  });
+
+  it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });
+    await runner.execute(judgeClaim());
+
+    // The deterministic-fallback path records no real spend, so no usage frame is posted.
+    assert.equal(calls.messages.length, 0, "an error result must not post a usage frame");
+    // The run still reports running then completes with the fallback review.
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "completed"],
+    );
   });
 
   it("falls back to the deterministic command-not-found review when the model errors", async () => {
@@ -391,6 +469,26 @@ describe("buildJudgePrompt", () => {
     assert.ok(!withEmpty.includes("used before for this user"), "no dangling reuse instruction when the menu is empty");
   });
 
+  // PRD #69 M7a Pass B: the TRUSTED failure class (runs.fail_origin enum VALUE) is
+  // rendered in the pre-fence TRUSTED header — server-computed, so safe alongside
+  // status/iterations rather than inside the untrusted trace fence. Enum value only.
+  it("renders the failure class in the trusted pre-fence header", () => {
+    const prompt = buildJudgePrompt(emptyTrace, null, [], "provisioning_failed");
+    assert.match(prompt, /Failure class: provisioning_failed/);
+    // It must sit in the TRUSTED region — before the untrusted-trace fence opens, next to
+    // the other header axes, never inside the untrusted data frame.
+    const classIdx = prompt.indexOf("Failure class: provisioning_failed");
+    const fenceIdx = prompt.indexOf("<untrusted_trace_");
+    assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
+    assert.ok(classIdx >= 0 && classIdx < fenceIdx, "the failure class must render before the untrusted fence (trusted header region)");
+  });
+
+  // Null failure class omits the line entirely — no dangling "Failure class:" header.
+  it("omits the failure class line when the class is null", () => {
+    const prompt = buildJudgePrompt(emptyTrace, null, [], null);
+    assert.ok(!prompt.includes("Failure class:"), "no failure-class line when the class is null");
+  });
+
   // A target string that itself contains a would-be closing tag cannot break the fence:
   // the nonce is minted AFTER the targets are known, so the real close tag is unguessable.
   it("keeps a target containing a would-be closing tag inside the nonce fence", () => {
@@ -400,6 +498,35 @@ describe("buildJudgePrompt", () => {
     // The real close tag carries the random nonce, not the attacker's static string.
     assert.notEqual(menu![1], "deadbeef");
     assert.match(prompt, new RegExp(`</known_improve_uzi_targets_${menu![1]}>`));
+  });
+});
+
+// PRD #69 M7a Pass B: the system prompt carries the ONE prompt-behavior rule this PRD
+// adds — a network timeout/connection error is not automatically transient, and a
+// policy/config-denied failure class must NOT draw a retry/backoff recommendation. Read
+// the literal out of source (isolated to the JUDGE_SYSTEM_PROMPT template, same approach
+// as judge-denylist-prompt.test.ts) so a match in a comment elsewhere cannot pass it.
+describe("judge system prompt carries the no-retry-for-policy-failure rule (PRD #69 M7a)", () => {
+  const promptSrc = fs.readFileSync(new URL("../src/judge-runner.ts", import.meta.url), "utf8");
+
+  function judgeSystemPrompt(): string {
+    const start = promptSrc.indexOf("const JUDGE_SYSTEM_PROMPT = `");
+    assert.ok(start >= 0, "JUDGE_SYSTEM_PROMPT not found — did it move or get renamed?");
+    const body = promptSrc.slice(start + "const JUDGE_SYSTEM_PROMPT = `".length);
+    const end = body.indexOf("`;");
+    assert.ok(end > 0, "could not find the end of the JUDGE_SYSTEM_PROMPT template literal");
+    return body.slice(0, end);
+  }
+
+  it("names the three policy/config-denied classes and forbids retry/backoff for them", () => {
+    const prompt = judgeSystemPrompt();
+    assert.match(prompt, /not automatically transient/i);
+    // The three pre-start policy/config-denied classes must be named.
+    for (const cls of ["provisioning_failed", "credential_unavailable", "guardrail_blocked"]) {
+      assert.ok(prompt.includes(cls), `the rule must name the ${cls} class`);
+    }
+    // And it must tell the judge not to recommend a retry / backoff for them.
+    assert.match(prompt, /do NOT recommend a retry or exponential backoff/i);
   });
 });
 

@@ -134,6 +134,17 @@ type ClaimPayload struct {
 	// omitted when the scan found nothing). The judge interprets it; if the model call
 	// fails it is the deterministic fallback recommendation. The regex only flags.
 	JudgeSignal *JudgeSignal `json:"judge_signal,omitempty"`
+	// FailureClass is the reviewed run's TRUSTED failure ORIGIN — the runs.fail_origin
+	// closed-enum VALUE ONLY (never failure_reason free text), read from the target run
+	// at judge-claim assembly (PRD #69 M7a Pass B). Present only for kind=judge, and
+	// omitted when the reviewed run did not fail with a recognised origin (a NULL
+	// fail_origin, or a completed run) — omitempty for the SAME reason JudgeSignal and
+	// KnownImproveUziTargets carry it: an ordinary (non-judge) claim keeps today's wire
+	// shape byte-for-byte, and an older worker ignores the key. The judge weighs the
+	// class — e.g. a policy/config-denied class is NOT retryable. Distinct from
+	// autostop.go's unrelated `failure_class` slog key: this is a claim DTO field
+	// carrying only the enum value.
+	FailureClass *string `json:"failure_class,omitempty"`
 
 	// KnownImproveUziTargets is the run owner's existing improve_uzi target coordinates
 	// (issue #232): the judge reuses a matching one verbatim instead of inventing a new

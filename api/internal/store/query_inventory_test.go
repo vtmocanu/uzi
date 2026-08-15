@@ -455,6 +455,18 @@ var queryInventory = []queryPin{
 		"direct call, judge_integration_test.go:65 (TestClaimRunDockerRepoAllowlistLiveDB also calls it, but only as fixture setup)"},
 	{"GetActiveJudgeRunForWorkerTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:91"},
+	{"LastJudgeEnqueuedAt", "judge.sql", unpinnedPin,
+		"PRD #69 M5 Gate 5 cooldown lookup (read-only MAX(created_at) over kind='judge'). No " +
+			"store-package live-DB test executes it: its logic is exercised through the workersvc " +
+			"Store fake in judge_m5_test.go (TestJudgeCooldownGuard / TestJudgeSpendGuardsFailOpen), " +
+			"which pins the enqueue-gate behaviour — within/outside window, NULL last, fail-open — " +
+			"but not the SQL against a real row. A simple aggregate with no partial index or " +
+			"ordering to regress, so a live-DB pin would add little; UNPINNED with this reason."},
+	{"CountJudgesSince", "judge.sql", unpinnedPin,
+		"PRD #69 M5 Gate 5 daily-budget count (read-only COUNT(*) over kind='judge' AND " +
+			"created_at > @since). Same as LastJudgeEnqueuedAt: exercised via the workersvc Store " +
+			"fake in judge_m5_test.go (TestJudgeDailyBudgetGuard, which also asserts the rolling-24h " +
+			"@since the caller passes), not by a store-package live-DB test. UNPINNED with this reason."},
 	{"GetActiveJudgeRunForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go — the \"pending judge\" subtest (PRD #119 M1). " +
 			"The pin is the predicate↔index equivalence, not mere reachability: the subtest " +
@@ -488,6 +500,9 @@ var queryInventory = []queryPin{
 		"direct call, judge_integration_test.go:103"},
 	{"GetRunReviewForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:140"},
+	{"GetJudgeRunUsageForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
+		"direct call, judge_integration_test.go: asserts judge_run_id resolves and the " +
+			"run_usage_totals LEFT JOIN yields NULL usage for a judge with no run_usage row"},
 	{"ListRecommendationsForReview", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:147"},
 	{"ListOwnedRecommendationsForCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFiledMemberIsNotOpenLiveDB",

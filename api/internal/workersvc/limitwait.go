@@ -565,9 +565,14 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 	if !d.Park {
 		return s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 			FailureReason: pgText(d.Reason),
-			SessionID:     sessionID,
-			ID:            run.ID,
-			WorkerID:      pgUUID(wkr.ID),
+			// PRD #69 M7a: this failure is definitionally rate-limit-caused — the run hit
+			// an Anthropic usage limit and decided NOT to park (opt-out, or the wait budget
+			// is spent). Stamp the class as a server-side literal rather than trusting the
+			// worker's fail_origin, since the server owns the fact that this is the limit path.
+			FailOrigin: pgText("rate_limited"),
+			SessionID:  sessionID,
+			ID:         run.ID,
+			WorkerID:   pgUUID(wkr.ID),
 		})
 	}
 

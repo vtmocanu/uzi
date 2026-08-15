@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -210,6 +212,96 @@ func TestGetRunReviewPendingJudgeEnvelope(t *testing.T) {
 		if !ok || string(raw) != "null" {
 			t.Fatalf("pending_judge = %s (present=%v), want an explicit null alongside a populated review",
 				raw, ok)
+		}
+	})
+}
+
+// TestGetRunReviewSurfacesJudgeRunUsage pins PRD #69 M6 Decision 10: once the judge run
+// posts its result frame, foldRunUsage writes a run_usage row keyed on the judge run, and
+// the reviewed run's review DTO surfaces that row's timing + token/cost usage under
+// judge_run. It also pins the pre-feature contract: a judge with NO run_usage row (NULL
+// usage columns) surfaces judge_run WITHOUT a usage strip — never a fabricated 0.
+func TestGetRunReviewSurfacesJudgeRunUsage(t *testing.T) {
+	claimed := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
+	started := claimed.Add(2 * time.Second)
+	finished := started.Add(11 * time.Second)
+	judgeRunID := uuid.New()
+
+	usageRow := func(withUsage bool) *store.GetJudgeRunUsageForTargetRow {
+		row := &store.GetJudgeRunUsageForTargetRow{
+			JudgeRunID: pgtype.UUID{Bytes: judgeRunID, Valid: true},
+			ClaimedAt:  pgtype.Timestamptz{Time: claimed, Valid: true},
+			StartedAt:  pgtype.Timestamptz{Time: started, Valid: true},
+			FinishedAt: pgtype.Timestamptz{Time: finished, Valid: true},
+		}
+		if withUsage {
+			row.InputTokens = pgtype.Int8{Int64: 1200, Valid: true}
+			row.CacheReadTokens = pgtype.Int8{Int64: 300, Valid: true}
+			row.CacheCreationTokens = pgtype.Int8{Int64: 100, Valid: true}
+			row.OutputTokens = pgtype.Int8{Int64: 450, Valid: true}
+			row.CostUsd = pgtype.Numeric{Int: big.NewInt(123456), Exp: -6, Valid: true} // $0.123456
+		}
+		return row
+	}
+
+	decodeJudgeRun := func(t *testing.T, st *dispStore, runID uuid.UUID) *apitypes.JudgeRunDTO {
+		t.Helper()
+		h := newRunsHandler(t, st)
+		rec := httptest.NewRecorder()
+		h.GetRunReview(rec, runReq(store.User{ID: st.ownerID}, runID))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GetRunReview = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Review *apitypes.ReviewDTO `json:"review"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+		}
+		if body.Review == nil {
+			t.Fatal("review = null, want a populated verdict")
+		}
+		return body.Review.JudgeRun
+	}
+
+	t.Run("with usage → strip surfaces", func(t *testing.T) {
+		st, runID, _ := oneRecStore()
+		st.judgeRunUsage = usageRow(true)
+
+		jr := decodeJudgeRun(t, st, runID)
+		if jr == nil {
+			t.Fatal("judge_run absent — the review must surface the judge run's timing + usage")
+		}
+		if jr.JudgeRunID != judgeRunID.String() {
+			t.Errorf("judge_run_id = %q, want %q", jr.JudgeRunID, judgeRunID)
+		}
+		if jr.StartedAt == nil || !jr.StartedAt.Equal(started) {
+			t.Errorf("started_at = %v, want %v", jr.StartedAt, started)
+		}
+		if jr.FinishedAt == nil || !jr.FinishedAt.Equal(finished) {
+			t.Errorf("finished_at = %v, want %v", jr.FinishedAt, finished)
+		}
+		if jr.Usage == nil {
+			t.Fatal("usage absent — a judge that posted a result frame must surface its tokens + cost")
+		}
+		if jr.Usage.InputTokens != 1200 || jr.Usage.OutputTokens != 450 {
+			t.Errorf("usage tokens = %+v, want input=1200 output=450", jr.Usage)
+		}
+		if jr.Usage.CostUSD != 0.123456 {
+			t.Errorf("usage cost_usd = %v, want 0.123456", jr.Usage.CostUSD)
+		}
+	})
+
+	t.Run("pre-feature judge (NULL usage) → judge_run present but no usage strip", func(t *testing.T) {
+		st, runID, _ := oneRecStore()
+		st.judgeRunUsage = usageRow(false)
+
+		jr := decodeJudgeRun(t, st, runID)
+		if jr == nil {
+			t.Fatal("judge_run absent — timings still surface for a pre-feature judge")
+		}
+		if jr.Usage != nil {
+			t.Errorf("usage = %+v, want nil (no run_usage row ⇒ no strip, never a fabricated 0)", jr.Usage)
 		}
 	})
 }

@@ -53,11 +53,23 @@ const (
 	KeySlackBotToken = "slack_bot_token"
 	KeySlackAppToken = "slack_app_token"
 	// Run-judge keys (PRD #46 Decision 7). judge_enabled is the global kill-switch
-	// (text "true"/"false"); judge_model is the cheap model the judge runs on
-	// (a model alias, validated with the PRD #17 rules). Both are admin-writable and
-	// carry compiled-in defaults.
+	// (text "true"/"false"); judge_model is the model the judge runs on (opus by
+	// default since PRD #69; a model alias, validated with the PRD #17 rules).
+	// Both are admin-writable and carry compiled-in defaults.
 	KeyJudgeEnabled = "judge_enabled"
 	KeyJudgeModel   = "judge_model"
+	// KeyJudgeEnforceAll (PRD #69) is an admin bool ("true"/"false"). When true it
+	// bypasses the per-user judge_enabled opt-in gate so every run is judged; the
+	// kill-switch (KeyJudgeEnabled) and token presence still govern, so a disabled
+	// judge or a token-less user is never overridden.
+	KeyJudgeEnforceAll = "judge_enforce_all"
+	// Per-user judge spend guards (PRD #69 M5, Decision 9). Two admin-tuned,
+	// count-based, best-effort anti-runaway backstops checked at enqueue in EVERY
+	// mode. judge_cooldown_seconds is an integer in {0} ∪ [60, 86400] (0 disables the
+	// cooldown); judge_daily_budget is a non-negative count (0 = unlimited/off).
+	// Runtime-tunable from the Admin Settings page; no env var.
+	KeyJudgeCooldownSeconds = "judge_cooldown_seconds"
+	KeyJudgeDailyBudget     = "judge_daily_budget"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -129,10 +141,21 @@ const (
 	DefaultPublicBaseURL = "http://127.0.0.1:8080"
 	// PRD #46. The judge is OFF until an admin enables it (it spends user tokens), so
 	// the whole feature is a strict no-op on a fresh instance. The default model is
-	// the cheap haiku alias — a retrospective is a single compacted-trace round-trip,
-	// so the cheapest capable model is the right default (Decision 7).
+	// opus (PRD #69 Decision 1): the recommendation half feeds self-improvement, so
+	// the strongest model is wanted by default. The per-user override (M2) is the
+	// cost lever down to haiku/sonnet; opus is ~5–15× haiku per run, which is why
+	// M5's spend guards and the per-user override exist.
 	DefaultJudgeEnabled = "false"
-	DefaultJudgeModel   = "haiku"
+	DefaultJudgeModel   = "opus"
+	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
+	// until an admin flips this on, so the feature is a strict no-op on upgrade.
+	DefaultJudgeEnforceAll = "false"
+	// PRD #69 M5 Decision 9. The cooldown is ON by default (60s: skip a judge for a
+	// user who had one enqueued within the last minute), a cheap runaway-loop backstop
+	// even for opted-in users. The daily budget is OFF by default ("0" = unlimited): a
+	// count cap is opt-in because the generous cooldown already catches the loop case.
+	DefaultJudgeCooldownSeconds = "60"
+	DefaultJudgeDailyBudget     = "0"
 	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
 	// it, the engine reviews uzi's own repo on the configured interval (2 days).
 	DefaultSelfimproveEnabled  = "false"
@@ -186,6 +209,13 @@ const (
 // ResourceQuota incident.
 const maxHostedWorkerQuota = 20
 
+// maxJudgeDailyBudget bounds the per-user judge daily budget (PRD #69 M5 Decision
+// 9). 0 means unlimited (the guard is off); a positive count caps judge runs per
+// rolling 24h. The upper bound only catches a fat-fingered value — no real user
+// runs thousands of judges a day — so an admin meaning 50 and typing 50000 gets a
+// rejected write instead of an effectively-unlimited guard.
+const maxJudgeDailyBudget = 10000
+
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
 
@@ -221,10 +251,13 @@ var Defaults = map[string]string{
 	// defaults). The three engine-managed selfimprove keys (repo/user_id/last_run_at)
 	// are deliberately NOT here — see their KeySelfimprove* doc — so a body PUT to
 	// them is rejected as unknown and only the M5 engine writes them.
-	KeyJudgeEnabled:        DefaultJudgeEnabled,
-	KeyJudgeModel:          DefaultJudgeModel,
-	KeySelfimproveEnabled:  DefaultSelfimproveEnabled,
-	KeySelfimproveInterval: DefaultSelfimproveInterval,
+	KeyJudgeEnabled:         DefaultJudgeEnabled,
+	KeyJudgeModel:           DefaultJudgeModel,
+	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
+	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
+	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,
+	KeySelfimproveEnabled:   DefaultSelfimproveEnabled,
+	KeySelfimproveInterval:  DefaultSelfimproveInterval,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
 	// to these defaults, so All/AdminView surface them to the settings page and no
 	// migration seeds them.
@@ -523,8 +556,25 @@ func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
 	}
 }
 
+// JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
+// bypassing the per-user judge_enabled opt-in gate. Stored as the text
+// "true"/"false"; any other value falls back to the compiled-in default (false) —
+// the same strict junk-tolerance as JudgeEnabled, so a malformed row never
+// silently turns forced token spend on.
+func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyJudgeEnforceAll)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultJudgeEnforceAll == "true", err
+	}
+}
+
 // JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
-// back to the cheap DefaultJudgeModel ("haiku").
+// back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
 func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyJudgeModel)
 }
@@ -636,6 +686,21 @@ func (c *Cache) HealthNudgeCooldownSeconds(ctx context.Context) (int, error) {
 // Validate cannot reach retroactively.
 func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHostedWorkerQuota)
+}
+
+// JudgeCooldownSeconds returns the per-user judge cooldown in seconds (PRD #69 M5
+// Decision 9); 0 disables the cooldown guard. Best-effort at the enqueue gate — the
+// caller proceeds (fails open) on a read error, since the guard is a soft cost
+// backstop, not a correctness control.
+func (c *Cache) JudgeCooldownSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyJudgeCooldownSeconds)
+}
+
+// JudgeDailyBudget returns the per-user judge daily budget as a count (PRD #69 M5
+// Decision 9); 0 means unlimited (the guard is off). Best-effort at the enqueue
+// gate, like JudgeCooldownSeconds.
+func (c *Cache) JudgeDailyBudget(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyJudgeDailyBudget)
 }
 
 // DockerRepoAllowlist returns the set of repo ids a docker-enabled worker may claim
@@ -908,7 +973,7 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeySelfimproveEnabled, KeyHealthEnabled,
+	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeySelfimproveEnabled, KeyHealthEnabled,
 		KeyEligibleLabelWaivesPRDLink:
 		return validateBool(value)
 	case KeyJudgeModel:
@@ -918,6 +983,13 @@ func Validate(key, value string) error {
 	case KeyHealthStallSeconds, KeyHealthSlowSeconds, KeyHealthQueuedSeconds,
 		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
 		return validateHealthSeconds(value)
+	case KeyJudgeCooldownSeconds:
+		// {0} ∪ [60, 86400], identical to the run-health seconds bounds (PRD #69 M5
+		// Decision 9), so validateHealthSeconds enforces it verbatim — 0 disables the
+		// cooldown, the day cap stops a fat-fingered value silently disabling it.
+		return validateHealthSeconds(value)
+	case KeyJudgeDailyBudget:
+		return validateJudgeDailyBudget(value)
 	case KeyHostedWorkerQuota:
 		return validateHostedWorkerQuota(value)
 	case KeyDockerRepoAllowlist:
@@ -1049,6 +1121,30 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+// validateJudgeDailyBudget is the write-time gate for the per-user judge daily
+// budget (PRD #69 M5 Decision 9): a base-10 integer in {0} ∪ [1, maxJudgeDailyBudget],
+// where 0 is the documented "unlimited / guard off" value rather than a rejection.
+// Negatives, non-integers, and values above the cap are refused.
+//
+// Like validateHostedWorkerQuota, the explicit Validate case this backs is
+// load-bearing: Validate's default branch falls through to ValidateLabel, which
+// accepts any non-empty ≤64-char string — so without this case "abc" would save and
+// intSetting would silently fall back to the compiled-in default on every read, an
+// admin's typed cap silently ignored.
+func validateJudgeDailyBudget(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of judge runs")
+	}
+	if n == 0 {
+		return nil
+	}
+	if n < 0 || n > maxJudgeDailyBudget {
+		return fmt.Errorf("must be 0 (unlimited) or between 1 and %d judge runs", maxJudgeDailyBudget)
 	}
 	return nil
 }

@@ -12,11 +12,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countJudgesSince = `-- name: CountJudgesSince :one
+SELECT COUNT(*) FROM runs
+WHERE kind = 'judge' AND user_id = $1 AND created_at > $2
+`
+
+type CountJudgesSinceParams struct {
+	UserID uuid.UUID          `json:"user_id"`
+	Since  pgtype.Timestamptz `json:"since"`
+}
+
+// Count of a user's judge runs created after @since, for the per-user daily-budget
+// spend guard (PRD #69 M5 Decision 9, Gate 5). @since is now-24h at the call site, so
+// this is the rolling-24h judge count. Same low-QPS funnel as LastJudgeEnqueuedAt, so
+// no dedicated index (see its comment).
+func (q *Queries) CountJudgesSince(ctx context.Context, arg CountJudgesSinceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countJudgesSince, arg.UserID, arg.Since)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createJudgeRun = `-- name: CreateJudgeRun :one
 
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status)
 VALUES ($1, 'judge', $2, $3, $4, 'queued')
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin
 `
 
 type CreateJudgeRunParams struct {
@@ -122,6 +143,7 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 		&i.CiConfigPaths,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.FailOrigin,
 	)
 	return i, err
 }
@@ -176,7 +198,7 @@ func (q *Queries) GetActiveJudgeRunForTarget(ctx context.Context, targetRunID pg
 }
 
 const getActiveJudgeRunForWorkerTarget = `-- name: GetActiveJudgeRunForWorkerTarget :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin FROM runs
 WHERE worker_id = $1
   AND kind = 'judge'
   AND target_run_id = $2
@@ -272,6 +294,64 @@ func (q *Queries) GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg GetA
 		&i.CiConfigPaths,
 		&i.Model,
 		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+	)
+	return i, err
+}
+
+const getJudgeRunUsageForTarget = `-- name: GetJudgeRunUsageForTarget :one
+SELECT rr.judge_run_id,
+       jr.claimed_at,
+       jr.started_at,
+       jr.finished_at,
+       ru.input_tokens,
+       ru.cache_read_tokens,
+       ru.cache_creation_tokens,
+       ru.output_tokens,
+       ru.cost_usd
+FROM run_reviews rr
+JOIN runs jr ON jr.id = rr.judge_run_id
+LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id
+WHERE rr.target_run_id = $1
+`
+
+type GetJudgeRunUsageForTargetRow struct {
+	JudgeRunID          pgtype.UUID        `json:"judge_run_id"`
+	ClaimedAt           pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	FinishedAt          pgtype.Timestamptz `json:"finished_at"`
+	InputTokens         pgtype.Int8        `json:"input_tokens"`
+	CacheReadTokens     pgtype.Int8        `json:"cache_read_tokens"`
+	CacheCreationTokens pgtype.Int8        `json:"cache_creation_tokens"`
+	OutputTokens        pgtype.Int8        `json:"output_tokens"`
+	CostUsd             pgtype.Numeric     `json:"cost_usd"`
+}
+
+// The judge run's timing + token/cost usage for a target run's review panel (PRD #69
+// M6, Decision 10). Read-side companion to GetRunReviewForTarget: the judge run itself
+// records its cost NOWHERE until it posts its terminal result frame, which the worker
+// now does so foldRunUsage writes a run_usage row keyed on the judge run.
+//
+// The three timings come from the judge run row (jr): claimed_at/started_at/finished_at.
+// started_at is stamped only once the worker reports `running` (PRD #69 M6) — NULL for a
+// pre-feature judge that never reported it. The five usage columns come from the
+// run_usage_totals view via a LEFT JOIN, so a judge with no run_usage row (every
+// pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
+// fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
+// the target) BEFORE this read, exactly like GetRunReviewForTarget.
+func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (GetJudgeRunUsageForTargetRow, error) {
+	row := q.db.QueryRow(ctx, getJudgeRunUsageForTarget, targetRunID)
+	var i GetJudgeRunUsageForTargetRow
+	err := row.Scan(
+		&i.JudgeRunID,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.InputTokens,
+		&i.CacheReadTokens,
+		&i.CacheCreationTokens,
+		&i.OutputTokens,
+		&i.CostUsd,
 	)
 	return i, err
 }
@@ -300,6 +380,27 @@ func (q *Queries) GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UU
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const lastJudgeEnqueuedAt = `-- name: LastJudgeEnqueuedAt :one
+SELECT MAX(created_at)::timestamptz FROM runs
+WHERE kind = 'judge' AND user_id = $1
+`
+
+// The most recent judge-run creation time for a user, for the per-user cooldown
+// spend guard (PRD #69 M5 Decision 9, Gate 5). MAX over an empty set is SQL NULL, so
+// the return is a NULLABLE timestamp — NULL means "this user has never had a judge",
+// which the caller reads as "no cooldown in effect". The ::timestamptz cast pins the
+// column type for sqlc (a bare MAX(created_at) is inferred as interface{}).
+//
+// No dedicated index: the judge funnel is low-QPS (one read per terminal transition
+// per user), so idx_runs_user already covers this; a partial runs(user_id,created_at)
+// WHERE kind='judge' index would be premature.
+func (q *Queries) LastJudgeEnqueuedAt(ctx context.Context, userID uuid.UUID) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, lastJudgeEnqueuedAt, userID)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const listRecommendationsForReview = `-- name: ListRecommendationsForReview :many

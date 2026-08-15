@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
 )
@@ -370,6 +371,32 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	// compiled-in defaults (enabled, "PRDLESS"), never an error.
 	prdlessLabel, _ := h.settings.PrdlessLabel(ctx)
 	prdlessEnabled, _ := h.settings.PrdlessEnabled(ctx)
+	// Judge consent surface (PRD #69 M4): a non-admin cannot read
+	// /api/admin/settings, so the two facts the user needs to consent to their own
+	// token being spent ride the session payload. Both are resolved server-side and
+	// best-effort — a cold/failed settings read degrades to the SAFE reading (not
+	// enforced; the instance/default model), never a 500 on /me.
+	//
+	// judge_enforced_by_admin mirrors the Gate-2-wins semantics of the enqueue path
+	// (workersvc): the kill-switch (judge_enabled) dominates enforce_all, so the
+	// judge is only "enforced" when BOTH are on. With the kill-switch off, an
+	// enforce_all=true row is inert and reported as not enforced.
+	judgeEnabled, _ := h.settings.JudgeEnabled(ctx)
+	judgeEnforceAll, _ := h.settings.JudgeEnforceAll(ctx)
+	judgeEnforced := judgeEnabled && judgeEnforceAll
+	// effective_judge_model is the model THIS user's judge actually runs on, resolved
+	// exactly the way assembleJudgeClaim resolves it (user-value-wins): the user's own
+	// non-blank judge_model, else the instance judge_model, which itself falls back to
+	// DefaultJudgeModel ("opus") inside JudgeModel. So the consent copy names the real
+	// model, not a guess.
+	effectiveJudgeModel := ""
+	if user.JudgeModel.Valid && strings.TrimSpace(user.JudgeModel.String) != "" {
+		effectiveJudgeModel = user.JudgeModel.String
+	} else if m, err := h.settings.JudgeModel(ctx); err == nil && strings.TrimSpace(m) != "" {
+		effectiveJudgeModel = m
+	} else {
+		effectiveJudgeModel = settings.DefaultJudgeModel
+	}
 	return map[string]any{
 		"user":            toDTO(user),
 		"prd_label":       prdLabel,
@@ -398,6 +425,12 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		// has_password is false for OIDC-only users (NULL password_hash); the SPA uses
 		// it with vault.exists to choose passphrase-create vs unlock wording (PRD #45).
 		"has_password": user.PasswordHash.Valid,
+		// Judge consent (PRD #69 M4). judge_enforced_by_admin drives the RunDefaults
+		// ENFORCED banner; effective_judge_model names the model the user's own token
+		// will run on. The user's RAW per-user judge_model override is read/written
+		// through PUT /me/settings (userSettingsDTO), so it is not duplicated here.
+		"judge_enforced_by_admin": judgeEnforced,
+		"effective_judge_model":   effectiveJudgeModel,
 	}
 }
 

@@ -520,6 +520,12 @@ export interface ClaimResponse {
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */
   judge_signal?: JudgeSignal | null;
+  /** The reviewed run's TRUSTED failure ORIGIN — the runs.fail_origin closed-enum VALUE
+   *  ONLY (never failure_reason free text), computed API-side from status + fail_origin
+   *  (PRD #69 M7a Pass B). Present only for kind="judge"; null when the reviewed run did
+   *  not fail with a recognised origin. The judge weighs the class, e.g. a
+   *  policy/config-denied class is not retryable. */
+  failure_class?: string | null;
   /** The run owner's existing improve_uzi target coordinates (issue #232), delivered on
    *  a judge claim so the judge reuses a matching target string verbatim instead of
    *  inventing a new phrasing — future recurrences then land on the same exact key the
@@ -1212,6 +1218,14 @@ export interface StateRequest {
    *  feed or Slack. Doing the allowlisting here as well would put the authoritative
    *  copy of the vocabulary on the untrusted side. */
   rate_limit_type?: string;
+  /** failed (PRD #69 M7a): the worker's structured guess at WHY this run is failing,
+   *  mapped from the known reason CONSTANT at the report site — e.g.
+   *  "provisioning_failed", "credential_unavailable" or "rate_limited". Additive +
+   *  optional and OMITTED for an ordinary agent failure (the server then defaults it
+   *  to 'agent_failure'). Sent UNVALIDATED on purpose, exactly like `rate_limit_type`:
+   *  the server allowlists it against its own closed enum and drops anything else,
+   *  so the authoritative copy of the vocabulary stays on the trusted side. */
+  fail_origin?: string;
 }
 
 /**

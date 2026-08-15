@@ -42,6 +42,10 @@ import type {
 
 const NOW = Date.now();
 export const minsAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
+// secsAgo gives sub-minute granularity, needed for the judge run's start/finish stamps
+// (PRD #69 M6): a retrospective takes seconds, so its Duration tile needs second-level
+// timestamps rather than the minute-granular minsAgo the reviews otherwise use.
+export const secsAgo = (s: number) => new Date(NOW - s * 1000).toISOString();
 export const daysAgo = (d: number) => new Date(NOW - d * 86_400_000).toISOString();
 // minsAhead is the FUTURE direction, which nothing needed until PRD #35: a parked
 // run's whole surface is a countdown, and a countdown seeded in the past renders the
@@ -440,6 +444,23 @@ export interface MockReview {
   // all, which is the one state the "done via #IID" label exists for.
   dispositions: (Disposition & { set_via?: "issue_close" })[];
   triage: TriageCounts;
+  // The judge run's OWN timing + token/cost usage (PRD #69 M6), for the panel's
+  // time/tokens/cost strip. Shape mirrors the real ReviewDTO.judge_run: `usage` is null
+  // for a pre-feature judge that posted no result frame (the panel renders NO strip),
+  // and a set object renders the four-tile strip. Kept honest per PRD #311 mock currency.
+  judge_run?: {
+    judge_run_id: string;
+    claimed_at: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    usage: {
+      input_tokens: number;
+      cache_read_tokens: number;
+      cache_creation_tokens: number;
+      output_tokens: number;
+      cost_usd: number;
+    } | null;
+  };
 }
 
 export const mockReviews: MockReview[] = [
@@ -549,6 +570,21 @@ export const mockReviews: MockReview[] = [
     // total 5: todo 1 (rec-3), filed 1 (rec-4), done 1 (rec-1), dismissed 2 (rec-2,
     // rec-5), of which 1 is a false positive (rec-5). Recomputed by mockApi on mutation.
     triage: { total: 5, todo: 1, filed: 1, done: 1, dismissed: 2, false_positives: 1 },
+    // A judged-on-metered-tokens judge (PRD #69 M6): the strip shows real tokens, a ~14s
+    // duration, and a non-zero cost.
+    judge_run: {
+      judge_run_id: "judge-run-done",
+      claimed_at: secsAgo(378),
+      started_at: secsAgo(374),
+      finished_at: secsAgo(360),
+      usage: {
+        input_tokens: 48200,
+        cache_read_tokens: 12800,
+        cache_creation_tokens: 3100,
+        output_tokens: 1840,
+        cost_usd: 0.42,
+      },
+    },
   },
   // ── Two more reviews so the Judge menu (PRD #98 M3) demos dedup across runs ──────
   // These share coordinates with rev-done so the by-target grouping has something to
@@ -616,6 +652,21 @@ export const mockReviews: MockReview[] = [
     // total 3: todo 2 (rc-1, rc-2), done 1 (rc-3 — auto, via the closed #91). The done rung
     // outranks filed on the shared ladder, so the filed link above does NOT make it filed.
     triage: { total: 3, todo: 2, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+    // A judge run on a SUBSCRIPTION plan (PRD #69 M6): the SDK prices it at $0, so the
+    // Cost tile renders "—" (never "$0.00") while the token + duration tiles still show.
+    judge_run: {
+      judge_run_id: "judge-run-closed",
+      claimed_at: secsAgo(300),
+      started_at: secsAgo(297),
+      finished_at: secsAgo(288),
+      usage: {
+        input_tokens: 31500,
+        cache_read_tokens: 9200,
+        cache_creation_tokens: 0,
+        output_tokens: 1120,
+        cost_usd: 0,
+      },
+    },
   },
   {
     id: "rev-cancelled",
@@ -670,6 +721,17 @@ export const mockReviews: MockReview[] = [
     ],
     // total 3: todo 1 (rx-1), filed 1 (rx-2), done 1 (rx-3), dismissed 0.
     triage: { total: 3, todo: 1, filed: 1, done: 1, dismissed: 0, false_positives: 0 },
+    // A PRE-FEATURE judge (PRD #69 M6): it posted no result frame, so there is no
+    // run_usage row — usage is null and the panel renders NO cost/time strip (never a
+    // fabricated 0). The timings are still present (a pre-feature judge could report
+    // running), which is why the strip gates on `usage`, not on `judge_run`.
+    judge_run: {
+      judge_run_id: "judge-run-cancelled",
+      claimed_at: secsAgo(500),
+      started_at: secsAgo(496),
+      finished_at: secsAgo(480),
+      usage: null,
+    },
   },
 ];
 

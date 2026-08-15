@@ -159,6 +159,8 @@ beforeEach(() => {
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
+    judgeEnforcedByAdmin: false,
+    effectiveJudgeModel: "opus",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

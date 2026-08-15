@@ -45,6 +45,11 @@ type dispStore struct {
 	// expects and what keeps their assertions about the review half unchanged.
 	pendingJudge *store.GetActiveJudgeRunForTargetRow
 
+	// judgeRunUsage backs the PRD #69 M6 judge-run timing+usage read the review READ path
+	// now makes. nil returns pgx.ErrNoRows ("no judge-run detail"), which keeps the
+	// judge_run field omitted and every pre-#69 assertion about the review half unchanged.
+	judgeRunUsage *store.GetJudgeRunUsageForTargetRow
+
 	// triageRows backs the global stats aggregate (ListJudgeTriageRowsForUser).
 	triageRows   []store.ListJudgeTriageRowsForUserRow
 	statsUserArg uuid.UUID
@@ -107,6 +112,13 @@ func (s *dispStore) GetActiveJudgeRunForTarget(_ context.Context, _ pgtype.UUID)
 func (s *dispStore) ListDispositionsForReview(_ context.Context, _ uuid.UUID) ([]store.RecommendationDisposition, error) {
 	s.note("ListDispositionsForReview")
 	return s.disps, nil
+}
+func (s *dispStore) GetJudgeRunUsageForTarget(_ context.Context, _ uuid.UUID) (store.GetJudgeRunUsageForTargetRow, error) {
+	s.note("GetJudgeRunUsageForTarget")
+	if s.judgeRunUsage == nil {
+		return store.GetJudgeRunUsageForTargetRow{}, pgx.ErrNoRows
+	}
+	return *s.judgeRunUsage, nil
 }
 func (s *dispStore) UpsertRecommendationDisposition(_ context.Context, arg store.UpsertRecommendationDispositionParams) (store.RecommendationDisposition, error) {
 	s.note("UpsertRecommendationDisposition")

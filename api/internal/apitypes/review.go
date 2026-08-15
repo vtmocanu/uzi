@@ -323,6 +323,24 @@ type PendingJudgeDTO struct {
 	EnqueuedAt time.Time `json:"enqueued_at"`
 }
 
+// JudgeRunDTO is the judge run's own timing + token/cost usage for the reviewed run's
+// panel (PRD #69 M6, Decision 10). Judge spend is the owner's own token spend: the judge
+// run posts its terminal result frame like any work run, so foldRunUsage writes a
+// run_usage row and it also rolls into the owner's usage totals — the CHOSEN behavior.
+//
+// ClaimedAt/StartedAt/FinishedAt are the judge run's lifecycle stamps; StartedAt is set
+// once the worker reports `running`, so it is null for a pre-feature judge that never
+// did (leaving the panel to show no duration). Usage is nil when the judge posted no
+// result frame (every pre-feature judge) — the panel then renders NO cost/time strip,
+// never a fabricated 0.
+type JudgeRunDTO struct {
+	JudgeRunID string     `json:"judge_run_id"`
+	ClaimedAt  *time.Time `json:"claimed_at"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	Usage      *UsageDTO  `json:"usage"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {
@@ -341,4 +359,7 @@ type ReviewDTO struct {
 	Dispositions []DispositionDTO `json:"dispositions"`
 	// Triage is the server-computed per-review tally (PRD #94), rendered directly by the panel.
 	Triage TriageDTO `json:"triage"`
+	// JudgeRun is the judge run's own timing + usage (PRD #69 M6), for the panel's
+	// time/tokens/cost strip. Omitted when there is no judge-run detail to surface.
+	JudgeRun *JudgeRunDTO `json:"judge_run,omitempty"`
 }

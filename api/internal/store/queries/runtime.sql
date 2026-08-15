@@ -1201,6 +1201,11 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status             = 'failed',
     failure_reason     = @failure_reason,
+    -- PRD #69 M7a: the TRUSTED failure class, always set from Go (the worker-reported
+    -- `failed` arm coerces req.fail_origin through the allowlist and defaults a
+    -- classless failure to 'agent_failure'; the limit-opt-out non-park path stamps
+    -- 'rate_limited'). Never derived from failure_reason, which is never parsed.
+    fail_origin        = @fail_origin,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     move_pending_since = now(),
     finished_at        = now(),
@@ -1219,6 +1224,12 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status             = 'failed',
     failure_reason     = @failure_reason,
+    -- PRD #69 M7a: the TRUSTED failure class. recoverClaimAssembly maps each infra
+    -- sentinel to its own origin (errCredentialUnavailable → 'credential_unavailable',
+    -- errToolPackagesRejected → 'provisioning_failed', errGuardrailBlockedClaim →
+    -- 'guardrail_blocked') and passes it here, so the class survives the assembly that
+    -- would otherwise collapse into one indistinguishable failure_reason.
+    fail_origin        = @fail_origin,
     move_pending_since = now(),
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
@@ -1276,6 +1287,10 @@ WHERE id = @id AND user_id = @user_id
 UPDATE runs SET status = 'failed',
     failure_reason     = @failure_reason,
     stop_kind          = 'auto_stopped',
+    -- PRD #69 M7a: the trusted failure class for the auto-stop. Overlaps stop_kind
+    -- deliberately (see 00126) so this failed writer, like every other, sets a
+    -- non-NULL origin without a consumer joining two columns.
+    fail_origin        = 'auto_stopped',
     move_pending_since = now(),
     finished_at        = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
@@ -1314,7 +1329,10 @@ WHERE id = @id
 -- stamped 'plan_rejected' in the same statement as the status/failure_reason write
 -- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 -- regardless of the failure_reason text.
-UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected',
+    -- PRD #69 M7a: trusted failure class, overlapping stop_kind deliberately (see 00126).
+    fail_origin = 'plan_rejected',
+    failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -1373,7 +1391,12 @@ WHERE id = @id AND status = 'claimed';
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 -- reconcile loop a marker to restore the origin column later. Chat runs are exempt
 -- (Decision 3): a chat legitimately parks for a long time between turns, so its own
--- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
+-- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead. Judge
+-- runs are exempt too (PRD #69 M6 follow-up): M6 stamps started_at on the judge run so it
+-- now sits in 'running' during its single trace-fetch + model turn, where before it went
+-- claimed→completed and this sweep never saw it. A judge carries no work-run wall budget
+-- and is bounded by its own runner-side timeout, so folding it in here would newly fail a
+-- slow judge (large trace / slow API) that would otherwise complete.
 --
 -- PRD #122 M2 (Decision 5b): the cutoff is now PER-RUN, not a single global @cutoff.
 -- A run that froze a scaled budget carries budget_wall_seconds; the sweep honours it,
@@ -1387,7 +1410,10 @@ WHERE id = @id AND status = 'claimed';
 -- it in before persisting. This consumer trusts budget_wall_seconds as an already-capped,
 -- server-only, IMMUTABLE value — so a future writer that persists an UNCAPPED budget_wall_seconds
 -- would bypass the ceiling here, and the cap must stay at every write path, not be moved to reads.
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
+    -- PRD #69 M7a: the trusted failure class for a run killed by RUN_TIMEOUT.
+    fail_origin = 'run_timeout',
+    move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
@@ -1395,7 +1421,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pendin
     updated_at = now()
 WHERE status = 'running'
   AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
-  AND kind <> 'chat'
+  AND kind NOT IN ('chat', 'judge')
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -1403,7 +1429,10 @@ RETURNING id, user_id, status;
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -1440,7 +1469,10 @@ RETURNING id, user_id, status;
 -- it stamps move_pending_since. RETURNING id so the caller can funnel these
 -- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
 -- as the sweeper's FailRunsOfStaleWorkersOverCap does.
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
+    -- PRD #69 M7a: the trusted failure class for an orphaned run whose worker is gone.
+    fail_origin = 'worker_lost',
+    move_pending_since = now(), finished_at = now(),
     -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
     milestones_in_progress = NULL,
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.

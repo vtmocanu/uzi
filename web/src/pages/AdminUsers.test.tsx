@@ -3,19 +3,33 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminUsers } from "./AdminUsers";
-import { api, type User } from "../lib/api";
+import { api, type SettingsResponse, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listUsers: vi.fn(), setUserActive: vi.fn(), setUserJudgeEnabled: vi.fn() },
+    api: {
+      listUsers: vi.fn(),
+      setUserActive: vi.fn(),
+      setUserJudgeEnabled: vi.fn(),
+      setUserCIAutofixEnabled: vi.fn(),
+      // PRD #69 M4: AdminUsers now reads judge_enforce_all to grey the per-user judge
+      // control under enforced mode.
+      getSettings: vi.fn(),
+    },
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
 const mockApi = vi.mocked(api);
+
+// settingsResp is the minimal admin settings the AdminUsers load path reads: only
+// judge_enforce_all is consumed, so the rest is a thin cast.
+function settingsResp(enforceAll: boolean): SettingsResponse {
+  return { settings: { judge_enforce_all: enforceAll ? "true" : "false" } } as unknown as SettingsResponse;
+}
 
 function aUser(over: Partial<User> = {}): User {
   return {
@@ -38,6 +52,9 @@ function aUser(over: Partial<User> = {}): User {
 
 beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({ user: { id: "admin1", is_admin: true } } as unknown as ReturnType<typeof useAuth>);
+  // Default: enforced mode off, so the per-user judge control is live. Tests that
+  // exercise enforced mode override this.
+  mockApi.getSettings.mockResolvedValue(settingsResp(false));
 });
 afterEach(() => {
   cleanup();
@@ -87,6 +104,25 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
     fireEvent.click(judgeCell().getByText("Disable"));
     expect(mockApi.setUserJudgeEnabled).toHaveBeenCalledWith("u2", false);
     await waitFor(() => expect(judgeCell().getByText("Off")).toBeTruthy());
+  });
+});
+
+describe("AdminUsers judge enforced mode (PRD #69 M4)", () => {
+  it("greys and disables the per-user judge control when enforce-all is on", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ judge_enabled: false })] });
+    mockApi.getSettings.mockResolvedValue(settingsResp(true));
+
+    render(
+      <MemoryRouter>
+        <AdminUsers />
+      </MemoryRouter>,
+    );
+    const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    const judgeCell = () => within(within(row).getAllByRole("cell")[4]);
+    // The Enable button is present but disabled (inert), and the cell annotates why.
+    const btn = judgeCell().getByText("Enable") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(judgeCell().getByText(/Inert/).textContent).toContain("enforced mode");
   });
 });
 

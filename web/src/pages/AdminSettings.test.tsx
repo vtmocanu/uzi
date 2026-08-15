@@ -36,7 +36,10 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
-  judge_model: "haiku",
+  judge_model: "opus",
+  judge_enforce_all: "false",
+  judge_cooldown_seconds: "60",
+  judge_daily_budget: "0",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -377,7 +380,33 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     fireEvent.click(btn);
 
     await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith({ judge_enabled: "true", judge_model: "opus" }),
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({
+        judge_enabled: "true",
+        judge_model: "opus",
+        // enforce-all stays off (fixture default), the spend guards keep their loaded
+        // values (PRD #69 M4/M5): the card sends the whole judge group on one save.
+        judge_enforce_all: "false",
+        judge_cooldown_seconds: "60",
+        judge_daily_budget: "0",
+      }),
+    );
+  });
+
+  it("greys the enforce-all toggle while the judge kill-switch is off, and sends it on once enabled", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_enforce_all: "true" }));
+    renderPage();
+    const enforce = (await screen.findByLabelText(/Enforce the judge on every run/i)) as HTMLInputElement;
+    // Kill-switch off (fixture default): the enforce toggle is disabled.
+    expect(enforce.disabled).toBe(true);
+    // Turning the judge on frees the enforce toggle; then enforce + save.
+    fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
+    expect((screen.getByLabelText(/Enforce the judge on every run/i) as HTMLInputElement).disabled).toBe(false);
+    fireEvent.click(screen.getByLabelText(/Enforce the judge on every run/i));
+    fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ judge_enabled: "true", judge_enforce_all: "true" }),
+      ),
     );
   });
 

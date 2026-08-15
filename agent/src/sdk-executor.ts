@@ -131,7 +131,9 @@ const PRD_DONE_PATH_MAX_LEN = 512;
 const REASON_WALL = "run exceeded its wall-clock timeout";
 const REASON_IDLE = "run stalled: no agent activity within the idle timeout";
 const REASON_CANCELLED = "run cancelled";
-const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
+// Exported so the runner's failed-report site can map it to a fail_origin
+// (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
+export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 const REASON_NO_PLAN =
   "the agent ended the planning turn without submitting a plan";
 /** PRD #88 M4: the lead kept asking instead of planning. Distinct from

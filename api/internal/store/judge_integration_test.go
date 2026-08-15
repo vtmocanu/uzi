@@ -182,6 +182,25 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 		t.Fatalf("read-back recommendations wrong (want the single post-re-judge rec): %+v", readRecs)
 	}
 
+	// ── judge run timing + usage (PRD #69 M6): GetJudgeRunUsageForTarget ──
+	// The join resolves the review's judge_run_id, and the LEFT JOIN onto
+	// run_usage_totals yields NULL usage for this judge (it posted no result frame, so no
+	// run_usage row exists) — the pre-feature contract the DTO renders as an absent strip.
+	// Executing it is the only thing that proves the join wiring; sqlc generating is not a
+	// measurement.
+	ju, err := q.GetJudgeRunUsageForTarget(ctx, targetID)
+	if err != nil {
+		t.Fatalf("GetJudgeRunUsageForTarget: %v", err)
+	}
+	if uuid.UUID(ju.JudgeRunID.Bytes) != judge.ID {
+		t.Fatalf("GetJudgeRunUsageForTarget judge_run_id = %v, want the review's judge run %v",
+			uuid.UUID(ju.JudgeRunID.Bytes), judge.ID)
+	}
+	if ju.CostUsd.Valid || ju.InputTokens.Valid {
+		t.Fatalf("a judge with no run_usage row must yield NULL usage (LEFT JOIN), got cost.Valid=%v input.Valid=%v — "+
+			"a fabricated 0 here would render a bogus $0.00 strip", ju.CostUsd.Valid, ju.InputTokens.Valid)
+	}
+
 	// ── trace/review authz: a TERMINAL judge run is no longer "active" ──
 	// GetActiveJudgeRunForWorkerTarget filters status NOT IN (completed,failed,
 	// cancelled), so once the judge run finishes the worker can no longer stream the
