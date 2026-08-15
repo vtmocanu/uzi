@@ -55,7 +55,7 @@ describe("coordKey (PRD #68/#94/#98)", () => {
   // `target` is spelled. Pinning the enum is therefore the real guard; asserting a
   // general non-collision would be asserting something false.
   // NOTE WHICH SIDE THIS PINS: RECOMMENDATION_LABELS is the TS MIRROR of the category enum,
-  // not the database's own CHECK constraint (00059_run_reviews.sql, widened in 00125). So a
+  // not the database's own CHECK constraint (00059_run_reviews.sql, widened in 00127). So a
   // future DB category containing a space, added without updating this union, would slip past
   // this test. That is
   // a real gap and a small one: recommendationLabel already falls back to humanising an

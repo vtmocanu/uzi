@@ -17,9 +17,11 @@
 -- Constraint-only change: no column added/typed, no new `-- name:` query, so this needs
 -- NO sqlc regen (sqlc reads the schema for column types, which a CHECK does not affect).
 --
--- NOTE (goose numbering): drafted as 00125 — the next free number above the live head
--- (00124) at drafting time — and renumbered at the landing merge if another migration
--- lands first, per the CLAUDE.md convention (goose is strict, no allow-missing).
+-- NOTE (goose numbering): drafted as 00125 (the next free number above the then-live
+-- head 00124), renumbered to 00127 on landing because origin/main's PRD #69 had taken
+-- 00125 (00125_user_judge_model) and 00126 (00126_run_fail_origin). 00127 is above the
+-- current live head 00126; renumber again above the live head if another migration lands
+-- first, per the CLAUDE.md convention (goose is strict, no allow-missing).
 ALTER TABLE review_recommendations DROP CONSTRAINT review_recommendations_category_check;
 ALTER TABLE review_recommendations ADD CONSTRAINT review_recommendations_category_check
     CHECK (category IN (
