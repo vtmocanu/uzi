@@ -1612,7 +1612,8 @@ export type RecommendationCategory =
   | "adjust_template"
   | "improve_agent"
   | "add_agent"
-  | "improve_uzi";
+  | "improve_uzi"
+  | "cost_efficiency";
 
 export interface ReviewRecommendation {
   id: string;
