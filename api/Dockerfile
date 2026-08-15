@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage ---
-FROM golang:1.26@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647 AS build
+FROM golang:1.26@sha256:26326682769ca980f8f1d3b1f52be2dd1c1d25270e3de3fe0c97d6bb65df3556 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
