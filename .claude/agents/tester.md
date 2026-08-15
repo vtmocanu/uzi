@@ -248,6 +248,13 @@ it was.
 
 ## For this repo (uzi)
 
+**Prune your fold worktrees when you finish.** A non-vacuity fold runs in a
+detached throwaway worktree (`git worktree add --detach <tmp> <sha>`, per the rule
+above); remove it with `git worktree remove <tmp>` when done, and `git worktree
+prune` if you already deleted the directory. A leftover directory-gone entry
+survives in `git worktree list` and reads as a real worktree to the reviewer's
+tree-evidence check, costing turns to rule out contamination (measured on PRD #290).
+
 Gate slots, per component. Everything not listed as a target genuinely does not
 exist here yet — see PRD #103, which builds them.
 

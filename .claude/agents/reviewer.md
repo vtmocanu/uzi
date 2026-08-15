@@ -167,6 +167,14 @@ proven otherwise.
 
 ## For this repo (uzi)
 
+**Prune your fold worktrees, or the tree-evidence check reads a ghost.** When you
+fold a non-vacuity mutation in a detached throwaway worktree (`git worktree add
+--detach <tmp> <sha>`), remove it with `git worktree remove <tmp>` when you finish,
+and `git worktree prune` if the directory is already gone. A leftover
+directory-gone entry lingers in `git worktree list` — the same command the
+tree-evidence step above reads — so a stale entry reads as a live worktree and
+costs turns to rule out as contamination (measured on PRD #290).
+
 Dead-code slot: **`task deadcode`** — run it, and read what it does *not* cover
 before you conclude anything from a green. Three tools sit in this slot now:
 `golangci-lint unused` (M3, unused **unexported** symbols **within** a Go

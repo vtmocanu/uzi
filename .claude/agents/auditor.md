@@ -168,6 +168,14 @@ proven otherwise.
 
 ## For this repo (uzi)
 
+**Prune your fold worktrees, or the tree-evidence check reads a ghost.** When you
+fold a non-vacuity mutation in a detached throwaway worktree (`git worktree add
+--detach <tmp> <sha>`), remove it with `git worktree remove <tmp>` when you finish,
+and `git worktree prune` if the directory is already gone. A leftover
+directory-gone entry lingers in `git worktree list` — the same command the
+tree-evidence step above reads — so a stale entry reads as a live worktree and
+costs turns to rule out as contamination (measured on PRD #290).
+
 Security-scan slot: **secrets AND dependency vulnerabilities are both covered as
 of PRD #103 M5 — MR-B for secrets, MR-C (`fce6a06d`) for dependencies.**
 `task scan:secrets` (gitleaks) runs inside
