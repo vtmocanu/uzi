@@ -4331,7 +4331,10 @@ Serves human: allowlist-bounded per-repo tools.
   copy of that manifest (Decision 5 — `go:embed` cannot cross the package/module boundary
   to reach `agent/`), normalizes seed nix attrs to allowlist names (strip a trailing nix
   output selector from a closed set — `bin`/`out`/`dev`/`man`/`doc`/`lib`/`info`/`debug`/`dist`,
-  e.g. `jq.bin`→`jq`, `file.out`→`file`; alias `yq-go`→`yq`), and exposes `Covered(pkg)`. **Enforced at THREE
+  e.g. `jq.bin`→`jq`, `file.out`→`file`; then alias each baked package whose binary differs from the
+  attr — `yq-go`→`yq`, `go-task`→`task`, `gnumake`→`make`, `kubernetes-helm`→`helm`, `python3Packages.pip`→`pip`
+  — so coverage is asserted at the binary-on-PATH level, owner-ruled, with the `yq`/`yq-go` same-binary
+  caveat documented), and exposes `Covered(pkg)`. **Enforced at THREE
   points** (Decision 4c): `CreateToolAllowlistEntry` (400), `SetRepoToolProfile` (400),
   and `resolveTooling`/claim assembly (terminal claim failure via
   `errToolPackagesRejected`). A golden test asserts the embedded copy matches the manifest;

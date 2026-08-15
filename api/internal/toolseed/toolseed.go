@@ -33,9 +33,9 @@ var seedManifest []byte
 // shellcheck.bin). An admin allowlists the plain package name (openssl, file,
 // jq), so we strip the output selector when building the covered set. This is a
 // closed set of OUTPUT names, deliberately: `python3Packages.pip` ends in `.pip`,
-// but `pip` is not an output name, so it is left intact and its base
-// `python3Packages` never appears (pip is covered as `python3Packages.pip` if an
-// admin ever allowlisted that exact attr, which they do not — see below).
+// but `pip` is not an output name, so the selector strip leaves it intact — the
+// `python3Packages.pip`→`pip` mapping is then done by the alias map below (so `pip`
+// is the covered name, not `python3Packages.pip`), not by this strip.
 var nixOutputSuffixes = map[string]bool{
 	"bin":   true,
 	"out":   true,
@@ -49,19 +49,30 @@ var nixOutputSuffixes = map[string]bool{
 }
 
 // seedAliases maps a seed attr's normalized name to the allowlist name that names
-// the same tool. This is the ONE genuine package alias: the seed bakes the Go
-// `yq-go` package, whose binary on PATH is `yq` — which is the allowlist name. So
-// coverage for yq is asserted at the binary-on-PATH level, a documented caveat.
+// the same tool on PATH. Coverage is asserted at the BINARY-ON-PATH level (owner
+// ruling, PRD #123 M3 approval): where the baked devbox package name differs from
+// the binary an agent invokes, the allowlist name follows the binary, so the gate
+// treats the binary name as covered.
 //
-// Deliberately NOT aliased to their binary names: go-task (binary `task`), gnumake
-// (binary `make`), kubernetes-helm (binary `helm`), python3Packages.pip (binary
-// `pip`). An admin allowlists the devbox PACKAGE name, not the binary name, so
-// allowlisting `go-task` is covered but `task` is not — and `devbox install task`
-// would resolve a DIFFERENT nixpkgs attr, so treating `task` as covered would be
-// wrong. yq-go→yq is the sole exception because the swap is a naming quirk of that
-// one package, not a package-vs-binary distinction an admin could get wrong.
+//   - yq-go   → yq   : the seed bakes the Go `yq-go`, whose binary on PATH is `yq`.
+//   - go-task → task : mainProgram `task`.
+//   - gnumake → make : mainProgram `make`.
+//   - kubernetes-helm → helm : mainProgram `helm`.
+//   - python3Packages.pip → pip : the `pip` CLI.
+//
+// CAVEAT, documented rather than hidden: `yq` names two DIFFERENT nixpkgs packages
+// — the baked Go `yq-go` and the python-wrapper `yq` — that share the `yq` binary.
+// So "covered" here means "the binary is on PATH from the baked toolchain", NOT
+// "a tier-1 `devbox install yq` resolves the same derivation". The same on-PATH
+// framing applies to helm/task/make/pip. This matches the owner-accepted posture
+// for the gate: it prevents allowlisting a tool the image cannot supply on PATH,
+// not a proof of derivation-level offline resolution (that was M0's retired spike).
 var seedAliases = map[string]string{
-	"yq-go": "yq",
+	"yq-go":               "yq",
+	"go-task":             "task",
+	"gnumake":             "make",
+	"kubernetes-helm":     "helm",
+	"python3Packages.pip": "pip",
 }
 
 // seedExceptions are packages that are allowlisted but deliberately NOT baked into
@@ -107,8 +118,9 @@ func buildSeedSet() map[string]bool {
 
 // normalize maps a seed attr to the allowlist name it covers: it strips a trailing
 // nixpkgs `.<output>` selector (jq.bin→jq, openssl.bin→openssl, file.out→file,
-// shellcheck.bin→shellcheck) but leaves python3Packages.pip intact (pip is not an
-// output name), then applies the alias map (yq-go→yq). Everything else is
+// shellcheck.bin→shellcheck) but leaves python3Packages.pip intact at this step
+// (pip is not an output name), then applies the alias map (yq-go→yq, go-task→task,
+// gnumake→make, kubernetes-helm→helm, python3Packages.pip→pip). Everything else is
 // identity. Case-sensitive: nix attrs are case-sensitive.
 func normalize(attr string) string {
 	if i := strings.LastIndexByte(attr, '.'); i >= 0 {

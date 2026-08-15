@@ -41,19 +41,22 @@ func TestSeededAllowlistCoveredBySeed(t *testing.T) {
 		}
 	}
 
-	// NOT-covered examples: a package neither baked nor an exception, plus the four
-	// package-vs-binary-name traps the deliberate non-aliasing protects. An admin
-	// allowlists the devbox PACKAGE name (go-task, gnumake, kubernetes-helm,
-	// python3Packages.pip), so the binary name (task, make, helm, pip) is NOT covered
-	// — treating it as covered would either resolve a different nixpkgs attr or match
-	// nothing baked.
+	// Binary-name aliases ARE covered (owner ruling, PRD #123 M3): coverage is
+	// asserted at the binary-on-PATH level, so the allowlist name that follows the
+	// baked binary (helm←kubernetes-helm, task←go-task, make←gnumake, pip←…pip) is
+	// covered even though it differs from the devbox package/attr name.
+	coveredViaAlias := []string{"helm", "task", "make", "pip"}
+	for _, name := range coveredViaAlias {
+		if !Covered(name) {
+			t.Errorf("Covered(%q) = false, want true (binary-name alias must be covered)", name)
+		}
+	}
+
+	// NOT-covered: a package neither baked nor an exception.
 	notCovered := []string{
 		"ruby",      // never baked (tier-2 only), not an exception
 		"terraform", // swapped off the allowlist by 00124, not baked (unfree)
-		"helm",      // baked as kubernetes-helm, not `helm` (binary name, not attr)
-		"task",      // baked as go-task, not `task`
-		"make",      // baked as gnumake, not `make`
-		"pip",       // baked as python3Packages.pip, not `pip`
+		"cowsay",    // arbitrary un-baked package
 	}
 	for _, name := range notCovered {
 		if Covered(name) {
@@ -72,16 +75,17 @@ func TestSeededAllowlistCoveredBySeed(t *testing.T) {
 
 func TestNormalize(t *testing.T) {
 	cases := map[string]string{
-		"jq.bin":              "jq",                  // output selector stripped
-		"openssl.bin":         "openssl",             // output selector stripped
-		"file.out":            "file",                // output selector stripped
-		"shellcheck.bin":      "shellcheck",          // output selector stripped
-		"yq-go":               "yq",                  // alias applied
-		"python3Packages.pip": "python3Packages.pip", // .pip is not an output name
-		"ripgrep":             "ripgrep",             // identity
-		"opentofu":            "opentofu",            // identity
-		"go-task":             "go-task",             // NOT aliased to `task`
-		"kubernetes-helm":     "kubernetes-helm",     // NOT aliased to `helm`
+		"jq.bin":              "jq",         // output selector stripped
+		"openssl.bin":         "openssl",    // output selector stripped
+		"file.out":            "file",       // output selector stripped
+		"shellcheck.bin":      "shellcheck", // output selector stripped
+		"yq-go":               "yq",         // alias applied
+		"python3Packages.pip": "pip",        // .pip not stripped (not an output), then aliased
+		"ripgrep":             "ripgrep",    // identity
+		"opentofu":            "opentofu",   // identity
+		"go-task":             "task",       // aliased to binary name
+		"gnumake":             "make",       // aliased to binary name
+		"kubernetes-helm":     "helm",       // aliased to binary name
 	}
 	for in, want := range cases {
 		if got := normalize(in); got != want {
