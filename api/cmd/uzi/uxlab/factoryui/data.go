@@ -8,6 +8,7 @@ type Run struct {
 	ID, Kind, Status, Title string
 	Health, Age, Owner      string
 	Verdict                 string // "", ideal, ok, issues — the judge badge
+	Todo                    int    // still-to-triage judge recommendations (⚖ issues · N when > 0)
 	ParkLine                string // limit_wait countdown line, "" otherwise
 	Lanes                   []Lane
 	Transcript              []Frame
@@ -67,7 +68,7 @@ func SeedRuns() []Run {
 			Age: "22m", Owner: "dana@example.com", ParkLine: "paused: Anthropic usage limit (five_hour) · resumes in 41m · attempt 2",
 			Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "a7b8c9d0", Kind: "issue", Status: "failed", Title: "Migrate per-user secrets into the vault hierarchy",
-			Age: "5h", Owner: "sam@example.com", Verdict: "issues", Lanes: fullCrew(), Transcript: crewTranscript()},
+			Age: "5h", Owner: "sam@example.com", Verdict: "issues", Todo: 3, Lanes: fullCrew(), Transcript: crewTranscript()},
 		{ID: "b8c9d0e1", Kind: "ci_fix", Status: "completed", Title: "Repair the changelog assertion gate",
 			Age: "1d", Owner: "priya@example.com", Verdict: "ok", Lanes: fullCrew(), Transcript: crewTranscript()},
 	}

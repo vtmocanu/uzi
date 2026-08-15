@@ -55,7 +55,8 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 	if admin {
 		ownerCol = "  " + padCell("OWNER", 18)
 	}
-	sb.WriteString("  " + p.eyebrow(padCell("RUN", 9)+ownerCol+"  "+padCell("STATUS", 19)+"  "+padCell("HEALTH", 10)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
+	// 3-space prefix aligns RUN with the data rows' spine(1)+gutter(1)+space(1).
+	sb.WriteString("   " + p.eyebrow(padCell("RUN", 9)+ownerCol+"  "+padCell("STATUS", 19)+"  "+padCell("HEALTH", 10)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
 
 	if len(visible) == 0 {
 		sb.WriteString("  " + p.fg(p.muted).Render("No runs yet. Start one from the web board or the command line.") + "\n")
@@ -99,7 +100,8 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 			owner = "  " + p.fg(p.muted).Render(padCell(r.Owner, 18))
 		}
 
-		title := titleStyle.Render(capCell(r.Title, 44))
+		// F4: judge marker with the todo count when > 0 (⚖ issues · N).
+		marker := ""
 		if r.Verdict != "" {
 			vc := p.muted
 			switch r.Verdict {
@@ -108,8 +110,22 @@ func RenderBoard(p Palette, rows []Run, cursor int, admin, filtering bool, filte
 			case "issues":
 				vc = p.statusColor("failed")
 			}
-			title += "  " + p.fg(vc).Render("⚖ "+r.Verdict)
+			label := "⚖ " + r.Verdict
+			if r.Todo > 0 {
+				label += fmt.Sprintf(" · %d", r.Todo)
+			}
+			marker = "  " + p.fg(vc).Render(label)
 		}
+		// F2: cap the title to what remains so no row exceeds the rule width at ~100 cols.
+		prefix := 3 + 9 + 2 + 19 + 2 + 10 + 2 + 5 + 2
+		if admin {
+			prefix += 2 + 18
+		}
+		avail := (width - 1) - prefix - visualWidth(marker)
+		if avail < 10 {
+			avail = 10
+		}
+		title := titleStyle.Render(capCell(r.Title, avail)) + marker
 
 		line := spine + gutter + " " + idStyle.Render(padCell(r.ID, 9)) + owner + "  " +
 			statusCell + "  " + health + "  " + p.fg(p.faint).Render(padCell(r.Age, 5)) + "  " + title

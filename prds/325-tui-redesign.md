@@ -153,7 +153,7 @@ deadcode + test), not just build, as each milestone's acceptance.
 - [ ] **M2 — Semantic status seam + board redesign** (kept whole; seam enumerated so M3/M6 can
       start against it). **Seam, in `tui_render.go`** (`[review]`, from factoryui's consumers):
       extend the `palette` struct (`:104-112`) with a `status` lookup (`statusColor(status,
-      health) lipgloss.Style` applying the precedence rule above), a `chipFg` colour, and a
+      health) color.Color` applying the precedence rule above), a `chipFg` colour, and a
       `chip(text, bg)` renderer — all populated in `newPalette`. M3 (detail chips) and M6
       (verdict/confidence severity) only **read** these, so neither reaches back into
       `tui_render.go`. The crew-lane dot palette (`states`, `:124-130`) is a **separate** axis
@@ -301,3 +301,44 @@ after M2. M4→M5 are sequential (both edit `tui_detail.go`).
 7. `cd api/cmd/uzi/uxlab && devbox run build` regenerates the full light/dark screenshot set from
    the shipped views, and the repo's Go gate (`task gate:api`: build + lint-ratchet + deadcode +
    test) stays green at every milestone.
+
+## Amendments
+
+### M2 review fixes (accepted, 2026-08-15)
+
+M2 (`856d41c0`) passed the review wave — reviewer + tester. D7 OwnerEmail sanitization is
+mutation-confirmed (dropping `Plain`/using `capCell`-only reddens the render guard at the right
+line, vacuity guard sound); `task gate:api` green (independently run, 94s); NO_COLOR spine glyphs
+survive the real Ascii/NoTTY downgrade; seam complete and read-only-consumable by M3/M6. Accepted
+follow-up fixes, to land as a follow-up commit on `856d41c0` before M2 is closed:
+
+- **F1 — admin OWNER alignment (reviewer, was framed blocking).** The admin OWNER cell is drawn
+  via `Plain` (truncates, does not pad), so STATUS/HEALTH/AGE/TITLE go ragged row-to-row and miss
+  the header (`tui_board.go:273`). Wrap in `padCell(m.renderer.Plain(strOr(r.OwnerEmail,""),
+  boardOwnerWidth), boardOwnerWidth)`. (factoryui already pads owner to 18 — the shipped board is
+  the one that regressed.)
+- **F2 — column degradation at ~100 cols (reviewer; PRD Open Question 2).** No column drops/title
+  truncation: a long owner+title renders up to ~134 visual cols at `m.width=100` and the terminal
+  wraps. Truncate the TITLE (and/or drop least-important columns) so no row exceeds
+  `boardRuleWidth`. Verify at width=100 via the harness.
+- **F3 — header/data column alignment + stale comment.** Header row sits 1 col left of data rows
+  (spine+gutter mismatch, present in factoryui too); align them. Fix the stale header comment
+  (`tui_board.go:182-183`) that still describes the pre-HEALTH-column "4 spaces" layout. Keep
+  factoryui in sync.
+- **F4 — verdict todo count.** `verdictMarker` drops `JudgeTodoCount`; render the DTO's documented
+  "⚖ issues · N" grammar when N>0 (`tui_board.go:319`, `apitypes/run.go:304-318`).
+
+Spec correction (done in this amendment's commit range): `statusColor` returns `color.Color`, not
+`lipgloss.Style` as §M2 first stated — the impl is correct (chip bg + M6 foreground both want a
+`color.Color`), the §M2 line is fixed to match.
+
+Observations, NOT changed (match the stated spec / not server-reachable): a terminal-status row
+with `Health="stalled"` would still count as stalled and render orange — matches the "stalled
+overrides" precedence and is not produced by the server (stalled is a running-heartbeat concept).
+The D7 render guard is presence-class: it catches a direct raw/`capCell`-only draw of a fixtured
+field, not a future neutralizing addition or a NEW untrusted field absent from `d7UntrustedFields`
+— keep new untrusted board fields covered as they are added.
+
+Hygiene note (not an M2 defect): both validators ran in detached worktrees under the shared
+scratchpad and observed one being pruned externally mid-review (results unaffected, captured
+first). Watch for cross-agent worktree pruning under the shared scratchpad.

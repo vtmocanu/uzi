@@ -179,13 +179,13 @@ func (m tuiModel) renderBoard() string {
 		sb.WriteString(m.pal.faint.Render("could not refresh: "+fmtErr(m.board.err)) + "\n")
 	}
 
-	// Column header. The 2-col spine+gutter is a blank prefix here; the 4 spaces between
-	// STATUS and AGE cover the row's " " + 2-col health + " ".
+	// Column header. The 3-space prefix aligns RUN with the data rows, whose spine (1) +
+	// gutter (1) + space (1) also occupy 3 cols; every column below uses two-space gaps.
 	ownerHdr := ""
 	if m.board.admin {
 		ownerHdr = "  " + padCell("OWNER", boardOwnerWidth)
 	}
-	sb.WriteString("  " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
+	sb.WriteString("   " + m.pal.faint.Render(padCell("RUN", 9)+ownerHdr+"  "+padCell("STATUS", boardStatusWidth)+"  "+padCell("HEALTH", boardHealthWidth)+"  "+padCell("AGE", 5)+"  TITLE") + "\n")
 
 	if len(rows) == 0 {
 		sb.WriteString(m.boardEmptyState())
@@ -269,20 +269,40 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool) string {
 	if m.board.admin {
 		// D7 (PRD #325 M2, B1): OwnerEmail is forge-authored untrusted text — route it
 		// through renderer.Plain (= capCell(cellText(...))); bare capCell would not strip
-		// control bytes. OwnerEmail is in d7UntrustedFields.
-		owner = "  " + m.pal.faint.Render(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth))
+		// control bytes. OwnerEmail is in d7UntrustedFields. F1: pad to the column so the
+		// admin rows and header align (Plain truncates but does not pad).
+		owner = "  " + m.pal.faint.Render(padCell(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth), boardOwnerWidth))
 	}
 
 	statusCell := padVisual(m.pal.chip(m.renderer.Plain(r.Status, boardStatusWidth-2), sc), boardStatusWidth)
 
-	title := m.renderer.Plain(runTitle(r.RunDTO), 60)
-	// The judge marker is own-board-only: AdminListRuns carries no JudgeVerdict.
+	// F4: the judge marker carries the todo count when > 0 ("⚖ issues · N"), own board only
+	// (AdminListRuns carries no JudgeVerdict).
+	marker := ""
 	if !m.board.admin && r.JudgeVerdict != nil {
-		title += "  " + m.verdictMarker(*r.JudgeVerdict)
+		marker = "  " + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount)
 	}
+	// F2: cap the title to the remaining width so no row exceeds boardRuleWidth and a
+	// narrow (~100 col) terminal does not wrap. Every column before TITLE is fixed-width.
+	avail := boardRuleWidth(m.width) - boardRowPrefixWidth(m.board.admin) - visualWidth(marker)
+	if avail < 10 {
+		avail = 10
+	}
+	title := m.renderer.Plain(runTitle(r.RunDTO), avail) + marker
 
 	return spine + gutter + " " + id + owner + "  " + statusCell + "  " + m.boardHealthCell(r) + "  " +
 		m.pal.faint.Render(padCell(relAge(r.CreatedAt), 5)) + "  " + title
+}
+
+// boardRowPrefixWidth is the visual width of every column before TITLE, so F2 can size the
+// title to what remains. spine(1)+gutter(1)+space(1)+id(9), then two-space gaps around the
+// STATUS, HEALTH and AGE cells, plus the admin OWNER cell.
+func boardRowPrefixWidth(admin bool) int {
+	w := 3 + 9 + 2 + boardStatusWidth + 2 + boardHealthWidth + 2 + 5 + 2
+	if admin {
+		w += 2 + boardOwnerWidth
+	}
+	return w
 }
 
 // boardHealthCell is the HEALTH column. "stalled" (which also turns the spine/chip orange
@@ -305,8 +325,11 @@ func (m tuiModel) boardHealthCell(r apitypes.RunListItemDTO) string {
 
 // verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → red,
 // ideal/ok → teal). The verdict is a closed enum, but it is rendered through Plain so an
-// unrecognised value from a newer server cannot inject control bytes.
-func (m tuiModel) verdictMarker(verdict string) string {
+// unrecognised value from a newer server cannot inject control bytes. F4: it appends the
+// still-to-triage recommendation count when > 0, the DTO's "⚖ issues · N" grammar
+// (JudgeTodoCount, apitypes/run.go), so a healthy or fully-triaged run shows just the
+// verdict.
+func (m tuiModel) verdictMarker(verdict string, todo int) string {
 	var c color.Color
 	switch verdict {
 	case "ideal", "ok":
@@ -316,7 +339,11 @@ func (m tuiModel) verdictMarker(verdict string) string {
 	default:
 		c = m.pal.statusDefault
 	}
-	return lipgloss.NewStyle().Foreground(c).Render("⚖ " + m.renderer.Plain(verdict, 8))
+	label := "⚖ " + m.renderer.Plain(verdict, 8)
+	if todo > 0 {
+		label += " · " + itoa(todo)
+	}
+	return lipgloss.NewStyle().Foreground(c).Render(label)
 }
 
 // statusGlyph is the per-status spine marker. It is the NO_COLOR fallback (D3), so it must

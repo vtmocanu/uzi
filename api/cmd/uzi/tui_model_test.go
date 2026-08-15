@@ -438,11 +438,13 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 // M2: the board encodes run status as a colour chip + spine and a summary bar. Automatable
 // via the View() substring / SGR seam so CI gates the semantics per milestone (B2).
 func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
+	issues := "issues"
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "one"}},
 		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "two"}},
 		{RunDTO: apitypes.RunDTO{ID: "cccccccc-3", Kind: "issue", Status: "running", Health: "stalled", IssueTitle: "three"}},
 		{RunDTO: apitypes.RunDTO{ID: "dddddddd-4", Kind: "issue", Status: "running", Health: "looping", IssueTitle: "four"}},
+		{RunDTO: apitypes.RunDTO{ID: "eeeeeeee-5", Kind: "issue", Status: "completed", IssueTitle: "five"}, JudgeVerdict: &issues, JudgeTodoCount: 2},
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
@@ -450,8 +452,9 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 	out := m.View().Content
 
 	// "looping" is NOT stalled, so it is not counted as stalled — but its WORD must show in
-	// the HEALTH column (restored, not reduced to a faint marker).
-	for _, want := range []string{"4 runs", "1 needs you", "1 stalled", "looping"} {
+	// the HEALTH column (restored, not reduced to a faint marker). F4: the judge marker
+	// carries the todo count ("issues · 2") when JudgeTodoCount > 0.
+	for _, want := range []string{"5 runs", "1 needs you", "1 stalled", "looping", "issues · 2"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("board missing %q\n%s", want, out)
 		}
