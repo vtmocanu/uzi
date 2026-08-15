@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -1044,6 +1046,14 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// PRD #319 M3: when the just-approved selection EXPLICITLY excluded a guard role
+	// (spec-keeper today), emit exactly one best-effort owner heads-up — an inbox row plus
+	// an optional Slack DM. A non-guard exclusion (or any non-approve path) leaves the
+	// slice empty and emits nothing. Best-effort: it never fails the approve, which is
+	// already durably recorded by SubmitInput.
+	if len(res.ExcludedGuardRoles) > 0 {
+		h.notifyGuardRoleExcluded(r.Context(), user.ID, id, res.ExcludedGuardRoles)
+	}
 	resp := apitypes.RunInputResponse{ServerSide: res.ServerSide}
 	// A follow_up write returns the created row (PRD #95 S2) so the web's optimistic
 	// queue entry adopts the real id + timestamp. follow_up is never server-side (only
@@ -1055,6 +1065,88 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		resp.CreatedAt = &createdAt
 	}
 	httpx.JSON(w, http.StatusAccepted, resp)
+}
+
+// guardRoleExcludedNotificationKind is the inbox kind emitted when a run owner approves a
+// plan whose agent selection EXPLICITLY excludes a guard role (PRD #319 M3). Like every
+// other kind it is a plain literal — notifications.kind is a generic text column with no
+// CHECK, so a new kind needs no migration. The inbox + Slack renderers key on the
+// { title, body } payload convention; the web renders it generically and routes the
+// run-anchored row to the run page.
+const guardRoleExcludedNotificationKind = "guard_role_excluded"
+
+// notifyGuardRoleExcluded fires the "guard role excluded" heads-up for a just-approved
+// run whose selection dropped one or more guard roles (PRD #319 M3). Best-effort and
+// nil-safe, mirroring notifyReviewReady: no notifier wired ⇒ no-op; a delivery error is
+// logged, never returned (the approve already succeeded durably). The deep link's base is
+// the operator-set public base URL (server-side, never LLM text); a lookup failure simply
+// drops the link. The notification goes only to the run's OWNER (userID), never cross-user.
+func (h *Handler) notifyGuardRoleExcluded(ctx context.Context, userID, runID uuid.UUID, roles []string) {
+	if h.notifier == nil {
+		return
+	}
+	base := ""
+	if h.settings != nil {
+		if b, err := h.settings.PublicBaseURL(ctx); err == nil {
+			base = b
+		}
+	}
+	if _, err := h.notifier.Notify(ctx, buildGuardRoleExcludedNotification(base, userID, runID, roles)); err != nil {
+		slog.Error("notify guard role excluded", "error", err)
+	}
+}
+
+// buildGuardRoleExcludedNotification assembles the "guard role excluded" notification
+// (PRD #319 M3). It is PURE (no I/O) so its shape is unit-testable. The role names come
+// from the CLOSED workersvc guard-role set (never free user text), so the body is trusted
+// plain text — no untrusted plan/agent text is interpolated. The deep link is server-built
+// from the operator-set base URL + the run UUID (never any LLM-supplied text); an
+// empty/unset base yields no link. The notification is anchored to the run and goes only
+// to its owner.
+func buildGuardRoleExcludedNotification(baseURL string, userID, runID uuid.UUID, roles []string) notifysvc.Notification {
+	const title = "Guard role excluded from run"
+	body := guardRoleExcludedBody(roles)
+	rid := runID
+	return notifysvc.Notification{
+		UserID: userID,
+		Kind:   guardRoleExcludedNotificationKind,
+		Payload: map[string]any{
+			"title": title,
+			"body":  body,
+			"roles": roles,
+		},
+		RunID: &rid,
+		Slack: &notifysvc.SlackRender{
+			Emoji: "🛡️",
+			Title: title,
+			Body:  body,
+			Link:  runDeepLink(baseURL, runID),
+		},
+	}
+}
+
+// guardRoleExcludedBody renders the notification body: it names the dropped guard role(s)
+// and why the exclusion matters. The role names are drawn from the closed guard-role set,
+// so this is trusted plain text. spec-keeper gets a bespoke sentence naming the specs it
+// guards; any other guard role degrades to a generic sentence keyed on its name.
+func guardRoleExcludedBody(roles []string) string {
+	if len(roles) == 1 && roles[0] == "spec-keeper" {
+		return "You approved this run with the spec-keeper guard role excluded — the role that guards specs/human.md and specs/ai.md from silent drift."
+	}
+	return "You approved this run with " + strings.Join(roles, ", ") + " excluded — a guard role whose exclusion leaves the specs it protects unwatched for this run."
+}
+
+// runDeepLink builds a Slack DM deep link to the run page from the operator-set public
+// base URL and the run UUID. Both are server-controlled; no LLM text is interpolated. An
+// empty base (unset, or the settings lookup failed) yields "" so the notification simply
+// carries no link. Mirrors reviewDeepLink, but points at /runs/:id (where the web routes
+// this kind) rather than the Judge workbench.
+func runDeepLink(baseURL string, runID uuid.UUID) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	return baseURL + "/runs/" + runID.String()
 }
 
 // steerInputToDTO maps a follow_up run_user_inputs row to the web/CLI steer-queue DTO

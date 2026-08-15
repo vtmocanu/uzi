@@ -1093,7 +1093,8 @@ export const RunEventRow = memo(function RunEventRow({
     }
     // PRD #41: the user's steering text for a revision. UNTRUSTED, so it is rendered
     // through the hardened <Markdown> (react-markdown, no raw-HTML sink) — never a
-    // raw injection point.
+    // raw injection point. Since issue #319 <Markdown> also strips Cf/bidi control
+    // characters centrally, so this sink is scrubbed by construction (no per-site wrap).
     case "plan_feedback": {
       const feedback = asString(rec?.["feedback"]) ?? "";
       return (
@@ -1116,9 +1117,11 @@ export const RunEventRow = memo(function RunEventRow({
     //
     // Every string in the payload is model-authored from repo/issue content the agent
     // read, i.e. attacker-influenceable. `question` goes through the hardened <Markdown>
-    // (no rehype-raw, so raw HTML is inert text); the header and each option render as
-    // React text children. Nothing here reaches href/title/style — option `label` in a
-    // `title` attribute would be the one channel a subtree-text assertion cannot see.
+    // (no rehype-raw, so raw HTML is inert text; and, since issue #319, <Markdown> also
+    // strips Cf/bidi control characters centrally, so this sink is scrubbed by
+    // construction); the header and each option render as React text children. Nothing
+    // here reaches href/title/style — option `label` in a `title` attribute would be the
+    // one channel a subtree-text assertion cannot see.
     case "question": {
       // parseQuestionsForDisplay, NOT parseQuestionPayload. The strict parse requires a
       // `question_id` because an answer must name one — but a feed row answers nothing,

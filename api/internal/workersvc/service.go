@@ -4159,6 +4159,12 @@ type SubmitInputResult struct {
 	// on the server-side and approve_plan paths (no queue row to surface).
 	ID        int64
 	CreatedAt time.Time
+	// ExcludedGuardRoles are the guard roles (workersvc guardRoles) this approve
+	// EXPLICITLY excluded, in exclusion order; the handler emits one owner heads-up
+	// notification when it is non-empty (PRD #319 M3). Empty on every non-approve path,
+	// and on an approve that dropped no guard role. Populated only AFTER validateSelection
+	// accepts the selection, so a rejected exclusion never notifies.
+	ExcludedGuardRoles []string
 }
 
 // SubmitInput records a steering input (approve/reject/follow-up/cancel) for a
@@ -4359,7 +4365,9 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}
-	return SubmitInputResult{ServerSide: false}, nil
+	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
+	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
+	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, nil
 }
 
 // AnswerBody is the wire shape of an `answer` steering input (PRD #88 M1). It is

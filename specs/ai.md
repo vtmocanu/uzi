@@ -20510,3 +20510,41 @@ that correction is recorded in §490 Decision 4 and the clock-cadence consequenc
 - **The two smaller ux tweaks that shipped on this branch** (realizations of the same pending human.md
   items): the sidebar collapse control was reworked so it no longer consumes a full sidebar row
   (`AppShell.tsx`), and the Schedules "Last fire" caret now renders correctly (`web/src/pages/Schedules.tsx`).
+
+# PRD #319 — Judge-triage fixes batch
+
+Design record [prds/done/319-judge-triage-fixes-batch.md](../prds/done/319-judge-triage-fixes-batch.md).
+
+## 532. PRD #319 M2 — the Bash guardrail ALLOWS a targeted diagnostic env read (`printenv PATH`/`TMPDIR`) while enumeration and secret-bearing vars stay denied
+
+Rationale of record: [adr/0319-env-read-diagnostic-allowlist.md](../adr/0319-env-read-diagnostic-allowlist.md) — read it
+rather than duplicating here. In `agent/src/guardrails.ts` a narrow exception is carved into the env/printenv deny: a
+call is ALLOWED iff it has ≥1 positional argument AND EVERY positional is in the allowlist `{PATH, TMPDIR}`. The test is
+`.every` (never `.some`), so a single non-allowlisted or secret-bearing var re-denies the whole call, and bare
+`env`/`printenv` (enumeration, zero positionals) stays DENIED.
+
+- **Where it applies.** The allowance is threaded into the single env-deny site in `analyzeSimple` (which covers both
+  the `printenv` and `env` bases); the second deny site — the bare-`env` deny in `analyzeSegment` — stays UNCONDITIONAL
+  (there is no per-segment partial-failure of a compound Bash command — the ADR records why that is structurally
+  impossible, so the whole command is judged as one). In practice only the `printenv <var>` spelling is allowlist-gated:
+  `analyzeSegment` peels a leading `env`, so `env PATH` reaches `analyzeSimple` as command word `PATH` (an
+  unknown-command allow), not as an `env` read.
+- **Why the scope is exactly PATH+TMPDIR — the real containment lives elsewhere.** The guardrail is defence-in-depth,
+  not the boundary. The actual containment is `agent/src/sdk-env.ts` `buildSdkEnv`, which hands the SDK subprocess a
+  REPLACEMENT env carrying no secret in `PATH`/`TMPDIR`. `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, and provisioned keys are
+  DELIBERATELY not allowlisted, so even an allowed read cannot surface a credential.
+
+## 533. PRD #319 M3 — approving a plan that ACTIVELY excludes a guard role emits exactly one owner notification (`guard_role_excluded`)
+
+When a run owner APPROVES a plan whose agent selection explicitly excludes a guard role (the extensible `guardRoles`
+set — `spec-keeper` today), the approve path emits exactly one owner notification naming the dropped role, reusing the
+existing `notifysvc` (in-app inbox row + best-effort Slack DM). New notification kind `guard_role_excluded`. Wired across
+`api/internal/workersvc/{agent_selection.go,service.go}` and `api/internal/handler/workers.go`.
+
+- **Fires on ACTIVE exclusion only.** The role must appear in `sel.Exclusions` (D4) — a role merely ABSENT from a
+  roster never fires. It fires only AFTER `validateSelection` accepts the selection, and only to the run OWNER.
+- **Best-effort, never blocking.** A notify failure never blocks the approve; the notification is a side effect of an
+  already-committed decision.
+- **Deliberately minimal surface.** No new wire field, no migration (`notifications.kind` is a generic text column), no
+  web change (the web renders kinds generically), no CLI change — the kind rides the existing generic notification
+  plumbing end to end.

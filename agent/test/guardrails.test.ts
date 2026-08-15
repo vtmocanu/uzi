@@ -34,7 +34,13 @@ const DENIED: Array<[string, string]> = [
   ["git config --get http.extraHeader", "credential read"],
   ["git config --list", "config dump"],
   ["env", "environment dump"],
-  ["printenv PATH", "printenv"],
+  // Bare/enumerating env reads dump the whole environment (incl. CLAUDE_CODE_OAUTH_TOKEN);
+  // a name-read of a non-allowlisted / secret var is denied too (only PATH/TMPDIR pass).
+  ["printenv", "bare printenv dumps env"],
+  ["printenv PATH ANTHROPIC_API_KEY", "mixed allowlisted + secret"],
+  ["printenv HOME", "HOME not allowlisted"],
+  ["printenv ANTHROPIC_API_KEY", "secret var"],
+  ["printenv CLAUDE_CODE_OAUTH_TOKEN", "token var"],
   ["ps aux | grep git", "process listing"],
   ["cat /proc/1/environ", "/proc read"],
   ["cat /proc/self/cmdline", "/proc cmdline read"],
@@ -97,6 +103,11 @@ const ALLOWED: string[] = [
   "git config user.email dev@example.com", // config write to a non-sensitive key
   "git -c protocol.version=2 fetch", // benign inline -c to a non-protected namespace
   "env FOO=bar npm test", // env wrapper around a benign command
+  // Diagnostic env READS by name are allowed IFF every positional is allowlisted (PATH/TMPDIR).
+  "printenv PATH",
+  "printenv TMPDIR",
+  "printenv PATH TMPDIR",
+  "env PATH", // env with an allowlisted positional
   "sh -c 'npm run build'", // benign inner command
   "bash -c \"git status && git commit -m ok\"", // benign inner chain
   "timeout 30 npm test", // timeout wrapper around a benign command
@@ -294,6 +305,16 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
     assert.strictEqual(screenBashCommand("FOO=bar sudo git push").denied, true, "assignment + generic wrapper + git push");
     assert.strictEqual(screenBashCommand("FOO=bar sh -c 'git push'").denied, true, "assignment + sh -c wrapper + git push");
     assert.strictEqual(screenBashCommand("FOO=1 sudo BAR=2 git push").denied, true, "assignment + wrapper + assignment + git push");
+  });
+
+  // The env-read allowlist is per-segment: an allowlisted first segment does NOT license a
+  // secret-bearing read in a later segment. A denial in ANY segment denies the whole call.
+  it("denies a compound where a later segment reads a secret env var, even after an allowlisted read", () => {
+    assert.strictEqual(
+      screenBashCommand("printenv PATH; printenv CLAUDE_CODE_OAUTH_TOKEN").denied,
+      true,
+      "second segment (token read) denies the whole compound",
+    );
   });
 });
 

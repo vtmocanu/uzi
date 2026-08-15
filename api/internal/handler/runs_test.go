@@ -90,6 +90,9 @@ func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAl
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
 	return s.createInputRow, nil
 }
+func (s *runsStore) CreateApprovePlanInput(context.Context, store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
+	return store.RunUserInput{}, nil
+}
 func (s *runsStore) CountRunReviseInputs(context.Context, uuid.UUID) (int64, error) {
 	return s.reviseCount, nil
 }

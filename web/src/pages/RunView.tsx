@@ -1835,13 +1835,16 @@ export function JudgePanel({ run }: { run: Run }) {
               onerror>) stays inert text; react-markdown's urlTransform plus our own
               schemeIsDangerous strip javascript:/data:/file: URLs; links are forced external
               (target="_blank" rel="noopener noreferrer"); images are size-capped.
-              stripUnsafeChars is STILL applied to the source FIRST and is NOT redundant: it
-              performs the issue #124 Cf/bidi-override strip at the render site. Markdown
-              syntax chars (`*`/`` ` ``/`#`/`-`/`[]()`) are not control chars, so stripping
-              first preserves them while removing bidi overrides. Rows written before the
-              ingest-side Cf strip landed still arrive carrying bidi overrides, which is why
-              the render-site strip stays. See lib/safeText.ts for why the strip lives at the
-              render site and not at the API boundary.
+              The issue #124 Cf/bidi-override strip is now CENTRALIZED inside <Markdown>
+              itself (see components/Markdown.tsx), so it applies to this surface by
+              construction — the stripUnsafeChars wrap kept below is therefore redundant but
+              harmless: stripUnsafeChars is idempotent, so the second pass is a no-op, and it
+              keeps this value identical to the non-Markdown rec.target/judge_model sinks that
+              still strip per-site. Markdown syntax chars (`*`/`` ` ``/`#`/`-`/`[]()`) are not
+              control chars, so the strip preserves them while removing bidi overrides. Rows
+              written before the ingest-side Cf strip landed still arrive carrying bidi
+              overrides, which is why the render still strips. See lib/safeText.ts for why the
+              strip lives at display time and not at the API boundary.
               rec.target (the <code> coordinate just below) DELIBERATELY stays inert escaped
               plaintext — it is a coordinate the page posts back, not prose, and must NOT
               become a markdown/link sink.

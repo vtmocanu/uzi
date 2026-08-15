@@ -223,18 +223,18 @@ numbers.
 
 ## Milestones
 
-- [ ] **M1** — Cf/bidi stripping is centralized in `Markdown.tsx` and covers every untrusted
+- [x] **M1** — Cf/bidi stripping is centralized in `Markdown.tsx` and covers every untrusted
   `<Markdown>` sink by construction; a web test asserts a Cf/bidi-bearing `plan_md` renders
   stripped; the stale per-site comments are corrected in the same commit. `task gate:web` green.
-- [ ] **M2** — `printenv PATH` / `env TMPDIR` (allowlisted, ≥1 arg) are answerable; bare
+- [x] **M2** — `printenv PATH` / `printenv TMPDIR` (allowlisted, ≥1 arg) are answerable; bare
   `env`/`printenv` and any non-allowlisted or secret-bearing variable stay denied; the
   existing `printenv PATH` deny fixture is flipped to allow. ADR `0319` added. `task gate:agent`
   green.
-- [ ] **M3** — Approving a run whose selection **excludes** a guard role (`spec-keeper`) emits
+- [x] **M3** — Approving a run whose selection **excludes** a guard role (`spec-keeper`) emits
   one `notifysvc` notification (in-app center + best-effort Slack DM) naming the role; a
   non-guard exclusion emits none. Tests cover both on the emit path. CHANGELOG line added.
   `task gate:api` green.
-- [ ] **M4** — `builtins/lead.md` carries both nudges, each protected by a phrase-pin test;
+- [x] **M4** — `builtins/lead.md` carries both nudges, each protected by a phrase-pin test;
   the agenttmpl parse tests pass; a CHANGELOG `[Unreleased]` line records the builtin change.
   `task gate:api` green.
 
