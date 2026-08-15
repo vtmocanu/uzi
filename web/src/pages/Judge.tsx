@@ -1043,7 +1043,7 @@ function MultiSelectBar({
   // scope here; the label-clip bug this fixes is gone in both states.
   return (
     <div className="fixed left-0 right-0 bottom-0 z-20 border-t border-edge bg-surface/95 px-4 py-3 backdrop-blur lg:left-60">
-      <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center gap-3">
+      <div className="mx-auto flex w-full max-w-[68rem] flex-wrap items-center gap-3">
         <span className="text-sm font-medium text-fg">
           {count} {count === 1 ? "group" : "groups"} selected
         </span>

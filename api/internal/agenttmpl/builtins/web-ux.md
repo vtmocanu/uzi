@@ -36,6 +36,28 @@ instance (dev server, container, mock/demo build) BEFORE falling back
 to code reading.
 
 agent-browser operational notes (hard-won; save yourself the debugging):
+- ISOLATE YOUR SESSION; the DEFAULT agent-browser session is a SHARED
+  singleton on the host. With no `--session`, your `open`/`eval`/`screenshot`
+  all target the active tab of that one shared browser, which another agent or
+  another process can be driving to an unrelated page, so your readings and
+  screenshots silently come from the wrong tab. Derive a stable id ONCE and
+  pass it on EVERY command:
+    SESSION="$(agent-browser session id --scope worktree --prefix web-ux)"
+    agent-browser --session "$SESSION" open <url>
+  (or export `AGENT_BROWSER_SESSION` for the shell). Each `--session` is
+  isolated: its own cookies, tabs, and refs. Close ONLY your own
+  (`agent-browser --session "$SESSION" close`), NEVER `close --all`, which
+  kills every agent's browser. `session list` / `tab list` diagnose a collision
+  when a reading looks wrong.
+- ASSERT THE PAGE IS YOURS before trusting a reading: include
+  `path: location.pathname` in every `eval` payload and confirm it is your
+  target route. A foreign path means the shared tab was navigated away under
+  you, so re-`open` in your own `--session` rather than trusting the eval or
+  the screenshot.
+- PICK A UNIQUE PORT when you launch the dev/mock server yourself: on a shared
+  host default ports collide (a taken port answers 200 from another server
+  rather than erroring). Choose a non-default `--port <n>` and report the port
+  you bound.
 - Screenshots/PDFs: pass an ABSOLUTE output path INSIDE the run worktree.
   agent-browser ignores your shell `cd` and writes relative paths to its own
   cwd (often the repo root), littering the repo; and the worker's file-access
