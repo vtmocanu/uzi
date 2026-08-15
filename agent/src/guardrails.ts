@@ -143,6 +143,15 @@ const REASON_FORCE = "denied by guardrail: forced git operations are not permitt
 const REASON_CONFIG_READ = "denied by guardrail: reading git config values is not permitted";
 const REASON_CONFIG_WRITE = "denied by guardrail: modifying remote/core/http/credential git config is not permitted";
 const REASON_ENV = "denied by guardrail: reading the process environment is not permitted";
+// Diagnostic env vars a run may READ by name via `printenv <VAR>` / `env <VAR>`.
+// Allowlisted because buildSdkEnv (sdk-env.ts) hands the SDK subprocess a REPLACEMENT
+// env that carries no secret in these — PATH is the runner image PATH, TMPDIR the
+// runner's private scratch dir. Bare/enumerating `env`/`printenv` stays denied because
+// it dumps the WHOLE environment, including CLAUDE_CODE_OAUTH_TOKEN; HOME and the
+// provisioned keys are deliberately NOT here. The read is allowed IFF there is ≥1
+// positional arg AND EVERY positional is in this set (`.every()`, never `.some()` — so
+// `printenv PATH ANTHROPIC_API_KEY` stays denied). See ADR-0319.
+const ENV_READ_ALLOWLIST: ReadonlySet<string> = new Set(["PATH", "TMPDIR"]);
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
@@ -476,7 +485,20 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
   if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
   if (cmd.some((w) => hitsSecret(w, secretPaths))) return deny(REASON_SECRET_FILE);
   const base = basename(cmd[0]!).toLowerCase();
-  if (base === "printenv" || base === "env") return deny(REASON_ENV);
+  if (base === "printenv" || base === "env") {
+    // Allow reading a diagnostic var by name (`printenv PATH`) but deny enumeration:
+    // ≥1 positional AND every positional in the allowlist. This is the `printenv` rule —
+    // `printenv` is not a wrapper, so `printenv PATH` always reaches here. Bare
+    // `printenv` (no args) fails the length check and is denied because it would dump
+    // CLAUDE_CODE_OAUTH_TOKEN. The `|| base === "env"` disjunct is unreachable for a real
+    // `env` invocation (analyzeSegment peels `env` first, so `env PATH` arrives here as
+    // command word `PATH`, not `env PATH`) — it is harmless defense-in-depth for a direct
+    // analyzeSimple call only, and does NOT govern `env <var>` reads (those never print a
+    // variable: `env NAME` execs a command named NAME). See ENV_READ_ALLOWLIST / ADR-0319.
+    const args = cmd.slice(1);
+    if (args.length > 0 && args.every((a) => ENV_READ_ALLOWLIST.has(a))) return ALLOW;
+    return deny(REASON_ENV);
+  }
   if (base === "ps" || base === "pgrep") return deny(REASON_PS);
   if (base === "git") return analyzeGit(cmd.slice(1));
   if (DOCKER_BASES.has(base)) return analyzeDocker(cmd, assignments, dockerWired);
@@ -520,6 +542,11 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
         break;
       }
       if (i >= words.length) return deny(REASON_ENV); // bare `env` dumps the environment
+      // A non-assignment positional (`env PATH`) breaks the peel above and rides down to
+      // analyzeSimple as command word `PATH` — env's own run-a-command semantics, NOT a
+      // variable read (`env NAME` execs a program named NAME; it never prints the value), so
+      // it is allowed as an unknown command regardless of the ENV_READ_ALLOWLIST. The
+      // bare-env deny here stays UNCONDITIONAL — enumeration is never allowed at this site.
       continue;
     }
 
