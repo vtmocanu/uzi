@@ -209,6 +209,10 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 		{"pointer set is labelled exhaustive or starting point", "Say whether that list is exhaustive or a starting point"},
 		{"the set of locations is itself a claim", "the set of locations is itself a claim"},
 		{"locations, never conclusions", "Give locations, not conclusions"},
+		// Verifier fan-out discipline (PRD #319 M4). Complements the per-unit
+		// read-only review wave rather than duplicating it: a verifier must not be
+		// spent re-reading a coordinate the lead already confirmed itself.
+		{"no re-dispatch to re-read a coordinate the lead already confirmed", "Do not dispatch a verifier to re-read a coordinate you already opened and confirmed yourself"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(body, c.phrase) {
@@ -512,6 +516,7 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 		{"the no-write rule exists to protect the approval gate", "a change nobody saw when approving it"},
 		{"re-planning re-cites only what changed", "re-cite only the mechanisms that changed"},
 		{"the bar is a property of the plan, never of the issue text", "never as a judgement about the issue text"},
+		{"exact literal tokens from the scope are carried verbatim into the plan", "carry those literal tokens verbatim into the plan"},
 	}
 	// The dispatch of the read-only wave, which now happens PER UNIT rather than
 	// as an end-of-run barrier (PRD #215 M2). Kept as its own region so that a
