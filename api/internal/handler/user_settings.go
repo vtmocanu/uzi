@@ -27,6 +27,7 @@ import (
 // token always shows and is never listed; empty means default-only.
 type userSettingsDTO struct {
 	DefaultModel    *string  `json:"default_model"`
+	JudgeModel      *string  `json:"judge_model"`
 	Theme           *string  `json:"theme"`
 	SidebarTokenIds []string `json:"sidebar_token_ids"`
 }
@@ -43,6 +44,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
 			DefaultModel:    textPtrValue(s.DefaultModel.Valid, s.DefaultModel.String),
+			JudgeModel:      textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
 			Theme:           textPtrValue(s.Theme.Valid, s.Theme.String),
 			SidebarTokenIds: uuidStrings(s.SidebarTokenIds),
 		},
@@ -79,6 +81,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 	// bytes `null`); a plain *string cannot, and absent must mean "unchanged".
 	var req struct {
 		DefaultModel    json.RawMessage `json:"default_model"`
+		JudgeModel      json.RawMessage `json:"judge_model"`
 		Theme           json.RawMessage `json:"theme"`
 		SidebarTokenIds json.RawMessage `json:"sidebar_token_ids"`
 	}
@@ -103,6 +106,29 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			DefaultModel: model,
 		}); err != nil {
 			slog.Error("set user default model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if req.JudgeModel != nil {
+		var raw *string
+		if err := json.Unmarshal(req.JudgeModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid judge_model")
+			return
+		}
+		// Same validator as default_model (PRD #69 M2, Decision 4): nil/blank
+		// trims to NULL = inherit the instance judge_model; a bad model is a 400.
+		model, err := validateModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, err := h.q.SetUserJudgeModel(r.Context(), store.SetUserJudgeModelParams{
+			ID:         user.ID,
+			JudgeModel: model,
+		}); err != nil {
+			slog.Error("set user judge model", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

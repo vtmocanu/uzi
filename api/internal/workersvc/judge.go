@@ -892,10 +892,24 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes))
 	}
 
+	// Judge model resolution is user-value-wins (PRD #69 M2, Decision 5): the run
+	// owner's per-user judge_model overrides the instance judge_model for their
+	// own judge runs; NULL/blank inherits the instance value. The whole thing
+	// stays inside the s.settings != nil guard — a nil-settings deployment never
+	// enqueues judges. On a user-row read error we fall back to the instance value
+	// best-effort with a log; we NEVER send an empty model to the SDK.
 	var judgeModel *string
 	if s.settings != nil {
-		if m, err := s.settings.JudgeModel(ctx); err == nil && strings.TrimSpace(m) != "" {
+		if um, err := s.q.GetUserJudgeModel(ctx, run.UserID); err != nil {
+			slog.Warn("judge claim: read user judge model", "user", run.UserID.String(), "error", err)
+		} else if um.Valid && strings.TrimSpace(um.String) != "" {
+			m := um.String
 			judgeModel = &m
+		}
+		if judgeModel == nil {
+			if m, err := s.settings.JudgeModel(ctx); err == nil && strings.TrimSpace(m) != "" {
+				judgeModel = &m
+			}
 		}
 	}
 

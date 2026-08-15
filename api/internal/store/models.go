@@ -493,6 +493,7 @@ type User struct {
 	WaitOnLimit            bool               `json:"wait_on_limit"`
 	CiAutofixEnabled       bool               `json:"ci_autofix_enabled"`
 	SidebarTokenIds        []uuid.UUID        `json:"sidebar_token_ids"`
+	JudgeModel             pgtype.Text        `json:"judge_model"`
 }
 
 type UserSecret struct {

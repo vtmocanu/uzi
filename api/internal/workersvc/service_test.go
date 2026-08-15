@@ -105,9 +105,15 @@ type fakeStore struct {
 	anthropicSealedWith string
 	// onClaimRun, if set, runs inside ClaimRun — used to simulate the vault locking
 	// between the claim gate and the token open (the M3 lock race).
-	onClaimRun          func()
-	defaultModel        pgtype.Text
-	defaultModelErr     error
+	onClaimRun      func()
+	defaultModel    pgtype.Text
+	defaultModelErr error
+	// judgeModel is the run owner's per-user judge_model override (PRD #69 M2);
+	// the zero value is NULL/inherit, so existing judge fixtures resolve the
+	// instance value unchanged. judgeModelErr models a user-row read fault, which
+	// must fall back to the instance value best-effort (never an empty model).
+	judgeModel          pgtype.Text
+	judgeModelErr       error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
 	skillAllocationsErr error
@@ -524,6 +530,9 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
+}
+func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.judgeModel, f.judgeModelErr
 }
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil

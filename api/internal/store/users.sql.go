@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type CreateUserParams struct {
@@ -80,6 +80,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
@@ -87,7 +88,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 const createUserOIDC = `-- name: CreateUserOIDC :one
 INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
 VALUES ($1, NULL, $2, $3, $4, $5)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type CreateUserOIDCParams struct {
@@ -134,12 +135,13 @@ func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) 
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -169,12 +171,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -204,12 +207,13 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const getUserByOIDCSubject = `-- name: GetUserByOIDCSubject :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
 `
 
 type GetUserByOIDCSubjectParams struct {
@@ -245,6 +249,7 @@ func (q *Queries) GetUserByOIDCSubject(ctx context.Context, arg GetUserByOIDCSub
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
@@ -276,31 +281,53 @@ func (q *Queries) GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID)
 	return judge_anthropic_secret_id, err
 }
 
+const getUserJudgeModel = `-- name: GetUserJudgeModel :one
+SELECT judge_model FROM users WHERE id = $1
+`
+
+// The current user's per-user judge model override (PRD #69 M2); NULL = inherit
+// the instance judge_model. Read at judge-claim assembly, keyed on the run owner.
+// Selects only the column: the judge claim needs no other user field, and a
+// narrow read keeps resolution self-contained and cheap (Decision 5).
+func (q *Queries) GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, getUserJudgeModel, id)
+	var judge_model pgtype.Text
+	err := row.Scan(&judge_model)
+	return judge_model, err
+}
+
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, theme, sidebar_token_ids FROM users WHERE id = $1
+SELECT default_model, judge_model, theme, sidebar_token_ids FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
 	DefaultModel    pgtype.Text `json:"default_model"`
+	JudgeModel      pgtype.Text `json:"judge_model"`
 	Theme           pgtype.Text `json:"theme"`
 	SidebarTokenIds []uuid.UUID `json:"sidebar_token_ids"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
-// (PRD #17), UI theme override (PRD #21), and the sidebar token-meter choice
-// (00123). NULL = inherit / use the instance default / default-token-only.
-// Own-user only; the caller passes the session user's id.
+// (PRD #17), per-user judge model override (PRD #69), UI theme override
+// (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit / use
+// the instance default / default-token-only. Own-user only; the caller passes
+// the session user's id.
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
-	err := row.Scan(&i.DefaultModel, &i.Theme, &i.SidebarTokenIds)
+	err := row.Scan(
+		&i.DefaultModel,
+		&i.JudgeModel,
+		&i.Theme,
+		&i.SidebarTokenIds,
+	)
 	return i, err
 }
 
 const linkUserOIDC = `-- name: LinkUserOIDC :one
 UPDATE users SET oidc_issuer = $2, oidc_subject = $3
 WHERE id = $1 AND oidc_subject IS NULL
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type LinkUserOIDCParams struct {
@@ -341,12 +368,13 @@ func (q *Queries) LinkUserOIDC(ctx context.Context, arg LinkUserOIDCParams) (Use
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -382,6 +410,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.WaitOnLimit,
 			&i.CiAutofixEnabled,
 			&i.SidebarTokenIds,
+			&i.JudgeModel,
 		); err != nil {
 			return nil, err
 		}
@@ -409,7 +438,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserActiveParams struct {
@@ -444,13 +473,14 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const setUserAdmin = `-- name: SetUserAdmin :one
 UPDATE users SET is_admin = $1 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserAdminParams struct {
@@ -490,13 +520,14 @@ func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (Use
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -533,13 +564,14 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const setUserCIAutofixEnabled = `-- name: SetUserCIAutofixEnabled :one
 UPDATE users SET ci_autofix_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserCIAutofixEnabledParams struct {
@@ -578,6 +610,7 @@ func (q *Queries) SetUserCIAutofixEnabled(ctx context.Context, arg SetUserCIAuto
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
@@ -603,7 +636,7 @@ func (q *Queries) SetUserDefaultModel(ctx context.Context, arg SetUserDefaultMod
 
 const setUserJudgeAnthropicSecret = `-- name: SetUserJudgeAnthropicSecret :one
 UPDATE users SET judge_anthropic_secret_id = $1 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserJudgeAnthropicSecretParams struct {
@@ -648,13 +681,14 @@ func (q *Queries) SetUserJudgeAnthropicSecret(ctx context.Context, arg SetUserJu
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }
 
 const setUserJudgeEnabled = `-- name: SetUserJudgeEnabled :one
 UPDATE users SET judge_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserJudgeEnabledParams struct {
@@ -693,8 +727,29 @@ func (q *Queries) SetUserJudgeEnabled(ctx context.Context, arg SetUserJudgeEnabl
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
+}
+
+const setUserJudgeModel = `-- name: SetUserJudgeModel :one
+UPDATE users SET judge_model = $1 WHERE id = $2
+RETURNING judge_model
+`
+
+type SetUserJudgeModelParams struct {
+	JudgeModel pgtype.Text `json:"judge_model"`
+	ID         uuid.UUID   `json:"id"`
+}
+
+// Sets (or clears, when @judge_model is NULL) the current user's per-user judge
+// model. NULL inherits the instance judge_model. Own-user only; caller passes the
+// session user's id.
+func (q *Queries) SetUserJudgeModel(ctx context.Context, arg SetUserJudgeModelParams) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, setUserJudgeModel, arg.JudgeModel, arg.ID)
+	var judge_model pgtype.Text
+	err := row.Scan(&judge_model)
+	return judge_model, err
 }
 
 const setUserSidebarTokens = `-- name: SetUserSidebarTokens :one
@@ -739,7 +794,7 @@ func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgt
 
 const setUserWaitOnLimit = `-- name: SetUserWaitOnLimit :one
 UPDATE users SET wait_on_limit = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model
 `
 
 type SetUserWaitOnLimitParams struct {
@@ -783,6 +838,7 @@ func (q *Queries) SetUserWaitOnLimit(ctx context.Context, arg SetUserWaitOnLimit
 		&i.WaitOnLimit,
 		&i.CiAutofixEnabled,
 		&i.SidebarTokenIds,
+		&i.JudgeModel,
 	)
 	return i, err
 }

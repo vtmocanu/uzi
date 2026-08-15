@@ -485,6 +485,9 @@ type Store interface {
 	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
 	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
+	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
+	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.

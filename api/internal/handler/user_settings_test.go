@@ -19,15 +19,16 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeSettingsDB is a store.DBTX holding one user's default_model, theme, and
-// sidebar token set, so the GetMySettings/PutMySettings handlers run end to end
-// (decode -> validate -> store -> respond) without a real database. The
-// SetUserDefaultModel/SetUserTheme UPDATEs QueryRow a single Text RETURNING
-// column and SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows three
-// (default_model, theme, sidebar_token_ids). The UPDATE paths record the
-// written value so the round-trip is observable.
+// fakeSettingsDB is a store.DBTX holding one user's default_model, judge_model,
+// theme, and sidebar token set, so the GetMySettings/PutMySettings handlers run
+// end to end (decode -> validate -> store -> respond) without a real database. The
+// SetUserDefaultModel/SetUserJudgeModel/SetUserTheme UPDATEs QueryRow a single Text
+// RETURNING column and SetUserSidebarTokens a uuid[] one; GetUserSettings QueryRows
+// four (default_model, judge_model, theme, sidebar_token_ids). The UPDATE paths
+// record the written value so the round-trip is observable.
 type fakeSettingsDB struct {
 	model      pgtype.Text
+	judge      pgtype.Text
 	theme      pgtype.Text
 	sidebarIDs []uuid.UUID
 }
@@ -46,6 +47,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if m, ok := args[0].(pgtype.Text); ok {
 			f.model = m // SetUserDefaultModel: $1 = default_model
 		}
+	case strings.Contains(sql, "UPDATE users SET judge_model") && len(args) >= 1:
+		if j, ok := args[0].(pgtype.Text); ok {
+			f.judge = j // SetUserJudgeModel: $1 = judge_model
+		}
 	case strings.Contains(sql, "UPDATE users SET theme") && len(args) >= 1:
 		if t, ok := args[0].(pgtype.Text); ok {
 			f.theme = t // SetUserTheme: $1 = theme
@@ -55,11 +60,12 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 			f.sidebarIDs = ids // SetUserSidebarTokens: $1 = sidebar_token_ids
 		}
 	}
-	return fakeSettingsRow{model: f.model, theme: f.theme, sidebarIDs: f.sidebarIDs}
+	return fakeSettingsRow{model: f.model, judge: f.judge, theme: f.theme, sidebarIDs: f.sidebarIDs}
 }
 
 type fakeSettingsRow struct {
 	model      pgtype.Text
+	judge      pgtype.Text
 	theme      pgtype.Text
 	sidebarIDs []uuid.UUID
 }
@@ -72,15 +78,18 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
-	case 3:
-		// GetUserSettings: SELECT default_model, theme, sidebar_token_ids.
+	case 4:
+		// GetUserSettings: SELECT default_model, judge_model, theme, sidebar_token_ids.
 		if p, ok := dest[0].(*pgtype.Text); ok {
 			*p = r.model
 		}
 		if p, ok := dest[1].(*pgtype.Text); ok {
+			*p = r.judge
+		}
+		if p, ok := dest[2].(*pgtype.Text); ok {
 			*p = r.theme
 		}
-		if p, ok := dest[2].(*[]uuid.UUID); ok {
+		if p, ok := dest[3].(*[]uuid.UUID); ok {
 			*p = r.sidebarIDs
 		}
 	}
@@ -194,6 +203,116 @@ func TestPutMySettingsRejectsInvalidModel(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for a model with interior whitespace; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// decodeJudgeModel pulls the judge_model field out of a /me/settings response.
+func decodeJudgeModel(t *testing.T, body []byte) *string {
+	t.Helper()
+	var resp struct {
+		Settings struct {
+			JudgeModel *string `json:"judge_model"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode settings response %s: %v", body, err)
+	}
+	return resp.Settings.JudgeModel
+}
+
+// PRD #69 M2: the per-user judge_model mirrors default_model — set, clear (blank
+// ⇒ NULL/inherit), reject an invalid model, and GET reflects the stored value.
+
+func TestGetMySettingsReturnsStoredJudgeModel(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{judge: pgtype.Text{String: "opus", Valid: true}})}
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeModel(t, rec.Body.Bytes()); got == nil || *got != "opus" {
+		t.Fatalf("judge_model = %v, want \"opus\"", got)
+	}
+}
+
+func TestGetMySettingsNullJudgeModelSerializesAsNull(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})} // judge zero ⇒ NULL
+	rec := httptest.NewRecorder()
+	h.GetMySettings(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/settings", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := decodeJudgeModel(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("judge_model = %q, want null (inherit)", *got)
+	}
+}
+
+func TestPutMySettingsJudgeModelRoundTrip(t *testing.T) {
+	db := &fakeSettingsDB{}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"judge_model":"opus"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeModel(t, rec.Body.Bytes()); got == nil || *got != "opus" {
+		t.Fatalf("response judge_model = %v, want \"opus\"", got)
+	}
+	if !db.judge.Valid || db.judge.String != "opus" {
+		t.Fatalf("stored judge_model = %+v, want opus", db.judge)
+	}
+}
+
+func TestPutMySettingsBlankJudgeModelClearsToInherit(t *testing.T) {
+	db := &fakeSettingsDB{judge: pgtype.Text{String: "opus", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"judge_model":""}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := decodeJudgeModel(t, rec.Body.Bytes()); got != nil {
+		t.Fatalf("response judge_model = %q, want null after clearing", *got)
+	}
+	if db.judge.Valid {
+		t.Fatalf("stored judge_model should be NULL after a blank clear, got %+v", db.judge)
+	}
+}
+
+func TestPutMySettingsRejectsInvalidJudgeModel(t *testing.T) {
+	h := &Handler{q: store.New(&fakeSettingsDB{})}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"judge_model":"claude 3"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a model with interior whitespace; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// A judge-model-only PUT must not clobber the stored default_model: the two model
+// controls save independently over the one endpoint (PATCH-like semantics).
+func TestPutMySettingsJudgeModelOnlyLeavesDefaultModelUntouched(t *testing.T) {
+	db := &fakeSettingsDB{model: pgtype.Text{String: "sonnet", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"judge_model":"opus"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.model.Valid || db.model.String != "sonnet" {
+		t.Fatalf("default_model must be untouched by a judge-model-only PUT, got %+v", db.model)
+	}
+	if got := decodeSettings(t, rec.Body.Bytes()); got == nil || *got != "sonnet" {
+		t.Fatalf("response default_model = %v, want the untouched \"sonnet\"", got)
 	}
 }
 
