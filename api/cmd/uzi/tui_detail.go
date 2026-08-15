@@ -15,6 +15,14 @@ import (
 // laneRailWidth is the left rail's fixed column budget.
 const laneRailWidth = 26
 
+// The detail view has two focusable panes (PRD #325 M4). ←/→ (and tab) move focus between
+// them; ↑/↓ act WITHIN the focused pane — between agents on the rail, scrolling the
+// transcript. The zero value is focusRail, so a run opens focused on the crew rail.
+const (
+	focusRail = iota
+	focusTranscript
+)
+
 // detailState is one run's live view: the lane rail plus the selected lane's
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
@@ -29,6 +37,7 @@ type detailState struct {
 	lanes     []agentLane
 	laneIdx   int
 	scroll    int
+	focus     int // focusRail | focusTranscript — which pane ↑/↓ drives (M4)
 	loaded    bool
 	loadErr   error
 	stream    *uzicli.RunStream
@@ -146,20 +155,33 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		return m, m.fetchRunsCmd(m.board.admin)
 	case keyRefresh:
 		return m, m.loadDetailCmd(m.detail.runID)
-	case keyTab, "l", keyRight:
-		if n := len(m.detail.lanes); n > 0 {
-			m.detail.laneIdx = (m.detail.laneIdx + 1) % n
-			m.detail.scroll = 0
-		}
+	case keyTab:
+		// tab cycles focus between the two panes.
+		m.detail.focus = 1 - m.detail.focus
 		return m, nil
 	case "h", keyLeft:
-		if n := len(m.detail.lanes); n > 0 {
-			m.detail.laneIdx = (m.detail.laneIdx - 1 + n) % n
-			m.detail.scroll = 0
-		}
+		m.detail.focus = focusRail
+		return m, nil
+	case "l", keyRight:
+		m.detail.focus = focusTranscript
 		return m, nil
 	}
 	if d := motionDelta(k); d != 0 {
+		if m.detail.focus == focusRail {
+			// Move between agents. One step per press regardless of the motion size
+			// (page keys are meaningless for a short lane list).
+			if n := len(m.detail.lanes); n > 0 {
+				step := 1
+				if d < 0 {
+					step = -1
+				}
+				m.detail.laneIdx = (m.detail.laneIdx + step + n) % n
+				m.detail.scroll = 0
+			}
+			return m, nil
+		}
+		// Transcript focused: scroll (top-anchored for now; M5 inverts to bottom-anchored
+		// follow, so this stays intentionally minimal).
 		m.detail.scroll += d
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
@@ -183,8 +205,16 @@ func (m tuiModel) renderDetail() string {
 			head += "  " + m.pal.chip(m.renderer.Plain(d.run.Kind, 10), m.pal.title.GetForeground())
 		}
 		head += "  " + m.pal.chip(m.renderer.Plain(d.run.Status, 18), m.pal.statusColor(d.run.Status, d.run.Health))
-		if h := d.run.Health; h != "" && h != "ok" && h != "stalled" {
-			head += "  " + m.renderer.Plain(h, 14)
+		if h := d.run.Health; h != "" && h != "ok" {
+			// A NO_COLOR-safe health cue (M4 review nit): without it a stalled run's only
+			// header signal is the orange chip colour, which vanishes under an Ascii
+			// profile. "stalled" gets a ▲ glyph + word (the glyph survives the colour
+			// strip); any other non-ok health shows its word, as the board does.
+			if h == "stalled" {
+				head += "  " + lipgloss.NewStyle().Foreground(m.pal.statusStalled).Render("▲ "+m.renderer.Plain(h, 14))
+			} else {
+				head += "  " + m.renderer.Plain(h, 14)
+			}
 		}
 		head += "  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60))
 	}
@@ -236,13 +266,54 @@ func (m tuiModel) renderDetail() string {
 	body := m.renderTranscript()
 	sb.WriteString(joinColumns(rail, body, laneRailWidth))
 	// The attention banner (PRD #325 M3) shows regardless of ownership — it is
-	// informational. The owner-gated action keys live in the steer bar below it.
+	// informational. The owner-gated action keys live in the footer below it.
 	if b := m.detailBanner(); b != "" {
 		sb.WriteString(b + "\n")
 	}
-	sb.WriteString(m.renderSteerBar() + "\n")
-	sb.WriteString(m.pal.faint.Render("tab/h/l lane · j/k scroll · r refresh · esc back · ? keys"))
+	// Steer status (queue indicator, notice, typing input, confirm box, or the read-only
+	// reason) renders above the footer when present. When the bar is mid-input it owns the
+	// key hints, so the single combined footer is drawn only when the bar is idle (M4).
+	if steer := m.renderSteerBar(); steer != "" {
+		sb.WriteString(steer + "\n")
+	}
+	if m.detail.steer.mode == steerIdle {
+		sb.WriteString(m.detailFooter())
+	}
 	return sb.String()
+}
+
+// detailFooter is the single-line keymap (PRD #325 M4): pane/scroll navigation combined
+// with the owner's steer actions, with approve/reject leading at a plan gate. The steer
+// bar's interactive modes draw their own hints, so this is only emitted when idle.
+func (m tuiModel) detailFooter() string {
+	owner := m.detail.steer.access == steerAllowed
+	var parts []string
+	if owner && atPlanGate(m.detail.run) {
+		parts = append(parts, m.keyHint("y", "approve"), m.keyHint("n", "reject"),
+			m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"),
+			m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+	} else {
+		parts = append(parts, m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"))
+		if owner {
+			parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("v", "review"), m.keyHint("x", "cancel"))
+		}
+	}
+	parts = append(parts, m.keyHint("esc", "back"), m.keyHint("?", "keys"))
+	return strings.Join(parts, m.pal.faint.Render(" · "))
+}
+
+// keyHint is a compact bright-key / muted-label footer hint.
+func (m tuiModel) keyHint(k, label string) string {
+	return m.pal.title.Render(k) + m.pal.faint.Render(" "+label)
+}
+
+// paneTitle renders a detail pane's title with a focus indicator: a bright brand bar + bold
+// title when focused, a dim title otherwise (M4).
+func (m tuiModel) paneTitle(title string, focused bool) string {
+	if focused {
+		return m.pal.title.Render("▎" + strings.ToUpper(title))
+	}
+	return " " + m.pal.faint.Render(strings.ToUpper(title))
 }
 
 // detailBanner is the S3 two-banner treatment: awaiting_approval gets the PLAN GATE banner
@@ -279,7 +350,7 @@ func (m tuiModel) renderLaneRail() string {
 	active := activeLaneKey(d.run.Status, d.frames)
 
 	var sb strings.Builder
-	sb.WriteString(m.pal.faint.Render("AGENTS") + "\n")
+	sb.WriteString(m.paneTitle("crew", d.focus == focusRail) + "\n")
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
 		return sb.String()
@@ -311,9 +382,10 @@ func (m tuiModel) renderLaneRail() string {
 }
 
 func (m tuiModel) renderTranscript() string {
+	title := m.paneTitle("transcript", m.detail.focus == focusTranscript)
 	lane, ok := m.detail.selectedLane()
 	if !ok {
-		return m.pal.faint.Render("no lane selected")
+		return title + "\n" + m.pal.faint.Render("no lane selected")
 	}
 	var sb strings.Builder
 	for _, f := range lane.Frames {
@@ -324,10 +396,12 @@ func (m tuiModel) renderTranscript() string {
 	if m.detail.scroll < len(out) {
 		out = out[m.detail.scroll:]
 	}
-	if h := m.height - 10; h > 0 && len(out) > h {
+	// The pane title is a fixed header above the scrolled body, so the viewport is one row
+	// shorter than before.
+	if h := m.height - 11; h > 0 && len(out) > h {
 		out = out[:h]
 	}
-	return strings.Join(out, "\n")
+	return title + "\n" + strings.Join(out, "\n")
 }
 
 // transcriptText pulls the human-readable body out of a frame's payload. The payload

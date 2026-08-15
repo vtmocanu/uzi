@@ -69,8 +69,9 @@ func helpLines(inDetail bool) []string {
 	}
 	if inDetail {
 		return append([]string{
-			"tab        next lane",
-			"h / l      previous / next lane",
+			"← / →      focus the crew rail / the transcript",
+			"tab        cycle the focused pane",
+			"↑ / ↓      move within the focused pane (agents · scroll)",
 		}, common...)
 	}
 	return append([]string{

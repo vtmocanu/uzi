@@ -214,9 +214,10 @@ func TestTUIDetailPlanGateBanner(t *testing.T) {
 	if !strings.Contains(out, "PLAN GATE") {
 		t.Errorf("plan-gate banner missing\n%s", out)
 	}
-	for _, want := range []string{"[y]", "approve", "[n]", "reject"} {
+	// The owner's footer leads with approve/reject at the gate (M4 one-line footer).
+	for _, want := range []string{"approve", "reject"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("plan gate does not promote %q for the owner\n%s", want, out)
+			t.Errorf("plan gate does not offer %q for the owner\n%s", want, out)
 		}
 	}
 	// The header status chip is a solid colour fill (a truecolor background SGR).
@@ -435,9 +436,10 @@ func TestTUIDetailIgnoresRepliesForAnotherRun(t *testing.T) {
 	}
 }
 
-// Lane switching cycles both ways and resets the scroll, so a long lane does not
-// leave the next one scrolled past its start.
-func TestTUIDetailLaneSwitching(t *testing.T) {
+// M4: the detail view has two focusable panes. ←/→ (and tab) select the pane; ↑/↓ act
+// WITHIN it — moving between agents on the rail, scrolling the transcript. Default focus is
+// the crew rail; the focused pane title carries the ▎ marker.
+func TestTUIDetailFocusPaneNavigation(t *testing.T) {
 	now := time.Now()
 	runID := "77777777-1111"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
@@ -451,26 +453,77 @@ func TestTUIDetailLaneSwitching(t *testing.T) {
 	})
 	m = next.(tuiModel)
 
-	m = press(t, m, "j") // scroll down within the lane
-	if m.detail.scroll == 0 {
-		t.Fatal("j did not scroll the transcript")
+	// Detail opens focused on the crew rail.
+	if m.detail.focus != focusRail {
+		t.Fatalf("detail opened focused on pane %d, want the crew rail", m.detail.focus)
 	}
-	m = press(t, m, keyTab)
+	// With the rail focused, j moves BETWEEN agents (it does not scroll).
+	m = press(t, m, "j")
 	if m.detail.laneIdx != 1 {
-		t.Errorf("tab moved to lane %d, want 1", m.detail.laneIdx)
+		t.Errorf("j on the focused rail moved to lane %d, want 1", m.detail.laneIdx)
 	}
 	if m.detail.scroll != 0 {
-		t.Error("switching lanes did not reset the scroll; the new lane opens mid-transcript")
+		t.Errorf("j on the rail scrolled the transcript (scroll=%d); it should move agents", m.detail.scroll)
 	}
-	// Wrap-around in both directions.
-	m = press(t, m, keyTab)
-	m = press(t, m, keyTab)
+
+	// → focuses the transcript; now j scrolls and does NOT change the agent.
+	m = press(t, m, keyRight)
+	if m.detail.focus != focusTranscript {
+		t.Fatal("→ did not focus the transcript")
+	}
+	lane := m.detail.laneIdx
+	m = press(t, m, "j")
+	if m.detail.scroll == 0 {
+		t.Error("j on the focused transcript did not scroll")
+	}
+	if m.detail.laneIdx != lane {
+		t.Error("j on the transcript changed the selected agent; it should scroll")
+	}
+
+	// ← returns focus to the rail; moving agents resets the scroll and wraps.
+	m = press(t, m, keyLeft)
+	if m.detail.focus != focusRail {
+		t.Fatal("← did not focus the crew rail")
+	}
+	m = press(t, m, "k")
 	if m.detail.laneIdx != 0 {
-		t.Errorf("tab did not wrap to lane 0, got %d", m.detail.laneIdx)
+		t.Errorf("k on the rail moved to lane %d, want 0", m.detail.laneIdx)
 	}
-	m = press(t, m, "h")
+	if m.detail.scroll != 0 {
+		t.Error("moving agents did not reset the scroll")
+	}
+	m = press(t, m, "k") // wrap backwards past the first lane
 	if m.detail.laneIdx != 2 {
-		t.Errorf("h did not wrap backwards to the last lane, got %d", m.detail.laneIdx)
+		t.Errorf("k did not wrap to the last lane, got %d", m.detail.laneIdx)
+	}
+
+	// tab cycles focus, and the focused pane title carries the ▎ marker.
+	m = press(t, m, keyTab)
+	if m.detail.focus != focusTranscript {
+		t.Errorf("tab did not cycle focus to the transcript (got %d)", m.detail.focus)
+	}
+	if !strings.Contains(m.View().Content, "▎") {
+		t.Error("no focus indicator (▎) rendered on the focused pane")
+	}
+}
+
+// M4: the detail keymap is a SINGLE line — navigation and the owner's actions combined,
+// not the pre-M4 two-line (steer key list + separate nav footer) region.
+func TestTUIDetailFooterIsOneLine(t *testing.T) {
+	runID := "foot-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // owner → steerAllowed
+	m = next.(tuiModel)
+
+	lines := strings.Split(strings.TrimRight(m.View().Content, "\n"), "\n")
+	last := lines[len(lines)-1]
+	// Navigation ("pane"/"move") and an action ("follow-up") share the ONE footer line.
+	for _, want := range []string{"pane", "move", "follow-up"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("the detail footer is not one combined line (missing %q)\nlast line: %q", want, last)
+		}
 	}
 }
 

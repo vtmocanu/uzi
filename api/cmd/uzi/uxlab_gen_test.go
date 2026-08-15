@@ -82,6 +82,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-admin":              boardAdmin,
 		"board-filter":             func(d bool) string { return boardFilter(d, now) },
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
+		"detail-focus-transcript":  func(d bool) string { return detailFocusTranscript(d, now) },
 		"detail-stalled":           func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval": func(d bool) string { return detailAwaitingApproval(d, now) },
 		"detail-awaiting-input":    func(d bool) string { return detailAwaitingInput(d, now) },
@@ -219,6 +220,15 @@ func detailRunning(dark bool, now time.Time) string {
 		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
 	m := detailBase(dark, run, now, true)
 	m = withLiveStream(m)
+	return m.View().Content
+}
+
+func detailFocusTranscript(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
+	m := detailBase(dark, run, now, true)
+	m = withLiveStream(m)
+	m = key(m, "l") // focus the transcript pane
 	return m.View().Content
 }
 

@@ -137,7 +137,7 @@ substring/SGR-escape seam (as in `tui_render_test.go` / `tui_model_test.go`), so
 something per milestone rather than only at M7. Run `task gate:api` (build + lint-ratchet +
 deadcode + test), not just build, as each milestone's acceptance.
 
-- [ ] **M1 — Land the uxlab render harness** (already built on this branch, untracked). Commit
+- [x] **M1 — Land the uxlab render harness** (already built on this branch, untracked). Commit
       `api/cmd/uzi/uxlab/` + `uxlab_gen_test.go` + `uxlab_mock_test.go`. This is the
       "agents can see the TUI" deliverable: `cd api/cmd/uzi/uxlab && devbox run build` renders
       every screen × state × {dark,light} to PNGs via charmbracelet/freeze, driving the real
@@ -150,12 +150,12 @@ deadcode + test), not just build, as each milestone's acceptance.
       reached by `uxlab/demo`'s `main` or a `-test` reference fails `task deadcode:api`; any lint
       finding in the new files gates. M1 must prove deadcode + lint clean, since D1 keeps
       `factoryui` alive through M6.
-- [ ] **M2 — Semantic status seam + board redesign** (kept whole; seam enumerated so M3/M6 can
+- [x] **M2 — Semantic status seam + board redesign** (kept whole; seam enumerated so M3/M6 can
       start against it). **Seam, in `tui_render.go`** (`[review]`, from factoryui's consumers):
       extend the `palette` struct (`:104-112`) with a `status` lookup (`statusColor(status,
       health) color.Color` applying the precedence rule above), a `chipFg` colour, and a
       `chip(text, bg)` renderer — all populated in `newPalette`. M3 (detail chips) and M6
-      (verdict/confidence severity) only **read** these, so neither reaches back into
+      (verdict severity) only **read** these, so neither reaches back into
       `tui_render.go`. The crew-lane dot palette (`states`, `:124-130`) is a **separate** axis
       that already carries green/amber/blue — M4's rail needs little change. **Board, in
       `tui_board.go`**: status chip + left colour spine (with the NO_COLOR text-marker fallback),
@@ -175,7 +175,7 @@ deadcode + test), not just build, as each milestone's acceptance.
       frame. The clean-fixture harness cannot catch this (golden-fixture trap — see Risks), so the
       test is the only guard. Regenerate the M1 screenshots and confirm the board matches
       `mock-board-*` / `mock-board-admin-*`.
-- [ ] **M3 — Plan-gate banner + detail header status chips.** In `tui_detail.go` / `tui_steer.go`:
+- [x] **M3 — Plan-gate banner + detail header status chips.** In `tui_detail.go` / `tui_steer.go`:
       render the amber `PLAN GATE` banner on its own line at `awaiting_approval` with promoted
       `[y]/[n]` keycaps (with the NO_COLOR bordered-banner fallback), and switch the detail header
       to semantic status chips (consumes M2's seam). **`[review]` Two distinct banners (S3):**
@@ -204,7 +204,7 @@ deadcode + test), not just build, as each milestone's acceptance.
       auto-tail, detach to `⏸ PAUSED ↓N new` on scroll-up, `g` to go live (jump to newest),
       re-attach on scroll-to-bottom, with the viewport/extent clamp. `g` chosen because `f` is
       already follow-up. Matches `mock-detail-running-*` / `mock-detail-paused-*`.
-- [ ] **M6 — Judge review overlay severity + inline-code fix.** In `tui_review.go`, colour the
+- [x] **M6 — Judge review overlay severity + inline-code fix.** In `tui_review.go`, colour the
       verdict by severity (consumes M2's seam); in `tui_render.go`, retune the glamour style so
       inline code no longer renders alarm-red (it is colour 203 in both dark and light today).
       Runs after M2 (shared `tui_render.go`). Matches `mock-review-*`.
@@ -342,3 +342,28 @@ field, not a future neutralizing addition or a NEW untrusted field absent from `
 Hygiene note (not an M2 defect): both validators ran in detached worktrees under the shared
 scratchpad and observed one being pruned externally mid-review (results unaffected, captured
 first). Watch for cross-agent worktree pruning under the shared scratchpad.
+
+### M3 + M6 review outcomes (accepted, 2026-08-15)
+
+M3 (`fd3cb128`) and M6 (`1cce7e0b`) both passed their review waves with NO blocking findings.
+- **M3** — reviewer + tester PASS. Two-banner branching mutation-confirmed (adding `awaiting_input`
+  to `atPlanGate` reddens the input-distinct test); the non-owner approve-key guard is
+  mutation-confirmed non-vacuous and defense-in-depth (`renderSteerBar` early-return AND `steerKey`
+  gating, so leaked keycaps would be inert); seam consumed read-only; NO_COLOR banner border
+  survives.
+- **M6** — reviewer PASS. The inline-code retune is verified from glamour source NOT to mutate the
+  shared package-global `StyleConfig` (value copy + pointer reassignment, not a deref-mutate), so
+  other renderers are unaffected. Verdict severity mappings correct (teal ideal/ok, red issues,
+  grey default); the board ⚖ marker is refactored onto the same `verdictColor` (byte-for-byte
+  extraction, so board and overlay can't disagree).
+
+Accepted nits and dispositions:
+- **M3 header stalled cue is colour-only under NO_COLOR** → folded into M4 (which reworks the detail
+  view): keep a text-marker/word cue for a stalled run in the detail header so it survives colour
+  stripping (consistent with the board keeping health words).
+- **M6 inline-code test lacks a light-theme control** → folded into M7's test pass (add a symmetric
+  light control; the dark control + shared-source already mitigate).
+- **M6 nit: `codeRed` negative could pass on a render-error fallback** → not reachable (the control
+  proves the markdown renders); no action.
+- The §M2 seam line's "verdict/confidence severity" was corrected to "verdict severity" — M6 colours
+  the verdict only; confidence renders neutral (`faint`) by design.
