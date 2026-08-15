@@ -6,6 +6,42 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Owner heads-up when an approved run drops a guard role (PRD #319 M3).**
+  Approving a plan whose agent selection explicitly excludes a guard role
+  (`spec-keeper` today) now sends the run owner one notification — an in-app
+  inbox row plus a best-effort Slack DM — naming the dropped role. It fires only
+  on an active exclusion (never on a role merely absent from a roster), only
+  after the selection validates, and never blocks the approve. No new wire
+  field, no migration, and no web/CLI change. (#319)
+
+### Changed
+
+- **Diagnostic env reads `printenv PATH` / `printenv TMPDIR` are now allowed
+  (PRD #319 M2).** The Bash guardrail permits a targeted read of the two
+  non-secret diagnostic variables (allow iff the call has ≥1 argument and every
+  argument is in `{PATH, TMPDIR}`), while enumeration (bare `env`/`printenv`)
+  and any non-allowlisted or secret-bearing variable stay denied. The real
+  containment remains the SDK's replacement subprocess env, which carries no
+  secret in those vars. See `adr/0319`. (#319)
+- **Two lead-orchestrator prompt nudges (PRD #319 M4).** The builtin `lead`
+  template now reserves independent-verifier fan-out for genuinely uncertain or
+  post-implementation claims — no re-dispatching verifiers to re-read
+  coordinates the lead already confirmed itself — and carries a PRD's exact
+  literal tokens (e.g. NBSP vs ASCII space) verbatim into the plan. Re-applies
+  to pristine builtin rows on the next boot. (#319)
+
+### Security
+
+- **Untrusted Markdown strips Unicode bidi/format characters before render
+  (PRD #319 M1).** The `<Markdown>` component (plan bodies at the approval gate,
+  agent prose, chat, questions, feedback) now strips Cc/Cf control and
+  bidirectional-override characters, closing a Trojan-Source / bidi-spoofing
+  vector on untrusted LLM/forge text (cf. issue #124). Centralized in the
+  component so every current and future untrusted sink is covered by
+  construction; trusted docs rendering is unaffected. (#319)
+
 ## [0.37.0] - 2026-08-14
 
 ### Changed
