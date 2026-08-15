@@ -8,7 +8,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 // would. This jsdom build does not expose window.localStorage, so back it with a
 // Map-based Storage stub (same approach as prefs.test.ts / theme.test.ts).
 
-const KEY = "uzi.mock.v2";
+const KEY = "uzi.mock.v3";
 
 function installStorage(initial: Record<string, string> = {}): void {
   const m = new Map<string, string>(Object.entries(initial));
@@ -41,7 +41,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     installStorage({
       [KEY]: JSON.stringify({
         v: 1,
-        userSettings: { default_model: "opus", theme: "mission" },
+        userSettings: { default_model: "opus", judge_model: "haiku", theme: "mission" },
         appSettings: {
           prd_label: "Feature",
           autopilot_label: "autopilot",
@@ -52,6 +52,9 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           public_base_url: "https://uzi.example",
           judge_enabled: "false",
           judge_model: "opus",
+          judge_enforce_all: "false",
+          judge_cooldown_seconds: "60",
+          judge_daily_budget: "0",
           health_enabled: "false",
           health_stall_seconds: "120",
           health_slow_seconds: "2700",

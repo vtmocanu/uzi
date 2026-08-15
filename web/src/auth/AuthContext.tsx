@@ -60,6 +60,13 @@ interface AuthState {
   // Both default true so password users and older servers keep the existing flow.
   vaultExists: boolean;
   hasPassword: boolean;
+  // Judge consent (PRD #69 M4). judgeEnforcedByAdmin is true when the admin has put
+  // the judge in ENFORCED mode (kill-switch on AND enforce_all on): the RunDefaults
+  // card then shows the enforced banner. effectiveJudgeModel is the model this user's
+  // judge actually runs on after per-user→instance→default resolution. Both default to
+  // the safe reading (not enforced, "") so an older server never fabricates enforcement.
+  judgeEnforcedByAdmin: boolean;
+  effectiveJudgeModel: string;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -85,6 +92,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
   const [vaultExists, setVaultExists] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
+  const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
+  const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -116,6 +125,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Absent → true so a password user / older server never sees the create dialog.
     setVaultExists(session.vault?.exists ?? true);
     setHasPassword(session.has_password ?? true);
+    // Both are bools/strings, so `?? false` / `?? ""` (not `||`) preserve an explicit
+    // value while an absent field (older server) reads as the safe not-enforced state.
+    setJudgeEnforcedByAdmin(session.judge_enforced_by_admin ?? false);
+    setEffectiveJudgeModel(session.effective_judge_model ?? "");
   }, []);
 
   const refresh = useCallback(async () => {
@@ -205,6 +218,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       vaultUnlocked,
       vaultExists,
       hasPassword,
+      judgeEnforcedByAdmin,
+      effectiveJudgeModel,
       register,
       login,
       logout,
@@ -225,6 +240,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       vaultUnlocked,
       vaultExists,
       hasPassword,
+      judgeEnforcedByAdmin,
+      effectiveJudgeModel,
       register,
       login,
       logout,

@@ -20622,6 +20622,118 @@ terminal-failed write site, modelled on `limitwait.go`'s `rate_limit_type` coerc
   notifies through its own `s.notify`.)
 
 - **What M7a does NOT touch.** The audit-H3 enforced-mode invariant note (a user cannot force another user's token to
-  be spent, weakened deliberately at the instance level by enforced mode) stays as recorded — it is an M2/M4 concern,
-  untouched here. M7b (host-naming) stays dead/deferred: #123 retired host-naming and #290 already classifies
+  be spent, weakened deliberately at the instance level by enforced mode) stays as recorded (§538) — it is an M2/M4
+  concern, untouched here. M7b (host-naming) stays dead/deferred: #123 retired host-naming and #290 already classifies
   transient-vs-permanent, so M7a's class-only signal is the whole accuracy delta.
+
+## 535. PRD #69 M1 — three effective judge modes derived from `judge_enabled` + a new `judge_enforce_all` bool
+
+Serves human.md #46 (judge feature, global toggle + per-user opt-in). The judge gains an ENFORCED mode without
+migrating the existing kill-switch.
+
+- **`judge_enforce_all` is a separate bool, NOT a tri-state enum replacing `judge_enabled`** (Decision 2). Keeping the
+  master kill-switch as-is and adding one flag is the lower-risk change: no setting migration, no rename rippling
+  through e2e / web mocks / admin UI / tests, and the kill-switch semantics stay where every reader expects them. App
+  setting `judge_enforce_all` (text `"true"`/`"false"`, default `"false"`, no seeded row — synthesized from `Defaults`).
+- **The three modes are DERIVED at the enqueue gate, never stored:**
+  - **off** — `judge_enabled=false`: no judge for anyone. The kill-switch always wins — `enabled=false,
+    enforce_all=true` resolves to off (the one representable-but-meaningless combination).
+  - **optional** — enabled + `enforce_all=false`: per-user opt-in via `users.judge_enabled` (prior behavior).
+  - **enforced** — enabled + `enforce_all=true`: Gate 3 bypasses the per-user `owner.JudgeEnabled` flag for every user
+    *with an Anthropic token*; token-less users are still skipped silently at Gate 4 (nothing to spend, no
+    notification). Gate 2 (global kill-switch) and Gate 4 (token presence) still govern in every mode.
+- **`JudgeEnforceAll(ctx)` accessor defaults FALSE on malformed/absent** (Decision 6, mirrors `SlackEnabled`): a
+  malformed row must never silently turn forced token spend on. `KeyJudgeEnforceAll` is registered in the `Validate`
+  **bool** branch, not the default/label fall-through (which would accept `"yes"` and then read false). The
+  enqueue-gate read is itself best-effort — a read error reads as false, so the per-user opt-in is still required.
+- **`SettingsReader` widened with `JudgeEnforceAll`** — a package-wide compile event; every `workersvc` fake gains the
+  method in M1's own commit. `RerunJudge` already bypasses the per-user opt-in by design and needs no change in any mode.
+
+## 536. PRD #69 M2 — nullable per-user `users.judge_model`, resolved user-over-instance at judge-claim assembly
+
+Serves human.md #46 ("judge model configurable"). Mirrors PRD #17's `default_model` layering (§ per-user model
+precedence), one layer deeper for the judge lane.
+
+- **`users.judge_model text` nullable** (new migration, next free number above the live head per the goose
+  discipline). Set by the user through `/me/settings` alongside `default_model`/`theme`, trimmed-to-NULL via the shared
+  `validateModel`; blank = inherit. The per-user WRITE path keeps audit-H3 discipline — target from session, never the
+  body.
+- **Resolution at `assembleJudgeClaim`, keyed by the run OWNER**: `GetUserJudgeModel(run.UserID)` wins when set, else
+  the instance `JudgeModel`, else `DefaultJudgeModel`. Resolving here (not threading the owner from enqueue) makes
+  fresh claims and re-claims after requeue/affinity-grace resolve identically. On a user-row read error, fall back to
+  the instance value best-effort with a log — never send an empty model to the SDK.
+- **Spend stays on the run owner's own token** (unchanged; the PRD #46 own-token invariant). Stored
+  `run_reviews.judge_model` rows remain historical — they record what actually ran and are never rewritten, so
+  per-user overrides stay auditable with no schema change.
+
+## 537. PRD #69 M3 — instance default judge model is `opus` (supersedes PRD #59's sonnet)
+
+- **`DefaultJudgeModel` flipped `haiku`→`opus`** and every surface stating/displaying the default aligned (settings
+  comment trail, AdminSettings copy, web mocks/tests). This is a USER decision (2026-07-17, Decision 1) that reverses
+  PRD #59 Decision 1 (which proposed sonnet); **PRD #59 is closed as superseded**. NOTE: contradicts human.md #46's
+  "cheap default" line — flagged to `main` for the contract (§ provenance note in the dispatch report).
+- **Why opus:** the recommendation half feeds self-improvement runs, so the strongest model is wanted by default;
+  the per-user override (§536) and the admin instance pin are the cost levers. opus is the heaviest per-run cost point
+  and the judge fires on every eligible completed AND failed run — accepted because the judge is off by default,
+  spends only the owner's own token, and is overridable.
+- **M3 MUST ship with M5's spend guards (§539).** opus default without the guards recreates exactly the runaway-loop
+  cost risk (Decisions 1/9). Do not land M3 alone.
+- **Upgrade behavior (Decision 8):** an enabled instance with no pinned `judge_model` silently jumps haiku→opus on
+  pull (a 5–15× per-call change); no migration pins the old value. Called out in release notes + `docs/admin-settings.md`
+  with the pin-cheaper remedy, not docs-only.
+
+## 538. PRD #69 Decision 7 / risk R2 — enforced mode is a DELIBERATE, instance-level weakening of audit invariant H3
+
+Recorded so a future audit does NOT read PRD #46's H3 ("nobody can opt another user into spending their tokens",
+stated at §219) as still intact. The stale `handler/judge.go` invariant comment was corrected in the same change.
+
+- **The weakening:** at the INSTANCE level an admin who sets `judge_enforce_all=true` CAN cause every user's own runs
+  to be judged on each user's own token, bypassing the per-user opt-in. This is the documented exception to H3.
+- **The weakening is bounded to own-token/own-runs.** An admin still cannot redirect judge spend to a DIFFERENT
+  account — spend never leaves the run owner (§536; PRD #46 own-token invariant holds). The per-user model WRITE path
+  also keeps H3 (target from session, never body). So H3 is weakened at exactly one axis: instance force-ON of a
+  user's own retrospectives on the user's own token.
+- **Consequences named** (Decision 3): enforced mode silently overrides the admin per-user force-disable — one bool
+  cannot distinguish admin-forced-off from user-opted-out, and a third state is not worth it. The only true opt-out
+  left is deleting your Anthropic token (which also kills your own runs); `docs/judge.md` states this bluntly.
+- **Consent surface:** the `/me` payload gains `judge_enforced_by_admin` (bool) + `effective_judge_model` (after the
+  per-user→instance→default resolution), so a non-admin — who cannot read `/api/admin/settings` — can still see the
+  mode is admin-enforced and which model it runs on, with the per-user override reachable from the same card.
+
+## 539. PRD #69 M5 — per-user spend guards at a new best-effort, FAIL-OPEN Gate 5
+
+Serves the enforced-cost backstop (risk R1/R3). Two admin count-based per-user guards at a new Gate 5
+(`judgeSpendGuardsAllow`) in `maybeEnqueueJudge`, checked in EVERY mode (a runaway loop is a footgun even for an
+opted-in user), after Gate 4 and before `CreateJudgeRun`:
+
+- **`judge_cooldown_seconds`** (default `60`, on; bound `{0} ∪ [60,86400]`) — skip if the user had a judge enqueued
+  within the last N s. Safe at 60s because real runs take minutes, so sub-minute completions are almost always failures.
+- **`judge_daily_budget`** (default `0` = off; `0` or `[1, maxJudgeDailyBudget]`) — skip if the user already had ≥ N
+  judge runs in the rolling 24h. A hard volume ceiling admins opt into.
+- **Count-based, not cost/token-based:** the gate runs at enqueue, before the about-to-run judge's cost is known and
+  before `run_usage` (M6, §540) folds. Two read-only queries `LastJudgeEnqueuedAt` / `CountJudgesSince` over
+  `runs WHERE kind='judge'`.
+- **On trip: skip SILENTLY** (no defer, no queue, no notification — identical to a Gate 3/4 miss), debug-logged.
+- **Deliberately FAIL-OPEN on any settings/query read error** — the opposite of the fail-closed correctness/consent
+  Gates 2–4. A transient DB/settings hiccup must never silently disable judging: these are a soft cost backstop, not a
+  correctness/consent gate. (§534's M7a pre-start gate is a *sibling* of this Gate 5.)
+
+## 540. PRD #69 M6 — judge run cost/time via the existing PRD #40 usage fold; spend rolls into the owner's totals
+
+Serves human.md #40 (per-run/per-user/factory cost) for the judge lane, which recorded its cost nowhere (Decision 10).
+Reuses the proven work-run accounting path rather than a judge-specific cost field.
+
+- **Capture:** the judge lane now POSTs its single terminal result frame as ONE `run_message` via the existing
+  `postMessages` endpoint; `AppendMessages`→`foldRunUsage` writes a `run_usage` row keyed on the judge `run_id`, with
+  the same GREATEST merge and untrusted-worker clamps as work runs — **no new trust boundary** (worker-reported usage
+  was already trusted). The judge lane posts no other messages; it is not made a streamed run.
+- **Rolls into the owner's totals deliberately** (user decision): `SelfUsage`/`AdminUsageTotals`/`AdminUsagePerUser`
+  already aggregate `run_usage_totals` over `kind <> 'chat'`, which admits `judge` — **zero query change**. Judge spend
+  is the owner's own token spend and now shows where the rest of it does; with the opus default (§537) the single most
+  expensive per-run call was the one previously missing from the bill.
+- **Duration:** one `reportState({status:"running"})` at the start of `execute()` stamps `started_at`, giving the
+  uniform `finished_at - started_at` (a judge run's `SetRunRunning` never fired before, so it had no `started_at`).
+- **Surface:** `reviewDTO` gains a nested `judge_run` (`judge_run_id` + claim/start/finish timing + a usage bundle) via
+  the new read query `GetJudgeRunUsageForTarget`; `JudgePanel` renders a 4-tile strip (Tokens in · Tokens out ·
+  Duration · Cost) mirroring the work-run `RunUsagePanel`. A judge run predating the feature (no `run_usage` row)
+  renders no strip — never a fabricated 0 (PRD #40's pre-feature rule). The judge run stays hidden from every run list.

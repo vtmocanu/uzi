@@ -75,6 +75,10 @@ export interface SecretMeta {
 // #21).
 export interface UserSettings {
   default_model: string | null;
+  /** Per-user judge model override (PRD #69 M2); null means inherit the instance
+   *  judge_model (which itself falls back to opus). Written through PUT /me/settings
+   *  alongside default_model, validated by the same model rules. */
+  judge_model: string | null;
   theme: string | null;
   /** Ids of NON-default tokens whose rate meters the user also wants on the
    *  sidebar rail. The default token always shows and is never listed here.
@@ -87,6 +91,8 @@ export interface UserSettings {
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
   default_model?: string | null;
+  /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
+  judge_model?: string | null;
   theme?: string | null;
   /** Replaces the whole sidebar-token set (null clears it); absent leaves it. */
   sidebar_token_ids?: string[] | null;
@@ -573,6 +579,14 @@ export interface AppSettings {
   // self-improvement keys are engine-managed and NOT surfaced here.
   judge_enabled: string;
   judge_model: string;
+  // judge_enforce_all (PRD #69) is the text "true"/"false": when on, EVERY user's
+  // finished runs are judged on that user's own token, bypassing the per-user opt-in
+  // — but the kill-switch (judge_enabled) still dominates. judge_cooldown_seconds and
+  // judge_daily_budget are the per-user spend guards, integer seconds / count as
+  // strings (the API serves every setting as a string); 0 disables each guard.
+  judge_enforce_all: string;
+  judge_cooldown_seconds: string;
+  judge_daily_budget: string;
   // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
   // the rest are integer seconds as strings (the API serves every setting as a
   // string). 0 disables that one signal.
@@ -669,6 +683,14 @@ export interface SessionResponse {
   // has_password is false for OIDC-only users (NULL password_hash; PRD #45). Absent
   // (older server, or a password user) reads as true — no passphrase-create dialog.
   has_password?: boolean;
+  // Judge consent surface (PRD #69 M4), resolved server-side so a non-admin (who
+  // cannot read /admin/settings) still sees what their own token is committed to.
+  // judge_enforced_by_admin is true only when the judge is ENFORCED (kill-switch on
+  // AND enforce_all on) — the RunDefaults enforced banner reads it. effective_judge_model
+  // is the model this user's judge actually runs on after the per-user→instance→default
+  // resolution. Both optional so an older server (no enforced mode) reads as off / "".
+  judge_enforced_by_admin?: boolean;
+  effective_judge_model?: string;
 }
 
 // AuthConfig is the unauthenticated registration policy the register page reads

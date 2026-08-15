@@ -12,11 +12,18 @@ export function AdminUsers() {
   const [judgeBusyId, setJudgeBusyId] = useState<string | null>(null);
   const [ciAutofixBusyId, setCiAutofixBusyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Whether the admin has ENFORCED the judge instance-wide (PRD #69 M4). Under
+  // enforced mode the per-user judge flag is bypassed at enqueue (Decision 3), so the
+  // per-user toggle in this table is INERT — greyed and annotated, not removed. Read
+  // best-effort from the admin settings alongside the user list; a failed read leaves
+  // it false so the toggle stays live rather than falsely claiming to be inert.
+  const [judgeEnforceAll, setJudgeEnforceAll] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const { users } = await api.listUsers();
+      const [{ users }, { settings }] = await Promise.all([api.listUsers(), api.getSettings()]);
       setUsers(users);
+      setJudgeEnforceAll(settings.judge_enforce_all === "true");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load users");
     } finally {
@@ -114,19 +121,24 @@ export function AdminUsers() {
                       </Badge>
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
+                      <div className={`flex items-center gap-2 ${judgeEnforceAll ? "opacity-50" : ""}`}>
                         <Badge tone={u.judge_enabled ? "ok" : "neutral"} dot>
                           {u.judge_enabled ? "On" : "Off"}
                         </Badge>
                         <Button
                           variant="ghost"
                           size="sm"
-                          disabled={judgeBusyId === u.id}
+                          disabled={judgeBusyId === u.id || judgeEnforceAll}
                           onClick={() => toggleJudge(u)}
                         >
                           {u.judge_enabled ? "Disable" : "Enable"}
                         </Button>
                       </div>
+                      {judgeEnforceAll && (
+                        <p className="mt-1 text-xs text-faint">
+                          Inert: enforced mode judges every run regardless of this flag.
+                        </p>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">

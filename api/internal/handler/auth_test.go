@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -51,6 +53,54 @@ func TestSessionPayloadCarriesEligibilityFields(t *testing.T) {
 	}
 	if waiver != false {
 		t.Errorf("eligible_label_waives_prd_link = %v, want false", waiver)
+	}
+}
+
+// TestSessionPayloadJudgeConsentFields pins the PRD #69 M4 consent channel on the
+// session payload: judge_enforced_by_admin follows the Gate-2-wins semantics (the
+// kill-switch dominates enforce_all), and effective_judge_model is resolved
+// user-value-wins over the instance value, which itself falls back to opus.
+func TestSessionPayloadJudgeConsentFields(t *testing.T) {
+	// Kill-switch ON + enforce_all ON ⇒ enforced. Instance model "sonnet", user has
+	// no per-user override ⇒ effective is the instance value.
+	h := newSettingsHandler(
+		store.AppSetting{Key: settings.KeyJudgeEnabled, Value: "true"},
+		store.AppSetting{Key: settings.KeyJudgeEnforceAll, Value: "true"},
+		store.AppSetting{Key: settings.KeyJudgeModel, Value: "sonnet"},
+	)
+	payload := h.sessionPayload(context.Background(), store.User{})
+	if enforced, ok := payload["judge_enforced_by_admin"].(bool); !ok || !enforced {
+		t.Errorf("judge_enforced_by_admin = %v (%T), want true", payload["judge_enforced_by_admin"], payload["judge_enforced_by_admin"])
+	}
+	if m := payload["effective_judge_model"]; m != "sonnet" {
+		t.Errorf("effective_judge_model = %v, want sonnet (instance value)", m)
+	}
+
+	// Kill-switch OFF but enforce_all ON ⇒ NOT enforced (Gate-2-wins). A user override
+	// wins for the effective model regardless of the enforced flag.
+	h2 := newSettingsHandler(
+		store.AppSetting{Key: settings.KeyJudgeEnabled, Value: "false"},
+		store.AppSetting{Key: settings.KeyJudgeEnforceAll, Value: "true"},
+		store.AppSetting{Key: settings.KeyJudgeModel, Value: "sonnet"},
+	)
+	user := store.User{JudgeModel: pgtype.Text{String: "haiku", Valid: true}}
+	payload2 := h2.sessionPayload(context.Background(), user)
+	if enforced, ok := payload2["judge_enforced_by_admin"].(bool); !ok || enforced {
+		t.Errorf("judge_enforced_by_admin = %v, want false when kill-switch off", payload2["judge_enforced_by_admin"])
+	}
+	if m := payload2["effective_judge_model"]; m != "haiku" {
+		t.Errorf("effective_judge_model = %v, want haiku (user override wins)", m)
+	}
+
+	// No judge settings at all ⇒ not enforced, effective falls back to the compiled-in
+	// DefaultJudgeModel (opus) rather than an empty string.
+	h3 := newSettingsHandler()
+	payload3 := h3.sessionPayload(context.Background(), store.User{})
+	if enforced, _ := payload3["judge_enforced_by_admin"].(bool); enforced {
+		t.Errorf("judge_enforced_by_admin = true, want false with no settings")
+	}
+	if m := payload3["effective_judge_model"]; m != settings.DefaultJudgeModel {
+		t.Errorf("effective_judge_model = %v, want %q (default)", m, settings.DefaultJudgeModel)
 	}
 }
 

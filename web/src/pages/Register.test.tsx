@@ -46,6 +46,8 @@ beforeEach(() => {
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
+    judgeEnforcedByAdmin: false,
+    effectiveJudgeModel: "opus",
   });
 });
 

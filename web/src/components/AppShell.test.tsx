@@ -37,7 +37,7 @@ vi.mock("../lib/api", () => ({
     // no_token so they render nothing in these nav/collapse assertions.
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     // SidebarRateLimits fetches the chosen sidebar-token set on mount.
-    getMySettings: vi.fn().mockResolvedValue({ settings: { default_model: null, theme: null } }),
+    getMySettings: vi.fn().mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: null } }),
     // The sidebar-footer version badge fetches GET /api/version on mount; resolve it
     // so the shared module-level promise settles instead of throwing on an undefined
     // mock. Bare (no leading v) so the "renders" test below can assert the UI adds
@@ -161,6 +161,8 @@ beforeEach(() => {
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
+    judgeEnforcedByAdmin: false,
+    effectiveJudgeModel: "opus",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

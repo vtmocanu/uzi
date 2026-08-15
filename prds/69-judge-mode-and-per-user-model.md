@@ -638,14 +638,14 @@ So the safe fan-out is M1 first, then M2 and M3 (and M6) in parallel on top of i
 then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
 `maybeEnqueueJudge`), then M4 last — not all-wide from a cold start. M7b is deferred.
 
-- [ ] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
+- [x] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
   default-false-on-junk accessor + `SettingsReader` widening (+ all fakes) +
   enqueue gate bypass + admin-settings surface. `go test ./internal/settings
   ./internal/workersvc ./internal/handler` green.
-- [ ] **M2 — Per-user judge model**: `users.judge_model` migration + sqlc +
+- [x] **M2 — Per-user judge model**: `users.judge_model` migration + sqlc +
   `/me/settings` read/write + claim-assembly resolution (user-wins, error
   fallback). `go test ./...` + `sqlc generate` clean.
-- [ ] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
+- [x] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
   trail + settings tests + web mock defaults. `go test ./internal/settings`;
   `npm run typecheck` + `npm test`.
 - [x] **M5 — Per-user spend guards**: `judge_cooldown_seconds` (default `"60"`,
@@ -673,7 +673,7 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   sqlc stable (only `judge.sql.go` regenerated). The `judge_run` field is nested (not the
   flat `judge_run_id`+timing the checklist sketched) to keep the timing/usage grouped
   under one omitempty key.
-- [ ] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
+- [x] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
   closed-enum `failure_class` over the target run, computed from the trusted axes
   (`status` + `iteration_count` + transition origin, NOT parsed from `failure_reason` —
   Decision 11) on the judge claim + rendered in the trusted signal block (enum value
@@ -684,7 +684,16 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   proving a pre-start provisioning failure yields a non-"transient", non-retry
   recommendation, a 0-iteration infra failure is notified not judged, and an
   agent-crash-at-iteration-0 is still judged.
-  - *Pass A (the SEAM) landed 2026-08-15 — box stays unchecked pending Pass B.* Added
+  - *Landed 2026-08-15 in two passes. Notification design changed from the PRD's
+    "inject notifysvc into workersvc": that would create an import cycle (notifysvc
+    already imports workersvc — `RunFailureNotifier` is a `workersvc.Broadcaster`), so
+    the pre-start gate skips the judge and the deterministic failure notification is
+    delivered by the EXISTING `RunFailureNotifier` on the same `PublishState("failed")`
+    transition (the PRD's "route the notify half through it" option). Every gate-reachable
+    infra origin is worker-reported and publishes before enqueue; `guardrail_blocked`/
+    tool-package origins come only via `recoverClaimAssembly`, which is not gate-reachable.
+    No new stamped `judge_infra_notified_at` column was needed.*
+  - *Pass A (the SEAM).* Added
     the `runs.fail_origin` closed-enum column (migration `00126_run_fail_origin.sql`;
     nullable, 9 members, CHECK-closed), a `CoerceFailOrigin` allowlist + `AllFailOrigins`
     in `workersvc/failorigin.go` mirroring `limitwait.go`'s `rate_limit_type`, and stamping
@@ -699,7 +708,7 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
 - [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
   a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value because the
   durable fix (pin nixpkgs / pre-seed, issue #82) removes the underlying failure mode.
-- [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
+- [x] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
   admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
   user judge card (enforced banner + per-user model input), stale-comment fix,
   docs for all four changes, `specs/ai.md` entries, release note, close #59.

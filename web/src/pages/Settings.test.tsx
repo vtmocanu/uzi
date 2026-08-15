@@ -84,6 +84,8 @@ function mockAuth(user: User) {
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
+    judgeEnforcedByAdmin: false,
+    effectiveJudgeModel: "opus",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
@@ -93,8 +95,8 @@ function mockAuth(user: User) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked" },
   });
@@ -224,7 +226,7 @@ describe("Settings — per-token 'Show in sidebar' toggle", () => {
   it("checking an extra saves the whole set over PUT /me/settings", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: twoSecrets });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
+      settings: { default_model: null, judge_model: null, theme: null, sidebar_token_ids: ["sec-2"] },
     });
     render(
       <MemoryRouter>

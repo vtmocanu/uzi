@@ -15,6 +15,45 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   on an active exclusion (never on a role merely absent from a roster), only
   after the selection validates, and never blocks the approve. No new wire
   field, no migration, and no web/CLI change. (#319)
+- **Judge mode: off, optional, or enforced for everyone (PRD #69 M1).** A new
+  admin **Enforce the judge on every run** setting combines with the
+  existing kill-switch into three effective modes: off (the kill-switch
+  always wins), optional (today's per-user opt-in), and enforced (every
+  user who holds an Anthropic token is judged regardless of their own
+  opt-in, still spent on their own token — an admin can force that judging
+  *happens*, never redirect *who pays*). Enforcement also makes a per-user
+  admin force-disable on the Users page inert while it's on, since one flag
+  can't distinguish "an admin disabled you" from "you opted out." (#69)
+- **Per-user judge model override (PRD #69 M2).** A new **Settings → Run
+  judge → Judge model** picker lets a user pin the model their own judge
+  runs on, independent of the instance default; left on Inherit it falls
+  back to the instance setting. Resolution happens at judge-claim time and
+  always spends the run owner's own token — an admin still cannot redirect
+  judge spend to another user's account. (#69)
+- **Per-user judge spend guards: cooldown and daily budget (PRD #69 M5).**
+  Two admin-tuned, count-based settings — a per-user cooldown (default 60s,
+  `0` disables it) and a per-user daily budget (default `0` = unlimited) —
+  are checked before every judge is enqueued, in every mode. Both are
+  best-effort and fail **open** on a settings-read error; a tripped guard
+  skips the judge silently, with no notification and no queued run. Ships
+  alongside the opus default below so a heavier judge can't recreate a
+  runaway-cost loop on its own. (#69)
+- **Judge run cost and time are now visible (PRD #69 M6).** A judge run's
+  own tokens, duration, and cost are captured the same way a work run's
+  are, so they now fold into the owner's usage totals and render as a
+  compact strip (Tokens in/out, Duration, Cost) on the reviewed run's judge
+  panel. A judge run predating this change shows no strip rather than a
+  fabricated zero. (#69)
+- **Judge accuracy: a trusted failure-class signal, and a pre-start skip
+  (PRD #69 M7a).** The API now computes a closed-enum failure class for a
+  failed run from server-owned axes (status, iteration count, and the
+  terminal transition's own origin) — never by parsing the free-text
+  failure reason — and hands it to the judge, which no longer recommends
+  retry/backoff for a policy- or config-denied failure (a provisioning,
+  credential, or guardrail block). A run that failed before its agent ever
+  started (0 iterations, a pre-start infra origin) skips the judge entirely
+  and gets a deterministic failure notification instead of an opus
+  retrospective. (#69)
 
 ### Changed
 
@@ -31,6 +70,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   coordinates the lead already confirmed itself — and carries a PRD's exact
   literal tokens (e.g. NBSP vs ASCII space) verbatim into the plan. Re-applies
   to pristine builtin rows on the next boot. (#319)
+- **Default judge model is now `opus`, not `haiku` (PRD #69 M3, supersedes
+  PRD #59).** The judge's recommendation half feeds self-improvement, so
+  the strongest model is now the instance default; the per-user override
+  and the admin instance setting are both still there as the cost levers.
+  **Upgrade note:** an existing instance with the judge enabled and no
+  `judge_model` pinned starts spending opus (roughly 5–15× haiku per run)
+  right after upgrading — pin **Judge model** to `haiku` or `sonnet` first
+  if you want to keep the previous cost. On a subscription-plan Anthropic
+  token, an opus judge also spends plan/rate-limit quota rather than
+  dollars, which can eat into what your real runs need — this matters most
+  under the new enforced mode above. (#69)
 
 ### Security
 
