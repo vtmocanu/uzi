@@ -6,6 +6,21 @@
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.
 **Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model). PRD #98 (Judge menu — the downstream *output workbench*: this PRD is the judge control plane (mode/model/spend/accuracy/consent), #98 is where its recommendations get triaged. Cleanly separable, and no notification seam: #98 adds **no Slack digest** — it only retargets the existing `judge_review` deep-link and groups those rows in the *web* inbox (judge_review-scoped), so this PRD's M7a infra-skip notification is untouched).
 
+## Revalidation (2026-08-15)
+
+Re-checked against `main @ e5ed9161`, ~1 month after drafting. **Nothing here landed and nothing was obviated** — every milestone is unimplemented against real symbols, and the api even carries an in-code note that #69 "is still Draft" (`handler/judge.go`, the `setJudgeRequest` comment). But the judge subsystem moved under #104/#111/#121/#300 (landed) and is about to move again under #229/#123 (planned), which splits this PRD into a **build-now cluster** and a **coordinate-first layer**:
+
+- **Build now, self-contained (depend on nothing unlanded): M1, M3+M5, M6.**
+  - **M3 and M5 MUST ship together.** An opus default without the spend guards recreates exactly the runaway-loop risk Decisions 1/9 exist to prevent. Do not land M3 alone. (`"opus"` still resolves to the top tier — aliases pass straight to the SDK, `agenttmpl/model.go` only validates; `builtins/lead.md` is already `model: opus` — so M3's alias story is unchanged.)
+  - **M6 is still a genuine gap.** `foldRunUsage` already admits `kind='judge'`, but the runner delivers no result frame and `apitypes.ReviewDTO` has no usage/timing fields; the judge-menu family (#98/#94/#119/#294) built the workbench but never added cost. Uncontested.
+  - **M1** is uncontested — the enqueue gate still has no enforce bypass.
+- **Coordinate before building: M2, M7a.**
+  - **M2 → fold into PRD #229's per-user judge `{provider, model}` setting.** #229 (active, not started) explicitly plans to build "the per-user judge setting per #69's shape"; a standalone `users.judge_model` string built now is something #229 then has to migrate. The claim-assembly seam Decision 5 asked for is already proven and in place (PRD #104's `judgeSecretID(ctx, run.UserID)`), and PRD #300 built the identical nullable-model-override-reusing-`ValidateModel` pattern one layer up (and cites #69 as the sibling) — so M2 is *mechanically trivial*, just entangled. If #229 stalls, M2 reverts cleanly to buildable standalone on those precedents.
+  - **M7a → key its trusted enum off PRD #123's classified `failure_reason`, not today's generic timeout string.** #123 (draft, the #82 durable fix) names #69 M7a as the consumer of its worker-side failure classification. #78's failure mode is still live (worker egress is still 3 FQDNs), so the motivation holds. Note the judge already *receives* raw `failure_reason`/status/iterations in its prompt header — so M7a's real value is now "make that input **trusted + closed-enum + prompt-ruled + pre-start-gated**," not "give the judge ground truth it lacks." The pre-start infra-skip gate and the one prompt rule are valid independent of #123.
+- **Keep deferred: M7b.** Unchanged; #123 landing would retire it for good.
+
+**Citations below have rotted — re-derive at implementation time, do not trust them.** As the judge subsystem absorbed #104/#111/#121/#232, roughly a dozen `file.go:NN` references drifted 20–700 lines (e.g. `DefaultJudgeModel` :109→:135, still `"haiku"`; `settings.go:748`→:911; `workersvc/judge.go:138`→:855; `service.go:295/297`→:663/665). One is a *mechanism* change, not just a moved line: Decision 1/5 describe the judge claim reading the owner's OAuth token directly at `judge.go:177`, but PRD #104 made that vault-aware (`openAnthropic`/`cred.Token`). Per the repo's re-derive-at-assertion convention, line numbers are re-resolved when a milestone is picked up, not maintained here.
+
 ## Problem
 
 The run judge (PRD #46) has three rigid points that admins and users have asked
@@ -385,7 +400,9 @@ What does **not** change:
 - **New column** `users.judge_model text` (nullable, no default) — migration
   `00067_user_judge_model.sql` (number is a draft; renamed to the next free
   number above the live head at merge, per the goose discipline in CLAUDE.md;
-  head is currently `00066_hosted_workers.sql`). sqlc: extend `GetUserSettings`
+  live head is `00123_user_sidebar_tokens.sql` as of 2026-08-15 — it was
+  `00066_hosted_workers.sql` when this was drafted, so treat `00067` as a dead
+  draft number and take the next free number above the head at landing). sqlc: extend `GetUserSettings`
   / `GetUserByID` rows and add `SetUserJudgeModel`, regenerate.
 - **New app setting** `judge_enforce_all` (text `"true"`/`"false"`, default
   `"false"`). Follows the PRD #46 no-seeded-row pattern: add to `Defaults`
