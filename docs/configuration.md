@@ -109,7 +109,7 @@ The first time a repo's board is opened, uzi ensures four labels exist on that G
 Boards seeded before `Planned` existed keep their `Upcoming` column, in its old position. uzi does not migrate them: renaming a column means rewriting a real GitLab label that saved filters, other boards and other tooling may depend on, and there is no undo for it from inside uzi. To adopt the new name by hand, do it **in this order**:
 
 1. **Rename the label in GitLab first.** Project → Manage → Labels, edit `Upcoming`, set its title to `Planned`, save. GitLab carries every issue over with the label, so no issue loses its labelling.
-2. **Then repoint the uzi column.** On the board, open **Columns**, remove `Upcoming`, add `Planned`, move it to the top with the arrows, and save.
+2. **Then repoint the uzi column.** On the board, open **Columns**, remove `Upcoming`, add `Planned`, drag it to the top by its grip handle, and save.
 
 The order matters. Between the two steps the affected cards sit in `Backlog`: they now carry `Planned`, which is not yet a configured column. (They move there once uzi next polls GitLab and notices the renamed label, within one `FORGE_POLL_INTERVAL`, so you may see them stay put for a minute first.) Step 2 settles them into `Planned` **as soon as you save** the column change, with no further wait: saving columns rebuilds and returns the board in the same request.
 

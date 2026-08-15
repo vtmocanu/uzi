@@ -20821,3 +20821,32 @@ colour-coded status board. TUI/CLI-only — no API, DB, worker or web change; bl
 See [prds/325-tui-redesign.md](../prds/325-tui-redesign.md) for the milestone/decision record and
 the review-wave amendments; §368-§372 for the PRD #112 base this builds on (D7 §371, D8 ownership
 §372, package layout §370).
+
+## 542. PRD #318 — the COLUMNS editor reorders by grip-drag, and the ↑/↓ arrows are DROPPED (owner override), taking the keyboard/touch path with them
+
+The board Settings → **COLUMNS** editor (`ColumnSettings` in `web/src/pages/Board.tsx`)
+reorders by dragging a **6-dot grip handle**, replacing the per-row **↑/↓ arrow buttons**.
+
+- **Reuses the board cards' hand-rolled DnD idiom verbatim, no new dependency.** Payload
+  via `dataTransfer.setData("text/plain", label)`, top/bottom-half edge detection through
+  `insertionEdgeFor`, dragged row at `opacity-40`, an inset brand-colour shadow as the
+  insertion marker, and **one** `moveTo` order path. `web/package.json` carries no DnD
+  library and the cards are hand-rolled; matching them keeps the two reorder surfaces
+  consistent rather than introducing a second idiom.
+- **No API/DTO/backend change.** Reorder mutates local component state only; nothing
+  persists until **Save columns** (`api.configureColumns`, unchanged).
+- **The arrows are DROPPED ENTIRELY, not kept alongside the grip.** A `ux-designer`
+  analysis recommended a *hybrid* retaining the arrows; the owner overrode it to remove
+  them. Recorded because the shipped choice contradicts the advisory input.
+- **Accepted a11y residual (owner-accepted, recorded per the PRD).** The arrows were the
+  only keyboard-, screen-reader-, and touch-operable reorder path; native HTML5 drag is
+  pointer-only (no keyboard initiation in mainstream browsers, does not fire from touch),
+  so column reordering now **requires a mouse** — a deliberate **WCAG 2.1.1 (Keyboard)**
+  regression scoped to the column editor. This DIVERGES from the board **cards**, which
+  keep an ↑/↓ keyboard/touch fallback for exactly this reason (§443; `Board.tsx` ~1796-1824);
+  the divergence is intentional, at the owner's direction. No aria-live announcement was
+  added — the editor had none, and with reorder now mouse-only there is no keyboard trigger
+  for one; a future keyboard-path PRD would add both.
+
+See [prds/done/318-board-column-dnd-reorder.md](../prds/done/318-board-column-dnd-reorder.md) for the
+Design Decisions and Accepted residuals; §440 for `ColumnSettings`' chip/label exclusions.
