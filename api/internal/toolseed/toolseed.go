@@ -100,17 +100,17 @@ func buildSeedSet() map[string]bool {
 	}
 	set := make(map[string]bool, len(m.Packages))
 	for _, attr := range m.Packages {
-		set[Normalize(attr)] = true
+		set[normalize(attr)] = true
 	}
 	return set
 }
 
-// Normalize maps a seed attr to the allowlist name it covers: it strips a trailing
+// normalize maps a seed attr to the allowlist name it covers: it strips a trailing
 // nixpkgs `.<output>` selector (jq.bin→jq, openssl.bin→openssl, file.out→file,
 // shellcheck.bin→shellcheck) but leaves python3Packages.pip intact (pip is not an
 // output name), then applies the alias map (yq-go→yq). Everything else is
 // identity. Case-sensitive: nix attrs are case-sensitive.
-func Normalize(attr string) string {
+func normalize(attr string) string {
 	if i := strings.LastIndexByte(attr, '.'); i >= 0 {
 		if nixOutputSuffixes[attr[i+1:]] {
 			attr = attr[:i]
