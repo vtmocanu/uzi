@@ -99,7 +99,7 @@ beforeEach(() => {
   mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: null } });
   mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
-    slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked" },
+    slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
   mockAuth(baseUser);
 });

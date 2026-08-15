@@ -14,6 +14,18 @@ const STATE_META: Record<SlackLink["state"], { label: string; tone: BadgeTone }>
   confirmed: { label: "Linked", tone: "ok" },
 };
 
+// WORKSPACE_ALERT maps the server-derived Slack workspace state (PRD #56) to a
+// non-blocking info banner that explains why the card behaves the way it does.
+// "connected" carries no banner — the link-state helpers below take over. All
+// three non-connected states use tone="info" (error is deliberately softer than
+// tone="danger": a temporary outage, not a user-facing failure).
+const WORKSPACE_ALERT: Record<Exclude<SlackLink["workspace"], "connected">, string> = {
+  unconfigured:
+    "Slack isn't connected on this uzi instance yet, so notifications can't be delivered. An admin can set it up under Admin Settings → Slack.",
+  connecting: "Slack is reconnecting…",
+  error: "Slack is temporarily unavailable — an admin can check Admin Settings → Slack.",
+};
+
 export function SlackNotifications() {
   const [link, setLink] = useState<SlackLink | null>(null);
   const [loading, setLoading] = useState(true);
@@ -87,6 +99,10 @@ export function SlackNotifications() {
   };
 
   const overrideDirty = link !== null && override.trim() !== (link.member_id ?? "");
+  // When Slack was never configured on this instance, no control can do anything
+  // useful, so every write path is disabled (the card stays visible). All other
+  // workspace states leave the controls to their normal link-state rules.
+  const controlsDisabled = link?.workspace === "unconfigured";
 
   return (
     <Card className="space-y-5">
@@ -106,6 +122,10 @@ export function SlackNotifications() {
         <Skeleton className="h-24 w-full" />
       ) : (
         <>
+          {link.workspace !== "connected" && (
+            <Alert tone="info" message={WORKSPACE_ALERT[link.workspace]} />
+          )}
+
           <div className="flex flex-wrap items-center gap-2 text-sm">
             <span className="text-muted">Link status</span>
             <Badge tone={STATE_META[link.state].tone} dot>
@@ -121,12 +141,18 @@ export function SlackNotifications() {
             </p>
           )}
 
+          {link.state === "pending" && link.workspace === "connected" && (
+            <p className="text-sm text-muted">
+              Check Slack for a confirmation DM from uzi — notifications start once you press Confirm.
+            </p>
+          )}
+
           <label className="flex items-center gap-3 text-sm">
             <input
               type="checkbox"
               className="h-4 w-4 accent-brand"
               checked={link.notify}
-              disabled={busy}
+              disabled={busy || controlsDisabled}
               onChange={(e) => toggleNotify(e.target.checked)}
             />
             <span className="text-fg">Send me Slack notifications about my runs</span>
@@ -138,23 +164,29 @@ export function SlackNotifications() {
                 id="slack-override"
                 placeholder="e.g. U0123ABCD — leave blank to match by email"
                 value={override}
-                disabled={busy}
+                disabled={busy || controlsDisabled}
                 onChange={(e) => setOverride(e.target.value)}
               />
             </Field>
             <div className="flex flex-wrap gap-2">
-              <Button type="button" disabled={busy || !overrideDirty} onClick={saveOverride}>
+              <Button type="button" disabled={busy || !overrideDirty || controlsDisabled} onClick={saveOverride}>
                 Save override
               </Button>
               <Button
                 type="button"
                 variant="secondary"
-                disabled={busy || !link.resolved_id}
+                disabled={busy || !link.resolved_id || controlsDisabled}
                 onClick={sendTest}
               >
                 Send test DM
               </Button>
             </div>
+            {link.state === "unlinked" && link.workspace === "connected" && (
+              <p className="text-sm text-muted">
+                Test DMs become available once uzi resolves your Slack account — by email match or the
+                override above.
+              </p>
+            )}
           </div>
         </>
       )}

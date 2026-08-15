@@ -20,7 +20,7 @@ vi.mock("../lib/api", async (importActual) => {
 const mockApi = vi.mocked(api);
 
 function link(overrides: Partial<SlackLink> = {}): SlackLink {
-  return { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", ...overrides };
+  return { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected", ...overrides };
 }
 
 const notifyToggle = () =>
@@ -73,7 +73,9 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     fireEvent.change(overrideInput(), { target: { value: "U9" } });
     fireEvent.click(screen.getByText("Save override"));
     await waitFor(() => expect(mockApi.setMySlackOverride).toHaveBeenCalledWith("U9"));
-    expect(await screen.findByText(/confirmation DM/i)).toBeTruthy();
+    // The success notice and the pending helper both mention "confirmation DM";
+    // match the notice specifically so the assertion stays unambiguous.
+    expect(await screen.findByText(/Override saved/i)).toBeTruthy();
   });
 
   it("surfaces a 409 collision when the id is already linked", async () => {
@@ -101,5 +103,44 @@ describe("SlackNotifications (PRD #25 M3)", () => {
     fireEvent.click(testButton());
     await waitFor(() => expect(mockApi.testMySlackDM).toHaveBeenCalled());
     expect(await screen.findByText(/Test DM sent/i)).toBeTruthy();
+  });
+
+  const saveButton = () => screen.getByText("Save override").closest("button") as HTMLButtonElement;
+
+  // Workspace axis (PRD #56 M2). These compose over the link-state layout above.
+  it("explains an unconfigured workspace and disables every control", async () => {
+    mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "unconfigured" }) });
+    const { container } = render(<SlackNotifications />);
+    await waitFor(() => expect(notifyToggle()).toBeTruthy());
+    expect(container.textContent).toContain("Slack isn't connected on this uzi instance yet");
+    expect(notifyToggle().disabled).toBe(true);
+    expect(overrideInput().disabled).toBe(true);
+    expect(saveButton().disabled).toBe(true);
+    expect(testButton().disabled).toBe(true);
+  });
+
+  it("hints where test DMs come from when unlinked, with no workspace alert", async () => {
+    mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "connected", state: "unlinked" }) });
+    const { container } = render(<SlackNotifications />);
+    await waitFor(() => expect(notifyToggle()).toBeTruthy());
+    expect(container.textContent).toContain("Test DMs become available once uzi resolves your Slack account");
+    expect(container.querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("guides the user to confirm when pending and keeps the test DM enabled", async () => {
+    mockApi.getMySlack.mockResolvedValue({
+      slack: link({ workspace: "connected", state: "pending", resolved_id: "U1" }),
+    });
+    const { container } = render(<SlackNotifications />);
+    await waitFor(() => expect(testButton().disabled).toBe(false));
+    expect(container.textContent).toContain("Check Slack for a confirmation DM from uzi");
+  });
+
+  it("shows the reconnecting alert but leaves controls enabled", async () => {
+    mockApi.getMySlack.mockResolvedValue({ slack: link({ workspace: "connecting" }) });
+    const { container } = render(<SlackNotifications />);
+    await waitFor(() => expect(notifyToggle()).toBeTruthy());
+    expect(container.textContent).toContain("Slack is reconnecting");
+    expect(notifyToggle().disabled).toBe(false);
   });
 });

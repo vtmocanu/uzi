@@ -106,13 +106,16 @@ export type AgentTemplateScope = "builtin" | "global" | "user";
 // Settings → Notifications section. state is derived: unlinked (no resolved id) |
 // pending (resolved, awaiting the Confirm DM) | confirmed. member_id is the manual
 // override (null = rely on email auto-match); resolved_id is the effective linked
-// Slack id (the override, else the cached email match).
+// Slack id (the override, else the cached email match). workspace is the
+// server-derived Slack workspace connection state for this uzi instance (PRD #56):
+// unconfigured (no Slack set up) | connecting (reconnecting) | connected | error.
 export interface SlackLink {
   member_id: string | null;
   notify: boolean;
   resolved_id: string | null;
   confirmed: boolean;
   state: "unlinked" | "pending" | "confirmed";
+  workspace: "unconfigured" | "connecting" | "connected" | "error";
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
