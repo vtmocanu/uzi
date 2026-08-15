@@ -63,6 +63,24 @@ type RepoAgent = apitypes.RepoAgent
 // AgentSelection — see RepoAgent.
 type AgentSelection = apitypes.AgentSelection
 
+// guardRoles are subagent roles whose deliberate exclusion at approve time warrants an
+// owner heads-up (PRD #319 M3, D4). spec-keeper guards specs/human.md + specs/ai.md.
+// Extensible: add a role here to make its exclusion notify.
+var guardRoles = map[string]bool{"spec-keeper": true}
+
+// excludedGuardRoles returns the guard roles the selection EXPLICITLY excludes, in the
+// order they appear in sel.Exclusions (deterministic). Fires on active exclusion only —
+// never on a role merely absent from a roster (D4).
+func excludedGuardRoles(sel AgentSelection) []string {
+	var out []string
+	for _, name := range sel.Exclusions {
+		if guardRoles[name] {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // validateRepoAgents enforces every bound on a worker-reported roster: length,
 // per-item name shape and length, description length, and the absence of control
 // characters (a name or description reaches a run message, the DB, and the gate
