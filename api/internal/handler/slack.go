@@ -32,6 +32,27 @@ type slackLinkDTO struct {
 	ResolvedID *string `json:"resolved_id"`
 	Confirmed  bool    `json:"confirmed"`
 	State      string  `json:"state"`
+	// workspace is the collapsed, non-secret Slack workspace connection state
+	// (PRD #56 M1): unconfigured | connecting | connected | error.
+	Workspace string `json:"workspace"`
+}
+
+// publicSlackState collapses the five admin-only manager states (slacksvc.State*)
+// to the four public values the Notifications settings surface. The two error
+// classes fold to a single "error" so the auth-vs-connection distinction — an
+// admin diagnostic — never leaks to a non-admin (PRD #56 Decision 2). Any
+// unknown or empty input fails safe to "unconfigured".
+func publicSlackState(s string) string {
+	switch s {
+	case slacksvc.StateConnecting:
+		return "connecting"
+	case slacksvc.StateConnected:
+		return "connected"
+	case slacksvc.StateErrorAuth, slacksvc.StateErrorConnection:
+		return "error"
+	default: // StateDisabled, empty, or any unexpected value
+		return "unconfigured"
+	}
 }
 
 func slackLinkStateOf(resolvedValid, confirmedValid bool) string {
@@ -47,7 +68,7 @@ func slackLinkStateOf(resolvedValid, confirmedValid bool) string {
 
 // writeSlackLink renders the linking DTO from the four columns every Slack link
 // query returns, so the GET and the PUTs never drift.
-func writeSlackLink(w http.ResponseWriter, member, resolved pgtype.Text, notify bool, confirmed pgtype.Timestamptz) {
+func writeSlackLink(w http.ResponseWriter, member, resolved pgtype.Text, notify bool, confirmed pgtype.Timestamptz, workspace string) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"slack": slackLinkDTO{
 			MemberID:   textPtrValue(member.Valid, member.String),
@@ -55,6 +76,7 @@ func writeSlackLink(w http.ResponseWriter, member, resolved pgtype.Text, notify 
 			ResolvedID: textPtrValue(resolved.Valid, resolved.String),
 			Confirmed:  confirmed.Valid,
 			State:      slackLinkStateOf(resolved.Valid, confirmed.Valid),
+			Workspace:  workspace,
 		},
 	})
 }
@@ -73,7 +95,7 @@ func (h *Handler) GetMySlack(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	writeSlackLink(w, link.SlackMemberID, link.SlackResolvedID, link.SlackNotify, link.SlackLinkConfirmedAt)
+	writeSlackLink(w, link.SlackMemberID, link.SlackResolvedID, link.SlackNotify, link.SlackLinkConfirmedAt, publicSlackState(h.slackState()))
 }
 
 // PutMySlackNotify flips the current user's per-user notification kill switch
@@ -100,7 +122,7 @@ func (h *Handler) PutMySlackNotify(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	writeSlackLink(w, row.SlackMemberID, row.SlackResolvedID, row.SlackNotify, row.SlackLinkConfirmedAt)
+	writeSlackLink(w, row.SlackMemberID, row.SlackResolvedID, row.SlackNotify, row.SlackLinkConfirmedAt, publicSlackState(h.slackState()))
 }
 
 // PutMySlackOverride sets or clears the manual Slack member-ID override (own-user
@@ -161,7 +183,7 @@ func (h *Handler) PutMySlackOverride(w http.ResponseWriter, r *http.Request) {
 	if member != "" && h.slackLinker != nil {
 		h.slackLinker.SendLinkConfirmation(r.Context(), member, user.Email)
 	}
-	writeSlackLink(w, row.SlackMemberID, row.SlackResolvedID, row.SlackNotify, row.SlackLinkConfirmedAt)
+	writeSlackLink(w, row.SlackMemberID, row.SlackResolvedID, row.SlackNotify, row.SlackLinkConfirmedAt, publicSlackState(h.slackState()))
 }
 
 // PostMySlackTestDM sends a user-initiated test DM to the caller's resolved Slack

@@ -159,6 +159,56 @@ func TestGetMySlackDerivesState(t *testing.T) {
 	}
 }
 
+func TestPublicSlackState(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{slacksvc.StateDisabled, "unconfigured"},
+		{slacksvc.StateConnecting, "connecting"},
+		{slacksvc.StateConnected, "connected"},
+		{slacksvc.StateErrorAuth, "error"},
+		{slacksvc.StateErrorConnection, "error"},
+		{"", "unconfigured"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := publicSlackState(tc.in); got != tc.want {
+				t.Fatalf("publicSlackState(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The workspace field on the link DTO reflects the live socket state collapsed to
+// its public value: absent status accessor ⇒ unconfigured, a wired "connected" ⇒
+// connected. The two error classes are covered by TestPublicSlackState.
+func TestGetMySlackReportsWorkspace(t *testing.T) {
+	t.Run("unwired", func(t *testing.T) {
+		h := &Handler{q: store.New(&fakeSlackDB{notify: true})} // no SetSlackStatus
+		rec := httptest.NewRecorder()
+		h.GetMySlack(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/slack", nil)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if got := decodeSlack(t, rec.Body.Bytes()); got.Workspace != "unconfigured" {
+			t.Fatalf("workspace = %q, want unconfigured when no status is wired", got.Workspace)
+		}
+	})
+	t.Run("connected", func(t *testing.T) {
+		h := &Handler{q: store.New(&fakeSlackDB{notify: true})}
+		h.SetSlackStatus(func() string { return "connected" })
+		rec := httptest.NewRecorder()
+		h.GetMySlack(rec, authed(httptest.NewRequest(http.MethodGet, "/api/me/slack", nil)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if got := decodeSlack(t, rec.Body.Bytes()); got.Workspace != "connected" {
+			t.Fatalf("workspace = %q, want connected", got.Workspace)
+		}
+	})
+}
+
 func TestPutMySlackNotifyRoundTrip(t *testing.T) {
 	db := &fakeSlackDB{notify: true}
 	h := &Handler{q: store.New(db)}
