@@ -296,6 +296,17 @@ describe("parseReview", () => {
     assert.equal(r.recommendations[0]?.category, "install_worker_tool");
   });
 
+  it("keeps a cost_efficiency recommendation (it is in the valid enum)", () => {
+    const text =
+      '{"verdict":"ok","summary":"s","recommendations":[' +
+      '{"category":"cost_efficiency","target":"lead orchestration","rationale":"a redundant full-gate re-run","confidence":"medium"}]}';
+    const r = parseReview(text, "haiku");
+    assert.equal(r.recommendations.length, 1, "a valid cost_efficiency category is kept, not dropped");
+    assert.equal(r.recommendations[0]?.category, "cost_efficiency");
+    assert.equal(r.recommendations[0]?.target, "lead orchestration");
+    assert.equal(r.recommendations[0]?.confidence, "medium");
+  });
+
   it("throws on an invalid verdict (→ caller falls back)", () => {
     assert.throws(() => parseReview('{"verdict":"amazing","summary":"s","recommendations":[]}', "haiku"));
   });

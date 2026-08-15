@@ -23,6 +23,7 @@ var (
 	RecommendationCategories = map[string]bool{
 		"enable_tool": true, "install_worker_tool": true, "adjust_template": true,
 		"improve_agent": true, "add_agent": true, "improve_uzi": true,
+		"cost_efficiency": true,
 	}
 	RecommendationConfidences = map[string]bool{"": true, "low": true, "medium": true, "high": true}
 )

@@ -217,7 +217,7 @@ const backlogBucketFlagUsage = "filter by triage bucket: todo (default) | filed 
 // TestBacklogCategoryUsageMatchesServerEnum pins it to workersvc's RecommendationCategories
 // set both ways, so it cannot drift from the server enum unnoticed. This --category is a
 // DISTINCT flag from the single-coordinate --category on `resolve`/`dismiss`.
-const backlogCategoryFlagUsage = "filter by recommendation label (comma-separated): enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi"
+const backlogCategoryFlagUsage = "filter by recommendation label (comma-separated): enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi | cost_efficiency"
 
 // addCoordFlags adds the group-form flags shared by `resolve` and `dismiss`. The pair is
 // the (category, target) coordinate the Judge backlog groups by — the same grain the web

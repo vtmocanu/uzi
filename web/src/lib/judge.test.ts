@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   coordKey,
+  isCategory,
+  JUDGE_CATEGORIES,
   RECOMMENDATION_LABELS,
   recommendationLabel,
   verdictLabel,
@@ -21,10 +23,22 @@ describe("judge display helpers (PRD #46 M4)", () => {
     expect(recommendationLabel("install_worker_tool")).toBe("Install a worker tool");
     expect(recommendationLabel("improve_uzi")).toBe("Improve uzi");
     expect(recommendationLabel("add_agent")).toBe("Add a missing agent");
+    expect(recommendationLabel("cost_efficiency")).toBe("Cost efficiency");
   });
 
   it("humanizes an unknown category rather than showing a raw enum", () => {
     expect(recommendationLabel("some_future_category")).toBe("some future category");
+  });
+
+  // cost_efficiency (the seventh category) must be END-TO-END live in the UI, not just
+  // labelled: JUDGE_CATEGORIES drives both the label-filter chip row AND the ?category=
+  // URL guard (isCategory), so this pins that a filter chip renders for it and a
+  // ?category=cost_efficiency deep-link is accepted rather than silently dropped.
+  it("wires cost_efficiency as a real filter chip and a valid ?category= deep-link", () => {
+    expect(JUDGE_CATEGORIES).toContain("cost_efficiency");
+    expect(isCategory("cost_efficiency")).toBe(true);
+    // and an unknown token is still rejected by the same guard
+    expect(isCategory("cost_savings")).toBe(false);
   });
 });
 
@@ -41,8 +55,9 @@ describe("coordKey (PRD #68/#94/#98)", () => {
   // `target` is spelled. Pinning the enum is therefore the real guard; asserting a
   // general non-collision would be asserting something false.
   // NOTE WHICH SIDE THIS PINS: RECOMMENDATION_LABELS is the TS MIRROR of the category enum,
-  // not the database's own CHECK constraint (00059_run_reviews.sql). So a seventh DB category
-  // containing a space, added without updating this union, would slip past this test. That is
+  // not the database's own CHECK constraint (00059_run_reviews.sql, widened in 00127). So a
+  // future DB category containing a space, added without updating this union, would slip past
+  // this test. That is
   // a real gap and a small one: recommendationLabel already falls back to humanising an
   // unknown category, so the display side degrades gracefully, and the server's CHECK is the
   // thing that actually decides what categories exist. Recorded so a reader does not mistake
