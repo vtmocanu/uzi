@@ -276,6 +276,63 @@ func (q *Queries) GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg GetA
 	return i, err
 }
 
+const getJudgeRunUsageForTarget = `-- name: GetJudgeRunUsageForTarget :one
+SELECT rr.judge_run_id,
+       jr.claimed_at,
+       jr.started_at,
+       jr.finished_at,
+       ru.input_tokens,
+       ru.cache_read_tokens,
+       ru.cache_creation_tokens,
+       ru.output_tokens,
+       ru.cost_usd
+FROM run_reviews rr
+JOIN runs jr ON jr.id = rr.judge_run_id
+LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id
+WHERE rr.target_run_id = $1
+`
+
+type GetJudgeRunUsageForTargetRow struct {
+	JudgeRunID          pgtype.UUID        `json:"judge_run_id"`
+	ClaimedAt           pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	FinishedAt          pgtype.Timestamptz `json:"finished_at"`
+	InputTokens         pgtype.Int8        `json:"input_tokens"`
+	CacheReadTokens     pgtype.Int8        `json:"cache_read_tokens"`
+	CacheCreationTokens pgtype.Int8        `json:"cache_creation_tokens"`
+	OutputTokens        pgtype.Int8        `json:"output_tokens"`
+	CostUsd             pgtype.Numeric     `json:"cost_usd"`
+}
+
+// The judge run's timing + token/cost usage for a target run's review panel (PRD #69
+// M6, Decision 10). Read-side companion to GetRunReviewForTarget: the judge run itself
+// records its cost NOWHERE until it posts its terminal result frame, which the worker
+// now does so foldRunUsage writes a run_usage row keyed on the judge run.
+//
+// The three timings come from the judge run row (jr): claimed_at/started_at/finished_at.
+// started_at is stamped only once the worker reports `running` (PRD #69 M6) — NULL for a
+// pre-feature judge that never reported it. The five usage columns come from the
+// run_usage_totals view via a LEFT JOIN, so a judge with no run_usage row (every
+// pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
+// fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
+// the target) BEFORE this read, exactly like GetRunReviewForTarget.
+func (q *Queries) GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (GetJudgeRunUsageForTargetRow, error) {
+	row := q.db.QueryRow(ctx, getJudgeRunUsageForTarget, targetRunID)
+	var i GetJudgeRunUsageForTargetRow
+	err := row.Scan(
+		&i.JudgeRunID,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.InputTokens,
+		&i.CacheReadTokens,
+		&i.CacheCreationTokens,
+		&i.OutputTokens,
+		&i.CostUsd,
+	)
+	return i, err
+}
+
 const getRunReviewForTarget = `-- name: GetRunReviewForTarget :one
 SELECT id, target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status, created_at, updated_at FROM run_reviews WHERE target_run_id = $1
 `

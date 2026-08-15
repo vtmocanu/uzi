@@ -209,6 +209,8 @@ type fakeStore struct {
 	upsertReviewErr         error
 	reviewByTarget          store.RunReview
 	reviewByTargetErr       error
+	judgeRunUsage           store.GetJudgeRunUsageForTargetRow
+	judgeRunUsageErr        error
 	recsByReview            []store.ReviewRecommendation
 	recsByReviewErr         error
 	filedByReview           []store.RecommendationFiledIssue
@@ -714,6 +716,9 @@ func (f *fakeStore) UpsertRunReviewWithRecommendations(_ context.Context, arg st
 }
 func (f *fakeStore) GetRunReviewForTarget(context.Context, uuid.UUID) (store.RunReview, error) {
 	return f.reviewByTarget, f.reviewByTargetErr
+}
+func (f *fakeStore) GetJudgeRunUsageForTarget(context.Context, uuid.UUID) (store.GetJudgeRunUsageForTargetRow, error) {
+	return f.judgeRunUsage, f.judgeRunUsageErr
 }
 func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]store.ReviewRecommendation, error) {
 	return f.recsByReview, f.recsByReviewErr

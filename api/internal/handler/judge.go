@@ -238,7 +238,35 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 		FiledIssues:     filed,
 		Dispositions:    dispositions,
 		Triage:          workersvc.BucketTriage(triageRows),
+		JudgeRun:        judgeRunToDTO(rw.JudgeRun),
 	}
+}
+
+// judgeRunToDTO renders the judge run's timing + usage for the review panel (PRD #69
+// M6). nil in → nil out (no judge-run detail). Usage is attached ONLY when the judge
+// posted a result frame (its run_usage row exists, so cost_usd is non-null) — a
+// pre-feature judge has valid timings but NULL usage, which stays nil so the panel
+// renders no cost/time strip rather than a fabricated 0.
+func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO {
+	if jr == nil {
+		return nil
+	}
+	dto := &apitypes.JudgeRunDTO{
+		JudgeRunID: uuid.UUID(jr.JudgeRunID.Bytes).String(),
+		ClaimedAt:  timePtr(jr.ClaimedAt.Valid, jr.ClaimedAt.Time),
+		StartedAt:  timePtr(jr.StartedAt.Valid, jr.StartedAt.Time),
+		FinishedAt: timePtr(jr.FinishedAt.Valid, jr.FinishedAt.Time),
+	}
+	if jr.CostUsd.Valid {
+		dto.Usage = &apitypes.UsageDTO{
+			InputTokens:         jr.InputTokens.Int64,
+			CacheReadTokens:     jr.CacheReadTokens.Int64,
+			CacheCreationTokens: jr.CacheCreationTokens.Int64,
+			OutputTokens:        jr.OutputTokens.Int64,
+			CostUSD:             numericToFloat(jr.CostUsd),
+		}
+	}
+	return dto
 }
 
 // pendingJudgeState normalizes a judge run's RAW runs.status into the two-value display

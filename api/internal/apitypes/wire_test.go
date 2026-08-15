@@ -168,10 +168,26 @@ func TestRecommendationDTOTags(t *testing.T) {
 }
 
 func TestReviewDTOTags(t *testing.T) {
+	// judge_run is omitempty (PRD #69 M6): a review with no judge-run detail omits it
+	// rather than shipping a null the consumer special-cases, so the zero value carries
+	// the pre-#69 key set exactly.
 	assertTags(t, "ReviewDTO", ReviewDTO{},
 		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
 		"created_at", "updated_at", "recommendations", "filed_issues",
 		"dispositions", "triage")
+	// With a judge run attached, the nested strip surfaces under judge_run.
+	assertTags(t, "ReviewDTO(judge_run)", ReviewDTO{JudgeRun: &JudgeRunDTO{}},
+		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
+		"created_at", "updated_at", "recommendations", "filed_issues",
+		"dispositions", "triage", "judge_run")
+}
+
+func TestJudgeRunDTOTags(t *testing.T) {
+	// claimed_at/started_at/finished_at and usage are NOT omitempty: the timings are
+	// present-with-null for a pre-feature judge (started_at null), and usage is null when
+	// the judge posted no result frame — an absent strip is a null usage, read explicitly.
+	assertTags(t, "JudgeRunDTO", JudgeRunDTO{},
+		"judge_run_id", "claimed_at", "started_at", "finished_at", "usage")
 }
 
 func TestFiledIssueDTOTags(t *testing.T) {

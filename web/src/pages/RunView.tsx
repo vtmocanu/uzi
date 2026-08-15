@@ -48,6 +48,7 @@ import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RunCredential } from "../components/RunCredential";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
+import { formatTokens, formatCost } from "../lib/formatTokens";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
@@ -1462,6 +1463,48 @@ export function AgentRosterSummary({ run }: { run: Run }) {
 // self_improve run never has a review, so the panel is hidden for those kinds.
 const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
 
+// JUDGE_STAT_K is the tile label class, mirroring RunUsage.tsx's K_CLASS so the judge
+// strip reads identically to the run's own usage strip.
+const JUDGE_STAT_K = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
+
+function JudgeStat({ label, value, cost }: { label: string; value: string; cost?: boolean }) {
+  return (
+    <div className="bg-raised/75 px-3.5 py-2.5">
+      <div className={JUDGE_STAT_K}>{label}</div>
+      <div className={cx("mt-0.5 font-mono text-[17px] font-semibold tabular-nums", cost && "text-brand")}>{value}</div>
+    </div>
+  );
+}
+
+// JudgeUsageStrip is the judge run's OWN cost/time strip (PRD #69 M6, Decision 10): the
+// tokens + duration + cost of the retrospective itself, surfaced on the reviewed run's
+// panel. It mirrors RunUsagePanel's 4-tile confirmed strip (Tokens in · Tokens out ·
+// Duration · Cost). Rendered ONLY when the judge posted a result frame (usage present);
+// a pre-feature judge has no run_usage row and renders NOTHING here, never a fabricated 0.
+// Duration = finished_at - started_at; absent when either stamp is missing.
+function JudgeUsageStrip({ judgeRun }: { judgeRun: NonNullable<RunReview["judge_run"]> }) {
+  const usage = judgeRun.usage;
+  if (!usage) return null;
+  const durationMs =
+    judgeRun.started_at !== null && judgeRun.finished_at !== null
+      ? new Date(judgeRun.finished_at).getTime() - new Date(judgeRun.started_at).getTime()
+      : null;
+  return (
+    <div
+      role="group"
+      aria-label="Judge run cost and time"
+      className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-edge bg-edge sm:grid-cols-4"
+    >
+      <JudgeStat label="Tokens in" value={formatTokens(usage.input_tokens)} />
+      <JudgeStat label="Tokens out" value={formatTokens(usage.output_tokens)} />
+      <JudgeStat label="Duration" value={durationMs !== null ? formatDuration(durationMs) : "—"} />
+      {/* A $0 cost with real tokens is a subscription-auth run the SDK prices at $0
+          (formatTokens.ts money convention) — render "—", never a misleading "$0.00". */}
+      <JudgeStat label="Cost" value={usage.cost_usd > 0 ? formatCost(usage.cost_usd) : "—"} cost />
+    </div>
+  );
+}
+
 // JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
 // structured recommendations, plus the "re-run judge" action. It fetches its own
 // review (owner-or-admin scoped server-side) and, while a judge is in flight, polls a
@@ -1855,6 +1898,11 @@ export function JudgePanel({ run }: { run: Run }) {
               <Markdown content={stripUnsafeChars(review.summary_md)} />
             </div>
           )}
+
+          {/* Judge run cost/time strip (PRD #69 M6): the retrospective's OWN tokens,
+              duration and cost. Rendered only when the judge posted a result frame (a
+              run_usage row exists); absent for a pre-feature judge, never a fabricated 0. */}
+          {review.judge_run?.usage && <JudgeUsageStrip judgeRun={review.judge_run} />}
 
           {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
               meter, rendered DIRECTLY from review.triage — never re-derived from the

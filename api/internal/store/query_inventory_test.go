@@ -488,6 +488,9 @@ var queryInventory = []queryPin{
 		"direct call, judge_integration_test.go:103"},
 	{"GetRunReviewForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:140"},
+	{"GetJudgeRunUsageForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
+		"direct call, judge_integration_test.go: asserts judge_run_id resolves and the " +
+			"run_usage_totals LEFT JOIN yields NULL usage for a judge with no run_usage row"},
 	{"ListRecommendationsForReview", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:147"},
 	{"ListOwnedRecommendationsForCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFiledMemberIsNotOpenLiveDB",

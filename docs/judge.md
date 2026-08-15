@@ -43,7 +43,9 @@ judged), a review lands in five places:
 
 - **The run page**: a verdict chip (Ideal / OK / Issues found) plus a list of
   recommendations, each with a category, a target (the tool/agent/repo it's
-  about), a rationale, and a confidence level.
+  about), a rationale, and a confidence level. The panel also shows what the
+  retrospective itself cost — a small strip with the judge run's tokens in,
+  tokens out, duration, and cost.
 - **The [Judge menu](./judge-menu.md)**: the cross-run backlog, where the same
   recommendation raised by many runs is **one row** to triage once. This is
   where you work the list; the run page is where you see one run's verdict.
@@ -54,6 +56,12 @@ judged), a review lands in five places:
 - **The [uzi CLI](./cli.md)**: `uzi review show <run-id>` prints the same
   verdict, recommendations, and your triage state from the terminal — see
   [Reading a review from the CLI](#reading-a-review-from-the-cli) below.
+
+A judge run is the owner's own token spend, so its cost counts as your spend:
+it appears in your usage totals alongside your runs, and — since it is the
+strongest model by default — a busy judge is a real line item worth watching.
+The per-run cost/time strip above and your usage totals are the two places you
+see it.
 
 Recommendations use a fixed taxonomy: enable an existing tool or skill,
 install a missing worker tool, adjust an agent template or prompt, improve an

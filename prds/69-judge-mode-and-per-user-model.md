@@ -653,12 +653,17 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   Gate 5 in `maybeEnqueueJudge` (skip-not-defer, all modes). `go test
   ./internal/settings ./internal/workersvc` green, including a loop test (N rapid
   failures → judges throttled by cooldown, capped by budget).
-- [ ] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
-  + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains
-  `judge_run_id` + timing + usage; `JudgePanel` 4-tile strip; `docs/judge.md`.
-  Verify a completed judge writes a `run_usage` row and its cost appears in
-  `SelfUsage`/`AdminUsage`. `go test ./internal/workersvc ./internal/handler`,
-  `cd agent && npm test`, `cd web && npm run build` green.
+- [x] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
+  + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains a
+  nested `judge_run` (`judge_run_id` + claim/start/finish timing + `usage`);
+  `JudgePanel` 4-tile strip (Tokens in · Tokens out · Duration · Cost), rendered only
+  when usage is present (absent for a pre-feature judge, never a fabricated 0);
+  `docs/judge.md`. Judge spend deliberately rolls into `SelfUsage`/`AdminUsage` (the
+  `kind <> 'chat'` aggregates admit `judge`, no query change — Decision 10). Gates:
+  `task gate:agent`, `task gate:api`, `task gate:web` + `cd web && npm run build` green;
+  sqlc stable (only `judge.sql.go` regenerated). The `judge_run` field is nested (not the
+  flat `judge_run_id`+timing the checklist sketched) to keep the timing/usage grouped
+  under one omitempty key.
 - [ ] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
   closed-enum `failure_class` over the target run, computed from the trusted axes
   (`status` + `iteration_count` + transition origin, NOT parsed from `failure_reason` —

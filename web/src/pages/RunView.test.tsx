@@ -751,6 +751,63 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(mockApi.getRunReview).toHaveBeenCalledWith("r1");
   });
 
+  it("renders the judge run cost/time strip when the judge posted usage (PRD #69 M6)", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        judge_run: {
+          judge_run_id: "judge-1",
+          claimed_at: "2026-01-01T00:00:00Z",
+          started_at: "2026-01-01T00:00:05Z",
+          finished_at: "2026-01-01T00:00:19Z", // 14s
+          usage: {
+            input_tokens: 48200,
+            cache_read_tokens: 12800,
+            cache_creation_tokens: 3100,
+            output_tokens: 1840,
+            cost_usd: 0.42,
+          },
+        },
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[aria-label="Judge run cost and time"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    const text = strip.textContent ?? "";
+    // The four tiles: tokens in/out (formatTokens), duration (14s), cost (formatCost).
+    expect(text).toContain("Tokens in");
+    expect(text).toContain("48.2k"); // formatTokens(48200)
+    expect(text).toContain("Tokens out");
+    expect(text).toContain("1.8k"); // formatTokens(1840) → "1.8k"
+    expect(text).toContain("Duration");
+    expect(text).toContain("Cost");
+    expect(text).toContain("$0.42");
+  });
+
+  it("omits the judge cost/time strip for a pre-feature judge with null usage (PRD #69 M6)", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
+      review: review({
+        judge_run: {
+          judge_run_id: "judge-1",
+          claimed_at: "2026-01-01T00:00:00Z",
+          started_at: "2026-01-01T00:00:05Z",
+          finished_at: "2026-01-01T00:00:19Z",
+          usage: null, // no run_usage row ⇒ no strip, never a fabricated 0
+        },
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // Wait for the panel to settle (the verdict chip renders), THEN assert no strip.
+    await screen.findByText("Issues found");
+    expect(container.querySelector('[aria-label="Judge run cost and time"]')).toBeNull();
+  });
+
   it("renders review markdown as elements while keeping raw HTML inert", async () => {
     // summary_md now renders through the shared hardened <Markdown> (same as plan_md):
     // markdown syntax becomes real elements, but raw HTML stays INERT text because the

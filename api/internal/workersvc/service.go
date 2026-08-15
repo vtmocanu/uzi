@@ -301,6 +301,10 @@ type Store interface {
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.
 	GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.RunReview, error)
+	// The judge run's timing + usage for the reviewed run's panel (PRD #69 M6): the
+	// judge run's claim/start/finish stamps and its run_usage_totals rollup, NULL usage
+	// for a pre-feature judge that posted no result frame.
+	GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (store.GetJudgeRunUsageForTargetRow, error)
 	// The ACTIVE judge run for a target (PRD #119 M1): the panel's pending-judge signal,
 	// on the same owner-or-admin gate as the review read. Its predicate is the
 	// one-active-judge-per-target index's partial WHERE with the indexed column

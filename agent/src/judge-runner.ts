@@ -22,6 +22,7 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
 import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
+import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { rmTreeForce } from "./rmtree.js";
@@ -63,6 +64,10 @@ const VALID_CATEGORIES = new Set<ReviewRecommendation["category"]>([
 ]);
 const VALID_VERDICTS = new Set(["ideal", "ok", "issues"]);
 const VALID_CONFIDENCE = new Set(["", "low", "medium", "high"]);
+
+// The agent label the judge stamps on its posted usage frame (PRD #69 M6). Inert to
+// foldRunUsage (it reads only `event` + `modelUsage`); a plain label for the pane.
+const JUDGE_AGENT = "judge";
 
 const JUDGE_SYSTEM_PROMPT = `You are the run-retrospective judge for the "uzi" AI factory. You are given the trace of a
 finished agent run — its agents, tools, prompts, plan, review cycles, and delivery — and you produce a
@@ -136,14 +141,29 @@ export class JudgeRunner {
     // command-not-found findings the claim carries (Decision 4): a trace-fetch throw
     // must not lose them, so it falls back rather than failing the run with no review.
     let review: ReviewRequest;
+    // The terminal result frame's usage, mapped to a run message the API's foldRunUsage
+    // writes into a run_usage row (PRD #69 M6). Set ONLY on a successful model call —
+    // the no-token, trace-fetch-throw, and model-error/limit paths all post NO usage
+    // frame (there is no real spend to record on the deterministic fallback).
+    let usageMessage: EmittedMessage | undefined;
     try {
+      // Report `running` so the judge run's started_at is stamped (PRD #69 M6). A judge
+      // never enters awaiting_approval, so claimed→running stamps cleanly through
+      // SetRunRunning's `started_at = COALESCE(started_at, now())`. Kept INSIDE the try:
+      // a transient failure of this first call must fall through to the deterministic
+      // fallback + `completed` report, not throw out of execute() and leave the judge run
+      // non-terminal — execute()'s never-throws contract (above). started_at simply stays
+      // NULL on that rare path, so the panel shows no duration rather than losing the run.
+      await this.client.reportState(judgeRunId, { status: "running" });
       const trace = await this.fetchTrace(targetId);
       const token = claim.secrets?.anthropic_oauth_token?.trim();
       if (!token) {
         this.log.warn("judge claim carried no Anthropic token; using deterministic fallback", { run_id: judgeRunId });
         review = fallbackReview(claim.judge_signal);
       } else {
-        review = await this.judge(claim, trace, token);
+        const judged = await this.judge(claim, trace, token);
+        review = judged.review;
+        usageMessage = judged.usageMessage;
       }
     } catch (err) {
       this.log.warn("judge trace/prep failed; posting deterministic fallback", {
@@ -154,6 +174,14 @@ export class JudgeRunner {
     }
 
     try {
+      // Post the judge's own usage frame BEFORE the review + completion so the run_usage
+      // row exists (PRD #69 M6). A single-turn judge has no batcher/gapless-seq machinery
+      // in this lane, so seq:1 is safe.
+      if (usageMessage) {
+        await this.client.postMessages(judgeRunId, [
+          { seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload },
+        ]);
+      }
       await this.client.postReview(targetId, review);
       await this.client.reportState(judgeRunId, { status: "completed" });
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
@@ -184,12 +212,16 @@ export class JudgeRunner {
 
   /** The model call: one structured turn, no tools, JSON out. Throws on any failure
    *  so execute() falls back to the deterministic review. */
-  private async judge(claim: ClaimResponse, trace: JudgeTraceResponse, token: string): Promise<ReviewRequest> {
+  private async judge(
+    claim: ClaimResponse,
+    trace: JudgeTraceResponse,
+    token: string,
+  ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
     const model = (claim.judge_model ?? "").trim();
     try {
       const prompt = buildJudgePrompt(trace, claim.judge_signal ?? null, claim.known_improve_uzi_targets ?? []);
-      const text = await this.runModel(token, model, prompt);
-      return parseReview(text, model);
+      const { text, result } = await this.runModel(token, model, prompt);
+      return { review: parseReview(text, model), usageMessage: result };
     } catch (err) {
       this.log.warn("judge model call failed; using deterministic fallback", {
         run_id: claim.run_id,
@@ -197,11 +229,13 @@ export class JudgeRunner {
       });
       const fb = fallbackReview(claim.judge_signal);
       fb.model = model;
-      return fb;
+      // No usageMessage on the fallback: the model call did not complete, so there is
+      // no terminal result frame — and no spend — to fold.
+      return { review: fb };
     }
   }
 
-  private async runModel(token: string, model: string, prompt: string): Promise<string> {
+  private async runModel(token: string, model: string, prompt: string): Promise<{ text: string; result?: EmittedMessage }> {
     const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-judge-"));
     // PRD #51 M4: the judge SDK CLI runs as the `runner` uid (spawnClaudeCodeProcess ->
     // runnerSpawn), but fs.mkdtemp FORCES mode 0700 (Node ignores umask) and JudgeRunner
@@ -252,7 +286,7 @@ export class JudgeRunner {
     prompt: string,
     homeDir: string,
     abort: AbortController,
-  ): Promise<string> {
+  ): Promise<{ text: string; result?: EmittedMessage }> {
     const env = buildSdkEnv(token, homeDir);
     const options: SdkOptions = {
       env: env as unknown as Record<string, string | undefined>,
@@ -276,6 +310,11 @@ export class JudgeRunner {
     if (model) options.model = model;
 
     let text = "";
+    // The terminal success frame mapped to a run message (PRD #69 M6): mapSdkMessage
+    // routes a result frame through mapResult, which carries event:"result" + modelUsage
+    // — the only fields the API's foldRunUsage reads. Surfaced to execute() to post so a
+    // run_usage row lands for the judge; undefined on the error/limit path (it throws).
+    let result: EmittedMessage | undefined;
     // PRD #35 Decision 14: a judge run NEVER parks. It is executed by this runner,
     // not RunRunner, so it never reaches that cleanup carve-out at all — and parking
     // it would mean duplicating detection, the park report and a second carve-out
@@ -300,10 +339,11 @@ export class JudgeRunner {
           if (limit) throw new LimitReachedError(limit);
           throw new Error("judge model call returned an error result");
         }
+        result = mapSdkMessage(msg)[0];
         break;
       }
     }
-    return text;
+    return { text, result };
   }
 
   private async safeReportFailed(runId: string, reason: string, cause?: unknown): Promise<void> {

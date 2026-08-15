@@ -6,19 +6,36 @@ import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../s
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
-import type { ClaimResponse, JudgeTraceResponse, ReviewRequest, StateRequest } from "../src/protocol.js";
+import type {
+  ClaimResponse,
+  JudgeTraceResponse,
+  OutgoingMessage,
+  ReviewRequest,
+  StateRequest,
+} from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
-// A fake worker client recording the review + state the judge posts.
+// A fake worker client recording the review, EVERY state, and the messages the judge
+// posts. `states` records all reportState calls in order (PRD #69 M6 stamps a `running`
+// report before `completed`); `state` stays the LAST call for the pre-M6 assertions.
 function fakeClient(trace: JudgeTraceResponse) {
-  const calls: { review?: { id: string; review: ReviewRequest }; state?: { id: string; body: StateRequest } } = {};
+  const calls: {
+    review?: { id: string; review: ReviewRequest };
+    state?: { id: string; body: StateRequest };
+    states: { id: string; body: StateRequest }[];
+    messages: { id: string; messages: OutgoingMessage[] }[];
+  } = { states: [], messages: [] };
   const client = {
     getTrace: async () => trace,
     postReview: async (id: string, review: ReviewRequest) => {
       calls.review = { id, review };
     },
     reportState: async (id: string, body: StateRequest) => {
+      calls.states.push({ id, body });
       calls.state = { id, body };
+    },
+    postMessages: async (id: string, messages: OutgoingMessage[]) => {
+      calls.messages.push({ id, messages });
     },
   } as unknown as WorkerClient;
   return { client, calls };
@@ -69,6 +86,23 @@ function replyingQueryFn(text: string, error = false): SdkQueryFn {
   } as unknown as SdkQueryFn;
 }
 
+// Like replyingQueryFn but the success frame carries per-model usage, as a real judge
+// call's terminal result-frame does — so the mapped run message the judge posts carries
+// the modelUsage the API's foldRunUsage folds into a run_usage row (PRD #69 M6).
+function replyingQueryFnWithUsage(text: string): SdkQueryFn {
+  return async function* () {
+    yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+    yield {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_ms: 1234,
+      total_cost_usd: 0.42,
+      modelUsage: { "claude-opus-4": { inputTokens: 100, outputTokens: 50, costUSD: 0.42 } },
+    };
+  } as unknown as SdkQueryFn;
+}
+
 describe("JudgeRunner", () => {
   it("posts the parsed verdict + recommendations and completes the run", async () => {
     const { client, calls } = fakeClient(emptyTrace);
@@ -87,6 +121,49 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
     assert.equal(calls.state?.id, "judge-1");
     assert.equal(calls.state?.body.status, "completed");
+  });
+
+  it("reports running before completed and posts the result frame's usage (PRD #69 M6)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    await runner.execute(judgeClaim());
+
+    // A `running` report precedes the terminal `completed` one — this is what stamps the
+    // judge run's started_at, giving the reviewed run's panel a duration to show.
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "completed"],
+      "the judge must report running before completed",
+    );
+    // Exactly one usage frame posted, on the judge run, carrying a result event and the
+    // non-empty per-model usage the API folds into run_usage.
+    assert.equal(calls.messages.length, 1, "one usage frame is posted on the success path");
+    assert.equal(calls.messages[0]?.id, "judge-1");
+    assert.equal(calls.messages[0]?.messages.length, 1);
+    const payload = calls.messages[0]?.messages[0]?.payload as {
+      event?: string;
+      modelUsage?: Record<string, unknown>;
+    };
+    assert.equal(payload.event, "result", "the posted frame is the terminal result frame");
+    assert.ok(
+      payload.modelUsage && Object.keys(payload.modelUsage).length > 0,
+      "the frame carries non-empty per-model usage (usage reaches the API)",
+    );
+  });
+
+  it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });
+    await runner.execute(judgeClaim());
+
+    // The deterministic-fallback path records no real spend, so no usage frame is posted.
+    assert.equal(calls.messages.length, 0, "an error result must not post a usage frame");
+    // The run still reports running then completes with the fallback review.
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "completed"],
+    );
   });
 
   it("falls back to the deterministic command-not-found review when the model errors", async () => {

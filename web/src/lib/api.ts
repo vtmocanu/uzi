@@ -1699,6 +1699,17 @@ export interface RunReview {
   // dispByCoord map (like filedByCoord) and renders `triage` verbatim.
   dispositions: Disposition[];
   triage: TriageCounts;
+  // PRD #69 M6: the judge run's OWN timing + token/cost usage, for the panel's
+  // time/tokens/cost strip. Omitted (absent) when there is no judge-run detail; `usage`
+  // is null for a pre-feature judge that posted no result frame (render NO strip, never a
+  // fabricated 0). Duration is finished_at - started_at.
+  judge_run?: {
+    judge_run_id: string;
+    claimed_at: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    usage: RunUsage | null;
+  };
 }
 
 // PendingJudge is the ACTIVE judge run for a target (PRD #119) — "a verdict is already

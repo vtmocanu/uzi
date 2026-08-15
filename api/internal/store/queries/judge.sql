@@ -139,6 +139,33 @@ SELECT id FROM upserted;
 -- on the target run) BEFORE this read, not here — this is a plain by-target lookup.
 SELECT * FROM run_reviews WHERE target_run_id = @target_run_id;
 
+-- name: GetJudgeRunUsageForTarget :one
+-- The judge run's timing + token/cost usage for a target run's review panel (PRD #69
+-- M6, Decision 10). Read-side companion to GetRunReviewForTarget: the judge run itself
+-- records its cost NOWHERE until it posts its terminal result frame, which the worker
+-- now does so foldRunUsage writes a run_usage row keyed on the judge run.
+--
+-- The three timings come from the judge run row (jr): claimed_at/started_at/finished_at.
+-- started_at is stamped only once the worker reports `running` (PRD #69 M6) — NULL for a
+-- pre-feature judge that never reported it. The five usage columns come from the
+-- run_usage_totals view via a LEFT JOIN, so a judge with no run_usage row (every
+-- pre-feature judge) yields NULLs, which the DTO renders as an absent strip — never a
+-- fabricated 0. Owner-or-admin visibility is enforced by the caller (GetRunForViewer on
+-- the target) BEFORE this read, exactly like GetRunReviewForTarget.
+SELECT rr.judge_run_id,
+       jr.claimed_at,
+       jr.started_at,
+       jr.finished_at,
+       ru.input_tokens,
+       ru.cache_read_tokens,
+       ru.cache_creation_tokens,
+       ru.output_tokens,
+       ru.cost_usd
+FROM run_reviews rr
+JOIN runs jr ON jr.id = rr.judge_run_id
+LEFT JOIN run_usage_totals ru ON ru.run_id = rr.judge_run_id
+WHERE rr.target_run_id = @target_run_id;
+
 -- name: ListRecommendationsForReview :many
 -- The structured recommendations of a review, oldest-first, for the run-page panel
 -- (Decision 5, M4). Served by idx_review_recommendations_review. Every free-text
