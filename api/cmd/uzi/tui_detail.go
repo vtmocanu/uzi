@@ -196,9 +196,10 @@ func (m tuiModel) renderDetail() string {
 	var sb strings.Builder
 
 	// Header: id + a kind chip + a semantic STATUS chip (PRD #325 M3, reading M2's
-	// statusColor/chip seam — this milestone does NOT edit tui_render.go). Health "stalled"
-	// already shows as an orange status chip via the precedence rule; any other non-ok
-	// health is appended as a word so it is not lost.
+	// statusColor/chip seam). "stalled" already turns the status chip orange via the
+	// precedence rule; because that colour vanishes under NO_COLOR, M4 appends a
+	// NO_COLOR-safe cue for it (▲ + "stalled") as well as the word for any other non-ok
+	// health, so no health state is lost when colour is stripped.
 	head := m.pal.faint.Render("run ") + m.pal.title.Render(shortRunID(d.runID))
 	if d.run.ID != "" {
 		if d.run.Kind != "" {

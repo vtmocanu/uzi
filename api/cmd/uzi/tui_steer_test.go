@@ -129,13 +129,26 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	if m.detail.steer.input != wantBody {
 		t.Fatalf("typed input = %q, want %q", m.detail.steer.input, wantBody)
 	}
-	// Focus keys must NOT fire while typing (M4 N2): "h"/"l" are the pane-focus keys and
-	// steerTyping swallows them, so neither the lane nor the pane focus moved.
-	if m.detail.laneIdx != 0 {
-		t.Error("typing into the follow-up moved the lane selection; the input must swallow focus keys")
+	// Now press the ACTUAL focus-change keys while still typing. steerTyping must swallow
+	// them (M4 N2), so the pane focus and lane stay put and the typed body is untouched.
+	// Pressing them is what BINDS this: single-rune typing alone never challenges focus, so
+	// without these presses the assertions are vacuous — a mutation leaking focus keys
+	// during typing left this test green until it did. Assert after EACH press: →left then
+	// tab would toggle the focus back to the rail and hide a leak.
+	for _, k := range []string{keyRight, keyLeft, keyTab} {
+		m = press(t, m, k)
+		if m.detail.steer.mode != steerTyping {
+			t.Fatalf("%q ended the follow-up typing; steerTyping must swallow focus keys", k)
+		}
+		if m.detail.focus != focusRail {
+			t.Errorf("%q changed the pane focus while typing a follow-up (focus=%d); steerTyping must swallow it", k, m.detail.focus)
+		}
+		if m.detail.laneIdx != 0 {
+			t.Errorf("%q moved the lane selection while typing a follow-up", k)
+		}
 	}
-	if m.detail.focus != focusRail {
-		t.Error("typing into the follow-up changed the pane focus; steerTyping must swallow ←/→/tab/h/l")
+	if m.detail.steer.input != wantBody {
+		t.Errorf("a swallowed focus key altered the typed input: %q", m.detail.steer.input)
 	}
 
 	_, cmd := m.handleKey(keyEnter)
