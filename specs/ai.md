@@ -4325,6 +4325,27 @@ Serves human: allowlist-bounded per-repo tools.
 - **Claim payload** gains `tool_packages []string` (resolved tier-1 list) + `repo_devbox_opt_in bool`.
 - **Web**: repo **Tools** panel (Boards page) = allowlist-backed package picker;
   **Admin → Tool allowlist** page for the allowlist CRUD.
+- **Seed-superset gate** (PRD #123 M3): the admin allowlist is GATED to the baked worker
+  image toolchain — an allowlist entry must be a package the image bakes
+  (`agent/devbox-global/devbox.json`). `api/internal/toolseed` embeds a byte-identical
+  copy of that manifest (Decision 5 — `go:embed` cannot cross the package/module boundary
+  to reach `agent/`), normalizes seed nix attrs to allowlist names (strip a trailing nix
+  output selector from a closed set — `bin`/`out`/`dev`/`man`/`doc`/`lib`/`info`/`debug`/`dist`,
+  e.g. `jq.bin`→`jq`, `file.out`→`file`; alias `yq-go`→`yq`), and exposes `Covered(pkg)`. **Enforced at THREE
+  points** (Decision 4c): `CreateToolAllowlistEntry` (400), `SetRepoToolProfile` (400),
+  and `resolveTooling`/claim assembly (terminal claim failure via
+  `errToolPackagesRejected`). A golden test asserts the embedded copy matches the manifest;
+  a subset test asserts the seeded allowlist is covered. The gate is **name-level** (the
+  baked set is version-locked; version coverage is not gated).
+- **Documented exceptions {kubectl, nodejs}**: allowlisted but not baked (kubectl — a
+  worker reaches no cluster; nodejs — the base-image node is not a devbox nodejs); the gate
+  ALLOWS them, but they still can't provision offline on a cold hosted worker (documented
+  operability limit). A **non-fatal boot-time WARN** in `api/cmd/server/main.go` names any
+  live `tool_allowlist` row NOT covered by the seed (the deploy-time offender report —
+  chosen over a SQL reporting-migration so the seed stays the single source of truth).
+- **M2 toolchain swap** (PRD #123 M2): the seeded `terraform` row was swapped for
+  `opentofu` (baked, MPL-2.0) via a migration, so opentofu is allowlisted+baked (no
+  exception); ripgrep was also baked. terraform is BUSL-unfree and deliberately NOT baked.
 
 ## 157. Tier-2 repo `devbox.json` opt-in (M5)
 
@@ -4347,13 +4368,19 @@ Serves human: repo-carried toolchains, safely.
   warning naming the dropped repo extras and **retry with tier-1 only**. Reason it was
   needed: the extraction previously used strict `JSON.parse`, so any commented (normal)
   manifest silently extracted nothing and tier-2 had never actually taken effect.
-  Caveat: even with the degrade, tier-2 still cannot resolve on the live cluster until
-  the egress decision in #123 — this change does not touch egress.
-- **Tier-2 bypasses BOTH the allowlist AND the credential-CLI denylist** — the PRD
-  posture, **audit-ACCEPTED** (probed, no concrete escalation): bounded by opt-in +
-  packages-only, and the actual security control is Decision 3's secret-scrubbed
-  provisioning env (a freshly nix-installed CLI holds no credentials; toolEnv folds only
-  into the SDK env, never the worker's PAT-bearing process). NOT re-hardened.
+  Caveat: #123 RESOLVED with **no egress change** (the three FQDNs stand); tier-2
+  continues to degrade gracefully on the standard tier — this change does not touch egress.
+- **Tier-2 now enforces the credential-CLI denylist; it still bypasses the allowlist**
+  (PRD #123 M1b). The DENYLIST HALF is now hardened: the server ships its compile-time
+  denylist base names to the worker in the claim (`ClaimConfig.denied_tool_packages`,
+  `api/internal/workersvc/claim.go`; TS mirror `agent/src/protocol.ts`), and the worker
+  filters tier-2 (repo `devbox.json`) packages by base name (case-insensitive) BEFORE
+  merge/install (`filterDeniedPackages` in `agent/src/repo-tools.ts`, applied in
+  `provision-run.ts`), **DROPPING** denied packages with a run-feed notice — it does NOT
+  fail the run (tier-2 is best-effort; Decision 3a). The ALLOWLIST HALF is still bypassed
+  by design: tier-2 is not allowlist-checked, bounded instead by opt-in + packages-only +
+  the scrubbed provisioning env (Decision 3: a freshly nix-installed CLI holds no
+  credentials; toolEnv folds only into the SDK env, never the worker's PAT-bearing process).
 
 ## 158. Agent template scopes migration + user CRUD (M6)
 

@@ -44,24 +44,45 @@ version conflict).
 **What the toggle does and doesn't protect.** Only the `packages` field is
 read: the repo's `shell.init_hook`, `shell.scripts`, flake references, and
 every other key are ignored and **never executed**. It does **not** re-check
-those packages against the admin allowlist **or the credential-CLI denylist**
-below — tier 2 is bounded by being opt-in, packages-only, and provisioned in
-the scrubbed env instead. Enable it only for a repo whose review discipline
-you trust, since a package can still run arbitrary build code (as any nix
-package can), just never your credentials: all provisioning runs in a
-subprocess scrubbed of the forge token, the Anthropic token, and the join
-token.
+those packages against the admin allowlist — tier 2 is bounded by being
+opt-in, packages-only, and provisioned in the scrubbed env instead. It
+**does** apply the credential-CLI denylist below: a tier-2 package whose
+base name is denylisted is silently dropped before install, with a
+run-feed notice, rather than failing the run. Enable it only for a repo
+whose review discipline you trust, since a package can still run arbitrary
+build code (as any nix package can), just never your credentials: all
+provisioning runs in a subprocess scrubbed of the forge token, the
+Anthropic token, and the join token.
 
 ## The allowlist (admins)
 
 **Admin → Tool allowlist** is the set of packages a tier-1 profile may use:
 an exact package name (no wildcards) plus an optional pinned-version policy.
-A small **denylist**
-of credential-bearing CLIs (a pre-authenticated `glab`, a kubeconfig helper)
-gates **tier 1 only**: such a package is refused even if it matches the
-allowlist, so an allowlist-picked tool can never hold push rights the agent
-isn't meant to have. (Tier 2 is neither allowlist- nor denylist-checked — it
-relies on the opt-in and the scrubbed provisioning env instead, as above.)
+A small **denylist** of credential-bearing CLIs (a pre-authenticated `glab`,
+a kubeconfig helper) gates **both tiers**: on tier 1 such a package is
+refused even if it matches the allowlist, so an allowlist-picked tool can
+never hold push rights the agent isn't meant to have; on tier 2 it is
+silently dropped, with a run-feed notice, rather than failing the run (as
+above). Tier 2 is still **not** allowlist-checked — only the opt-in,
+packages-only extraction, the scrubbed provisioning env, and the denylist
+bound it.
+
+**An admin can only allowlist a package the worker image actually bakes.**
+The allowlist governs *permission*; the baked toolchain (the shared devbox
+manifest at `agent/devbox-global/devbox.json`) governs *availability* — and
+a permitted-but-unbaked package can't be fetched behind the worker's
+locked-down egress, so it would otherwise hang and fail at run time.
+Adding an unbaked package is rejected with a 400 naming it and stating it
+must be added to the image and the image rolled before it can be
+allowlisted; the same gate applies when saving a tool profile and at claim
+time, so a grandfathered allowlist row that isn't baked fails the run's
+claim with a clear message instead of hanging. Two packages are allowlisted
+despite not being baked, as documented exceptions: `kubectl` (a hosted
+worker can reach no cluster, so baking it buys nothing) and `nodejs` (the
+base image's Node isn't a devbox-provisioned `nodejs`). Requesting either
+still can't provision offline on a cold hosted worker — a documented
+operability limit, not a bug. The gate is name-level: a pinned version is
+the admin's own responsibility to match what the image actually bakes.
 
 ## Storage and egress
 
