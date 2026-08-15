@@ -1,6 +1,7 @@
 import { memo, type ReactNode } from "react";
 import { type Components } from "react-markdown";
 import { schemeIsDangerous } from "../lib/docs";
+import { stripUnsafeChars } from "../lib/safeText";
 import { CommandBlock } from "./RunEvent";
 import { MarkdownCore } from "./MarkdownCore";
 
@@ -11,6 +12,20 @@ import { MarkdownCore } from "./MarkdownCore";
 // overrides run. We add schemeIsDangerous as independent defense-in-depth (a
 // future urlTransform override can't reopen the hole) and apply three behaviours
 // the docs policy does NOT want here:
+//
+// Cf/bidi CENTRALIZED HERE (issue #124 / #319). This component strips Unicode
+// control/format characters (U+202E RIGHT-TO-LEFT OVERRIDE and its relatives, the
+// zero-width family) via stripUnsafeChars before handing content to MarkdownCore,
+// so EVERY untrusted <Markdown> sink — current and future, notably plan_md at the
+// plan-approval gate — is covered by construction rather than by each call site
+// remembering to wrap. The strip runs BEFORE the markdown parse (deliberately: it
+// also covers fenced code, where a Trojan-Source payload would sit) and never
+// removes a character that carries markdown meaning. stripUnsafeChars is
+// idempotent, so call sites that keep their own stripUnsafeChars wrap (e.g. the
+// non-Markdown escaped-JSX sinks that share a value with a Markdown one) stay
+// correct — the second pass is a no-op. This lives in Markdown.tsx and NOT in
+// MarkdownCore, because MarkdownCore is also driven by DocMarkdown (the trusted
+// docs policy), which must not be scrubbed.
 //   - links are treated as external: new tab + rel="noopener noreferrer" (never
 //     rewritten to in-app routes — a model must not forge SPA navigation).
 //   - images are size-capped via CSS so a remote/oversized <img> can't blow up
@@ -143,5 +158,11 @@ const components: Components = {
 // Memoized so an append to the run feed never re-parses an unchanged message's
 // markdown (rows are keyed by immutable seq, so `content` is stable per row).
 export const Markdown = memo(function Markdown({ content }: { content: string }) {
-  return <MarkdownCore content={content} className="docs-prose" components={components} />;
+  return (
+    <MarkdownCore
+      content={stripUnsafeChars(content)}
+      className="docs-prose"
+      components={components}
+    />
+  );
 });

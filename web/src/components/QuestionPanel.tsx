@@ -21,7 +21,9 @@ import { answersReady, composeAnswer, encodeAnswerBody, type OpenQuestion } from
 // `description` are untrusted:
 //   - question text → the hardened <Markdown> sink (no rehype-raw, so raw HTML is inert
 //     text; react-markdown v10's default urlTransform plus our own schemeIsDangerous
-//     kill javascript:/data: hrefs).
+//     kill javascript:/data: hrefs; and, since issue #319, <Markdown> also strips Cf/bidi
+//     control characters centrally, so this sink is scrubbed by construction with no
+//     per-site stripUnsafeChars wrap).
 //   - option label/description → React text CHILDREN. Never an href, title, style, or
 //     dangerouslySetInnerHTML. A `title` would be the worst of these: a whole-subtree
 //     textContent assertion cannot see an attribute, so the escape would be untested by

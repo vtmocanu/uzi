@@ -95,6 +95,22 @@ describe("Markdown shell-fence parity", () => {
     expect(container.querySelector("code")?.textContent).toBe(cmd);
   });
 
+  it("strips Cf/bidi control characters centrally, keeping the visible text (#124/#319)", () => {
+    // Every untrusted <Markdown> sink is covered by construction: the component strips
+    // Unicode control/format characters before parse, so a caller need not wrap. Here the
+    // content is passed RAW (no per-site stripUnsafeChars) to prove the strip lives in the
+    // component. "before‮after​end" = RLO + zero-width space around visible letters.
+    const { container } = render(<Markdown content={"before‮after​end"} />);
+    const rendered = container.textContent ?? "";
+    // Neither the bidi override nor the zero-width space survives to the rendered DOM.
+    expect(rendered).not.toContain("‮");
+    expect(rendered).not.toContain("​");
+    // No character from the Cf category at all.
+    expect(rendered).not.toMatch(/[\p{Cf}]/u);
+    // The visible letters are untouched (the strip removes only meaning-free characters).
+    expect(rendered).toContain("beforeafterend");
+  });
+
   it("unwraps the <pre> for a shell fence but keeps it for other languages", () => {
     // A shell fence becomes the block-level CommandBlock (no <pre>); every other
     // fence keeps its default <pre><code> so .docs-prose styling is untouched.

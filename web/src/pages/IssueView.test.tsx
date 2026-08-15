@@ -130,8 +130,11 @@ afterEach(() => {
 
 // Issue #124, item 9. The issue TITLE and DESCRIPTION are both forge-supplied, and the
 // issue's own audit list names descriptions alongside titles. The description renders
-// through <Markdown>, which is hardened against raw HTML and dangerous URL schemes —
-// neither of which is a bidi override, so that pipeline does not close this.
+// through <Markdown>, which is hardened against raw HTML and dangerous URL schemes and,
+// since issue #319, ALSO strips Cf/bidi control characters centrally — so that pipeline
+// now closes the bidi hole by construction for the description (the page's own
+// stripUnsafeChars wrap on it is redundant but harmless). The title is a non-Markdown
+// escaped-JSX sink and still strips per-site.
 describe("IssueView — the forge title and description carry no format characters (#124)", () => {
   it("strips bidi/zero-width characters from both", async () => {
     setAuth(false);

@@ -335,9 +335,10 @@ export function IssueView() {
             </h2>
             {issue.description.trim() ? (
               <div className="docs-prose max-w-none">
-                {/* Issue #124 names issue DESCRIPTIONS alongside titles, and Markdown does
-                    not close this: that pipeline is hardened against raw HTML and dangerous
-                    URL schemes, neither of which is a bidi override. Stripping before the
+                {/* Issue #124 names issue DESCRIPTIONS alongside titles. Since #319 the
+                    <Markdown> pipeline strips Cf/bidi centrally, so this per-site
+                    stripUnsafeChars wrap is redundant-but-harmless (idempotent) — kept so
+                    the value matches the escaped-JSX title sink. Stripping before the
                     renderer cannot inject markdown structure — it only deletes characters
                     that carry no markdown meaning. */}
                 <Markdown content={stripUnsafeChars(issue.description)} />

@@ -41,7 +41,12 @@
 // NOT applied at the API boundary, deliberately. `target` is a COORDINATE: the page matches
 // dispositions and filed issues by (category, target) and posts that pair back. Normalizing
 // it on the way in would send a value the server cannot find. So this is a display-time
-// transform, applied per render site, and the raw value stays the identity.
+// transform and the raw value stays the identity. For the untrusted `<Markdown>` sink the
+// strip now runs CENTRALLY inside the component (components/Markdown.tsx), covering every
+// current and future markdown sink by construction; the per-render-site framing is now true
+// only of the non-Markdown escaped-JSX sinks (e.g. rec.target/judge_model, run.branch,
+// header metadata) that call stripUnsafeChars directly. Idempotence keeps a call site that
+// wraps a value shared with a Markdown sink correct — the extra pass is a no-op.
 
 /**
  * Cc (control) plus Cf (format), except the two whitespace characters the pre-wrap
