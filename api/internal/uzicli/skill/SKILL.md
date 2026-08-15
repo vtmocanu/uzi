@@ -233,6 +233,19 @@ uzi version
   *second* wait in a gated loop must exclude the gate it just cleared:
   `uzi run wait <id> --until completed,failed,cancelled`. A bare `run wait` there
   would return immediately at the gate it just approved.
+
+  **Long runs in a harness that reaps background processes: poll `run get`, do
+  NOT lean on a single long-lived `run wait`.** `run wait` is the right primitive
+  wherever the process running it survives — a foreground shell, a CI job. But a
+  large gated run (a multi-milestone PRD driven end-to-end) can take hours, and if
+  you launch `run wait` as a *detached/background* watcher inside an agent harness
+  that kills long-lived background processes, the watcher dies before the run
+  finishes and you never learn it completed. Measured: Claude Code reaped a
+  backgrounded `run wait` repeatedly (`status: killed`), while the run itself kept
+  going. There, do not depend on one long wait — poll `uzi run get <id> --field
+  status` from the harness's own scheduler (a cron / wakeup) and branch on the
+  status, so a killed watcher simply re-fires on the next tick. Keep `run wait` for
+  the foreground/CI case where its process is not at risk of being reaped.
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
   `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
