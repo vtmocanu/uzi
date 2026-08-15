@@ -167,6 +167,81 @@ func TestJudgeAccessors(t *testing.T) {
 	}
 }
 
+// TestJudgeSpendGuardAccessors pins the PRD #69 M5 Decision 9 per-user spend-guard
+// accessors: the cooldown defaults ON (60s), the daily budget OFF (0), and a stored
+// value is returned verbatim while an unparseable row falls back to the default
+// (the same junk-tolerance the other int accessors carry).
+func TestJudgeSpendGuardAccessors(t *testing.T) {
+	// Empty table → compiled-in defaults.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.JudgeCooldownSeconds(context.Background()); err != nil || got != 60 {
+		t.Fatalf("JudgeCooldownSeconds default = %d, %v; want 60", got, err)
+	}
+	if got, err := c.JudgeDailyBudget(context.Background()); err != nil || got != 0 {
+		t.Fatalf("JudgeDailyBudget default = %d, %v; want 0", got, err)
+	}
+	// Pin the literal defaults so an accidental flip is caught.
+	if DefaultJudgeCooldownSeconds != "60" || DefaultJudgeDailyBudget != "0" {
+		t.Fatalf("defaults = (%q, %q), want (\"60\", \"0\")", DefaultJudgeCooldownSeconds, DefaultJudgeDailyBudget)
+	}
+
+	// Stored values returned verbatim; a junk row falls back to the default.
+	for _, tc := range []struct {
+		stored string
+		want   int
+	}{
+		{"0", 0}, {"120", 120}, {"86400", 86400}, {"", 60}, {"banana", 60},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeCooldownSeconds, tc.stored)}}, time.Minute)
+		if got, _ := c.JudgeCooldownSeconds(context.Background()); got != tc.want {
+			t.Errorf("JudgeCooldownSeconds(stored=%q) = %d, want %d", tc.stored, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		stored string
+		want   int
+	}{
+		{"0", 0}, {"25", 25}, {"", 0}, {"junk", 0},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeDailyBudget, tc.stored)}}, time.Minute)
+		if got, _ := c.JudgeDailyBudget(context.Background()); got != tc.want {
+			t.Errorf("JudgeDailyBudget(stored=%q) = %d, want %d", tc.stored, got, tc.want)
+		}
+	}
+}
+
+// TestJudgeSpendGuardValidation pins the PRD #69 M5 Decision 9 write-time bounds: the
+// cooldown reuses the run-health {0} ∪ [60, 86400] gate; the budget is 0 (unlimited)
+// or a positive count under the cap. Both MUST have explicit int cases — the default
+// branch (ValidateLabel) would accept junk that then reads as the default.
+func TestJudgeSpendGuardValidation(t *testing.T) {
+	// Cooldown: 0 disables; the [60, 86400] band is accepted at both edges; a sub-60
+	// value, a non-int, and an over-cap value are rejected.
+	for _, ok := range []string{"0", "60", "86400", "3600"} {
+		if err := Validate(KeyJudgeCooldownSeconds, ok); err != nil {
+			t.Errorf("Validate(judge_cooldown_seconds, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"59", "30", "1", "86401", "-1", "abc", ""} {
+		if err := Validate(KeyJudgeCooldownSeconds, bad); err == nil {
+			t.Errorf("Validate(judge_cooldown_seconds, %q) = nil, want a rejection", bad)
+		}
+	}
+
+	// Budget: 0 (unlimited) and a positive count accepted; negatives, non-ints, and
+	// an absurd over-cap value rejected.
+	for _, ok := range []string{"0", "1", "50", "10000"} {
+		if err := Validate(KeyJudgeDailyBudget, ok); err != nil {
+			t.Errorf("Validate(judge_daily_budget, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"-1", "-5", "abc", "", "10001"} {
+		if err := Validate(KeyJudgeDailyBudget, bad); err == nil {
+			t.Errorf("Validate(judge_daily_budget, %q) = nil, want a rejection", bad)
+		}
+	}
+}
+
 func TestSelfimproveAccessors(t *testing.T) {
 	// Empty table → compiled-in defaults: OFF, 48h interval, empty engine state.
 	c := New(&fakeStore{}, time.Minute)

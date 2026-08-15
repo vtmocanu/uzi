@@ -648,11 +648,20 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
 - [ ] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
   trail + settings tests + web mock defaults. `go test ./internal/settings`;
   `npm run typecheck` + `npm test`.
-- [ ] **M5 — Per-user spend guards**: `judge_cooldown_seconds` +
-  `judge_daily_budget` int settings + accessors, the two count queries (sqlc),
-  Gate 5 in `maybeEnqueueJudge` (skip-not-defer, all modes). `go test
-  ./internal/settings ./internal/workersvc` green, including a loop test (N rapid
-  failures → judges throttled by cooldown, capped by budget).
+- [x] **M5 — Per-user spend guards**: `judge_cooldown_seconds` (default `"60"`,
+  reuses the `{0} ∪ [60,86400]` health-seconds bound) + `judge_daily_budget`
+  (default `"0"`, `validateJudgeDailyBudget` = 0 or `[1, maxJudgeDailyBudget]`)
+  int settings + `JudgeCooldownSeconds`/`JudgeDailyBudget` accessors; the two
+  count queries `LastJudgeEnqueuedAt` / `CountJudgesSince` (sqlc regenerated,
+  no drift); Gate 5 (`judgeSpendGuardsAllow`) in `maybeEnqueueJudge`, after
+  Gate 4 and before `CreateJudgeRun`, skip-not-defer in all modes and deliberately
+  **fail-open** on any settings/query read error (soft cost backstop, opposite of
+  Gates 2–4). `SettingsReader` widened (+ all fakes: `fakeSettings`, `judgeSwitch`),
+  `Store` widened (+ `fakeStore` doubles). `task gate:api` green — including the
+  settings validation/accessor tests and the workersvc guard tests (cooldown,
+  budget, fail-open, enforced-mode, and the loop test: N rapid failures throttled
+  by cooldown, capped by budget). The two count queries are declared UNPINNED in
+  the query inventory (exercised via workersvc fakes, no store-package live-DB test).
 - [x] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
   + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains a
   nested `judge_run` (`judge_run_id` + claim/start/finish timing + `usage`);

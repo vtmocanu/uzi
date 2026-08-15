@@ -23,21 +23,30 @@ import (
 // waivesPRDLink is likewise zero (false) by default; a test that exercises the
 // PRD #196 waiver sets it explicitly.
 type fakeSettings struct {
-	enabled        bool
-	enforceAll     bool
-	model          string
-	prdLabel       string
-	eligibleLabels []string
-	waivesPRDLink  bool
-	prdlessEnabled bool
-	prdlessLabel   string
-	err            error
+	enabled         bool
+	enforceAll      bool
+	cooldownSeconds int
+	dailyBudget     int
+	spendGuardErr   error // read error for the PRD #69 M5 spend-guard accessors (fail-open)
+	model           string
+	prdLabel        string
+	eligibleLabels  []string
+	waivesPRDLink   bool
+	prdlessEnabled  bool
+	prdlessLabel    string
+	err             error
 }
 
 func (f fakeSettings) JudgeEnabled(context.Context) (bool, error)    { return f.enabled, f.err }
 func (f fakeSettings) JudgeEnforceAll(context.Context) (bool, error) { return f.enforceAll, f.err }
-func (f fakeSettings) JudgeModel(context.Context) (string, error)    { return f.model, f.err }
-func (f fakeSettings) PRDLabel(context.Context) (string, error)      { return f.prdLabel, f.err }
+func (f fakeSettings) JudgeCooldownSeconds(context.Context) (int, error) {
+	return f.cooldownSeconds, f.spendGuardErr
+}
+func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
+	return f.dailyBudget, f.spendGuardErr
+}
+func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
+func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
 func (f fakeSettings) RunEligibleLabels(context.Context) ([]string, error) {
 	return f.eligibleLabels, f.err
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -91,6 +92,18 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
 	}
+	// Gate 5: per-user spend guards (PRD #69 M5, Decision 9). Count-based, best-effort,
+	// applied in EVERY mode (a runaway loop is a footgun even for an opted-in user). On
+	// trip: skip silently (like a Gate 3/4 miss), debug-logged — no defer, no queue, no
+	// notification. Deliberately FAIL-OPEN, the opposite of Gates 2–4: those gate
+	// correctness/consent and fail closed; these are a soft anti-runaway cost backstop,
+	// so on ANY read error (settings or query) we do NOT trip the guard — we proceed to
+	// enqueue (a query error is logged at warn). A transient DB/settings hiccup must
+	// never silently disable judging; the generous defaults keep the guard to genuine
+	// runaways.
+	if !s.judgeSpendGuardsAllow(ctx, run) {
+		return
+	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
 	if _, err := s.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
@@ -105,6 +118,43 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
 	}
+}
+
+// judgeSpendGuardsAllow is Gate 5 (PRD #69 M5, Decision 9): the per-user, count-based,
+// best-effort spend guards. It reports whether the judge may be enqueued — false skips
+// it silently (debug-logged). Called in every mode, after the correctness/consent gates
+// and before the idempotency insert.
+//
+// FAIL-OPEN by design (opposite to Gates 2–4): on ANY read error, settings or query, it
+// returns true so the enqueue proceeds — the guards are a soft cost backstop, and a
+// transient DB/settings hiccup must never silently disable judging. A query error is
+// logged at warn; the generous defaults keep the guard to genuine runaways. s.settings
+// is non-nil here (Gate 2 returned early otherwise).
+func (s *Service) judgeSpendGuardsAllow(ctx context.Context, run store.Run) bool {
+	// Cooldown: skip if this user had a judge enqueued within the last N seconds.
+	if cooldown, err := s.settings.JudgeCooldownSeconds(ctx); err == nil && cooldown > 0 {
+		last, lerr := s.q.LastJudgeEnqueuedAt(ctx, run.UserID)
+		if lerr != nil {
+			slog.Warn("judge enqueue: cooldown lookup failed, proceeding (fail-open)", "run", run.ID, "user", run.UserID, "error", lerr)
+		} else if last.Valid && time.Since(last.Time) < time.Duration(cooldown)*time.Second {
+			slog.Debug("judge enqueue: within cooldown, skipping", "run", run.ID, "user", run.UserID, "cooldown_s", cooldown)
+			return false
+		}
+	}
+	// Daily budget: skip if this user already had >= N judge runs in the rolling 24h.
+	if budget, err := s.settings.JudgeDailyBudget(ctx); err == nil && budget > 0 {
+		count, cerr := s.q.CountJudgesSince(ctx, store.CountJudgesSinceParams{
+			UserID: run.UserID,
+			Since:  pgTime(time.Now().Add(-24 * time.Hour)),
+		})
+		if cerr != nil {
+			slog.Warn("judge enqueue: budget lookup failed, proceeding (fail-open)", "run", run.ID, "user", run.UserID, "error", cerr)
+		} else if count >= int64(budget) {
+			slog.Debug("judge enqueue: daily budget reached, skipping", "run", run.ID, "user", run.UserID, "budget", budget)
+			return false
+		}
+	}
+	return true
 }
 
 // judgeRunTitle synthesizes a display title for a judge run (it has no issue of its own).

@@ -12,6 +12,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countJudgesSince = `-- name: CountJudgesSince :one
+SELECT COUNT(*) FROM runs
+WHERE kind = 'judge' AND user_id = $1 AND created_at > $2
+`
+
+type CountJudgesSinceParams struct {
+	UserID uuid.UUID          `json:"user_id"`
+	Since  pgtype.Timestamptz `json:"since"`
+}
+
+// Count of a user's judge runs created after @since, for the per-user daily-budget
+// spend guard (PRD #69 M5 Decision 9, Gate 5). @since is now-24h at the call site, so
+// this is the rolling-24h judge count. Same low-QPS funnel as LastJudgeEnqueuedAt, so
+// no dedicated index (see its comment).
+func (q *Queries) CountJudgesSince(ctx context.Context, arg CountJudgesSinceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countJudgesSince, arg.UserID, arg.Since)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createJudgeRun = `-- name: CreateJudgeRun :one
 
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status)
@@ -357,6 +378,27 @@ func (q *Queries) GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UU
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const lastJudgeEnqueuedAt = `-- name: LastJudgeEnqueuedAt :one
+SELECT MAX(created_at)::timestamptz FROM runs
+WHERE kind = 'judge' AND user_id = $1
+`
+
+// The most recent judge-run creation time for a user, for the per-user cooldown
+// spend guard (PRD #69 M5 Decision 9, Gate 5). MAX over an empty set is SQL NULL, so
+// the return is a NULLABLE timestamp — NULL means "this user has never had a judge",
+// which the caller reads as "no cooldown in effect". The ::timestamptz cast pins the
+// column type for sqlc (a bare MAX(created_at) is inferred as interface{}).
+//
+// No dedicated index: the judge funnel is low-QPS (one read per terminal transition
+// per user), so idx_runs_user already covers this; a partial runs(user_id,created_at)
+// WHERE kind='judge' index would be premature.
+func (q *Queries) LastJudgeEnqueuedAt(ctx context.Context, userID uuid.UUID) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, lastJudgeEnqueuedAt, userID)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const listRecommendationsForReview = `-- name: ListRecommendationsForReview :many

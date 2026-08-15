@@ -183,6 +183,14 @@ type fakeStore struct {
 	userByIDErr       error
 	createdJudgeRun   *store.CreateJudgeRunParams
 	createJudgeRunErr error
+	// PRD #69 M5 Gate 5 spend guards (best-effort, fail-open). lastJudgeAt is the
+	// cooldown lookup (Valid:false ⇒ no prior judge); judgesSince is the daily-budget
+	// count. The *Err fields stage a read error to prove the guard proceeds anyway.
+	lastJudgeAt       pgtype.Timestamptz
+	lastJudgeAtErr    error
+	judgesSince       int64
+	judgesSinceErr    error
+	judgesSinceArgs   []store.CountJudgesSinceParams
 	activeJudgeRun    store.Run
 	activeJudgeRunErr error
 	// The PRD #119 pending-judge read (GetActiveJudgeRunForTarget). pendingJudgeErr is
@@ -686,6 +694,15 @@ func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunPa
 }
 func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeJudgeRun, f.activeJudgeRunErr
+}
+
+// PRD #69 M5 Gate 5 spend-guard reads.
+func (f *fakeStore) LastJudgeEnqueuedAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
+	return f.lastJudgeAt, f.lastJudgeAtErr
+}
+func (f *fakeStore) CountJudgesSince(_ context.Context, arg store.CountJudgesSinceParams) (int64, error) {
+	f.judgesSinceArgs = append(f.judgesSinceArgs, arg)
+	return f.judgesSince, f.judgesSinceErr
 }
 
 // The PRD #119 pending-judge read. It records the target it was asked for, which is how

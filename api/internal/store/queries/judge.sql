@@ -17,6 +17,27 @@ INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, 
 VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued')
 RETURNING *;
 
+-- name: LastJudgeEnqueuedAt :one
+-- The most recent judge-run creation time for a user, for the per-user cooldown
+-- spend guard (PRD #69 M5 Decision 9, Gate 5). MAX over an empty set is SQL NULL, so
+-- the return is a NULLABLE timestamp — NULL means "this user has never had a judge",
+-- which the caller reads as "no cooldown in effect". The ::timestamptz cast pins the
+-- column type for sqlc (a bare MAX(created_at) is inferred as interface{}).
+--
+-- No dedicated index: the judge funnel is low-QPS (one read per terminal transition
+-- per user), so idx_runs_user already covers this; a partial runs(user_id,created_at)
+-- WHERE kind='judge' index would be premature.
+SELECT MAX(created_at)::timestamptz FROM runs
+WHERE kind = 'judge' AND user_id = @user_id;
+
+-- name: CountJudgesSince :one
+-- Count of a user's judge runs created after @since, for the per-user daily-budget
+-- spend guard (PRD #69 M5 Decision 9, Gate 5). @since is now-24h at the call site, so
+-- this is the rolling-24h judge count. Same low-QPS funnel as LastJudgeEnqueuedAt, so
+-- no dedicated index (see its comment).
+SELECT COUNT(*) FROM runs
+WHERE kind = 'judge' AND user_id = @user_id AND created_at > @since;
+
 -- name: GetActiveJudgeRunForWorkerTarget :one
 -- Trace/review authorization (Decision 3, audit H1): the caller's worker must own a
 -- NON-TERMINAL judge run whose target_run_id is @target_run_id. This is judge-run

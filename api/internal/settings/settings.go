@@ -63,6 +63,13 @@ const (
 	// kill-switch (KeyJudgeEnabled) and token presence still govern, so a disabled
 	// judge or a token-less user is never overridden.
 	KeyJudgeEnforceAll = "judge_enforce_all"
+	// Per-user judge spend guards (PRD #69 M5, Decision 9). Two admin-tuned,
+	// count-based, best-effort anti-runaway backstops checked at enqueue in EVERY
+	// mode. judge_cooldown_seconds is an integer in {0} ∪ [60, 86400] (0 disables the
+	// cooldown); judge_daily_budget is a non-negative count (0 = unlimited/off).
+	// Runtime-tunable from the Admin Settings page; no env var.
+	KeyJudgeCooldownSeconds = "judge_cooldown_seconds"
+	KeyJudgeDailyBudget     = "judge_daily_budget"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -143,6 +150,12 @@ const (
 	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
 	// until an admin flips this on, so the feature is a strict no-op on upgrade.
 	DefaultJudgeEnforceAll = "false"
+	// PRD #69 M5 Decision 9. The cooldown is ON by default (60s: skip a judge for a
+	// user who had one enqueued within the last minute), a cheap runaway-loop backstop
+	// even for opted-in users. The daily budget is OFF by default ("0" = unlimited): a
+	// count cap is opt-in because the generous cooldown already catches the loop case.
+	DefaultJudgeCooldownSeconds = "60"
+	DefaultJudgeDailyBudget     = "0"
 	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
 	// it, the engine reviews uzi's own repo on the configured interval (2 days).
 	DefaultSelfimproveEnabled  = "false"
@@ -196,6 +209,13 @@ const (
 // ResourceQuota incident.
 const maxHostedWorkerQuota = 20
 
+// maxJudgeDailyBudget bounds the per-user judge daily budget (PRD #69 M5 Decision
+// 9). 0 means unlimited (the guard is off); a positive count caps judge runs per
+// rolling 24h. The upper bound only catches a fat-fingered value — no real user
+// runs thousands of judges a day — so an admin meaning 50 and typing 50000 gets a
+// rejected write instead of an effectively-unlimited guard.
+const maxJudgeDailyBudget = 10000
+
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
 
@@ -231,11 +251,13 @@ var Defaults = map[string]string{
 	// defaults). The three engine-managed selfimprove keys (repo/user_id/last_run_at)
 	// are deliberately NOT here — see their KeySelfimprove* doc — so a body PUT to
 	// them is rejected as unknown and only the M5 engine writes them.
-	KeyJudgeEnabled:        DefaultJudgeEnabled,
-	KeyJudgeModel:          DefaultJudgeModel,
-	KeyJudgeEnforceAll:     DefaultJudgeEnforceAll,
-	KeySelfimproveEnabled:  DefaultSelfimproveEnabled,
-	KeySelfimproveInterval: DefaultSelfimproveInterval,
+	KeyJudgeEnabled:         DefaultJudgeEnabled,
+	KeyJudgeModel:           DefaultJudgeModel,
+	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
+	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
+	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,
+	KeySelfimproveEnabled:   DefaultSelfimproveEnabled,
+	KeySelfimproveInterval:  DefaultSelfimproveInterval,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
 	// to these defaults, so All/AdminView surface them to the settings page and no
 	// migration seeds them.
@@ -666,6 +688,21 @@ func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHostedWorkerQuota)
 }
 
+// JudgeCooldownSeconds returns the per-user judge cooldown in seconds (PRD #69 M5
+// Decision 9); 0 disables the cooldown guard. Best-effort at the enqueue gate — the
+// caller proceeds (fails open) on a read error, since the guard is a soft cost
+// backstop, not a correctness control.
+func (c *Cache) JudgeCooldownSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyJudgeCooldownSeconds)
+}
+
+// JudgeDailyBudget returns the per-user judge daily budget as a count (PRD #69 M5
+// Decision 9); 0 means unlimited (the guard is off). Best-effort at the enqueue
+// gate, like JudgeCooldownSeconds.
+func (c *Cache) JudgeDailyBudget(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyJudgeDailyBudget)
+}
+
 // DockerRepoAllowlist returns the set of repo ids a docker-enabled worker may claim
 // runs for (PRD #89 M-allow). Stored as a comma-separated list of repo UUIDs; an
 // absent/empty value yields an EMPTY slice, which the claim gate treats as
@@ -946,6 +983,13 @@ func Validate(key, value string) error {
 	case KeyHealthStallSeconds, KeyHealthSlowSeconds, KeyHealthQueuedSeconds,
 		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
 		return validateHealthSeconds(value)
+	case KeyJudgeCooldownSeconds:
+		// {0} ∪ [60, 86400], identical to the run-health seconds bounds (PRD #69 M5
+		// Decision 9), so validateHealthSeconds enforces it verbatim — 0 disables the
+		// cooldown, the day cap stops a fat-fingered value silently disabling it.
+		return validateHealthSeconds(value)
+	case KeyJudgeDailyBudget:
+		return validateJudgeDailyBudget(value)
 	case KeyHostedWorkerQuota:
 		return validateHostedWorkerQuota(value)
 	case KeyDockerRepoAllowlist:
@@ -1077,6 +1121,30 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+// validateJudgeDailyBudget is the write-time gate for the per-user judge daily
+// budget (PRD #69 M5 Decision 9): a base-10 integer in {0} ∪ [1, maxJudgeDailyBudget],
+// where 0 is the documented "unlimited / guard off" value rather than a rejection.
+// Negatives, non-integers, and values above the cap are refused.
+//
+// Like validateHostedWorkerQuota, the explicit Validate case this backs is
+// load-bearing: Validate's default branch falls through to ValidateLabel, which
+// accepts any non-empty ≤64-char string — so without this case "abc" would save and
+// intSetting would silently fall back to the compiled-in default on every read, an
+// admin's typed cap silently ignored.
+func validateJudgeDailyBudget(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of judge runs")
+	}
+	if n == 0 {
+		return nil
+	}
+	if n < 0 || n > maxJudgeDailyBudget {
+		return fmt.Errorf("must be 0 (unlimited) or between 1 and %d judge runs", maxJudgeDailyBudget)
 	}
 	return nil
 }

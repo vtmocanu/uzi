@@ -291,6 +291,11 @@ type Store interface {
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	// Per-user judge spend guards (PRD #69 M5 Decision 9, Gate 5). Read-only count
+	// queries feeding the cooldown and daily-budget backstops in maybeEnqueueJudge.
+	// LastJudgeEnqueuedAt returns a NULLABLE timestamp (NULL ⇒ user never judged).
+	LastJudgeEnqueuedAt(ctx context.Context, userID uuid.UUID) (pgtype.Timestamptz, error)
+	CountJudgesSince(ctx context.Context, arg store.CountJudgesSinceParams) (int64, error)
 	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
 	ListToolTraceForRun(ctx context.Context, arg store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error)
 	// ListKnownImproveUziTargetsForUser is the owner's existing improve_uzi target menu
@@ -675,6 +680,12 @@ type SettingsReader interface {
 	// presence still govern. A nil reader (or a best-effort error) reads as false, so
 	// enforcement never turns on when settings are unavailable.
 	JudgeEnforceAll(ctx context.Context) (bool, error)
+	// JudgeCooldownSeconds / JudgeDailyBudget are the per-user judge spend guards (PRD
+	// #69 M5 Decision 9), checked at Gate 5 in every mode. Cooldown 0 disables the
+	// cooldown; budget 0 means unlimited. Best-effort: a read error fails OPEN (the
+	// enqueue proceeds), since these are soft cost backstops, not correctness gates.
+	JudgeCooldownSeconds(ctx context.Context) (int, error)
+	JudgeDailyBudget(ctx context.Context) (int, error)
 	JudgeModel(ctx context.Context) (string, error)
 	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
 	// 14). It is read here rather than passed in by each caller because the gate is
