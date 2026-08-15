@@ -3,7 +3,7 @@
 **Issue**: [#311](https://gitlab.example.com/vtmocanu/uzi/-/issues/311)
 **Priority**: Medium
 **Status**: Draft
-**Labels**: PRD, Night (nightly 02:00 sweep)
+**Labels**: PRD, Night-Shift (nightly 02:00 sweep)
 
 ## Problem
 
