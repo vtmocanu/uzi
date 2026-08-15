@@ -386,7 +386,10 @@ an MR — never touching `main`. This adds one optional service (`agent`, above)
 and a third trust boundary: `api` now also accepts *inbound* calls from each
 user's worker (the reverse of the forge boundary, where `api` calls *out*).
 Full design rationale lives in the PRD (`prds/done/4-agent-runtime-workers.md`,
-especially its Decision Log); this section is the map.
+especially its Decision Log); this section is the map. See
+[docs/run-cost.md](docs/run-cost.md) for why a run on this runtime costs less
+than the same task worked by a local Claude Code agent-team session, and
+whether the cheaper run is as good.
 
 ```
 browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)
