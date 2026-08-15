@@ -1872,4 +1872,37 @@ describe("ColumnSettings reorder (PRD #318 M2)", () => {
       { label_name: "Planned" },
     ]);
   });
+
+  it("compensates the index on a mid-list downward drag", async () => {
+    mockApi.getBoard.mockResolvedValue({
+      board: aBoard({
+        columns: [
+          { label_name: "Planned" },
+          { label_name: "In Progress" },
+          { label_name: "Human Review" },
+        ] as BoardData["columns"],
+      }),
+    });
+    const panel = await openSettings();
+    const rows = within(panel).getAllByRole("listitem");
+
+    // Drag row 0 ("Planned") DOWN onto row 1 ("In Progress"). jsdom's zero rect makes
+    // clientY 0 resolve to the "bottom" edge, so it lands just after "In Progress".
+    // This is the case that exercises `if (from < to) to -= 1`: from=0, i=1,
+    // edge="bottom" → to=2 → from<to → to=1 → moveTo(0,1) → ["In Progress","Planned",
+    // "Human Review"]. WITHOUT the decrement, to would stay 2 and moveTo(0,2) would
+    // yield ["In Progress","Human Review","Planned"] — a different, wrong order — so
+    // this test fails if that line regresses (the drag-to-bottom test above cannot,
+    // because splice clamps identically at the array end).
+    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn(), getData: () => "Planned" } });
+    fireEvent.drop(rows[1], { dataTransfer: { getData: () => "Planned" }, clientY: 0 });
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Save columns" }));
+    await waitFor(() => expect(mockApi.configureColumns).toHaveBeenCalled());
+    expect(mockApi.configureColumns).toHaveBeenCalledWith("repo-1", [
+      { label_name: "In Progress" },
+      { label_name: "Planned" },
+      { label_name: "Human Review" },
+    ]);
+  });
 });
