@@ -663,6 +663,11 @@ type RunLifecycle interface {
 // in tests and any deployment that never wired it.
 type SettingsReader interface {
 	JudgeEnabled(ctx context.Context) (bool, error)
+	// JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
+	// bypassing the per-user judge_enabled opt-in gate. The kill-switch and token
+	// presence still govern. A nil reader (or a best-effort error) reads as false, so
+	// enforcement never turns on when settings are unavailable.
+	JudgeEnforceAll(ctx context.Context) (bool, error)
 	JudgeModel(ctx context.Context) (string, error)
 	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
 	// 14). It is read here rather than passed in by each caller because the gate is

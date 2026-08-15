@@ -138,6 +138,28 @@ func TestJudgeAccessors(t *testing.T) {
 	if got, _ := c.JudgeModel(context.Background()); got != "sonnet" {
 		t.Fatalf("JudgeModel = %q, want sonnet", got)
 	}
+
+	// JudgeEnforceAll (PRD #69): default OFF, "true"/"false" honored, junk → false —
+	// a malformed row never silently turns forced token spend ON.
+	if got, err := c.JudgeEnforceAll(context.Background()); err != nil || got != false {
+		t.Fatalf("JudgeEnforceAll default = %v, %v; want false", got, err)
+	}
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", false},     // empty → default false
+		{"yes", false},  // junk → default false
+		{"TRUE", false}, // non-canonical → default, not a lenient parse
+		{"1", false},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeEnforceAll, tc.stored)}}, time.Minute)
+		if got, _ := c.JudgeEnforceAll(context.Background()); got != tc.want {
+			t.Errorf("JudgeEnforceAll(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
 }
 
 func TestSelfimproveAccessors(t *testing.T) {
@@ -203,6 +225,7 @@ func TestSelfimproveAccessors(t *testing.T) {
 func TestJudgeSelfimproveWritability(t *testing.T) {
 	writable := map[string]string{
 		KeyJudgeEnabled:        "true",
+		KeyJudgeEnforceAll:     "false",
 		KeyJudgeModel:          "haiku",
 		KeySelfimproveEnabled:  "false",
 		KeySelfimproveInterval: "48h",

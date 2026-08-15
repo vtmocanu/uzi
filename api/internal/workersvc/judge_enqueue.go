@@ -62,13 +62,22 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !enabled {
 		return
 	}
-	// Gate 3: owner opted in (users.judge_enabled).
+	// Gate 3: owner opted in (users.judge_enabled) — UNLESS the admin has enforced the
+	// judge for every run (PRD #69), in which case the per-user opt-in is bypassed. The
+	// enforce read is best-effort: an error reads as false (opt-in still required), so a
+	// settings hiccup never forces token spend on. The owner load is still needed for the
+	// Gate 4 token check even in enforced mode.
 	owner, err := s.q.GetUserByID(ctx, run.UserID)
 	if err != nil {
 		slog.Warn("judge enqueue: load owner", "run", run.ID, "error", err)
 		return
 	}
-	if !owner.JudgeEnabled {
+	enforceAll, err := s.settings.JudgeEnforceAll(ctx)
+	if err != nil {
+		slog.Warn("judge enqueue: read judge_enforce_all", "run", run.ID, "error", err)
+		enforceAll = false
+	}
+	if !enforceAll && !owner.JudgeEnabled {
 		return
 	}
 	// Gate 4: owner has an Anthropic token. Presence only, not decryptability — a

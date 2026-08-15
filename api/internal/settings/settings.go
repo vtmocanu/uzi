@@ -58,6 +58,11 @@ const (
 	// carry compiled-in defaults.
 	KeyJudgeEnabled = "judge_enabled"
 	KeyJudgeModel   = "judge_model"
+	// KeyJudgeEnforceAll (PRD #69) is an admin bool ("true"/"false"). When true it
+	// bypasses the per-user judge_enabled opt-in gate so every run is judged; the
+	// kill-switch (KeyJudgeEnabled) and token presence still govern, so a disabled
+	// judge or a token-less user is never overridden.
+	KeyJudgeEnforceAll = "judge_enforce_all"
 	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
 	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
@@ -133,6 +138,9 @@ const (
 	// so the cheapest capable model is the right default (Decision 7).
 	DefaultJudgeEnabled = "false"
 	DefaultJudgeModel   = "haiku"
+	// PRD #69. Judge enforcement is OFF by default: the per-user opt-in gate stands
+	// until an admin flips this on, so the feature is a strict no-op on upgrade.
+	DefaultJudgeEnforceAll = "false"
 	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
 	// it, the engine reviews uzi's own repo on the configured interval (2 days).
 	DefaultSelfimproveEnabled  = "false"
@@ -223,6 +231,7 @@ var Defaults = map[string]string{
 	// them is rejected as unknown and only the M5 engine writes them.
 	KeyJudgeEnabled:        DefaultJudgeEnabled,
 	KeyJudgeModel:          DefaultJudgeModel,
+	KeyJudgeEnforceAll:     DefaultJudgeEnforceAll,
 	KeySelfimproveEnabled:  DefaultSelfimproveEnabled,
 	KeySelfimproveInterval: DefaultSelfimproveInterval,
 	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
@@ -520,6 +529,23 @@ func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
 		return false, err
 	default:
 		return DefaultJudgeEnabled == "true", err
+	}
+}
+
+// JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
+// bypassing the per-user judge_enabled opt-in gate. Stored as the text
+// "true"/"false"; any other value falls back to the compiled-in default (false) —
+// the same strict junk-tolerance as JudgeEnabled, so a malformed row never
+// silently turns forced token spend on.
+func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyJudgeEnforceAll)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultJudgeEnforceAll == "true", err
 	}
 }
 
@@ -908,7 +934,7 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeySelfimproveEnabled, KeyHealthEnabled,
+	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeySelfimproveEnabled, KeyHealthEnabled,
 		KeyEligibleLabelWaivesPRDLink:
 		return validateBool(value)
 	case KeyJudgeModel:
