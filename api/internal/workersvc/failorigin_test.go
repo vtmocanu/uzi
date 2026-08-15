@@ -17,12 +17,35 @@ func TestCoerceFailOrigin(t *testing.T) {
 	if got := CoerceFailOrigin(nil); got != nil {
 		t.Fatalf("CoerceFailOrigin(nil) = %v, want nil", got)
 	}
-	for _, in := range AllFailOrigins() {
+	// The worker-reportable subset passes through verbatim.
+	for in := range workerReportableFailOrigins {
 		v := in
 		got := CoerceFailOrigin(&v)
 		if got == nil || *got != in {
 			t.Fatalf("CoerceFailOrigin(%q) = %v, want passthrough", in, got)
 		}
+	}
+	// Server-authoritative classes are NOT worker-reportable: a worker naming one is a
+	// forgery and must coerce to nil (→ the failed arm defaults to agent_failure), so a
+	// worker cannot inject worker_lost/run_timeout/plan_rejected/auto_stopped/
+	// guardrail_blocked into the trusted classification, nor steer Gate 4b via a forged
+	// guardrail_blocked. Each must still be a real stored member (else the split is stale).
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked"}
+	for _, s := range serverOnly {
+		if !failOriginSet[s] {
+			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)
+		}
+		v := s
+		if got := CoerceFailOrigin(&v); got != nil {
+			t.Fatalf("CoerceFailOrigin(%q) = %v, want nil (server-authoritative class must not be worker-reportable)", s, *got)
+		}
+	}
+	// The worker-reportable subset and the server-only set must PARTITION the vocabulary,
+	// so a future member added to failOrigins must be classified into exactly one rather
+	// than defaulting into worker-reportable-by-omission (the very hole this fix closed).
+	if len(workerReportableFailOrigins)+len(serverOnly) != len(failOrigins) {
+		t.Fatalf("worker-reportable(%d) + server-only(%d) != vocabulary(%d); a new fail_origin was not classified",
+			len(workerReportableFailOrigins), len(serverOnly), len(failOrigins))
 	}
 	for _, bad := range []string{"", "nonsense", "AGENT_FAILURE", "rate limited", "unknown"} {
 		v := bad

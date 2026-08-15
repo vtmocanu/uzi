@@ -10,9 +10,11 @@ package workersvc
 // WHY THE ALLOWLIST IS THE WHOLE SANITIZER, and why it lives here rather than in the
 // worker: identical to rate_limit_type's argument. The worker reports fail_origin as
 // UNTRUSTED free text — whatever the report site attached — and CoerceFailOrigin maps
-// everything outside this set to nil before it can reach the DB, a DTO, the feed or
-// the judge. An allowlist closes length, control-char and injection concerns in one
-// move; no worker-controlled byte survives it.
+// everything outside the WORKER-REPORTABLE subset (see workerReportableFailOrigins) to
+// nil before it can reach the DB, a DTO, the feed or the judge. An allowlist closes
+// length, control-char and injection concerns in one move; scoping it to the subset the
+// worker legitimately emits additionally stops a worker forging a server-authoritative
+// class. No worker-controlled byte survives it.
 //
 // WHERE THE UNKNOWN MAPPING DIFFERS FROM rate_limit_type, ON PURPOSE. CoerceRateLimitType
 // maps an unrecognised value to the literal "unknown" — a real member of its stored
@@ -62,18 +64,39 @@ func AllFailOrigins() []string {
 	return out
 }
 
-// CoerceFailOrigin maps a worker-reported fail_origin onto the stored vocabulary.
+// workerReportableFailOrigins is the SUBSET of the vocabulary a worker may report on its
+// own `failed` state. The other five — worker_lost, run_timeout, plan_rejected,
+// auto_stopped, guardrail_blocked — are stamped ONLY by the server's own sweeper/queries
+// and claim-assembly recovery, never by a worker, so a worker value naming one of them is
+// a forgery: it would corrupt the TRUSTED classification the judge and any consumer key
+// on, and (guardrail_blocked being a Gate 4b member) let an untrusted report steer whether
+// a run is judged. CoerceFailOrigin gates on THIS set, not the full failOrigins vocabulary.
+// The worker legitimately emits only provisioning_failed / credential_unavailable
+// (failOriginForReason) and rate_limited (the limit opt-out path, runner.ts); agent_failure
+// is included because it is the judgeable default the `failed` arm applies anyway, so an
+// explicit worker agent_failure is harmless and semantically correct. The partition
+// (worker-reportable + server-only == vocabulary) is pinned by TestCoerceFailOrigin.
+var workerReportableFailOrigins = map[string]bool{
+	"provisioning_failed":    true,
+	"credential_unavailable": true,
+	"rate_limited":           true,
+	"agent_failure":          true,
+}
+
+// CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.
 //
-// Absent (nil) stays absent. Present-and-in-set passes through verbatim.
-// Present-but-unrecognised becomes nil — NOT a placeholder member — so the coercer
-// never invents a class; the caller decides what a classless failure means (the
-// `failed` arm defaults it to 'agent_failure'). Never an error: a terminal report is
-// never failed on a technicality, mirroring CoerceRateLimitType's stated principle.
+// Absent (nil) stays absent. A value in workerReportableFailOrigins passes through
+// verbatim. Everything else — an unrecognised value OR a server-authoritative class a
+// worker has no authority to claim (worker_lost/run_timeout/plan_rejected/auto_stopped/
+// guardrail_blocked) — becomes nil, NOT a placeholder member, so the coercer never invents
+// or forges a class; the caller decides what a classless failure means (the `failed` arm
+// defaults it to 'agent_failure'). Never an error: a terminal report is never failed on a
+// technicality, mirroring CoerceRateLimitType's stated principle.
 func CoerceFailOrigin(reported *string) *string {
 	if reported == nil {
 		return nil
 	}
-	if failOriginSet[*reported] {
+	if workerReportableFailOrigins[*reported] {
 		return reported
 	}
 	return nil

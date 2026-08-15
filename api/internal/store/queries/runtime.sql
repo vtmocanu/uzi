@@ -1391,7 +1391,12 @@ WHERE id = @id AND status = 'claimed';
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 -- reconcile loop a marker to restore the origin column later. Chat runs are exempt
 -- (Decision 3): a chat legitimately parks for a long time between turns, so its own
--- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
+-- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead. Judge
+-- runs are exempt too (PRD #69 M6 follow-up): M6 stamps started_at on the judge run so it
+-- now sits in 'running' during its single trace-fetch + model turn, where before it went
+-- claimed→completed and this sweep never saw it. A judge carries no work-run wall budget
+-- and is bounded by its own runner-side timeout, so folding it in here would newly fail a
+-- slow judge (large trace / slow API) that would otherwise complete.
 --
 -- PRD #122 M2 (Decision 5b): the cutoff is now PER-RUN, not a single global @cutoff.
 -- A run that froze a scaled budget carries budget_wall_seconds; the sweep honours it,
@@ -1416,7 +1421,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason,
     updated_at = now()
 WHERE status = 'running'
   AND started_at < (sqlc.arg('now')::timestamptz - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)))
-  AND kind <> 'chat'
+  AND kind NOT IN ('chat', 'judge')
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many

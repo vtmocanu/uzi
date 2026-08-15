@@ -300,12 +300,17 @@ export function RunDefaults() {
 
         {judgeError && <Alert message={judgeError} />}
 
-        <label className="flex items-center gap-3 text-sm">
+        {/* In enforced mode the per-user opt-in is bypassed at enqueue (Decision 3), so
+            this toggle is INERT — grey and disable it (matching AdminUsers.tsx), rather
+            than leave a live control that contradicts the banner above it. */}
+        <label
+          className={`flex items-center gap-3 text-sm${judgeEnforcedByAdmin ? " opacity-60" : ""}`}
+        >
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
             checked={user?.judge_enabled ?? false}
-            disabled={judgeBusy}
+            disabled={judgeBusy || judgeEnforcedByAdmin}
             onChange={(e) => toggleJudge(e.target.checked)}
           />
           <span className="text-fg">Judge my finished runs</span>

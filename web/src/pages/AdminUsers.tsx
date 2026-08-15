@@ -21,9 +21,18 @@ export function AdminUsers() {
 
   const load = useCallback(async () => {
     try {
-      const [{ users }, { settings }] = await Promise.all([api.listUsers(), api.getSettings()]);
+      // The user list is the page; a failure here is fatal. The settings read is
+      // best-effort per the judgeEnforceAll comment above: it only decides whether the
+      // per-user toggle is annotated inert, so a settings-endpoint blip must NOT blank
+      // the whole table. Keep it OUT of the fatal path — leave enforce=false on error.
+      const { users } = await api.listUsers();
       setUsers(users);
-      setJudgeEnforceAll(settings.judge_enforce_all === "true");
+      try {
+        const { settings } = await api.getSettings();
+        setJudgeEnforceAll(settings.judge_enforce_all === "true");
+      } catch {
+        setJudgeEnforceAll(false);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load users");
     } finally {
