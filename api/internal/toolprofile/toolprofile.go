@@ -86,6 +86,21 @@ func Denied(pkg string) bool {
 	return denylist[base]
 }
 
+// DenylistNames returns the denylist's package BASE names, sorted. Shipped in the
+// claim (ClaimConfig.DeniedToolPackages) so the worker can apply the SAME Decision 6
+// policy to TIER-2 (repo devbox.json opt-in) packages, which the server filters by
+// shape only and so never denylist-checks (PRD #123 M1b). These are package names,
+// not executable names — see deniedPackageExecutables for the exec-name mapping the
+// judge scan uses. It is a compile-time-constant list; callers may send it verbatim.
+func DenylistNames() []string {
+	names := make([]string, 0, len(denylist))
+	for name := range denylist {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // deniedPackageExecutables maps each denylisted PACKAGE to the executables it puts on
 // PATH. The denylist above is keyed by package name, which is right for provisioning
 // (a package name is what an admin allowlists and what devbox installs) and wrong for
@@ -155,10 +170,13 @@ var deniedExecutableSet = func() map[string]bool {
 // SCOPE, stated precisely because the obvious stronger claim is false. The denylist is
 // enforced on the TIER-1 path at three points — the admin allowlist write (via Denied),
 // and profile save + claim assembly (via Resolve → Allowed, which reads the denylist map
-// directly rather than going through Denied). It is NOT consulted on the tier-2 path: a cloned repo's own
-// devbox.json under repo_devbox_opt_in is filtered by SHAPE ONLY, so a repo that opts in
-// CAN install these. See the dated correction at agent/src/provision.ts (PRD #123 §6),
-// which retracted exactly this over-claim.
+// directly rather than going through Denied). The tier-2 path (a cloned repo's own
+// devbox.json under repo_devbox_opt_in) is filtered by SHAPE server-side, and since
+// PRD #123 M1b the denylist BASE NAMES also ship in the claim (DenylistNames →
+// ClaimConfig.DeniedToolPackages) so the worker drops any denied tier-2 package by base
+// name before provisioning (agent/src/repo-tools.ts filterDeniedPackages,
+// provision-run.ts). This DeniedExecutable scan (exec names, judge path) is still not
+// the tier-2 enforcement point — that is the worker package-name filter just named.
 //
 // (An earlier draft of this note said Denied() has "exactly one call site" and inferred
 // tier-1 was bounded only at the allowlist write. The call-site count was right and the

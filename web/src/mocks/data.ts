@@ -1698,7 +1698,7 @@ export const mockAdminWorkers: AdminWorker[] = [
 
 export const mockToolAllowlist: ToolAllowlistEntry[] = [
   { id: "tal-kubectl", name: "kubectl", pinned_version: null, note: "For the k8s repos", updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
-  { id: "tal-terraform", name: "terraform", pinned_version: "1.7", note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+  { id: "tal-opentofu", name: "opentofu", pinned_version: "1.7", note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
   { id: "tal-jq", name: "jq", pinned_version: null, note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
 ];
 

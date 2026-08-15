@@ -34,6 +34,36 @@ function baseName(pkg: string): string {
 }
 
 /**
+ * Partition tier-2 (repo devbox.json) packages by the server's Decision 6 denylist
+ * (PRD #123 M1b). A package is DROPPED when its base name (before any @version) is in
+ * `denied`; otherwise it is KEPT. The denylist ships in the claim
+ * (ClaimConfig.denied_tool_packages) so the worker enforces the same credential-CLI
+ * policy the server already applies to tier-1 — closing the tier-2 bypass where a
+ * repo's own devbox.json could install a logged-in glab/gh/aws/vault/….
+ *
+ * Base-name matching so a pinned `glab@1.2` is caught when `glab` is denied.
+ * Case-INSENSITIVE on the base name so a repo declaring `Glab@1.2` / `GH` is dropped
+ * too rather than relying on nixpkgs resolution to fail. The returned tokens keep
+ * their original casing — only the comparison is lowercased. Input order is preserved
+ * in both outputs. An empty `denied` keeps everything (an older server ships no list ⇒
+ * today's behavior). Apply to TIER-2 ONLY — tier-1 is already denylist-checked
+ * server-side and must never be filtered here.
+ */
+export function filterDeniedPackages(
+  repoPackages: string[],
+  denied: readonly string[],
+): { kept: string[]; dropped: string[] } {
+  const deniedSet = new Set(denied.map((d) => d.toLowerCase()));
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const pkg of repoPackages) {
+    if (deniedSet.has(baseName(pkg).toLowerCase())) dropped.push(pkg);
+    else kept.push(pkg);
+  }
+  return { kept, dropped };
+}
+
+/**
  * Strip JSONC (hujson-style) comments and tolerate trailing commas so a
  * comment-bearing devbox.json can be handed to the native JSON.parse validator.
  * A devbox manifest tolerates `//` line comments, `/* … *\/` block comments, and

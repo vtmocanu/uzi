@@ -54,7 +54,7 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 | `base` (default) | Node 24 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
 
-Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade.
+Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade. The baked set also covers a handful of everyday utilities (`ripgrep`, `opentofu`/`tofu`, and others) beyond go/python3/pip — the shared manifest at `agent/devbox-global/devbox.json` is the canonical list, not this page.
 
 Pick a template at build time with the `WORKER_TEMPLATE` variable, which selects `agent/templates/<name>/Dockerfile`:
 
@@ -79,11 +79,12 @@ This adds a rootless Docker-in-Docker sidecar alongside the ordinary `agent` ser
 
 ## Tool provisioning
 
-Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kubectl, terraform, jq, and so on) on demand with [devbox](https://www.jetify.com/devbox) (nix under the hood). Users set a repo's tool profile, opt into a repo's own `devbox.json`, and admins manage the allowlist — all covered in [Per-repo tools](./worker-tools.md). The operator points to know:
+Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kubectl, opentofu, jq, and so on) on demand with [devbox](https://www.jetify.com/devbox) (nix under the hood). Users set a repo's tool profile, opt into a repo's own `devbox.json`, and admins manage the allowlist — all covered in [Per-repo tools](./worker-tools.md). The operator points to know:
 
 - **New outbound egress.** Installing tools reaches **nix substituters** (`https://cache.nixos.org` plus any you configure) — the one *new* egress this feature adds. A worker also reaches the forge directly for git (clone/fetch/push), so its full outbound set is `api` + the forge + the substituters. Allow the substituters through an egress firewall if you run one.
 - **Provisioning is secret-scrubbed.** The install runs in a subprocess stripped of the forge token, the Anthropic token, and the join token, so a package's build hook cannot read your credentials. Only an explicit allowlist of tool environment variables (`PATH` and nix's TLS/locale vars) is passed back to the agent.
 - **Provisioning failure fails the run** with a clear message rather than silently continuing without the tool.
+- **The admin allowlist is gated to what the image bakes.** A cold hosted worker can't resolve an arbitrary new package at run time — its egress is locked to the substituters above, not to the wider hosts devbox needs to resolve an unbaked package — so an admin can only allowlist a package the worker image already bakes into its shared devbox toolchain (`agent/devbox-global/devbox.json`). Allowlisting a new tool means baking it into that toolchain and rolling the worker image; the gate rejects the alternative with a clear message instead of letting a run hang. `kubectl` and `nodejs` are the two documented exceptions that stay allowlisted without being baked — see [Per-repo tools](./worker-tools.md#the-allowlist-admins).
 
 The worker image installs a **pinned** devbox binary and nix at build time (no floating installer, no first-run download). Storage: the nix store is the `agentnix` volume at `/nix`; devbox/nix per-user metadata lands HOME-derived under `/data` (the `agentdata` volume). Both persist across `docker compose down`/`up`, so only a fresh `down -v` re-downloads packages.
 

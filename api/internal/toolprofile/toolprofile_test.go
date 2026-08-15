@@ -12,16 +12,16 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// rules used across the tests: kubectl any-version, terraform pinned to 1.7, jq
+// rules used across the tests: kubectl any-version, opentofu pinned to 1.8, jq
 // any-version.
 var testRules = Rules{
-	"kubectl":   {},
-	"terraform": {PinnedVersion: "1.7"},
-	"jq":        {},
+	"kubectl":  {},
+	"opentofu": {PinnedVersion: "1.8"},
+	"jq":       {},
 }
 
 func TestAllowed(t *testing.T) {
-	ok := []string{"kubectl", "kubectl@1.31", "jq", "terraform@1.7"}
+	ok := []string{"kubectl", "kubectl@1.31", "jq", "opentofu@1.8"}
 	for _, p := range ok {
 		if !Allowed(p, testRules) {
 			t.Errorf("Allowed(%q) = false, want true", p)
@@ -30,9 +30,9 @@ func TestAllowed(t *testing.T) {
 	bad := []string{
 		"", "not-a-real-pkg", "kubectl; rm -rf /", "../etc", "kubectl kubectl",
 		"$(whoami)", "jq&", "kube ctl", "kubectl@", "@1.0",
-		"terraform",     // pinned rule requires @1.7
-		"terraform@1.6", // wrong pinned version
-		"terraform@",    // malformed
+		"opentofu",     // pinned rule requires @1.8
+		"opentofu@1.6", // wrong pinned version
+		"opentofu@",    // malformed
 	}
 	for _, p := range bad {
 		if Allowed(p, testRules) {
@@ -55,12 +55,12 @@ func TestWellFormed(t *testing.T) {
 }
 
 func TestResolveFiltersAndDedups(t *testing.T) {
-	allowed, rejected := Resolve([]string{"kubectl@1.31", "evil; rm", "jq", "kubectl@1.31", "  terraform@1.7  ", "nope", "terraform@9"}, testRules)
-	if !reflect.DeepEqual(allowed, []string{"jq", "kubectl@1.31", "terraform@1.7"}) {
-		t.Fatalf("allowed = %v, want [jq kubectl@1.31 terraform@1.7]", allowed)
+	allowed, rejected := Resolve([]string{"kubectl@1.31", "evil; rm", "jq", "kubectl@1.31", "  opentofu@1.8  ", "nope", "opentofu@9"}, testRules)
+	if !reflect.DeepEqual(allowed, []string{"jq", "kubectl@1.31", "opentofu@1.8"}) {
+		t.Fatalf("allowed = %v, want [jq kubectl@1.31 opentofu@1.8]", allowed)
 	}
-	if !reflect.DeepEqual(rejected, []string{"evil; rm", "nope", "terraform@9"}) {
-		t.Fatalf("rejected = %v, want [evil; rm nope terraform@9]", rejected)
+	if !reflect.DeepEqual(rejected, []string{"evil; rm", "nope", "opentofu@9"}) {
+		t.Fatalf("rejected = %v, want [evil; rm nope opentofu@9]", rejected)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestWellFormedLengthCap(t *testing.T) {
 func TestRulesFromRows(t *testing.T) {
 	rows := []store.ToolAllowlist{
 		{Name: "kubectl"},
-		{Name: "terraform", PinnedVersion: pgtype.Text{String: "1.7", Valid: true}},
+		{Name: "opentofu", PinnedVersion: pgtype.Text{String: "1.8", Valid: true}},
 	}
 	rules := RulesFromRows(rows)
 	if len(rules) != 2 {
@@ -113,15 +113,15 @@ func TestRulesFromRows(t *testing.T) {
 	if rules["kubectl"].PinnedVersion != "" {
 		t.Errorf("kubectl should have no pinned version, got %q", rules["kubectl"].PinnedVersion)
 	}
-	if rules["terraform"].PinnedVersion != "1.7" {
-		t.Errorf("terraform pinned = %q, want 1.7", rules["terraform"].PinnedVersion)
+	if rules["opentofu"].PinnedVersion != "1.8" {
+		t.Errorf("opentofu pinned = %q, want 1.8", rules["opentofu"].PinnedVersion)
 	}
 	// The projected rules drive Resolve identically at write + claim time.
-	allowed, rejected := Resolve([]string{"kubectl", "terraform@1.7", "terraform@9"}, rules)
-	if !reflect.DeepEqual(allowed, []string{"kubectl", "terraform@1.7"}) {
+	allowed, rejected := Resolve([]string{"kubectl", "opentofu@1.8", "opentofu@9"}, rules)
+	if !reflect.DeepEqual(allowed, []string{"kubectl", "opentofu@1.8"}) {
 		t.Fatalf("allowed = %v", allowed)
 	}
-	if !reflect.DeepEqual(rejected, []string{"terraform@9"}) {
+	if !reflect.DeepEqual(rejected, []string{"opentofu@9"}) {
 		t.Fatalf("rejected = %v", rejected)
 	}
 }

@@ -129,6 +129,11 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			SkillsMaxPerRun:        32,
 			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
 			RepoDevboxOptIn:        false,                          // M5 wires the toggle; false until then
+			// PRD #123 M1b: the Decision 6 denylist base names ride the claim so the worker
+			// filters tier-2 (repo devbox.json) packages by base name. A small NON-EMPTY
+			// subset here (the real list is the full denylist) pins the wire key + shape
+			// across the language boundary; the TS contract test deep-equals this value.
+			DeniedToolPackages: []string{"glab", "vault"},
 			// PRD #305 M3: OverrideSubagentModel is deliberately LEFT at its zero value
 			// here, unlike the other flags in this fixture. It carries omitempty, so an off
 			// run omits the key and its claim is byte-identical to today's wire — the exact

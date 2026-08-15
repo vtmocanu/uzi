@@ -32,7 +32,7 @@ function entry(over: Partial<ToolAllowlistEntry> & Pick<ToolAllowlistEntry, "id"
 
 const ENTRIES: ToolAllowlistEntry[] = [
   entry({ id: "t-kubectl", name: "kubectl", note: "k8s repos" }),
-  entry({ id: "t-terraform", name: "terraform", pinned_version: "1.7" }),
+  entry({ id: "t-opentofu", name: "opentofu", pinned_version: "1.7" }),
 ];
 
 beforeEach(() => {
@@ -53,7 +53,7 @@ describe("ToolAllowlist admin page", () => {
     </MemoryRouter>,
   );
     expect(await screen.findByText("kubectl")).toBeTruthy();
-    expect(screen.getByText("terraform")).toBeTruthy();
+    expect(screen.getByText("opentofu")).toBeTruthy();
     // The pinned version renders; the any-version entry shows "any".
     expect(screen.getByText("= 1.7")).toBeTruthy();
     expect(screen.getAllByText("any").length).toBeGreaterThan(0);

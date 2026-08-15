@@ -10,7 +10,7 @@ import path from "node:path";
 import type { Logger } from "./log.js";
 import type { RunContext } from "./executor.js";
 import { provisionTools } from "./provision.js";
-import { extractRepoDevboxPackages, mergeToolPackages } from "./repo-tools.js";
+import { extractRepoDevboxPackages, mergeToolPackages, filterDeniedPackages } from "./repo-tools.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** Reason prefix for a FATAL provisioning failure. Tier-1 (uzi-stored) failure
@@ -65,8 +65,20 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   // comment-tolerant (JSONC) parse; nothing in the manifest is executed.
   if (ctx.config?.repo_devbox_opt_in) {
     const repoPackages = await extractRepoDevboxPackages(ctx.worktreePath);
-    if (repoPackages.length > 0) {
-      toolPackages = mergeToolPackages(tier1, repoPackages);
+    // PRD #123 M1b: apply the server's Decision 6 denylist to TIER-2 (repo) packages
+    // ONLY, dropping any credential-bearing CLI (glab/gh/aws/vault/…) a repo's own
+    // devbox.json declares. Tier-1 (tool_packages) is already denylist-checked
+    // server-side and is NEVER filtered here. Absent list (older server) ⇒ keep all.
+    const { kept, dropped } = filterDeniedPackages(repoPackages, ctx.config?.denied_tool_packages ?? []);
+    if (dropped.length > 0) {
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `dropped ${dropped.length} tool(s) from this repo's devbox.json blocked by policy: ${dropped.join(", ")}` },
+      });
+    }
+    if (kept.length > 0) {
+      toolPackages = mergeToolPackages(tier1, kept);
       // mergeToolPackages preserves tier-1 order then appends surviving tier-2
       // entries, so anything beyond tier1.length is a tier-2-only add.
       tier2Added = toolPackages.length - tier1.length;

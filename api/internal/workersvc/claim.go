@@ -301,6 +301,17 @@ type ClaimConfig struct {
 	// packages into the provisioned set (PRD #18 M5). Delivered from M3 but always
 	// false until M5 wires the per-repo trust toggle.
 	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
+	// DeniedToolPackages is the server's Decision 6 denylist BASE NAMES (PRD #123 M1b),
+	// shipped so the worker applies the SAME credential-CLI policy to TIER-2 (repo
+	// devbox.json opt-in) packages, which are filtered by shape server-side and so are
+	// never denylist-checked there. The worker drops any tier-2 package whose base name
+	// is in this set before provisioning (repo-tools.ts filterDeniedPackages). It is a
+	// compile-time constant list (toolprofile.DenylistNames), NOT a per-run DB read, and
+	// applies to tier-2 ONLY — tier-1 is already denylist-checked server-side and must
+	// never be filtered locally. Always sent as a non-nil slice (`[]`, never null),
+	// matching ToolPackages; an old worker that ignores the key keeps today's behavior
+	// (no tier-2 denylist filtering).
+	DeniedToolPackages []string `json:"denied_tool_packages"`
 	// CIConfigPaths is the ci_fix run's guard watch set (PRD #71 M2): the CI-config
 	// glob patterns a fix may touch, resolved server-side at queue time. omitempty is
 	// REQUIRED — a non-ci_fix run's runs.ci_config_paths column is NULL, so the field

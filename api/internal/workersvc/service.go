@@ -46,6 +46,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolseed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
 
@@ -1859,6 +1860,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			SkillsMaxPerRun:       s.p.SkillsMaxPerRun,
 			ToolPackages:          toolPackages,
 			RepoDevboxOptIn:       rc.RepoDevboxOptIn,
+			// PRD #123 M1b: ship the Decision 6 denylist base names so the worker applies
+			// the same credential-CLI policy to TIER-2 (repo devbox.json opt-in) packages,
+			// which are shape-filtered server-side and so never denylist-checked there.
+			// Compile-time constant list (no new DB read); always a non-nil slice.
+			DeniedToolPackages: toolprofile.DenylistNames(),
 			// PRD #71 M2: nil for non-ci_fix runs (column NULL) → omitted by omitempty.
 			CIConfigPaths: run.CiConfigPaths,
 		},
@@ -1997,6 +2003,20 @@ func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackag
 	allowed, rejected := toolprofile.Resolve(desired, rules)
 	if len(rejected) > 0 {
 		return nil, fmt.Errorf("%w: %s", errToolPackagesRejected, strings.Join(rejected, ", "))
+	}
+	// PRD #123 M3 (Decision 4c): an allowlisted package that is not in the baked
+	// worker toolchain cannot be provisioned behind the egress block, so fail the
+	// claim here rather than let the run hang at 0 iterations. Wrap
+	// errToolPackagesRejected so recoverClaimAssembly's existing terminal handling
+	// applies (the run is failed with the offending names, never secret bytes).
+	var unbaked []string
+	for _, p := range allowed {
+		if !toolseed.Covered(p) {
+			unbaked = append(unbaked, p)
+		}
+	}
+	if len(unbaked) > 0 {
+		return nil, fmt.Errorf("%w: not in baked toolchain (image roll required): %s", errToolPackagesRejected, strings.Join(unbaked, ", "))
 	}
 	if allowed == nil {
 		allowed = []string{} // always send an array, never null (wire contract)

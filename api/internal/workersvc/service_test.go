@@ -1212,8 +1212,28 @@ func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
 
 func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 	fs := &fakeStore{
-		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","terraform"]`)},
-		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // terraform removed after the profile was saved
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","opentofu"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // opentofu removed after the profile was saved
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
+	if !errors.Is(err, errToolPackagesRejected) {
+		t.Fatalf("err = %v, want errToolPackagesRejected", err)
+	}
+	if !strings.Contains(err.Error(), "opentofu") {
+		t.Fatalf("error should name the rejected package: %v", err)
+	}
+}
+
+func TestResolveToolingRejectsAllowlistedButUnbakedPackage(t *testing.T) {
+	// PRD #123 M3 (Decision 4c): a package that is on the allowlist but NOT in the
+	// baked worker toolchain (a grandfathered row that predates the write-time
+	// gate) fails the claim here rather than hanging the run behind the egress
+	// block. `terraform` is allowlist-shaped but not baked (swapped off for
+	// opentofu, and unfree anyway), so it is not toolseed.Covered.
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["jq","terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "jq"}, {Name: "terraform"}},
 	}
 	svc := New(fs, newBox(t), testParams())
 	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
@@ -1221,7 +1241,10 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 		t.Fatalf("err = %v, want errToolPackagesRejected", err)
 	}
 	if !strings.Contains(err.Error(), "terraform") {
-		t.Fatalf("error should name the rejected package: %v", err)
+		t.Fatalf("error should name the unbaked package: %v", err)
+	}
+	if !strings.Contains(err.Error(), "baked toolchain") {
+		t.Fatalf("error should explain the unbaked reason: %v", err)
 	}
 }
 
@@ -1247,7 +1270,7 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 		claimRun:      store.Run{ID: uuid.New(), Status: "claimed"},
 		claimCtx:      store.GetRunClaimContextRow{TokenCiphertext: sealedPAT, RepoWebUrl: "https://x/y", BotUsername: "uzi-bot"},
 		anthropic:     sealedTok,
-		toolProfile:   store.RepoToolProfile{Packages: []byte(`["terraform"]`)},
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["opentofu"]`)},
 		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
 	}
 	svc := New(fs, box, testParams())
@@ -1261,7 +1284,7 @@ func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
 	if fs.markedFailed == nil {
 		t.Fatal("the run should have been marked failed")
 	}
-	if !strings.Contains(fs.markedFailed.FailureReason.String, "terraform") {
+	if !strings.Contains(fs.markedFailed.FailureReason.String, "opentofu") {
 		t.Fatalf("failure reason should name the rejected package: %+v", fs.markedFailed.FailureReason)
 	}
 }
