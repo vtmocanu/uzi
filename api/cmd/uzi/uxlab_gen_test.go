@@ -84,6 +84,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-running":           func(d bool) string { return detailRunning(d, now) },
 		"detail-stalled":           func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval": func(d bool) string { return detailAwaitingApproval(d, now) },
+		"detail-awaiting-input":    func(d bool) string { return detailAwaitingInput(d, now) },
 		"detail-limit-wait":        func(d bool) string { return detailLimitWait(d, now) },
 		"detail-degraded":          func(d bool) string { return detailDegraded(d, now) },
 		"detail-steer-typing":      func(d bool) string { return detailSteerTyping(d, now) },
@@ -234,6 +235,20 @@ func detailAwaitingApproval(dark bool, now time.Time) string {
 		IssueTitle: "Add rate-limit headroom to the scheduler poll"}
 	msgs := []apitypes.MessageDTO{
 		msgDTO(1, "text", "lead", "", "", "## Plan\n\n1. Back off `pollInterval` when the usage window is within 10% of the cap.\n2. Add a unit test for the near-cap case.\n3. Open an MR against a feature branch.\n\nReady for approval.", now.Add(-2*time.Minute)),
+	}
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, detailRunID, dark)
+	m = step(m, detailLoadedMsg{run: run, msgs: msgs})
+	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
+	m = withLiveStream(m)
+	return m.View().Content
+}
+
+func detailAwaitingInput(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
+		IssueTitle: "Clarify the target branch for the fix"}
+	msgs := []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "Which branch should the MR target: the default branch, or a release branch? I'll wait for your answer before opening it.", now.Add(-1*time.Minute)),
 	}
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)

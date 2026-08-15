@@ -220,7 +220,6 @@ func TranscriptExtent(p Palette, r Run, selLane, height int) (total, viewport in
 // transcript follows live (auto-tails) unless the reader has scrolled back.
 func RenderDetail(p Palette, r Run, focus, selLane, scroll int, following bool, width, height int) string {
 	sc := p.rowColor(r.Status, r.Health)
-	needsHuman := r.Status == "awaiting_approval" || r.Status == "awaiting_input"
 
 	var sb strings.Builder
 	ctx := p.fg(p.muted).Render("run ") + p.fg(p.ink).Bold(true).Render(r.ID) + "  " +
@@ -248,20 +247,37 @@ func RenderDetail(p Palette, r Run, focus, selLane, scroll int, following bool, 
 
 	sb.WriteString(joinColumns(p, rail, trans, laneRailWidth, vp+1) + "\n")
 
-	// The keymap is ONE compact line (bracketless, middot-separated) so it never wraps at a
-	// normal width. At a plan gate the banner carries the context, so the footer leads with
-	// approve/reject and drops review (a judge review only exists after a run finishes).
-	if needsHuman {
-		banner := lipgloss.NewStyle().Background(sc).Foreground(p.chipFg).Bold(true).
-			Width(width-1).Padding(0, 1).Render("⚑  PLAN GATE · this run is waiting on your approval")
-		sb.WriteString(banner + "\n")
+	// S3: TWO DISTINCT banners. awaiting_approval → PLAN GATE (approve/reject); awaiting_input
+	// → a needs-input banner that does NOT offer y/n (a clarification park is answered
+	// off-TUI). Both are BORDERED so they survive NO_COLOR (D3). The keymap is one compact
+	// line.
+	switch r.Status {
+	case "awaiting_approval":
+		sb.WriteString(attentionBanner(p, "⚑  PLAN GATE", "this run is waiting on your approval", width) + "\n")
 		sb.WriteString(p.hintbar(p.hint("y", "approve"), p.hint("n", "reject"), p.hint("f", "follow-up"),
 			p.hint("x", "cancel"), p.hint("←→", "pane"), p.hint("↑↓", "move"), p.hint("esc", "back"), p.hint("?", "keys")))
-	} else {
+	case "awaiting_input":
+		sb.WriteString(attentionBanner(p, "✎  NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", width) + "\n")
+		sb.WriteString(p.hintbar(p.hint("←→", "pane"), p.hint("↑↓", "move"), p.hint("f", "follow-up"),
+			p.hint("x", "cancel"), p.hint("esc", "back"), p.hint("?", "keys")))
+	default:
 		sb.WriteString(p.hintbar(p.hint("←→", "pane"), p.hint("↑↓", "move"), p.hint("g", "live"), p.hint("f", "follow-up"),
 			p.hint("v", "review"), p.hint("x", "cancel"), p.hint("esc", "back"), p.hint("?", "keys")))
 	}
 	return sb.String()
+}
+
+// attentionBanner is the bordered amber needs-you banner. The rounded border is the
+// NO_COLOR fallback: the amber fill/foreground is stripped under an Ascii profile but the
+// box and bold text survive, keeping the gate unmissable without colour.
+func attentionBanner(p Palette, head, body string, width int) string {
+	c := p.statusColor("awaiting_approval")
+	inner := width - 4
+	if inner < 20 {
+		inner = 20
+	}
+	text := lipgloss.NewStyle().Bold(true).Foreground(c).Render(head) + p.fg(p.faint).Render("  ·  ") + body
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c).Padding(0, 1).Width(inner).Render(text)
 }
 
 // paneTitle renders a pane's title with a focus indicator: a bright brand bar + bold title

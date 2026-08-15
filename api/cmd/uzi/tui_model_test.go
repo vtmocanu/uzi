@@ -198,6 +198,76 @@ func TestTUIQuitIsConfirmed(t *testing.T) {
 	}
 }
 
+// M3: the plan gate shows the amber PLAN GATE banner and, for the OWNER, promoted
+// approve/reject keycaps; the detail header carries a semantic status chip.
+func TestTUIDetailPlanGateBanner(t *testing.T) {
+	runID := "pg-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // err nil → owner → steerAllowed
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "PLAN GATE") {
+		t.Errorf("plan-gate banner missing\n%s", out)
+	}
+	for _, want := range []string{"[y]", "approve", "[n]", "reject"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan gate does not promote %q for the owner\n%s", want, out)
+		}
+	}
+	// The header status chip is a solid colour fill (a truecolor background SGR).
+	if !strings.Contains(out, "\x1b[48;2;") {
+		t.Errorf("detail header has no status chip fill\n%s", out)
+	}
+}
+
+// M3 S3: awaiting_input gets a DISTINCT banner and NEVER offers y/n — those keys do
+// nothing at a clarification park (which is answered off-TUI).
+func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
+	runID := "in-1"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_input"}})
+	m = next.(tuiModel)
+	next, _ = m.Update(runInputsMsg{runID: runID}) // owner
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "NEEDS INPUT") {
+		t.Errorf("awaiting_input banner missing\n%s", out)
+	}
+	if strings.Contains(out, "PLAN GATE") {
+		t.Errorf("awaiting_input must NOT show the plan-gate banner\n%s", out)
+	}
+	if strings.Contains(out, "[y]") || strings.Contains(out, "approve") {
+		t.Errorf("awaiting_input offered approve/reject, which does nothing at a clarification park\n%s", out)
+	}
+}
+
+// M3 N1: the plan-gate banner shows for a NON-OWNER (informational), but the promoted
+// approve/reject keys are ownership-gated and must not appear.
+func TestTUIDetailPlanGateBannerNonOwnerHasNoKeys(t *testing.T) {
+	runID := "pg-2"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "awaiting_approval"}})
+	m = next.(tuiModel)
+	// RunInputs 404 → steerNotOwner (an admin observing another user's run).
+	next, _ = m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitNotFound, "not found")})
+	m = next.(tuiModel)
+	out := m.View().Content
+
+	if !strings.Contains(out, "PLAN GATE") {
+		t.Errorf("the plan-gate banner must show even for a non-owner\n%s", out)
+	}
+	if strings.Contains(out, "[y]") || strings.Contains(out, "approve") {
+		t.Errorf("a non-owner must not be offered approve/reject keys\n%s", out)
+	}
+	if !strings.Contains(out, "read-only") {
+		t.Errorf("the non-owner steer bar should explain it is read-only\n%s", out)
+	}
+}
+
 // The detail view: replay builds lanes, and a live frame extends them.
 func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
 	now := time.Now()

@@ -244,8 +244,11 @@ func TestSteerApproveOnlyAtThePlanGate(t *testing.T) {
 	gate := ownedRun(runID)
 	gate.Status = "awaiting_approval"
 	m := ownerModel(t, &uzicli.FakeClient{}, runID, gate)
-	if !strings.Contains(m.View().Content, "y approve") {
-		t.Error("the approve key is not offered at the plan gate")
+	// M3 promotes the plan-gate keys to bright keycaps ([y] approve / [n] reject), so the
+	// key and its label are asserted separately (a styled span sits between them).
+	content := m.View().Content
+	if !strings.Contains(content, "[y]") || !strings.Contains(content, "approve") {
+		t.Errorf("the approve key is not offered at the plan gate\n%s", content)
 	}
 	_, cmd := m.handleKey(keyConfirmY)
 	if cmd == nil {
@@ -349,7 +352,9 @@ func TestSteerBarSuppressedOnATerminalRun(t *testing.T) {
 			// message itself says "follow-ups, approvals and cancel are refused", so a
 			// Contains(out, "follow-up") matches the explanation and fails on correct
 			// code. It did. The hints are what a user could actually press.
-			for _, hint := range []string{"f follow-up", "x cancel run", "y approve", "n reject"} {
+			// The promoted plan-gate keys render as "[y]"/"[n]" (M3); the other verbs stay
+			// literal. All must be absent when the bar is suppressed.
+			for _, hint := range []string{"f follow-up", "x cancel run", "[y]", "[n]"} {
 				if strings.Contains(out, hint) {
 					t.Errorf("a %s run still offers %q; every steer verb is refused server-side with ErrRunTerminal\n%s", status, hint, out)
 				}

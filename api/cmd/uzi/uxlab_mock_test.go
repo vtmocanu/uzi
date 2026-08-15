@@ -61,6 +61,12 @@ func TestGenerateUXLabMocks(t *testing.T) {
 		"mock-detail-awaiting-approval": func(dark bool) string {
 			return factoryui.RenderDetail(factoryui.NewPalette(dark), runByStatus("awaiting_approval"), factoryui.FocusTranscript, 0, 0, false, frameWidth, 30)
 		},
+		"mock-detail-awaiting-input": func(dark bool) string {
+			r := runByStatus("awaiting_approval")
+			r.Status = "awaiting_input"
+			r.Title = "Clarify the target branch for the fix"
+			return factoryui.RenderDetail(factoryui.NewPalette(dark), r, factoryui.FocusTranscript, 0, 0, false, frameWidth, 30)
+		},
 		"mock-detail-limit-wait": func(dark bool) string {
 			return factoryui.RenderDetail(factoryui.NewPalette(dark), runByStatus("limit_wait"), factoryui.FocusTranscript, 0, 0, false, frameWidth, 30)
 		},

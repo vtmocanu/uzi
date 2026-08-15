@@ -173,18 +173,22 @@ func (m tuiModel) renderDetail() string {
 	d := &m.detail
 	var sb strings.Builder
 
-	head := "run " + shortRunID(d.runID)
+	// Header: id + a kind chip + a semantic STATUS chip (PRD #325 M3, reading M2's
+	// statusColor/chip seam — this milestone does NOT edit tui_render.go). Health "stalled"
+	// already shows as an orange status chip via the precedence rule; any other non-ok
+	// health is appended as a word so it is not lost.
+	head := m.pal.faint.Render("run ") + m.pal.title.Render(shortRunID(d.runID))
 	if d.run.ID != "" {
-		head += " · " + m.renderer.Plain(d.run.Status, 20)
-		if h := d.run.Health; h != "" && h != "ok" {
-			head += " · " + m.renderer.Plain(h, 20)
+		if d.run.Kind != "" {
+			head += "  " + m.pal.chip(m.renderer.Plain(d.run.Kind, 10), m.pal.title.GetForeground())
 		}
+		head += "  " + m.pal.chip(m.renderer.Plain(d.run.Status, 18), m.pal.statusColor(d.run.Status, d.run.Health))
+		if h := d.run.Health; h != "" && h != "ok" && h != "stalled" {
+			head += "  " + m.renderer.Plain(h, 14)
+		}
+		head += "  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60))
 	}
-	sb.WriteString(m.pal.title.Render(head))
-	if d.run.ID != "" {
-		sb.WriteString("  " + m.pal.faint.Render(m.renderer.Plain(runTitle(d.run), 60)))
-	}
-	sb.WriteString("\n")
+	sb.WriteString(head + "\n")
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -231,9 +235,42 @@ func (m tuiModel) renderDetail() string {
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(joinColumns(rail, body, laneRailWidth))
+	// The attention banner (PRD #325 M3) shows regardless of ownership — it is
+	// informational. The owner-gated action keys live in the steer bar below it.
+	if b := m.detailBanner(); b != "" {
+		sb.WriteString(b + "\n")
+	}
 	sb.WriteString(m.renderSteerBar() + "\n")
 	sb.WriteString(m.pal.faint.Render("tab/h/l lane · j/k scroll · r refresh · esc back · ? keys"))
 	return sb.String()
+}
+
+// detailBanner is the S3 two-banner treatment: awaiting_approval gets the PLAN GATE banner
+// (approve/reject, owner-gated keys in the steer bar); awaiting_input gets a DISTINCT
+// needs-input banner that does NOT offer y/n — those keys do nothing at a clarification
+// park, which is answered off-TUI (run answer / web / Slack). It shows for owner and
+// non-owner alike; only the promoted keys below are gated.
+func (m tuiModel) detailBanner() string {
+	switch m.detail.run.Status {
+	case "awaiting_approval":
+		return m.attentionBanner("⚑  PLAN GATE", "this run is waiting on your approval")
+	case "awaiting_input":
+		return m.attentionBanner("✎  NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack")
+	}
+	return ""
+}
+
+// attentionBanner draws a BORDERED amber banner. The border is the NO_COLOR fallback (D3):
+// under an Ascii profile the amber fill/foreground is stripped but the box and its bold
+// text survive, so the gate stays structurally unmissable (SC2) without colour.
+func (m tuiModel) attentionBanner(head, body string) string {
+	c := m.pal.statusColor("awaiting_approval", "") // the needs-you colour (amber)
+	inner := m.width - 4
+	if inner < 20 {
+		inner = 20
+	}
+	text := lipgloss.NewStyle().Bold(true).Foreground(c).Render(head) + m.pal.faint.Render("  ·  ") + body
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c).Padding(0, 1).Width(inner).Render(text)
 }
 
 func (m tuiModel) renderLaneRail() string {

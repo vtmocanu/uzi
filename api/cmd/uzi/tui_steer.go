@@ -188,13 +188,24 @@ func (m tuiModel) renderSteerBar() string {
 		sb.WriteString(m.pal.title.Render("follow-up> ") + cellText(s.input) + "▌")
 		sb.WriteString("\n" + m.pal.faint.Render("enter send · esc cancel"))
 	default:
-		keys := []string{"f follow-up", "x cancel run", "v review"}
+		// At the plan gate, promote approve/reject to bright keycaps (this branch is only
+		// reached for the owner — a non-owner returned above with the read-only reason, so
+		// the promoted keys are ownership-gated by construction, PRD #325 M3 N1). Every
+		// other action stays a quiet hint.
+		var b strings.Builder
 		if atPlanGate(m.detail.run) {
-			keys = append([]string{"y approve", "n reject"}, keys...)
+			b.WriteString(m.promotedKey("y", "approve") + "   " + m.promotedKey("n", "reject") +
+				m.pal.faint.Render("   ·   "))
 		}
-		sb.WriteString(m.pal.faint.Render(strings.Join(keys, " · ")))
+		b.WriteString(m.pal.faint.Render("f follow-up · x cancel run · v review"))
+		sb.WriteString(b.String())
 	}
 	return sb.String()
+}
+
+// promotedKey renders a bright, high-emphasis keycap ([k] label) for the plan-gate action.
+func (m tuiModel) promotedKey(k, label string) string {
+	return m.pal.title.Render("["+k+"]") + m.pal.faint.Render(" "+label)
 }
 
 func steerVerbLabel(kind string) string {
