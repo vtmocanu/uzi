@@ -15,7 +15,7 @@ Re-checked against `main @ e5ed9161`, ~1 month after drafting. **Nothing here la
   - **M6 is still a genuine gap.** `foldRunUsage` already admits `kind='judge'`, but the runner delivers no result frame and `apitypes.ReviewDTO` has no usage/timing fields; the judge-menu family (#98/#94/#119/#294) built the workbench but never added cost. Uncontested.
   - **M1** is uncontested — the enqueue gate still has no enforce bypass.
   - **M2 is build-now, standalone (updated 2026-08-15).** PRD #229 is **parked** (owner: not landing anytime soon), so its "coordinate first" hold on M2 is lifted. The claim-assembly seam Decision 5 asked for is already proven and in place (PRD #104's `judgeSecretID(ctx, run.UserID)`), and PRD #300 built the identical nullable-model-override-reusing-`ValidateModel` pattern one layer up (and cites #69 as the sibling) — so a standalone `users.judge_model` is mechanically trivial to build now. Residual cost: if #229 *ever* lands it absorbs this as the model-half of a per-user judge `{provider, model}` — a trivial add-a-column migration, the same absorption it already owes #300's per-schedule model. No unique debt.
-  - **M7a is unblocked — #123 merged (updated 2026-08-15).** PRD #123 landed (MR !296; PRD now at `prds/done/123-provisioning-without-github-egress.md`), so its coordination hold is lifted. **Re-scope before building**, because #123 did not ship what it planned: its follow-up corrections (MRs 244/245/246 — *"tier-2 provisions end-to-end, egress not enforced"*, *"retract the docker-tier misread"*, and ADR-285 "worker egress tier trust model") moved the delivered failure-classification and egress story off the plan. So (a) key the trusted closed-enum off the `failure_reason` strings #123 **actually** ships — re-read them, do not trust Decision 11's TypeScript-constant list — and (b) verify whether the #78 github-egress-denied case still exists under #123's tier trust model before building the pre-start gate around it. The pre-start infra-skip gate and the one prompt rule are valid regardless; the judge already *receives* raw `failure_reason`/status/iterations in its prompt header, so M7a's value is "make that input **trusted + closed-enum + prompt-ruled + pre-start-gated**," not "give the judge ground truth it lacks."
+  - **M7a re-scoped against #123's shipped behavior (2026-08-15) — now plain build-now.** #123 landed (MR !296; PRD at `prds/done/123-provisioning-without-github-egress.md`) but shipped differently than planned, and the re-scope changed M7a's mechanism (folded into Decisions 11/12 and Touchpoints M7a below). The load-bearing change: **compute the trusted `failure_class` from the server-owned `status` + `iteration_count` axes and the terminal transition's origin — NOT by parsing `failure_reason` strings**, which the repo documents as never-parse free text in three places (`notifysvc/run_failure_notifier.go`, `workersvc/autostop.go`, `00050_run_stop_kind.sql`); the sanctioned precedent is `limitwait.go`'s `rate_limit_type` closed-enum coercion. The pre-start gate targets the **general** pre-start infra class (`status='failed' AND iteration_count=0`, provisioning/credential/guardrail origin), not the #78 egress case specifically — #123's tier-1 bake gate narrowed egress-denied provisioning to a rare `{kubectl, nodejs}` cold-worker tail. **M7b is now effectively dead** (host-naming retired in #123; #290 already classifies transient-vs-permanent), though still formally deferred.
 - **Keep deferred: M7b.** Unchanged; #123 landing would retire it for good.
 
 **Citations below have rotted — re-derive at implementation time, do not trust them.** As the judge subsystem absorbed #104/#111/#121/#232, roughly a dozen `file.go:NN` references drifted 20–700 lines (e.g. `DefaultJudgeModel` :109→:135, still `"haiku"`; `settings.go:748`→:911; `workersvc/judge.go:138`→:855; `service.go:295/297`→:663/665). One is a *mechanism* change, not just a moved line: Decision 1/5 describe the judge claim reading the owner's OAuth token directly at `judge.go:177`, but PRD #104 made that vault-aware (`openAnthropic`/`cred.Token`). Per the repo's re-derive-at-assertion convention, line numbers are re-resolved when a milestone is picked up, not maintained here.
@@ -96,23 +96,23 @@ visibility, and accuracy build on the enqueue gate and judge paths the first add
    judge stops confidently misclassifying failures whose cause it cannot see
    (Problem 4), split by what the API can already do:
    - **M7a (the shippable core):** (a) the API computes a trusted, **closed-enum**
-     failure-class signal — extending the existing command-not-found pre-scan — from
-     data it already holds (the target run's `status`, `failure_reason`,
-     `iteration_count`), naming causes like `provisioning_failed` /
-     `provisioning_timeout` / `plan_approval_timeout` / `rate_limited`, fed into the
-     judge prompt as data the judge trusts over its own inference; plus one targeted
+     failure-class signal — extending the existing command-not-found pre-scan — from the
+     server-owned trusted axes (the target run's `status` + `iteration_count` + the
+     terminal transition's origin), **not by parsing the free-text `failure_reason`**
+     (re-scoped 2026-08-15, Decision 11), naming causes like `provisioning_failed` /
+     `credential_unavailable` / `plan_rejected` / `rate_limited`, fed into the judge
+     prompt as data the judge trusts over its own inference; plus one targeted
      `JUDGE_SYSTEM_PROMPT` addition (transient≠permanent; no retry for a
      policy/config-denied failure). (b) a **pre-start gate**: a run that failed before
-     the agent started (0 iterations AND an infra-class `failure_reason`) is routed to
-     a deterministic infra notification instead of an opus retrospective — cheaper and
-     more correct. M7a alone prevents both #78 failure modes (the run would not have
-     been judged at all).
-   - **M7b (deferred, low marginal value):** enriching the signal to name the specific
-     unreachable host and cross-check it against the deployment's egress allowlist. As
-     Decision 11 records, the API holds neither the allowlist nor the host today, so
-     this needs new config plumbing and a host source; and the durable fix (pin
-     nixpkgs / pre-seed, issue #82) removes the github dependency entirely, so its
-     marginal value is small. Documented, not built.
+     the agent started (`status='failed'` AND 0 iterations AND a pre-start infra origin)
+     is routed to a deterministic infra notification instead of an opus retrospective —
+     cheaper and more correct.
+   - **M7b (deferred, now effectively dead):** enriching the signal to name the specific
+     unreachable host and cross-check it against the deployment's egress allowlist.
+     #123 (the #82 durable fix) landed 2026-08-15: it retired host-naming, narrowed
+     egress-denied provisioning to a rare `{kubectl, nodejs}` cold-worker tail, and #290
+     already classifies transient-vs-permanent retry — so M7b's motivation is gone.
+     Documented, formally deferred, not to be built.
    Detailed in Decisions 11–12 and M7.
 
 ### Consent surface (enforced mode)
@@ -341,50 +341,66 @@ What does **not** change:
 
 11. **Feed the judge a deterministic, closed-enum failure-class signal; it trusts
     it over its own inference.** Extends an existing pattern: the API already hands
-    the judge a trusted command-not-found pre-scan (`signalBlock`, `judge-runner.ts:310`,
-    assembled API-side). Add a **failure-class signal** over the *target* run,
-    computed from data the API already holds — `status`, `failure_reason`,
-    `iteration_count` (`store.Run`, `store/models.go`) — as a **closed enum**
-    (`provisioning_failed`, `provisioning_timeout`, `plan_approval_timeout`,
-    `rate_limited`, `agent_failure`, …). The `JUDGE_SYSTEM_PROMPT` gains ONE targeted
-    addition (the only prompt change this PRD makes — see the Out-of-Scope carve-out):
-    a network timeout is not automatically transient, and retry/backoff must not be
-    recommended for a policy- or config-denied failure. **Why signals over "make the
-    model smarter":** the judge failed here from missing inputs, not weak reasoning —
-    given the ground truth, "transient → retry" is not a reachable conclusion.
-    - **Trust boundary:** the signal is trusted API-computed data (like the
-      command-not-found scan), so it sits OUTSIDE the untrusted-trace fence. Because of
-      that it MUST be the enum value plus, at most, a **syntax-validated FQDN token** —
-      never interpolated raw `failure_reason` text (worker-reported and untrusted;
-      interpolating it would write attacker-controlled text into the judge's trusted
-      zone).
-    - **Cross-language coupling:** the infra classes are matched from `failure_reason`
-      prefixes authored in TypeScript (e.g. `REASON_PROVISION_FAILED`,
-      `agent/src/provision-run.ts:17`) plus API-side sweeper reasons. Enumerate the
-      recognized prefixes in one place; a reworded agent constant silently un-classes.
-    - **Egress-allowlist cross-check is M7b, and infeasible today (deferred).** Naming
-      the specific unreachable host and checking it against `workers.fqdnEgress.allowFQDNs`
-      is NOT buildable from what the API holds: the allowlist exists only as a Helm value
-      rendered into an Antrea CRD (`deploy/chart/templates/worker-fqdn-egress.yaml`),
-      nothing under `api/` reads it, and `failure_reason` carries no hostname
-      (`provision.ts:184` is a generic message). M7b would need (a) the allowlist fed to
-      the API (e.g. a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env, empty = no policy)
-      and (b) a host source (worker-side enrichment or a run-stream scan). Given the
-      durable fix (pin nixpkgs / pre-seed, issue #82) removes the github dependency
-      entirely and M7b is infeasible today, M7a's class-only signal plus the prompt
-      rule is the justified scope.
+    the judge a trusted command-not-found pre-scan (`signalBlock`, assembled API-side).
+    Add a **failure-class signal** over the *target* run, computed API-side as a
+    **closed enum** (`provisioning_failed`, `credential_unavailable`, `plan_rejected`,
+    `run_timeout`, `worker_lost`, `rate_limited`, `agent_failure`, …). The
+    `JUDGE_SYSTEM_PROMPT` gains ONE targeted addition (the only prompt change this PRD
+    makes — see the Out-of-Scope carve-out): a network timeout is not automatically
+    transient, and retry/backoff must not be recommended for a policy- or config-denied
+    failure. **Why signals over "make the model smarter":** the judge failed here from
+    missing inputs, not weak reasoning — given the ground truth, "transient → retry" is
+    not a reachable conclusion.
+    - **Re-scoped 2026-08-15 (#123 landed) — derive from trusted AXES, never parse
+      `failure_reason`.** #123's investigation surfaced a load-bearing repo invariant:
+      `failure_reason` is documented as never-parse free text in three places
+      (`notifysvc/run_failure_notifier.go`, `workersvc/autostop.go`, migration
+      `00050_run_stop_kind.sql`), and structured signals (`stop_kind`, `rate_limit_type`)
+      exist precisely so nobody string-matches it. So compute the class from the
+      SERVER-OWNED trusted axes — `status` + `iteration_count` (both already on the judge
+      claim, see Touchpoints M7a) plus the *origin* of the terminal transition (which
+      claim-assembly sentinel fired — `errCredentialUnavailable` / `errToolPackagesRejected`
+      / `errGuardrailBlockedClaim`, or which sweeper/limit path set the state) — and never
+      from the reason string. The sanctioned precedent is `limitwait.go`'s `rate_limit_type`
+      closed-enum coercion; this signal follows it. (This is the single biggest change
+      from #69's original Decision 11, which assumed keying off `failure_reason` prefixes.)
+    - **Trust boundary:** the signal is trusted because it is derived from server-owned
+      axes, like the command-not-found scan, so it sits OUTSIDE the untrusted-trace
+      fence. It is the enum value ONLY — no host token (host-naming was retired in #123)
+      and no interpolated `failure_reason` text. `failure_reason` never enters the
+      trusted zone.
+    - **No cross-language string coupling (was Decision 11's biggest risk, now removed).**
+      The class is authored entirely API-side from the transition origin + server axes,
+      NOT by matching `failure_reason` prefixes across the TS/Go boundary, so a reworded
+      agent constant cannot silently un-class a run. The one worker-origin pre-start case,
+      `REASON_PROVISION_FAILED` (`agent/src/provision-run.ts:19`, always
+      `iteration_count=0`), is recognized by the `status='failed' AND iteration_count=0`
+      shape, not by its text.
+    - **M7b (egress-allowlist / host cross-check) is now effectively dead, not merely
+      deferred.** #123 retired host-naming (the reason carries no hostname), its tier-1
+      bake gate (`toolseed.Covered()`) narrowed egress-denied provisioning to a rare
+      `{kubectl, nodejs}` cold-standard-tier tail, and #290's `classifyDevboxError`
+      already classifies transient-vs-permanent retry. So M7a's class-only signal plus the
+      prompt rule is the full justified scope; M7b stays formally deferred but should not
+      be built.
 
 12. **Don't judge a run that never started; route pre-start infra failures to a
     deterministic notification.** A run that failed before the agent began
-    (`iteration_count=0` **AND** an infra-class `failure_reason` — the conjunction
-    matters: 0 iterations alone also matches an agent that started and crashed before
-    its first iteration report, which is judgeable) has no agent behavior to
-    retrospect — the judge's actual strength. Gate it in `maybeEnqueueJudge` (a sibling
-    of the M5 spend-guard Gate 5, after Gates 2–4, so a judge-disabled or token-less
-    user gets nothing — this is a judge *replacement*, not a general failure notifier).
-    This is both an **accuracy** fix (no hallucinated agent-quality verdict on an infra
-    failure) and a **spend** fix (the single most expensive per-run call — Decision 1 —
-    is not fired on a run that did nothing), so it composes with the M5 guards.
+    (`status='failed'` **AND** `iteration_count=0` **AND** a pre-start infra/config
+    origin — the conjunction matters: 0 iterations alone also matches an agent that
+    started and crashed before its first iteration report, which is judgeable) has no
+    agent behavior to retrospect — the judge's actual strength. **Re-scoped 2026-08-15:**
+    the gate targets the GENERAL pre-start infra class — worker `REASON_PROVISION_FAILED`
+    plus the API-side claim-assembly terminals (`errCredentialUnavailable`,
+    `errToolPackagesRejected`, `errGuardrailBlockedClaim`) and `REASON_NO_TOKEN` — NOT
+    the #78 github-egress case specifically (which #123 narrowed to a rare tail). The
+    origin is read from trusted axes (Decision 11), never by parsing `failure_reason`.
+    Gate it in `maybeEnqueueJudge` (a sibling of the M5 spend-guard Gate 5, after
+    Gates 2–4, so a judge-disabled or token-less user gets nothing — this is a judge
+    *replacement*, not a general failure notifier). This is both an **accuracy** fix (no
+    hallucinated agent-quality verdict on an infra failure) and a **spend** fix (the
+    single most expensive per-run call — Decision 1 — is not fired on a run that did
+    nothing), so it composes with the M5 guards.
     - **Notifier dependency:** `workersvc` has no user-notification capability today
       (`notifysvc.Notify` is called from the handler layer; `selfimprove/engine.go` is
       the in-package precedent), so the gate needs a notifier **injected into the
@@ -524,29 +540,46 @@ independent of M1/M2/M3/M5 — touches disjoint files):
   their usage totals and on the run's review panel.
 
 **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)** (folded from
-issue #81; touches the enqueue gate + the judge prompt assembly):
-- `api/internal/workersvc/judge*.go`: compute a closed-enum `failure_class` over the
-  **target** run (in the `judgeSignal`-style path, `judge.go:196` — note that in
-  `assembleJudgeClaim` the `run` var is the *judge* run, so read the target run's
-  `status`/`failure_reason`/`iteration_count`), carried on the judge claim alongside the
-  existing command-not-found `judge_signal`. Enumerate the recognized infra
-  `failure_reason` prefixes in one place (coupled to the TS constants, e.g.
-  `provision-run.ts:17`). New gate (sibling to M5's Gate 5, after Gates 2–4) in
-  `maybeEnqueueJudge`: `iteration_count=0` AND infra-class reason → skip the judge and
-  fire a deterministic infra notification via a notifier **newly injected into
-  `workersvc`** (selfimprove engine is the precedent), with its own idempotency
-  (per-run key / stamped column).
-- `agent/src/judge-runner.ts`: `buildJudgePrompt` (`:293`) renders the enum
-  `failure_class` in the trusted (pre-fence) signal block next to `signalBlock` (`:310`)
-  — enum value + at most a syntax-validated FQDN token, never raw `failure_reason`;
-  amend `JUDGE_SYSTEM_PROMPT` (`:65`) with the transient≠permanent /
-  no-retry-for-policy rule. The trace fence and no-tools discipline are unchanged.
-- Tests: `workersvc/judge_*_test.go` (class derivation incl. the provisioning-timeout
-  case; a 0-iteration infra run is notified not enqueued; an agent-crash-at-iteration-0
-  run is still judged) and `agent/test/judge-runner.test.ts` (the class reaches the
-  prompt in the trusted block; the prompt carries the rule).
+issue #81; re-scoped 2026-08-15 against #123's shipped behavior — see Decisions 11/12.
+Line refs below are current as of that date but re-derive at implement time):
+- `api/internal/workersvc/judge.go`: compute a closed-enum `failure_class` over the
+  **target** run and carry it on the claim beside the existing command-not-found signal
+  (`JudgeSignal` struct at `judge.go:74-80`, assembled in the `judgeSignal` path at
+  `judge.go:964`). **Derive it from the SERVER-OWNED trusted axes, NOT `failure_reason`**
+  (never-parse, Decision 11): `assembleJudgeClaim` (`judge.go:855`) already puts `Status`
+  and `IterationCount` on the `ClaimPayload` (built `:917-951`; `Status` `:922`,
+  `IterationCount` `:929`, `JudgeSignal` `:925`), and the terminal transition's origin is
+  known API-side — the claim-assembly sentinels `errCredentialUnavailable` /
+  `errToolPackagesRejected` / `errGuardrailBlockedClaim` (`service.go:1074-1076`), the
+  sweeper/limit paths, and worker `REASON_PROVISION_FAILED` recognized by the
+  `status='failed' AND iteration_count=0` shape. Model it on `limitwait.go`'s
+  `rate_limit_type` coercion. **Name collision:** `failure_class` is already a slog key in
+  `autostop.go` (an unrelated `persistFailKind`) — this is a claim/DTO field, do not
+  collide. (`failure_reason` stays off the claim; the worker can read target
+  `status`/`iteration_count` via the trace DTO `handler/judge_worker.go:36-49`, TS mirror
+  `agent/src/protocol.ts:615-628`, if any part is rendered worker-side.)
+- New gate in `maybeEnqueueJudge` (`judge_enqueue.go:44`; Gate 0 = `status ∈
+  {completed,failed}` at `:45-48`, and the incoming `store.Run` carries `IterationCount`
+  and `FailureReason`), sibling to M5's Gate 5, after Gates 2–4: `status='failed' AND
+  iteration_count=0 AND pre-start infra origin` → skip the judge and fire a deterministic
+  infra notification. A run-failure notifier already exists (`notifysvc/run_failure_notifier.go`,
+  which gates on `stop_kind`, never `failure_reason`) — route the notify half through it
+  or the injected notifysvc seam (selfimprove is the in-`workersvc` precedent), with its
+  own idempotency (per-run key / stamped column).
+- `agent/src/judge-runner.ts`: `buildJudgePrompt` (`:348`) renders the enum
+  `failure_class` in the trusted (pre-fence) header, adjacent to where it already prints
+  `status` (`:355`), `failure_reason` (`:358`) and `iterations` (`:359`) — enum value
+  only, no host token, never re-derived from the reason text; amend `JUDGE_SYSTEM_PROMPT`
+  (`:67-98`, which already carries a credential-CLI policy block at `:80-89`) with the
+  transient≠permanent / no-retry-for-policy rule. The trace fence and no-tools discipline
+  are unchanged.
+- Tests: `workersvc/judge_*_test.go` (class derivation from status+iterations+origin incl.
+  a provisioning pre-start case; a 0-iteration infra run is notified not enqueued; an
+  agent-crash-at-iteration-0 run is still judged) and `agent/test/judge-runner.test.ts`
+  (the class reaches the prompt in the trusted block; the prompt carries the rule).
 - `docs/judge.md`: the failure-class signal + the pre-start-skip behavior. `specs/ai.md`:
-  the accuracy decision.
+  the accuracy decision (and that the class is computed from trusted axes, not
+  `failure_reason`).
 
 **M7b — Egress-allowlist enrichment (DEFERRED, not built):** name the specific
 unreachable host and cross-check it against the deployment's `allowFQDNs`. Blocked on
@@ -608,14 +641,16 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   `SelfUsage`/`AdminUsage`. `go test ./internal/workersvc ./internal/handler`,
   `cd agent && npm test`, `cd web && npm run build` green.
 - [ ] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
-  closed-enum `failure_class` over the target run (status + reason + iteration_count) on
-  the judge claim + rendered in the trusted signal block (enum + validated FQDN only);
-  `JUDGE_SYSTEM_PROMPT` transient≠permanent / no-retry-for-policy rule; pre-start-infra
-  gate in `maybeEnqueueJudge` (0 iterations AND infra reason → skip judge →
-  deterministic notification via an injected notifier, idempotent); docs + specs. `go
-  test ./internal/workersvc`, `cd agent && npm test` green, with a test proving a
-  #78-class failure yields a non-"transient", non-retry recommendation, a 0-iteration
-  infra failure is notified not judged, and an agent-crash-at-iteration-0 is still judged.
+  closed-enum `failure_class` over the target run, computed from the trusted axes
+  (`status` + `iteration_count` + transition origin, NOT parsed from `failure_reason` —
+  Decision 11) on the judge claim + rendered in the trusted signal block (enum value
+  only, no host token); `JUDGE_SYSTEM_PROMPT` transient≠permanent / no-retry-for-policy
+  rule; pre-start-infra gate in `maybeEnqueueJudge` (`status='failed'` AND 0 iterations
+  AND pre-start infra origin → skip judge → deterministic notification, idempotent);
+  docs + specs. `go test ./internal/workersvc`, `cd agent && npm test` green, with a test
+  proving a pre-start provisioning failure yields a non-"transient", non-retry
+  recommendation, a 0-iteration infra failure is notified not judged, and an
+  agent-crash-at-iteration-0 is still judged.
 - [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
   a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value because the
   durable fix (pin nixpkgs / pre-seed, issue #82) removes the underlying failure mode.
@@ -655,13 +690,14 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   cost render on the reviewed run's review panel as the 4-tile strip; a judge run
   predating the feature shows no strip (never a fabricated 0); the judge run
   itself remains hidden from every run list.
-- **Judge accuracy (M7a)**: a provisioning-timeout failure is presented to the judge
-  as a `provisioning_timeout` class (in the trusted block, no raw reason text) and,
-  with the prompt rule, does not yield a "transient / retry-with-backoff"
-  recommendation; a run that failed at 0 iterations AND with an infra-class reason is
-  not judged (no opus call) but produces a deterministic infra notification; an agent
-  that started and crashed at iteration 0 is still judged. (M7b — the host/allowlist
-  cross-check — is deferred and has no criterion here.)
+- **Judge accuracy (M7a)**: a pre-start provisioning failure is presented to the judge
+  as a `provisioning_failed` class (computed from `status`+`iteration_count`+origin, in
+  the trusted block, no raw reason text) and, with the prompt rule, does not yield a
+  "transient / retry-with-backoff" recommendation; a run that failed at 0 iterations AND
+  with a pre-start infra-class origin is not judged (no opus call) but produces a
+  deterministic infra notification; an agent that started and crashed at iteration 0 is
+  still judged. (M7b — the host/allowlist cross-check — is deferred and effectively dead;
+  no criterion here.)
 
 ## Out of Scope
 
