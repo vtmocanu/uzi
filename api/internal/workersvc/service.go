@@ -291,6 +291,11 @@ type Store interface {
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	// Per-user judge spend guards (PRD #69 M5 Decision 9, Gate 5). Read-only count
+	// queries feeding the cooldown and daily-budget backstops in maybeEnqueueJudge.
+	// LastJudgeEnqueuedAt returns a NULLABLE timestamp (NULL ⇒ user never judged).
+	LastJudgeEnqueuedAt(ctx context.Context, userID uuid.UUID) (pgtype.Timestamptz, error)
+	CountJudgesSince(ctx context.Context, arg store.CountJudgesSinceParams) (int64, error)
 	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
 	ListToolTraceForRun(ctx context.Context, arg store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error)
 	// ListKnownImproveUziTargetsForUser is the owner's existing improve_uzi target menu
@@ -301,6 +306,10 @@ type Store interface {
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.
 	GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.RunReview, error)
+	// The judge run's timing + usage for the reviewed run's panel (PRD #69 M6): the
+	// judge run's claim/start/finish stamps and its run_usage_totals rollup, NULL usage
+	// for a pre-feature judge that posted no result frame.
+	GetJudgeRunUsageForTarget(ctx context.Context, targetRunID uuid.UUID) (store.GetJudgeRunUsageForTargetRow, error)
 	// The ACTIVE judge run for a target (PRD #119 M1): the panel's pending-judge signal,
 	// on the same owner-or-admin gate as the review read. Its predicate is the
 	// one-active-judge-per-target index's partial WHERE with the indexed column
@@ -485,6 +494,9 @@ type Store interface {
 	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
 	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
+	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
+	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -663,6 +675,17 @@ type RunLifecycle interface {
 // in tests and any deployment that never wired it.
 type SettingsReader interface {
 	JudgeEnabled(ctx context.Context) (bool, error)
+	// JudgeEnforceAll reports whether the judge is enforced for every run (PRD #69),
+	// bypassing the per-user judge_enabled opt-in gate. The kill-switch and token
+	// presence still govern. A nil reader (or a best-effort error) reads as false, so
+	// enforcement never turns on when settings are unavailable.
+	JudgeEnforceAll(ctx context.Context) (bool, error)
+	// JudgeCooldownSeconds / JudgeDailyBudget are the per-user judge spend guards (PRD
+	// #69 M5 Decision 9), checked at Gate 5 in every mode. Cooldown 0 disables the
+	// cooldown; budget 0 means unlimited. Best-effort: a read error fails OPEN (the
+	// enqueue proceeds), since these are soft cost backstops, not correctness gates.
+	JudgeCooldownSeconds(ctx context.Context) (int, error)
+	JudgeDailyBudget(ctx context.Context) (int, error)
 	JudgeModel(ctx context.Context) (string, error)
 	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
 	// 14). It is read here rather than passed in by each caller because the gate is
@@ -1071,9 +1094,24 @@ func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err e
 		// A guardrail block at claim (D1 layer 3) is TERMINAL — fail-closed even on a
 		// forge blip (R4; the user restarts after fixing protection), matching
 		// errCredentialUnavailable rather than the transient errVaultLocked requeue.
+		//
+		// PRD #69 M7a: these three infra sentinels used to collapse into one failed
+		// write, LOSING the origin. Split the class per sentinel so the judge sees a
+		// TRUSTED origin (errVaultLocked never reaches here — it requeues above — and
+		// errRunVanished is not a failed write, so neither owes a fail_origin).
+		var failOrigin string
+		switch {
+		case errors.Is(err, errCredentialUnavailable):
+			failOrigin = "credential_unavailable"
+		case errors.Is(err, errToolPackagesRejected):
+			failOrigin = "provisioning_failed"
+		case errors.Is(err, errGuardrailBlockedClaim):
+			failOrigin = "guardrail_blocked"
+		}
 		if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 			ID:            run.ID,
 			FailureReason: pgText(err.Error()),
+			FailOrigin:    pgText(failOrigin),
 		}); ferr != nil {
 			return ferr
 		}
@@ -2794,6 +2832,13 @@ type StateRequest struct {
 	// length and control-char concerns in one move — unlike the register path, the
 	// state path has no sanitizeSelfReported.
 	RateLimitType *string `json:"rate_limit_type"`
+	// FailOrigin is the worker's structured guess at WHY a `failed` report is failing
+	// (PRD #69 M7a): the reason CONSTANT the report site mapped to an origin, e.g.
+	// "provisioning_failed" or "rate_limited". UNTRUSTED free text on arrival — the
+	// server allowlists it through CoerceFailOrigin (unknown → nil) before it reaches
+	// the DB, exactly as it does RateLimitType. Ordinary agent failures omit it and the
+	// server defaults them to 'agent_failure'. Ignored on every non-`failed` state.
+	FailOrigin *string `json:"fail_origin"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2890,6 +2935,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
+		// PRD #69 M7a: stamp the TRUSTED failure class. The worker-reported origin is
+		// UNTRUSTED, so CoerceFailOrigin allowlists it (unknown → nil) before it reaches
+		// the DB. A classless (nil) failure is exactly the judgeable AGENT-FAILURE case —
+		// an ordinary agent death reports `failed` with no fail_origin — so it defaults to
+		// 'agent_failure' here rather than storing NULL (NULL is reserved for pre-feature /
+		// unclassified rows). The rate-limit opt-out path sends fail_origin='rate_limited'.
+		failOrigin := "agent_failure"
+		if o := CoerceFailOrigin(req.FailOrigin); o != nil {
+			failOrigin = *o
+		}
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
 			// the SERVER composes the sentence from its own allowlisted enum and replaces
@@ -2900,6 +2955,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// server" would then be false on exactly the path a human reads. When the
 			// fields are absent this is nil and every other failure path is untouched.
 			FailureReason: limitAwareFailureReason(req),
+			FailOrigin:    pgText(failOrigin),
 			SessionID:     sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:

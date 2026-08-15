@@ -638,28 +638,42 @@ So the safe fan-out is M1 first, then M2 and M3 (and M6) in parallel on top of i
 then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
 `maybeEnqueueJudge`), then M4 last — not all-wide from a cold start. M7b is deferred.
 
-- [ ] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
+- [x] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
   default-false-on-junk accessor + `SettingsReader` widening (+ all fakes) +
   enqueue gate bypass + admin-settings surface. `go test ./internal/settings
   ./internal/workersvc ./internal/handler` green.
-- [ ] **M2 — Per-user judge model**: `users.judge_model` migration + sqlc +
+- [x] **M2 — Per-user judge model**: `users.judge_model` migration + sqlc +
   `/me/settings` read/write + claim-assembly resolution (user-wins, error
   fallback). `go test ./...` + `sqlc generate` clean.
-- [ ] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
+- [x] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
   trail + settings tests + web mock defaults. `go test ./internal/settings`;
   `npm run typecheck` + `npm test`.
-- [ ] **M5 — Per-user spend guards**: `judge_cooldown_seconds` +
-  `judge_daily_budget` int settings + accessors, the two count queries (sqlc),
-  Gate 5 in `maybeEnqueueJudge` (skip-not-defer, all modes). `go test
-  ./internal/settings ./internal/workersvc` green, including a loop test (N rapid
-  failures → judges throttled by cooldown, capped by budget).
-- [ ] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
-  + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains
-  `judge_run_id` + timing + usage; `JudgePanel` 4-tile strip; `docs/judge.md`.
-  Verify a completed judge writes a `run_usage` row and its cost appears in
-  `SelfUsage`/`AdminUsage`. `go test ./internal/workersvc ./internal/handler`,
-  `cd agent && npm test`, `cd web && npm run build` green.
-- [ ] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
+- [x] **M5 — Per-user spend guards**: `judge_cooldown_seconds` (default `"60"`,
+  reuses the `{0} ∪ [60,86400]` health-seconds bound) + `judge_daily_budget`
+  (default `"0"`, `validateJudgeDailyBudget` = 0 or `[1, maxJudgeDailyBudget]`)
+  int settings + `JudgeCooldownSeconds`/`JudgeDailyBudget` accessors; the two
+  count queries `LastJudgeEnqueuedAt` / `CountJudgesSince` (sqlc regenerated,
+  no drift); Gate 5 (`judgeSpendGuardsAllow`) in `maybeEnqueueJudge`, after
+  Gate 4 and before `CreateJudgeRun`, skip-not-defer in all modes and deliberately
+  **fail-open** on any settings/query read error (soft cost backstop, opposite of
+  Gates 2–4). `SettingsReader` widened (+ all fakes: `fakeSettings`, `judgeSwitch`),
+  `Store` widened (+ `fakeStore` doubles). `task gate:api` green — including the
+  settings validation/accessor tests and the workersvc guard tests (cooldown,
+  budget, fail-open, enforced-mode, and the loop test: N rapid failures throttled
+  by cooldown, capped by budget). The two count queries are declared UNPINNED in
+  the query inventory (exercised via workersvc fakes, no store-package live-DB test).
+- [x] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
+  + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains a
+  nested `judge_run` (`judge_run_id` + claim/start/finish timing + `usage`);
+  `JudgePanel` 4-tile strip (Tokens in · Tokens out · Duration · Cost), rendered only
+  when usage is present (absent for a pre-feature judge, never a fabricated 0);
+  `docs/judge.md`. Judge spend deliberately rolls into `SelfUsage`/`AdminUsage` (the
+  `kind <> 'chat'` aggregates admit `judge`, no query change — Decision 10). Gates:
+  `task gate:agent`, `task gate:api`, `task gate:web` + `cd web && npm run build` green;
+  sqlc stable (only `judge.sql.go` regenerated). The `judge_run` field is nested (not the
+  flat `judge_run_id`+timing the checklist sketched) to keep the timing/usage grouped
+  under one omitempty key.
+- [x] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
   closed-enum `failure_class` over the target run, computed from the trusted axes
   (`status` + `iteration_count` + transition origin, NOT parsed from `failure_reason` —
   Decision 11) on the judge claim + rendered in the trusted signal block (enum value
@@ -670,10 +684,31 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   proving a pre-start provisioning failure yields a non-"transient", non-retry
   recommendation, a 0-iteration infra failure is notified not judged, and an
   agent-crash-at-iteration-0 is still judged.
+  - *Landed 2026-08-15 in two passes. Notification design changed from the PRD's
+    "inject notifysvc into workersvc": that would create an import cycle (notifysvc
+    already imports workersvc — `RunFailureNotifier` is a `workersvc.Broadcaster`), so
+    the pre-start gate skips the judge and the deterministic failure notification is
+    delivered by the EXISTING `RunFailureNotifier` on the same `PublishState("failed")`
+    transition (the PRD's "route the notify half through it" option). Every gate-reachable
+    infra origin is worker-reported and publishes before enqueue; `guardrail_blocked`/
+    tool-package origins come only via `recoverClaimAssembly`, which is not gate-reachable.
+    No new stamped `judge_infra_notified_at` column was needed.*
+  - *Pass A (the SEAM).* Added
+    the `runs.fail_origin` closed-enum column (migration `00126_run_fail_origin.sql`;
+    nullable, 9 members, CHECK-closed), a `CoerceFailOrigin` allowlist + `AllFailOrigins`
+    in `workersvc/failorigin.go` mirroring `limitwait.go`'s `rate_limit_type`, and stamping
+    at all 7 terminal-`failed` writers (`SetRunFailed`/`MarkRunFailedByID` from Go;
+    `run_timeout`/`worker_lost`×2/`auto_stopped`/`plan_rejected` as SQL literals). The
+    claim-assembly infra sentinels now split per-origin, the worker-reported `failed` arm
+    defaults a classless failure to `agent_failure`, and the worker sends `fail_origin`
+    (protocol.ts + runner.ts) for provisioning / no-token / rate-limit failures. **Pass B
+    still owed:** the derived `failure_class` signal + trusted-block render, the
+    `JUDGE_SYSTEM_PROMPT` transient≠permanent rule, and the pre-start-infra gate in
+    `maybeEnqueueJudge`.
 - [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
   a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value because the
   durable fix (pin nixpkgs / pre-seed, issue #82) removes the underlying failure mode.
-- [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
+- [x] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
   admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
   user judge card (enforced banner + per-user model input), stale-comment fix,
   docs for all four changes, `specs/ai.md` entries, release note, close #59.

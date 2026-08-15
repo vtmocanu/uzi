@@ -14,7 +14,7 @@ import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
 
 export function RunDefaults() {
-  const { user, refresh } = useAuth();
+  const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel } = useAuth();
   const [secrets, setSecrets] = useState<SecretMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -114,6 +114,13 @@ export function RunDefaults() {
   const [savedModel, setSavedModel] = useState("");
   const [modelBusy, setModelBusy] = useState(false);
 
+  // Per-user judge model (PRD #69 M2): "" = inherit the instance judge_model. Its own
+  // saved/busy pair, independent of the worker model above — they write the same
+  // /me/settings endpoint but each sends only its own field.
+  const [judgeModel, setJudgeModel] = useState("");
+  const [savedJudgeModel, setSavedJudgeModel] = useState("");
+  const [judgeModelBusy, setJudgeModelBusy] = useState(false);
+
   // secrets feed the judge token picker; settings carry the saved worker model.
   const load = useCallback(async () => {
     try {
@@ -125,6 +132,9 @@ export function RunDefaults() {
       const model = settings.default_model ?? "";
       setDefaultModel(model);
       setSavedModel(model);
+      const jm = settings.judge_model ?? "";
+      setJudgeModel(jm);
+      setSavedJudgeModel(jm);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -157,6 +167,32 @@ export function RunDefaults() {
       setError(err instanceof ApiError ? err.message : "Failed to save worker model");
     } finally {
       setModelBusy(false);
+    }
+  };
+
+  // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
+  // gates Save, so a per-user judge model can't be saved to a shape the server rejects.
+  const judgeModelWarning = modelFieldWarning(judgeModel);
+  const judgeModelDirty = judgeModel.trim() !== savedJudgeModel;
+
+  const saveJudgeModel = async () => {
+    setError("");
+    setNotice("");
+    setJudgeModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ judge_model: judgeModel.trim() || null });
+      const model = settings.judge_model ?? "";
+      setJudgeModel(model);
+      setSavedJudgeModel(model);
+      setNotice(
+        model === ""
+          ? "Judge model cleared. Your runs are judged on the instance default model."
+          : `Judge model set to ${model}. It applies to your next judged run.`,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save judge model");
+    } finally {
+      setJudgeModelBusy(false);
     }
   };
 
@@ -247,14 +283,34 @@ export function RunDefaults() {
           </p>
         </div>
 
+        {/* Enforced-mode banner (PRD #69 M4). When the admin turns on enforce-all, the
+            judge runs on EVERY finished run regardless of the opt-in below, still on the
+            user's own token — so the honest opt-out is removing the token, not this
+            toggle. effective_judge_model names the model that token will actually run. */}
+        {judgeEnforcedByAdmin && (
+          <Alert
+            tone="warning"
+            message={
+              `Your admin has ENFORCED the run judge: every one of your finished runs is judged on ` +
+              `your own Anthropic token${effectiveJudgeModel ? ` (model: ${effectiveJudgeModel})` : ""}, ` +
+              `whether or not the opt-in below is on. The only way to opt out is to remove your Anthropic token.`
+            }
+          />
+        )}
+
         {judgeError && <Alert message={judgeError} />}
 
-        <label className="flex items-center gap-3 text-sm">
+        {/* In enforced mode the per-user opt-in is bypassed at enqueue (Decision 3), so
+            this toggle is INERT — grey and disable it (matching AdminUsers.tsx), rather
+            than leave a live control that contradicts the banner above it. */}
+        <label
+          className={`flex items-center gap-3 text-sm${judgeEnforcedByAdmin ? " opacity-60" : ""}`}
+        >
           <input
             type="checkbox"
             className="h-4 w-4 accent-brand"
             checked={user?.judge_enabled ?? false}
-            disabled={judgeBusy}
+            disabled={judgeBusy || judgeEnforcedByAdmin}
             onChange={(e) => toggleJudge(e.target.checked)}
           />
           <span className="text-fg">Judge my finished runs</span>
@@ -286,6 +342,28 @@ export function RunDefaults() {
             </p>
           </Field>
         )}
+
+        {/* Per-user judge model (PRD #69 M2). Leave on Inherit to use the instance
+            judge model the admin picked; pinning one here overrides it for YOUR judged
+            runs only, and applies in enforced mode too. Same picker + validation as the
+            worker model, so a bad model blocks Save rather than failing on the next run. */}
+        <div className="space-y-3">
+          <Field label="Judge model" htmlFor="judge-model">
+            <ModelSelect id="judge-model" value={judgeModel} onChange={setJudgeModel} />
+          </Field>
+          <p className="text-xs text-faint">
+            The Claude model your finished runs are judged on. Leave it on <em>Inherit</em> to use the
+            instance default (opus unless your admin changed it); pin a cheaper alias to spend less.
+          </p>
+          {judgeModelWarning && <Alert message={judgeModelWarning} tone="warning" />}
+          <Button
+            type="button"
+            disabled={judgeModelBusy || !judgeModelDirty || judgeModelWarning !== ""}
+            onClick={saveJudgeModel}
+          >
+            Save judge model
+          </Button>
+        </div>
       </Card>
 
       <Card className="space-y-4">

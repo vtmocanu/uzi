@@ -51,9 +51,12 @@ func (s *rerunStore) CreateJudgeRun(_ context.Context, _ store.CreateJudgeRunPar
 // the enqueue.
 type judgeSwitch struct{ enabled bool }
 
-func (j judgeSwitch) JudgeEnabled(context.Context) (bool, error) { return j.enabled, nil }
-func (j judgeSwitch) JudgeModel(context.Context) (string, error) { return "", nil }
-func (j judgeSwitch) PRDLabel(context.Context) (string, error)   { return "", nil }
+func (j judgeSwitch) JudgeEnabled(context.Context) (bool, error)        { return j.enabled, nil }
+func (j judgeSwitch) JudgeEnforceAll(context.Context) (bool, error)     { return false, nil }
+func (j judgeSwitch) JudgeCooldownSeconds(context.Context) (int, error) { return 0, nil }
+func (j judgeSwitch) JudgeDailyBudget(context.Context) (int, error)     { return 0, nil }
+func (j judgeSwitch) JudgeModel(context.Context) (string, error)        { return "", nil }
+func (j judgeSwitch) PRDLabel(context.Context) (string, error)          { return "", nil }
 func (j judgeSwitch) RunEligibleLabels(context.Context) ([]string, error) {
 	return nil, nil
 }

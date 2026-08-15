@@ -68,6 +68,37 @@ func TestGetSettingsReturnsKnownKeysWithDefaults(t *testing.T) {
 	}
 }
 
+// The admin GET surface auto-surfaces new Defaults keys (PRD #69): judge_enforce_all
+// reads as its compiled-in default when unset, and a stored bool round-trips
+// verbatim through the admin view. This is the read half of the enforce-all setting;
+// the write half needs a live pool and lives in the LiveDB suite.
+func TestGetSettingsSurfacesJudgeEnforceAll(t *testing.T) {
+	// Unset → compiled-in default "false".
+	h := newSettingsHandler()
+	rec := httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	var resp struct {
+		Settings map[string]string `json:"settings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := resp.Settings[settings.KeyJudgeEnforceAll]; got != settings.DefaultJudgeEnforceAll {
+		t.Errorf("judge_enforce_all default = %q, want %q", got, settings.DefaultJudgeEnforceAll)
+	}
+
+	// A stored "true" round-trips through the admin view.
+	h = newSettingsHandler(store.AppSetting{Key: settings.KeyJudgeEnforceAll, Value: "true"})
+	rec = httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := resp.Settings[settings.KeyJudgeEnforceAll]; got != "true" {
+		t.Errorf("judge_enforce_all stored = %q, want true", got)
+	}
+}
+
 func TestUpdateSettingsRejectsUnauthenticated(t *testing.T) {
 	h := newSettingsHandler()
 	rec := httptest.NewRecorder()
@@ -93,6 +124,10 @@ func TestUpdateSettingsValidationRejections(t *testing.T) {
 		"equal labels": `{"settings":{"prd_label":"autopilot"}}`,
 		// PRD #22 M1: prdless_enabled is a strict bool; a non-bool is rejected.
 		"non-bool prdless_enabled": `{"settings":{"prdless_enabled":"banana"}}`,
+		// PRD #69: judge_enforce_all is a strict bool. "yes" MUST be rejected — it is
+		// the documented pitfall: were the key to fall through to ValidateLabel it would
+		// accept "yes" and then read as false, silently disabling enforcement.
+		"non-bool judge_enforce_all": `{"settings":{"judge_enforce_all":"yes"}}`,
 		// prdless_label must be pairwise-distinct from the other two (defaults PRD /
 		// autopilot), even against their stored values on a single-key PUT.
 		"prdless equals prd default":       `{"settings":{"prdless_label":"PRD"}}`,

@@ -85,11 +85,65 @@ refresh (in practice, their next login or reload — there's no push). See
 ## Run judge
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
-on (**Judge model**, a cheap alias like `haiku` by default — a retrospective
-is a single trace round-trip, so a cheap model is usually right). This switch
+on (**Judge model**, `opus` by default — the judge's recommendations feed
+self-improvement, so the strongest model is the default; pin a cheaper alias
+like `haiku` or `sonnet` to spend less). This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
 the admin's.
+
+**Upgrade note:** an instance that already had the judge enabled, with no
+`judge_model` pinned, starts spending `opus` the moment it upgrades to a
+version carrying this default — there's no migration that preserves the old
+(cheaper) value. Pin **Judge model** to `haiku` or `sonnet` before upgrading
+if you want to keep spending where it was.
+
+### Judge mode: off, optional, enforced
+
+A second checkbox, **Enforce the judge on every run (no per-user opt-in)**
+(`judge_enforce_all`, off by default — greyed out while the kill-switch
+above is off), combines with the kill-switch into three effective modes:
+
+| Setting combination | Mode | Who gets judged |
+|---|---|---|
+| `judge_enabled=false` | **Off** | Nobody — the kill-switch always wins, even with `judge_enforce_all=true`. |
+| `judge_enabled=true`, `judge_enforce_all=false` | **Optional** | Only users who've opted in themselves. |
+| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds an Anthropic token, whether or not they've opted in; a token-less user is still skipped, since there's nothing to spend. |
+
+Enforcing the judge never redirects *who pays*: spend always stays on each
+run owner's own Anthropic token — an admin can force that judging happens,
+never send the bill to a different account. It also overrides a per-user
+force-disable set on **Admin → Users**: the per-user toggle there is shown
+greyed and labelled "Inert: enforced mode judges every run regardless of
+this flag" while enforcement is on, since one boolean can't tell "an admin
+disabled you" from "you opted out." The only opt-out left to an enforced
+user is deleting their own Anthropic token, which also stops their own
+runs — see [Judge mode](./judge.md#judge-mode-off-optional-enforced) in the
+judge doc.
+
+If your users hold Anthropic **subscription** plans rather than metered
+console keys, remember that an enforced `opus` judge spends their
+plan/rate-limit **quota**, not dollars — a busy judge can eat into the quota
+their real runs need. Pin **Judge model** to `haiku`/`sonnet` before
+enforcing, or leave enforcement off and let users opt in with their own
+per-user model choice (**Settings → Run judge → Judge model**).
+
+### Spend guards
+
+Two more per-user, count-based, best-effort fields bound how often the judge
+fires for any one user, in every mode (not just enforced) — a runaway
+failure loop is a footgun even for an opted-in user:
+
+| Setting | Default | Controls |
+|---|---|---|
+| Per-user cooldown (seconds) (`judge_cooldown_seconds`) | `60` | Skip enqueuing a judge for a user who already had one enqueued within the last N seconds. `0` disables the cooldown; otherwise `60`–`86400`. |
+| Per-user daily budget (runs) (`judge_daily_budget`) | `0` (unlimited) | Skip enqueuing a judge for a user who already had `N` or more judge runs in the rolling last 24 hours. `0` disables the cap; otherwise a positive count. |
+
+Both are blunt on purpose — a legitimate high-throughput burst can also lose
+a few retrospectives — and both fail **open**: a settings-read hiccup lets
+the judge through rather than silently going quiet. On trip, the judge is
+skipped the same way an ineligible run is: silently, with no notification
+and no queued run.
 
 ## Self-improvement
 

@@ -126,8 +126,16 @@ function requireSession(): User {
 // stale demo state can't outlive a seed-schema change.
 // Bumped to v2 for PRD #47 (the six health_* keys joined AppSettings): a stale v1
 // blob lacks them, so discarding it re-seeds a complete shape.
-const MOCK_SETTINGS_KEY = "uzi.mock.v2";
-const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null, sidebar_token_ids: [] };
+// Bumped to v3 for PRD #69 M4 (judge_enforce_all / judge_cooldown_seconds /
+// judge_daily_budget joined AppSettings, judge_model joined UserSettings): a stale v2
+// blob lacks them, so discarding it re-seeds a complete shape.
+const MOCK_SETTINGS_KEY = "uzi.mock.v3";
+const SEED_USER_SETTINGS: UserSettings = {
+  default_model: null,
+  judge_model: null,
+  theme: null,
+  sidebar_token_ids: [],
+};
 const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
   autopilot_label: "autopilot",
@@ -137,7 +145,12 @@ const SEED_APP_SETTINGS: AppSettings = {
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
-  judge_model: "haiku",
+  judge_model: "opus",
+  // PRD #69: enforced mode off, spend guards at their server defaults (cooldown 60s,
+  // budget 0 = unlimited).
+  judge_enforce_all: "false",
+  judge_cooldown_seconds: "60",
+  judge_daily_budget: "0",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -181,6 +194,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const a = as as Record<string, unknown>;
   const okUser =
     (u.default_model === null || typeof u.default_model === "string") &&
+    // Optional so a pre-#69 blob stays valid; absent reads as inherit.
+    (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
     (u.sidebar_token_ids === undefined ||
@@ -196,6 +211,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.public_base_url === "string" &&
     typeof a.judge_enabled === "string" &&
     typeof a.judge_model === "string" &&
+    typeof a.judge_enforce_all === "string" &&
+    typeof a.judge_cooldown_seconds === "string" &&
+    typeof a.judge_daily_budget === "string" &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     typeof a.health_slow_seconds === "string" &&
@@ -1251,6 +1269,16 @@ function sessionBody() {
       ? { unlocked: false, exists: false }
       : { unlocked: state.vaultUnlocked, exists: true },
     has_password: !oidcDemo().passwordless,
+    // Judge consent (PRD #69 M4), resolved exactly like the server: enforced only when
+    // BOTH the kill-switch and enforce-all are on (Gate-2-wins), and the effective model
+    // is user-value-wins over the instance value, which falls back to opus.
+    judge_enforced_by_admin: appSettings.judge_enabled === "true" && appSettings.judge_enforce_all === "true",
+    effective_judge_model:
+      (userSettings.judge_model ?? "").trim() !== ""
+        ? (userSettings.judge_model as string)
+        : appSettings.judge_model.trim() !== ""
+          ? appSettings.judge_model
+          : "opus",
   };
 }
 
@@ -1408,12 +1436,33 @@ export const mockApi = {
         key === "prdless_enabled" ||
         key === "slack_enabled" ||
         key === "judge_enabled" ||
+        key === "judge_enforce_all" ||
         key === "eligible_label_waives_prd_link"
       ) {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // judge_cooldown_seconds: 0 (off) or 60..86400 seconds; judge_daily_budget: 0
+      // (unlimited) or 1..10000 runs (PRD #69 M5, mirroring the server validators).
+      if (key === "judge_cooldown_seconds") {
+        if (!/^\d+$/.test(value)) throw new ApiError(400, "judge_cooldown_seconds: must be a whole number");
+        const n = Number(value);
+        if (n !== 0 && (n < 60 || n > 86400)) {
+          throw new ApiError(400, "judge_cooldown_seconds: must be 0 (off) or between 60 and 86400");
+        }
+        nonSecret.judge_cooldown_seconds = String(n);
+        continue;
+      }
+      if (key === "judge_daily_budget") {
+        if (!/^\d+$/.test(value)) throw new ApiError(400, "judge_daily_budget: must be a whole number");
+        const n = Number(value);
+        if (n < 0 || n > 10000) {
+          throw new ApiError(400, "judge_daily_budget: must be 0 (unlimited) or between 1 and 10000 judge runs");
+        }
+        nonSecret.judge_daily_budget = String(n);
         continue;
       }
       // run_eligible_labels / board_extra_labels are comma-separated label lists (PRD
@@ -1804,6 +1853,15 @@ export const mockApi = {
     if (patch.default_model !== undefined) {
       const trimmed = patch.default_model?.trim() ?? "";
       userSettings = { ...userSettings, default_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.judge_model !== undefined) {
+      // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with
+      // internal whitespace is rejected, mirroring the server's ValidateModel.
+      const trimmed = patch.judge_model?.trim() ?? "";
+      if (trimmed !== "" && /\s/.test(trimmed)) {
+        throw new ApiError(400, "judge_model must be a single token with no spaces");
+      }
+      userSettings = { ...userSettings, judge_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

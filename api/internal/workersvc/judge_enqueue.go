@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -17,6 +18,19 @@ import (
 // deliberately, and judge/self_improve/chat stay out (no recursion, no self-feeding
 // improvement loop; audit M4).
 var judgeEligibleKinds = map[string]bool{RunKindIssue: true, RunKindCIFix: true}
+
+// preStartInfraFailOrigins is the fail_origin set that means a run failed BEFORE the
+// agent did anything reviewable (PRD #69 M7a Pass B, Decision 12): a
+// provisioning/credential/guardrail block that is permanent until the config or policy
+// is fixed. Gate 4b skips the judge for such a run at iteration_count == 0 — there is no
+// agent behavior to retrospect. Deliberately EXACTLY these three: not
+// rate_limited/worker_lost/run_timeout (transient) and not agent_failure (judgeable).
+// The members are a strict subset of failorigin.go's vocabulary.
+var preStartInfraFailOrigins = map[string]bool{
+	"provisioning_failed":    true,
+	"credential_unavailable": true,
+	"guardrail_blocked":      true,
+}
 
 // maybeEnqueueJudgeByID reloads a run by id and runs the judge gate. Used by the
 // sweeper, whose swept rows do not carry the full run shape the gate needs.
@@ -62,13 +76,22 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !enabled {
 		return
 	}
-	// Gate 3: owner opted in (users.judge_enabled).
+	// Gate 3: owner opted in (users.judge_enabled) — UNLESS the admin has enforced the
+	// judge for every run (PRD #69), in which case the per-user opt-in is bypassed. The
+	// enforce read is best-effort: an error reads as false (opt-in still required), so a
+	// settings hiccup never forces token spend on. The owner load is still needed for the
+	// Gate 4 token check even in enforced mode.
 	owner, err := s.q.GetUserByID(ctx, run.UserID)
 	if err != nil {
 		slog.Warn("judge enqueue: load owner", "run", run.ID, "error", err)
 		return
 	}
-	if !owner.JudgeEnabled {
+	enforceAll, err := s.settings.JudgeEnforceAll(ctx)
+	if err != nil {
+		slog.Warn("judge enqueue: read judge_enforce_all", "run", run.ID, "error", err)
+		enforceAll = false
+	}
+	if !enforceAll && !owner.JudgeEnabled {
 		return
 	}
 	// Gate 4: owner has an Anthropic token. Presence only, not decryptability — a
@@ -81,6 +104,48 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
 		}
 		return // no token ⇒ nothing to spend ⇒ no judge run
+	}
+	// Gate 4b (PRD #69 M7a Pass B, Decision 12): skip the judge for a PRE-START INFRA
+	// failure — a run that failed BEFORE the agent did anything worth retrospecting.
+	// The set is EXACTLY the three policy/config-denied origins, AND only at
+	// iteration_count == 0. An agent that started and crashed at iteration 0 carries
+	// 'agent_failure' (the worker-reported default), stays out of this set, and is still
+	// judged (SC3); the iteration conjunct is the PRD's defensive guard for that. NOT
+	// rate_limited/worker_lost/run_timeout (transient) and NOT agent_failure (judgeable).
+	// This is the ACCURACY+SPEND fix: a pre-start infra failure has no agent behavior to
+	// review, and skipping avoids the most expensive per-run call (opus) on a run that
+	// did nothing.
+	//
+	// DETERMINISTIC INFRA NOTIFICATION — delivered here by the EXISTING RunFailureNotifier,
+	// NOT injected. The judge is a REPLACEMENT for these runs, not an addition, so they
+	// still owe a failure notification. Every path that can reach this gate carrying one
+	// of these three origins is the worker-reported SetState terminal transition, which
+	// fires s.bcast.PublishState(runID,"failed") BEFORE calling maybeEnqueueJudge; the
+	// RunFailureNotifier subscribes to that PublishState and notifies every
+	// non-cancelled/non-plan_rejected failure (infra included), so the notification has
+	// already been delivered on the SAME transition and this gate need only skip the
+	// judge. (The server-side claim-assembly failer that also stamps these three origins
+	// via MarkRunFailedByID never calls maybeEnqueueJudge at all, so it is not
+	// gate-reachable; it notifies through its own s.notify.) No notifysvc injection is
+	// possible anyway — notifysvc imports workersvc (RunFailureNotifier is a
+	// workersvc.Broadcaster), so injecting it would create an import cycle.
+	if run.Status == "failed" && run.IterationCount == 0 &&
+		run.FailOrigin.Valid && preStartInfraFailOrigins[run.FailOrigin.String] {
+		slog.Debug("judge enqueue: pre-start infra failure, skipping judge (deterministic notification delivered by RunFailureNotifier on the same transition)",
+			"run", run.ID, "fail_origin", run.FailOrigin.String)
+		return
+	}
+	// Gate 5: per-user spend guards (PRD #69 M5, Decision 9). Count-based, best-effort,
+	// applied in EVERY mode (a runaway loop is a footgun even for an opted-in user). On
+	// trip: skip silently (like a Gate 3/4 miss), debug-logged — no defer, no queue, no
+	// notification. Deliberately FAIL-OPEN, the opposite of Gates 2–4: those gate
+	// correctness/consent and fail closed; these are a soft anti-runaway cost backstop,
+	// so on ANY read error (settings or query) we do NOT trip the guard — we proceed to
+	// enqueue (a query error is logged at warn). A transient DB/settings hiccup must
+	// never silently disable judging; the generous defaults keep the guard to genuine
+	// runaways.
+	if !s.judgeSpendGuardsAllow(ctx, run) {
+		return
 	}
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
@@ -96,6 +161,43 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
 	}
+}
+
+// judgeSpendGuardsAllow is Gate 5 (PRD #69 M5, Decision 9): the per-user, count-based,
+// best-effort spend guards. It reports whether the judge may be enqueued — false skips
+// it silently (debug-logged). Called in every mode, after the correctness/consent gates
+// and before the idempotency insert.
+//
+// FAIL-OPEN by design (opposite to Gates 2–4): on ANY read error, settings or query, it
+// returns true so the enqueue proceeds — the guards are a soft cost backstop, and a
+// transient DB/settings hiccup must never silently disable judging. A query error is
+// logged at warn; the generous defaults keep the guard to genuine runaways. s.settings
+// is non-nil here (Gate 2 returned early otherwise).
+func (s *Service) judgeSpendGuardsAllow(ctx context.Context, run store.Run) bool {
+	// Cooldown: skip if this user had a judge enqueued within the last N seconds.
+	if cooldown, err := s.settings.JudgeCooldownSeconds(ctx); err == nil && cooldown > 0 {
+		last, lerr := s.q.LastJudgeEnqueuedAt(ctx, run.UserID)
+		if lerr != nil {
+			slog.Warn("judge enqueue: cooldown lookup failed, proceeding (fail-open)", "run", run.ID, "user", run.UserID, "error", lerr)
+		} else if last.Valid && time.Since(last.Time) < time.Duration(cooldown)*time.Second {
+			slog.Debug("judge enqueue: within cooldown, skipping", "run", run.ID, "user", run.UserID, "cooldown_s", cooldown)
+			return false
+		}
+	}
+	// Daily budget: skip if this user already had >= N judge runs in the rolling 24h.
+	if budget, err := s.settings.JudgeDailyBudget(ctx); err == nil && budget > 0 {
+		count, cerr := s.q.CountJudgesSince(ctx, store.CountJudgesSinceParams{
+			UserID: run.UserID,
+			Since:  pgTime(time.Now().Add(-24 * time.Hour)),
+		})
+		if cerr != nil {
+			slog.Warn("judge enqueue: budget lookup failed, proceeding (fail-open)", "run", run.ID, "user", run.UserID, "error", cerr)
+		} else if count >= int64(budget) {
+			slog.Debug("judge enqueue: daily budget reached, skipping", "run", run.ID, "user", run.UserID, "budget", budget)
+			return false
+		}
+	}
+	return true
 }
 
 // judgeRunTitle synthesizes a display title for a judge run (it has no issue of its own).

@@ -19,7 +19,34 @@ globally first.
 Your admin enables the feature globally under **Admin → Instance settings →
 Run judge**. Once that's on, open **Settings → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
-judge for any individual user from **Admin → Users**.
+judge for any individual user from **Admin → Users**. See
+[Admin settings](./admin-settings.md#run-judge) for the full set of
+instance-wide judge controls.
+
+## Judge mode: off, optional, enforced
+
+The kill-switch above combines with a second instance setting — enforce the
+judge for everyone — into three effective modes:
+
+- **Off** — the kill-switch is off. Nobody is judged, no matter what else is
+  set; the kill-switch always wins, even over enforcement.
+- **Optional** — the kill-switch is on, enforcement is off. Each user opts in
+  themselves, exactly as in [Enable it](#1-enable-it) above. This is the mode
+  once an admin turns the judge on, until they also turn on enforcement.
+- **Enforced** — both are on. Every one of your finished runs is judged
+  **whether or not you've opted in yourself**, as long as you hold an
+  Anthropic token — a token-less user is still skipped silently, since
+  there's nothing to spend. Spend still stays on your own token: an admin can
+  force that judging *happens*, never redirect *who pays* for it. Enforcement
+  also overrides a per-user force-disable an admin may have set for you on
+  **Admin → Users** — one flag can't tell "an admin disabled you" from "you
+  opted out," so enforcement wins whenever it's on.
+
+**The only real opt-out from enforced mode is deleting your Anthropic
+token.** That also stops your own runs, since both spend the same
+credential — there's no separate "opt out of enforced judging" switch. Your
+lever under enforced mode is the *model* it runs on, not the on/off toggle —
+see the next section.
 
 ## Which token the judge spends
 
@@ -36,6 +63,27 @@ worker's. Everything else — issue runs, autopilot, CI-fix, chat — is unaffec
 by this setting. Leave it on **your default token** to keep everything on one
 account.
 
+## Which model it runs on
+
+The instance default is **opus** — the strongest model, since the judge's
+recommendations feed [self-improvement](./self-improvement.md) and a shallow
+retrospective produces shallow self-improvement work. From **Settings → Run
+judge**, the **Judge model** picker lets you override that default for your
+own judge runs; leave it on **Inherit** to use whatever the instance is set
+to. Your admin can also pin a cheaper instance-wide default (`haiku` or
+`sonnet`) from **Admin → Instance settings → Run judge** — either lever
+works, but your own override only changes your runs, while the admin's is
+the fallback for everyone who hasn't set one.
+
+Opus runs roughly **5–15× the cost of haiku** per retrospective. If your
+Anthropic token is a **subscription plan** rather than a metered console key,
+an opus judge spends **plan/rate-limit quota, not dollars** — under enforced
+mode especially, a busy judge can eat into the quota your real runs need.
+Pinning your judge model to `haiku` or `sonnet` is the fix if that's a
+problem; short of that, deleting your token is the only way to stop the
+judge from running under enforced mode (see [Judge
+mode](#judge-mode-off-optional-enforced) above).
+
 ## What you get
 
 When a judged run finishes (completed or failed — a cancelled run is never
@@ -43,7 +91,9 @@ judged), a review lands in five places:
 
 - **The run page**: a verdict chip (Ideal / OK / Issues found) plus a list of
   recommendations, each with a category, a target (the tool/agent/repo it's
-  about), a rationale, and a confidence level.
+  about), a rationale, and a confidence level. The panel also shows what the
+  retrospective itself cost — a small strip with the judge run's tokens in,
+  tokens out, duration, and cost.
 - **The [Judge menu](./judge-menu.md)**: the cross-run backlog, where the same
   recommendation raised by many runs is **one row** to triage once. This is
   where you work the list; the run page is where you see one run's verdict.
@@ -54,6 +104,13 @@ judged), a review lands in five places:
 - **The [uzi CLI](./cli.md)**: `uzi review show <run-id>` prints the same
   verdict, recommendations, and your triage state from the terminal — see
   [Reading a review from the CLI](#reading-a-review-from-the-cli) below.
+
+A judge run is the owner's own token spend, so its cost counts as your spend:
+it appears in your usage totals alongside your runs, and — since it is the
+strongest model by default (see [Which model it runs
+on](#which-model-it-runs-on) above) — a busy judge is a real line item worth
+watching. The per-run cost/time strip above and your usage totals are the two
+places you see it.
 
 Recommendations use a fixed taxonomy: enable an existing tool or skill,
 install a missing worker tool, adjust an agent template or prompt, improve an
@@ -70,6 +127,19 @@ trace. But **if the judge model call itself fails**, every hit is turned into
 an "install a worker tool" recommendation naming the tool, guaranteed — so a
 finding still lands even when the LLM doesn't run. When that happens the run
 page shows a "judge incomplete" badge next to the verdict.
+
+## The failure-class signal
+
+When the reviewed run **failed**, the judge is also handed a trusted
+**failure class** — a single closed-vocabulary label for *why* the run failed
+(for example `provisioning_failed`, `credential_unavailable`,
+`guardrail_blocked`, `agent_failure`, `run_timeout`). It is derived from the
+run's own structured state at the moment it failed, never by reading the
+free-text failure reason, so the judge weighs a fact rather than a string. The
+practical effect: a network timeout or connection error is **not** treated as
+automatically transient, and a policy- or config-denied failure does not draw a
+"just retry / add backoff" recommendation — that class of block stays until the
+configuration or policy is fixed.
 
 ## Reading a review from the CLI
 
@@ -241,6 +311,15 @@ cleared for good if the review itself is deleted (e.g. the run is deleted).
 Only finished **issue** and **CI-fix** runs are eligible. Chat runs, judge
 runs, and self-improvement runs are never judged — there's no recursive
 judging, and no self-feeding loop.
+
+One more run is deliberately skipped: a run that **failed before its agent ever
+started** — a provisioning, credential, or guardrail block that stopped the run
+at zero iterations. There is no agent behaviour to retrospect on such a run, and
+judging it would only spend the (strongest, most expensive) model on a run that
+did nothing, so the judge is skipped. **The failure notification still lands** —
+the skip drops only the retrospective, never the "your run failed" alert. (A run
+that started and then crashed early is *not* in this set; it carries agent
+behaviour and is still judged.)
 
 ## The inbox
 

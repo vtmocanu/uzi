@@ -105,9 +105,15 @@ type fakeStore struct {
 	anthropicSealedWith string
 	// onClaimRun, if set, runs inside ClaimRun — used to simulate the vault locking
 	// between the claim gate and the token open (the M3 lock race).
-	onClaimRun          func()
-	defaultModel        pgtype.Text
-	defaultModelErr     error
+	onClaimRun      func()
+	defaultModel    pgtype.Text
+	defaultModelErr error
+	// judgeModel is the run owner's per-user judge_model override (PRD #69 M2);
+	// the zero value is NULL/inherit, so existing judge fixtures resolve the
+	// instance value unchanged. judgeModelErr models a user-row read fault, which
+	// must fall back to the instance value best-effort (never an empty model).
+	judgeModel          pgtype.Text
+	judgeModelErr       error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
 	skillAllocationsErr error
@@ -177,6 +183,14 @@ type fakeStore struct {
 	userByIDErr       error
 	createdJudgeRun   *store.CreateJudgeRunParams
 	createJudgeRunErr error
+	// PRD #69 M5 Gate 5 spend guards (best-effort, fail-open). lastJudgeAt is the
+	// cooldown lookup (Valid:false ⇒ no prior judge); judgesSince is the daily-budget
+	// count. The *Err fields stage a read error to prove the guard proceeds anyway.
+	lastJudgeAt       pgtype.Timestamptz
+	lastJudgeAtErr    error
+	judgesSince       int64
+	judgesSinceErr    error
+	judgesSinceArgs   []store.CountJudgesSinceParams
 	activeJudgeRun    store.Run
 	activeJudgeRunErr error
 	// The PRD #119 pending-judge read (GetActiveJudgeRunForTarget). pendingJudgeErr is
@@ -203,6 +217,8 @@ type fakeStore struct {
 	upsertReviewErr         error
 	reviewByTarget          store.RunReview
 	reviewByTargetErr       error
+	judgeRunUsage           store.GetJudgeRunUsageForTargetRow
+	judgeRunUsageErr        error
 	recsByReview            []store.ReviewRecommendation
 	recsByReviewErr         error
 	filedByReview           []store.RecommendationFiledIssue
@@ -525,6 +541,9 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
 }
+func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.judgeModel, f.judgeModelErr
+}
 func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
 }
@@ -677,6 +696,15 @@ func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetA
 	return f.activeJudgeRun, f.activeJudgeRunErr
 }
 
+// PRD #69 M5 Gate 5 spend-guard reads.
+func (f *fakeStore) LastJudgeEnqueuedAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
+	return f.lastJudgeAt, f.lastJudgeAtErr
+}
+func (f *fakeStore) CountJudgesSince(_ context.Context, arg store.CountJudgesSinceParams) (int64, error) {
+	f.judgesSinceArgs = append(f.judgesSinceArgs, arg)
+	return f.judgesSince, f.judgesSinceErr
+}
+
 // The PRD #119 pending-judge read. It records the target it was asked for, which is how
 // the panel tests assert the query is NOT issued for a run the viewer cannot see.
 func (f *fakeStore) GetActiveJudgeRunForTarget(_ context.Context, targetRunID pgtype.UUID) (store.GetActiveJudgeRunForTargetRow, error) {
@@ -705,6 +733,9 @@ func (f *fakeStore) UpsertRunReviewWithRecommendations(_ context.Context, arg st
 }
 func (f *fakeStore) GetRunReviewForTarget(context.Context, uuid.UUID) (store.RunReview, error) {
 	return f.reviewByTarget, f.reviewByTargetErr
+}
+func (f *fakeStore) GetJudgeRunUsageForTarget(context.Context, uuid.UUID) (store.GetJudgeRunUsageForTargetRow, error) {
+	return f.judgeRunUsage, f.judgeRunUsageErr
 }
 func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]store.ReviewRecommendation, error) {
 	return f.recsByReview, f.recsByReviewErr

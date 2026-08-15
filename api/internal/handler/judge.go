@@ -27,18 +27,27 @@ type setJudgeRequest struct {
 	// key at all. Collapsing those two would make enabling the judge silently unbind
 	// the user's judge credential. See parseTokenField.
 	//
-	// This EXTENDS the existing enabled-only body; it does not assume PRD #69's
-	// per-user judge-model surface, which is still Draft. judge_model remains a
-	// GLOBAL admin setting (settings.KeyJudgeModel) — if #69 lands, the two per-user
-	// judge settings merge there rather than here.
+	// This EXTENDS the existing enabled-only body. PRD #69 has since landed a per-user
+	// judge_model, but it does NOT live here: it is written through PUT /me/settings
+	// (userSettingsDTO, PRD #69 M2), alongside the user's default_model, not on this
+	// judge opt-in body. The instance-wide judge_model (settings.KeyJudgeModel) remains
+	// the admin fallback the per-user value overrides.
 	AnthropicToken json.RawMessage `json:"anthropic_token"`
 }
 
 // SetJudgeEnabled flips the CURRENT user's run-judge opt-in (PRD #46 Decision 7).
 // Enabling it lets every one of this user's finished runs be reviewed by an LLM on
 // THEIR own Anthropic token, so — exactly like the autopilot opt-in — the target is
-// taken from the session, NEVER the body (audit H3): nobody can opt another user
-// into spending their tokens. Returns the updated user.
+// taken from the session, NEVER the body (audit H3): this WRITE path never lets one
+// user opt another into spending their tokens. Returns the updated user.
+//
+// The instance-level exception is enforced mode (PRD #69): when an admin turns on
+// judge_enforce_all, every user's OWN finished runs are judged on each user's OWN
+// token without their per-user opt-in. That is the deliberate, documented tradeoff of
+// enforced mode — the admin still cannot redirect the spend onto anyone ELSE's token
+// (the judge always bills the run owner), so audit H3's core property (nobody spends a
+// DIFFERENT user's tokens) holds; only the self-opt-in gate is what enforced mode
+// bypasses. This write path is untouched by that: it still stamps the session user.
 func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -238,7 +247,35 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 		FiledIssues:     filed,
 		Dispositions:    dispositions,
 		Triage:          workersvc.BucketTriage(triageRows),
+		JudgeRun:        judgeRunToDTO(rw.JudgeRun),
 	}
+}
+
+// judgeRunToDTO renders the judge run's timing + usage for the review panel (PRD #69
+// M6). nil in → nil out (no judge-run detail). Usage is attached ONLY when the judge
+// posted a result frame (its run_usage row exists, so cost_usd is non-null) — a
+// pre-feature judge has valid timings but NULL usage, which stays nil so the panel
+// renders no cost/time strip rather than a fabricated 0.
+func judgeRunToDTO(jr *store.GetJudgeRunUsageForTargetRow) *apitypes.JudgeRunDTO {
+	if jr == nil {
+		return nil
+	}
+	dto := &apitypes.JudgeRunDTO{
+		JudgeRunID: uuid.UUID(jr.JudgeRunID.Bytes).String(),
+		ClaimedAt:  timePtr(jr.ClaimedAt.Valid, jr.ClaimedAt.Time),
+		StartedAt:  timePtr(jr.StartedAt.Valid, jr.StartedAt.Time),
+		FinishedAt: timePtr(jr.FinishedAt.Valid, jr.FinishedAt.Time),
+	}
+	if jr.CostUsd.Valid {
+		dto.Usage = &apitypes.UsageDTO{
+			InputTokens:         jr.InputTokens.Int64,
+			CacheReadTokens:     jr.CacheReadTokens.Int64,
+			CacheCreationTokens: jr.CacheCreationTokens.Int64,
+			OutputTokens:        jr.OutputTokens.Int64,
+			CostUSD:             numericToFloat(jr.CostUsd),
+		}
+	}
+	return dto
 }
 
 // pendingJudgeState normalizes a judge run's RAW runs.status into the two-value display

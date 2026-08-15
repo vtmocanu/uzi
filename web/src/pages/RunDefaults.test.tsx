@@ -68,7 +68,7 @@ const baseUser: User = {
   last_login: null,
 };
 
-function mockAuth(user: User) {
+function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
@@ -84,17 +84,20 @@ function mockAuth(user: User) {
     vaultUnlocked: true,
     vaultExists: true,
     hasPassword: true,
+    judgeEnforcedByAdmin: false,
+    effectiveJudgeModel: "opus",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
     refresh,
+    ...over,
   });
 }
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, judge_model: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked" },
   });
@@ -224,6 +227,52 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
     fireEvent.click(judgeToggle());
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(judgeToggle().disabled).toBe(false);
+  });
+});
+
+describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)", () => {
+  it("shows no enforced banner when the admin has not enforced the judge", async () => {
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run judge");
+    expect(container.textContent ?? "").not.toMatch(/ENFORCED/i);
+  });
+
+  it("renders the enforced banner naming the effective model and the token opt-out", async () => {
+    mockAuth(baseUser, { judgeEnforcedByAdmin: true, effectiveJudgeModel: "sonnet" });
+    const { container } = render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run judge");
+    const text = container.textContent ?? "";
+    expect(text).toMatch(/ENFORCED/);
+    expect(text).toMatch(/model: sonnet/);
+    expect(text).toMatch(/remove your Anthropic token/i);
+  });
+
+  it("saves the per-user judge model through PUT /me/settings", async () => {
+    mockApi.getMySettings.mockResolvedValue({
+      settings: { default_model: null, judge_model: null, theme: null },
+    });
+    mockApi.putMySettings.mockResolvedValue({
+      settings: { default_model: null, judge_model: "haiku", theme: null },
+    });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run judge");
+    // The judge-model picker offers a "haiku" option; selecting it dirties Save.
+    const select = screen.getByLabelText("Judge model") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "haiku" } });
+    fireEvent.click(screen.getByText("Save judge model"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku" }));
   });
 });
 
