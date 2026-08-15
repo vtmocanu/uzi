@@ -363,7 +363,7 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Keybindings
 
 ```
-←/→, tab     detail: focus the crew rail / the transcript (tab cycles). Detail opens focused on the crew rail.
+←/→, h/l, tab detail: focus the crew rail / the transcript (h/← rail, l/→ transcript; tab cycles). Detail opens focused on the crew rail.
 j/k, ↑/↓     move within the focused pane (board: row · detail: between agents on the rail, or scroll the transcript)
 g            detail: follow live — re-attach and jump to the newest output (live runs only)
 enter        open the selected run (board)

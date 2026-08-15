@@ -22,10 +22,10 @@ wraps the shipped model with a live-frame ticker, so the board, the plan gate, t
 panes and follow-live are all drivable.
 
 Keys — board: `j`/`k` or arrows move, `enter` opens a run, `/` filters, `a` toggles the
-all-crews board, `r` refresh, `q` quit. Detail: `←`/`→` (or `tab`) focus the crew rail / the
-transcript, `↑`/`↓` move within the focused pane (agents · scroll), `g` follow live (jump to
-newest), `f` follow-up, `v` review, `y`/`n` approve/reject at a plan gate, `esc` back, `?`
-help.
+all-crews board, `r` refresh, `q` quit. Detail: `←`/`→` (or `h`/`l`, or `tab`) focus the crew
+rail / the transcript, `↑`/`↓` (or `j`/`k`) move within the focused pane (agents · scroll),
+`g` follow live (jump to newest), `f` follow-up, `v` review, `y`/`n` approve/reject at a plan
+gate, `esc` back, `?` help.
 
 ## Screenshots — one command
 

@@ -208,7 +208,7 @@ deadcode + test), not just build, as each milestone's acceptance.
       verdict by severity (consumes M2's seam); in `tui_render.go`, retune the glamour style so
       inline code no longer renders alarm-red (it is colour 203 in both dark and light today).
       Runs after M2 (shared `tui_render.go`). Matches `mock-review-*`.
-- [ ] **M7 — New tests, docs, CHANGELOG** (`[review]` shrunk per B2 — per-milestone test edits
+- [x] **M7 — New tests, docs, CHANGELOG** (`[review]` shrunk per B2 — per-milestone test edits
       live in their milestones). Here: genuinely-new tests (follow-live attach/detach, pane-focus)
       and the B1 security test if not already landed in M2; **rewrite** the now-stale nav
       description in `docs/cli.md:352-392` (fix-the-doc: the current "left/right switches agent,

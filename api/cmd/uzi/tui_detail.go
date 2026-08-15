@@ -134,8 +134,8 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 	// The overlay and the steer bar get first refusal, in that order: while either is
-	// in an input/confirm mode it must swallow keys that would otherwise be lane
-	// navigation, or typing "l" into a follow-up would switch lanes underneath it.
+	// in an input/confirm mode it must swallow keys that would otherwise be pane
+	// navigation, or typing "l" into a follow-up would move pane focus underneath it.
 	if nm, cmd, handled := m.reviewKey(k); handled {
 		return nm, cmd
 	}
