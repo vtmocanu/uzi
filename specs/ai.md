@@ -9493,7 +9493,7 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
   re-suppressing a possibly-different concern. Cleaned only by the
   review-deletion cascade (`review_id ON DELETE CASCADE`).
 
-## 544. Issue #167 — deterministic net auto-dismisses judge recs targeting a denylisted credential-bearing CLI; a self-measuring `set_via='denied_cli'` provenance
+## 548. Issue #167 — deterministic net auto-dismisses judge recs targeting a denylisted credential-bearing CLI; a self-measuring `set_via='denied_cli'` provenance
 
 Extends the PRD #94 disposition design (§331–338) and mirrors PRD #98's
 `issue_close` provenance (§362). It is the DETERMINISTIC BACKSTOP behind MR
@@ -12518,7 +12518,7 @@ is entitled to make yet.
   avoided in `js-deps` (measured: the timeout kills from the worker uid, gets `EPERM`, and leaves the
   runner process alive past its cap).
 
-## 511. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
+## 549. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
 
 Delivers what §401 recorded as deferred (M4 gate honesty), in the reduced form the repo can honestly
 sign: annotate the never-ran case rather than reconcile declared gates. Serves the same human contract
