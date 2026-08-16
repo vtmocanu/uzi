@@ -224,6 +224,55 @@ func TestRenderRunDetailReportOnly(t *testing.T) {
 	}
 }
 
+// TestRenderRunDetailPrdLifecycle pins `uzi run get`'s PRD-link lifecycle rows (#150):
+// PRD_MOVE (the worker-declared path the run moved a PRD to) and PRD_PATCH_SETTLED_AT
+// (the server timestamp for when the link-patch lifecycle settled). Both are
+// emit-only-when-set, so a run that moved no PRD — or one predating the feature —
+// renders neither, the same back-compat contract the nil pointers carry.
+//
+// PRD_MOVE is worker-authored text, so it goes through sanitizeTTY: a bidi override
+// and a CSI escape must be stripped while the printable path survives. The timestamp
+// is rendered in UTC RFC3339, mirroring LIMIT_RESETS_AT.
+func TestRenderRunDetailPrdLifecycle(t *testing.T) {
+	settled := time.Date(2026, 8, 16, 9, 30, 0, 0, time.UTC)
+	path := "prds/done/150-run-dto.md"
+	set := apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: "completed",
+		IssueTitle: "move the PRD", ForgeType: "gitlab", Health: "ok",
+		PrdDonePath: &path, PrdPatchSettledAt: &settled,
+	}
+	out := renderDetail(t, set)
+	for _, want := range []string{"PRD_MOVE", "prds/done/150-run-dto.md", "PRD_PATCH_SETTLED_AT", "2026-08-16T09:30:00Z"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a run that settled its PRD link must render %q, got:\n%s", want, out)
+		}
+	}
+
+	// PRD_MOVE is worker-declared, so a hostile path must be neutralised: the escape and
+	// the bidi override are stripped, the printable path survives.
+	hostile := "prds/done/x\u202e\x1b[31m.md"
+	hostileRun := set
+	hostileRun.PrdDonePath = &hostile
+	hout := renderDetail(t, hostileRun)
+	for _, bad := range []string{"\u202e", "\x1b"} {
+		if strings.Contains(hout, bad) {
+			t.Errorf("a hostile prd_done_path reached the terminal carrying %q, got:\n%q", bad, hout)
+		}
+	}
+	if !strings.Contains(hout, "prds/done/x") || !strings.Contains(hout, ".md") {
+		t.Errorf("sanitizing dropped the printable path too, got:\n%q", hout)
+	}
+
+	// Both nil ⇒ neither row, byte-for-byte the pre-#150 output.
+	none := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	nout := renderDetail(t, none)
+	for _, bad := range []string{"PRD_MOVE", "PRD_PATCH_SETTLED_AT"} {
+		if strings.Contains(nout, bad) {
+			t.Errorf("a run that moved no PRD must render no %q row, got:\n%s", bad, nout)
+		}
+	}
+}
+
 // ---- PRD #122 M5: milestone progress + effective budget --------------------
 
 // milestoneRun is the fixture the milestone tests start from: a three-milestone frozen
