@@ -40,6 +40,8 @@
   --warn: 251 191 36;
   --danger: 251 113 133;
   --info: 56 189 248;
+  /* issue #321: planning-phase badge, indigo — distinct from sky info and violet queue */
+  --plan: 79 70 229;
 
   /* Queue + idle/stopped status tones. Unlike the four tinted tones above
      (a single hue at low opacity for border/bg/text), these reproduce ember's
@@ -116,6 +118,7 @@
   --warn: 251 191 36;
   --danger: 244 63 94;
   --info: 34 211 238;
+  --plan: 129 140 248;
 
   /* The signature violet queue and a lighter slate idle/stopped. */
   --queue-fg: 196 181 253;

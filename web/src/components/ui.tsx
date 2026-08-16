@@ -248,7 +248,7 @@ export function Alert({
 }
 
 export type BadgeTone =
-  "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand";
+  "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand" | "plan";
 
 // neutral and queue carry a border/surface/fg triple (theme tokens set all
 // three), so ember renders its solid gray pill while a theme can retint just
@@ -261,6 +261,7 @@ const BADGE_TONES: Record<BadgeTone, string> = {
   ok: "border-ok/40 bg-ok/10 text-ok",
   info: "border-info/40 bg-info/10 text-info",
   brand: "border-brand/40 bg-brand/10 text-brand",
+  plan: "border-plan/40 bg-plan/10 text-plan",
 };
 
 export function Badge({

@@ -19,7 +19,7 @@ import { stripUnsafeChars } from "./safeText";
 // (failure). Since PRD #35 that mirror is asserted by a test rather than only
 // claimed here — see the RUN_STATUS_TONES agreement case in runBadge.test.ts.
 export type BadgeTone =
-  "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
+  "neutral" | "queue" | "warning" | "danger" | "info" | "ok" | "plan";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
 // chip (rendered as a link to the merge request), carrying the derived MR-state
