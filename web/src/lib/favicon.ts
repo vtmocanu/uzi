@@ -130,7 +130,7 @@ export function renderFavicon(state: FaviconState): string {
     const cy = 16;
     const r = 12;
     ctx.beginPath();
-    ctx.arc(cx, cy, r + 2, 0, Math.PI * 2);
+    ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
     ctx.fillStyle = FIELD;
     ctx.fill();
     ctx.beginPath();
@@ -150,21 +150,25 @@ function findIconLink(): HTMLLinkElement | null {
   return document.querySelector<HTMLLinkElement>('link[rel~="icon"][type="image/svg+xml"]');
 }
 
-// applyFavicon points the icon <link> at the right image for the state. Idle restores
-// the static /favicon.svg; any other state swaps in a freshly-rendered PNG data URL.
-// It is defensive on purpose: a missing link is a no-op, and any render failure
+// applyFavicon points the icon <link> at the right image for the state, keeping its
+// `type` in step: idle restores the static /favicon.svg (type image/svg+xml); any
+// other state swaps in a freshly-rendered PNG data URL (type image/png). It is
+// defensive on purpose: a missing link is a no-op, and any render failure
 // (canvas/toDataURL unsupported, e.g. some Safari configs) is swallowed so the icon
-// simply stays the static mark rather than throwing into React.
+// and its type simply stay the static mark rather than throwing into React.
 export function applyFavicon(state: FaviconState): void {
   const link = findIconLink();
   if (!link) return;
   if (state === "idle") {
+    link.type = "image/svg+xml";
     link.href = "/favicon.svg";
     return;
   }
   try {
-    link.href = renderFavicon(state);
+    const url = renderFavicon(state);
+    link.type = "image/png";
+    link.href = url;
   } catch {
-    // Leave the current (static) mark in place on any render failure.
+    // Leave the current (static) mark and its type in place on any render failure.
   }
 }
