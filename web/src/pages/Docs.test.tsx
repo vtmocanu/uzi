@@ -1,14 +1,29 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Docs } from "./Docs";
+import { useAuth } from "../auth/AuthContext";
+
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+const mockUseAuth = vi.mocked(useAuth);
+
+// Docs only reads `user?.is_admin`, so a bare user object is enough.
+function setAuth(isAdmin: boolean) {
+  mockUseAuth.mockReturnValue({ user: { is_admin: isAdmin } } as ReturnType<typeof useAuth>);
+}
 
 // These run against the REAL bundled docs/ corpus (the same glob the index
 // uses), so they double as the behavioral gate for search: a body-only term is
 // found with a marked snippet. `UZI_WORKER_TOKEN` lives only in worker-setup.md
 // among the `audience: user` pages, and only in its body (not title/summary).
 const BODY_ONLY_TERM = "UZI_WORKER_TOKEN";
+
+// An `audience: operator` body-only term: "reverse proxy" lives in
+// configuration.md (operator) and no `audience: user` page.
+const OPERATOR_BODY_TERM = "reverse proxy";
+
+beforeEach(() => setAuth(false));
 
 function renderPage() {
   return render(
@@ -117,5 +132,39 @@ describe("Docs index — search", () => {
     expect(kbd()).toBeNull();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(kbd()?.textContent).toBe("/");
+  });
+});
+
+describe("Docs index — role-aware operator docs (issue #75 M1)", () => {
+  it("hides the Admin / operator section and operator search results from a non-admin", () => {
+    setAuth(false);
+    renderPage();
+    expect(screen.queryByRole("heading", { name: "Admin / operator" })).toBeNull();
+    // The operator doc "Configuration" is not listed for a non-admin.
+    expect(screen.queryByRole("heading", { name: "Configuration", level: 2 })).toBeNull();
+    // An operator-only body term returns nothing from the non-admin corpus.
+    fireEvent.change(searchBox(), { target: { value: OPERATOR_BODY_TERM } });
+    expect(screen.getByText(/No docs match/)).toBeTruthy();
+  });
+
+  it("shows the Admin / operator section listing an operator doc for an admin", () => {
+    setAuth(true);
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Admin / operator" })).toBeTruthy();
+    // A real operator doc (configuration.md, title "Configuration") is listed;
+    // its card heading also carries the "Operator" pill, so match on a substring.
+    expect(screen.getByRole("heading", { name: /Configuration/, level: 2 })).toBeTruthy();
+  });
+
+  it("finds an operator doc by a body-only term for an admin and links to it", () => {
+    setAuth(true);
+    renderPage();
+    fireEvent.change(searchBox(), { target: { value: OPERATOR_BODY_TERM } });
+    const heading = screen.getByRole("heading", { name: /Configuration/, level: 2 });
+    const result = heading.closest("a")!;
+    expect(result.getAttribute("href")).toBe("/docs/configuration");
+    // The result carries the "Operator" pill so it is recognizable in the
+    // combined search results.
+    expect(within(result).getByText("Operator")).toBeTruthy();
   });
 });

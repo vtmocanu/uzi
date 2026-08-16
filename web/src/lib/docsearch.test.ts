@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { buildIndex, searchIndex, stripDocBody, MIN_QUERY_LENGTH, type IndexedDoc } from "./docsearch";
+import {
+  buildIndex,
+  searchDocs,
+  searchIndex,
+  stripDocBody,
+  MIN_QUERY_LENGTH,
+  type IndexedDoc,
+} from "./docsearch";
 import type { Doc } from "./docs";
 
 // The snippet window is ~160 chars plus at most two `…` bracket characters.
@@ -183,5 +190,17 @@ describe("searchIndex — mixed title-token + body-token snippet", () => {
     expect(result.snippet).toBe("The kanban board summary");
     // "board" is highlighted where it appears in the summary.
     expect(result.ranges.map(([s, e]) => result.snippet.slice(s, e).toLowerCase())).toEqual(["board"]);
+  });
+});
+
+// searchDocs binds the pure core to the REAL bundled corpus, which is role-aware
+// (issue #75 M1): an operator-doc body term is searchable only in the admin
+// corpus. "reverse proxy" lives in configuration.md (audience: operator) and no
+// `audience: user` page.
+describe("searchDocs — role-aware corpus", () => {
+  it("finds an operator-only body term for an admin but not a non-admin", () => {
+    const asAdmin = searchDocs("reverse proxy", true).map((r) => r.doc.slug);
+    expect(asAdmin).toContain("configuration");
+    expect(searchDocs("reverse proxy", false).map((r) => r.doc.slug)).not.toContain("configuration");
   });
 });

@@ -125,8 +125,12 @@ export function getDoc(slug: string): Doc | undefined {
   return docsBySlug.get(slug);
 }
 
-export function isUserDoc(slug: string): boolean {
-  return docsBySlug.get(slug)?.meta.audience === "user";
+// Whether a doc slug is routable in-app for this viewer: `user` pages are
+// routable for everyone; `operator` pages are additionally routable for admins
+// (role-aware in-app docs, issue #75). Everything else stays repo-only.
+export function isRoutableDoc(slug: string, isAdmin: boolean): boolean {
+  const audience = docsBySlug.get(slug)?.meta.audience;
+  return audience === "user" || (isAdmin && audience === "operator");
 }
 
 // Index order: `order` ascending, missing order last, slug as a stable
@@ -142,6 +146,18 @@ export function sortDocsForIndex(docs: Doc[]): Doc[] {
 // In-app index: only `audience: user` pages, ordered by sortDocsForIndex.
 export function listUserDocs(): Doc[] {
   return sortDocsForIndex([...docsBySlug.values()].filter((d) => d.meta.audience === "user"));
+}
+
+// Admin-only in-app index: the `audience: operator` pages, ordered the same way.
+export function listOperatorDocs(): Doc[] {
+  return sortDocsForIndex([...docsBySlug.values()].filter((d) => d.meta.audience === "operator"));
+}
+
+// The listed/searchable corpus for a viewer: user docs for everyone, plus the
+// operator docs (user docs first) for an admin. Both the index and the search
+// corpus derive from this.
+export function docsForIndex(isAdmin: boolean): Doc[] {
+  return isAdmin ? [...listUserDocs(), ...listOperatorDocs()] : listUserDocs();
 }
 
 // Resolve a doc-relative POSIX path against `docs/` and normalize `.`/`..` into
@@ -178,16 +194,17 @@ export function schemeIsDangerous(url: string): boolean {
   return DANGEROUS_SCHEME.test(url.replace(/[\x00-\x20]+/g, ""));
 }
 
-// Pure core of link rewriting. `isUserPage(slug)` reports whether a doc slug is
-// a bundled in-app page; passing it in (rather than reading module state) keeps
-// this rule unit-testable without the build-time doc glob.
+// Pure core of link rewriting. `isRoutablePage(slug)` reports whether a doc slug
+// is routable in-app for this viewer (see isRoutableDoc: `user` for everyone,
+// `operator` too for admins); passing it in (rather than reading module state)
+// keeps this rule unit-testable without the build-time doc glob.
 //   - `#anchor` and absolute/external URLs pass through untouched.
 //   - dangerous schemes are neutralized to an empty href.
-//   - a relative `*.md` that resolves to a bundled `user` page -> `/docs/:slug`
+//   - a relative `*.md` that resolves to an in-app-routable page -> `/docs/:slug`
 //     (in-app route), preserving any `#anchor`.
-//   - any other relative path (repo-only doc, ../plan.md, ...) -> the pinned
+//   - any other relative path (non-routable doc, ../plan.md, ...) -> the pinned
 //     GitLab blob URL, preserving any `#anchor`.
-export function resolveHref(href: string, isUserPage: (slug: string) => boolean): RewrittenHref {
+export function resolveHref(href: string, isRoutablePage: (slug: string) => boolean): RewrittenHref {
   // Protocol-relative (`//host`, and the `/\` variant browsers also treat as
   // such) is an off-app URL, not an in-app route — classify before the
   // single-slash internal case below.
@@ -216,16 +233,19 @@ export function resolveHref(href: string, isUserPage: (slug: string) => boolean)
   const repoPath = resolveFromDocs(path);
   if (repoPath.startsWith("docs/") && repoPath.endsWith(".md")) {
     const slug = repoPath.slice("docs/".length, -".md".length);
-    if (isUserPage(slug)) {
+    if (isRoutablePage(slug)) {
       return { href: `/docs/${slug}${anchor}`, external: false, internal: true };
     }
   }
   return { href: `${GITLAB_BLOB_BASE}${repoPath}${anchor}`, external: true, internal: false };
 }
 
-// Bound to the docs actually bundled in this build.
-export function rewriteHref(href: string): RewrittenHref {
-  return resolveHref(href, isUserDoc);
+// Bound to the docs actually bundled in this build. A relative `*.md` link
+// routes in-app when its target is routable for this viewer — user pages for
+// everyone, and operator pages too for an admin (issue #75 M1); anything else
+// resolves to the pinned GitLab blob URL.
+export function rewriteHref(href: string, isAdmin: boolean): RewrittenHref {
+  return resolveHref(href, (slug) => isRoutableDoc(slug, isAdmin));
 }
 
 // Resolve a relative image src in doc markdown to its hashed asset URL. Absolute
