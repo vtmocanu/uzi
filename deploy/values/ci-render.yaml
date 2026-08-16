@@ -1,0 +1,149 @@
+# CI-only render values — the input for the `helm_chart` job's chart-render assertions
+# (scripts/assert-chart-render.sh, scripts/assert-controller-strategy.sh).
+#
+# WHY THIS EXISTS: those two assertions need the FULL "real" posture rendered — workers
+# + controller + docker tier + NetworkPolicy + TLS + Infisical-mode pull secrets — so
+# that #149's worker ServiceAccount/pull-secret objects and #224's controller Deployment
+# are present. deploy/values/kind-smoke.yaml cannot stand in (it sets controller.enabled:
+# false and networkPolicy.enabled: false, so neither assertion has anything to check).
+#
+# It reproduces the feature TOGGLES of a real per-cluster values file but carries ONLY
+# dummy/example hosts, CIDRs, registries and Infisical scopes — no real cluster data. The
+# assertions validate document STRUCTURE (one kind per doc; controller strategy), which is
+# a property of the templates and independent of these string values. Keep the toggles in
+# lockstep with the real per-cluster values so this stays a faithful stand-in.
+
+api:
+  config:
+    FRONTEND_ORIGIN: https://uzi.example.com
+    UZI_PUBLIC_BASE_URL: https://uzi.example.com
+    # Dummy pod CIDR — trusted-proxy value; any valid CIDR renders identically.
+    TRUSTED_PROXIES: "10.244.0.0/16"
+    FORGE_ALLOWED_BASE_URLS: https://gitlab.example.com
+    UZI_OIDC_ISSUER_URL: https://keycloak.example.com/realms/example
+    UZI_OIDC_CLIENT_ID: uzi
+    UZI_OIDC_PROVIDER_NAME: Keycloak
+    UZI_OIDC_ADMIN_GROUPS: uzi-admins
+    UZI_OIDC_ALLOWED_GROUPS: uzi-users,uzi-admins
+    UZI_ALLOWED_EMAIL_DOMAINS: example.com
+    RUN_TIMEOUT: 6h
+  secretEnv:
+    UZI_OIDC_CLIENT_SECRET: UZI_OIDC_CLIENT_SECRET
+  # Dummy node CIDR for the kubelet probe source.
+  networkPolicy:
+    probeCIDRs:
+      - 10.0.0.0/24
+  # REQUIRED whenever workers.enabled is true (worker-invariants render guard).
+  tls:
+    enabled: true
+
+workers:
+  enabled: true
+  storageClass: standard
+  maxConcurrentRuns: 2
+  docker:
+    enabled: true
+    rootless: false
+    acknowledgeNonRootlessNodeRoot: true
+    dindResources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 6Gi
+    networkPolicy:
+      enabled: true
+      podCIDR: 10.244.0.0/16
+      serviceCIDR: 10.96.0.0/12
+      linkLocalCIDR: 169.254.0.0/16
+      extraExcept:
+        - 10.0.0.0/24
+  fqdnEgress:
+    enabled: true
+    denyCIDRs:
+      - name: drop-cloud-metadata
+        cidr: 169.254.169.254/32
+      - name: drop-kube-apiserver
+        cidr: 10.96.0.1/32
+      - name: drop-node-cidr
+        cidr: 10.0.0.0/24
+    allowFQDNs:
+      - name: allow-forge
+        fqdn: "gitlab.example.com"
+        ports: [443]
+      - name: allow-anthropic
+        fqdn: "*.anthropic.com"
+        ports: [443]
+      - name: allow-nix-substituters
+        fqdn: "cache.nixos.org"
+        ports: [443]
+      - name: allow-cnpg-oci-registry
+        fqdn: "ghcr.io"
+        ports: [443]
+      - name: allow-cnpg-oci-blobs
+        fqdn: "pkg-containers.githubusercontent.com"
+        ports: [443]
+  networkPolicy:
+    allowWebService: true
+
+web:
+  ingress:
+    host: uzi.example.com
+
+postgres:
+  enabled: true
+  cluster:
+    imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+    imagePullSecrets:
+      - name: uzi-pull-secret
+    instances: 3
+    storage:
+      storageClass: standard
+    walStorage:
+      storageClass: standard
+  backups:
+    enabled: true
+    provider: s3
+    endpointURL: https://s3.example.com
+    destinationPath: s3://postgres-example
+    secret:
+      create: false
+      name: postgres-s3-backup-creds
+    wal:
+      compression: gzip
+      encryption: ""
+      maxParallel: 2
+    data:
+      compression: gzip
+      encryption: ""
+      jobs: 2
+    scheduledBackups:
+      - name: daily-backup
+        schedule: "0 0 3 * * *"
+        backupOwnerReference: self
+        method: barmanObjectStore
+    retentionPolicy: "90d"
+
+infisicalList:
+  - name: infsec-uzi
+    projectSlug: example-project
+    envSlug: dev
+    secretsPath: /uzi
+    secretName: uzi-secrets
+    secretType: Opaque
+    syncWave: "-10"
+  - name: infsec-harbor-robot-uzi
+    projectSlug: example-project
+    envSlug: prod
+    secretsPath: /k8s-registry-robot
+    secretName: uzi-pull-secret
+    secretType: kubernetes.io/dockerconfigjson
+    syncWave: "-10"
+  - name: infsec-postgres-s3-backups-creds
+    projectSlug: example-project
+    envSlug: prod
+    secretsPath: /postgres-s3-backup-creds
+    secretName: postgres-s3-backup-creds
+    secretType: Opaque
+    syncWave: "-5"

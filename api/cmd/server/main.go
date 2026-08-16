@@ -1138,10 +1138,10 @@ func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
 // WHY THIS EXISTS, so nobody simplifies it away:
 //
 // mw.ClientIP trusts X-Forwarded-For based on the PEER IP alone — it knows nothing
-// about which listener or route the request arrived on. On dev-cluster
-// TRUSTED_PROXIES is the whole pod CIDR (10.244.0.0/16), because pod IPs are
-// dynamic and no narrower value is maintainable. Hosted worker pods get IPs inside
-// it, so they are trusted proxies BY CONSTRUCTION. Until PRD #58 M3 nothing could
+// about which listener or route the request arrived on. In a cluster deployment
+// TRUSTED_PROXIES is set to the whole pod CIDR, because pod IPs are dynamic and no
+// narrower value is maintainable. Hosted worker pods get IPs inside it, so they are
+// trusted proxies BY CONSTRUCTION. Until PRD #58 M3 nothing could
 // exploit that, because the api NetworkPolicy admitted web pods and nothing else —
 // and M3's own Decision 5(a) rule, which admits the worker namespace to this port,
 // is exactly what removes that mitigation. Without this, a compromised worker (the

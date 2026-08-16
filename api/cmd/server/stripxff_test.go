@@ -12,14 +12,14 @@ import (
 // stripXFF (PRD #58 M3), layer (b) of two.
 //
 // These tests assert the BYPASS is closed, not merely that a header is absent:
-// each one runs the real mw.ClientIP against the real pod-CIDR TRUSTED_PROXIES
-// value from deploy/values/dev-cluster.yaml, from a peer IP inside it. Asserting
-// only "the header is gone" would pass against a ClientIP that had stopped reading
-// XFF for some other reason, and would not notice if it started again.
+// each one runs the real mw.ClientIP against a representative pod-CIDR
+// TRUSTED_PROXIES value, from a peer IP inside it. Asserting only "the header is
+// gone" would pass against a ClientIP that had stopped reading XFF for some other
+// reason, and would not notice if it started again.
 
-// podCIDR is the dev-cluster value, verbatim: TRUSTED_PROXIES: "10.244.0.0/16"
-// (deploy/values/dev-cluster.yaml). It is the whole pod CIDR because pod IPs are
-// dynamic, which is exactly why hosted workers land inside it.
+// podCIDR is a representative pod CIDR. A cluster sets TRUSTED_PROXIES to its whole
+// pod CIDR because pod IPs are dynamic, which is exactly why hosted workers land
+// inside it; the value here is a generic example, not any specific cluster's.
 func podCIDR(t *testing.T) []*net.IPNet {
 	t.Helper()
 	_, n, err := net.ParseCIDR("10.244.0.0/16")
@@ -31,7 +31,7 @@ func podCIDR(t *testing.T) []*net.IPNet {
 
 // workerPeer is a hosted worker pod's address — inside the pod CIDR, hence a
 // trusted proxy by construction.
-const workerPeer = "192.168.42.7:54321"
+const workerPeer = "10.244.42.7:54321"
 
 // The bug, demonstrated: WITHOUT the strip, a worker chooses its own rate-limit
 // key. This test is what gives the fix its meaning — if it ever stops failing on
@@ -63,8 +63,8 @@ func TestStripXFFPinsTheClientIPToTheRealPeer(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
-	if seen != "192.168.42.7" {
-		t.Fatalf("ClientIP = %q, want the worker's real peer 192.168.42.7", seen)
+	if seen != "10.244.42.7" {
+		t.Fatalf("ClientIP = %q, want the worker's real peer 10.244.42.7", seen)
 	}
 }
 
@@ -81,7 +81,7 @@ func TestStripXFFDefeatsARotatingForgedHeader(t *testing.T) {
 		req.Header.Set("X-Forwarded-For", forged)
 		h.ServeHTTP(httptest.NewRecorder(), req)
 	}
-	if len(keys) != 1 || !keys["192.168.42.7"] {
+	if len(keys) != 1 || !keys["10.244.42.7"] {
 		t.Fatalf("rate-limit keys = %v, want exactly one: the worker's real peer. "+
 			"More than one means a worker can still mint fresh per-IP buckets at will.", keys)
 	}
