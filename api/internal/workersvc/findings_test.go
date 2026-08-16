@@ -239,7 +239,7 @@ func TestCreateFindingDerivesUserRepoFromRun(t *testing.T) {
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
 
-	got, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	got, notify, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title:       "Leaked ticker",
 		Description: "sweepLoop never Stops the ticker",
 		Location:    "./api/internal/Sweep.go#sweepLoop",
@@ -248,6 +248,9 @@ func TestCreateFindingDerivesUserRepoFromRun(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("CreateFinding: %v", err)
+	}
+	if !notify {
+		t.Error("a fresh open coordinate must return notify=true")
 	}
 	if f.inserted == nil {
 		t.Fatal("no evidence row inserted")
@@ -278,7 +281,7 @@ func TestCreateFindingForeignRunIs404(t *testing.T) {
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: f.run.UserID}
 	// A run id that is not the worker's user's run.
-	_, err := svc.CreateFinding(context.Background(), wkr, uuid.New(), CreateFindingRequest{
+	_, _, err := svc.CreateFinding(context.Background(), wkr, uuid.New(), CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
 	})
 	if !errors.Is(err, ErrRunNotFound) {
@@ -294,7 +297,7 @@ func TestCreateFindingCapReached(t *testing.T) {
 	f := &findingsFakeStore{run: run, count: MaxFindingsPerRun}
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
-	_, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
 	})
 	if !errors.Is(err, ErrFindingCapReached) {
@@ -311,7 +314,7 @@ func TestCreateFindingRepoRequired(t *testing.T) {
 	f := &findingsFakeStore{run: run}
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
-	_, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
 	})
 	if !errors.Is(err, ErrFindingRepoRequired) {
@@ -333,7 +336,7 @@ func TestCreateFindingAntiNagOrdering(t *testing.T) {
 	}
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
-	_, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, notify, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
 	})
 	if err != nil {
@@ -348,6 +351,11 @@ func TestCreateFindingAntiNagOrdering(t *testing.T) {
 	if f.updateCalled == nil {
 		t.Error("when the re-open matched 0 rows, the last_title refresh must be attempted")
 	}
+	// The anti-nag guarantee (R2): a matching-hash re-report on a resolved coordinate
+	// (re-open 0, refresh 0) is SUPPRESSED — it must NOT notify.
+	if notify {
+		t.Error("a suppressed matching-hash re-report on a resolved coordinate must return notify=false")
+	}
 	// Ordering: re-open is tried BEFORE the open-only refresh, so an identical-hash report
 	// on a filed/dismissed row never resurrects it.
 }
@@ -359,9 +367,10 @@ func TestCreateFindingReopenSkipsRefresh(t *testing.T) {
 	f := &findingsFakeStore{run: run, upsertErr: pgx.ErrNoRows, reopenRows: 1}
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
-	if _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, notify, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateFinding: %v", err)
 	}
 	if f.reopenCalled == nil {
@@ -369,6 +378,31 @@ func TestCreateFindingReopenSkipsRefresh(t *testing.T) {
 	}
 	if f.updateCalled != nil {
 		t.Error("a successful re-open (1 row) must NOT fall through to the last_title refresh")
+	}
+	if !notify {
+		t.Error("a materially-different report that re-opens (1 row) must return notify=true")
+	}
+}
+
+func TestCreateFindingLiveOpenCoordinateRefreshNotifies(t *testing.T) {
+	// A fresh finding on an ALREADY-open coordinate: the upsert conflicts (ErrNoRows), the
+	// re-open matches 0 rows (nothing resolved to re-open), and the open-only last_title
+	// refresh matches 1 row — the coordinate is live, so this is a real finding to notify.
+	run := baseFindingRun()
+	f := &findingsFakeStore{run: run, upsertErr: pgx.ErrNoRows, reopenRows: 0, updateRows: 1}
+	svc := New(f, nil, Params{})
+	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
+	_, notify, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+		Title: "T", Description: "D", Location: "a/b.go#f",
+	})
+	if err != nil {
+		t.Fatalf("CreateFinding: %v", err)
+	}
+	if f.updateCalled == nil {
+		t.Error("the open-only last_title refresh must be attempted when the re-open matched 0 rows")
+	}
+	if !notify {
+		t.Error("a fresh finding on a live open coordinate (refresh matched 1 row) must return notify=true")
 	}
 }
 
@@ -379,12 +413,16 @@ func TestCreateFindingFirstReportInsertsOpen(t *testing.T) {
 	f := &findingsFakeStore{run: run, upsertErr: nil}
 	svc := New(f, nil, Params{})
 	wkr := store.Worker{ID: uuid.New(), UserID: run.UserID}
-	if _, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
+	_, notify, err := svc.CreateFinding(context.Background(), wkr, run.ID, CreateFindingRequest{
 		Title: "T", Description: "D", Location: "a/b.go#f",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateFinding: %v", err)
 	}
 	if f.reopenCalled != nil || f.updateCalled != nil {
 		t.Error("a fresh open insert must not touch the re-open / refresh UPDATEs")
+	}
+	if !notify {
+		t.Error("a fresh open insert must return notify=true")
 	}
 }

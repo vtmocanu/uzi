@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -28,6 +30,13 @@ type workerFindingsStore struct {
 	count    int64
 	inserted *store.InsertFindingParams
 	disp     *store.UpsertOpenDispositionParams
+
+	// Disposition outcome knobs (default zero = a fresh `open` insert → notify). Set
+	// upsertErr=pgx.ErrNoRows with reopenRows=0/updateRows=0 to model the SUPPRESSED
+	// matching-hash re-report on a resolved coordinate (notify=false).
+	upsertErr  error
+	reopenRows int64
+	updateRows int64
 }
 
 func (s *workerFindingsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -49,7 +58,16 @@ func (s *workerFindingsStore) InsertFinding(_ context.Context, arg store.InsertF
 }
 func (s *workerFindingsStore) UpsertOpenDisposition(_ context.Context, arg store.UpsertOpenDispositionParams) (store.FindingDisposition, error) {
 	s.disp = &arg
+	if s.upsertErr != nil {
+		return store.FindingDisposition{}, s.upsertErr
+	}
 	return store.FindingDisposition{}, nil // a fresh open row was inserted
+}
+func (s *workerFindingsStore) ReopenDispositionOnHashMismatch(context.Context, store.ReopenDispositionOnHashMismatchParams) (int64, error) {
+	return s.reopenRows, nil
+}
+func (s *workerFindingsStore) UpdateDispositionLastTitle(context.Context, store.UpdateDispositionLastTitleParams) (int64, error) {
+	return s.updateRows, nil
 }
 
 func findingRun(userID, repoID uuid.UUID) store.Run {
@@ -169,4 +187,100 @@ func manyLabels(n int) string {
 	}
 	b, _ := json.Marshal(ls)
 	return string(b)
+}
+
+// notifyingSpyStore is a notifysvc.Store that records the InsertNotification calls the M3
+// coalescing path makes, so the handler test can assert WorkerCreateFinding fires the
+// notification when the finding opened/re-opened a coordinate and stays silent when it was
+// suppressed. FindUnreadNotificationForRunKind always reports "no coalescible row" so the
+// first (and only) finding takes the insert-and-DM branch. insertErr lets a test prove the
+// notification failing does not fail the 200.
+type notifyingSpyStore struct {
+	inserts   int
+	insertErr error
+}
+
+func (s *notifyingSpyStore) InsertNotification(_ context.Context, arg store.InsertNotificationParams) (store.Notification, error) {
+	s.inserts++
+	if s.insertErr != nil {
+		return store.Notification{}, s.insertErr
+	}
+	return store.Notification{ID: uuid.New(), UserID: arg.UserID, Kind: arg.Kind, Payload: arg.Payload}, nil
+}
+func (s *notifyingSpyStore) PruneNotificationsForUser(context.Context, store.PruneNotificationsForUserParams) (int64, error) {
+	return 0, nil
+}
+func (s *notifyingSpyStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return store.Run{}, nil
+}
+func (s *notifyingSpyStore) FindUnreadNotificationForRunKind(context.Context, store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
+	return store.Notification{}, pgx.ErrNoRows
+}
+func (s *notifyingSpyStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
+	return store.Notification{ID: arg.ID, UserID: arg.UserID, Payload: arg.Payload}, nil
+}
+
+func newNotifyingWorkerHandler(st workersvc.Store, ns *notifyingSpyStore) *Handler {
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h.SetNotifier(notifysvc.New(ns, nil, 0, nil))
+	return h
+}
+
+func TestWorkerCreateFindingFiresNotificationWhenOpened(t *testing.T) {
+	uid, repoID := uuid.New(), uuid.New()
+	run := findingRun(uid, repoID)
+	st := &workerFindingsStore{userID: uid, run: run} // fresh open insert → notify
+	ns := &notifyingSpyStore{}
+	h := newNotifyingWorkerHandler(st, ns)
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+
+	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
+	rec := httptest.NewRecorder()
+	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create finding = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ns.inserts != 1 {
+		t.Errorf("a newly-opened coordinate must fire exactly one notification, got %d", ns.inserts)
+	}
+}
+
+func TestWorkerCreateFindingSuppressedDoesNotNotify(t *testing.T) {
+	uid, repoID := uuid.New(), uuid.New()
+	run := findingRun(uid, repoID)
+	// Suppressed: the coordinate already exists (upsert conflict), the re-open matches 0
+	// rows (identical hash) and the open-only refresh matches 0 (resolved) → notify=false.
+	st := &workerFindingsStore{userID: uid, run: run, upsertErr: pgx.ErrNoRows, reopenRows: 0, updateRows: 0}
+	ns := &notifyingSpyStore{}
+	h := newNotifyingWorkerHandler(st, ns)
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+
+	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
+	rec := httptest.NewRecorder()
+	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("suppressed capture must still return 200 (the evidence is stored); got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if ns.inserts != 0 {
+		t.Errorf("a suppressed matching-hash re-report must NOT notify (anti-nag, R2), got %d inserts", ns.inserts)
+	}
+}
+
+func TestWorkerCreateFindingNotificationFailureDoesNotFail200(t *testing.T) {
+	uid, repoID := uuid.New(), uuid.New()
+	run := findingRun(uid, repoID)
+	st := &workerFindingsStore{userID: uid, run: run}
+	ns := &notifyingSpyStore{insertErr: errors.New("inbox down")}
+	h := newNotifyingWorkerHandler(st, ns)
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+
+	body := `{"title":"Leaked ticker","description":"sweepLoop never Stops it","location":"a/b.go#f"}`
+	rec := httptest.NewRecorder()
+	h.WorkerCreateFinding(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/findings", wkr, run.ID, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a notification failure must not fail the capture; got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if st.inserted == nil {
+		t.Error("the finding must still be durably stored even when the notification fails")
+	}
 }

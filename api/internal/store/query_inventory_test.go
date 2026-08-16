@@ -879,17 +879,18 @@ var queryInventory = []queryPin{
 
 	// ── notifications.sql — the PRD #333 D6 coalescing plumbing (M1 lands the queries; M3 uses them) ──
 	{"FindUnreadNotificationForRunKind", "notifications.sql", unpinnedPin,
-		"PRD #333 M1 lands this query so M3 need not regenerate sqlc; no M1 live test executes it. " +
-			"Its only caller is the M3 notifysvc coalescing entry point (not yet written), which finds " +
-			"the coalescible unread (user, run, kind) row before bumping its payload count. Its " +
-			"read_at IS NULL + (user_id, run_id, kind) predicate is what decides coalesce-vs-fire-fresh; " +
-			"a live pin belongs with M3's notifysvc test. UNPINNED with this reason until then."},
+		"PRD #333 M3 drives this query, but only from notifysvc.NotifyIncidentalFinding — exercised " +
+			"by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc, which is NOT one of " +
+			"inventoryPackages (a non-live fake Store, not a store-package live-DB test). That test " +
+			"asserts the coalesce-vs-fire-fresh decision this query's read_at IS NULL + (user_id, " +
+			"run_id, kind) predicate makes: a miss inserts + DMs once, a hit bumps the payload. UNPINNED " +
+			"because no store/handler test executes it against a live DB; the honest pin lives in notifysvc."},
 	{"UpdateNotificationPayload", "notifications.sql", unpinnedPin,
-		"PRD #333 M1 lands this query so M3 need not regenerate sqlc; no M1 live test executes it. " +
-			"Its only caller is the same M3 coalescing path, which rewrites payload.count/finding_ids " +
-			"on the row FindUnreadNotificationForRunKind returned (bump the badge without re-firing " +
-			"Slack). A plain by-id UPDATE ... RETURNING with nothing to regress at the SQL layer; " +
-			"UNPINNED with this reason until M3 drives it."},
+		"PRD #333 M3 drives this query from the same notifysvc.NotifyIncidentalFinding coalescing path, " +
+			"exercised by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc (outside " +
+			"inventoryPackages, a fake Store). That test asserts the row count stays 1 while the payload " +
+			"count bumps to 2 — the UPDATE ... WHERE id AND user_id RETURNING this query is. UNPINNED " +
+			"because no store/handler live-DB test executes it; the honest pin lives in notifysvc."},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

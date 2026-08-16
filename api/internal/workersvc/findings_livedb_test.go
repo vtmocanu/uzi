@@ -74,10 +74,12 @@ func TestCreateFindingLiveDB(t *testing.T) {
 
 	// (1) First report — a drifted location collapses to the canonical coordinate and
 	//     opens the disposition.
-	if _, err := svc.CreateFinding(ctx, wkr, run1, CreateFindingRequest{
+	if _, notify, err := svc.CreateFinding(ctx, wkr, run1, CreateFindingRequest{
 		Title: "Leaked ticker", Description: "sweepLoop never Stops it", Location: "./api/internal/Sweep.go#sweepLoop",
 	}); err != nil {
 		t.Fatalf("first report: %v", err)
+	} else if !notify {
+		t.Error("a brand-new open coordinate must return notify=true")
 	}
 	if evidenceCount() != 1 {
 		t.Fatalf("after first report, evidence=%d want 1", evidenceCount())
@@ -93,10 +95,12 @@ func TestCreateFindingLiveDB(t *testing.T) {
 	// (3) A later run RE-REPORTS the SAME finding (identical content) at the same
 	//     coordinate: a new evidence row exists, but the dismissed coordinate does NOT
 	//     resurrect (anti-nag, R2).
-	if _, err := svc.CreateFinding(ctx, wkr, run2, CreateFindingRequest{
+	if _, notify, err := svc.CreateFinding(ctx, wkr, run2, CreateFindingRequest{
 		Title: "Leaked ticker", Description: "sweepLoop never Stops it", Location: "api/internal/sweep.go#sweepLoop",
 	}); err != nil {
 		t.Fatalf("re-report: %v", err)
+	} else if notify {
+		t.Error("an identical-hash re-report on a dismissed coordinate must return notify=false (suppressed, R2)")
 	}
 	if evidenceCount() != 2 {
 		t.Errorf("after identical re-report, evidence=%d want 2 (evidence still recorded)", evidenceCount())
@@ -106,10 +110,12 @@ func TestCreateFindingLiveDB(t *testing.T) {
 	}
 
 	// (4) A materially-different finding at the SAME coordinate re-opens it (D3).
-	if _, err := svc.CreateFinding(ctx, wkr, run3, CreateFindingRequest{
+	if _, notify, err := svc.CreateFinding(ctx, wkr, run3, CreateFindingRequest{
 		Title: "Leaked ticker", Description: "actually it double-Stops and panics", Location: "api/internal/sweep.go#sweepLoop",
 	}); err != nil {
 		t.Fatalf("materially-different re-report: %v", err)
+	} else if !notify {
+		t.Error("a materially-different report that re-opens a resolved coordinate must return notify=true")
 	}
 	if evidenceCount() != 3 {
 		t.Errorf("after re-open report, evidence=%d want 3", evidenceCount())

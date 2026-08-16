@@ -73,22 +73,26 @@ type CreateFindingRequest struct {
 // upserts the coordinate's `open` disposition — re-opening a resolved coordinate only
 // when the content materially changed, and never resurrecting a matching-hash
 // filed/dismissed one (the anti-nag ordering, R2). It NEVER writes the forge — filing
-// is human-gated later (D4). Returns the created evidence row.
-func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CreateFindingRequest) (store.IncidentalFinding, error) {
+// is human-gated later (D4). Returns the created evidence row and a `notify` bool: true
+// when the coordinate ended up open/re-opened (the caller fires the M3 coalesced
+// notification), false when the report was SUPPRESSED (a matching-hash re-report on an
+// already filed/dismissed coordinate — the anti-nag guarantee, R2), so a dismissed bug
+// never re-nags across runs.
+func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CreateFindingRequest) (store.IncidentalFinding, bool, error) {
 	// (1) Derive (user_id, repo_id) from the claimed run — never a client-sent id.
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return store.IncidentalFinding{}, ErrRunNotFound
+			return store.IncidentalFinding{}, false, ErrRunNotFound
 		}
-		return store.IncidentalFinding{}, err
+		return store.IncidentalFinding{}, false, err
 	}
 	if !run.RepoID.Valid {
-		return store.IncidentalFinding{}, ErrFindingRepoRequired
+		return store.IncidentalFinding{}, false, ErrFindingRepoRequired
 	}
 	// A finding comes from an ACTIVE worker; a terminal run cannot be reporting one.
 	if terminalStatuses[run.Status] {
-		return store.IncidentalFinding{}, ErrRunTerminal
+		return store.IncidentalFinding{}, false, ErrRunTerminal
 	}
 	repoID := uuid.UUID(run.RepoID.Bytes)
 	userID := run.UserID
@@ -96,10 +100,10 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	// (2) Per-run capture cap (D11).
 	count, err := s.q.CountFindingsForRun(ctx, runID)
 	if err != nil {
-		return store.IncidentalFinding{}, err
+		return store.IncidentalFinding{}, false, err
 	}
 	if count >= MaxFindingsPerRun {
-		return store.IncidentalFinding{}, ErrFindingCapReached
+		return store.IncidentalFinding{}, false, ErrFindingCapReached
 	}
 
 	// (3) Ingest hygiene (D4): sanitise the untrusted self-reported text to INERT form
@@ -115,7 +119,7 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	// ordering. A location that canonicalises to empty is a meaningless coordinate.
 	location := canonicalizeLocation(sanitizeFindingText(req.Location, MaxFindingLocationBytes), MaxFindingLocationBytes)
 	if location == "" {
-		return store.IncidentalFinding{}, ErrFindingLocationInvalid
+		return store.IncidentalFinding{}, false, ErrFindingLocationInvalid
 	}
 
 	confidence := sanitizeFindingText(req.Confidence, MaxFindingConfidenceBytes)
@@ -126,7 +130,7 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 
 	labelsJSON, err := marshalFindingLabels(req.Labels)
 	if err != nil {
-		return store.IncidentalFinding{}, err
+		return store.IncidentalFinding{}, false, err
 	}
 
 	// (6) Insert the per-run evidence row (already-canonical location + inert text).
@@ -141,12 +145,16 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 		Confidence:    confidence,
 	})
 	if err != nil {
-		return store.IncidentalFinding{}, err
+		return store.IncidentalFinding{}, false, err
 	}
 
 	// (7) Claim the coordinate as `open` on the FIRST report (ON CONFLICT DO NOTHING).
 	// An actual insert returns the row; a conflict (a row already exists at this
-	// coordinate) returns pgx.ErrNoRows — that IS the did-I-insert signal.
+	// coordinate) returns pgx.ErrNoRows — that IS the did-I-insert signal. `notify`
+	// tracks whether the coordinate ended up open/re-opened (notify the user) versus
+	// SUPPRESSED (a matching-hash re-report on a filed/dismissed row — the anti-nag
+	// guarantee, R2). The caller fires the M3 coalesced notification only when notify.
+	notify := false
 	_, err = s.q.UpsertOpenDisposition(ctx, store.UpsertOpenDispositionParams{
 		UserID:      userID,
 		RepoID:      repoID,
@@ -156,7 +164,8 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	})
 	switch {
 	case err == nil:
-		// A brand-new `open` coordinate was created.
+		// A brand-new `open` coordinate was created → notify.
+		notify = true
 	case errors.Is(err, pgx.ErrNoRows):
 		// The coordinate already exists. Order matters for the anti-nag guarantee (R2):
 		// try the guarded re-open FIRST — it re-opens ONLY a filed/dismissed row whose
@@ -173,27 +182,40 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 			Location:    location,
 		})
 		if rerr != nil {
-			return store.IncidentalFinding{}, rerr
+			return store.IncidentalFinding{}, false, rerr
 		}
-		if reopened == 0 {
-			if _, uerr := s.q.UpdateDispositionLastTitle(ctx, store.UpdateDispositionLastTitleParams{
+		if reopened == 1 {
+			// A materially-different report re-opened a resolved coordinate → notify.
+			notify = true
+		} else {
+			// The re-open matched nothing. Either the coordinate is already `open` (refresh
+			// its last_title → notify, a fresh finding on a live coordinate) or it is a
+			// filed/dismissed row with a MATCHING hash (the refresh is an open-only no-op →
+			// suppressed, do NOT notify). The rows-affected count discriminates the two.
+			updated, uerr := s.q.UpdateDispositionLastTitle(ctx, store.UpdateDispositionLastTitleParams{
 				LastTitle:   title,
 				ContentHash: contentHash,
 				UserID:      userID,
 				RepoID:      repoID,
 				Location:    location,
-			}); uerr != nil {
-				return store.IncidentalFinding{}, uerr
+			})
+			if uerr != nil {
+				return store.IncidentalFinding{}, false, uerr
+			}
+			if updated == 1 {
+				notify = true
 			}
 		}
 	default:
-		return store.IncidentalFinding{}, err
+		return store.IncidentalFinding{}, false, err
 	}
 
-	// (8) M3: enqueue coalesced notification here (inbox + one Slack DM per run, D6),
-	// suppressed on a resolved matching coordinate. M3 owns that plumbing; M2 stops at the
-	// stored evidence + open coordinate and returns without notifying.
-	return finding, nil
+	// (8) The caller (the handler) fires the M3 coalesced notification when notify is
+	// true — inbox + one Slack DM per run (D6), coalesced on subsequent findings and
+	// suppressed here on a resolved matching coordinate. The notification is best-effort
+	// and lives in the handler so workersvc stays free of a notifysvc import (the cycle
+	// warning in judge_enqueue.go: notifysvc imports workersvc).
+	return finding, notify, nil
 }
 
 // marshalFindingLabels sanitises each label to INERT form and JSON-encodes the set for

@@ -317,21 +317,25 @@ func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotifi
 const updateNotificationPayload = `-- name: UpdateNotificationPayload :one
 UPDATE notifications
 SET payload = $1
-WHERE id = $2
+WHERE id = $2 AND user_id = $3
 RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at
 `
 
 type UpdateNotificationPayloadParams struct {
 	Payload []byte    `json:"payload"`
 	ID      uuid.UUID `json:"id"`
+	UserID  uuid.UUID `json:"user_id"`
 }
 
 // Bump a coalesced notification's payload without re-firing Slack (D6). M3 rewrites
 // payload.count (and finding_ids) on the row FindUnreadNotificationForRunKind returned, so
 // the bell badge and inbox reflect "Run #N flagged M findings" while the Slack DM fired
 // exactly once, on the first finding. RETURNING * so the caller can echo the updated row.
+// The (id, user_id) match is defense-in-depth (matching MarkNotificationRead): the caller
+// always passes the row FindUnreadNotificationForRunKind returned for this same user, so a
+// foreign id can never be updated even if a caller is ever wired to pass an untrusted id.
 func (q *Queries) UpdateNotificationPayload(ctx context.Context, arg UpdateNotificationPayloadParams) (Notification, error) {
-	row := q.db.QueryRow(ctx, updateNotificationPayload, arg.Payload, arg.ID)
+	row := q.db.QueryRow(ctx, updateNotificationPayload, arg.Payload, arg.ID, arg.UserID)
 	var i Notification
 	err := row.Scan(
 		&i.ID,

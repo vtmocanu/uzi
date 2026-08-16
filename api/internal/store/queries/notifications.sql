@@ -105,7 +105,10 @@ LIMIT 1;
 -- payload.count (and finding_ids) on the row FindUnreadNotificationForRunKind returned, so
 -- the bell badge and inbox reflect "Run #N flagged M findings" while the Slack DM fired
 -- exactly once, on the first finding. RETURNING * so the caller can echo the updated row.
+-- The (id, user_id) match is defense-in-depth (matching MarkNotificationRead): the caller
+-- always passes the row FindUnreadNotificationForRunKind returned for this same user, so a
+-- foreign id can never be updated even if a caller is ever wired to pass an untrusted id.
 UPDATE notifications
 SET payload = @payload
-WHERE id = @id
+WHERE id = @id AND user_id = @user_id
 RETURNING *;
