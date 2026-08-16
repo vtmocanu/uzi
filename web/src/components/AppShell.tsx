@@ -21,6 +21,7 @@ import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import {
   ActivityIcon,
+  AlertIcon,
   BellIcon,
   BoardIcon,
   BookIcon,
@@ -347,6 +348,7 @@ function SidebarContent({
   runsInProgress = 0,
   schedulesEnabled = 0,
   workersAttention = 0,
+  findingsOpen = 0,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
@@ -369,6 +371,10 @@ function SidebarContent({
   // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
   // badge showing zero, which would be a permanent ornament that means nothing.
   workersAttention?: number;
+  // Open-findings count for the Findings nav badge (PRD #333 M7, D8). The caller's open
+  // finding coordinates, sourced from the GET /api/findings response `open_count` meta — a
+  // new count source, separate from the shared bell unread. Brand "count" tone, 0 hides it.
+  findingsOpen?: number;
   // Notifications unread count for the bell badge (PRD #46 M2). Owned by the
   // parent AppShell so the single poll feeds both this badge and the status
   // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
@@ -507,6 +513,19 @@ function SidebarContent({
             collapsed={collapsed}
           />
           <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Findings (PRD #333 D8): off-task bugs workers flagged on YOUR code — Work, not the
+              agent-grading Factory where Judge lives. Badge is the open-findings count from the
+              GET /api/findings meta; brand "count" tone, the noun is "open". */}
+          <NavItem
+            to="/findings"
+            icon={<AlertIcon />}
+            label="Findings"
+            badge={findingsOpen}
+            badgeTone="count"
+            badgeLabel="open"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
         </NavGroup>
 
         <NavGroup label="Factory" collapsed={collapsed}>
@@ -724,6 +743,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
+  // Open-findings badge (PRD #333 M7, D8). Owned here alongside the other nav counts, sourced
+  // from the GET /api/findings response `open_count` meta (unfiltered → global open count).
+  const [findingsOpen, setFindingsOpen] = useState(0);
   // Desktop sidebar collapse, persisted per browser. Initialised lazily from
   // localStorage so the first paint already matches the stored state — a
   // post-mount effect would flash the sidebar expanded then snap it collapsed.
@@ -848,6 +870,26 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
   }, [user, location.pathname]);
 
+  // Open-findings poll (PRD #333 M7, D8): the same on-navigation cadence as the Judge poll,
+  // reading the GET /api/findings `open_count` meta with NO repo filter (the global count). A
+  // failed fetch keeps the last known count rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setFindingsOpen(0);
+      return;
+    }
+    let alive = true;
+    api
+      .listFindings()
+      .then((data) => {
+        if (alive) setFindingsOpen(data.open_count);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [user, location.pathname]);
+
   // Status favicon (PRD #70 M4): mounted here so it lives on every route incl.
   // guest and survives logout (enabled flips false → reset to the static mark).
   // Reuses the unread count above — no second unread poll — and owns its own
@@ -885,6 +927,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           runsInProgress={runsInProgress}
           schedulesEnabled={schedulesEnabled}
           workersAttention={workersAttention}
+          findingsOpen={findingsOpen}
         />
       </aside>
 
@@ -916,7 +959,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} runsInProgress={runsInProgress} schedulesEnabled={schedulesEnabled} workersAttention={workersAttention} findingsOpen={findingsOpen} />
           </div>
         </div>
       )}

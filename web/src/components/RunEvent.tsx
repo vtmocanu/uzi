@@ -15,6 +15,7 @@ import {
   ThoughtIcon,
 } from "./icons";
 import { parseAnswerPayload, parseQuestionsForDisplay } from "../lib/runQuestion";
+import { FindingCard } from "./FindingCard";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -39,6 +40,9 @@ function asString(v: unknown): string | undefined {
 }
 function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+function asStringArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
 function firstLine(s: string): string {
   const i = s.indexOf("\n");
@@ -1215,6 +1219,25 @@ export const RunEventRow = memo(function RunEventRow({
     // is the one of the pair that reads as breakage.
     case "limit_hit":
       return <LimitRow payload={rec} />;
+    // PRD #333 M7: an incidental (off-task) finding the worker flagged mid-run. The card is
+    // the durable record AND the file/dismiss affordance (info/blue, D10) — its buttons act on
+    // the persisted finding `{id}`. Without an id there is nothing to act on, so it degrades to
+    // the same muted line every unrenderable frame gets rather than a dead-button card. Every
+    // string (title/location/confidence/labels) is model-authored and rendered inert by the
+    // card (escaped JSX + stripUnsafeChars, never Markdown).
+    case "finding": {
+      const findingId = asString(rec?.["id"]);
+      if (!findingId) return <UnrenderableRow kind={msg.kind} rec={rec} />;
+      return (
+        <FindingCard
+          id={findingId}
+          title={asString(rec?.["title"]) ?? ""}
+          location={asString(rec?.["location"]) ?? ""}
+          confidence={asString(rec?.["confidence"])}
+          labels={asStringArray(rec?.["labels"])}
+        />
+      );
+    }
     default:
       return <UnrenderableRow kind={msg.kind} rec={rec} />;
   }
