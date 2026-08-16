@@ -428,6 +428,50 @@ func TestRunFollowUpRequiresMessage(t *testing.T) {
 	}
 }
 
+// `run revise` steers a plan at the approval gate: it maps to the revise_plan
+// input kind and forwards the feedback verbatim as the body, without stopping the
+// run (unlike reject). Modelled on the follow-up verb.
+func TestRunRevise(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "revise", "r1", "-m", "tweak the schema")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastInputRunID != "r1" || fc.LastInputKind != "revise_plan" || fc.LastInputBody != "tweak the schema" {
+		t.Fatalf("revise mapping = run %q kind %q body %q, want r1/revise_plan/'tweak the schema'",
+			fc.LastInputRunID, fc.LastInputKind, fc.LastInputBody)
+	}
+	if fc.LastInputSelection != nil {
+		t.Error("revise must send no selection")
+	}
+	if !strings.Contains(out, "plan revision sent") {
+		t.Errorf("revise output = %q, want a 'plan revision sent' confirmation", out)
+	}
+}
+
+// A revision carries feedback by definition, so a missing/blank message (no -m,
+// empty stdin) is a usage error and submits nothing — the same guard follow-up has.
+func TestRunReviseRequiresMessage(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "revise", "r1")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage: no message)", code, uzicli.ExitUsage)
+	}
+	if fc.LastInputKind != "" {
+		t.Error("an empty revision must not submit an input")
+	}
+}
+
+// The revision limit is a server concern: an exhausted limit (or a run not at the
+// gate) is a 409 conflict, and the verb must surface it as exit 5, not swallow it.
+func TestRunRevisePropagatesConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitConflict, "revision limit exhausted")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "revise", "r1", "-m", "more changes")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
+	}
+}
+
 // The write verbs must surface a server error's exit code (e.g. a finished run →
 // 409 conflict → exit 5), not swallow it.
 func TestRunWriteVerbPropagatesConflict(t *testing.T) {
