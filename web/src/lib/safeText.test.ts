@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import { stripUnsafeChars } from "./safeText";
 
 // Issue #124. The corpus below deliberately MIRRORS the one the api pins for `sanitizeTTY`
@@ -139,5 +140,48 @@ describe("stripUnsafeChars", () => {
     // A `replace` without /g fixes the first character and ships the rest, which reads as
     // a working fix in any test that plants exactly one.
     expect(stripUnsafeChars(`${RLO}a${RLO}b${ZWSP}c`)).toBe("abc");
+  });
+});
+
+describe("shared termsafe corpus", () => {
+  // Issue #161. The shared golden corpus (fixtures/termsafe/corpus.json) is loaded by BOTH
+  // this suite and the Go termsafe test (api/internal/termsafe/termsafe_test.go), pinning the
+  // JS answer to the same classification the api uses so the two independent implementations
+  // cannot drift. Anchored to THIS file via import.meta.url — a BARE relative fs read would
+  // resolve from process.cwd() (web/), overshooting the repo root.
+  const corpus = JSON.parse(
+    readFileSync(new URL("../../../fixtures/termsafe/corpus.json", import.meta.url), "utf8"),
+  ) as { codepoints: { cp: string; name: string; category: string; unsafe: boolean }[] };
+
+  // The same count guard lives in the Go test. Its purpose is to RED on an add/remove so a
+  // change to the shared corpus is a deliberate, acknowledged act on both sides — bump both
+  // when you intentionally add or remove a code point.
+  const EXPECTED = 36;
+
+  it("has the pinned number of shared code points, both classes present", () => {
+    expect(corpus.codepoints.length).toBe(EXPECTED);
+    expect(corpus.codepoints.some((e) => e.unsafe)).toBe(true);
+    expect(corpus.codepoints.some((e) => !e.unsafe)).toBe(true);
+  });
+
+  it("strips exactly the corpus's unsafe code points via the production stripUnsafeChars", () => {
+    // The REAL web-side pin: assert the PRODUCTION scrubber, so dropping Cf (or any category)
+    // from safeText.ts's UNSAFE_CHAR reds here, mirroring how the Go test pins termsafe.Unsafe.
+    // The corpus omits \n/\t/\r, so stripUnsafeChars's whitespace exception never applies and
+    // "unsafe" == "stripped" holds for every entry.
+    for (const e of corpus.codepoints) {
+      const ch = String.fromCodePoint(parseInt(e.cp, 16));
+      expect(stripUnsafeChars(`a${ch}b`), `U+${e.cp} ${e.name}`).toBe(e.unsafe ? "ab" : `a${ch}b`);
+    }
+  });
+
+  it("labels each code point by the same Cc/Cf category rule the api uses", () => {
+    // Secondary: the corpus's own `unsafe` column matches JS Unicode category semantics
+    // /[\p{Cc}\p{Cf}]/u — the rule stripUnsafeChars is built from — keeping the fixture honest
+    // independently of the production regex asserted above.
+    for (const e of corpus.codepoints) {
+      const ch = String.fromCodePoint(parseInt(e.cp, 16));
+      expect(/[\p{Cc}\p{Cf}]/u.test(ch), `U+${e.cp} ${e.name}`).toBe(e.unsafe);
+    }
   });
 });
