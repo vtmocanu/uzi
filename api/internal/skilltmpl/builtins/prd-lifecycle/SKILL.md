@@ -63,6 +63,40 @@ the run.
 
 Then update the status header in the moved file to say it is complete, with the date.
 
+**Repoint inbound links to the moved file — in the SAME commit as the move.** Moving
+`prds/<file>.md` to `prds/done/` breaks every relative markdown link that pointed at
+the old path. Those links live in files this run never touched (`docs/*.md`,
+`adr/*.md`, `ARCHITECTURE.md`, other PRDs), so they are invisible unless you go
+looking — and a docs link-checker fails on them at merge time, in a file you then
+have to hunt for. Fix them now. Find the inbound links:
+
+```sh
+git grep -lF "prds/<file>.md"
+```
+
+Use `git grep` — it searches the repo's tracked files via the index, so it is
+unaffected by your working directory and by ignore rules that would make some
+recursive `grep` builds (ripgrep, ugrep) skip a tracked-but-git-ignored file. Use
+`-F` so the `.` in the filename is matched literally instead of as a regex wildcard.
+For every file it lists, repoint the link so it resolves to the new location,
+`prds/done/<file>.md`:
+
+- The common case — a link written `](../prds/<file>.md)` or `](prds/<file>.md)` — is
+  a plain literal substitution of `prds/<file>.md` → `prds/done/<file>.md`. It is safe
+  to apply blindly: an already-correct `prds/done/<file>.md` reference does not contain
+  the substring `prds/<file>.md`, so it is never double-prefixed into
+  `prds/done/done/...`.
+- The correct `../` prefix depends on the *linking file's own directory*, so the rule
+  is "make each inbound link resolve to `prds/done/<file>.md`", not one blind sed over
+  the whole tree. A sibling link from another PRD written `](<file>.md)` becomes
+  `](done/<file>.md)`, not `](prds/done/<file>.md)`.
+- Repoint the link *text* too when it is itself a path (e.g.
+  `[prds/<file>.md](../prds/<file>.md)`) — a link checker flags display text that names
+  a file which no longer exists, even when the target already resolves.
+
+Then confirm you caught them all: `git grep -F "prds/<file>.md"` should return nothing
+except matches inside the moved file's own new path.
+
 Commit the PRD change with the rest of your work, on the run's branch. Do not stage
 the whole tree to do it, and do not push.
 
