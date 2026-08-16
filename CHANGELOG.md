@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-08-16
+
 ### Added
 
 - **`check-styles` build gate for unresolved Tailwind classes (#170).** A
@@ -73,6 +75,31 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   gate every filing, same as every other forge write in uzi. New CLI verbs:
   `uzi findings list/file/dismiss`. See [docs/findings.md](docs/findings.md).
   (#333)
+
+- **`uzi run revise` CLI verb steers a plan at the approval gate (#335).** The
+  API already supported revising a queued plan at the approval gate; the CLI now
+  exposes it as `uzi run revise`, so a plan can be steered from the command line
+  without the web UI. (#335)
+
+### Changed
+
+- **The judge deterministically downgrades high-confidence recommendations its
+  signals cannot confirm (#336).** Implements `#81` proposal #4: a
+  recommendation the judge cannot back with concrete trace signals is demoted
+  from high confidence rather than surfaced as-is, reducing false-confident
+  advice. (#336, #81)
+
+- **The judge auto-dismisses recommendations targeting denylisted CLIs (#167).**
+  A deterministic net behind the existing prompt-side fix: a recommendation that
+  would steer a run toward a denylisted CLI is now dismissed automatically
+  rather than relying on the prompt alone. (#167)
+
+- **Housekeeping and public-migration prep.** The Go module path was renamed to
+  `github.com/vtmocanu/uzi` (`c7bbd9ac`); a batch of internal-only data was
+  scrubbed ahead of the public release (`1df03bd7`); the deploy chart's
+  per-cluster values were relocated and cleaned up (`5dbdb0be`); and CI's
+  chart-render check was decoupled from the per-cluster values file
+  (`ca489c62`, #16).
 
 ### Fixed
 
@@ -161,6 +188,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (`web/scripts/check-docs.mjs` already reports every broken link in one pass,
   so the surviving gap was the repoint, not the reporting.) (#257)
 
+- **Status-favicon review follow-ups from PRD #70 (#73).** Addresses the review
+  follow-ups filed against the PRD #70 status-favicon work (MR !66), in
+  `web/src/lib/favicon.ts`. (#73, #70)
+
 ### Security
 
 - **Both hostile-forge DoS vectors closed across all three forge drivers
@@ -192,6 +223,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   authoritative and evict cached issues. Both caps are sized far above any real
   forge list, so only a misbehaving forge hits them. Mirrors the CLI's existing
   `RunLogs` / `maxLogsMessages` backstop. (#338)
+
+- **Terminal and label sanitization converged onto a single unsafe-char
+  predicate (#161).** The remaining hand-rolled unsafe-character predicates now
+  route through `termsafe.Unsafe`, and the Go and web test corpora are pinned
+  together so the two stay in lockstep, closing the drift that let one surface
+  sanitize differently from another. (#161)
+
+- **The worker-name delete announcement is now sanitized (#173).** The delete
+  screen-reader announcement was the one `announce()` call whose "its visible
+  counterpart is already sanitized" justification did not hold, so it could emit
+  unsanitized worker-supplied text; it now sanitizes like the rest. (#173)
+
+- **WorkersSettings' two worker-name sanitizers converged (#172).** Three sites
+  used `stripUnsafeChars` while one used `sanitizeLabel`; all four now use the
+  same predicate, removing the inconsistency that could let one field accept
+  what another rejected. (#172)
 
 ## [0.39.0] - 2026-08-16
 
