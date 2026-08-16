@@ -36,6 +36,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   run-timeout failure, and the merge-request link is recorded independently
   of the final run status, so a run that opened an MR never displays
   "MR: none". (#329)
+- **A run's declared PRD-completion move is now auditable after the fact
+  (#150).** The run DTO and `uzi run get` (human view, `--json`, and `--field`)
+  now expose `prd_done_path` (the repo-relative path a run declared it moved a
+  completed PRD to) and `prd_patch_settled_at` (the RFC3339 timestamp when the
+  PRD-link patch lifecycle settled, null while still pending); the web run
+  footer surfaces `prd_done_path` alone. All read-only and emitted only when
+  set, so a run predating the feature is unchanged. (#150)
+
 ### Security
 
 - **Both hostile-forge DoS vectors closed across all three forge drivers
