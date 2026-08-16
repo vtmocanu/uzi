@@ -3,9 +3,11 @@ package uzicli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -253,6 +255,231 @@ func TestHTTPClientRunInputs(t *testing.T) {
 	}
 	if in[1].ID != 1 || in[1].ConsumedAt != nil {
 		t.Errorf("second row should be unconsumed (Queued): %+v", in[1])
+	}
+}
+
+// runLogsPagingServer serves a synthetic run history of `total` messages
+// (seq 1..total) as bounded ?after=&limit= pages, exactly like the M2 endpoint:
+// it returns at most `limit` messages with seq strictly greater than `after`, in
+// ascending order. It counts the requests it served so tests can assert the paging
+// arithmetic. If failAfterReq > 0, the (failAfterReq+1)-th request returns 500 —
+// used to prove the all-or-nothing contract.
+func runLogsPagingServer(t *testing.T, total int, failAfterReq int) (*httptest.Server, *int32, *int32) {
+	t.Helper()
+	var reqs int32
+	var minAfter int32 = 1 << 30 // smallest `after` the server ever observed
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&reqs, 1)
+		after, err := strconv.Atoi(r.URL.Query().Get("after"))
+		if err != nil {
+			t.Errorf("bad after: %q", r.URL.Query().Get("after"))
+		}
+		for {
+			old := atomic.LoadInt32(&minAfter)
+			if int32(after) >= old || atomic.CompareAndSwapInt32(&minAfter, old, int32(after)) {
+				break
+			}
+		}
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil || limit <= 0 {
+			t.Errorf("bad limit: %q", r.URL.Query().Get("limit"))
+		}
+		if failAfterReq > 0 && int(n) > failAfterReq {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"boom"}`))
+			return
+		}
+		var b strings.Builder
+		b.WriteString(`{"messages":[`)
+		count := 0
+		for seq := after + 1; seq <= total && count < limit; seq++ {
+			if count > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"seq":%d,"kind":"stdout","payload":{},"created_at":"2026-08-16T00:00:00Z"}`, seq)
+			count++
+		}
+		b.WriteString(`]}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	return srv, &reqs, &minAfter
+}
+
+// RunLogs pages a large history and reassembles it in order. 450 messages come back
+// as all 450 with contiguous seqs. With stop-on-empty the loop cannot treat the
+// 50-message third page as terminal (a short page may be a server-clamped limit, not
+// the end), so it issues a fourth request that comes back empty and stops: pages of
+// 200/200/50/empty, four requests total.
+func TestHTTPClientRunLogsMultiPage(t *testing.T) {
+	srv, reqs, _ := runLogsPagingServer(t, 450, 0)
+	defer srv.Close()
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 0)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	if len(msgs) != 450 {
+		t.Fatalf("len = %d, want 450", len(msgs))
+	}
+	for i, m := range msgs {
+		if m.Seq != int32(i+1) {
+			t.Fatalf("msg[%d].Seq = %d, want %d", i, m.Seq, i+1)
+		}
+	}
+	if got := atomic.LoadInt32(reqs); got != 4 {
+		t.Fatalf("requests = %d, want 4 (200+200+50+empty)", got)
+	}
+}
+
+// The key contract test: if a page mid-sequence fails, RunLogs returns an error
+// and DISCARDS everything accumulated so far. A caller must never receive the
+// first 200 messages dressed up as a complete history.
+func TestHTTPClientRunLogsAllOrNothing(t *testing.T) {
+	srv, reqs, _ := runLogsPagingServer(t, 450, 1) // first page ok, second 500s
+	defer srv.Close()
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 0)
+	if err == nil {
+		t.Fatalf("expected an error, got nil (msgs=%d)", len(msgs))
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("partial history leaked: len = %d, want 0", len(msgs))
+	}
+	if got := atomic.LoadInt32(reqs); got != 2 {
+		t.Fatalf("requests = %d, want 2 (page ok, page 500)", got)
+	}
+}
+
+// When the total is an exact multiple of logsPageSize the first page is full, so
+// the loop cannot tell it is done and must issue one more request; that page is
+// empty and terminates the loop cleanly, returning exactly the whole history.
+func TestHTTPClientRunLogsExactMultipleBoundary(t *testing.T) {
+	srv, reqs, _ := runLogsPagingServer(t, logsPageSize, 0)
+	defer srv.Close()
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 0)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	if len(msgs) != logsPageSize {
+		t.Fatalf("len = %d, want %d", len(msgs), logsPageSize)
+	}
+	if got := atomic.LoadInt32(reqs); got != 2 {
+		t.Fatalf("requests = %d, want 2 (full page + empty page)", got)
+	}
+}
+
+// Paging starts at the caller's `after`: the server must never see a request with
+// after < 100 when RunLogs is called with after=100.
+func TestHTTPClientRunLogsHonorsAfter(t *testing.T) {
+	srv, _, minAfter := runLogsPagingServer(t, 450, 0)
+	defer srv.Close()
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 100)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	if len(msgs) != 350 { // seqs 101..450
+		t.Fatalf("len = %d, want 350", len(msgs))
+	}
+	if msgs[0].Seq != 101 {
+		t.Fatalf("first seq = %d, want 101", msgs[0].Seq)
+	}
+	if got := atomic.LoadInt32(minAfter); got < 100 {
+		t.Fatalf("server saw after=%d, want never < 100", got)
+	}
+}
+
+// A server may clamp ?limit= to its own maxRunMessagesPage, which could be BELOW
+// logsPageSize. This one always returns at most 50 messages per page regardless of the
+// requested 200, over a 300-message history. Stop-on-empty must still return ALL 300 in
+// order: a stop-on-short loop would have taken the first 50-message page as terminal and
+// silently truncated the history to 50 while returning a nil error — the exact partial
+// -that-looks-complete this fix defeats.
+func TestHTTPClientRunLogsRobustToClamp(t *testing.T) {
+	const total = 300
+	const serverCap = 50 // the server's own maxRunMessagesPage, below logsPageSize
+	var reqs int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqs, 1)
+		after, err := strconv.Atoi(r.URL.Query().Get("after"))
+		if err != nil {
+			t.Errorf("bad after: %q", r.URL.Query().Get("after"))
+		}
+		// The client asks for logsPageSize; the server ignores it and clamps to its own cap.
+		if limit, _ := strconv.Atoi(r.URL.Query().Get("limit")); limit != logsPageSize {
+			t.Errorf("client requested limit=%d, want %d", limit, logsPageSize)
+		}
+		var b strings.Builder
+		b.WriteString(`{"messages":[`)
+		count := 0
+		for seq := after + 1; seq <= total && count < serverCap; seq++ {
+			if count > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"seq":%d,"kind":"stdout","payload":{},"created_at":"2026-08-16T00:00:00Z"}`, seq)
+			count++
+		}
+		b.WriteString(`]}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 0)
+	if err != nil {
+		t.Fatalf("RunLogs: %v", err)
+	}
+	if len(msgs) != total {
+		t.Fatalf("len = %d, want %d — stop-on-empty must defeat the server clamp, not truncate at the first short page", len(msgs), total)
+	}
+	for i, m := range msgs {
+		if m.Seq != int32(i+1) {
+			t.Fatalf("msg[%d].Seq = %d, want %d", i, m.Seq, i+1)
+		}
+	}
+}
+
+// A hostile server that ALWAYS returns a full logsPageSize page with strictly-increasing
+// seqs never sends an empty page, so the stop-on-empty loop would run forever and grow
+// the accumulator toward OOM. maxLogsMessages is the backstop: RunLogs must abort with a
+// non-nil error and a nil/empty slice (all-or-nothing) once it crosses the cap. The cap
+// is lowered here (and restored in a defer) so the test reaches it with a modest number
+// of pages instead of accumulating a million messages.
+func TestHTTPClientRunLogsBackstop(t *testing.T) {
+	defer func(orig int) { maxLogsMessages = orig }(maxLogsMessages)
+	maxLogsMessages = 500 // crossed after 3 full pages of 200
+
+	var reqs int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqs, 1)
+		after, err := strconv.Atoi(r.URL.Query().Get("after"))
+		if err != nil {
+			t.Errorf("bad after: %q", r.URL.Query().Get("after"))
+		}
+		// Always a full page with strictly-increasing seqs — never empty.
+		var b strings.Builder
+		b.WriteString(`{"messages":[`)
+		for i := 0; i < logsPageSize; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"seq":%d,"kind":"stdout","payload":{},"created_at":"2026-08-16T00:00:00Z"}`, after+1+i)
+		}
+		b.WriteString(`]}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+
+	msgs, err := newTestClient(srv).RunLogs(context.Background(), "r1", 0)
+	if err == nil {
+		t.Fatalf("expected the backstop to abort, got nil error (msgs=%d)", len(msgs))
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("partial history leaked past the backstop: len = %d, want 0", len(msgs))
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %q, want the backstop message", err.Error())
+	}
+	// It must abort promptly, not accumulate toward maxLogsMessages' real value: at
+	// 200 per page and a cap of 500, three pages cross it.
+	if got := atomic.LoadInt32(&reqs); got != 3 {
+		t.Fatalf("requests = %d, want 3 (backstop crossed after 3 full pages)", got)
 	}
 }
 

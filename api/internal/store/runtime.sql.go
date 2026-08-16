@@ -2614,6 +2614,56 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 	return items, nil
 }
 
+const listRunMessagesAfterPage = `-- name: ListRunMessagesAfterPage :many
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = $1 AND seq > $2
+ORDER BY seq ASC
+LIMIT $3
+`
+
+type ListRunMessagesAfterPageParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	AfterSeq int32     `json:"after_seq"`
+	Lim      int32     `json:"lim"`
+}
+
+// Bounded twin of ListRunMessagesAfter for the viewer/CLI paging path (issue #160):
+// everything after a seq, in order, but @lim caps the page so a single response
+// can't be unbounded. Authorization (owner-or-admin) is checked by the caller.
+// Column order is IDENTICAL to ListRunMessagesAfter so the row stays
+// store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
+// in the same order the ALTER TABLE adds them — see that query's note.
+func (q *Queries) ListRunMessagesAfterPage(ctx context.Context, arg ListRunMessagesAfterPageParams) ([]RunMessage, error) {
+	rows, err := q.db.Query(ctx, listRunMessagesAfterPage, arg.RunID, arg.AfterSeq, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessage{}
+	for rows.Next() {
+		var i RunMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.AgentInstance,
+			&i.AgentLabel,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesForWorkerPage = `-- name: ListRunMessagesForWorkerPage :many
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages

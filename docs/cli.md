@@ -281,6 +281,20 @@ A few worth knowing:
   These two keys are the same per-invocation attribution the web pane draws
   its lanes from — see
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn).
+- **`run logs` pages a large history transparently, and is all-or-nothing.**
+  The server gzips the messages response and the CLI fetches it internally in
+  bounded pages, reassembling them before printing anything — you never see a
+  page boundary and never need to discover a run is large and resume manually
+  with `--after` (that flag still works; it just sets the *starting* sequence,
+  not a page). If any page fetch fails, a one-shot `run logs` prints
+  **nothing** and exits non-zero rather than emitting a partial log (this
+  whole-or-nothing guarantee is per fetch; under `--follow`, batches already
+  streamed by earlier polls stay printed, but a failed poll still exits the
+  session non-zero). Either way, **empty stdout only means "no messages" when
+  the exit code is 0**; a non-zero exit means the fetch failed and stdout is
+  not a reliable (or complete) transcript. A `--json` consumer should gate on
+  the exit code before parsing NDJSON, not infer "empty run" from empty output
+  alone.
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports

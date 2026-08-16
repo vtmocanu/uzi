@@ -397,6 +397,7 @@ type Store interface {
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
+	ListRunMessagesAfterPage(ctx context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error)
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
@@ -4193,6 +4194,17 @@ func (s *Service) ListRunMessagesForViewer(ctx context.Context, userID uuid.UUID
 		return nil, err
 	}
 	return s.q.ListRunMessagesAfter(ctx, store.ListRunMessagesAfterParams{RunID: runID, AfterSeq: afterSeq})
+}
+
+// ListRunMessagesForViewerPage is the bounded twin of ListRunMessagesForViewer
+// (issue #160): same owner-or-admin visibility gate, but @limit caps the page so
+// the CLI (M3) can page instead of pulling an unbounded response. The caller is
+// responsible for clamping limit to a sane maximum before calling.
+func (s *Service) ListRunMessagesForViewerPage(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, afterSeq int32, limit int32) ([]store.RunMessage, error) {
+	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+		return nil, err
+	}
+	return s.q.ListRunMessagesAfterPage(ctx, store.ListRunMessagesAfterPageParams{RunID: runID, AfterSeq: afterSeq, Lim: limit})
 }
 
 // ListRunsForUser returns the user's runs (newest first) with repo path and

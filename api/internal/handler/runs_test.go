@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +18,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
@@ -32,9 +40,14 @@ type runsStore struct {
 	judgeTriageRunErr  error
 
 	workersvc.Store
-	ownerID     uuid.UUID
-	run         store.Run
-	msgs        []store.RunMessage
+	ownerID uuid.UUID
+	run     store.Run
+	msgs    []store.RunMessage
+	// lastPageLim records the Lim (page size) the handler passed through to
+	// ListRunMessagesAfterPage on the bounded ?limit= path, so TestListRunMessagesLimit
+	// can assert the handler clamped/forwarded the requested size BEFORE the store call —
+	// the fixture size alone can't distinguish a clamped page from an unclamped one.
+	lastPageLim int32
 	userRuns    []store.ListRunsForUserRow
 	lastRunsArg *store.ListRunsForUserParams
 	allWorkers  []store.ListAllWorkersRow
@@ -73,6 +86,14 @@ func (s *runsStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, erro
 }
 func (s *runsStore) ListRunMessagesAfter(context.Context, store.ListRunMessagesAfterParams) ([]store.RunMessage, error) {
 	return s.msgs, nil
+}
+func (s *runsStore) ListRunMessagesAfterPage(_ context.Context, arg store.ListRunMessagesAfterPageParams) ([]store.RunMessage, error) {
+	s.lastPageLim = arg.Lim
+	out := s.msgs
+	if arg.Lim >= 0 && int(arg.Lim) < len(out) {
+		out = out[:arg.Lim]
+	}
+	return out, nil
 }
 func (s *runsStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return s.claimTemplates, nil
@@ -299,6 +320,268 @@ func TestListRunMessagesViewerAuthz(t *testing.T) {
 	h.ListRunMessages(rec, runReq(admin, runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin messages = %d, want 200", rec.Code)
+	}
+}
+
+// TestListRunMessagesPagedViewerAuthz is the ?limit= twin of TestListRunMessagesViewerAuthz:
+// it proves the owner-or-admin gate holds on the BOUNDED path too, so a future edit that
+// forgets the GetRunForViewer check on ListRunMessagesForViewerPage is caught. Modeled on
+// the unbounded authz test's harness (same runsStore fake, same three viewers), but every
+// request carries ?limit=5 so it drives the paged service method.
+func TestListRunMessagesPagedViewerAuthz(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    []store.RunMessage{{Seq: 1, Kind: "text", Payload: []byte(`{}`)}},
+	}
+	h := newRunsHandler(t, st)
+
+	// Owner sees the bounded page.
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "limit=5"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"seq":1`) {
+		t.Fatalf("owner paged messages = %d %q, want 200 with seq 1", rec.Code, rec.Body.String())
+	}
+
+	// A non-owner is denied the SAME way as on the unbounded path: 404, no messages.
+	other := store.User{ID: uuid.New()}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(other, runID, "limit=5"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner paged messages = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"seq"`) {
+		t.Fatalf("non-owner paged messages must leak nothing, got %q", rec.Body.String())
+	}
+
+	// An admin sees any run through the bounded path.
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(admin, runID, "limit=5"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin paged messages = %d, want 200", rec.Code)
+	}
+}
+
+// runReqQuery is runReq with a raw query string (e.g. "limit=2") on the URL so the
+// ListRunMessages handler's ?limit=/?after= parsing is exercised.
+func runReqQuery(user store.User, runID uuid.UUID, rawQuery string) *http.Request {
+	req := runReq(user, runID)
+	req.URL.RawQuery = rawQuery
+	return req
+}
+
+// TestListRunMessagesLimit covers the opt-in bounded ?limit= page (issue #160 M2):
+// a valid limit returns a bounded slice, invalid limits are 400, an absent limit
+// stays on the unbounded legacy path, and an over-max limit is clamped down.
+func TestListRunMessagesLimit(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	msgs := make([]store.RunMessage, 0, 5)
+	for i := 0; i < 5; i++ {
+		msgs = append(msgs, store.RunMessage{Seq: int32(i + 1), Kind: "text", Payload: []byte(`{}`)})
+	}
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+	h := newRunsHandler(t, st)
+
+	decodeSeqs := func(t *testing.T, body string) []int32 {
+		t.Helper()
+		var env struct {
+			Messages []struct {
+				Seq int32 `json:"seq"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &env); err != nil {
+			t.Fatalf("decode messages: %v (body %q)", err, body)
+		}
+		seqs := make([]int32, 0, len(env.Messages))
+		for _, m := range env.Messages {
+			seqs = append(seqs, m.Seq)
+		}
+		return seqs
+	}
+
+	// (a) ?limit=2 returns exactly the first 2 of 5 messages, in seq order.
+	rec := httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, "limit=2"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("limit=2 status = %d, want 200", rec.Code)
+	}
+	if got := decodeSeqs(t, rec.Body.String()); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("limit=2 seqs = %v, want [1 2]", got)
+	}
+	// The handler must forward the exact requested page size on the non-clamped path.
+	if st.lastPageLim != 2 {
+		t.Fatalf("limit=2 forwarded Lim = %d, want 2", st.lastPageLim)
+	}
+
+	// (b) invalid limits are rejected with 400.
+	for _, raw := range []string{"limit=0", "limit=-1", "limit=abc"} {
+		rec = httptest.NewRecorder()
+		h.ListRunMessages(rec, runReqQuery(owner, runID, raw))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", raw, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "limit must be a positive integer") {
+			t.Fatalf("%s body = %q, want positive-integer error", raw, rec.Body.String())
+		}
+	}
+
+	// (c) absent limit stays on the unbounded path: all 5 messages come back.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReq(owner, runID))
+	if got := decodeSeqs(t, rec.Body.String()); len(got) != 5 {
+		t.Fatalf("no-limit seqs = %v, want all 5", got)
+	}
+
+	// (d) a limit above maxRunMessagesPage is clamped down to it BEFORE the store call.
+	// The 5-message fixture can't distinguish clamped from unclamped by response size, so
+	// this asserts on the Lim the handler actually forwarded to the store: the handler
+	// must have reduced maxRunMessagesPage+50 to exactly maxRunMessagesPage. Deleting the
+	// clamp block in workers.go reddens this assertion (the fake would record the raw
+	// over-max Lim), which is what gives the subcase its gating power.
+	rec = httptest.NewRecorder()
+	h.ListRunMessages(rec, runReqQuery(owner, runID, fmt.Sprintf("limit=%d", maxRunMessagesPage+50)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("over-max limit status = %d, want 200", rec.Code)
+	}
+	if st.lastPageLim != maxRunMessagesPage {
+		t.Fatalf("over-max limit forwarded Lim = %d, want it clamped to %d", st.lastPageLim, maxRunMessagesPage)
+	}
+	if got := decodeSeqs(t, rec.Body.String()); len(got) > maxRunMessagesPage {
+		t.Fatalf("over-max limit returned %d messages, want <= %d", len(got), maxRunMessagesPage)
+	}
+}
+
+// gzipAuthDB is a store.DBTX that lets a request clear RequireUser's cookie branch
+// without a live database: it answers getUserByID ("FROM users") with a single active
+// user and returns no rows for anything else. It exists so TestListRunMessagesGzip can
+// drive its request through the REAL h.Routes() router — including the Compress
+// middleware handler.go mounts on /runs/{id}/messages — rather than a hand-built one.
+type gzipAuthDB struct{ user store.User }
+
+func (gzipAuthDB) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (gzipAuthDB) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	return nil, pgx.ErrNoRows
+}
+func (d gzipAuthDB) QueryRow(_ context.Context, sql string, _ ...interface{}) pgx.Row {
+	if strings.Contains(sql, "FROM users") {
+		return gzipUserRow{u: d.user}
+	}
+	return gzipNoRow{}
+}
+
+type gzipNoRow struct{}
+
+func (gzipNoRow) Scan(...any) error { return pgx.ErrNoRows }
+
+// gzipUserRow scans the stored user positionally into getUserByID's destinations.
+// sqlc generates the Scan targets in User's field-declaration order, so a positional
+// copy is faithful; the field-count guard reddens loudly if that ceases to hold.
+type gzipUserRow struct{ u store.User }
+
+func (r gzipUserRow) Scan(dest ...any) error {
+	v := reflect.ValueOf(r.u)
+	if v.NumField() != len(dest) {
+		return fmt.Errorf("gzipUserRow: user has %d fields but scan wants %d", v.NumField(), len(dest))
+	}
+	for i, d := range dest {
+		reflect.ValueOf(d).Elem().Set(v.Field(i))
+	}
+	return nil
+}
+
+// TestListRunMessagesGzip proves the run-messages route is wired through chi's
+// Compress middleware (handler.go:1097): a request advertising `Accept-Encoding: gzip`
+// gets a `Content-Encoding: gzip` body that, once inflated, is byte-identical to the
+// uncompressed response. It drives the request through the REAL h.Routes() router, so
+// deleting `r.With(chimw.Compress(5))` in handler.go makes this test fail — a
+// hand-built router registering the middleware itself could not catch that regression.
+//
+// chi v5's Compress negotiates on Accept-Encoding and Content-Type only (there is no
+// size threshold), so a one-message fixture would already exercise it; the larger,
+// repetitive fixture just makes the inflate-equals-plain assertion cover a body big
+// enough that compression is non-degenerate.
+func TestListRunMessagesGzip(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	msgs := make([]store.RunMessage, 0, 200)
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs, store.RunMessage{
+			Seq:     int32(i + 1),
+			Kind:    "text",
+			Payload: []byte(`{"role":"assistant","content":"a repetitive message body that compresses well"}`),
+		})
+	}
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		msgs:    msgs,
+	}
+
+	// Real router, real RequireUser: authenticate over the cookie branch as the owner,
+	// backed by gzipAuthDB so getUserByID resolves without a live database.
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	h := &Handler{
+		q:    store.New(gzipAuthDB{user: store.User{ID: owner.ID, IsActive: true}}),
+		cfg:  config.Config{JWTSecret: secret, AuthTokenTTL: time.Hour},
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		hub:  hub.New(),
+	}
+	noLimit := mw.NewLimiter(100000, time.Minute, nil)
+	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+
+	jwt, err := auth.IssueToken(secret, owner.ID.String(), 0, time.Hour)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	newReq := func(acceptGzip bool) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/api/runs/"+runID.String()+"/messages", nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		if acceptGzip {
+			req.Header.Set("Accept-Encoding", "gzip")
+		}
+		return req
+	}
+
+	// Uncompressed baseline.
+	plainRec := httptest.NewRecorder()
+	router.ServeHTTP(plainRec, newReq(false))
+	if plainRec.Code != http.StatusOK {
+		t.Fatalf("plain messages = %d, want 200", plainRec.Code)
+	}
+	if ce := plainRec.Header().Get("Content-Encoding"); ce != "" {
+		t.Fatalf("plain request must not be gzip-encoded, got Content-Encoding %q", ce)
+	}
+
+	// gzip-negotiated request.
+	gzRec := httptest.NewRecorder()
+	router.ServeHTTP(gzRec, newReq(true))
+	if gzRec.Code != http.StatusOK {
+		t.Fatalf("gzip messages = %d, want 200", gzRec.Code)
+	}
+	if ce := gzRec.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip (Compress middleware must wrap this route)", ce)
+	}
+
+	gr, err := gzip.NewReader(bytes.NewReader(gzRec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	inflated, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("gzip inflate: %v", err)
+	}
+	if !bytes.Equal(inflated, plainRec.Body.Bytes()) {
+		t.Fatalf("inflated gzip body differs from uncompressed body:\ngot  %q\nwant %q", inflated, plainRec.Body.Bytes())
 	}
 }
 

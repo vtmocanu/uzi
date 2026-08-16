@@ -1090,7 +1090,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListRuns)
 				r.Get("/{id}", h.GetRun)
-				r.Get("/{id}/messages", h.ListRunMessages)
+				// gzip-compress this response only: a run's message history is large,
+				// key-repetitive JSON that compresses dramatically. gzip is transparent —
+				// the uzi CLI's Go transport and browsers both auto-negotiate
+				// Accept-Encoding and transparently decompress, so no caller changes.
+				r.With(chimw.Compress(5)).Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
 				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
