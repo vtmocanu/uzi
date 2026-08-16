@@ -20,6 +20,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `validate:web`, alongside `check-docs`. Fixed the six latent offenders it
   surfaced (`bg-bg` → `bg-ink`, `border-line` → `border-edge`). (#170)
 
+- **`yamllint` is now baked into the default worker toolchain (#330).** Every
+  worker image ships `yamllint` through the pinned devbox-global toolchain
+  (1.37.1), restoring local fidelity of uzi's own `lint:yaml` gate on the
+  worker: `task lint:yaml` previously failed open and printed SKIPPED because
+  `yamllint` was absent, so a worker could not exercise that gate the way CI
+  does. Same "every worker should have it" class as the already-baked
+  `shellcheck`. (#330)
+
 - **`ux-designer` builtin agent template (#314).** uzi now ships a twelfth
   builtin role: a build-capable UX/UI design lead that sets opinionated visual
   and information-architecture direction, implements the frontend/UI (including
