@@ -187,6 +187,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/auth/oidc/login", noLimiter},
 	{"GET", "/api/chats/", noLimiter},
 	{"GET", "/api/controller/poll", noLimiter},
+	// PRD #333 M4: the Findings backlog read + the issue-draft read. Both are RequireUser
+	// reads with no per-user limiter — owner-scoped, no forge call, no spend → noLimiter.
+	{"GET", "/api/findings/", noLimiter},
+	{"GET", "/api/findings/{id}/issue-draft", noLimiter},
 	{"GET", "/api/forge/config", noLimiter},
 	{"GET", "/api/forge/connections/", noLimiter},
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
@@ -290,6 +294,13 @@ var wantRouteMounts = []routeMount{
 	// trusted proxy by construction. The real bounds on this endpoint are the ones that
 	// fit it — a 1 MiB body cap and an explicit 512-entry cap — not a request rate.
 	// Same reasoning, same answer as GET /api/controller/poll above.
+	// PRD #333 M5: filing a forge issue from a finding is a forge WRITE on the caller's
+	// connection, so it carries the per-user forge budget, mirroring the recommendation
+	// file route below.
+	{"POST", "/api/findings/{id}/issue", limForge},
+	// PRD #333 M5: dismissing a finding is a LOCAL write — no forge call, no spend — so it
+	// carries no per-user limiter, like the recommendation disposition write.
+	{"POST", "/api/findings/{id}/dismiss", noLimiter},
 	{"POST", "/api/controller/status", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
@@ -330,6 +341,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/heartbeat", noLimiter},
 	{"POST", "/api/worker/register", noLimiter},
 	{"POST", "/api/worker/runs/claim", noLimiter},
+	// PRD #333 M2: the incidental-findings capture route. It rides
+	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
+	// per-USER probe reads as noLimiter — same as the proposals route below it.
+	{"POST", "/api/worker/runs/{id}/findings", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

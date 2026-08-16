@@ -49,6 +49,9 @@ vi.mock("../lib/api", () => ({
     // here would start measuring the wrong badge.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    // PRD #333 M7: AppShell polls the Findings open-count badge on mount; zero + empty so
+    // these navigation tests assert the nav STRUCTURE without a findings badge in the way.
+    listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
     listNotifications: vi.fn(),

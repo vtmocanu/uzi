@@ -91,6 +91,7 @@ import {
 } from "./limit.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
+import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
 import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
@@ -626,6 +627,20 @@ export class SdkExecutor implements Executor {
       mcpServers[FORGE_SERVER_NAME] = buildForgeToolsServer({
         client: this.client,
         runId: ctx.runId,
+        log: this.log,
+      }).server;
+      // PRD #333 M2: the incidental-findings capture tool (mcp__findings__report_-
+      // incidental_issue). A PLAIN working tool (POST → emit card → ack, turn
+      // continues), so it takes `emit` in addition to the run-scoped {client, runId,
+      // log}. Mounted here in the `if (this.client)` block = for the SdkExecutor run
+      // lane (issue / ci_fix / prompt / self_improve), NOT chat/judge (separate
+      // executors) — which is exactly "all autonomous lanes" (D2). DELIBERATELY not
+      // gated on isIssueRun (contrast report_progress/checkpoint above): a bug an agent
+      // reads past is equally worth capturing on a ci_fix or self_improve run.
+      mcpServers[FINDINGS_SERVER_NAME] = buildFindingsToolsServer({
+        client: this.client,
+        runId: ctx.runId,
+        emit: (m) => ctx.emit(m),
         log: this.log,
       }).server;
     }

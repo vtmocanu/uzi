@@ -14,6 +14,14 @@ describe("notificationLink (Decision 4: kind-conditional, NOT a URL edit)", () =
     expect(notificationLink("judge_review", "run-7")).toBe("/judge?run=run-7");
   });
 
+  // PRD #333 M7: a findings ping opens the per-repo Findings backlog filtered to the flagging
+  // run — the same kind-conditional guard, a different destination from both the judge and the
+  // generic run rows. The gate above (every OTHER kind → /runs) proves this did not leak.
+  it("sends an incidental_finding ping to the Findings backlog, filtered to its run", () => {
+    expect(notificationLink("incidental_finding", "run-7")).toBe("/findings?run=run-7");
+    expect(notificationLink("incidental_finding", null)).toBeNull();
+  });
+
   // THE GATE. Read the failure mode before touching this: the inbox linked
   // /runs/${run_id} for every kind, so "retarget the judge notification" reads as a
   // one-line URL change — and that change redirects EVERY other kind to the Judge page.

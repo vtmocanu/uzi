@@ -14,11 +14,13 @@ import { BellIcon } from "../components/icons";
 import {
   emitNotificationsChanged,
   groupNotifications,
+  INCIDENTAL_FINDING_KIND,
   notificationBody,
   notificationLink,
   notificationTitle,
 } from "../lib/notifications";
 import { useJudgeTodo } from "../components/JudgeTodoContext";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // PAGE_SIZE matches the API's default page; Load-more fetches the next page.
 const PAGE_SIZE = 30;
@@ -65,6 +67,72 @@ function NotificationRow({
             {link && (
               <Link to={link} className="font-medium text-brand hover:text-brand-hover">
                 {n.kind === "judge_review" ? "· Open in Judge" : "· Open run"}
+              </Link>
+            )}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {unread ? (
+            canMarkRead && (
+              <Button variant="ghost" size="sm" onClick={() => onMarkRead(n.id)}>
+                Mark read
+              </Button>
+            )
+          ) : (
+            <Badge tone="neutral">read</Badge>
+          )}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+// FindingNotificationRow renders the coalesced incidental-findings ping (PRD #333 M7). The
+// per-run notification carries { count, repo_path, run_id }, so the row states "Run flagged N
+// finding(s)", names the repo_path INERT (agent-authored — escaped text + stripUnsafeChars,
+// never Markdown), and deep-links "Review findings" to the backlog filtered to that run. Read
+// state and per-row Mark read are the same as every other row — the coalescing keeps this a
+// single notification, so it counts toward the bell unread with no extra wiring.
+function FindingNotificationRow({
+  n,
+  canMarkRead,
+  onMarkRead,
+}: {
+  n: Notification;
+  canMarkRead: boolean;
+  onMarkRead: (id: string) => void;
+}) {
+  const unread = !n.read_at;
+  const rawCount = n.payload.count;
+  const count = typeof rawCount === "number" && Number.isFinite(rawCount) ? rawCount : 0;
+  const repoPath = typeof n.payload.repo_path === "string" ? n.payload.repo_path : "";
+  const link = notificationLink(n.kind, n.run_id);
+  return (
+    <li
+      className={cx(
+        "rounded-lg border px-3 py-2.5",
+        unread ? "border-brand/30 bg-brand/5" : "border-edge bg-raised/40",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            {unread && (
+              <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand" />
+            )}
+            <p className="truncate text-sm font-medium text-fg">
+              Run flagged {count} {count === 1 ? "finding" : "findings"}
+            </p>
+          </div>
+          {repoPath && (
+            <p className="mt-0.5 font-mono text-xs text-muted">{stripUnsafeChars(repoPath)}</p>
+          )}
+          <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-faint">
+            {n.owner && <span>{n.owner.display_name ?? n.owner.email}</span>}
+            <span>{new Date(n.created_at).toLocaleString()}</span>
+            {link && (
+              <Link to={link} className="font-medium text-brand hover:text-brand-hover">
+                · Review findings
               </Link>
             )}
           </p>
@@ -274,6 +342,13 @@ export function Notifications() {
                       key={`judge-group-${g.items[0].id}`}
                       items={g.items}
                       canMarkRead={canMark}
+                      onMarkRead={markRead}
+                    />
+                  ) : g.item.kind === INCIDENTAL_FINDING_KIND ? (
+                    <FindingNotificationRow
+                      key={g.item.id}
+                      n={g.item}
+                      canMarkRead={canMark(g.item)}
                       onMarkRead={markRead}
                     />
                   ) : (

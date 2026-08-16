@@ -121,6 +121,13 @@ const (
 	KeyRunEligibleLabels          = "run_eligible_labels"
 	KeyBoardExtraLabels           = "board_extra_labels"
 	KeyEligibleLabelWaivesPRDLink = "eligible_label_waives_prd_link"
+	// KeyFindingLabel is the server-mandated marker label attached to every forge
+	// issue filed from an incidental finding (PRD #333 D5). Config-overridable, it is
+	// EnsureLabels-ed to exist before the file write (Forgejo resolves label ids and
+	// errors on an unknown name) and unioned into the filed label set server-side, so a
+	// client can never supply a trigger label that bypasses it. A plain single label, it
+	// takes the Decision-8 label rules like prd_label (Validate's default branch).
+	KeyFindingLabel = "finding_label"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -190,6 +197,9 @@ const (
 	DefaultRunEligibleLabels          = "PRD,bug"
 	DefaultBoardExtraLabels           = "bug"
 	DefaultEligibleLabelWaivesPRDLink = "true"
+	// PRD #333 D5: the incidental-finding marker defaults to "agent-found", mirroring
+	// prd_label's no-seeded-row pattern (an absent row synthesizes to this default).
+	DefaultFindingLabel = "agent-found"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -284,6 +294,10 @@ var Defaults = map[string]string{
 	KeyRunEligibleLabels:          DefaultRunEligibleLabels,
 	KeyBoardExtraLabels:           DefaultBoardExtraLabels,
 	KeyEligibleLabelWaivesPRDLink: DefaultEligibleLabelWaivesPRDLink,
+	// PRD #333 D5 incidental-finding marker. Same no-seeded-row pattern: an absent row
+	// synthesizes to DefaultFindingLabel, so All/AdminView surface it on every instance
+	// and no migration seeds it. Validate's default branch applies the label rules.
+	KeyFindingLabel: DefaultFindingLabel,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -507,6 +521,14 @@ func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
 	default:
 		return DefaultPrdlessEnabled == "true", err
 	}
+}
+
+// FindingLabel returns the configured incidental-finding marker label (PRD #333 D5),
+// the server-mandated tag every filed finding issue carries. Falls back to
+// DefaultFindingLabel ("agent-found"). A single label validated by the Decision-8
+// label rules, exactly like PRDLabel.
+func (c *Cache) FindingLabel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyFindingLabel)
 }
 
 // DefaultTheme returns the configured instance-default theme id (PRD #21).

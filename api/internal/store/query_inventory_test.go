@@ -411,6 +411,8 @@ var inventoryQueryFiles = []string{
 	"settings.sql",
 	// PRD #71 M4 — the ci-autofix loop guard
 	"ci_autofix.sql",
+	// PRD #333 M1 — the incidental-findings store (full query set)
+	"findings.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -823,6 +825,78 @@ var queryInventory = []queryPin{
 			"the caller SWALLOWS its error (log-and-continue, because a forensic stamp must not fail " +
 			"an auth decision), so even 'it ran without erroring' is unobservable. last_used_ip is " +
 			"described in the query as the only detection control the design has"},
+
+	// ── findings.sql — the incidental-findings store (PRD #333 M1) ─────────────────────
+	// All twelve are driven by one live test, TestIncidentalFindingsLiveDB, which walks the
+	// whole lifecycle (insert evidence → open coordinate → claim → settle/revert → re-open →
+	// dismiss) plus the disposition-driven backlog. Each row below names the discriminating
+	// assertion, not mere reachability.
+	{"InsertFinding", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call via the insFinding helper: three evidence rows at the SAME location across " +
+			"two runs of repoA and one of repoB, which is what makes the coordinate-collapse and " +
+			"cross-repo-split assertions below able to fail"},
+	{"CountFindingsForRun", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: asserts runA1 holds exactly 1 evidence row (the per-run cap input, D11)"},
+	{"UpsertOpenDisposition", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call via upsertOpen (returns did-insert by discriminating pgx.ErrNoRows on " +
+			"conflict). Discriminating in both directions: the first upsert on a coordinate INSERTs, " +
+			"a second on the SAME coordinate is a no-op (ON CONFLICT DO NOTHING), the same location " +
+			"under repoB INSERTs a distinct coordinate, and an upsert on a FILED coordinate does NOT " +
+			"resurrect it (the D6-suppression subtest)"},
+	{"UpdateDispositionLastTitle", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: refreshes last_title on an OPEN row (n=1, read back), the guard that keeps " +
+			"the backlog current since UpsertOpenDisposition does DO NOTHING on conflict"},
+	{"ReopenDispositionOnHashMismatch", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: an IDENTICAL content_hash affects 0 rows (stays filed — D6 suppression) " +
+			"while a DIFFERENT hash affects 1 and clears the resolved state (status→open, " +
+			"filed_issue_iid + resolved_at NULLed, last_title refreshed) — the D3 re-open, both " +
+			"directions"},
+	{"ClaimFindingForFiling", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: the guarded open→filing claim moves exactly 1 row and a SECOND claim on the " +
+			"now-filing coordinate moves 0 — the claim-first double-file safety (D4)"},
+	{"SettleFindingFiled", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: filing→filed stamps the iid and moves 1 row; reached after a re-claim in the " +
+			"revert subtest, and the status is read back as 'filed'"},
+	{"RevertFindingFiling", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call, both directions: a filing coordinate reverts to open (n=1, retryable), and a " +
+			"revert of a SETTLED (filed) row affects 0 rows — the status='filing' guard stops a late " +
+			"revert resurrecting a filed link"},
+	{"DismissFinding", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: a NULL reason VIOLATES the status/reason CHECK (errors, status unchanged) and " +
+			"a reason moves open→dismissed (n=1, read back)"},
+	{"GetIncidentalFinding", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call, owner scoping both directions: the owner resolves the row by id, a foreign " +
+			"user id on the SAME finding gets pgx.ErrNoRows (the 404 predicate)"},
+	{"CountOpenFindingsForUser", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call: counts open COORDINATES (2 across two repos), and ?repo= narrows to 1 — the " +
+			"nav-badge / meta count (D8)"},
+	{"ListFindingsBacklog", "findings.sql", "TestIncidentalFindingsLiveDB",
+		"direct call via the backlog helper: dedupes a two-run finding into ONE coordinate reading " +
+			"seen_in_runs=2 (repoB reads 1), buckets by status (all / to_file='open' / dismissed), " +
+			"filters by ?repo= and by ?run= (a SEMI-JOIN that does NOT shrink seen_in_runs), excludes " +
+			"an evidence row with no disposition (disposition-driven, D7), and returns nothing for a " +
+			"foreign user"},
+	{"SweepStrandedFilingFindings", "findings.sql", "TestSweepStrandedFilingFindingsLiveDB",
+		"direct call, both directions and fixture-scoped: a `filing` coordinate whose filing_since " +
+			"is older than the cutoff is reset to `open` (n>=1, read back as open with filing_since " +
+			"NULL, and it reappears in the to_file bucket / open_count) while a `filing` coordinate " +
+			"with a FRESH filing_since (within the cutoff) is NOT reset — the clamp that protects a " +
+			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
+
+	// ── notifications.sql — the PRD #333 D6 coalescing plumbing (M1 lands the queries; M3 uses them) ──
+	{"FindUnreadNotificationForRunKind", "notifications.sql", unpinnedPin,
+		"PRD #333 M3 drives this query, but only from notifysvc.NotifyIncidentalFinding — exercised " +
+			"by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc, which is NOT one of " +
+			"inventoryPackages (a non-live fake Store, not a store-package live-DB test). That test " +
+			"asserts the coalesce-vs-fire-fresh decision this query's read_at IS NULL + (user_id, " +
+			"run_id, kind) predicate makes: a miss inserts + DMs once, a hit bumps the payload. UNPINNED " +
+			"because no store/handler test executes it against a live DB; the honest pin lives in notifysvc."},
+	{"UpdateNotificationPayload", "notifications.sql", unpinnedPin,
+		"PRD #333 M3 drives this query from the same notifysvc.NotifyIncidentalFinding coalescing path, " +
+			"exercised by TestNotifyIncidentalFindingCoalescesPerRun in internal/notifysvc (outside " +
+			"inventoryPackages, a fake Store). That test asserts the row count stays 1 while the payload " +
+			"count bumps to 2 — the UPDATE ... WHERE id AND user_id RETURNING this query is. UNPINNED " +
+			"because no store/handler live-DB test executes it; the honest pin lives in notifysvc."},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

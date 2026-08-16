@@ -2,7 +2,7 @@
 
 - **Issue**: https://gitlab.example.com/vtmocanu/uzi/-/issues/333
 - **Mock**: interactive UI mock (run-stream card, inbox ping, review-and-file editor, per-repo Findings backlog) built during PRD authoring — https://claude.ai/code/artifact/6a1d59ec-d754-4583-b4e3-1a71fc52c300
-- **Status**: Draft
+- **Status**: Implemented (all eight milestones landed on `agent/issue-333`, 2026-08-16)
 - **Priority**: Medium
 
 ## Problem
@@ -48,7 +48,7 @@ All facts below are codebase-internal, confirmed by reading the tree and indepen
 ### Notifications (inbox + Slack) — kind needs no migration, but coalescing needs new queries
 - `notifications` table (`migration 00060_notifications.sql:16`): `kind text NOT NULL` with **no CHECK** (free text by design), `payload jsonb`, plus `user_id`, `run_id`, `review_id`, `read_at`, `created_at`. A new `incidental_finding` kind adds **no migration**.
 - `store/queries/notifications.sql` has **only** `Insert`, `List`, `Count`, `CountUnread`, `MarkRead`, `Prune` — **no find-unread-by-coordinate and no update-payload query.** `notifysvc.Service.Notify` (`api/internal/notifysvc/service.go:128`) is **INSERT-only**: it persists the inbox row, prunes, then if `s.slack != nil && n.Slack != nil` calls `PublishNotification` (`:161`, best-effort). **So per-run coalescing ("N findings → one updated notification") is NEW plumbing, not an existing pattern** — the self-improve "throttled skip ping" (`selfimprove/engine.go:275`) is an *in-memory* cadence gate on a long-lived singleton and transfers no code to a stateless per-request handler. M1 adds the two queries; M3 adds the notifysvc update path (D6).
-- Routes (`handler.go:751`): `GET /notifications`, `GET /notifications/unread_count` (bell badge), `POST /notifications/{id}/read`. The bell `unread` count is canonical over **all** kinds, so a finding notification counts toward it with no wiring change (`AppShell.tsx:706,746`; client `api.ts:2972`).
+- Routes (`handler.go:751`): `GET /notifications`, `GET /notifications/unread_count` (bell badge), `POST /notifications/{id}/read`. The bell `unread` count is canonical over **all** kinds, so a finding notification counts toward it with no wiring change (`AppShell.tsx:706,746`; client `api.ts:2984`).
 
 ### Worker → run mapping, and the run/worker tool lanes
 - `runs` (`00020_workers_runs.sql`) has `user_id uuid NOT NULL` (`:31`), `repo_id uuid` (`:32`, nullable for chat since `00053`), `kind`. **The worker never sends a user id** — the service derives `(user_id, repo_id)` from the claimed run (`GetRunByIDForUser`, `runtime.sql:347`). Kinds: `issue`, `ci_fix` (`00043`), `chat` (`00053`), `judge`, `self_improve` (`00058`), `prompt` (`00104`).
@@ -63,7 +63,7 @@ All facts below are codebase-internal, confirmed by reading the tree and indepen
 ### Wire contract, migrations, web
 - `apitypes/wire_test.go` (`assertTags`, `:37`) pins each DTO's exact top-level JSON key set. A new `apitypes` DTO gets a matching `assertTags` test.
 - Migration head is `00128_denied_cli_disposition_provenance.sql`; new migration drafts `00129`, renamed to the next free number at landing (Goose numbers assigned at merge — repo convention). The query-inventory gate (`query_inventory_test.go`) pins every query by name; the sqlc-generated `*.sql.go`/`models.go` regenerate from the whole schema and do not auto-merge across worktrees — these two are the serialize-and-regen points, not `findings.sql` itself.
-- `run_messages.kind` is an open string (web treats it as `string`, `api.ts:1933`), so a new `finding` card kind needs **no migration**.
+- `run_messages.kind` is an open string (web treats it as `string`, `api.ts:1935`), so a new `finding` card kind needs **no migration**.
 - Nav: `AppShell.tsx` — the **Work** `NavGroup` (`:469-510`, `Boards :470` … `Chat :509`) is where a `Findings` `NavItem` goes; Judge sits in **Factory** (`:531`). `RunEvent.tsx` renders message kinds; `ProposalCard.tsx` is the info-card precedent; `Notifications.tsx`'s `JudgeGroupRow` is the grouped-notification precedent.
 - **Naming**: a `privcheck.Finding` type already exists (`privcheck/report.go:134`, unrelated). To avoid two "Finding" concepts, the store model/DTO for this feature is named **`IncidentalFinding`** (table `findings` is fine; the generated Go type and the apitypes DTO carry the `Incidental` prefix).
 

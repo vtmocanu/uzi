@@ -21180,3 +21180,69 @@ model emitted.
   computation of `failure_class` itself is unchanged; and the #81 proposal #4 item 2 stretch idea
   (cap unconfirmable inferences at medium) was NOT implemented because it cannot be made non-heuristic
   cheaply.
+
+## 552. PRD #333 — Incidental Findings: a judge-shaped sibling backlog for off-task bugs in the user's code
+
+Serves the PRD #333 goal: let an autonomous run flag a bug it noticed in the USER's code while working
+something else, dedup it across runs, and let the human gate every filing. Full rationale in the
+Decision Log of `prds/done/333-incidental-findings.md` (D1–D12) — this section records only the durable
+design shape, not the code.
+
+- **Findings are a SIBLING of the judge backlog family, not the judge (D1).** They reuse the judge
+  backlog's data-model *shape* — per-run evidence rows plus a coordinate-keyed disposition lifecycle —
+  but are a distinct producer with an opposite subject: findings are captured MID-RUN by the working
+  agent and are about the user's own code (an off-task bug), whereas the judge is retrospective and
+  grades the agent's own performance/config. Rejected: overloading `issue_proposals` (per-run, no
+  coordinate, no backlog) and a single flat table.
+- **Two tables (D1, D12).** `findings` = per-run evidence (`run_id → runs ON DELETE CASCADE`, user/repo,
+  location, title, description, labels, confidence); it cascades away with its run. `finding_dispositions`
+  = the cross-run coordinate lifecycle, one row per `(user_id, repo_id, location)`, `UNIQUE`-keyed,
+  `status ∈ {open, filing, filed, dismissed}` (open→filing→filed / open→dismissed), `filed_issue_iid`,
+  `filing_since` claim marker, `content_hash`, `last_title` snapshot. It carries **no run FK** on purpose,
+  so the disposition survives its evidence — a `filed`/`dismissed` verdict must stay legible and resolved
+  after every producing run is gone. Collapses the judge's two side-tables into one linear lifecycle.
+- **Dedup lives in the STORAGE COORDINATE, a deliberate divergence from the judge's read-time rollup
+  (D3, D7).** The same bug seen in N runs is one coordinate; `seen_in_runs` is computed from the joined
+  evidence at read time, but the identity is the row. `location` is agent-supplied yet canonicalised
+  server-side to a fixed form (repo-relative, forward slashes, lowercased, whitespace-stripped,
+  line-numbers excluded, at most one normalised symbol token). A `content_hash` (sha256 of normalised
+  title+description) is the re-open discriminator: a materially-different finding at an already-resolved
+  `(repo, location)` re-opens the coordinate and re-notifies, while an identical re-report on a resolved
+  coordinate is suppressed — the anti-nag guarantee (dismissing a bug makes it stay gone across runs).
+- **The worker never writes to the forge; the human gates every filing (D2, D4, D5).** Capture is a
+  plain run-lane MCP tool `report_incidental_issue` → `WorkerClient.reportFinding` →
+  `POST /api/worker/runs/:id/findings` (`RequireWorker`, per-worker rate-limited); the worker holds no
+  forge token, and `(user_id, repo_id)` are derived from the claimed run row, never client-sent. Filing
+  is a separate, human-gated, claim-first two-phase forge write (`ClaimFindingForFiling` `open→filing`,
+  `CreateIssue` on the user's own connection, stamp `filed_issue_iid`, revert on failure) done through
+  `POST /api/findings/{id}/issue`. Labels are server-assembled: a mandatory marker (`agent-found`,
+  config-overridable, `EnsureLabels`-ed first) ∪ the user's sanitised, capped selection — no
+  client-trusted trigger label. Issue text is resolved from the stored, already-sanitised row by `{id}`,
+  never from the request/card payload; a user edit is re-run through the same sanitisers.
+- **All agent-authored text is untrusted and rendered inert at every sink (D4).** Findings build their
+  OWN deterministic issue template (not judge-hardcoded `issuedraft.Render`) that calls the shared,
+  feature-neutral field sanitisers (`SanitizeTitle`, `FenceBlock`+`SanitizeFiledBody`, `SafeInlineCode`,
+  `ScrubSecretShapes`). Ingest sanitises `location`; the web card escapes agent text as inert JSX, never
+  Markdown.
+- **Capture tool is registered on ALL autonomous lanes — issue / ci_fix / prompt / self_improve — not
+  chat (D2).** It deliberately does NOT copy the `isIssueRun` gate on `report_progress`, and is a plain
+  (non-turn-ending) tool that can never be promoted into the signal/park set. Chat has its own
+  `propose_issue` for user-directed drafting; findings are for autonomous, off-task discovery, kept a
+  separate mechanism.
+- **Notification is inbox+Slack via a new per-run COALESCING path with resolved-coordinate suppression
+  (D6).** Kind `incidental_finding`; the first finding on a run inserts the inbox row and fires one Slack
+  DM, subsequent findings on the same run bump the unread row's `count` with no new DM (two new queries:
+  find-unread-by-`(user,run,kind)` + update-payload — this is new plumbing, not an existing pattern). A
+  report on an already-resolved coordinate with a matching `content_hash` records evidence but does not
+  notify and does not re-enter the to-file bucket.
+- **Backlog + surfaces (D7, D8, D10).** `GET /api/findings` is disposition-driven
+  (`FROM finding_dispositions LEFT JOIN findings`), deduped by coordinate, bucketed
+  `to_file|filed|dismissed|all`, `?repo=`/`?run=`, with the open-findings count on the response meta (no
+  standalone badge route — the judge pattern). `Findings` navigates in the **Work** group (work on your
+  code, not agent-grading); the run-stream card is a new `finding` `run_messages` kind (no migration),
+  accented info/blue to read as a non-blocking side note distinct from the amber park gate.
+- **Per-run cap (D11).** `MaxFindingsPerRun` (default 10) — past the cap the tool returns a soft error
+  and the agent keeps working; prevents a noisy run flooding the backlog.
+- **Auto-file deferred but schema-ready (D9).** The status set and server-assembled-label path are
+  exactly what an auto-file mode would drive; adding it later is a create-time branch (insert straight to
+  `filing`), not a schema change.

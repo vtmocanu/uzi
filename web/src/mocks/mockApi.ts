@@ -26,6 +26,11 @@ import {
   type CreatedIssue,
   type Disposition,
   type IssueDraft,
+  type IncidentalFinding,
+  type IncidentalFindingBacklog,
+  type IncidentalFindingBucket,
+  type IncidentalFindingFileResult,
+  type IncidentalFindingIssueDraft,
   type JudgeBacklog,
   type JudgeBacklogBucket,
   type JudgeCategoryStats,
@@ -86,6 +91,8 @@ import {
   mockForgeConfig,
   mockMyRateLimitsByUser,
   mockMyTokenRateLimits,
+  mockFindings,
+  type MockFinding,
   mockNotifications,
   mockOtherRunOwners,
   type MockNotification,
@@ -262,6 +269,44 @@ const loadedSettings = loadSettings();
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
+// Incidental-findings coordinates (PRD #333 M7). Mutable copy so file/dismiss persist in a
+// demo session; the seed stays pristine so a module reload re-seeds a clean backlog.
+const findings: MockFinding[] = mockFindings.map((f) => ({ ...f, labels: [...f.labels], run_ids: [...f.run_ids] }));
+
+// findingDTO projects a mock coordinate to the wire DTO, omitting the optional keys exactly as
+// the server's `omitempty` tags do (a null finding_id / iid / resolved_at is simply absent).
+function findingDTO(f: MockFinding): IncidentalFinding {
+  return {
+    ...(f.finding_id ? { finding_id: f.finding_id } : {}),
+    location: f.location,
+    repo_id: f.repo_id,
+    repo_path: f.repo_path,
+    status: f.status,
+    last_title: f.last_title,
+    seen_in_runs: f.seen_in_runs,
+    ...(f.filed_issue_iid != null ? { filed_issue_iid: f.filed_issue_iid } : {}),
+    ...(f.filed_issue_url ? { filed_issue_url: f.filed_issue_url } : {}),
+    ...(f.resolved_at ? { resolved_at: f.resolved_at } : {}),
+  };
+}
+
+// matchFindingBucket maps a disposition status to the ?bucket= filter (D7): to_file shows only
+// open, filed/dismissed show their own status, all shows everything (the transient `filing` is
+// invisible to to_file, exactly like the server).
+function matchFindingBucket(status: MockFinding["status"], bucket: IncidentalFindingBucket): boolean {
+  switch (bucket) {
+    case "to_file":
+      return status === "open";
+    case "filed":
+      return status === "filed";
+    case "dismissed":
+      return status === "dismissed";
+    case "all":
+      return true;
+    default:
+      return false;
+  }
+}
 const reviews: MockReview[] = mockReviews.map((r) => ({
   ...r,
   recommendations: r.recommendations.map((x) => ({ ...x })),
@@ -3061,6 +3106,73 @@ export const mockApi = {
       triage: backlog.triage,
     };
     return delay(result, 120);
+  },
+
+  // ── Incidental Findings backlog (PRD #333 M7) ───────────────────────────────
+  listFindings: async (bucket: IncidentalFindingBucket = "to_file", repo?: string, run?: string) => {
+    const me = requireSession();
+    const mine = findings.filter((f) => f.user_id === me.id);
+    const byRepo = repo ? mine.filter((f) => f.repo_id === repo) : mine;
+    // open_count is the D8 nav-badge count: open coordinates scoped by the ?repo= filter but NOT
+    // the bucket or run — so it is stable across a tab switch, exactly like the server meta.
+    const openCount = byRepo.filter((f) => f.status === "open").length;
+    const byRun = run ? byRepo.filter((f) => f.run_ids.includes(run)) : byRepo;
+    const rows = byRun.filter((f) => matchFindingBucket(f.status, bucket)).map(findingDTO);
+    const backlog: IncidentalFindingBacklog = {
+      bucket,
+      repo: repo ?? "",
+      run: run ?? "",
+      open_count: openCount,
+      findings: rows,
+    };
+    return delay(backlog, 80);
+  },
+  findingIssueDraft: async (id: string) => {
+    const me = requireSession();
+    const f = findings.find((x) => x.finding_id === id && x.user_id === me.id);
+    if (!f) throw new ApiError(404, "finding not found");
+    const draft: IncidentalFindingIssueDraft = {
+      title: f.last_title,
+      description: f.description_md,
+      location: f.location,
+      labels: [...f.labels],
+      provenance: `Found by a run while working on ${f.repo_path}.`,
+    };
+    return delay(draft, 80);
+  },
+  fileFinding: async (id: string, body?: { title?: string; description?: string; labels?: string[] }) => {
+    const me = requireSession();
+    const f = findings.find((x) => x.finding_id === id && x.user_id === me.id);
+    if (!f) throw new ApiError(404, "finding not found");
+    // Claim-first: only an `open` coordinate can be filed — a second file is the 409 the stale
+    // card / stale backlog row handles gracefully (the guarded claim, D4).
+    if (f.status !== "open") throw new ApiError(409, "this finding is already filed or being filed");
+    const iid = 900 + (parseInt(id.replace(/\D/g, ""), 10) || 0);
+    f.status = "filed";
+    f.filed_issue_iid = iid;
+    f.resolved_at = new Date().toISOString();
+    const res: IncidentalFindingFileResult = {
+      issue: {
+        iid,
+        web_url: `https://gitlab.example.com/${f.repo_path}/-/issues/${iid}`,
+        title: body?.title ?? f.last_title,
+      },
+    };
+    return delay(res, 120);
+  },
+  dismissFinding: async (id: string, reason: "wont_do" | "not_an_issue") => {
+    const me = requireSession();
+    if (reason !== "wont_do" && reason !== "not_an_issue") {
+      throw new ApiError(400, "reason must be wont_do or not_an_issue");
+    }
+    const f = findings.find((x) => x.finding_id === id && x.user_id === me.id);
+    if (!f) throw new ApiError(404, "finding not found");
+    if (f.status !== "open") {
+      throw new ApiError(409, "cannot dismiss (already filed, being filed, or already dismissed)");
+    }
+    f.status = "dismissed";
+    f.resolved_at = new Date().toISOString();
+    return delay({ status: "dismissed", reason }, 80);
   },
 
   // ── File a forge issue from a recommendation (PRD #68 M4 preview) ────────────

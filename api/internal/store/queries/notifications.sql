@@ -78,3 +78,37 @@ WHERE n.user_id = @user_id
           LIMIT @keep
       ) AS keep_row
   );
+
+-- ── PRD #333 Incidental Findings: the per-run notification coalescing plumbing (D6) ──
+-- notifysvc.Notify is INSERT-only, so "N findings on one run → one updated inbox row" is
+-- NEW plumbing, not an existing pattern. These two queries are the whole of it that M1
+-- owns; M3 adds the notifysvc entry point that uses them. The existing 8 queries above are
+-- untouched.
+
+-- name: FindUnreadNotificationForRunKind :one
+-- Find the coalescible unread row for a (user, run, kind): the newest still-unread
+-- notification of this kind anchored to this run. M3's coalescing path calls this for a
+-- run's SUBSEQUENT finding — a hit means bump the existing row's payload count (below)
+-- with NO new Slack DM; a miss (pgx.ErrNoRows) means this is the first finding, so insert
+-- and fire one Slack DM. Scoped to the caller and their run; read_at IS NULL is what makes
+-- a row the user has already seen fall out and a fresh notification fire instead.
+SELECT * FROM notifications
+WHERE user_id = @user_id
+  AND run_id = @run_id::uuid
+  AND kind = @kind
+  AND read_at IS NULL
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- name: UpdateNotificationPayload :one
+-- Bump a coalesced notification's payload without re-firing Slack (D6). M3 rewrites
+-- payload.count (and finding_ids) on the row FindUnreadNotificationForRunKind returned, so
+-- the bell badge and inbox reflect "Run #N flagged M findings" while the Slack DM fired
+-- exactly once, on the first finding. RETURNING * so the caller can echo the updated row.
+-- The (id, user_id) match is defense-in-depth (matching MarkNotificationRead): the caller
+-- always passes the row FindUnreadNotificationForRunKind returned for this same user, so a
+-- foreign id can never be updated even if a caller is ever wired to pass an untrusted id.
+UPDATE notifications
+SET payload = @payload
+WHERE id = @id AND user_id = @user_id
+RETURNING *;

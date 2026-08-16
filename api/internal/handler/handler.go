@@ -672,6 +672,29 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Put("/recommendations/disposition", h.BulkSetDispositions)
 		})
 
+		// Incidental Findings backlog (PRD #333 M4/M5, D7/D8): the per-repo, owner-scoped,
+		// coordinate-deduped backlog of off-task bugs the worker flagged mid-run, its issue
+		// draft, and the human-gated file/dismiss WRITES. Two sibling groups (the runs
+		// pattern): the READS are RequireUser (so `uzi findings list` works from a CLI token)
+		// and the WRITES are the stricter cookie+CSRF RequireAuth — a CLI token cannot drive a
+		// forge write.
+		r.Route("/findings", func(r chi.Router) {
+			// Reads: owner-scoped by the query's user_id filter, no forge write, no spend.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Get("/", h.ListFindings)
+				r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
+			})
+			// Writes (M5): cookie+CSRF RequireAuth. Filing is a forge write, so it rides the
+			// per-user forge limiter (mirroring FileIssue); dismiss is a LOCAL write (no forge
+			// call, no spend) and carries no limiter, beside the reads.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issue", h.FileFinding)
+				r.Post("/{id}/dismiss", h.DismissFinding)
+			})
+		})
+
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
 		// secret DEK. All authenticated (CSRF applies to the POSTs). Unlock is a
 		// password-guessing surface, so it rides the auth limiter keyed PER USER
@@ -1297,6 +1320,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// write). The per-worker proposal limiter caps mass-creation across a
 		// user's chats; the per-run pending cap is the other half.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
+		// Incidental findings capture (PRD #333 M2, D2): the run-lane
+		// report_incidental_issue tool records one off-task bug. Like proposals it is a
+		// worker→api write that NEVER touches the forge (filing is human-gated), so it
+		// reuses the per-worker proposal limiter to bound mass-creation; the per-run
+		// MaxFindingsPerRun cap is the other half.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/findings", h.WorkerCreateFinding)
 	})
 }
 

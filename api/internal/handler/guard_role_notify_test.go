@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -107,6 +108,16 @@ func (s *countingNotifStore) PruneNotificationsForUser(context.Context, store.Pr
 
 func (s *countingNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
 	return store.Run{}, nil
+}
+
+// The PRD #333 coalescing pair, unused by the guard-role path but required to satisfy the
+// widened notifysvc.Store interface. Find reports "no coalescible row" so any accidental
+// caller takes the insert branch rather than a phantom hit.
+func (s *countingNotifStore) FindUnreadNotificationForRunKind(context.Context, store.FindUnreadNotificationForRunKindParams) (store.Notification, error) {
+	return store.Notification{}, pgx.ErrNoRows
+}
+func (s *countingNotifStore) UpdateNotificationPayload(_ context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error) {
+	return store.Notification{ID: arg.ID, UserID: arg.UserID, Payload: arg.Payload}, nil
 }
 
 // TestGuardRoleExcludedEmitDecision pins the producer notifyGuardRoleExcluded (PRD #319

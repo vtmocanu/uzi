@@ -101,6 +101,9 @@ uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all] [--categ
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
+uzi findings list [--repo <id>] [--bucket to_file|filed|dismissed|all] [--run <id>]
+uzi findings file <finding-id>
+uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
@@ -579,6 +582,56 @@ above). That indistinguishability between "misspelt" and "someone else's" is
 the point; a per-item outcome would rebuild exactly the existence oracle the
 404-on-everything rule removes. Don't read `updated: 0` as an error, and don't
 read it as success either.
+
+## Incidental findings: `uzi findings`
+
+While a worker implements a PRD it sometimes notices a bug **outside** the task at
+hand — a leaked ticker in a sweeper it read on the way past, a retry that can never
+succeed. Rather than smuggle an unrelated fix into the run's MR or drop the
+observation, it flags an *incidental finding* without stopping its turn. Nothing
+reaches the forge until you act: the findings collect into a per-repo backlog,
+deduped by `(repo, location)` across runs, that you triage from the terminal the same
+way as the [judge backlog](#reviewing-and-triaging-from-the-cli).
+
+```sh
+uzi findings list                                            # what still needs filing
+uzi findings list --bucket all --json                        # filed + dismissed too, for an agent
+uzi findings list --repo <repo-id>                           # one repo
+uzi findings list --run <run-id>                             # coordinates that also occur in that run
+uzi findings file <finding-id>                               # file a forge issue from a coordinate
+uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
+uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
+```
+
+`list` prints one row per `(repo, location)` coordinate, grouped by repo, carrying
+the actionable `finding_id`, the latest title, `seen in N runs`, and a status; the
+`open_count` (what still needs filing) prints as a meta line and rides the `--json`
+envelope. `--bucket` filters by disposition and defaults to `to_file`; `filed`,
+`dismissed` and `all` show the settled coordinates. `--repo <repo-id>` (from
+`uzi repo list`) and `--run <run-id>` narrow the list. As with `review backlog`, an
+unknown `--bucket` is a usage error (exit 2), never a silently empty list, while a
+well-formed but foreign or unknown `--repo`/`--run` returns an **empty list** — no
+existence oracle — rather than a 404.
+
+`file` turns one coordinate into a real forge issue on **your own** connection. The
+title, description and labels are assembled server-side from the stored, sanitised
+finding plus a mandatory marker label, so the CLI files the defaults — editing the
+draft before filing is a web action. It prints the created issue's number and URL;
+`--json` returns `{issue:{iid,web_url,title}, warning?}`, where a `warning` means the
+issue was created but its local record could not settle (a success with a note, still
+exit 0), not a retry signal. Filing a coordinate that is already filed or mid-filing
+is a conflict (exit 5); an unknown or foreign `<finding-id>` is not-found (exit 4).
+
+`dismiss` triages a coordinate to `dismissed` so it stays gone and does not re-nag
+across later runs (`not-an-issue` is a false positive, `wont-do` is valid-but-skip).
+A missing or invalid `--reason` is a usage error (exit 2) raised before any request is
+sent; a coordinate that is not dismissable (already filed, being filed, or already
+dismissed) is a conflict (exit 5), and an unknown or foreign id is not-found (exit 4).
+
+`<finding-id>` is the id `list` prints as the first column of each coordinate; paste
+it straight into `file`/`dismiss`. Treat `location`, the title and `repo_path` as
+untrusted free text (they are agent-authored): render them as data, and branch only
+on the `status`/`bucket` enums.
 
 ## Anthropic tokens
 

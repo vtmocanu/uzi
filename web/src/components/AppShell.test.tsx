@@ -29,6 +29,9 @@ vi.mock("../lib/api", () => ({
     // zero so these navigation tests assert the nav STRUCTURE without a badge in the way.
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    // PRD #333 M7: AppShell polls the Findings open-count badge on mount; zero + empty so
+    // these navigation tests assert the nav STRUCTURE without a findings badge in the way.
+    listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
     // The status favicon (PRD #70) polls listRuns on mount via useFavicon; stub it
     // so the poll resolves to an empty run set instead of throwing on an undefined
     // mock (the throw is synchronous, so the hook's own .catch never sees it).
@@ -228,6 +231,17 @@ describe("AppShell navigation", () => {
     const judge = await screen.findByRole("link", { name: /Judge/ });
     await waitFor(() => expect(judge.textContent).toContain("7"));
     expect(judge.textContent).not.toContain("12");
+  });
+
+  it("badges the Findings nav item with the GET /api/findings open_count meta (PRD #333 M7)", async () => {
+    mockApi.listFindings.mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 4, findings: [] });
+    renderShell("/dashboard");
+
+    // The Findings link lives in the Work group and its badge is the open-findings count,
+    // read from the response meta (D8) with no repo filter (the global count).
+    const findings = await screen.findByRole("link", { name: /Findings/ });
+    await waitFor(() => expect(findings.textContent).toContain("4"));
+    expect(findings.getAttribute("href")).toBe("/findings");
   });
 
   it("shows the server build version (GET /api/version) in the sidebar footer", async () => {

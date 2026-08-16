@@ -531,6 +531,23 @@ func run() error {
 				return q.SweepStrandedRecommendationClaims(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
 			},
 		},
+		// Stranded incidental-finding filing claims (PRD #333 M5): the finding sibling of
+		// the pass above. A FileFinding killed after ClaimFindingForFiling (status='filing')
+		// but before it settled/reverted leaves the coordinate `filing` forever — both
+		// ClaimFindingForFiling and DismissFinding guard status='open', so nothing else can
+		// move it. This resets it to `open` past the SAME clamped cutoff (>= 2x
+		// ForgeHTTPTimeout) so a slow-but-alive CreateIssue is never reset mid-flight. Reuses
+		// IssueFilingStuckTimeout (identical semantics — no new knob); 0 disables it.
+		sweeper.Pass{
+			Name: "finding_filing_claims_stranded",
+			Run: func(ctx context.Context) (int64, error) {
+				if cfg.IssueFilingStuckTimeout <= 0 {
+					return 0, nil
+				}
+				cutoff := time.Now().Add(-cfg.IssueFilingStuckTimeout)
+				return q.SweepStrandedFilingFindings(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+			},
+		},
 	)
 	sweep.Boot(ctx)
 

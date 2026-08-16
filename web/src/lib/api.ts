@@ -1906,6 +1906,82 @@ export interface JudgeDispositionResult {
   triage: TriageCounts;
 }
 
+// ── Incidental Findings (PRD #333 M7) ────────────────────────────────────────
+// The web mirror of the server DTOs in api/internal/apitypes/finding.go. These are
+// hand-maintained interfaces whose JSON keys must match the Go `json:"…"` tags exactly.
+
+// IncidentalFindingBucket is the GET /api/findings ?bucket= filter (D7). The default
+// (`to_file`) is the backlog's reason to exist — what still needs filing.
+export type IncidentalFindingBucket = "to_file" | "filed" | "dismissed" | "all";
+
+// IncidentalFinding is one (repo, location) coordinate in the per-repo Findings backlog,
+// deduped across every run it recurs in (mirrors apitypes.IncidentalFindingDTO, D7).
+//
+// `finding_id` is the latest evidence row's id — the id the file/dismiss actions drive on
+// (M5). It is UNDEFINED (omitempty) on a filed/dismissed coordinate whose evidence rows were
+// cascaded away with a deleted run (D12): the coordinate still appears (the read is
+// disposition-driven) and `last_title` keeps it legible, but there is no evidence row to act
+// on, so a nil finding_id means "not actionable from here".
+//
+// `location`, `repo_path` and `last_title` are agent-authored, already-sanitised (inert at
+// rest) — but like the judge's rationale_preview EVERY consumer renders them as escaped text
+// through stripUnsafeChars, never markdown/HTML (issue #124 hardening).
+export interface IncidentalFinding {
+  finding_id?: string;
+  location: string;
+  repo_id: string;
+  repo_path: string;
+  status: string;
+  last_title: string;
+  seen_in_runs: number;
+  filed_issue_iid?: number;
+  // filed_issue_url is the stored forge URL a filed coordinate produced (stamped at settle
+  // time). It is the DTO-carried source the backlog links "Filed #<iid>" through — present for a
+  // backlog-loaded filed row too, not just one filed this session — and is undefined until
+  // filed. Rendered as a link only when it is a real https URL.
+  filed_issue_url?: string;
+  resolved_at?: string;
+}
+
+// IncidentalFindingBacklog is GET /api/findings (D7/D8). `bucket`/`repo`/`run` echo the
+// applied filters ("" when a filter is absent). `open_count` is the D8 nav-badge count that
+// rides on this response meta (the judge pattern), scoped by the same ?repo= filter. `findings`
+// is never null on the wire (an empty backlog encodes []).
+export interface IncidentalFindingBacklog {
+  bucket: string;
+  repo: string;
+  run: string;
+  open_count: number;
+  findings: IncidentalFinding[];
+}
+
+// IncidentalFindingIssueDraft is GET /api/findings/{id}/issue-draft (D4): the deterministic,
+// human-editable draft. Every field is already inert; `labels` seed the editable selection
+// (the server-mandated marker is added at file time, D5, never here).
+export interface IncidentalFindingIssueDraft {
+  title: string;
+  description: string;
+  location: string;
+  labels: string[];
+  provenance: string;
+}
+
+// IncidentalFindingFiledIssue is the real forge issue POST /api/findings/{id}/issue created
+// (mirrors the handler's createdIssueDTO): only what the click produced.
+export interface IncidentalFindingFiledIssue {
+  iid: number;
+  web_url: string;
+  title: string;
+}
+
+// IncidentalFindingFileResult is the POST /api/findings/{id}/issue response (M5): the created
+// forge issue plus a non-empty `warning` when the issue WAS created but its local disposition
+// could not settle (created-with-warning — a success, never a retry signal).
+export interface IncidentalFindingFileResult {
+  issue: IncidentalFindingFiledIssue;
+  warning?: string;
+}
+
 // ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
 // The admin-facing view of the autonomous self-improvement job. repo_path /
 // user_email are display-only resolutions of the ids; last_run_at is the durable
@@ -2916,6 +2992,37 @@ const realApi = {
         ...(status === "dismissed" ? { reason } : {}),
       },
     ),
+
+  // ── Incidental Findings backlog (PRD #333 M7) ───────────────────────────────
+  // listFindings reads the coordinate-deduped, per-repo Findings backlog (RequireUser,
+  // owner-scoped, no forge write, no token spend), mirroring getJudgeBacklog's shape.
+  // bucket filters by disposition status (default to_file server-side); repo/run narrow by
+  // coordinate repo and by a run semi-join (the notification deep-link anchor). `open_count`
+  // in the response meta feeds the nav badge — render it, never re-derive from `findings`.
+  listFindings: (bucket?: IncidentalFindingBucket, repo?: string, run?: string) => {
+    const qs = new URLSearchParams();
+    if (bucket) qs.set("bucket", bucket);
+    if (repo) qs.set("repo", repo);
+    if (run) qs.set("run", run);
+    const suffix = qs.toString();
+    return request<IncidentalFindingBacklog>("GET", `/findings${suffix ? `?${suffix}` : ""}`);
+  },
+  // findingIssueDraft reads the deterministic, human-editable filing draft for one finding
+  // (D4). Every field is already sanitised server-side; the Edit-and-file panel seeds from it.
+  findingIssueDraft: (id: string) =>
+    request<IncidentalFindingIssueDraft>("GET", `/findings/${id}/issue-draft`),
+  // fileFinding is the human-gated forge write (M5, D4/D5): claim-first, marker-labelled,
+  // on the caller's own connection. The body is OPTIONAL — omitted, the server files the
+  // stored (already-sanitised) title/description; supplied, its title/description/labels are
+  // user EDITS re-run through the write-boundary sanitisers. A stale card acting on an
+  // already-filed coordinate gets a 409 (the guarded claim), which the caller renders as a
+  // friendly "already filed" state — the backlog is the source of truth.
+  fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
+    request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
+  // dismissFinding triages one coordinate to `dismissed` with a required reason from the
+  // closed enum (M5). A LOCAL write — no forge call, no token spend.
+  dismissFinding: (id: string, reason: "wont_do" | "not_an_issue") =>
+    request<{ status: string; reason: string }>("POST", `/findings/${id}/dismiss`, { reason }),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/

@@ -48,6 +48,50 @@ func (q *Queries) CountUnreadNotificationsForUser(ctx context.Context, userID uu
 	return count, err
 }
 
+const findUnreadNotificationForRunKind = `-- name: FindUnreadNotificationForRunKind :one
+
+SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at FROM notifications
+WHERE user_id = $1
+  AND run_id = $2::uuid
+  AND kind = $3
+  AND read_at IS NULL
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+type FindUnreadNotificationForRunKindParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	RunID  uuid.UUID `json:"run_id"`
+	Kind   string    `json:"kind"`
+}
+
+// ── PRD #333 Incidental Findings: the per-run notification coalescing plumbing (D6) ──
+// notifysvc.Notify is INSERT-only, so "N findings on one run → one updated inbox row" is
+// NEW plumbing, not an existing pattern. These two queries are the whole of it that M1
+// owns; M3 adds the notifysvc entry point that uses them. The existing 8 queries above are
+// untouched.
+// Find the coalescible unread row for a (user, run, kind): the newest still-unread
+// notification of this kind anchored to this run. M3's coalescing path calls this for a
+// run's SUBSEQUENT finding — a hit means bump the existing row's payload count (below)
+// with NO new Slack DM; a miss (pgx.ErrNoRows) means this is the first finding, so insert
+// and fire one Slack DM. Scoped to the caller and their run; read_at IS NULL is what makes
+// a row the user has already seen fall out and a fresh notification fire instead.
+func (q *Queries) FindUnreadNotificationForRunKind(ctx context.Context, arg FindUnreadNotificationForRunKindParams) (Notification, error) {
+	row := q.db.QueryRow(ctx, findUnreadNotificationForRunKind, arg.UserID, arg.RunID, arg.Kind)
+	var i Notification
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.Payload,
+		&i.RunID,
+		&i.ReviewID,
+		&i.ReadAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertNotification = `-- name: InsertNotification :one
 
 INSERT INTO notifications (user_id, kind, payload, run_id, review_id)
@@ -268,4 +312,40 @@ func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotifi
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const updateNotificationPayload = `-- name: UpdateNotificationPayload :one
+UPDATE notifications
+SET payload = $1
+WHERE id = $2 AND user_id = $3
+RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at
+`
+
+type UpdateNotificationPayloadParams struct {
+	Payload []byte    `json:"payload"`
+	ID      uuid.UUID `json:"id"`
+	UserID  uuid.UUID `json:"user_id"`
+}
+
+// Bump a coalesced notification's payload without re-firing Slack (D6). M3 rewrites
+// payload.count (and finding_ids) on the row FindUnreadNotificationForRunKind returned, so
+// the bell badge and inbox reflect "Run #N flagged M findings" while the Slack DM fired
+// exactly once, on the first finding. RETURNING * so the caller can echo the updated row.
+// The (id, user_id) match is defense-in-depth (matching MarkNotificationRead): the caller
+// always passes the row FindUnreadNotificationForRunKind returned for this same user, so a
+// foreign id can never be updated even if a caller is ever wired to pass an untrusted id.
+func (q *Queries) UpdateNotificationPayload(ctx context.Context, arg UpdateNotificationPayloadParams) (Notification, error) {
+	row := q.db.QueryRow(ctx, updateNotificationPayload, arg.Payload, arg.ID, arg.UserID)
+	var i Notification
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.Payload,
+		&i.RunID,
+		&i.ReviewID,
+		&i.ReadAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }

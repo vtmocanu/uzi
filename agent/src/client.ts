@@ -6,6 +6,7 @@ import {
   type ChatClaimResponse,
   type ClaimResponse,
   type CreateProposalRequest,
+  type ReportFindingRequest,
   type HeartbeatRequest,
   type MessagesRequest,
   type OutgoingMessage,
@@ -312,6 +313,19 @@ export class WorkerClient {
       proposal: WorkerProposal;
     };
     return res.proposal;
+  }
+
+  /** Record an INCIDENTAL FINDING for a run (POST /worker/runs/:id/findings, PRD #333
+   *  M2). The api derives (user_id, repo_id) from the claimed run (never a client id),
+   *  sanitises + canonicalises the text, and persists an evidence row + an `open`
+   *  coordinate. NEVER writes the forge — filing is human-gated later (D2/D4). Returns
+   *  the created finding's id so the emitted `finding` card can act on it. Throws
+   *  RequestError on non-2xx (429 = the per-run cap; the tool catches it and soft-acks). */
+  async reportFinding(runId: string, body: ReportFindingRequest): Promise<string> {
+    const res = (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/findings`, body)) as {
+      id: string;
+    };
+    return res.id;
   }
 
   // ── Cross-run agent memory (PRD #90) ───────────────────────────────────────

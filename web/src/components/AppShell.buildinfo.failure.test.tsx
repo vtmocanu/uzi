@@ -26,6 +26,9 @@ vi.mock("../lib/api", () => ({
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    // PRD #333 M7: AppShell polls the Findings open-count badge on mount; zero + empty so
+    // these navigation tests assert the nav STRUCTURE without a findings badge in the way.
+    listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     // SidebarRateLimits fetches the chosen sidebar-token set on mount.

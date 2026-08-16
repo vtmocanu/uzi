@@ -15,9 +15,11 @@ package notifysvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -39,6 +41,12 @@ type Store interface {
 	// through its own narrower runReader, but keeping this on Store lets the same
 	// *store.Queries value back both the notify seam and the adapter.
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
+	// FindUnreadNotificationForRunKind / UpdateNotificationPayload are the PRD #333 D6
+	// per-run coalescing pair: find the run's still-unread finding notification (a miss
+	// ⇒ this is the run's first finding, insert + one Slack DM), else bump its payload
+	// count WITHOUT re-firing Slack. See NotifyIncidentalFinding.
+	FindUnreadNotificationForRunKind(ctx context.Context, arg store.FindUnreadNotificationForRunKindParams) (store.Notification, error)
+	UpdateNotificationPayload(ctx context.Context, arg store.UpdateNotificationPayloadParams) (store.Notification, error)
 }
 
 // Slacker is the best-effort Slack delivery seam. The slacksvc Notifier satisfies
@@ -172,4 +180,106 @@ func optionalUUID(id *uuid.UUID) pgtype.UUID {
 		return pgtype.UUID{}
 	}
 	return pgtype.UUID{Bytes: *id, Valid: true}
+}
+
+// KindIncidentalFinding is the notifications.kind for a coalesced incidental-finding
+// notification (PRD #333 D6). kind is a generic text column with no CHECK, so this needs
+// no migration; the value is the coalescing key alongside (user_id, run_id).
+const KindIncidentalFinding = "incidental_finding"
+
+// maxCoalescedFindingIDs caps the finding_ids the coalesced payload accumulates so a
+// noisy run cannot grow one inbox row's jsonb without bound. The count keeps climbing past
+// the cap (it is the badge/headline number); only the id list stops appending. The per-run
+// capture cap (workersvc.MaxFindingsPerRun) is far below this, so in practice the cap is
+// defense-in-depth, not a limit users meet.
+const maxCoalescedFindingIDs = 50
+
+// IncidentalFindingPayload is the jsonb the inbox renders for an incidental_finding
+// notification (PRD #333 D6). run_id/repo_id anchor it; repo_path is the human label;
+// count is the coalesced headline ("Run flagged M findings") and finding_ids the deep-link
+// set. All fields are server-built from the run/repo, never untrusted agent text (the
+// finding's title/location live on the backlog behind the deep link, already sanitised).
+type IncidentalFindingPayload struct {
+	RunID      uuid.UUID   `json:"run_id"`
+	RepoID     uuid.UUID   `json:"repo_id"`
+	RepoPath   string      `json:"repo_path"`
+	Count      int         `json:"count"`
+	FindingIDs []uuid.UUID `json:"finding_ids"`
+}
+
+// IncidentalFindingNotifyInput carries everything NotifyIncidentalFinding needs. Every
+// field is server-derived (the run/repo the api resolved, the server-built deep link) —
+// no untrusted agent text rides in here.
+type IncidentalFindingNotifyInput struct {
+	UserID    uuid.UUID
+	RunID     uuid.UUID
+	RepoID    uuid.UUID
+	RepoPath  string
+	FindingID uuid.UUID
+	Link      string
+}
+
+// NotifyIncidentalFinding is the PRD #333 D6 coalescing entry point: the run's FIRST
+// finding inserts one inbox row and fires exactly one Slack DM (via the existing Notify
+// persist-first + prune + Slack path); every SUBSEQUENT finding for the SAME run bumps
+// that unread row's payload count and appends the finding id WITHOUT re-firing Slack, so
+// the bell badge and inbox read "Run flagged M findings" while the user is DM'd once. The
+// caller resolves whether to notify at all (a suppressed matching-hash re-report never
+// calls this, R2) and logs-and-swallows any error — the finding is already durably stored,
+// so a notification failure must never fail the capture.
+func (s *Service) NotifyIncidentalFinding(ctx context.Context, in IncidentalFindingNotifyInput) error {
+	existing, err := s.q.FindUnreadNotificationForRunKind(ctx, store.FindUnreadNotificationForRunKindParams{
+		UserID: in.UserID,
+		RunID:  in.RunID,
+		Kind:   KindIncidentalFinding,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No coalescible unread row ⇒ the run's FIRST finding: persist the inbox row and
+		// fire one Slack DM. Notify owns persist-first + prune + best-effort Slack.
+		runID := in.RunID
+		_, nerr := s.Notify(ctx, Notification{
+			UserID: in.UserID,
+			Kind:   KindIncidentalFinding,
+			Payload: IncidentalFindingPayload{
+				RunID:      in.RunID,
+				RepoID:     in.RepoID,
+				RepoPath:   in.RepoPath,
+				Count:      1,
+				FindingIDs: []uuid.UUID{in.FindingID},
+			},
+			RunID: &runID,
+			Slack: &SlackRender{
+				Title: "🐛 Run flagged an incidental finding",
+				Body:  in.RepoPath,
+				Link:  in.Link,
+				Emoji: "🐛",
+			},
+		})
+		return nerr
+	case err != nil:
+		return err
+	default:
+		// A coalescible unread row exists ⇒ a SUBSEQUENT finding on the same run: bump the
+		// count and append the id, then rewrite the payload. NO Slack (D6: the DM fired on
+		// the first finding). The row stays unread so it keeps counting toward the bell.
+		var payload IncidentalFindingPayload
+		if derr := json.Unmarshal(existing.Payload, &payload); derr != nil {
+			return derr
+		}
+		payload.Count++
+		if len(payload.FindingIDs) < maxCoalescedFindingIDs {
+			payload.FindingIDs = append(payload.FindingIDs, in.FindingID)
+		}
+		b, merr := json.Marshal(payload)
+		if merr != nil {
+			return merr
+		}
+		_, uerr := s.q.UpdateNotificationPayload(ctx, store.UpdateNotificationPayloadParams{
+			Payload: b,
+			ID:      existing.ID,
+			UserID:  in.UserID,
+		})
+		return uerr
+	}
 }

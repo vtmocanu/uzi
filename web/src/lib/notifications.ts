@@ -37,6 +37,12 @@ export function notificationBody(payload: Record<string, unknown>): string {
 // retarget and M5's grouping both key on it and a typo in either is silent.
 export const JUDGE_REVIEW_KIND = "judge_review";
 
+// The kind the coalesced incidental-findings ping carries (PRD #333 M6/M7). Spelled once
+// here because the inbox renderer and notificationLink both key on it — a typo is silent.
+// Its payload is { run_id, repo_id, repo_path, count, finding_ids }; the deep-link opens the
+// Findings backlog filtered to that run.
+export const INCIDENTAL_FINDING_KIND = "incidental_finding";
+
 // notificationLink is the inbox's deep-link, and it is KIND-CONDITIONAL on purpose.
 //
 // Read the shape of the bug this guards before simplifying it. The inbox linked
@@ -62,6 +68,11 @@ export const JUDGE_REVIEW_KIND = "judge_review";
 export function notificationLink(kind: string, runID: string | null | undefined): string | null {
   if (!runID) return null;
   if (kind === JUDGE_REVIEW_KIND) return `/judge?run=${runID}`;
+  // A findings ping opens the per-repo Findings backlog filtered to the flagging run (PRD
+  // #333 M7) — the same kind-conditional guard the judge retarget uses, so a future run-id
+  // kind still lands on /runs rather than being silently redirected here. runID is a
+  // server-generated UUID and the fixed prefix keeps this a same-origin path, so no encode.
+  if (kind === INCIDENTAL_FINDING_KIND) return `/findings?run=${runID}`;
   return `/runs/${runID}`;
 }
 

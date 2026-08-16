@@ -48,7 +48,7 @@ func TestCommandTree(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 
 	topWant := []string{
-		"login", "logout", "auth", "whoami", "run", "review",
+		"login", "logout", "auth", "whoami", "run", "review", "findings",
 		"worker", "token", "repo", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
@@ -62,12 +62,14 @@ func TestCommandTree(t *testing.T) {
 		// backlog is the PRD #98 M7 read; there is deliberately no `file` verb —
 		// filing stays browser-only (#68's stance, Decision 10).
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats"},
-		"worker": {"list", "rm", "set-token"},
-		"token":  {"list"},
-		"repo":   {"list"},
-		"admin":  {"users", "runs", "workers", "usage", "rate-limits"},
-		"skill":  {"status", "install"},
-		"auth":   {"token", "status"},
+		// PRD #333 M6: the terminal form of the per-repo Findings backlog.
+		"findings": {"list", "file", "dismiss"},
+		"worker":   {"list", "rm", "set-token"},
+		"token":    {"list"},
+		"repo":     {"list"},
+		"admin":    {"users", "runs", "workers", "usage", "rate-limits"},
+		"skill":    {"status", "install"},
+		"auth":     {"token", "status"},
 	}
 	for parent, kids := range subWant {
 		pc := findCmd(root, parent)

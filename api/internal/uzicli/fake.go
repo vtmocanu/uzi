@@ -186,6 +186,28 @@ type FakeClient struct {
 	RunNowResult       apitypes.RunNowResponse
 	LastRunNowSchedID  string
 
+	// Incidental findings (PRD #333 M6). FindingsResult is the canned `findings list` reply,
+	// and LastFindings{Bucket,Repo,Run} record the forwarded filters (empty = the flag was
+	// unset and the parameter omitted, so the SERVER's default applies — the fake must not
+	// substitute one, or a test could not tell the two apart, mirroring LastBacklogBucket).
+	//
+	// FileFindingResult / LastFileFindingID capture the file write; DismissFinding records its
+	// id + reason. FileFindingErr / DismissFindingErr, like SetDispositionErr, are returned by
+	// the WRITE in preference to Err so a test can model a 404/409 precisely while the capture
+	// still proves the write was REACHED with the right id.
+	FindingsResult     apitypes.IncidentalFindingBacklogDTO
+	LastFindingsBucket string
+	LastFindingsRepo   string
+	LastFindingsRun    string
+
+	FileFindingResult apitypes.IncidentalFindingFileResultDTO
+	LastFileFindingID string
+	FileFindingErr    error
+
+	LastDismissFindingID     string
+	LastDismissFindingReason string
+	DismissFindingErr        error
+
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
 	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a
@@ -576,6 +598,41 @@ func (f *FakeClient) RunScheduleNow(_ context.Context, id string) (apitypes.RunN
 		return apitypes.RunNowResponse{}, f.Err
 	}
 	return f.RunNowResult, nil
+}
+
+func (f *FakeClient) ListFindings(_ context.Context, bucket, repo, run string) (apitypes.IncidentalFindingBacklogDTO, error) {
+	f.LastFindingsBucket = bucket
+	f.LastFindingsRepo = repo
+	f.LastFindingsRun = run
+	if f.Err != nil {
+		return apitypes.IncidentalFindingBacklogDTO{}, f.Err
+	}
+	return f.FindingsResult, nil
+}
+
+// FileFinding records the id it was asked to file and returns the canned result. FileFindingErr
+// wins over the blanket Err so a test can model a 409/404 on the WRITE precisely, while the id
+// capture still proves the write was reached.
+func (f *FakeClient) FileFinding(_ context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
+	f.LastFileFindingID = id
+	if f.FileFindingErr != nil {
+		return apitypes.IncidentalFindingFileResultDTO{}, f.FileFindingErr
+	}
+	if f.Err != nil {
+		return apitypes.IncidentalFindingFileResultDTO{}, f.Err
+	}
+	return f.FileFindingResult, nil
+}
+
+// DismissFinding records the id + reason it was called with. DismissFindingErr wins over Err so
+// a test can model a 404/409 on the write while the capture still records what reached it.
+func (f *FakeClient) DismissFinding(_ context.Context, id, reason string) error {
+	f.LastDismissFindingID = id
+	f.LastDismissFindingReason = reason
+	if f.DismissFindingErr != nil {
+		return f.DismissFindingErr
+	}
+	return f.Err
 }
 
 func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, error) {
