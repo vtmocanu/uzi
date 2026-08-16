@@ -22,6 +22,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       moveIssue: vi.fn(),
       reorderBoard: vi.fn(),
       promoteIssue: vi.fn(),
+      configureColumns: vi.fn(),
     },
   };
 });
@@ -1744,5 +1745,164 @@ describe("Board — search + per-lane paging (PRD #304)", () => {
     // The search-hidden card is still frozen with the rest — payloadCards is unfiltered.
     expect(iids).toContain(2);
     expect(iids).toHaveLength(3);
+  });
+});
+
+// PRD #318 M2 — the COLUMNS settings editor gains grip-handle drag-and-drop reorder,
+// replacing the ↑/↓ arrow buttons. These mount the whole Board (the editor is opened
+// from the toolbar) so the assertions run against the real ColumnSettings tree.
+describe("ColumnSettings reorder (PRD #318 M2)", () => {
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [
+      { label_name: "Planned" },
+      { label_name: "In Progress" },
+    ] as BoardData["columns"],
+    cards: [aCard({ iid: 7, column: "In Progress", labels: ["PRD", "In Progress", "bug"] })],
+    pipeline: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: false,
+      runEligibleLabels: ["PRD", "bug"],
+      eligibleLabelWaivesPrdLink: true,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.setBoardPrefs.mockImplementation(async (_repoId, prefs) => prefs);
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 7, column: "" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
+    mockApi.configureColumns.mockResolvedValue({ board: aBoard() });
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  // The settings panel is the Card whose heading is the <SectionTitle>Columns</SectionTitle>
+  // h2 — its parent element wraps the whole editor (rows, inputs, Save button). Anchoring
+  // to the heading avoids matching the board lanes, which repeat every column label.
+  const openSettings = async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    const panel = screen.getByRole("heading", { name: "Columns", level: 2 })
+      .parentElement as HTMLElement;
+    return panel;
+  };
+
+  it("renders a drag grip on each column row", async () => {
+    const panel = await openSettings();
+    // GripVerticalIcon is aria-hidden, so query structurally: it is the only <svg> the
+    // editor renders (the Remove/Add/Save buttons and suggestion chips are text-only),
+    // one per column row.
+    const grips = panel.querySelectorAll("svg");
+    expect(grips.length).toBe(2);
+    // Guard against a stray non-grip svg slipping in: the grip is a 2×3 dot grid, six
+    // <circle>s, so every column contributes six circles.
+    expect(panel.querySelectorAll("circle").length).toBe(12);
+  });
+
+  it("no longer exposes the ↑/↓ arrow reorder buttons", async () => {
+    const panel = await openSettings();
+    // Scope to the editor and anchor the regex: a loose /Move .* up/ would also match the
+    // board cards' own "Move issue #N up in <lane>" controls, which live in the same DOM.
+    expect(within(panel).queryByLabelText(/^Move .+ up$/)).toBeNull();
+    expect(within(panel).queryByLabelText(/^Move .+ down$/)).toBeNull();
+    // The Remove control stays.
+    expect(within(panel).getAllByRole("button", { name: "Remove" }).length).toBe(2);
+  });
+
+  it("persists the reordered label list when a row is dragged to the bottom and saved", async () => {
+    mockApi.getBoard.mockResolvedValue({
+      board: aBoard({
+        columns: [
+          { label_name: "Planned" },
+          { label_name: "In Progress" },
+          { label_name: "Human Review" },
+        ] as BoardData["columns"],
+      }),
+    });
+    const panel = await openSettings();
+    const rows = within(panel).getAllByRole("listitem");
+    expect(rows.length).toBe(3);
+
+    // Drag the FIRST row ("Planned") onto the LAST row ("Human Review"). jsdom's rect is
+    // all-zeroes and clientY 0 resolves to the "bottom" edge (insertionEdgeFor(0,0,0)),
+    // so the source appends after the last row. The drop reads its source from
+    // dataTransfer.getData, which carries the column LABEL, not an iid.
+    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn(), getData: () => "Planned" } });
+    fireEvent.drop(rows[2], { dataTransfer: { getData: () => "Planned" }, clientY: 0 });
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Save columns" }));
+    await waitFor(() => expect(mockApi.configureColumns).toHaveBeenCalled());
+    // from=0, i=2, edge="bottom" → to=3 → from<to → to=2 → moveTo(0,2):
+    // ["Planned","In Progress","Human Review"] → ["In Progress","Human Review","Planned"].
+    expect(mockApi.configureColumns).toHaveBeenCalledWith("repo-1", [
+      { label_name: "In Progress" },
+      { label_name: "Human Review" },
+      { label_name: "Planned" },
+    ]);
+  });
+
+  it("compensates the index on a mid-list downward drag", async () => {
+    mockApi.getBoard.mockResolvedValue({
+      board: aBoard({
+        columns: [
+          { label_name: "Planned" },
+          { label_name: "In Progress" },
+          { label_name: "Human Review" },
+        ] as BoardData["columns"],
+      }),
+    });
+    const panel = await openSettings();
+    const rows = within(panel).getAllByRole("listitem");
+
+    // Drag row 0 ("Planned") DOWN onto row 1 ("In Progress"). jsdom's zero rect makes
+    // clientY 0 resolve to the "bottom" edge, so it lands just after "In Progress".
+    // This is the case that exercises `if (from < to) to -= 1`: from=0, i=1,
+    // edge="bottom" → to=2 → from<to → to=1 → moveTo(0,1) → ["In Progress","Planned",
+    // "Human Review"]. WITHOUT the decrement, to would stay 2 and moveTo(0,2) would
+    // yield ["In Progress","Human Review","Planned"] — a different, wrong order — so
+    // this test fails if that line regresses (the drag-to-bottom test above cannot,
+    // because splice clamps identically at the array end).
+    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn(), getData: () => "Planned" } });
+    fireEvent.drop(rows[1], { dataTransfer: { getData: () => "Planned" }, clientY: 0 });
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Save columns" }));
+    await waitFor(() => expect(mockApi.configureColumns).toHaveBeenCalled());
+    expect(mockApi.configureColumns).toHaveBeenCalledWith("repo-1", [
+      { label_name: "In Progress" },
+      { label_name: "Planned" },
+      { label_name: "Human Review" },
+    ]);
   });
 });

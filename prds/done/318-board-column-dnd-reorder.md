@@ -152,18 +152,18 @@ change.
 
 ## Milestones
 
-- [ ] **M1 — Grip icon + DnD reorder in `ColumnSettings`**: add `GripVerticalIcon`; replace
+- [x] **M1 — Grip icon + DnD reorder in `ColumnSettings`**: add `GripVerticalIcon`; replace
   the ↑/↓ arrows and `swap` with the grip handle + native HTML5 drag-and-drop through a
   single `moveTo`; dragged-row dim + inset-shadow insertion marker copied from the cards;
   Remove button kept and `draggable={false}`. Validation: in the app (or mock scenario)
   dragging a column by the grip reorders the list with the insertion line showing and no
   mid-drag reflow; **Save columns** persists the new order.
-- [ ] **M2 — Tests + gate green**: `Board.test.tsx` cases for a drag-reorder outcome, grip
+- [x] **M2 — Tests + gate green**: `Board.test.tsx` cases for a drag-reorder outcome, grip
   presence, and arrow-absence, using the existing `dataTransfer` stub idiom and asserting
   on order/`configureColumns` payload (not jsdom pixel math). Run `task gate:web` (oxlint,
   typecheck, vitest, knip) to green. Validation: `task gate:web` passes; new tests fail if
   the reorder wiring regresses.
-- [ ] **M3 — Docs/specs**: record the interaction in `specs/ai.md` (drop-arrows decision +
+- [x] **M3 — Docs/specs**: record the interaction in `specs/ai.md` (drop-arrows decision +
   the accepted a11y residual). If a user-facing board doc names the arrow reorder, update
   it; otherwise none. Validation: `specs/ai.md` carries the decision; `web/scripts/check-docs.mjs`
   (via `npm run build`) stays green if any `docs/*.md` was touched.
