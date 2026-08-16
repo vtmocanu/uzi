@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
+import { RequestError } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
@@ -500,6 +501,117 @@ describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
     const done = worker.run(controller.signal);
     for (let i = 0; i < 300 && !registered; i++) await tick();
     assert.strictEqual(registered, true, "a passing preflight lets registration proceed");
+    controller.abort();
+    await done;
+  });
+});
+
+// Issue #109: registerWithRetry classifies its failures. A 401/403 is a PERMANENT auth
+// rejection of the worker join token (rotated or invalid) — retrying can never clear it,
+// so it must FAIL LOUD (throw → main.ts fatal handler, exit 1). Every other error
+// (network, timeout, 5xx, 408/429, any other status) keeps retrying with the capped backoff.
+describe("Worker — register auth-rejection classification (issue #109)", () => {
+  for (const status of [401, 403]) {
+    it(`throws immediately on a ${status} auth rejection with no retry`, async () => {
+      const controller = new AbortController();
+      let calls = 0;
+      const client = {
+        register: async () => {
+          calls++;
+          throw new RequestError("POST", "/worker/register", status, "unauthorized");
+        },
+        heartbeat: async () => {},
+        claimRun: async () => null,
+        claimChat: async () => null,
+      } as unknown as WorkerClient;
+
+      const worker = new Worker(
+        fakeConfig(),
+        client,
+        { execute: async () => {} } as unknown as RunRunner,
+        {} as unknown as ChatRunner,
+        noJudge,
+        recordingLogger().logger,
+        okPreflight,
+      );
+
+      await assert.rejects(
+        () => worker.run(controller.signal),
+        (err: unknown) => err instanceof RequestError && err.status === status,
+        `run() rejects with the ${status} RequestError`,
+      );
+      assert.strictEqual(calls, 1, `register is called exactly once (no retry) on ${status}`);
+    });
+  }
+
+  it("retries a transient 5xx with backoff, then succeeds", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const { logger, lines } = recordingLogger();
+    const client = {
+      register: async () => {
+        calls++;
+        if (calls <= 2) throw new RequestError("POST", "/worker/register", 503, "unavailable");
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async () => null,
+      claimChat: async () => null,
+    } as unknown as WorkerClient;
+
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      { execute: async () => {} } as unknown as RunRunner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      logger,
+      okPreflight,
+    );
+
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && calls < 3; i++) await tick();
+    assert.strictEqual(calls, 3, "register retried past the transient 5xx and succeeded on the 3rd call");
+    assert.ok(
+      lines.some((l) => (l as { msg?: string }).msg === "register failed, retrying"),
+      "the transient retry path emitted a 'register failed, retrying' warn line",
+    );
+    controller.abort();
+    await done;
+  });
+
+  it("retries a plain network error with backoff, then succeeds", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const { logger, lines } = recordingLogger();
+    const client = {
+      register: async () => {
+        calls++;
+        if (calls <= 2) throw new Error("ECONNREFUSED");
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async () => null,
+      claimChat: async () => null,
+    } as unknown as WorkerClient;
+
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      { execute: async () => {} } as unknown as RunRunner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      logger,
+      okPreflight,
+    );
+
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && calls < 3; i++) await tick();
+    assert.strictEqual(calls, 3, "register retried past the network error and succeeded on the 3rd call");
+    assert.ok(
+      lines.some((l) => (l as { msg?: string }).msg === "register failed, retrying"),
+      "the network-error retry path emitted a 'register failed, retrying' warn line",
+    );
     controller.abort();
     await done;
   });
