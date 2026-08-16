@@ -466,6 +466,73 @@ describe("confidence calibration (issue #336)", () => {
     assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
   });
 
+  // Clause-scoped bidirectional guard (issue #336 hardening). The prior directional
+  // window only suppressed a negator BEFORE the retry term within ~20 chars, so it buried
+  // POST-POSED negations ("retrying will not help") and missed DISTANT pre-posed ones.
+  // The clause-scoped rule suppresses whenever a negator shares the retry term's clause,
+  // on either side and at any distance, biasing toward NOT firing.
+  // A high rec whose TARGET carries no retry term, so the retry shape lives entirely in
+  // the rationale under test (retryHigh's "run retry" target would otherwise be its own
+  // unnegated affirmative clause and mask the rationale's negation).
+  const negRec = (rationale: string): ReviewRequest["recommendations"][number] => ({
+    category: "adjust_template" as const,
+    target: "lead",
+    rationale,
+    confidence: "high" as const,
+  });
+
+  it("does NOT downgrade POST-POSED negation ('retrying will not help')", () => {
+    const out = calibrateReview(
+      wrap(negRec("Retrying will not help; the failure is permanent")),
+      "provisioning_failed",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high", "post-posed negation is a real 'do not retry' finding");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("does NOT downgrade POST-POSED negation ('retrying is not advisable here')", () => {
+    const out = calibrateReview(
+      wrap(negRec("retrying is not advisable here")),
+      "credential_unavailable",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high", "post-posed negation is a real 'do not retry' finding");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("does NOT downgrade DISTANT pre-posed negation ('do not, under any circumstances, retry')", () => {
+    const out = calibrateReview(
+      wrap(negRec("do not, under any circumstances, retry")),
+      "guardrail_blocked",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high", "a negator far from the retry term still suppresses in-clause");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("STILL downgrades an affirmative retry rec (clause with an unnegated term)", () => {
+    const out = calibrateReview(
+      wrap(negRec("retry with exponential backoff")),
+      "provisioning_failed",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "low", "a genuine affirmative retry rec is still downgraded");
+    assert.ok(rec.rationale.includes("Confidence auto-reduced to low"));
+  });
+
+  it("STILL downgrades when a DIFFERENT clause holds the negation", () => {
+    // The first clause is a genuine affirmative retry rec; the negator lives in a
+    // separate clause, so clause-scoping must not let it suppress the affirmative one.
+    const out = calibrateReview(
+      wrap(negRec("retry with backoff. This is not related.")),
+      "provisioning_failed",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "low", "an unnegated affirmative clause still triggers the downgrade");
+    assert.ok(rec.rationale.includes("Confidence auto-reduced to low"));
+  });
+
   it("leaves a retry-shaped MEDIUM rec UNCHANGED (only high is in scope)", () => {
     const out = calibrateReview(
       wrap({ ...retryHigh(), confidence: "medium" }),
