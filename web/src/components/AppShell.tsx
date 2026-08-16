@@ -501,6 +501,20 @@ function SidebarContent({
             onNavigate={onNavigate}
             collapsed={collapsed}
           />
+          {/* Findings (PRD #333 D8): off-task bugs workers flagged on YOUR code — Work, not the
+              agent-grading Factory where Judge lives. Sits directly under Runs, the lane whose
+              output it collects. Badge is the open-findings count from the GET /api/findings
+              meta; brand "count" tone, the noun is "open". */}
+          <NavItem
+            to="/findings"
+            icon={<AlertIcon />}
+            label="Findings"
+            badge={findingsOpen}
+            badgeTone="count"
+            badgeLabel="open"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
           {/* Schedules (PRD #241): the time-driven run origin. Badge is the caller's
               enabled-schedule count — brand "count" tone, paused ones excluded. */}
           <NavItem
@@ -513,19 +527,6 @@ function SidebarContent({
             collapsed={collapsed}
           />
           <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
-          {/* Findings (PRD #333 D8): off-task bugs workers flagged on YOUR code — Work, not the
-              agent-grading Factory where Judge lives. Badge is the open-findings count from the
-              GET /api/findings meta; brand "count" tone, the noun is "open". */}
-          <NavItem
-            to="/findings"
-            icon={<AlertIcon />}
-            label="Findings"
-            badge={findingsOpen}
-            badgeTone="count"
-            badgeLabel="open"
-            onNavigate={onNavigate}
-            collapsed={collapsed}
-          />
         </NavGroup>
 
         <NavGroup label="Factory" collapsed={collapsed}>
