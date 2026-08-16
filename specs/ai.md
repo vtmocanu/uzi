@@ -21148,10 +21148,15 @@ model emitted.
   (only-ever-downgrades + high-only, per the issue). No behaviour change when `failure_class` is null or a
   transient class (`rate_limited`, `run_timeout`, `worker_lost`, `agent_failure`, …).
 - **"Retry-shaped" is textual over target + rationale, with a NEGATION GUARD.** The affirmative match is
-  `retry` / `backoff` / `re-run` / `run again` / `try again` / `requeue`; the guard suppresses a
-  downgrade when a negator sits in a tight window before the term ("do not retry", "never re-run",
-  "avoid retrying", …). This deliberately protects the false positive that matters: a genuinely correct
-  "tell the agent NOT to retry" finding must survive. The window is kept tight, biasing toward NOT firing.
+  `retry` / `backoff` / `re-run` / `run again` / `try again` / `requeue`; the guard is CLAUSE-SCOPED and
+  bidirectional — the combined text is split on sentence/segment boundaries (`.!?`, newline, `;`), and a
+  rec is retry-shaped only if at least one clause carries a retry term AND no negator. A negator sharing a
+  clause with the retry term suppresses that clause, on EITHER side of the term and at any distance, so both
+  a pre-posed "do not retry" and a post-posed "retrying will not help" are preserved. This deliberately
+  protects the false positive that matters: a genuinely correct "tell the agent NOT to retry" finding must
+  survive. Biased toward NOT firing: any negator in the retry term's clause suppresses it. (An earlier
+  directional-window design — negator within ~20 chars before the term — was superseded during
+  implementation because it buried post-posed negations; the shipped guard is clause-scoped.)
 - **The fallback (non-model) review path is unaffected** — it emits only `install_worker_tool` recs,
   never retry-shaped ones, so the calibration is a no-op there.
 - **Out of scope (recorded as such):** no model-based verifier / second Anthropic call was added; the
