@@ -238,7 +238,7 @@ model); this section is the map. User-facing usage is
   below. Builtins are seeded/repaired by the same reconciler pattern as agent
   templates (editable, resettable, never deletable), Go-embedded from
   `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
-  builtins convention above) — `ci-cd-norms` and `prd-lifecycle`.
+  builtins convention above) — `prd-lifecycle`.
 - **Default allocations** (PRD #72 M2). A builtin with no allocation row
   reaches *nobody* — not its scoped subagents and not the lead either, since
   the union `ListRunSkillAllocations` builds is what the lead receives. So
@@ -249,10 +249,8 @@ model); this section is the map. User-facing usage is
   inserts the skill — `ReconcileBuiltinTemplates`' `n > 0` rule, for its
   reason: a default an admin later removes stays removed. The targets are
   agent-template *names*, so the template reconciler must run first (see
-  [Startup](#startup-and-migrations)), a zero-row seed warns rather than
-  failing silently, and `ci-cd-norms` — whose row predates the mechanism
-  on every live instance, so its insert can never return a row again — is
-  backfilled by a one-off migration instead.
+  [Startup](#startup-and-migrations)), and a zero-row seed warns rather than
+  failing silently.
 - **Read authz is deliberately not the agent-templates pattern.** Templates
   are all-shared; skills are not. Every read (`GET /api/skills*`) returns
   builtin ∪ global ∪ the caller's own user skills; admins additionally see

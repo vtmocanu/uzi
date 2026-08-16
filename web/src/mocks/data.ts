@@ -58,7 +58,7 @@ export const minsAhead = (m: number) => new Date(NOW + m * 60_000).toISOString()
 export const mockAdmin: User = {
   id: "u-admin",
   email: "vlad@uzi.local",
-  display_name: "Vlad",
+  display_name: "Robin Diaz",
   is_admin: true,
   is_active: true,
   autopilot_enabled: false,
@@ -76,7 +76,7 @@ export const mockUsers: User[] = [
   {
     id: "u-mira",
     email: "mira@uzi.local",
-    display_name: "Mira Ionescu",
+    display_name: "Alex Rivera",
     is_admin: false,
     is_active: true,
     autopilot_enabled: true,
@@ -95,7 +95,7 @@ export const mockUsers: User[] = [
   {
     id: "u-andrei",
     email: "andrei@uzi.local",
-    display_name: "Andrei Pop",
+    display_name: "Sam Chen",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -127,7 +127,7 @@ export const mockUsers: User[] = [
   {
     id: "u-radu",
     email: "radu@uzi.local",
-    display_name: "Radu Marin",
+    display_name: "Jordan Kim",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -142,7 +142,7 @@ export const mockUsers: User[] = [
   {
     id: "u-mihai",
     email: "mihai@uzi.local",
-    display_name: "Mihai Radu",
+    display_name: "Priya Nair",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -398,7 +398,7 @@ export const mockNotifications: MockNotification[] = [
     read_at: null,
     created_at: minsAgo(120),
     owner_email: "mira@uzi.local",
-    owner_display_name: "Mira Ionescu",
+    owner_display_name: "Alex Rivera",
   },
 ];
 
@@ -1060,7 +1060,7 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
     health: "ok",
     health_reason: null,
     health_since: null,
-    owner_name: "Vlad",
+    owner_name: "Robin Diaz",
     worker_name: null,
     is_mine: true,
     run_count: 1,
@@ -2006,22 +2006,22 @@ export const mockTemplateDriftCases: Record<string, string> = {
 // seed body as its reset target.
 export const mockSkills: Skill[] = [
   {
-    id: "skill-mm-cicd",
-    name: "ci-cd-norms",
+    id: "skill-prd-lifecycle",
+    name: "prd-lifecycle",
     description:
-      "How CI/CD works at example: myorg/pipelines includes, Harbor registry, ArgoCD GitOps, and how to spot an exception repo.",
+      "The end-of-run PRD checklist: tick only what the branch's evidence supports, and move the file to prds/done/ when every item is complete.",
     body: [
-      "# ci-cd-norms",
+      "# prd-lifecycle",
       "",
-      "The default norm: a thin `.gitlab-ci.yml` that includes a bundle from the",
-      "private `myorg/pipelines` project (lint → build → audit → push → cleanup).",
-      "Images and OCI charts go to Harbor (`harbor.example.com`). **CI never",
-      "deploys** — the ArgoCD app-of-apps in `myorg/k8s/argo-apps` does.",
+      "At the end of an issue run, scan every unchecked item in the issue's",
+      "linked `prds/*.md` file and tick only the ones direct evidence supports.",
+      "Move the file to `prds/done/` when (and only when) every item is",
+      "complete; a partly-done PRD keeps its ticks and stays where it is.",
       "",
-      "## Spotting an exception",
+      "## Reviewer half",
       "",
-      "No `include:` of `myorg/pipelines` means the repo is an exception. Follow its",
-      "local convention; never \"normalize\" it unasked.",
+      "Check the PRD diff against what the branch actually changed, and send",
+      "back an unsupported completion claim.",
     ].join("\n"),
     scope: "builtin",
     user_id: null,
@@ -2053,13 +2053,13 @@ export const mockSkills: Skill[] = [
     updated_at: daysAgo(1),
   },
   {
-    // Owned by another user (Mira). The admin session sees it in the "Other
+    // Owned by another user (Alex). The admin session sees it in the "Other
     // users" group (view-only — admins can read but not edit others' private
-    // skills); signed in as Mira it is her "Mine".
-    id: "skill-mira-runbook",
-    name: "mira-deploy-runbook",
-    description: "Mira's personal runbook for the staging deploy dance.",
-    body: "# mira-deploy-runbook\n\nThe order I run the staging promotion steps in…",
+    // skills); signed in as Alex it is their "Mine".
+    id: "skill-alex-runbook",
+    name: "alex-deploy-runbook",
+    description: "Alex's personal runbook for the staging deploy dance.",
+    body: "# alex-deploy-runbook\n\nThe order I run the staging promotion steps in…",
     scope: "user",
     user_id: "u-mira",
     updated_by: "mira@uzi.local",
@@ -2068,10 +2068,10 @@ export const mockSkills: Skill[] = [
   },
 ];
 
-// Seed allocation: the builtin ci-cd-norms is shared onto the coder template
+// Seed allocation: the builtin prd-lifecycle is shared onto the coder template
 // so the allocation panel shows a populated union out of the box.
 export const mockAllocations: Record<string, { shared: string[]; mine: string[] }> = {
-  "t-coder": { shared: ["skill-mm-cicd"], mine: [] },
+  "t-coder": { shared: ["skill-prd-lifecycle"], mine: [] },
 };
 
 // ── Runs ─────────────────────────────────────────────────────────────────────

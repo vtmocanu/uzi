@@ -55,7 +55,7 @@ const refresh = vi.fn();
 const baseUser: User = {
   id: "u1",
   email: "vlad@uzi.local",
-  display_name: "Vlad",
+  display_name: "Robin Diaz",
   is_admin: true,
   is_active: true,
   autopilot_enabled: false,

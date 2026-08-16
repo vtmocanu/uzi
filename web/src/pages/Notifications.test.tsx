@@ -116,7 +116,7 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     mockApi.listNotifications
       .mockResolvedValueOnce({ notifications: [], unread: 0, total: 0 }) // initial own view
       .mockResolvedValueOnce({
-        notifications: [aNotif({ owner: { id: "u-mira", email: "mira@uzi.local", display_name: "Mira Ionescu" } })],
+        notifications: [aNotif({ owner: { id: "u-mira", email: "mira@uzi.local", display_name: "Alex Rivera" } })],
         unread: 0,
         total: 1,
       });
@@ -130,7 +130,7 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     await waitFor(() => expect(screen.getByText("All users")).toBeTruthy());
     fireEvent.click(screen.getByText("All users"));
 
-    await waitFor(() => expect(screen.getByText("Mira Ionescu")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Alex Rivera")).toBeTruthy());
     expect(mockApi.listNotifications).toHaveBeenLastCalledWith({ all: true, limit: 30, offset: 0 });
     // Another user's row offers no mark-read control (own-row only).
     expect(screen.queryByText("Mark read")).toBeNull();

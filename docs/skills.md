@@ -20,7 +20,7 @@ and drops the rest):
 1. **Your own skills** ("Mine"): private playbooks only you can see or
    allocate.
 2. **Global**: admin-authored, visible to everyone.
-3. **Builtin**: shipped with uzi (`ci-cd-norms` and `prd-lifecycle`, below).
+3. **Builtin**: shipped with uzi (`prd-lifecycle`, below).
 4. **Repo skills**: opt-in per repo, lowest precedence (see below).
 
 ## Create or edit a skill
@@ -66,7 +66,7 @@ for what each repo subagent receives.
 ## Name shadowing
 
 If your overlay allocates a skill with the same name as one already shadowed
-by precedence, say a personal `ci-cd-norms` next to the builtin one, the
+by precedence, say a personal `prd-lifecycle` next to the builtin one, the
 higher-precedence skill's **body** replaces the lower one's for every run of
 yours, not just this template. The lower-precedence skill is dropped from
 your run entirely: only one body per name ever loads. This is intended
@@ -135,16 +135,6 @@ worker-held credential still block the action regardless of what the file
 says, and the resulting merge request still faces the same human review as
 any other run's. Enable this only for a repo you would already trust with
 **Repo skills** — the two capabilities require the same judgment call.
-
-## The `ci-cd-norms` builtin
-
-Ships with uzi: the example CI/CD norm (`myorg/pipelines` includes, Harbor,
-ArgoCD GitOps via `argo-apps`), how to recognize a repo that
-deviates from it, and example-app as the worked exception. Allocated to `coder`
-and `reviewer` by default, so agents extend a pipeline the example way
-instead of fighting it. Like any builtin, an admin can edit it in place,
-reset it to the shipped version, or drop the allocation if your repos do not
-follow that norm.
 
 ## The `prd-lifecycle` builtin
 

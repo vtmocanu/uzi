@@ -35,7 +35,7 @@ function aUser(over: Partial<User> = {}): User {
   return {
     id: "u2",
     email: "mira@uzi.local",
-    display_name: "Mira Ionescu",
+    display_name: "Alex Rivera",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,

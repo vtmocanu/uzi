@@ -95,7 +95,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 				PromptBody:  "you code",
 				Tools:       []string{"Read", "Edit"},
 				Model:       strptr("opus"),
-				Skills:      []string{"ci-cd-norms", "team-kb"},
+				Skills:      []string{"team-runbook", "team-kb"},
 			},
 			{
 				Name:        "reviewer",
@@ -107,11 +107,11 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			},
 		},
 		Skills: []ClaimSkill{
-			{Name: "ci-cd-norms", Description: "how CI/CD works at example.", Body: "# example CI/CD\n"},
+			{Name: "team-runbook", Description: "the team runbook.", Body: "# Team Runbook\n"},
 			{Name: "team-kb", Description: "the team knowledge base.", Body: "# Team KB\n"},
 		},
 		SkillsDropped: []ClaimSkillDrop{
-			{Name: "ci-cd-norms", Reason: DropShadowed},
+			{Name: "team-runbook", Reason: DropShadowed},
 		},
 		Config: ClaimConfig{
 			RunTimeoutSeconds:  7200,

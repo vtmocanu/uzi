@@ -46,17 +46,6 @@ func TestBuiltinNamesUnique(t *testing.T) {
 	}
 }
 
-// TestexampleCicdBuiltinPresent pins that the first builtin skill ships.
-func TestexampleCicdBuiltinPresent(t *testing.T) {
-	d, ok := BuiltinByName("ci-cd-norms")
-	if !ok {
-		t.Fatal("ci-cd-norms builtin not found")
-	}
-	if !strings.Contains(d.Body, "argo-apps") {
-		t.Error("ci-cd-norms body missing expected content")
-	}
-}
-
 func TestParseRejectsMalformed(t *testing.T) {
 	cases := map[string]string{
 		"no frontmatter":    "# just a body\n",

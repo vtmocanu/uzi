@@ -531,7 +531,7 @@ function SkillEditor({
                 <Input
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="ci-cd-norms"
+                  placeholder="team-runbook"
                   autoCapitalize="off"
                   autoCorrect="off"
                   spellCheck={false}

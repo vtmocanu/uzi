@@ -48,7 +48,7 @@
       ],
       "model": "opus",
       "skills": [
-        "ci-cd-norms",
+        "team-runbook",
         "team-kb"
       ]
     },
@@ -83,9 +83,9 @@
   },
   "skills": [
     {
-      "name": "ci-cd-norms",
-      "description": "how CI/CD works at example.",
-      "body": "# example CI/CD\n"
+      "name": "team-runbook",
+      "description": "the team runbook.",
+      "body": "# Team Runbook\n"
     },
     {
       "name": "team-kb",
@@ -95,7 +95,7 @@
   ],
   "skills_dropped": [
     {
-      "name": "ci-cd-norms",
+      "name": "team-runbook",
       "reason": "shadowed"
     }
   ]

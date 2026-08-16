@@ -25,11 +25,6 @@ import "fmt"
 // (Decision 9) — the second is what covers a template an ADMIN deleted, which no
 // test can see.
 var defaultAllocations = map[string][]string{
-	// The CI/CD playbook is for the roles that write and review pipeline changes.
-	// Backfilled onto existing instances by migration 00084, because the
-	// reconciler seeds only on FIRST insert and this row already exists
-	// everywhere — keep the two in sync by hand; SQL cannot read this map.
-	"ci-cd-norms": {"coder", "reviewer"},
 	// PRD #72 M3. `lead` is the semantic owner (it holds the PRD file and calls
 	// signal_done) and is guaranteed to exist under either agent source, since the
 	// lead always comes from the claim payload. But allocating to `lead` is NOT

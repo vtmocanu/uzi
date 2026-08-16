@@ -33,12 +33,12 @@ const caps = resolveSkillCaps(null); // defaults 65536 / 32
 
 describe("prepareSkillPlugin (shared SDK + stub path)", () => {
   it("materializes delivered skills and reports no repo survivors when opt-in is off", async () => {
-    const delivered: ClaimSkill[] = [{ name: "ci-cd-norms", description: "cicd.", body: "# CICD\n" }];
+    const delivered: ClaimSkill[] = [{ name: "team-runbook", description: "cicd.", body: "# CICD\n" }];
     writeRepoSkill("ignored", "repo-skill", "repo.", "body"); // present but flag off
     const out = await prepareSkillPlugin({ skills: delivered, repoSkillsEnabled: false, worktreePath: worktree }, caps);
-    assert.deepEqual(out.runSkills.map((s) => s.name), ["ci-cd-norms"]);
+    assert.deepEqual(out.runSkills.map((s) => s.name), ["team-runbook"]);
     assert.deepEqual(out.repoSurvivorNames, []);
-    assert.deepEqual(loadedNames(), ["ci-cd-norms"], "only the delivered skill is on disk");
+    assert.deepEqual(loadedNames(), ["team-runbook"], "only the delivered skill is on disk");
     assert.equal(out.pluginPath, skillsPluginDir(worktree));
   });
 

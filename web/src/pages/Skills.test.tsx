@@ -54,7 +54,7 @@ function skill(over: Partial<Skill> & Pick<Skill, "id" | "name" | "scope">): Ski
 }
 
 const SKILLS: Skill[] = [
-  skill({ id: "s-builtin", name: "ci-cd-norms", scope: "builtin" }),
+  skill({ id: "s-builtin", name: "prd-lifecycle", scope: "builtin" }),
   skill({ id: "s-global", name: "argocd-debugging", scope: "global" }),
   skill({ id: "s-mine", name: "qdrant-kb", scope: "user", user_id: "u-mira" }),
 ];
@@ -112,8 +112,8 @@ describe("Skills page — authz-conditional rendering", () => {
   it("admin: builtin rows show Edit + Reset and never Delete", async () => {
     setAuth(ADMIN);
     renderPage();
-    await screen.findByText("ci-cd-norms");
-    const row = within(rowFor("ci-cd-norms"));
+    await screen.findByText("prd-lifecycle");
+    const row = within(rowFor("prd-lifecycle"));
     expect(row.getByRole("button", { name: "Edit" })).toBeTruthy();
     expect(row.getByRole("button", { name: "Reset" })).toBeTruthy();
     expect(row.queryByRole("button", { name: "Delete" })).toBeNull();
@@ -132,8 +132,8 @@ describe("Skills page — authz-conditional rendering", () => {
   it("non-admin: builtin and global rows are view-only", async () => {
     setAuth(MEMBER);
     renderPage();
-    await screen.findByText("ci-cd-norms");
-    const builtin = within(rowFor("ci-cd-norms"));
+    await screen.findByText("prd-lifecycle");
+    const builtin = within(rowFor("prd-lifecycle"));
     expect(builtin.getByRole("button", { name: "View" })).toBeTruthy();
     expect(builtin.queryByRole("button", { name: "Edit" })).toBeNull();
     expect(builtin.queryByRole("button", { name: "Reset" })).toBeNull();
@@ -159,7 +159,7 @@ describe("Skills page — create scope gating", () => {
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /New skill/ }));
     // Create form: name is an editable input, scope is a select with Global.
-    expect(screen.getByPlaceholderText("ci-cd-norms")).toBeTruthy();
+    expect(screen.getByPlaceholderText("team-runbook")).toBeTruthy();
     const scope = screen.getByLabelText("Scope") as HTMLSelectElement;
     expect(within(scope).getByRole("option", { name: /Global/ })).toBeTruthy();
   });
@@ -168,7 +168,7 @@ describe("Skills page — create scope gating", () => {
     setAuth(MEMBER);
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /New skill/ }));
-    expect(screen.getByPlaceholderText("ci-cd-norms")).toBeTruthy();
+    expect(screen.getByPlaceholderText("team-runbook")).toBeTruthy();
     expect(screen.queryByLabelText("Scope")).toBeNull();
     expect(screen.getByText(/only your runs will see this skill/i)).toBeTruthy();
   });
@@ -178,7 +178,7 @@ describe("Skills page — create scope gating", () => {
     mockApi.createSkill.mockResolvedValue({ skill: skill({ id: "s-new", name: "my-skill", scope: "user" }) });
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /New skill/ }));
-    fireEvent.change(screen.getByPlaceholderText("ci-cd-norms"), { target: { value: "my-skill" } });
+    fireEvent.change(screen.getByPlaceholderText("team-runbook"), { target: { value: "my-skill" } });
     fireEvent.change(screen.getByPlaceholderText(/When and why/), {
       target: { value: "A one-line description." },
     });
@@ -205,7 +205,7 @@ describe("Skills page — name-locked edit", () => {
     fireEvent.click(within(rowFor("argocd-debugging")).getByRole("button", { name: "Edit" }));
     // Heading names the skill; the create-only name input is gone.
     expect(screen.getByText("Edit argocd-debugging")).toBeTruthy();
-    expect(screen.queryByPlaceholderText("ci-cd-norms")).toBeNull();
+    expect(screen.queryByPlaceholderText("team-runbook")).toBeNull();
   });
 
   it("updateSkill is called without a name field", async () => {
@@ -237,13 +237,13 @@ describe("Skills page — Other users view badge", () => {
 describe("Skills page — builtin reset confirm", () => {
   it("confirms before resetting a builtin", async () => {
     setAuth(ADMIN);
-    mockApi.resetSkill.mockResolvedValue({ skill: skill({ id: "s-builtin", name: "ci-cd-norms", scope: "builtin" }) });
+    mockApi.resetSkill.mockResolvedValue({ skill: skill({ id: "s-builtin", name: "prd-lifecycle", scope: "builtin" }) });
     renderPage();
-    await screen.findByText("ci-cd-norms");
-    fireEvent.click(within(rowFor("ci-cd-norms")).getByRole("button", { name: "Reset" }));
+    await screen.findByText("prd-lifecycle");
+    fireEvent.click(within(rowFor("prd-lifecycle")).getByRole("button", { name: "Reset" }));
     // A confirm step appears before the call fires.
     expect(mockApi.resetSkill).not.toHaveBeenCalled();
-    fireEvent.click(within(rowFor("ci-cd-norms")).getByRole("button", { name: "Confirm" }));
+    fireEvent.click(within(rowFor("prd-lifecycle")).getByRole("button", { name: "Confirm" }));
     await waitFor(() => expect(mockApi.resetSkill).toHaveBeenCalledWith("s-builtin"));
   });
 });

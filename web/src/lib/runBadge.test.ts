@@ -37,7 +37,7 @@ function run(over: Partial<LatestRun> = {}): LatestRun {
     health: "ok",
     health_reason: null,
     health_since: null,
-    owner_name: "Vlad",
+    owner_name: "Robin Diaz",
     worker_name: null,
     is_mine: true,
     run_count: 1,

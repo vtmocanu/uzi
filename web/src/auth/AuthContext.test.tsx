@@ -17,7 +17,7 @@ const mockApi = vi.mocked(api);
 const user = {
   id: "u1",
   email: "vlad@uzi.local",
-  display_name: "Vlad",
+  display_name: "Robin Diaz",
   is_admin: true,
 } as unknown as SessionResponse["user"];
 
