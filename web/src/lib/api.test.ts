@@ -81,3 +81,36 @@ describe("getJudgeBacklog builds the ?category= query string (PRD #235)", () => 
     expect(url).not.toContain("category");
   });
 });
+
+// Issue #331: a passive listRuns (the hidden-tab favicon poll) tags its request with
+// X-Uzi-Passive: 1 so the server authenticates it but skips the rolling refresh; a
+// normal board/dashboard listRuns must NOT carry the header.
+describe("listRuns passive-poll header (#331)", () => {
+  const emptyRuns = { runs: [] };
+
+  it("sends X-Uzi-Passive: 1 when called with { passive: true }", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, emptyRuns),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.listRuns({ passive: true });
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers["X-Uzi-Passive"]).toBe("1");
+  });
+
+  it("does not send X-Uzi-Passive on a normal listRuns", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, emptyRuns),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.listRuns();
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers["X-Uzi-Passive"]).toBeUndefined();
+  });
+});

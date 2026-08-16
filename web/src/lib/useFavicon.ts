@@ -27,7 +27,10 @@ import { onNotificationsChanged } from "./notifications";
 // the visibilitychange catch-up re-polls the instant the user returns, closing any
 // gap the throttle opened. The cadence is deliberately gentler than the foreground
 // Board/Dashboard polls (~10s): this is an always-on, tab-wide background poll, so a
-// ~20s beat keeps it cheap while staying live enough for a status dot.
+// ~20s beat keeps it cheap while staying live enough for a status dot. The poll is
+// marked passive (X-Uzi-Passive) so the server does NOT slide the session forward on
+// it (#331), letting an idle backgrounded tab still reach idle expiry while the
+// favicon stays live.
 const POLL_MS = 20_000;
 
 export function useFavicon({ unread, enabled }: { unread: number; enabled: boolean }): void {
@@ -87,7 +90,7 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
     let alive = true;
     const poll = () => {
       api
-        .listRuns()
+        .listRuns({ passive: true })
         .then(({ runs: latest }) => {
           if (!alive) return;
           // Seed the failed baseline on the first successful poll only.

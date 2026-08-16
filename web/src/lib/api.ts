@@ -2216,6 +2216,7 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
+  extraHeaders?: Record<string, string>,
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
@@ -2225,6 +2226,9 @@ async function request<T>(
     const csrf = readCookie("uzi_csrf");
     if (csrf) headers["X-CSRF-Token"] = csrf;
   }
+  // Append-only extra headers (e.g. the passive-poll marker, #331). Merged last so a
+  // caller can override, but callers pass only additive keys, not Content-Type/CSRF.
+  if (extraHeaders) Object.assign(headers, extraHeaders);
 
   const res = await fetch(`/api${path}`, {
     method,
@@ -2698,14 +2702,22 @@ const realApi = {
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
-  listRuns: (params?: { repoId?: string; issueIid?: number }) => {
+  listRuns: (params?: {
+    repoId?: string;
+    issueIid?: number;
+    passive?: boolean;
+  }) => {
     const q = new URLSearchParams();
     if (params?.repoId) q.set("repo_id", params.repoId);
     if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
     const qs = q.toString();
+    // A passive poll (the hidden-tab favicon poll, #331) carries X-Uzi-Passive so
+    // the server authenticates it but does NOT slide the session forward on it.
     return request<{ runs: RunListItem[] }>(
       "GET",
       qs ? `/runs?${qs}` : "/runs",
+      undefined,
+      params?.passive ? { "X-Uzi-Passive": "1" } : undefined,
     );
   },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),

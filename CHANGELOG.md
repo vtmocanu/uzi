@@ -38,6 +38,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **An idle backgrounded tab no longer keeps its session alive forever via the
+  favicon poll (#331).** The tab-icon poll (`useFavicon`) fetches `listRuns`
+  every ~20s even while hidden, and `RequireAuth`'s rolling refresh re-minted the
+  session on every authed request past half its TTL — so a backgrounded idle tab
+  slid its own expiry forward indefinitely and never reached `AUTH_TOKEN_TTL`
+  idle expiry. The favicon poll now marks its request passive (`X-Uzi-Passive:
+  1`), and the middleware skips ONLY the rolling-refresh side-effect for passive
+  requests; auth validation and CSRF are unchanged. Suppressing refresh can only
+  make a session expire sooner, never later, so the client-sent marker is safe.
+  (#331)
+
 - **`e2e/run-store-it.sh` no longer masquerades a Postgres-readiness timeout as
   a passing/skipped test run (#171).** The throwaway-Postgres wait was a
   hard-coded 30s; on a daemon busy with mutation containers it timed out and the
