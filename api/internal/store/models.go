@@ -131,6 +131,21 @@ type CliToken struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+type FindingDisposition struct {
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	RepoID        uuid.UUID          `json:"repo_id"`
+	Location      string             `json:"location"`
+	Status        string             `json:"status"`
+	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
+	FilingSince   pgtype.Timestamptz `json:"filing_since"`
+	DismissReason pgtype.Text        `json:"dismiss_reason"`
+	ContentHash   string             `json:"content_hash"`
+	LastTitle     string             `json:"last_title"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ResolvedAt    pgtype.Timestamptz `json:"resolved_at"`
+}
+
 type ForgeConnection struct {
 	ID                 uuid.UUID          `json:"id"`
 	UserID             uuid.UUID          `json:"user_id"`
@@ -152,6 +167,19 @@ type HostedWorkerToken struct {
 	TokenCiphertext []byte             `json:"token_ciphertext"`
 	DeliveredAt     pgtype.Timestamptz `json:"delivered_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type IncidentalFinding struct {
+	ID            uuid.UUID          `json:"id"`
+	RunID         uuid.UUID          `json:"run_id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	RepoID        uuid.UUID          `json:"repo_id"`
+	Location      string             `json:"location"`
+	Title         string             `json:"title"`
+	DescriptionMd string             `json:"description_md"`
+	Labels        []byte             `json:"labels"`
+	Confidence    string             `json:"confidence"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 type Issue struct {
