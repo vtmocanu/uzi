@@ -5623,21 +5623,35 @@ apiget /api/workers | jq -e '[.workers[] | select(.status == "online")] | length
 # subshell and be captured instead of printed — see claim_token above).
 hb() { curl -fsS -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $WTOK" \
   -H 'Content-Type: application/json' -d '{}' >/dev/null || fail "auto-stop phase: heartbeat POST failed"; }
-# asw_claim — bounded-retry the 204 (the create->claimable FOR UPDATE SKIP LOCKED
-# window is a real race), echo the claimed run id, mirroring claim_token's retry idiom.
+# asw_claim — bounded-retry the claim, echo the claimed run id. TWO independent causes
+# make a claim transiently 204 here, so the window must outlast BOTH:
+#   1. the create->claimable FOR UPDATE SKIP LOCKED window (a real race), and
+#   2. PRD #216 fleet-aware spread. The agent container was `compose stop`ped by the
+#      PRD #104 phase, but its worker ROW stays a LIVE spread peer until its last
+#      heartbeat ages past WORKER_HEARTBEAT_STALE (E2E_WORKER_HEARTBEAT_STALE=15s here).
+#      The spread defers a run to a strictly-less-loaded live peer, so our FIRST claim
+#      (at 0 active runs, never deferred) succeeds immediately, but our SECOND claim is
+#      DEFERRED to that stopped-but-still-"live" agent worker — which never claims it —
+#      and 204s until the peer finally goes stale. So we poll past the 15s stale window
+#      (a stopped worker is GUARANTEED to age out; this is waiting on a deterministic
+#      expiry, not a flaky race) AND heartbeat our OWN worker each idle iteration so it
+#      does not itself go stale while we wait. 30s gives comfortable margin over 15s.
 asw_claim() {
-  local raw code body
-  for _ in 1 2 3 4 5 6; do
+  local raw code body tries=0
+  while [ "$tries" -lt 30 ]; do
+    tries=$((tries + 1))
     raw="$(curl -sS -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" \
       -H "Authorization: Bearer $WTOK")"
     code="${raw##*$'\n'}"; body="${raw%$'\n'*}"
     case "$code" in
       200) printf '%s' "$body" | jq -r '.run_id'; return 0 ;;
-      204) sleep 1; continue ;;
+      204) curl -fsS -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $WTOK" \
+             -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+           sleep 1; continue ;;
       *) echo "auto-stop claim returned HTTP $code, not 200" >&2; return 1 ;;
     esac
   done
-  echo "auto-stop claim still 204 after 6 tries — no run became claimable by the synthetic worker" >&2
+  echo "auto-stop claim still 204 after 30 tries — no run became claimable (did the stopped agent worker never age past the 15s spread-liveness window?)" >&2
   return 1
 }
 # asw_running — drive a claimed run to running (allowed with no plan gate). The field
