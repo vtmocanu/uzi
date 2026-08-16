@@ -20934,11 +20934,20 @@ where amber was intended and survived several reviews. `web/scripts/check-styles
   So it tracks `tailwind.config.js` exactly — a new color token becomes "known" with no
   edit here — and built-ins (`text-xs`, `border-2`, `bg-cover`) never false-flag because
   the engine generates them.
-- **Candidates come from the TypeScript AST, never a text regex.** Tokens are extracted
-  only from JSX `className` attribute values and `cx(...)` call arguments (`cx` is the
-  repo's sole class helper). This is load-bearing: `Board.tsx` carries a comment that
-  literally contains `bg-bg` while explaining this bug, and a text regex would flag the
-  comment. `${…}`-adjacent template fragments are dropped as dynamic.
+- **Candidates in TS/TSX come from the TypeScript AST, not a text scan of the source.**
+  Tokens are extracted only from JSX `className` attribute values and `cx(...)` call
+  arguments (`cx` is the repo's sole class helper). This is load-bearing: `Board.tsx`
+  carries a comment that literally contains `bg-bg` while explaining this bug, and a text
+  regex over source would flag the comment. `${…}`-adjacent template fragments are dropped
+  as dynamic. (`index.html` — the static app shell with no JSX — is the one exception: its
+  classes are read from `class=`/`className=` attributes by regex, with HTML comments
+  blanked first so prose there is skipped the same way.)
+- **Known scope bounds (deliberate, not defects).** Only color-consuming prefixes are
+  flagged; a mistyped non-color stem is out of scope. A class hidden behind an *arbitrary*
+  variant (`[&:hover]:bg-foo`, `supports-[…]:bg-foo`) keeps a non-word prefix that the
+  bare-word variant strip does not remove, so it is not prefix-matched; and a class string
+  held in a `const` outside a `className`/`cx()` subtree is not scanned. All widen with the
+  same machinery if a future need appears.
 - **Scoped to color-consuming prefixes for a false-positive-free first landing.** Only
   `text-/bg-/border-/ring-/…` (see `COLOR_PREFIXES`) are flagged — matching issue #170's
   stated scope. Because membership already uses the engine, widening to every utility
