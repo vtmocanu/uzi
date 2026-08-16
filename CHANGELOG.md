@@ -29,6 +29,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   it up on the next boot. (#314)
 ### Fixed
 
+- **`e2e/run-store-it.sh` no longer masquerades a Postgres-readiness timeout as
+  a passing/skipped test run (#171).** The throwaway-Postgres wait was a
+  hard-coded 30s; on a daemon busy with mutation containers it timed out and the
+  run ended with no package times and a `RUN=0 PASS=0 FAIL=0` log —
+  indistinguishable from the false-green `.claude/rules/go.md` documents. The
+  wait is now 120s and env-overridable (`UZI_STORE_IT_PG_WAIT_SECS`), and a
+  readiness timeout prints a loud `INFRASTRUCTURE FAILURE … NO TESTS RAN` banner
+  on stderr (non-zero exit) that cannot be read as a test result. Documented as
+  a distinct cause of the double-zero signature in `.claude/rules/go.md`. (#171)
+
 - **A completed run with an opened MR is no longer recorded as a total loss
   (#329).** The run-timeout sweeper and the worker's completion report could
   race: when the sweeper's `RUN_TIMEOUT` write landed first, it clobbered the
