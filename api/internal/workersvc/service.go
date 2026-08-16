@@ -321,6 +321,10 @@ type Store interface {
 	// Judge review triage (PRD #94 M1): the coordinate-keyed disposition upsert/undo,
 	// the per-review list, and the global flat join feeding the Go bucketer.
 	UpsertRecommendationDisposition(ctx context.Context, arg store.UpsertRecommendationDispositionParams) (store.RecommendationDisposition, error)
+	// SystemDismissDeniedCLIRecommendation is the deterministic net (issue #167): a
+	// non-clobbering (ON CONFLICT DO NOTHING) system auto-dismissal of a denylisted-CLI
+	// recommendation, stamped set_via='denied_cli'. Distinct from the human upsert above.
+	SystemDismissDeniedCLIRecommendation(ctx context.Context, arg store.SystemDismissDeniedCLIRecommendationParams) (int64, error)
 	DeleteRecommendationDisposition(ctx context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error)
 	ListDispositionsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.RecommendationDisposition, error)
 	ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error)

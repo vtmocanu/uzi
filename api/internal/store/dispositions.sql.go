@@ -124,6 +124,40 @@ func (q *Queries) ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UU
 	return items, nil
 }
 
+const systemDismissDeniedCLIRecommendation = `-- name: SystemDismissDeniedCLIRecommendation :execrows
+INSERT INTO recommendation_dispositions
+    (review_id, category, target, status, dismiss_reason, rationale_hash, set_via, set_by_user_id)
+VALUES
+    ($1, $2, $3, 'dismissed', 'wont_do', $4, 'denied_cli', NULL)
+ON CONFLICT (review_id, category, target) DO NOTHING
+`
+
+type SystemDismissDeniedCLIRecommendationParams struct {
+	ReviewID      uuid.UUID `json:"review_id"`
+	Category      string    `json:"category"`
+	Target        string    `json:"target"`
+	RationaleHash string    `json:"rationale_hash"`
+}
+
+// The deterministic net (issue #167): auto-dismiss a recommendation whose target names a
+// denylisted credential-bearing CLI. status/dismiss_reason/set_via/set_by_user_id are
+// SERVER-SIDE LITERALS (never from a request body — same principle as the issue_close sync).
+// set_via='denied_cli' is the self-measuring provenance. ON CONFLICT DO NOTHING so a human's
+// existing verdict on the coordinate is NEVER overwritten. rationale_hash is stamped so the
+// stale flag stays honest, matching UpsertRecommendationDisposition.
+func (q *Queries) SystemDismissDeniedCLIRecommendation(ctx context.Context, arg SystemDismissDeniedCLIRecommendationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, systemDismissDeniedCLIRecommendation,
+		arg.ReviewID,
+		arg.Category,
+		arg.Target,
+		arg.RationaleHash,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertRecommendationDisposition = `-- name: UpsertRecommendationDisposition :one
 
 INSERT INTO recommendation_dispositions

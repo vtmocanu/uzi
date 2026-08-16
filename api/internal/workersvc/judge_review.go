@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 
@@ -106,5 +107,46 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 	if err != nil {
 		return ReviewResult{}, err
 	}
+	s.autoDismissDeniedCLIRecommendations(ctx, reviewID, recs)
 	return ReviewResult{OwnerID: target.UserID, ReviewID: reviewID}, nil
+}
+
+// autoDismissDeniedCLIRecommendations is the deterministic net behind the prompt-side fix
+// (issue #167, backstop for MR !136). At the PostReview hook — AFTER the review + its
+// recommendations are durably persisted — it auto-dismisses any recommendation whose
+// target names a denylisted, credential-bearing CLI (glab/gh/aws/az/…), stamping the
+// distinct, self-measuring provenance set_via='denied_cli' (dismiss_reason='wont_do',
+// set_by_user_id NULL).
+//
+// CATEGORY SCOPE. Only 'enable_tool' and 'install_worker_tool' are in scope: those are the
+// categories whose target IS a tool the rec proposes to add, which is precisely what can
+// never be actioned for a barred CLI. Other categories (e.g. improve_uzi "improve aws
+// integration") mention a denied name incidentally and must NOT be dismissed.
+//
+// BEST-EFFORT. A dispose failure logs and continues; it must NEVER fail the worker's review
+// submission. The review is the durable source of truth; this net is a layered surface, and
+// PostReview returns the same ReviewResult whether or not any dismissal landed.
+//
+// NON-CLOBBERING + THE ACCEPTED RESIDUAL. The store query is ON CONFLICT DO NOTHING, so a
+// surviving human verdict on the coordinate is never overwritten. An Undo deletes the
+// disposition row, so a later re-judge re-dismisses the coordinate — that re-dismissal is
+// accepted: it is visible (set_via='denied_cli') and reversible (Undo again).
+func (s *Service) autoDismissDeniedCLIRecommendations(ctx context.Context, reviewID uuid.UUID, recs []ReviewRecommendation) {
+	for _, rec := range recs {
+		if rec.Category != "enable_tool" && rec.Category != "install_worker_tool" {
+			continue
+		}
+		if !recommendsDeniedExecutable(rec.Target) {
+			continue
+		}
+		if _, err := s.q.SystemDismissDeniedCLIRecommendation(ctx, store.SystemDismissDeniedCLIRecommendationParams{
+			ReviewID:      reviewID,
+			Category:      rec.Category,
+			Target:        rec.Target,
+			RationaleHash: RationaleHash(rec.RationaleMd),
+		}); err != nil {
+			slog.Error("judge PostReview: auto-dismiss denied-CLI recommendation",
+				"review", reviewID.String(), "category", rec.Category, "target", rec.Target, "error", err)
+		}
+	}
 }

@@ -232,8 +232,15 @@ type fakeStore struct {
 	upsertedDisposition   *store.UpsertRecommendationDispositionParams
 	deletedDisposition    *store.DeleteRecommendationDispositionParams
 	dispositionDeleteRows int64
-	judgeTriageRows       []store.ListJudgeTriageRowsForUserRow
-	judgeTriageRowsErr    error
+	// PRD issue #167 deterministic net: systemDismissed captures every
+	// SystemDismissDeniedCLIRecommendation coordinate PostReview wrote; systemDismissRows
+	// is the rows-affected it returns (0 = ON CONFLICT DO NOTHING hit an existing row),
+	// systemDismissErr forces the best-effort error path.
+	systemDismissed    []store.SystemDismissDeniedCLIRecommendationParams
+	systemDismissRows  int64
+	systemDismissErr   error
+	judgeTriageRows    []store.ListJudgeTriageRowsForUserRow
+	judgeTriageRowsErr error
 	// judgeBacklogRows backs ListJudgeRecommendationRowsForUser (the PRD #98 M1 grouped
 	// read); backlogArg records the params it was called with. Both are consumed in
 	// judge_backlog_test.go, which also defines the fake's method.
@@ -754,6 +761,13 @@ func (f *fakeStore) UpsertRecommendationDisposition(_ context.Context, arg store
 		ID: uuid.New(), ReviewID: arg.ReviewID, Category: arg.Category, Target: arg.Target,
 		Status: arg.Status, DismissReason: arg.DismissReason, RationaleHash: arg.RationaleHash,
 	}, nil
+}
+func (f *fakeStore) SystemDismissDeniedCLIRecommendation(_ context.Context, arg store.SystemDismissDeniedCLIRecommendationParams) (int64, error) {
+	f.systemDismissed = append(f.systemDismissed, arg)
+	if f.systemDismissErr != nil {
+		return 0, f.systemDismissErr
+	}
+	return f.systemDismissRows, nil
 }
 func (f *fakeStore) DeleteRecommendationDisposition(_ context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error) {
 	f.deletedDisposition = &arg
