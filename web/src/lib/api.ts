@@ -1822,10 +1822,12 @@ export interface JudgeOccurrence {
   //
   // NOTE this NARROWS HARDER THAN THE WIRE GUARANTEES. Go ships `SetVia string`, so a future
   // server-side provenance value is a state this type calls impossible. It fails safe — an
-  // unrecognised value falls through to the plain "✓ Done" chip rather than mis-labelling —
-  // but the guarantee lives in Go's two SQL writers (the M6 literal and the human-write
-  // NULL), not in this declaration. Widen the union here when a third value is added there.
-  set_via?: "issue_close";
+  // unrecognised value falls through to the plain chip (a bare "✓ Done" or "Dismissed")
+  // rather than mis-labelling — but the guarantee lives in Go's SQL writers, not in this
+  // declaration. The third value is "denied_cli" (issue #167): a system auto-dismissal of a
+  // recommendation whose target names a credential-bearing CLI that policy permanently bars
+  // (glab, gh, aws, az, …). Widen the union here when a further value is added server-side.
+  set_via?: "issue_close" | "denied_cli";
   filed_issue?: JudgeFiledIssueRef;
 }
 

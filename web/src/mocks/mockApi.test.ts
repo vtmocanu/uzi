@@ -270,10 +270,11 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
 
     const anchored = await api.getJudgeBacklog("all", "run-closed");
     const coords = anchored.groups.map((g) => `${g.category}/${g.target}`).sort();
-    // run-closed's review carries poller, shellcheck, ripgrep — and nothing else survives.
+    // run-closed's review carries poller, shellcheck, ripgrep, glab — and nothing else survives.
     expect(coords).toEqual([
       "enable_tool/ripgrep",
       "improve_uzi/api/internal/poller",
+      "install_worker_tool/glab",
       "install_worker_tool/shellcheck",
     ]);
     // poller still shows ALL three of its occurrences (the recurrence is the whole point).
@@ -307,9 +308,10 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     expect(g.occurrences.map((o) => o.bucket).sort()).toEqual(["dismissed", "done"]);
 
     // Canonical counts moved: one left To triage, one joined Dismissed. (Baseline todo is 4,
-    // not 5, since B3's seeded auto-done — see the dedup test above.)
+    // not 5, since B3's seeded auto-done — see the dedup test above. Baseline dismissed is 3,
+    // not 2, since issue #167 seeded install_worker_tool/glab as a denied_cli auto-dismissal.)
     expect(res.triage.todo).toBe(3);
-    expect(res.triage.dismissed).toBe(3);
+    expect(res.triage.dismissed).toBe(4);
   });
 
   it("surfaces an issue-close auto-done distinctly, and a human override CLEARS the provenance", async () => {
@@ -370,6 +372,22 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     )!.occurrences[0];
     expect(after.bucket).toBe("done");
     expect(after.set_via).toBeUndefined();
+  });
+
+  // The BACKLOG path must carry the issue #167 denied_cli provenance through intact — it is
+  // what the Judge menu reads to render the auto-dismissal distinctly. run-closed seeds an
+  // install_worker_tool/glab disposition dismissed with set_via='denied_cli'; the occurrence
+  // must surface as bucket "dismissed" carrying that provenance, NOT a plain hand-dismissal.
+  it("carries denied_cli through the backlog occurrence with set_via intact", async () => {
+    installStorage();
+    const api = await reload();
+
+    const backlog = await api.getJudgeBacklog("all");
+    const group = backlog.groups.find((g) => g.category === "install_worker_tool" && g.target === "glab")!;
+    expect(group).toBeTruthy();
+    const occ = group.occurrences[0];
+    expect(occ.bucket).toBe("dismissed");
+    expect(occ.set_via).toBe("denied_cli");
   });
 
   // The mock must not invent wire fields. set_via is a mock-side extension of the STORED
@@ -471,7 +489,9 @@ describe("mockApi judge category stats (PRD #270)", () => {
         "presence in todo cannot demonstrate open-over-settled promotion",
     ).toBe(true);
     expect(counts_by_bucket.todo.install_worker_tool).toBe(1);
-    expect(counts_by_bucket.all.install_worker_tool).toBe(1);
+    // 2 groups now: shellcheck (todo, above) and glab (the issue #167 denied_cli auto-dismissal).
+    expect(counts_by_bucket.all.install_worker_tool).toBe(2);
+    expect(counts_by_bucket.dismissed.install_worker_tool).toBe(1); // glab, auto-dismissed
 
     // GROUPS, not rows: improve_uzi is 2 groups (poller, run-timeout) while its rows number 4
     // (poller recurs in three reviews). A rows-counter would read 4 in `all`.
@@ -492,7 +512,8 @@ describe("mockApi judge category stats (PRD #270)", () => {
     // fetch-once, triage-invariant aggregate #244 shipped.
     const before = (await api.getJudgeCategoryStats()).counts_by_bucket;
     expect(before.todo.install_worker_tool).toBe(1);
-    expect(before.dismissed.install_worker_tool ?? 0).toBe(0);
+    // glab is already dismissed in the seed (issue #167 denied_cli), so dismissed starts at 1.
+    expect(before.dismissed.install_worker_tool ?? 0).toBe(1);
 
     await api.bulkSetJudgeDisposition(
       [{ category: "install_worker_tool", target: "shellcheck" }],
@@ -503,8 +524,9 @@ describe("mockApi judge category stats (PRD #270)", () => {
 
     const after = (await api.getJudgeCategoryStats()).counts_by_bucket;
     expect(after.todo.install_worker_tool ?? 0).toBe(0);
-    expect(after.dismissed.install_worker_tool).toBe(1);
-    // The whole-backlog `all` slice is unchanged — one group, still one group.
+    // shellcheck joins glab in dismissed → 2 dismissed groups.
+    expect(after.dismissed.install_worker_tool).toBe(2);
+    // The whole-backlog `all` slice is unchanged — two groups, still two groups.
     expect(after.all.install_worker_tool).toBe(before.all.install_worker_tool);
   });
 

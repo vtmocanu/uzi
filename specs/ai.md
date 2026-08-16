@@ -9471,6 +9471,53 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
   re-suppressing a possibly-different concern. Cleaned only by the
   review-deletion cascade (`review_id ON DELETE CASCADE`).
 
+## 544. Issue #167 — deterministic net auto-dismisses judge recs targeting a denylisted credential-bearing CLI; a self-measuring `set_via='denied_cli'` provenance
+
+Extends the PRD #94 disposition design (§331–338) and mirrors PRD #98's
+`issue_close` provenance (§362). It is the DETERMINISTIC BACKSTOP behind MR
+!136's prompt-side fix (which told the judge model not to recommend
+credential-bearing CLIs like `glab`/`gh`/`aws`/`az`/… and filtered them from
+the deterministic pre-scan); this net catches what the model still emits.
+
+- **`PostReview` hook, run AFTER the review + recommendations are durably
+  persisted** (`autoDismissDeniedCLIRecommendations`, `workersvc/judge_review.go`,
+  called from `PostReview` post-`UpsertRunReviewWithRecommendations`). Chosen
+  **edge-triggered** — fires once per judge write — over a level-triggered
+  sweeper that would re-evaluate every coordinate on every tick.
+- **Reason = `wont_do`, not `not_an_issue`**, deliberately: the auto-dismissals
+  must NOT inflate the `not_an_issue` false-positive sub-count surfaced by
+  `workersvc.BucketTriage` (§334). The rec isn't wrong, it's just unactionable.
+- **Provenance = a NEW `set_via` value `'denied_cli'`** (migration
+  `00128_denied_cli_disposition_provenance.sql` widens the `set_via` CHECK on
+  `recommendation_dispositions`; `SystemDismissDeniedCLIRecommendation`,
+  `queries/dispositions.sql`, writes it as a server-side literal). This — NOT
+  `set_by_user_id IS NULL` — is the robust system/human discriminator, because
+  `set_by_user_id` is `ON DELETE SET NULL` so a human row also goes NULL once
+  that user is deleted. The value makes the mechanism **self-measuring**:
+  `count(*) WHERE set_via='denied_cli'` is the rate at which the MR !136 model
+  fix failed. Same reasoning and shape as the `'issue_close'` precedent (§362).
+  The Down re-narrows the CHECK and therefore FAILS once any `denied_cli` row
+  exists — those rows must be cleared before rollback.
+- **Category scope = only `enable_tool` and `install_worker_tool`** — the
+  categories whose `target` IS the tool being proposed. Categories that mention
+  a denied name incidentally (e.g. `improve_uzi` "improve aws integration") are
+  deliberately left untouched.
+- **Tokeniser `recommendsDeniedExecutable`** (`workersvc/judge_denied_cli.go`)
+  splits the free-text target on `[,/\s]+` and dismisses if ANY token is a
+  `toolprofile.DeniedExecutable`. PARTIAL match dismisses ON PURPOSE: the real
+  observed target `"file, glab"` is mixed, so an all-tokens rule would let it
+  through. `DeniedExecutable` basenames/trims, so a path-form token resolves to
+  its executable name.
+- **Non-clobbering + accepted residual.** The store query is `ON CONFLICT DO
+  NOTHING`, so a surviving human verdict on the coordinate is never overwritten.
+  An Undo deletes the row, so a later re-judge re-dismisses the coordinate —
+  accepted because the re-dismissal is visible (`set_via='denied_cli'`) and
+  reversible (Undo again).
+- **Best-effort.** A dispose error is logged (`slog.Error`) and swallowed; it
+  never fails the worker's review submission. `PostReview` returns the same
+  `ReviewResult` whether or not any dismissal landed — the review is the durable
+  source of truth, this net a layered surface.
+
 # PRD #41 — Plan revision at the approval gate ("Request changes")
 
 Serves human Feature #41: at the plan gate the user can request changes (bounded
