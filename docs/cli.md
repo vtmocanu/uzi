@@ -8,7 +8,7 @@ audience: user
 
 `uzi` is the terminal control surface for the factory: it drives the same API
 the web UI does, so anything you can do in a browser you can do headless —
-list and follow runs, approve or reject a plan gate, read the judge's review,
+list and follow runs, approve/reject/revise a plan gate, read the judge's review,
 manage workers and repos, and (read-only) admin state. Built for humans
 (tables on a TTY) and agents (`--json`, documented exit codes) alike.
 
@@ -86,6 +86,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--planned-commit <sha>] [--require-base]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
+uzi run revise <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
 uzi run answer <id> [--message <text> ...]
@@ -146,6 +147,13 @@ A few worth knowing:
   subagents from that source. `--exclude-agents` requires `--agent-source`.
   `run create --plan-file` takes the same two flags, for the seeded run's
   roster.
+- **`run revise <id> -m "<feedback>"`** steers a plan at the approval gate
+  without stopping the run: the agent re-plans from your feedback and returns
+  to `awaiting_approval` for another decision, where `run reject` instead ends
+  the run. Use it on a run parked at the gate; it needs a non-empty message
+  (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
+  revision limit, and an exhausted limit — or a run that has already finished —
+  is a 409 (exit 5).
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open

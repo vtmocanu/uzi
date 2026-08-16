@@ -28,6 +28,7 @@ const (
 	kindRejectPlan  = "reject_plan"
 	kindCancel      = "cancel"
 	kindFollowUp    = "follow_up"
+	kindRevisePlan  = "revise_plan"
 	kindAnswer      = "answer"
 )
 
@@ -495,6 +496,35 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
 
+	revise := &cobra.Command{
+		Use:   "revise <run-id>",
+		Short: "Revise a run's plan at the approval gate (re-plan without stopping the run)",
+		Long: "Send feedback to a run parked at its plan-approval gate (`awaiting_approval`) so the " +
+			"agent re-plans from your notes and re-gates, WITHOUT stopping the run — unlike `reject`, " +
+			"which ends it.\n\n" +
+			"The run stays live: the agent revises its plan in place using your feedback and returns to " +
+			"the gate for another approve/reject/revise decision. Revisions are capped by the run's " +
+			"revision limit; once exhausted — or if the run has already finished — the server answers " +
+			"409 (exit 5). Use it on a run parked at its `awaiting_approval` gate; that is where the " +
+			"agent folds your feedback into a new plan.\n\n" +
+			"A revision needs feedback (an empty one tells the agent nothing to change), so pass -m or " +
+			"pipe it on stdin.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a revision needs a message: pass -m <feedback> or pipe it on stdin")
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindRevisePlan, msg, nil)
+		},
+	}
+	revise.Flags().StringP("message", "m", "", "the plan feedback to send back (or pipe it on stdin)")
+
 	answer := &cobra.Command{
 		Use:   "answer <run-id>",
 		Short: "Answer the clarifying question a run is waiting on",
@@ -603,7 +633,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, cancel, followUp, answer, inputs)
+	cmd.AddCommand(list, get, logs, wait, review, create, approve, reject, revise, cancel, followUp, answer, inputs)
 	return cmd
 }
 
@@ -956,6 +986,8 @@ func inputOutcome(kind string, serverSide bool) string {
 		return "cancellation sent"
 	case kindFollowUp:
 		return "follow-up sent"
+	case kindRevisePlan:
+		return "plan revision sent"
 	case kindAnswer:
 		return "answer sent"
 	default:
