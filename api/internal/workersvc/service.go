@@ -24,7 +24,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -45,6 +44,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -3258,8 +3258,19 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 // sanitizeSelfReported in the handler package, minus the byte truncation (SaveMemory
 // applies the size cap AFTER this, on the sanitized value). keepWhitespace preserves
 // \n and \t for the multi-line body while still dropping every other C0/C1 control
-// char; a single-line title keeps neither. unicode.IsControl catches C0 (incl. ESC
-// 0x1b and BEL 0x07), DEL, and C1 — the whole ANSI-escape lead-in class.
+// char; a single-line title keeps neither. The predicate is termsafe.Unsafe, whose
+// control half catches C0 (incl. ESC 0x1b and BEL 0x07), DEL, and C1 — the whole
+// ANSI-escape lead-in class.
+//
+// As of issue #161 it ALSO strips Unicode format characters (Cf) via termsafe.Unsafe,
+// as Trojan-Source defense (issue #124 / CVE-2021-42574): a bidi override (U+202E and
+// its family) could otherwise visually reorder the stored note so it reads as
+// something other than what the run wrote, and the zero-widths let two notes look
+// identical. That carries the same accepted cost termsafe.SanitizeBounded documents:
+// a ZWJ family emoji (U+200D) degrades into its component glyphs and ZWNJ (U+200C) is
+// dropped — knowingly, because letting a bidi override persist at rest is the worse
+// trade. The \n/\t + keepWhitespace exception runs BEFORE the Unsafe test, so the
+// multi-line body keeps its real newlines and tabs.
 func sanitizeMemoryField(s string, keepWhitespace bool) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -3268,7 +3279,7 @@ func sanitizeMemoryField(s string, keepWhitespace bool) string {
 			b.WriteRune(r)
 			continue
 		}
-		if unicode.IsControl(r) {
+		if termsafe.Unsafe(r) {
 			continue
 		}
 		b.WriteRune(r)
