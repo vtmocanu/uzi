@@ -1293,6 +1293,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// write). The per-worker proposal limiter caps mass-creation across a
 		// user's chats; the per-run pending cap is the other half.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
+		// Incidental findings capture (PRD #333 M2, D2): the run-lane
+		// report_incidental_issue tool records one off-task bug. Like proposals it is a
+		// worker→api write that NEVER touches the forge (filing is human-gated), so it
+		// reuses the per-worker proposal limiter to bound mass-creation; the per-run
+		// MaxFindingsPerRun cap is the other half.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/findings", h.WorkerCreateFinding)
 	})
 }
 

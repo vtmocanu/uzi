@@ -330,6 +330,10 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/heartbeat", noLimiter},
 	{"POST", "/api/worker/register", noLimiter},
 	{"POST", "/api/worker/runs/claim", noLimiter},
+	// PRD #333 M2: the incidental-findings capture route. It rides
+	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
+	// per-USER probe reads as noLimiter — same as the proposals route below it.
+	{"POST", "/api/worker/runs/{id}/findings", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory", noLimiter},
 	{"POST", "/api/worker/runs/{id}/messages", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},

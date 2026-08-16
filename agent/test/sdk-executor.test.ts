@@ -10,6 +10,8 @@ import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { FINDINGS_SERVER_NAME } from "../src/findings-tools.js";
+import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
@@ -1093,6 +1095,39 @@ describe("SdkExecutor guardrail options", () => {
     // Planning turn resumes the claim's session; the loop turn resumes the SDK's.
     assert.strictEqual(turns[0]!.options.resume, "prev-session");
     assert.strictEqual(turns[1]!.options.resume, "sess-A");
+  });
+});
+
+describe("SdkExecutor findings capture tool mounting (PRD #333 M2, D2)", () => {
+  // The incidental-findings server is mounted only when a client is threaded (like
+  // memory/forge), in the `if (this.client)` block — so it reaches EVERY autonomous
+  // run lane the SdkExecutor drives (issue / ci_fix / prompt / self_improve) and is
+  // DELIBERATELY not gated on isIssueRun. A stub client is enough: the executor only
+  // closes over it when building the server; the faked turns never call the tool.
+  const stubClient = {} as unknown as WorkerClient;
+
+  for (const kind of ["issue", "ci_fix", "self_improve", "prompt"] as const) {
+    it(`mounts the findings server on a ${kind} run (not behind isIssueRun)`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ kind });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client: stubClient }).run(probe.ctx);
+
+      const o = turns[0]!.options;
+      assert.ok(o.mcpServers && FINDINGS_SERVER_NAME in o.mcpServers, `findings server wired for ${kind}`);
+    });
+  }
+
+  it("does NOT mount the findings server when no client is threaded", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
+    const o = turns[0]!.options;
+    assert.ok(!(o.mcpServers && FINDINGS_SERVER_NAME in o.mcpServers), "no client → no findings server");
   });
 });
 

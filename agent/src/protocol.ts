@@ -70,6 +70,13 @@ export type MessageKind =
    *  Like `proposal` it is human-gated — the model emits the card, only the user's
    *  Start click actually queues the run (through their own connection). */
   | "run_request"
+  /** PRD #333 M2: an INCIDENTAL FINDING card the run-lane `report_incidental_issue`
+   *  tool emits (payload `{ id, title, location, confidence?, labels }`). The finding
+   *  is already persisted server-side (the api derived user/repo from the run and
+   *  returned the id the card carries); the card is a non-blocking side note — the
+   *  human files or dismisses it later from the backlog. All fields are model-authored
+   *  from attacker-influenceable repo content: escaped sinks only (web M7). */
+  | "finding"
   /** PRD #41: the user's revision feedback at the approval gate (payload
    *  `{ feedback: string }`), echoed to the feed so the revision is auditable. */
   | "plan_feedback"
@@ -791,6 +798,20 @@ export interface CreateProposalRequest {
   title: string;
   description: string;
   labels: string[];
+}
+
+/** Request body for POST /api/worker/runs/:id/findings (PRD #333 M2). The server
+ *  derives (user_id, repo_id) from the run claim — the worker NEVER sends them (D2/D3).
+ *  `location` is a symbol-anchored, repo-root-relative coordinate with NO line number
+ *  (D3); the server canonicalises + sanitises title/description/location before storing
+ *  inert text. Caps (title/description/labels/location byte bounds, MaxFindingsPerRun)
+ *  are enforced server-side; the tool clamps client-side as defense-in-depth only. */
+export interface ReportFindingRequest {
+  title: string;
+  description: string;
+  location: string;
+  labels?: string[];
+  confidence?: string;
 }
 
 /** Writer-declared provenance for a saved memory (PRD #266 M2). `observed` = the

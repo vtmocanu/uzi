@@ -344,6 +344,16 @@ type Store interface {
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).
 	UpsertDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error)
+	// Incidental findings capture (PRD #333 M2): the per-run evidence insert + cap
+	// count, and the coordinate-keyed `open` disposition upsert with its two follow-up
+	// UPDATEs (re-open on a materially-different content_hash; refresh an already-open
+	// row's last_title/hash). CreateFinding derives (user_id, repo_id) from the claimed
+	// run and canonicalises + sanitises the text before any of these run.
+	CountFindingsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	InsertFinding(ctx context.Context, arg store.InsertFindingParams) (store.IncidentalFinding, error)
+	UpsertOpenDisposition(ctx context.Context, arg store.UpsertOpenDispositionParams) (store.FindingDisposition, error)
+	ReopenDispositionOnHashMismatch(ctx context.Context, arg store.ReopenDispositionOnHashMismatchParams) (int64, error)
+	UpdateDispositionLastTitle(ctx context.Context, arg store.UpdateDispositionLastTitleParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	// SetRunAwaitingInput parks a run on a clarification question (PRD #88 M1) and
