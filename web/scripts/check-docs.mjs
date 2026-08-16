@@ -10,8 +10,10 @@
 // build context (docker-compose.yml web.build.context + web/Dockerfile).
 //
 // Checks (fail the build): missing/invalid frontmatter (README.md exempt),
-// duplicate `order` among `user` pages, broken relative links (doc->doc and
-// doc->img), and any docs/img/* over the per-image byte budget.
+// missing/duplicate `order` among the in-app-indexed audiences (`user` and,
+// since issue #75, `operator` — each in its own order namespace), broken
+// relative links (doc->doc and doc->img), and any docs/img/* over the per-image
+// byte budget.
 // Warns (does not fail): a `user` page whose body exceeds the line budget.
 import { readFileSync, readdirSync, existsSync, statSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -103,7 +105,11 @@ const files = readdirSync(docsDir)
   .filter((f) => f.endsWith(".md"))
   .sort();
 
-const orderOwner = new Map(); // order value -> filename (duplicate detection)
+// The audiences that appear in an in-app index and therefore need an `order`:
+// `user` (everyone) and `operator` (admins only, issue #75). Each keeps its own
+// order namespace, so operator `order: 10` never collides with user `order: 10`.
+const ORDERED_AUDIENCES = new Set(["user", "operator"]);
+const orderOwnerByAudience = new Map(); // audience -> (order value -> filename)
 
 for (const file of files) {
   if (file === "README.md") continue; // exempt: it is the docs index/meta page
@@ -120,21 +126,30 @@ for (const file of files) {
       fail(file, `frontmatter: invalid audience "${meta.audience}" (expected ${[...AUDIENCES].join("|")})`);
     }
 
-    if (meta.audience === "user") {
+    if (ORDERED_AUDIENCES.has(meta.audience)) {
       const raw_order = meta.order;
       if (raw_order === undefined || raw_order === "") {
-        fail(file, "frontmatter: `order` is required for audience:user pages");
+        fail(file, `frontmatter: \`order\` is required for audience:${meta.audience} pages`);
       } else if (!Number.isFinite(Number(raw_order))) {
         fail(file, `frontmatter: \`order\` must be a number (got "${raw_order}")`);
       } else {
         const order = Number(raw_order);
-        if (orderOwner.has(order)) {
-          fail(file, `duplicate order ${order} (also used by ${orderOwner.get(order)})`);
+        let owner = orderOwnerByAudience.get(meta.audience);
+        if (!owner) {
+          owner = new Map();
+          orderOwnerByAudience.set(meta.audience, owner);
+        }
+        if (owner.has(order)) {
+          fail(file, `duplicate order ${order} among audience:${meta.audience} pages (also used by ${owner.get(order)})`);
         } else {
-          orderOwner.set(order, file);
+          owner.set(order, file);
         }
       }
+    }
 
+    // The line budget is a `user` howto house-style rule only; operator docs are
+    // reference material (configuration.md etc.) and are exempt.
+    if (meta.audience === "user") {
       const bodyLines = body.replace(/\n+$/, "").split("\n").length;
       if (bodyLines > LINE_BUDGET) {
         warn(file, `${bodyLines} body lines exceed the ${LINE_BUDGET}-line house-style budget`);

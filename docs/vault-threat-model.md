@@ -1,5 +1,6 @@
 ---
 title: Vault threat model
+order: 40
 audience: operator
 ---
 
