@@ -40,7 +40,7 @@ func seededRow(t *testing.T, name string) store.AgentTemplate {
 }
 
 // builtinWithTools picks a shipped builtin that actually carries a tools
-// allowlist. Two of the eleven (coder, lead) carry none, so a tools case built
+// allowlist. Three of the twelve (coder, lead, ux-designer) carry none, so a tools case built
 // on the wrong one would compare empty against empty and pass whatever the
 // implementation does.
 func builtinWithTools(t *testing.T) agenttmpl.Definition {
