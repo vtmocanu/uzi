@@ -1744,6 +1744,77 @@ func TestSetStateLeavesSessionIDUnsetWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestSetStateReconcilesMROnCompletion pins the issue #329 wiring: whenever a state
+// report carries an MrIID, SetState calls ReconcileRunMR (best-effort, after the
+// status switch) so a run that opened an MR never reports "MR: none" regardless of the
+// terminal status the switch wrote. When the report carries no MrIID the reconcile is
+// gated off entirely.
+func TestSetStateReconcilesMROnCompletion(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+		setCompletedRows: 1,
+		// The reconcile matched nothing (e.g. SetRunCompleted already COALESCE-wrote the
+		// MR): a 0 rowcount must NOT disturb the completed report's normal return.
+		reconcileMRRows: 0,
+	}
+	svc := New(fs, newBox(t), testParams())
+	branch, mr, url := "agent/issue-1", int64(77), "https://forge.e2e/g/r/-/merge_requests/77"
+	run, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "completed", Branch: &branch, MrIID: &mr, MrWebURL: &url,
+	})
+	if err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	// Best-effort reconcile must not affect the report's normal return.
+	if !applied {
+		t.Fatal("a completed transition on a live run must be applied (rows>0), even with reconcileMRRows=0")
+	}
+	if run.Status != "completed" {
+		t.Fatalf("status = %q, want completed", run.Status)
+	}
+	if fs.reconciledMR == nil {
+		t.Fatal("ReconcileRunMR was not called for a completed report carrying an MrIID")
+	}
+	if !fs.reconciledMR.MrIid.Valid || fs.reconciledMR.MrIid.Int64 != mr {
+		t.Fatalf("reconciled mr_iid = %+v, want %d", fs.reconciledMR.MrIid, mr)
+	}
+	if fs.reconciledMR.MrWebUrl.String != url {
+		t.Fatalf("reconciled mr_web_url = %q, want %q", fs.reconciledMR.MrWebUrl.String, url)
+	}
+	if fs.reconciledMR.Branch.String != branch {
+		t.Fatalf("reconciled branch = %q, want %q", fs.reconciledMR.Branch.String, branch)
+	}
+	if fs.reconciledMR.ID != fs.runOwned.ID {
+		t.Fatalf("reconciled id = %s, want the run's id %s", fs.reconciledMR.ID, fs.runOwned.ID)
+	}
+	if !fs.reconciledMR.WorkerID.Valid || fs.reconciledMR.WorkerID.Bytes != w.ID {
+		t.Fatalf("reconciled worker_id = %+v, want the worker's id %s", fs.reconciledMR.WorkerID, w.ID)
+	}
+}
+
+// TestSetStateSkipsReconcileWithoutMR pins the gate: a report with no MrIID (here a
+// `failed` report, but a `running` one is identical) must NOT call ReconcileRunMR — the
+// reconcile fires only when req.MrIID != nil.
+func TestSetStateSkipsReconcileWithoutMR(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "failed"},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "failed",
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.setFailed == nil {
+		t.Fatal("SetRunFailed not called (guard against the test asserting nothing ran)")
+	}
+	if fs.reconciledMR != nil {
+		t.Fatalf("ReconcileRunMR must NOT be called when the report carries no MrIID, got %+v", fs.reconciledMR)
+	}
+}
+
 func TestConsumeInputsRequiresOwnership(t *testing.T) {
 	fs := &fakeStore{runOwnedErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
