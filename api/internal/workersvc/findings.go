@@ -33,6 +33,10 @@ const (
 	MaxFindingTitleBytes      = MaxProposalTitleBytes
 	MaxFindingLocationBytes   = 512
 	MaxFindingConfidenceBytes = 32
+	// MaxFindingLabelBytes bounds each SANITISED label (M2 review, D4). A label is a
+	// short tag, so 64 bytes matches the server's 64-char label convention and keeps a
+	// runaway/prompt-injected tool call from storing an unbounded blob per label.
+	MaxFindingLabelBytes = 64
 )
 
 // Finding sentinel errors, mapped to HTTP status by the handler.
@@ -192,14 +196,21 @@ func (s *Service) CreateFinding(ctx context.Context, wkr store.Worker, runID uui
 	return finding, nil
 }
 
-// marshalFindingLabels JSON-encodes the label set for the evidence row, normalising a
-// nil slice to the empty array (matching the proposal path). The handler has already
-// bounded the count and each label's length.
+// marshalFindingLabels sanitises each label to INERT form and JSON-encodes the set for
+// the evidence row, normalising to the empty array (matching the proposal path). Each
+// label runs through sanitizeFindingText (the same control/bidi strip + secret scrub +
+// byte cap the four free-text fields use) so the store holds no bidi/control/secret
+// bytes at rest before M5/M7 consume them (M2 review, D4). A label that is empty after
+// sanitisation is dropped rather than stored blank. The handler has already bounded the
+// label count.
 func marshalFindingLabels(labels []string) ([]byte, error) {
-	if labels == nil {
-		labels = []string{}
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if clean := sanitizeFindingText(label, MaxFindingLabelBytes); clean != "" {
+			out = append(out, clean)
+		}
 	}
-	return json.Marshal(labels)
+	return json.Marshal(out)
 }
 
 // sanitizeFindingText renders one untrusted, agent-authored string INERT for storage
@@ -304,6 +315,12 @@ func canonicalizeLocationSymbol(sym string) string {
 		return ""
 	}
 	sym = asciiLowerASCII(removeAllSpace(fields[0]))
+	// Strip a trailing line reference on the symbol token too (M2 review R1): the path
+	// token already drops `:line` in canonicalizeLocationPath, but a symbol like
+	// `bar:42` was left intact, so `foo.go#bar:42` and `foo.go#bar` produced two
+	// coordinates for one bug (line numbers drift and would defeat dedup, D3). Apply the
+	// same strip here so `bar:42`/`bar:42:5` fold to `bar`.
+	sym = findingLineNumRe.ReplaceAllString(sym, "")
 	// A purely numeric "symbol" is a line reference, not a symbol name — drop it.
 	if sym == "" || isAllDigits(sym) {
 		return ""

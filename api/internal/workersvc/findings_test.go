@@ -52,6 +52,18 @@ func TestCanonicalizeLocationRules(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeLocationSymbolLineNumberStrip(t *testing.T) {
+	// M2 review R1: a trailing line reference on the SYMBOL token drifts and must be
+	// stripped, exactly like the path token — otherwise `foo.go#bar:42` and `foo.go#bar`
+	// are two coordinates for one bug (D3 dedup).
+	const want = "api/foo.go#bar"
+	for _, in := range []string{"api/foo.go#bar:42", "api/foo.go#bar:42:5", "api/foo.go#bar"} {
+		if got := canonicalizeLocation(in, MaxFindingLocationBytes); got != want {
+			t.Errorf("canonicalizeLocation(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCanonicalizeLocationBoundsAndEmpty(t *testing.T) {
 	if got := canonicalizeLocation("   ###   ", MaxFindingLocationBytes); got != "" {
 		t.Errorf("an all-punctuation location must canonicalise to empty, got %q", got)
@@ -101,6 +113,56 @@ func TestSanitizeFindingTextStripsUnsafe(t *testing.T) {
 	for _, r := range got {
 		if r == '\u202e' || r == '\x07' {
 			t.Errorf("sanitizeFindingText left an unsafe rune %U in %q", r, got)
+		}
+	}
+}
+
+func TestMarshalFindingLabelsSanitisesEachLabel(t *testing.T) {
+	// M2 review (D4): each label is rendered inert (bidi/control stripped, secret shapes
+	// scrubbed) before storage, and a label empty after sanitisation is dropped.
+	raw := []string{"bug\u202e", "glpat-ABCDEFGHIJ0123456789", "  ", "keep"}
+	b, err := marshalFindingLabels(raw)
+	if err != nil {
+		t.Fatalf("marshalFindingLabels: %v", err)
+	}
+	var got []string
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The whitespace-only label drops; bidi + secret survive but stripped/scrubbed.
+	if len(got) != 3 {
+		t.Fatalf("expected 3 labels after sanitisation, got %d (%v)", len(got), got)
+	}
+	for _, label := range got {
+		for _, r := range label {
+			if r == '\u202e' {
+				t.Errorf("label %q retained a bidi override", label)
+			}
+		}
+		if label == "glpat-ABCDEFGHIJ0123456789" {
+			t.Errorf("label %q left a secret-shaped token unscrubbed", label)
+		}
+	}
+	if got[0] != "bug" {
+		t.Errorf("bidi override should strip to %q, got %q", "bug", got[0])
+	}
+	if got[1] != "[redacted]" {
+		t.Errorf("secret-shaped label should scrub to %q, got %q", "[redacted]", got[1])
+	}
+	if got[2] != "keep" {
+		t.Errorf("plain label should survive intact, got %q", got[2])
+	}
+}
+
+func TestMarshalFindingLabelsEmpty(t *testing.T) {
+	// A nil/empty label set marshals to `[]`, not `null` (matching the proposal path).
+	for _, in := range [][]string{nil, {}, {"   ", "\u202e"}} {
+		b, err := marshalFindingLabels(in)
+		if err != nil {
+			t.Fatalf("marshalFindingLabels(%v): %v", in, err)
+		}
+		if string(b) != "[]" {
+			t.Errorf("marshalFindingLabels(%v) = %s, want []", in, b)
 		}
 	}
 }
