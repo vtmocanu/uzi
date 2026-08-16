@@ -120,7 +120,7 @@ func TestSanitizeFindingTextStripsUnsafe(t *testing.T) {
 func TestMarshalFindingLabelsSanitisesEachLabel(t *testing.T) {
 	// M2 review (D4): each label is rendered inert (bidi/control stripped, secret shapes
 	// scrubbed) before storage, and a label empty after sanitisation is dropped.
-	raw := []string{"bug\u202e", "glpat-ABCDEFGHIJ0123456789", "  ", "keep"}
+	raw := []string{"bug\u202e", "glpat-ABCDEFGHIJ0123456789", "  ", "keep"} //gitleaks:allow placeholder PAT shape (sequential filler, not a real credential): test input asserting the sanitiser scrubs secret-shaped labels
 	b, err := marshalFindingLabels(raw)
 	if err != nil {
 		t.Fatalf("marshalFindingLabels: %v", err)
@@ -139,7 +139,7 @@ func TestMarshalFindingLabelsSanitisesEachLabel(t *testing.T) {
 				t.Errorf("label %q retained a bidi override", label)
 			}
 		}
-		if label == "glpat-ABCDEFGHIJ0123456789" {
+		if label == "glpat-ABCDEFGHIJ0123456789" { //gitleaks:allow placeholder PAT shape (sequential filler, not a real credential): negative assertion the token was scrubbed
 			t.Errorf("label %q left a secret-shaped token unscrubbed", label)
 		}
 	}
