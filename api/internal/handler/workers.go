@@ -304,6 +304,19 @@ func int32PtrValue(valid bool, v int32) *int32 {
 	return &v
 }
 
+// isPlanningPhase reports whether a run is in its pre-approval PLANNING turn — a
+// display-only predicate meaningful only while status=="running" (issue #321). A run
+// is planning iff it is a planning-capable kind (chat/judge never plan), is running,
+// has not yet entered the implement loop (iteration_count 0), and has no persisted
+// plan yet (plan_md empty). The kind set matches ListRunsForUser's NOT IN
+// ('chat','judge') filter, so issue/ci_fix/self_improve are planning-capable.
+func isPlanningPhase(kind, status string, iterationCount int32, planMdPresent bool) bool {
+	if kind == "chat" || kind == "judge" {
+		return false
+	}
+	return status == "running" && iterationCount == 0 && !planMdPresent
+}
+
 func runToDTO(r store.Run) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
@@ -314,21 +327,23 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		Status:           r.Status,
 		RequeueCount:     r.RequeueCount,
 		IterationCount:   r.IterationCount,
-		AutoApprove:      r.AutoApprove,
-		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
-		MrWebURL:         textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
-		MrState:          textPtrValue(r.MrState.Valid, r.MrState.String),
-		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
-		StopKind:         textPtrValue(r.StopKind.Valid, r.StopKind.String),
-		Health:           r.Health,
-		HealthReason:     textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
-		HealthSince:      timePtr(r.HealthSince.Valid, r.HealthSince.Time),
-		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
-		PlanSource:       r.PlanSource,
-		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
-		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
-		ReportOnly:       r.ReportOnly,
-		ReportMd:         textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
+		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
+			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
+		AutoApprove:   r.AutoApprove,
+		Branch:        textPtrValue(r.Branch.Valid, r.Branch.String),
+		MrWebURL:      textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
+		MrState:       textPtrValue(r.MrState.Valid, r.MrState.String),
+		FailureReason: textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
+		StopKind:      textPtrValue(r.StopKind.Valid, r.StopKind.String),
+		Health:        r.Health,
+		HealthReason:  textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
+		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
+		PlanMd:        textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
+		PlanSource:    r.PlanSource,
+		PipelineRef:   textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
+		FixVerdict:    textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
+		ReportOnly:    r.ReportOnly,
+		ReportMd:      textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
 		// PRD-link reconciliation (read-only): the path the run declared it archived a
 		// completed PRD to, and when that patch lifecycle settled (null = still pending).
 		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),

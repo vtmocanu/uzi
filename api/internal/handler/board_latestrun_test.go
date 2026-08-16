@@ -24,9 +24,12 @@ func TestMapLatestRun(t *testing.T) {
 	updated := created.Add(5 * time.Minute)
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "completed", "issue", 2, true, i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
+		if dto.IsPlanning {
+			t.Fatal("a completed run must not be is_planning")
+		}
 		if dto.MrState == nil || *dto.MrState != "merged" {
 			t.Fatalf("mr_state should be carried, got %v", dto.MrState)
 		}
@@ -66,7 +69,7 @@ func TestMapLatestRun(t *testing.T) {
 		// failure_reason is withheld even though the run has one (it can carry a verbatim
 		// reject reason or a raw agent error). stop_kind (a non-sensitive enum) stays
 		// visible so the badge can still classify the run as stopped.
-		dto := mapLatestRun(runID, otherOwner, "failed", pgtype.Int8{}, nullTxt(), nullTxt(),
+		dto := mapLatestRun(runID, otherOwner, "failed", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			txt("panic: raw agent internals"), txt("plan_rejected"),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
@@ -94,9 +97,12 @@ func TestMapLatestRun(t *testing.T) {
 	})
 
 	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "queued", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+		if dto.IsPlanning {
+			t.Fatal("a queued run is not running, so it must not be is_planning")
+		}
 		if dto.OwnerName != "" {
 			t.Fatalf("owner_name should be empty when the display name is blank, got %q", dto.OwnerName)
 		}
@@ -105,9 +111,14 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("health: enum + since unconditional, reason owner-gated (PRD #47)", func(t *testing.T) {
 		since := created.Add(2 * time.Minute)
 		// The owner of a flagged run sees the enum, the since, AND the reason.
-		mine := mapLatestRun(runID, viewer, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		mine := mapLatestRun(runID, viewer, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+		// This owner's run is running at iteration 0 with no persisted plan: the board card
+		// carries the issue #321 planning flag (kind issue is planning-capable).
+		if !mine.IsPlanning {
+			t.Fatal("a running issue run at iteration 0 with no plan must be is_planning")
+		}
 		if mine.Health != "waiting_worker" {
 			t.Fatalf("owner health = %q, want waiting_worker", mine.Health)
 		}
@@ -121,7 +132,7 @@ func TestMapLatestRun(t *testing.T) {
 		// A non-owner viewer gets the enum and the since (non-sensitive, like stop_kind)
 		// but NOT the reason, which can name owner state (Decision 6).
 		other := uuid.New()
-		theirs := mapLatestRun(runID, other, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
+		theirs := mapLatestRun(runID, other, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if theirs.Health != "waiting_worker" {
@@ -151,9 +162,9 @@ func TestAssembleCards(t *testing.T) {
 	// Deliberately NOT in issue order (20 before 10): a correct assembly keys by
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
-		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrWebUrl: txt("https://forge.example/grp/repo/pulls/5"), MrState: txt("closed"),
+		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", Kind: "issue", IterationCount: 4, HasPlanMd: pgtype.Bool{Bool: true, Valid: true}, MrIid: i8(5), MrWebUrl: txt("https://forge.example/grp/repo/pulls/5"), MrState: txt("closed"),
 			FailureReason: txt("raw agent internals"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
-		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
+		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running", Kind: "issue", IterationCount: 0, HasPlanMd: pgtype.Bool{Bool: false, Valid: true},
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
 	position := map[string]int{"In Progress": 0}
@@ -216,6 +227,14 @@ func TestAssembleCards(t *testing.T) {
 	}
 	if byIID[10].LatestRun.RunCount != 1 {
 		t.Fatalf("issue 10: run_count should be 1, got %d", byIID[10].LatestRun.RunCount)
+	}
+	// issue #321: the planning flag threads through the list projection onto each card.
+	// Issue 10 is running at iteration 0 with no plan (planning); issue 20 is completed.
+	if !byIID[10].LatestRun.IsPlanning {
+		t.Fatal("issue 10: running issue run at iteration 0 with no plan must be is_planning")
+	}
+	if byIID[20].LatestRun.IsPlanning {
+		t.Fatal("issue 20: a completed run must not be is_planning")
 	}
 	// Column resolution flows through the assembly too.
 	if byIID[10].Column != "In Progress" {
