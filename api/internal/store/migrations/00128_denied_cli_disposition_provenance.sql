@@ -26,6 +26,12 @@ ALTER TABLE recommendation_dispositions ADD CONSTRAINT recommendation_dispositio
     CHECK (set_via IS NULL OR set_via IN ('issue_close', 'denied_cli'));
 
 -- +goose Down
+-- HAZARD: this Down re-narrows the CHECK to set_via IN ('issue_close'), and Postgres
+-- validates every existing row when a CHECK constraint is ADDed. So the Down FAILS (the
+-- ADD CONSTRAINT raises a check_violation) if ANY recommendation_dispositions row with
+-- set_via='denied_cli' exists at rollback time — i.e. once the deterministic net has
+-- auto-dismissed even one recommendation. Such rows must be cleared or re-dispositioned
+-- (away from 'denied_cli') BEFORE this Down can run.
 ALTER TABLE recommendation_dispositions DROP CONSTRAINT recommendation_dispositions_set_via_check;
 ALTER TABLE recommendation_dispositions ADD CONSTRAINT recommendation_dispositions_set_via_check
     CHECK (set_via IS NULL OR set_via IN ('issue_close'));
