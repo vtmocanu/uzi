@@ -48,6 +48,24 @@ type IncidentalFindingBacklogDTO struct {
 	Findings  []IncidentalFindingDTO `json:"findings"`
 }
 
+// IncidentalFindingFiledIssueDTO is the real forge issue POST /api/findings/{id}/issue created
+// (PRD #333 M5/M6): the iid and web_url `uzi findings file` prints so a user can open it. It
+// carries no forge project id or other coordinates — only what the click produced.
+type IncidentalFindingFiledIssueDTO struct {
+	IID    int64  `json:"iid"`
+	WebURL string `json:"web_url"`
+	Title  string `json:"title"`
+}
+
+// IncidentalFindingFileResultDTO is the POST /api/findings/{id}/issue response (PRD #333 M5):
+// the created forge issue, plus a non-empty Warning when the issue WAS created but its local
+// disposition could not settle (created-with-warning — a success, never a retry signal, so a
+// CLI prints it as a note and still exits 0). Warning is omitempty: absent on a clean file.
+type IncidentalFindingFileResultDTO struct {
+	Issue   IncidentalFindingFiledIssueDTO `json:"issue"`
+	Warning string                         `json:"warning,omitempty"`
+}
+
 // IncidentalFindingIssueDraftDTO is GET /api/findings/{id}/issue-draft (PRD #333 M4, D4): the
 // deterministic, human-editable draft for filing a forge issue from one finding. It is built
 // by issuedraft.RenderFinding — the finding-specific template that CALLS the field-level

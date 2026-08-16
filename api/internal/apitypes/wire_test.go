@@ -359,6 +359,17 @@ func TestIncidentalFindingIssueDraftDTOTags(t *testing.T) {
 		"title", "description", "location", "labels", "provenance")
 }
 
+// TestIncidentalFindingFileResultDTOTags pins the PRD #333 M5/M6 file-response shape. warning
+// is omitempty (absent on a clean file, present on created-with-warning), so the zero-value pin
+// asserts only `issue` and the populated pin surfaces `warning`.
+func TestIncidentalFindingFileResultDTOTags(t *testing.T) {
+	assertTags(t, "IncidentalFindingFiledIssueDTO", IncidentalFindingFiledIssueDTO{},
+		"iid", "web_url", "title")
+	assertTags(t, "IncidentalFindingFileResultDTO", IncidentalFindingFileResultDTO{}, "issue")
+	assertTags(t, "IncidentalFindingFileResultDTO(warn)",
+		IncidentalFindingFileResultDTO{Warning: "x"}, "issue", "warning")
+}
+
 // TestReviewNullEnvelope pins the GET /api/runs/{id}/review contract that a
 // visible-but-unjudged run returns 200 with BOTH envelope keys present and null, and
 // that a null on either is a valid decode — the CLI/SPA must model review AND

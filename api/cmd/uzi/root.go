@@ -169,6 +169,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newScheduleCmd(env, gf),
 		newTUICmd(env, gf),
 		newReviewCmd(env, gf),
+		newFindingsCmd(env, gf),
 		newWorkerCmd(env, gf),
 		newTokenCmd(env, gf),
 		newMemoryCmd(env, gf),

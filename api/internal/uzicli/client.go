@@ -272,6 +272,33 @@ type Client interface {
 	// WITHOUT advancing its cadence: POST /api/schedules/{id}/run-now (202
 	// RunNowResponse). A benign dedup skip fires nothing and reports Created:0.
 	RunScheduleNow(ctx context.Context, id string) (apitypes.RunNowResponse, error)
+
+	// ListFindings returns the caller's owner-scoped incidental-findings backlog, deduped
+	// by (repo, location) across every run a coordinate recurs in (PRD #333 M6): GET
+	// /api/findings. Owner-scoped on RequireUser (so `uzi findings list` works from a CLI
+	// token), read-only, no forge write and no token spend. The reply is the unenveloped
+	// IncidentalFindingBacklogDTO carrying the coordinate rows and the open-findings count.
+	//
+	// bucket/repo/run are forwarded VERBATIM and an empty value OMITS the parameter, so the
+	// SERVER's default applies (to_file for bucket, no filter for repo/run). The valid set is
+	// deliberately not restated here: the CLI never compares against a value, it only forwards
+	// one, so there is no predicate to fail silently — an unknown bucket comes back as the
+	// server's own 400 → the usage exit code, and a well-formed but foreign/unknown repo or run
+	// is an EMPTY list (no existence oracle), never a 404.
+	ListFindings(ctx context.Context, bucket, repo, run string) (apitypes.IncidentalFindingBacklogDTO, error)
+	// FileFinding files a forge issue from one finding coordinate (PRD #333 M6): POST
+	// /api/findings/{id}/issue with an empty body, so the server files with the STORED,
+	// already-sanitised template and the server-mandated marker label (the CLI is not the rich
+	// editor — the web is, D4/D5). Returns the created forge issue (iid/web_url) and any
+	// created-with-warning note. An unknown/foreign id is a 404 (exit 4); an already-filed or
+	// mid-filing coordinate is a 409 (exit 5) — both come straight from statusError.
+	FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error)
+	// DismissFinding triages one finding coordinate to `dismissed` with a reason (PRD #333 M6):
+	// POST /api/findings/{id}/dismiss {reason}. reason is the wire enum (wont_do|not_an_issue),
+	// mapped from the hyphenated flag and validated by the COMMAND before this is reached. An
+	// unknown/foreign id is a 404 (exit 4); a non-open coordinate (filed/filing/already
+	// dismissed) is a 409 (exit 5). 200 → nil.
+	DismissFinding(ctx context.Context, id, reason string) error
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -1112,4 +1139,47 @@ func (c *HTTPClient) RunScheduleNow(ctx context.Context, id string) (apitypes.Ru
 		return apitypes.RunNowResponse{}, err
 	}
 	return out, nil
+}
+
+func (c *HTTPClient) ListFindings(ctx context.Context, bucket, repo, run string) (apitypes.IncidentalFindingBacklogDTO, error) {
+	path := "/api/findings"
+	// Each omitted rather than sent empty when unset: the handler's `== ""` branches are what
+	// apply its defaults, and an explicit empty value would take the same branch only by
+	// coincidence. Escaped because all are user input off a flag.
+	q := url.Values{}
+	if bucket != "" {
+		q.Set("bucket", bucket)
+	}
+	if repo != "" {
+		q.Set("repo", repo)
+	}
+	if run != "" {
+		q.Set("run", run)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out apitypes.IncidentalFindingBacklogDTO
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.IncidentalFindingBacklogDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
+	// An empty JSON object body: the file endpoint resolves title/description from the STORED,
+	// already-sanitised finding row (D4) and assembles labels server-side (D5), so the CLI sends
+	// no edits — the web is the rich editor, the CLI files defaults. postJSON routes a non-2xx
+	// through statusError, so 404→ExitNotFound and 409→ExitConflict come for free.
+	var out apitypes.IncidentalFindingFileResultDTO
+	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/issue", struct{}{}, &out); err != nil {
+		return apitypes.IncidentalFindingFileResultDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) error {
+	// reason is the wire enum, already mapped and validated by the command. postJSON discards
+	// the (200) body via a nil out and maps a non-2xx through statusError (404→4, 409→5).
+	return c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/dismiss", map[string]string{"reason": reason}, nil)
 }

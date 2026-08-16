@@ -292,6 +292,20 @@ var knownInstructions = []knownInstruction{
 			"while explaining the bare-wait default and the D2 narrow-after-approve rule. " +
 			"Never emitted at runtime.",
 	},
+	{
+		command:  "uzi findings file",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #333 M6. The span sits in `uzi findings list`'s Long field
+		// (findings.go), which names the file verb the printed finding_id feeds — a cross-
+		// reference, not something the CLI ever tells a user to run at a decision point.
+		// classifyKind reads a cobra Long field as documentation, so the kind derives HELP;
+		// the complete bar for a help reference is that the path RESOLVES, and it does —
+		// `uzi findings file` is a real subcommand, pinned by TestCommandTree and exercised by
+		// TestFindingsFileSuccess/Conflict/NotFound in findings_test.go.
+		note: "HELP: inside `uzi findings list`'s Long description (findings.go), naming the " +
+			"file verb the printed finding_id feeds. Never emitted at runtime; the path-" +
+			"resolution check is the complete bar.",
+	},
 
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
 	{
