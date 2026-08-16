@@ -9,8 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeGuard is the workersvc test double for RepoGuard (the #66 default-branch

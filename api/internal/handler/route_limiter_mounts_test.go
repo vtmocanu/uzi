@@ -18,9 +18,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/config"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // This file guards the rate-limiter MOUNTS on the real route table. It exists

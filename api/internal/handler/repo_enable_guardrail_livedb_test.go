@@ -17,11 +17,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The live-DB half of PRD #66 M4 (D1 layer 1): the repo-enable gate. SetRepoEnabled

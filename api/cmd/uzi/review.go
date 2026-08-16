@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // Disposition wire strings (PRD #94 Decision 1/4), named so a typo is a compile

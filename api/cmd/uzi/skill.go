@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // newSkillCmd — `uzi skill`. Manages the bundled, self-upgrading Claude Code

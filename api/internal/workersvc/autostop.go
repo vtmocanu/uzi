@@ -32,7 +32,7 @@ import (
 	"log/slog"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Auto-stop KILL thresholds (PRD #108 §4), code constants rather than settings.

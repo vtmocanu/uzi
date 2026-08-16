@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
 )
 
 // ValidatePVCCeilings is what stands between a raised preset (or a lowered cluster

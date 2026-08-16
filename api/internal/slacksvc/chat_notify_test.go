@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // chatAnchor is a Slack-anchored chat's DM row: root_ts is the user's message, and

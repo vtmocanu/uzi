@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // newAuthCmd — `uzi auth` groups credential-plumbing verbs.

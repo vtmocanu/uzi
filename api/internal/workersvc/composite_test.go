@@ -8,8 +8,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeForge is a forge.Forge stub: it embeds the interface (so the 20 unused methods

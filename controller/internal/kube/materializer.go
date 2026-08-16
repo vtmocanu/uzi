@@ -17,9 +17,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // Materializer implements reconcile.Materializer against a real kube-apiserver.

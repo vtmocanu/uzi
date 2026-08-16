@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ErrRecommendationNotFound — the recID does not resolve to a recommendation in the run's

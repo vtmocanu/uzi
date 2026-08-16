@@ -10,11 +10,11 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestBuildGuardRoleExcludedNotification pins the producer shape (PRD #319 M3): the

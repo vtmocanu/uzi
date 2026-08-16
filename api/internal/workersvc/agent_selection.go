@@ -6,9 +6,9 @@ import (
 	"strings"
 	"unicode"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Per-run agent selection (PRD #37).

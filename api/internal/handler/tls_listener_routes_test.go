@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
 // The TLS listener's surface (PRD #58 M3), layer (a).

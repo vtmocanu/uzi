@@ -9,8 +9,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
 // The additive non-PRD fetch (PRD #102 M6, Decisions 9/11/11a). These are the

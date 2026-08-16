@@ -20,7 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // DefaultUserCap is the per-user retention cap: the newest this-many notifications

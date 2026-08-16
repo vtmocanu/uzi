@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestCanonicalizeTargetMatchesBackfillSQLLiveDB pins the ONE property the whole issue-#232

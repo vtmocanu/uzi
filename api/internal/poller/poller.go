@@ -17,8 +17,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // defaultMaxConcurrency bounds how many repos are synced in parallel per tick.

@@ -10,7 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // GenerateVerifier must produce a challenge the SERVER will accept: the server

@@ -23,9 +23,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #108 M1a — the poison-pill repro, against the real path (handler ->

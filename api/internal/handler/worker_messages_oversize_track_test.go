@@ -19,9 +19,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // oversizeTrackStore records the ownership lookup NoteOversizeBatch performs.

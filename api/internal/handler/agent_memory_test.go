@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // memoryStore is a minimal workersvc.Store for the agent-memory worker-protocol

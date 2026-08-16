@@ -3,7 +3,7 @@ package main
 import (
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // newRepoCmd — `uzi repo`. list is wired to the Client.

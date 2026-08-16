@@ -11,9 +11,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection.

@@ -11,9 +11,9 @@ import (
 
 	"github.com/google/uuid"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // settingsStore is a minimal settings.Store: it serves a fixed row set so the

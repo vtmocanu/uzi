@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // M7 — the part of the /status contract NO golden can cover.

@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // runTitle picks a human display title for a run row. A chat carries Title; an

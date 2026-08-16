@@ -8,11 +8,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
 // rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)

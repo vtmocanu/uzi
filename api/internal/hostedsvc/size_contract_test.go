@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize"
 )
 
 // The cross-module size golden (PRD #58 Decision 7).

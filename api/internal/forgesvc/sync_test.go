@@ -9,9 +9,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeForge is a mocked Forge whose ListIssues and GetMergeRequest are scripted;

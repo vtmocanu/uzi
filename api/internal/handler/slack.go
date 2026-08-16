@@ -10,10 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/slacksvc"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // slackMemberIDPattern is a light shape check on a manual override id (Slack

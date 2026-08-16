@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // loopingRun is a running run whose timestamps are healthy (recent start, recent

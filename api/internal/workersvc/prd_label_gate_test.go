@@ -7,8 +7,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The run-eligibility gate (PRD #102 Decision 14, generalised by PRD #196).

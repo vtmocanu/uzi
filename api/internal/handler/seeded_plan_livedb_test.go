@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #209 M1 milestone gate, against a REAL Postgres, through sqlc-generated SQL.

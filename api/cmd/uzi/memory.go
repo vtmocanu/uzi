@@ -3,7 +3,7 @@ package main
 import (
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // newMemoryCmd — `uzi memory`. list and rm are wired. There is no `save`: writing

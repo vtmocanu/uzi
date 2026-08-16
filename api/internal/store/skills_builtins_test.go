@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/skilltmpl"
+	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 )
 
 // skillReconcilerFake implements builtinSkillReconcilerQueries in memory so the

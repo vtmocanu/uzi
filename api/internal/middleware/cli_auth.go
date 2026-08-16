@@ -4,10 +4,10 @@ import (
 	"log/slog"
 	"net/http"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/clitoken"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // RequireUser authenticates a request from EITHER a browser session cookie OR a

@@ -11,10 +11,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The live-DB half of PRD #66 M6 (D1 layer 3): the claim backstop. A run can be

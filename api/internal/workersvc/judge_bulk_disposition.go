@@ -6,8 +6,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // JudgeDispositionMaxItems caps the coordinates one bulk call may carry (PRD #98 M2).

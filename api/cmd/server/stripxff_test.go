@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
 // stripXFF (PRD #58 M3), layer (b) of two.

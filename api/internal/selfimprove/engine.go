@@ -23,11 +23,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TrackingLabel marks the self-improvement tracking issue on uzi's own repo so the

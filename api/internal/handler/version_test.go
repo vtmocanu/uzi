@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/config"
 )
 
 // getVersion drives GET /api/version and returns the response as a raw key→value

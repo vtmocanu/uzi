@@ -15,7 +15,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 )
 
 // These tests prove the M8 publish algorithm against a LOCAL BARE fixture standing

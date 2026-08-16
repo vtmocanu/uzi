@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/auth"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
 // Config holds all runtime settings derived from the environment.

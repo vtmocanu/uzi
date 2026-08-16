@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
 const (

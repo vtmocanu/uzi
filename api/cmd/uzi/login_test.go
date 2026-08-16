@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // stubLoginHooks replaces the browser-open and inter-poll-wait package vars so a

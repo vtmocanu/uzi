@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // These *LiveDB tests pin PRD #217 M1's park-time exhaustion writes

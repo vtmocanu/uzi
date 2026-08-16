@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // labeledIssue builds a cached issue row carrying the given labels (as the stored

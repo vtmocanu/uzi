@@ -24,8 +24,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // frameWidth/frameHeight are the terminal box every frame is rendered at. 100x34 is a

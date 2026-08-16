@@ -7,7 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // The board: a live list of runs, refreshed on a ListRuns poll (D3 — the board is

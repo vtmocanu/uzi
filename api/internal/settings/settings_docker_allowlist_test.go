@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The docker-worker repo allowlist (PRD #89 M-allow): a comma-separated list of repo

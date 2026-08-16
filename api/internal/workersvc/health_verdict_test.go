@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Issue #182: an awaiting_approval run whose owner ALREADY answered this gate is waiting

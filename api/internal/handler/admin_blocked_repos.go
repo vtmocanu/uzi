@@ -6,9 +6,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/privcheck"
 )
 
 // AdminListBlockedRepos is the admin cross-user blocked-repos read (PRD #66 M9, D8).

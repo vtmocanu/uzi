@@ -10,10 +10,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/pipelinestatus"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
+	"github.com/vtmocanu/uzi/api/internal/pipelinestatus"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PipelineSyncOptions configures one repo's pipeline-status sync pass (PRD #6).

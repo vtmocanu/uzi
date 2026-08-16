@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 // maxErrorBodyBytes bounds how much of a non-2xx response we read back for the

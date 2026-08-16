@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
 // fakeUserForge is a forge.Forge whose only meaningful method is UserExists; the

@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 type fakeSweeper struct {

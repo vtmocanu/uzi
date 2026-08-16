@@ -12,7 +12,7 @@ package privcheck
 import (
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
 // Status is the denormalized worst-case tier of a report, stored on

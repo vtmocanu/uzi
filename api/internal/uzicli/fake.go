@@ -3,7 +3,7 @@ package uzicli
 import (
 	"context"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // FakeClient is an in-memory Client for command tests. It makes no network

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // Client is the read surface the CLI's command stubs depend on. Commands take a

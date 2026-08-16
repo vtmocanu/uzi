@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The controller and worker credentials are separate trust domains, and this file

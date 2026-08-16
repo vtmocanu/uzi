@@ -9,8 +9,8 @@ import (
 	"testing"
 	"unicode/utf16"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // storeRow is the generated query row, aliased only to keep the fixture types legible.

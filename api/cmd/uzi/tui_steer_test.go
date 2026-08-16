@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // PRD #112 M4. The ownership gate is the finding most likely to be waved through, so

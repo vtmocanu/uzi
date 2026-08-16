@@ -3,7 +3,7 @@ package handler
 import (
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
 func TestBuildIssueDetail(t *testing.T) {

@@ -17,11 +17,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/apiclient"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/config"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/kube"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+	"github.com/vtmocanu/uzi/controller/internal/apiclient"
+	"github.com/vtmocanu/uzi/controller/internal/config"
+	"github.com/vtmocanu/uzi/controller/internal/kube"
+	"github.com/vtmocanu/uzi/controller/internal/preset"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 func main() {

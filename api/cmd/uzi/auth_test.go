@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // storeEnv builds an Env backed by a real (temp-dir) Store and a fake client, so

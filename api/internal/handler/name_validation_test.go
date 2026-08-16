@@ -9,9 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // Issue #169, the validator half. `uzi admin workers` and `uzi admin cli-tokens` print a

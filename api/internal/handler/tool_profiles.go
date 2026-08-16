@@ -12,11 +12,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/toolseed"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/toolprofile"
+	"github.com/vtmocanu/uzi/api/internal/toolseed"
 )
 
 // maxProfilePackages bounds a repo tool profile's package list.

@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // fakeForge is a mocked Forge whose VerifyToken and ListProjects are scripted;
@@ -150,7 +150,7 @@ func TestForgeConnectionHappyPath(t *testing.T) {
 	ff := &fakeForge{
 		identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
 		projects: []forge.Project{
-			{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi", WebURL: "https://gitlab.example.com/vtmocanu/uzi", DefaultBranch: "main"},
+			{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi", WebURL: "https://github.com/vtmocanu/uzi", DefaultBranch: "main"},
 			{ForgeProjectID: 2, PathWithNamespace: "vtmocanu/other", WebURL: "https://gitlab.example.com/vtmocanu/other"},
 		},
 	}

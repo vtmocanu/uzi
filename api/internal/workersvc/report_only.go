@@ -5,9 +5,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/termsafe"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // clampWireReportOnly gates the worker's report_only declaration to issue runs

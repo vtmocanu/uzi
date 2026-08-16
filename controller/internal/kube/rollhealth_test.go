@@ -17,8 +17,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // Roll-health derivation (PRD #113 M3). The headline test is the two-tick one at the

@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // cardDTO.Labels must never reach the wire as JSON null (PRD #102 M6).

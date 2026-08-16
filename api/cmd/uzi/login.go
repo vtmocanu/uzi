@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // openBrowser launches the consent URL in the user's browser. It is a package var

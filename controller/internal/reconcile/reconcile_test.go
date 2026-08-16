@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
 type fakePoller struct {

@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 )
 
 // TestLimitWindowFor pins the ONE window mapping shared by deadCredentialReset (the

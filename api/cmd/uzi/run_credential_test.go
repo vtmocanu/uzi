@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 )
 
 // PRD #111 M5 — the CLI half of D20: the run view names the MODE, not just the token.

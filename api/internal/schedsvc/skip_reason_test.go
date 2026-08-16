@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestSkipReasonEnumIsHonest pins the Go side of the SkipReason contract internally

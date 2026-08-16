@@ -3,7 +3,7 @@ package forgesvc
 import (
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
+	"github.com/vtmocanu/uzi/api/internal/board"
 )
 
 // PRD #102 M2 / Decision 2. Nothing asserted on DefaultColumns before this, so the

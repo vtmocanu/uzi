@@ -3,8 +3,8 @@ package middleware
 import (
 	"net/http"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
 )
 
 // RequireController authenticates the hosted-worker controller (PRD #58 Decision

@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // seededRow builds the row a boot-time reconcile would produce for a builtin:

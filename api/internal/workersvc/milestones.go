@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // Milestone is one entry of a run's milestone list (PRD #122): a small {id, title}

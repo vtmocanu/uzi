@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 // slackBaseEnv sets the minimum valid environment for a full Load(): DB URL, a

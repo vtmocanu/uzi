@@ -24,7 +24,7 @@ import (
 	"sort"
 	"strings"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // maxPkgLen bounds a package token (name or name@version). The regex charset is

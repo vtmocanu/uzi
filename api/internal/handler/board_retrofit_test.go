@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/board"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func col(name string, pos int32) store.BoardColumn {

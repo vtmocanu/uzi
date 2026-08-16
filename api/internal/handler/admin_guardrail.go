@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
 
 // AdminGuardrailImpact is the admin-only, read-only pre-flight impact count for

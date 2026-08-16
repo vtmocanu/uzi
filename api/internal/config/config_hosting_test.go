@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 // hostingBaseEnv sets a syntactically valid minimum environment so each test can

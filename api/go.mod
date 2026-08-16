@@ -1,4 +1,4 @@
-module gitlab.example.com/vtmocanu/uzi/api
+module github.com/vtmocanu/uzi/api
 
 go 1.26.4
 

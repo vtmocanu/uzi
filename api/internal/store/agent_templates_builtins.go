@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // builtinReconcilerQueries is the query subset ReconcileBuiltinTemplates needs.

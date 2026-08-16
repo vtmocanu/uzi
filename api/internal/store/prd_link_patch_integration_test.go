@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The SQL half of PRD #72 M5. The forgesvc tests drive the watcher against a fake

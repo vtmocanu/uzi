@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestListRunInputsForRunLiveDB exercises judge.sql's ListRunInputsForRun against a REAL

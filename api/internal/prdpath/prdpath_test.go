@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.example.com/vtmocanu/uzi/api/internal/prdpath"
+	"github.com/vtmocanu/uzi/api/internal/prdpath"
 )
 
 func TestValidateAccepts(t *testing.T) {
