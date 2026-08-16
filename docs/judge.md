@@ -315,7 +315,7 @@ cleared for good if the review itself is deleted (e.g. the run is deleted).
 A recommendation that asks to enable or install a **credential-bearing CLI that
 uzi's policy permanently bars** — `glab`, `gh`, `aws`, `az`, and the like — can
 never be actioned: workers are deliberately denied those tools, so the finding is
-a dead end no matter how the judge phrased it. uzi recognises this case and
+a dead end however the tool is named in the recommendation. uzi recognises this case and
 **dismisses the recommendation for you automatically**, as **Won't do**. On the
 [Judge menu](./judge-menu.md) the occurrence reads **"Dismissed · barred CLI"**
 rather than a plain "Dismissed", so an auto-dismissal is always distinguishable

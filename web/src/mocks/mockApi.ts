@@ -2929,7 +2929,7 @@ export const mockApi = {
     // read "✓ Done", not "Done via #91". Object.assign copies only the keys `next` HAS, so
     // omitting this would leave a stale set_via on the existing row and the mock would demo
     // exactly the misattribution the server's literal NULL exists to prevent.
-    const next: Disposition & { set_via?: "issue_close" } = {
+    const next: Disposition & { set_via?: "issue_close" | "denied_cli" } = {
       category: rec.category,
       target: rec.target,
       status,
@@ -3021,7 +3021,7 @@ export const mockApi = {
         // set_via explicitly cleared: a bulk group action is a HUMAN write too, so it must
         // drop any issue-close provenance rather than inherit it (see the single-coordinate
         // path above for why Object.assign makes the omission a live bug, not a tidiness nit).
-        const next: Disposition & { set_via?: "issue_close" } = {
+        const next: Disposition & { set_via?: "issue_close" | "denied_cli" } = {
           category: rec.category,
           target: rec.target,
           status,
