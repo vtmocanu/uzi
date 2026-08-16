@@ -58,7 +58,7 @@ export const minsAhead = (m: number) => new Date(NOW + m * 60_000).toISOString()
 export const mockAdmin: User = {
   id: "u-admin",
   email: "vlad@uzi.local",
-  display_name: "Vlad",
+  display_name: "Robin Diaz",
   is_admin: true,
   is_active: true,
   autopilot_enabled: false,
@@ -76,7 +76,7 @@ export const mockUsers: User[] = [
   {
     id: "u-mira",
     email: "mira@uzi.local",
-    display_name: "Mira Ionescu",
+    display_name: "Alex Rivera",
     is_admin: false,
     is_active: true,
     autopilot_enabled: true,
@@ -95,7 +95,7 @@ export const mockUsers: User[] = [
   {
     id: "u-andrei",
     email: "andrei@uzi.local",
-    display_name: "Andrei Pop",
+    display_name: "Sam Chen",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -127,7 +127,7 @@ export const mockUsers: User[] = [
   {
     id: "u-radu",
     email: "radu@uzi.local",
-    display_name: "Radu Marin",
+    display_name: "Jordan Kim",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -142,7 +142,7 @@ export const mockUsers: User[] = [
   {
     id: "u-mihai",
     email: "mihai@uzi.local",
-    display_name: "Mihai Radu",
+    display_name: "Priya Nair",
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
@@ -398,7 +398,7 @@ export const mockNotifications: MockNotification[] = [
     read_at: null,
     created_at: minsAgo(120),
     owner_email: "mira@uzi.local",
-    owner_display_name: "Mira Ionescu",
+    owner_display_name: "Alex Rivera",
   },
 ];
 
@@ -1041,7 +1041,7 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
     health: "ok",
     health_reason: null,
     health_since: null,
-    owner_name: "Vlad",
+    owner_name: "Robin Diaz",
     worker_name: null,
     is_mine: true,
     run_count: 1,
@@ -2034,13 +2034,13 @@ export const mockSkills: Skill[] = [
     updated_at: daysAgo(1),
   },
   {
-    // Owned by another user (Mira). The admin session sees it in the "Other
+    // Owned by another user (Alex). The admin session sees it in the "Other
     // users" group (view-only — admins can read but not edit others' private
-    // skills); signed in as Mira it is her "Mine".
-    id: "skill-mira-runbook",
-    name: "mira-deploy-runbook",
-    description: "Mira's personal runbook for the staging deploy dance.",
-    body: "# mira-deploy-runbook\n\nThe order I run the staging promotion steps in…",
+    // skills); signed in as Alex it is their "Mine".
+    id: "skill-alex-runbook",
+    name: "alex-deploy-runbook",
+    description: "Alex's personal runbook for the staging deploy dance.",
+    body: "# alex-deploy-runbook\n\nThe order I run the staging promotion steps in…",
     scope: "user",
     user_id: "u-mira",
     updated_by: "mira@uzi.local",

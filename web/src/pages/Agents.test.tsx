@@ -25,7 +25,7 @@ const mockUseAuth = vi.mocked(useAuth);
 const MEMBER: User = {
   id: "u-mira",
   email: "mira@uzi.local",
-  display_name: "Mira",
+  display_name: "Alex",
   is_admin: false,
   is_active: true,
   autopilot_enabled: false,
