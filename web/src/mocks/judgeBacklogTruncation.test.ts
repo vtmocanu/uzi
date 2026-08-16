@@ -32,7 +32,7 @@ describe("demo-mode backlog truncation: the cut", () => {
     setScenario("");
     const b = await mockApi.getJudgeBacklog("all");
     expect(b.truncated, "the demo backlog truncates with no scenario set: this state must be opt-in").toBe(false);
-    expect(b.groups.length, "the uncapped demo backlog no longer returns all 7 groups").toBe(7);
+    expect(b.groups.length, "the uncapped demo backlog no longer returns all 8 groups").toBe(8);
   });
 
   it("only demos something if the demo data outgrows the cap", async () => {
@@ -92,7 +92,7 @@ describe("demo-mode backlog truncation: the cut", () => {
     setScenario(SCENARIO);
     const cut = (await mockApi.getJudgeBacklog("all")).groups;
 
-    expect(whole.length, "precondition: the uncapped demo backlog must hold 7 groups").toBe(7);
+    expect(whole.length, "precondition: the uncapped demo backlog must hold 8 groups").toBe(8);
     expect(cut.length, "the truncated page returns a different number of groups than the cut accounts for").toBe(5);
     // enable_tool/ripgrep is the demo's auto-done (set_via=issue_close). It vanishes entirely
     // from the truncated page -- which is precisely the case the banner exists for: absent is

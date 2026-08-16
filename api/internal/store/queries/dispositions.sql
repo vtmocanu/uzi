@@ -44,6 +44,19 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         updated_at     = now()
 RETURNING *;
 
+-- name: SystemDismissDeniedCLIRecommendation :execrows
+-- The deterministic net (issue #167): auto-dismiss a recommendation whose target names a
+-- denylisted credential-bearing CLI. status/dismiss_reason/set_via/set_by_user_id are
+-- SERVER-SIDE LITERALS (never from a request body — same principle as the issue_close sync).
+-- set_via='denied_cli' is the self-measuring provenance. ON CONFLICT DO NOTHING so a human's
+-- existing verdict on the coordinate is NEVER overwritten. rationale_hash is stamped so the
+-- stale flag stays honest, matching UpsertRecommendationDisposition.
+INSERT INTO recommendation_dispositions
+    (review_id, category, target, status, dismiss_reason, rationale_hash, set_via, set_by_user_id)
+VALUES
+    (@review_id, @category, @target, 'dismissed', 'wont_do', @rationale_hash, 'denied_cli', NULL)
+ON CONFLICT (review_id, category, target) DO NOTHING;
+
 -- name: DeleteRecommendationDisposition :execrows
 -- Undo (Decision 6): delete the coordinate row, returning the recommendation to whatever
 -- the settled-filed axis says (settled link → "Filed", else "To do"). Idempotent — a

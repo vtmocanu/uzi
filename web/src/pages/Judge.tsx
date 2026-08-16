@@ -953,13 +953,15 @@ function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
 }
 
 // OccurrenceBucketChip renders one occurrence's triage state from its bucket. The
-// occurrence DTO carries no dismiss reason, so a dismissed occurrence reads a plain
+// occurrence DTO carries no dismiss reason, so a HAND-dismissed occurrence reads a plain
 // "Dismissed" — the group-level controls carry the won't-do / not-an-issue distinction.
 //
-// A DONE splits by provenance (PRD #98 Decision 6): a person's "✓ Done" and the M6
-// issue-close sync's "Done via #IID" are different claims, and rendering them identically
-// attributes a system inference to the user. Both are bucket "done", so the split is on
-// set_via, which is the only thing that carries the difference.
+// Both DONE and DISMISSED split by provenance (PRD #98 Decision 6; issue #167). A person's
+// "✓ Done" and the M6 issue-close sync's "Done via #IID" are different claims, as are a
+// person's "Dismissed" and the system's auto-dismissal of a recommendation naming a
+// policy-barred credential-bearing CLI (set_via "denied_cli") — rendering either pair
+// identically attributes a system inference to the user. The split is on set_via, which is
+// the only thing that carries the difference within a single bucket.
 function OccurrenceBucketChip({ occ }: { occ: JudgeOccurrence }) {
   switch (occ.bucket) {
     case "done":
@@ -981,6 +983,16 @@ function OccurrenceBucketChip({ occ }: { occ: JudgeOccurrence }) {
         </Badge>
       );
     case "dismissed":
+      if (occ.set_via === "denied_cli") {
+        return (
+          <Badge
+            tone="neutral"
+            title="Automatically dismissed: this recommended a credential-bearing CLI that policy permanently bars (e.g. glab, gh, aws)"
+          >
+            Dismissed · barred CLI
+          </Badge>
+        );
+      }
       return <Badge tone="neutral">Dismissed</Badge>;
     case "filed":
       return occ.filed_issue && isHttpsUrl(occ.filed_issue.issue_url) ? (

@@ -648,6 +648,65 @@ describe("Judge — an auto-done is visibly distinct from a hand-marked done (PR
   });
 });
 
+describe("Judge — an auto-dismissed barred-CLI rec is visibly distinct from a hand-dismissed one (issue #167)", () => {
+  // Mirror of the done split above, one rung down: a person's "Dismissed" and the system's
+  // auto-dismissal of a recommendation naming a policy-barred credential-bearing CLI are
+  // DIFFERENT claims. Both are bucket "dismissed", so the load-bearing assertion is that the
+  // two chips differ — a test that only checked the auto-dismissal renders would pass
+  // unchanged if both rendered a plain "Dismissed", which is the state this ships to fix.
+  async function expandedChips(occurrences: JudgeRecommendationGroup["occurrences"]) {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        bucket: "dismissed",
+        groups: [group({ bucket: "dismissed", open_count: 0, occurrences })],
+        triage: { total: 2, todo: 0, filed: 0, done: 0, dismissed: 2, false_positives: 0 },
+      }),
+    );
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+    // Guard the fixture the same way the done suite does: every occurrence must bucket
+    // "dismissed", else this silently becomes a ladder test.
+    for (const o of occurrences) {
+      if (o.bucket !== "dismissed") {
+        throw new Error(
+          `fixture broken: every occurrence must bucket "dismissed" (got ${o.bucket}) — otherwise this ` +
+            "proves something about the ladder, not about set_via",
+        );
+      }
+    }
+    return screen.getAllByRole("listitem");
+  }
+
+  it("labels a denied_cli auto-dismissal 'Dismissed · barred CLI' with an explanatory title, a hand-dismissal just 'Dismissed'", async () => {
+    await expandedChips([
+      occ({ run_id: "run-auto", rec_id: "rec-auto", run_title: "auto run", bucket: "dismissed", set_via: "denied_cli" }),
+      occ({ run_id: "run-hand", rec_id: "rec-hand", run_title: "hand run", bucket: "dismissed" }),
+    ]);
+
+    const auto = screen.getByText("auto run").closest("li")!;
+    const hand = screen.getByText("hand run").closest("li")!;
+    expect(auto).not.toBe(hand);
+    expect(auto.contains(hand)).toBe(false);
+
+    // The auto-dismissal carries the distinct label and the policy explanation in its title.
+    // The occurrence row also holds a verdict chip with its OWN title, so pick the badge by
+    // its visible label rather than the first titled element in the row.
+    expect(auto.textContent).toContain("Dismissed · barred CLI");
+    const badge = Array.from(auto.querySelectorAll("[title]")).find((el) =>
+      el.textContent?.includes("Dismissed · barred CLI"),
+    )!;
+    expect(badge).not.toBeUndefined();
+    expect(badge.getAttribute("title") ?? "").toContain("credential-bearing CLI that policy permanently bars");
+
+    // ...and the hand-dismissal is a plain "Dismissed" with no such label or title.
+    expect(hand.textContent).toContain("Dismissed");
+    expect(hand.textContent).not.toContain("barred CLI");
+    // The two chips must render DIFFERENTLY — the same chip for both is the bug this fixes.
+    expect(auto.textContent).not.toEqual(hand.textContent);
+  });
+});
+
 describe("Judge — inbox-zero is a first-class view (PRD #98 Decision 8)", () => {
   it("renders the zero-state (and the opt-in card when the judge is off) when triage.todo is 0", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { judge_enabled: false } } as unknown as ReturnType<typeof useAuth>);

@@ -445,6 +445,9 @@ var inventoryPackages = []string{".", "../handler"}
 var queryInventory = []queryPin{
 	{"UpsertRecommendationDisposition", "dispositions.sql", "TestRecommendationDispositionsLiveDB",
 		"direct call, recommendation_dispositions_integration_test.go:108"},
+	{"SystemDismissDeniedCLIRecommendation", "dispositions.sql", "TestPostReviewAutoDismissesDeniedCLILiveDB",
+		"issue #167 net; reached through svc.PostReview → autoDismissDeniedCLIRecommendations " +
+			"(../handler denied_cli_dismiss_livedb_test.go), which asserts the denied_cli row it writes"},
 	{"DeleteRecommendationDisposition", "dispositions.sql", "TestRecommendationDispositionsLiveDB",
 		"direct call, recommendation_dispositions_integration_test.go:243"},
 	{"ListDispositionsForReview", "dispositions.sql", "TestRecommendationDispositionsLiveDB",

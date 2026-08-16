@@ -310,6 +310,26 @@ later re-judge raises the same finding again, your old disposition
 reappears — with the staleness check above applying as usual. It's only
 cleared for good if the review itself is deleted (e.g. the run is deleted).
 
+## Barred-CLI recommendations are dismissed for you
+
+A recommendation that asks to enable or install a **credential-bearing CLI that
+uzi's policy permanently bars** — `glab`, `gh`, `aws`, `az`, and the like — can
+never be actioned: workers are deliberately denied those tools, so the finding is
+a dead end however the tool is named in the recommendation. uzi recognises this case and
+**dismisses the recommendation for you automatically**, as **Won't do**. On the
+[Judge menu](./judge-menu.md) the occurrence reads **"Dismissed · barred CLI"**
+rather than a plain "Dismissed", so an auto-dismissal is always distinguishable
+from one you made yourself — and its rate across your backlog is observable
+through that distinct label.
+
+This is the deterministic backstop behind the judge model's own guidance not to
+recommend barred tools: even when a retrospective slips one through, the
+dismissal still lands. And it costs nothing permanent if the match is ever wrong
+— the dismissal is **visible and reversible** like any other. Click **Undo** on
+the row (or run `uzi review undo <run-id> <rec-id>` — see [Reviewing and triaging
+from the CLI](./cli.md#reviewing-and-triaging-from-the-cli)) and it returns to
+**To do** for you to triage by hand.
+
 ## Which runs are judged
 
 Only finished **issue** and **CI-fix** runs are eligible. Chat runs, judge

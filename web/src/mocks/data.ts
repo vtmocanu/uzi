@@ -438,11 +438,13 @@ export interface MockReview {
   // `triage` from these + filed_issues on every mutation, matching the server ladder.
   //
   // `set_via` mirrors the recommendation_dispositions column (PRD #98 Decision 6): absent
-  // means a PERSON set it, "issue_close" means the M6 poller sync did. It is a MOCK-side
-  // extension of Disposition because the run-page DTO does not carry provenance — only the
-  // Judge menu's occurrence does — and without it the mock cannot render an auto-done at
-  // all, which is the one state the "done via #IID" label exists for.
-  dispositions: (Disposition & { set_via?: "issue_close" })[];
+  // means a PERSON set it, "issue_close" means the M6 poller sync did, and "denied_cli"
+  // (issue #167) means the system auto-dismissed a recommendation naming a policy-barred
+  // credential-bearing CLI. It is a MOCK-side extension of Disposition because the run-page
+  // DTO does not carry provenance — only the Judge menu's occurrence does — and without it
+  // the mock cannot render an auto-done or an auto-dismissal at all, the two states the
+  // "Done via #IID" and "Dismissed · barred CLI" labels exist for.
+  dispositions: (Disposition & { set_via?: "issue_close" | "denied_cli" })[];
   triage: TriageCounts;
   // The judge run's OWN timing + token/cost usage (PRD #69 M6), for the panel's
   // time/tokens/cost strip. Shape mirrors the real ReviewDTO.judge_run: `usage` is null
@@ -630,6 +632,18 @@ export const mockReviews: MockReview[] = [
         confidence: "low",
         created_at: minsAgo(120),
       },
+      {
+        id: "rc-4",
+        category: "install_worker_tool",
+        // Names a credential-bearing CLI uzi's policy permanently bars, so the M-issue-167
+        // backstop auto-dismissed it — the auto-dismissal the Judge menu labels
+        // "Dismissed · barred CLI", visibly distinct from rev-done's hand-dismissed
+        // improve_agent/reviewer. Both grammars are seeded so the difference is demoable.
+        target: "glab",
+        rationale_md: "The agent needed to open a merge request and had no CLI; installing `glab` on the worker would let it.",
+        confidence: "medium",
+        created_at: minsAgo(120),
+      },
     ],
     // ripgrep was filed as #91 and that issue has since been CLOSED, so the M6 poller sync
     // marked the coordinate done on its own — the auto-done the Judge menu labels
@@ -648,10 +662,15 @@ export const mockReviews: MockReview[] = [
     dispositions: [
       // set_by_user_id would be NULL server-side: nobody clicked this.
       { category: "enable_tool", target: "ripgrep", status: "done", reason: "", set_at: minsAgo(30), stale: false, set_via: "issue_close" },
+      // Also system-authored: the issue #167 backstop dismisses a barred-CLI recommendation
+      // with wont_do provenance denied_cli. set_by_user_id would be NULL — nobody clicked it.
+      { category: "install_worker_tool", target: "glab", status: "dismissed", reason: "wont_do", set_at: minsAgo(20), stale: false, set_via: "denied_cli" },
     ],
-    // total 3: todo 2 (rc-1, rc-2), done 1 (rc-3 — auto, via the closed #91). The done rung
-    // outranks filed on the shared ladder, so the filed link above does NOT make it filed.
-    triage: { total: 3, todo: 2, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+    // total 4: todo 2 (rc-1, rc-2), done 1 (rc-3 — auto, via the closed #91), dismissed 1
+    // (rc-4 — auto, the barred-CLI backstop; wont_do, so it is NOT a false positive). The
+    // done rung outranks filed on the shared ladder, so the filed link above does NOT make
+    // ripgrep filed.
+    triage: { total: 4, todo: 2, filed: 0, done: 1, dismissed: 1, false_positives: 0 },
     // A judge run on a SUBSCRIPTION plan (PRD #69 M6): the SDK prices it at $0, so the
     // Cost tile renders "—" (never "$0.00") while the token + duration tiles still show.
     judge_run: {
