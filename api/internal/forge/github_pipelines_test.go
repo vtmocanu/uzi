@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,44 @@ func TestGitHubLatestMRPipelineNoHeadIsError(t *testing.T) {
 	_, err := d.LatestMRPipeline(context.Background(), 7, 4)
 	if err == nil || err == ErrNoPipeline {
 		t.Fatalf("a headless PR must be a real error, not ErrNoPipeline; got %v", err)
+	}
+}
+
+// TestGitHubLatestPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin: a
+// hostile forge returning {"workflow_runs":[null],"total_count":1} decodes to a
+// slice with a nil *WorkflowRun, which passes the len==0 guard. Without the
+// nil-element guard the toGitHubPipeline deref panics; with it the driver returns
+// ErrNoPipeline.
+func TestGitHubLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	if _, err := d.LatestPipeline(context.Background(), 7, "feature"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR path: the PR resolves with a head sha, then the runs endpoint returns a null
+// entry. The nil-element guard returns ErrNoPipeline rather than panicking.
+func TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 4, "state": "open",
+				"head": map[string]any{"sha": "headsha999"},
+			})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 4); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
 	}
 }
 

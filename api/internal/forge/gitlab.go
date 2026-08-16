@@ -436,7 +436,10 @@ func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string
 	if err != nil {
 		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest pipeline: %w", err))
 	}
-	if len(pipelines) == 0 {
+	// A hostile forge could return a one-element list whose single entry is a JSON
+	// null, which decodes to a nil *PipelineInfo that passes len==0 but panics on
+	// deref; reject it as "no pipeline".
+	if len(pipelines) == 0 || pipelines[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toPipeline(pipelines[0]), nil
@@ -455,14 +458,19 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if err != nil {
 		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest MR pipeline: %w", err))
 	}
-	if len(pipelines) == 0 {
-		return Pipeline{}, ErrNoPipeline
-	}
-	newest := pipelines[0]
-	for _, p := range pipelines[1:] {
-		if p.ID > newest.ID {
+	// Skip nil elements: a hostile forge could return a null entry in the list,
+	// which decodes to a nil *PipelineInfo and would panic the max-by-id scan.
+	var newest *gitlab.PipelineInfo
+	for _, p := range pipelines {
+		if p == nil {
+			continue
+		}
+		if newest == nil || p.ID > newest.ID {
 			newest = p
 		}
+	}
+	if newest == nil {
+		return Pipeline{}, ErrNoPipeline
 	}
 	return toPipeline(newest), nil
 }

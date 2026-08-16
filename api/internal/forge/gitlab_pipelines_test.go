@@ -113,6 +113,41 @@ func TestLatestMRPipelineNoPipelineMapsToErrNoPipeline(t *testing.T) {
 	}
 }
 
+// TestLatestPipelineNilElementMapsToErrNoPipeline is the issue-74 M2 pin: a hostile
+// forge returning a one-element list whose single entry is JSON null decodes to a
+// slice with a nil *PipelineInfo, which passes the len==0 guard. Without the
+// nil-element guard the toPipeline deref panics; with it the driver returns
+// ErrNoPipeline.
+func TestLatestPipelineNilElementMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/pipelines": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]any{nil}) // body: [null]
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	if _, err := d.LatestPipeline(context.Background(), 7, "main"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestLatestMRPipelineNilElementMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR-pipelines max-by-id scan: a null entry decodes to a nil *PipelineInfo whose
+// .ID deref would panic. The nil-skipping scan drops it and, with no other rows,
+// returns ErrNoPipeline.
+func TestLatestMRPipelineNilElementMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/merge_requests/13/pipelines": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]any{nil}) // body: [null]
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 13); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR-pipeline list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
 func TestListPipelineJobsPaginates(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/pipelines/99/jobs": func(w http.ResponseWriter, r *http.Request) {

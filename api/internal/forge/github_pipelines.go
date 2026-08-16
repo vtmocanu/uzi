@@ -36,7 +36,9 @@ func (g *github) LatestPipeline(ctx context.Context, projectID int64, ref string
 	if err != nil {
 		return Pipeline{}, g.wrapErr("latest pipeline", err)
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *WorkflowRun that passes len==0 but panics on deref.
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil
@@ -68,7 +70,9 @@ func (g *github) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if err != nil {
 		return Pipeline{}, g.wrapErr("latest MR pipeline", err)
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *WorkflowRun that passes len==0 but panics on deref.
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil

@@ -151,6 +151,46 @@ func TestForgejoLatestMRPipelineMalformedPRNotNoPipeline(t *testing.T) {
 	}
 }
 
+// TestForgejoLatestPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin: a
+// hostile forge returning {"total_count":1,"workflow_runs":[null]} decodes to a
+// slice with a nil *ActionWorkflowRun, which passes the len==0 guard. Without the
+// nil-element guard the toForgejoPipeline deref panics; with it the driver returns
+// ErrNoPipeline.
+func TestForgejoLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	if _, err := d.LatestPipeline(context.Background(), 7, "main"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestForgejoLatestMRPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR path: the PR resolves with a head sha, then the runs endpoint returns a null
+// entry. The nil-element guard returns ErrNoPipeline rather than panicking.
+func TestForgejoLatestMRPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/12": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "number": 12,
+				"head": map[string]any{"sha": "headsha999", "ref": "feature-x"},
+			})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 12); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
 // TestForgejoListPipelineJobs is test #11 (the parse half): the run's jobs come back
 // with name/status mapped, Status passed through as the raw Actions enum, and Stage
 // left empty (Forgejo Actions has no stage model).

@@ -57,7 +57,9 @@ func (f *forgejo) LatestPipeline(ctx context.Context, projectID int64, ref strin
 	if err != nil {
 		return Pipeline{}, f.redact.error(fmt.Errorf("forgejo: latest pipeline: %w", err))
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *ActionWorkflowRun that passes len==0 but panics on deref.
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toForgejoPipeline(runs.WorkflowRuns[0]), nil
@@ -99,7 +101,9 @@ func (f *forgejo) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) 
 	if err != nil {
 		return Pipeline{}, f.redact.error(fmt.Errorf("forgejo: latest MR pipeline: %w", err))
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *ActionWorkflowRun that passes len==0 but panics on deref.
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toForgejoPipeline(runs.WorkflowRuns[0]), nil
