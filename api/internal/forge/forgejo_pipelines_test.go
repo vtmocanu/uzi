@@ -242,6 +242,29 @@ func TestForgejoJobLogTailWholeLog(t *testing.T) {
 	}
 }
 
+// TestForgejoJobLogTailByteBoundsOversizedLog is the issue-74 M1 regression pin: a
+// hostile forge streaming a log LARGER than maxTraceBytes (16 MiB) must trip the
+// fail-closed ceiling and return an error with an empty tail, never buffer the whole
+// body. The driver now reads the logs endpoint through rawGetLimited's io.LimitReader,
+// so the transfer stops at maxTraceBytes+1 bytes rather than OOMing on a multi-GB body.
+func TestForgejoJobLogTailByteBoundsOversizedLog(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/jobs/888/logs": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	got, err := d.JobLogTail(context.Background(), 7, 888, 32*1024)
+	if err == nil {
+		t.Fatal("an oversized log must trip the ceiling error, got nil")
+	}
+	if got != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(got))
+	}
+}
+
 // TestForgejoJobLogTailRedactsToken: a hostile pipeline that echoes the bot's own
 // PAT into its log must not have it survive into the returned tail (the CI-fix
 // snapshot path). Covers the log-BODY redaction, distinct from the error-path

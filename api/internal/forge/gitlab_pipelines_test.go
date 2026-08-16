@@ -190,6 +190,30 @@ func TestJobLogTailReturnsFullTraceUnderCap(t *testing.T) {
 	}
 }
 
+// TestJobLogTailByteBoundsOversizedTrace is the issue-74 M1 regression pin: a
+// hostile forge streaming a trace LARGER than maxTraceBytes (16 MiB) must trip the
+// fail-closed ceiling and return an error with an empty tail, never buffer the whole
+// body. The driver now reads the raw trace endpoint through an io.LimitReader, so the
+// transfer stops at maxTraceBytes+1 bytes rather than OOMing on a multi-GB body.
+func TestJobLogTailByteBoundsOversizedTrace(t *testing.T) {
+	var wrote int
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/jobs/500/trace": func(w http.ResponseWriter, _ *http.Request) {
+			n, _ := w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+			wrote = n
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	tail, err := d.JobLogTail(context.Background(), 7, 500, 32*1024)
+	if err == nil {
+		t.Fatalf("an oversized trace must trip the ceiling error, got nil (wrote %d bytes)", wrote)
+	}
+	if tail != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(tail))
+	}
+}
+
 func TestJobLogTailKeepsValidUTF8AfterCut(t *testing.T) {
 	// The byte-boundary cut can land mid-rune; the driver drops leading continuation
 	// bytes so the tail is valid UTF-8. Build a trace whose last maxBytes would start

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,9 +29,17 @@ const maxTraceBytes = 16 << 20 // 16 MiB
 
 // gitLab is the GitLab REST driver. The embedded redactor scrubs the PAT out of
 // every error the underlying client hands back before it leaves this package.
+//
+// baseURL/token/httpClient are retained alongside the SDK client so JobLogTail
+// can bypass the SDK and stream the job trace under an io.LimitReader: client-go's
+// GetTraceFile buffers the whole trace into memory before returning it, so a raw
+// bounded GET is the only way to cap the TRANSFER rather than a post-buffer copy.
 type gitLab struct {
-	client *gitlab.Client
-	redact redactor
+	client     *gitlab.Client
+	redact     redactor
+	baseURL    string
+	token      string
+	httpClient *http.Client
 }
 
 // newGitLab builds a GitLab driver against baseURL using token, with a bounded
@@ -39,16 +48,23 @@ type gitLab struct {
 // timeout client so no call can hang forever (multica's untimeouted-client wart
 // is avoided). baseURL is assumed allowlist-checked by the caller.
 func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
+	hc := timeoutClient(timeout)
 	client, err := gitlab.NewClient(token,
 		gitlab.WithBaseURL(baseURL),
-		gitlab.WithHTTPClient(timeoutClient(timeout)),
+		gitlab.WithHTTPClient(hc),
 	)
 	if err != nil {
 		// NewClient failure can only stem from the base URL here; still route
 		// it through a redactor in case the token ever appears.
 		return nil, newRedactor(token).error(fmt.Errorf("gitlab: new client: %w", err))
 	}
-	return &gitLab{client: client, redact: newRedactor(token)}, nil
+	return &gitLab{
+		client:     client,
+		redact:     newRedactor(token),
+		baseURL:    strings.TrimSuffix(baseURL, "/"),
+		token:      token,
+		httpClient: hc,
+	}, nil
 }
 
 func (g *gitLab) VerifyToken(ctx context.Context) (BotIdentity, error) {
@@ -458,20 +474,32 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 
 func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {
 	// The trace endpoint streams the WHOLE log (no server-side range/tail), so we
-	// download it and keep only the last maxBytes. Confined to fix-trigger time
-	// (never the poll tick), so the full download is acceptable. The tail runs
-	// through the PAT redactor: a hostile pipeline could echo the bot's own token
-	// into its log, and it must not survive into a snapshot.
-	reader, _, err := g.client.Jobs.GetTraceFile(projectID, jobID, gitlab.WithContext(ctx))
+	// download it and keep only the last maxBytes. We bypass the SDK's GetTraceFile,
+	// which buffers the entire trace into memory before returning it: a raw GET read
+	// through an io.LimitReader byte-bounds the TRANSFER itself, so a hostile forge
+	// streaming a multi-GB body cannot OOM the api before the ceiling check fires.
+	// text/plain, no redirect — a plain bounded GET is correct. The tail runs through
+	// the PAT redactor: a hostile pipeline could echo the bot's own token into its
+	// log, and it must not survive into a snapshot.
+	url := g.baseURL + "/api/v4/projects/" + strconv.FormatInt(projectID, 10) + "/jobs/" + strconv.FormatInt(jobID, 10) + "/trace"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: build request: %w", err))
+	}
+	req.Header.Set("PRIVATE-TOKEN", g.token)
+	resp, err := g.httpClient.Do(req)
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: %w", err))
 	}
-	// Fail closed past a hard ceiling. client-go buffers the whole trace, so the
-	// transient download is bounded by FORGE_HTTP_TIMEOUT (time), not bytes; this
-	// guards the processing/storage path against a pathologically large trace rather
-	// than scanning/truncating an unbounded buffer. The returned tail is separately
-	// capped to maxBytes below.
-	data, err := io.ReadAll(io.LimitReader(reader, maxTraceBytes+1))
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 != 2 {
+		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: status %d", resp.StatusCode))
+	}
+	// Fail closed past a hard ceiling. The LimitReader bounds the transfer to
+	// maxTraceBytes+1 bytes, so the read stops long before a pathological body is
+	// fully received; the ceiling check below then errors rather than returning it.
+	// The returned tail is separately capped to maxBytes.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxTraceBytes+1))
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: read job trace: %w", err))
 	}

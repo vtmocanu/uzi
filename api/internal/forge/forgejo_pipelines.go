@@ -20,10 +20,11 @@ import (
 //     the server (version.go:98-100). So the SDK never rejects Forgejo's
 //     +gitea-1.22.0 compatibility version, and never makes its own /version call.
 //   - GetRepoActionJobLogs returns the whole body via an unbounded io.ReadAll
-//     (client.go). This is the SAME memory profile as the shipped GitLab driver:
-//     client-go's GetTraceFile also buffers the entire trace into a bytes.Buffer
-//     and returns a reader over it (v2.44.0 jobs.go:343), so neither driver is
-//     transfer-bounded. See JobLogTail.
+//     (client.go), so the driver does NOT use it: JobLogTail fetches the log
+//     through rawGetLimited, an io.LimitReader-bounded raw GET, so the transfer is
+//     byte-bounded and a hostile forge cannot OOM the api. The GitLab driver does
+//     the same for the same reason (its client-go GetTraceFile likewise buffers the
+//     whole trace before returning it). See JobLogTail.
 //
 // Status is passed through verbatim everywhere: the neutral Pipeline/Job.Status is
 // the Forgejo Actions RUN-status enum (unknown|waiting|running|success|failure|
@@ -142,17 +143,15 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 }
 
 // JobLogTail returns at most maxBytes from the END of a job's log (a failure's
-// cause concludes its log); maxBytes <= 0 returns the whole log. GetRepoActionJobLogs
-// GETs /actions/jobs/{job_id}/logs (text/plain). The gitea SDK reads the whole body
-// into memory with an unbounded io.ReadAll before we see its size, so the transient
-// download is bounded by FORGE_HTTP_TIMEOUT (time), not bytes. This is NOT weaker than
-// the GitLab driver: its client-go GetTraceFile likewise buffers the entire trace into
-// a bytes.Buffer and returns a reader over it (v2.44.0 jobs.go:343), so that driver's
-// io.LimitReader caps a copy out of an already-full buffer, not the transfer. The
-// maxTraceBytes ceiling here plays the same role on both drivers — a processing/storage
-// guard that errors on a pathological log rather than returning/storing it, never a
-// download bound. The returned tail passes through the PAT redactor: a hostile pipeline
-// could echo the bot's own token into its log, and it must not survive into a snapshot.
+// cause concludes its log); maxBytes <= 0 returns the whole log. The log lives at
+// /actions/jobs/{job_id}/logs (text/plain, no redirect). We bypass the gitea SDK's
+// GetRepoActionJobLogs — which reads the whole body into memory with an unbounded
+// io.ReadAll before we see its size — and fetch it through rawGetLimited, whose
+// io.LimitReader byte-bounds the TRANSFER itself. A hostile forge streaming a
+// multi-GB log body therefore cannot OOM the api: the read stops at maxTraceBytes+1
+// and the ceiling check below errors rather than returning it. The returned tail
+// passes through the PAT redactor: a hostile pipeline could echo the bot's own token
+// into its log, and it must not survive into a snapshot.
 func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -162,7 +161,7 @@ func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxByt
 	if err != nil {
 		return "", err
 	}
-	data, _, err := c.GetRepoActionJobLogs(slug.owner, slug.repo, jobID)
+	data, err := f.rawGetLimited(ctx, fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", slug.owner, slug.repo, jobID), maxTraceBytes+1)
 	if err != nil {
 		return "", f.redact.error(fmt.Errorf("forgejo: job log tail: %w", err))
 	}

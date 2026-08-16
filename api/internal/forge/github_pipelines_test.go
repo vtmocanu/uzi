@@ -135,6 +135,37 @@ func TestGitHubJobLogTailFromEnd(t *testing.T) {
 	}
 }
 
+// TestGitHubJobLogTailByteBoundsOversizedBlob is the issue-74 M1 regression pin for
+// GitHub, whose blob GET was ALREADY transfer-bounded (fetchJobLog reads through
+// io.LimitReader(maxTraceBytes+1)). A blob body LARGER than maxTraceBytes (16 MiB)
+// must trip the fail-closed ceiling and return an error with an empty tail: the
+// LimitReader stops the transfer, and the len>maxTraceBytes check errors rather than
+// returning the truncated body.
+func TestGitHubJobLogTailByteBoundsOversizedBlob(t *testing.T) {
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+	}))
+	t.Cleanup(blob.Close)
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/jobs/55/logs": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", blob.URL+"/log?token=presigned-secret")
+			w.WriteHeader(http.StatusFound)
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+	d.allowInsecureLogHost = true
+
+	tail, err := d.JobLogTail(context.Background(), 7, 55, 32*1024)
+	if err == nil {
+		t.Fatal("an oversized blob body must trip the ceiling error, got nil")
+	}
+	if tail != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(tail))
+	}
+}
+
 // TestGitHubJobLogTailNoAuthHeader pins item-16: the blob GET carries NO
 // Authorization header (the pre-signed URL must not receive the PAT).
 func TestGitHubJobLogTailNoAuthHeader(t *testing.T) {
