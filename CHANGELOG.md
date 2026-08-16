@@ -35,6 +35,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   read-only `web-ux` validator. It runs on `opus` and inherits the full
   toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
   it up on the next boot. (#314)
+- **A stable `resume_lineage_break` tag now marks the one path that breaks
+  `run_usage` resume lineage (#334).** When a resume is dropped and the
+  runner starts a fresh SDK session because the claimed session's transcript
+  is not resolvable on this worker (`agent/src/runner.ts`), both the run-feed
+  status message and the worker's structured warning log now carry
+  `event: "resume_lineage_break"` — a resolved resume records nothing. This
+  is a measure-before-you-build instrument for #332: a maintainer can now run
+  `select count(*) from run_messages where payload->>'event' =
+  'resume_lineage_break'` to size how often the undercount actually happens
+  before deciding whether #332's deferred Option B (a `lineage_epoch`
+  schema+protocol change) is worth building. No change to `run_usage`, its
+  fold, the merge, or the totals view. (#334, #332)
 - **Role-aware in-app docs: admins now see the operator setup guides (#75).**
   The in-app `/docs` section gains an "Admin / operator" area alongside the
   existing user howtos, surfacing installation, configuration, OIDC/Keycloak,
