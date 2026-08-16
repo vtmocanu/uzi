@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
-import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../src/judge-runner.js";
+import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview, calibrateReview } from "../src/judge-runner.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
@@ -391,6 +391,116 @@ describe("parseReview", () => {
 
   it("throws when there is no JSON object", () => {
     assert.throws(() => parseReview("the model refused to answer", "haiku"));
+  });
+});
+
+describe("confidence calibration (issue #336)", () => {
+  // A minimal ReviewRequest wrapping a single rec, so a test asserts on one downgrade.
+  const wrap = (rec: ReviewRequest["recommendations"][number]): ReviewRequest => ({
+    verdict: "issues",
+    summary: "s",
+    model: "haiku",
+    status: "complete",
+    recommendations: [rec],
+  });
+  const retryHigh = () => ({
+    category: "improve_uzi" as const,
+    target: "run retry",
+    rationale: "retry with exponential backoff",
+    confidence: "high" as const,
+  });
+
+  for (const fc of ["provisioning_failed", "credential_unavailable", "guardrail_blocked"]) {
+    it(`downgrades a retry-shaped high rec on the permanent class ${fc}`, () => {
+      const out = calibrateReview(wrap(retryHigh()), fc);
+      const rec = out.recommendations[0]!;
+      assert.equal(rec.confidence, "low");
+      assert.ok(rec.rationale.includes("Confidence auto-reduced to low"), "marker appended");
+      assert.ok(rec.rationale.includes(fc), "the failure-class name is named in the marker");
+    });
+  }
+
+  for (const fc of ["rate_limited", "run_timeout"]) {
+    it(`leaves a retry-shaped high rec UNCHANGED on the transient class ${fc}`, () => {
+      const out = calibrateReview(wrap(retryHigh()), fc);
+      const rec = out.recommendations[0]!;
+      assert.equal(rec.confidence, "high");
+      assert.ok(!rec.rationale.includes("Confidence auto-reduced"), "no marker on a transient class");
+    });
+  }
+
+  it("leaves a retry-shaped high rec UNCHANGED when failureClass is null", () => {
+    const out = calibrateReview(wrap(retryHigh()), null);
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("leaves a NON-retry high rec UNCHANGED on a permanent class", () => {
+    const out = calibrateReview(
+      wrap({
+        category: "cost_efficiency",
+        target: "lead orchestration",
+        rationale: "the review wave used too many agents for a one-line change",
+        confidence: "high",
+      }),
+      "provisioning_failed",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("does NOT downgrade a NEGATED retry rec (false-positive guard)", () => {
+    const out = calibrateReview(
+      wrap({
+        category: "adjust_template",
+        target: "lead",
+        rationale: "tell the agent to NOT retry on a guardrail block; the block is permanent",
+        confidence: "high",
+      }),
+      "guardrail_blocked",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "high", "a rec telling the agent NOT to retry is a real finding");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("leaves a retry-shaped MEDIUM rec UNCHANGED (only high is in scope)", () => {
+    const out = calibrateReview(
+      wrap({ ...retryHigh(), confidence: "medium" }),
+      "provisioning_failed",
+    );
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "medium");
+    assert.ok(!rec.rationale.includes("Confidence auto-reduced"));
+  });
+
+  it("composes with parseReview end to end", () => {
+    const text =
+      '{"verdict":"issues","summary":"s","recommendations":[' +
+      '{"category":"improve_uzi","target":"run retry","rationale":"retry with exponential backoff","confidence":"high"}]}';
+    const out = calibrateReview(parseReview(text, "haiku"), "credential_unavailable");
+    const rec = out.recommendations[0]!;
+    assert.equal(rec.confidence, "low");
+    assert.ok(rec.rationale.includes("Confidence auto-reduced to low"));
+  });
+
+  it("does not mutate the input review or its recommendations", () => {
+    const input = wrap(retryHigh());
+    const originalConfidence = input.recommendations[0]!.confidence;
+    const originalRationale = input.recommendations[0]!.rationale;
+    const out = calibrateReview(input, "guardrail_blocked");
+    assert.equal(input.recommendations[0]!.confidence, originalConfidence, "input confidence untouched");
+    assert.equal(input.recommendations[0]!.rationale, originalRationale, "input rationale untouched");
+    assert.notEqual(out.recommendations, input.recommendations, "a new recommendations array is returned");
+    assert.equal(out.recommendations[0]!.confidence, "low");
+  });
+
+  it("returns the SAME object (no copy) when the class is not policy-denied", () => {
+    const input = wrap(retryHigh());
+    assert.equal(calibrateReview(input, "rate_limited"), input);
+    assert.equal(calibrateReview(input, null), input);
   });
 });
 

@@ -21125,3 +21125,36 @@ paying for #332's deferred Option B (a `lineage_epoch` schema+protocol change).
   so no new inbound endpoint. The signal doubles as a resume-reliability indicator (a high rate means
   work-recovery fails more often than PRD #122 M8 intends). #332 Option B stays deferred until this
   counter shows the lineage break is material.
+
+## 551. Issue #336 (#81 proposal #4) — the DETERMINISTIC guard behind M7a's prompt rule: high-confidence retry advice on a permanent policy/config-denied class is auto-downgraded to low
+
+§534 gave the judge a TRUSTED `failure_class` and a PROMPT rule telling the model NOT to recommend
+retry / exponential-backoff for the three permanent policy/config-denied classes. A prompt rule is
+advisory — the model can ignore it. This issue adds the deterministic backstop the rule lacked, in
+`agent/src/judge-runner.ts`, so a wrong retry recommendation is corrected in code regardless of what the
+model emitted.
+
+- **`calibrateReview(review, failureClass)` is a pure exported function run in `judge()` AFTER
+  `parseReview` and BEFORE the review is posted.** It only ever DOWNGRADES confidence, never raises it,
+  and never mutates its input (recs are mapped into new objects). It touches only the `confidence` and
+  `rationale` fields of the one rec it rewrites; no other field, and no other rec.
+- **Scope: high-confidence, retry-shaped recs on a permanent class only.** The three classes are
+  `provisioning_failed`, `credential_unavailable`, `guardrail_blocked`, mirrored in a TS
+  `POLICY_DENIED_FAILURE_CLASSES` set kept in HAND-SYNC with the server's `preStartInfraFailOrigins`
+  (`api/internal/workersvc/judge_enqueue.go`). When the reviewed run's trusted `failure_class` is one of
+  these AND a rec is BOTH `high` confidence AND retry-shaped, its confidence is lowered to `low` and a
+  deterministic marker is appended to its rationale (`Confidence auto-reduced to low: retry/backoff
+  advice contradicts the permanent \`<class>\` failure class.`). `medium`/`low`/`""` recs are untouched
+  (only-ever-downgrades + high-only, per the issue). No behaviour change when `failure_class` is null or a
+  transient class (`rate_limited`, `run_timeout`, `worker_lost`, `agent_failure`, …).
+- **"Retry-shaped" is textual over target + rationale, with a NEGATION GUARD.** The affirmative match is
+  `retry` / `backoff` / `re-run` / `run again` / `try again` / `requeue`; the guard suppresses a
+  downgrade when a negator sits in a tight window before the term ("do not retry", "never re-run",
+  "avoid retrying", …). This deliberately protects the false positive that matters: a genuinely correct
+  "tell the agent NOT to retry" finding must survive. The window is kept tight, biasing toward NOT firing.
+- **The fallback (non-model) review path is unaffected** — it emits only `install_worker_tool` recs,
+  never retry-shaped ones, so the calibration is a no-op there.
+- **Out of scope (recorded as such):** no model-based verifier / second Anthropic call was added; the
+  computation of `failure_class` itself is unchanged; and the #81 proposal #4 item 2 stretch idea
+  (cap unconfirmable inferences at medium) was NOT implemented because it cannot be made non-heuristic
+  cheaply.
