@@ -5482,13 +5482,29 @@ CLAIM_TOKEN=""
 claim_token() {
   local raw code body
   CLAIM_TOKEN=""
-  # No -f: a non-2xx must reach the checks below as a status, not abort the run.
-  raw="$(curl -sS -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" \
-    -H "Authorization: Bearer $BINDW_TOKEN")"
-  code="${raw##*$'\n'}"
-  body="${raw%$'\n'*}"
+  # A run is created and claimed back-to-back here, so the create→claimable window
+  # (the row becoming visible to the claim query's FOR UPDATE SKIP LOCKED + affinity/
+  # quota predicates) is a real race — a legitimate 204 "queue idle" until it closes.
+  # Bounded-retry ONLY the 204, mirroring create_run's retry idiom above: a 204 means
+  # the claim mutated no row (workersvc returns nil,nil before any write), so retrying
+  # is idempotent-safe and, because the claim is user-scoped with fixed ordering, still
+  # lands on the same run a single call would. Fail loudly on any OTHER non-200 (a real
+  # rejection) and on a persistent 204 — never blanket-swallow, that would mask a stuck
+  # queue as green. e2e-only; the harness is not in CI (PRD #104 phase, issue #137).
+  for _ in 1 2 3 4 5 6; do
+    # No -f: a non-2xx must reach the checks below as a status, not abort the run.
+    raw="$(curl -sS -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" \
+      -H "Authorization: Bearer $BINDW_TOKEN")"
+    code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    case "$code" in
+      200) break ;;
+      204) sleep 1; continue ;;  # run not yet claimable; the next attempt sees it
+      *) fail "claim for '$1' returned HTTP $code, not 200" ;;
+    esac
+  done
   [ "$code" = 200 ] \
-    || fail "claim for '$1' returned HTTP $code, not 200 (204 means the queue was idle — the run existed but was not claimable by this worker)"
+    || fail "claim for '$1' still returned 204 after 6 tries — the run never became claimable by this worker"
   printf '%s' "$body" | jq -e 'has("secrets")' >/dev/null 2>&1 \
     || fail "claim for '$1' returned 200 with no 'secrets' object — top-level keys: $(printf '%s' "$body" | jq -c 'keys' 2>/dev/null)"
   CLAIM_TOKEN="$(printf '%s' "$body" | jq -r '.secrets.anthropic_oauth_token // empty')"

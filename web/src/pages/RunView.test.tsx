@@ -521,6 +521,40 @@ describe("RunCompletedLine — report-only deliverable (issue #279)", () => {
   });
 });
 
+describe("RunCompletedLine — the declared PRD-completion move (issue #150)", () => {
+  it("names the path prd_done_path was set to on a completed run", () => {
+    const { container } = render(
+      <RunCompletedLine
+        run={run({ branch: "agent/issue-72", mr_iid: 5, prd_done_path: "prds/done/72-x.md" })}
+        duration="4m"
+        mrState="opened"
+      />,
+    );
+    expect(container.textContent).toContain("PRD moved to");
+    expect(screen.getByText("prds/done/72-x.md")).toBeTruthy();
+  });
+
+  it("omits the PRD clause when prd_done_path is absent", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-72", mr_iid: 5 })} duration="4m" mrState="opened" />,
+    );
+    expect(container.textContent).toContain("Branch");
+    expect(container.textContent).not.toContain("PRD moved to");
+  });
+
+  it("strips bidi/control characters out of a hostile prd_done_path", () => {
+    const { container } = render(
+      <RunCompletedLine
+        run={run({ branch: "agent/issue-72", mr_iid: null, prd_done_path: "prds/done/‮72-x​.md" })}
+        duration="4m"
+      />,
+    );
+    expect(container.textContent).toContain("PRD moved to");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("prds/done/72-x.md")).toBeTruthy();
+  });
+});
+
 // PRD #300: the frozen per-schedule model is shown in the STATUS-INDEPENDENT header
 // metadata row (a Badge), not in the completed-hero line — a wrong/typo'd model must be
 // visible on a FAILED or stopped run too (Risks / SC6). These render the whole page

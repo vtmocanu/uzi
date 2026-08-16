@@ -88,6 +88,11 @@ var runDTOKeys = []string{
 	// completion) and its persisted findings summary. report_only is NOT NULL so always
 	// on the wire; report_md is null unless report_only.
 	"report_only", "report_md",
+	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
+	// to, and when that patch lifecycle settled (null while pending). Both always on the
+	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null
+	// until the patch edge is consumed.
+	"prd_done_path", "prd_patch_settled_at",
 	"claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",

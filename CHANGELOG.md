@@ -27,8 +27,26 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   read-only `web-ux` validator. It runs on `opus` and inherits the full
   toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
   it up on the next boot. (#314)
+- **Role-aware in-app docs: admins now see the operator setup guides (#75).**
+  The in-app `/docs` section gains an "Admin / operator" area alongside the
+  existing user howtos, surfacing installation, configuration, OIDC/Keycloak,
+  and vault threat-model pages — routable, indexed, and searchable — to any
+  admin (`me.is_admin`). It's presentation-only: every `docs/*.md` file was
+  already bundled to every browser, so this gates the index/routing/search on
+  admin status rather than introducing a new access boundary, and operator
+  pages carry no secrets.
+
 ### Fixed
 
+- **`e2e/run-store-it.sh` no longer masquerades a Postgres-readiness timeout as
+  a passing/skipped test run (#171).** The throwaway-Postgres wait was a
+  hard-coded 30s; on a daemon busy with mutation containers it timed out and the
+  run ended with no package times and a `RUN=0 PASS=0 FAIL=0` log —
+  indistinguishable from the false-green `.claude/rules/go.md` documents. The
+  wait is now 120s and env-overridable (`UZI_STORE_IT_PG_WAIT_SECS`), and a
+  readiness timeout prints a loud `INFRASTRUCTURE FAILURE … NO TESTS RAN` banner
+  on stderr (non-zero exit) that cannot be read as a test result. Documented as
+  a distinct cause of the double-zero signature in `.claude/rules/go.md`. (#171)
 - **The two `react-hooks/exhaustive-deps` suppressions PRD #103 M3 deferred are
   resolved as fixes, not baselined (#200).** Dashboard's first-load effect now
   lists `user?.is_admin` and WorkersSettings' `rebind` callback now lists
@@ -45,6 +63,40 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   run-timeout failure, and the merge-request link is recorded independently
   of the final run status, so a run that opened an MR never displays
   "MR: none". (#329)
+- **A run's declared PRD-completion move is now auditable after the fact
+  (#150).** The run DTO and `uzi run get` (human view, `--json`, and `--field`)
+  now expose `prd_done_path` (the repo-relative path a run declared it moved a
+  completed PRD to) and `prd_patch_settled_at` (the RFC3339 timestamp when the
+  PRD-link patch lifecycle settled, null while still pending); the web run
+  footer surfaces `prd_done_path` alone. All read-only and emitted only when
+  set, so a run predating the feature is unchanged. (#150)
+
+### Security
+
+- **Both hostile-forge DoS vectors closed across all three forge drivers
+  (#74).** A semi-trusted (compromised) connected forge could crash the shared,
+  multi-tenant api two ways, both symmetric across the gitlab, forgejo and
+  github drivers. First, a job-log fetch buffered the entire response body in
+  memory (inside the SDK) before the 16 MiB ceiling was evaluated, so a forge
+  streaming a multi-GB log body could OOM the process; the gitlab and forgejo
+  drivers now issue a raw request read through an `io.LimitReader` so the
+  transfer itself is byte-bounded (github was already bounded), and the gitlab
+  trace request additionally refuses redirects so a hostile 302 cannot replay
+  the bot PAT cross-host. Second, a forge returning a one-element pipeline/run
+  list whose single entry was JSON `null` dereferenced a nil pointer and
+  panicked the poller's pipeline-sync tick; all three drivers now guard the nil
+  element, and the poller's per-repo goroutine recovers any panic so one repo's
+  hostile response degrades to skipping that repo's sync rather than crashing
+  the api. (#74)
+
+- **Archiving a PRD to `prds/done/` no longer leaves broken inbound doc links
+  (#257).** The `prd-lifecycle` skill now tells a run that performs
+  `git mv prds/<file>.md prds/done/` to sweep the tree (`git grep -lF`) for
+  relative links to the old path and repoint them to the new location in the
+  same commit — so the archiving run fixes the links in files it never
+  otherwise touches, instead of failing the `check-docs` gate at merge time.
+  (`web/scripts/check-docs.mjs` already reports every broken link in one pass,
+  so the surviving gap was the repoint, not the reporting.) (#257)
 
 ## [0.39.0] - 2026-08-16
 

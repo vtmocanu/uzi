@@ -1,5 +1,6 @@
 ---
 title: Configuration
+order: 20
 audience: operator
 ---
 

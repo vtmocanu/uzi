@@ -715,6 +715,15 @@ schedule pinned none) and `uzi run get <id> --field override_subagent_model`
 (the boolean literal `true`/`false` — whether that model was also applied to
 every subagent).
 
+A run's PRD-completion declaration is readable the same way:
+`uzi run get <id> --field prd_done_path` (the repo-relative path the run
+declared it moved a completed PRD to, e.g. `prds/done/72-x.md`) and
+`uzi run get <id> --field prd_patch_settled_at` (an RFC3339 timestamp once
+the PRD-link patch lifecycle has settled, an empty line while still
+pending). Both are emit-only-when-set on the human view too — `run get`
+prints them as `PRD_MOVE` and `PRD_PATCH_SETTLED_AT` rows only when the run
+has declared a move — and appear the same way under `--json`.
+
 ### Run status, and what `--follow` waits for
 
 A run's `status` (on `run get` and `run list`) is one of exactly **nine** values:

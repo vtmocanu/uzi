@@ -151,6 +151,46 @@ func TestForgejoLatestMRPipelineMalformedPRNotNoPipeline(t *testing.T) {
 	}
 }
 
+// TestForgejoLatestPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin: a
+// hostile forge returning {"total_count":1,"workflow_runs":[null]} decodes to a
+// slice with a nil *ActionWorkflowRun, which passes the len==0 guard. Without the
+// nil-element guard the toForgejoPipeline deref panics; with it the driver returns
+// ErrNoPipeline.
+func TestForgejoLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	if _, err := d.LatestPipeline(context.Background(), 7, "main"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestForgejoLatestMRPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR path: the PR resolves with a head sha, then the runs endpoint returns a null
+// entry. The nil-element guard returns ErrNoPipeline rather than panicking.
+func TestForgejoLatestMRPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/12": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "number": 12,
+				"head": map[string]any{"sha": "headsha999", "ref": "feature-x"},
+			})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 12); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
 // TestForgejoListPipelineJobs is test #11 (the parse half): the run's jobs come back
 // with name/status mapped, Status passed through as the raw Actions enum, and Stage
 // left empty (Forgejo Actions has no stage model).
@@ -239,6 +279,29 @@ func TestForgejoJobLogTailWholeLog(t *testing.T) {
 	}
 	if got != body {
 		t.Fatalf("maxBytes<=0 must return the whole log, got %q", got)
+	}
+}
+
+// TestForgejoJobLogTailByteBoundsOversizedLog is the issue-74 M1 regression pin: a
+// hostile forge streaming a log LARGER than maxTraceBytes (16 MiB) must trip the
+// fail-closed ceiling and return an error with an empty tail, never buffer the whole
+// body. The driver now reads the logs endpoint through rawGetLimited's io.LimitReader,
+// so the transfer stops at maxTraceBytes+1 bytes rather than OOMing on a multi-GB body.
+func TestForgejoJobLogTailByteBoundsOversizedLog(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/jobs/888/logs": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	got, err := d.JobLogTail(context.Background(), 7, 888, 32*1024)
+	if err == nil {
+		t.Fatal("an oversized log must trip the ceiling error, got nil")
+	}
+	if got != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(got))
 	}
 }
 

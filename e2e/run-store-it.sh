@@ -24,6 +24,11 @@ NAME="uzi-store-it-$$"
 PORT="$(( 20000 + (RANDOM % 20000) ))"
 PGPASS="$(openssl rand -hex 16)"
 PGIMAGE="${UZI_STORE_IT_PG_IMAGE:-postgres:17}"
+# How long to wait for the throwaway Postgres to accept connections. Widened from
+# a hard-coded 30 (issue #171): on a daemon busy with mutation containers, 30s
+# timed out and produced a RUN=0 PASS=0 FAIL=0 log that reads exactly like the
+# false-green .claude/rules/go.md documents. Env-overridable for a very busy host.
+PGWAIT="${UZI_STORE_IT_PG_WAIT_SECS:-120}"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
@@ -41,13 +46,23 @@ docker run -d --rm --name "$NAME" \
 
 DSN="postgres://uzi:$PGPASS@127.0.0.1:$PORT/uzi?sslmode=disable"
 
-say "waiting for Postgres to accept connections"
-for _ in $(seq 1 30); do
+say "waiting for Postgres to accept connections (up to ${PGWAIT}s)"
+for _ in $(seq 1 "$PGWAIT"); do
   docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1 && break
   sleep 1
 done
-docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1 \
-  || { echo "postgres never became ready"; exit 1; }
+if ! docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1; then
+  # LOUD, unmistakable banner: a readiness timeout is an INFRASTRUCTURE fault,
+  # not a test result. Without it the run ends with no package times and, to
+  # whoever tallies the log, RUN=0 PASS=0 FAIL=0 — indistinguishable from the
+  # false-green .claude/rules/go.md documents (unset UZI_TEST_DATABASE_URL, or a
+  # -v-less grep). Keep this wording in sync with that passage.
+  printf '\n\033[1;31m==> INFRASTRUCTURE FAILURE: throwaway Postgres never became ready within %ss. NO TESTS RAN.\033[0m\n' "$PGWAIT" >&2
+  printf '\033[1;31m==> This is NOT a test result. A RUN=0 PASS=0 FAIL=0 tally here means the database never came up\033[0m\n' >&2
+  printf '\033[1;31m==> (usually daemon contention), NOT that the suite passed or was skipped. Retry, or raise\033[0m\n' >&2
+  printf '\033[1;31m==> UZI_STORE_IT_PG_WAIT_SECS (currently %s) to give a busy host more headroom.\033[0m\n' "$PGWAIT" >&2
+  exit 1
+fi
 
 say "running the live-DB integration tests"
 cd "$ROOT/api"

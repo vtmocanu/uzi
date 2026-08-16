@@ -329,11 +329,15 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ReportOnly:       r.ReportOnly,
 		ReportMd:         textPtrValue(r.ReportMd.Valid, r.ReportMd.String),
-		ClaimedAt:        timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
-		StartedAt:        timePtr(r.StartedAt.Valid, r.StartedAt.Time),
-		FinishedAt:       timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
-		CreatedAt:        r.CreatedAt.Time,
-		UpdatedAt:        r.UpdatedAt.Time,
+		// PRD-link reconciliation (read-only): the path the run declared it archived a
+		// completed PRD to, and when that patch lifecycle settled (null = still pending).
+		PrdDonePath:       textPtrValue(r.PrdDonePath.Valid, r.PrdDonePath.String),
+		PrdPatchSettledAt: timePtr(r.PrdPatchSettledAt.Valid, r.PrdPatchSettledAt.Time),
+		ClaimedAt:         timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
+		StartedAt:         timePtr(r.StartedAt.Valid, r.StartedAt.Time),
+		FinishedAt:        timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
+		CreatedAt:         r.CreatedAt.Time,
+		UpdatedAt:         r.UpdatedAt.Time,
 		// PRD #35 usage-limit park. Mapped INDEPENDENTLY of each other, like the
 		// PRD #111 credential fields below: WaitOnLimit is set on every run from
 		// creation while the other four stay null/zero until a first park, so a run

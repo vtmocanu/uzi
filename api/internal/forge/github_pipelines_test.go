@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -77,6 +78,48 @@ func TestGitHubLatestMRPipelineNoHeadIsError(t *testing.T) {
 	}
 }
 
+// TestGitHubLatestPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin: a
+// hostile forge returning {"workflow_runs":[null],"total_count":1} decodes to a
+// slice with a nil *WorkflowRun, which passes the len==0 guard. go-github's Get*
+// accessors are nil-safe, so without the guard toGitHubPipeline would not panic
+// (unlike gitlab/forgejo) — it would return a phantom zero-ID Pipeline with a nil
+// error, which this test catches as the errors.Is check failing. With the guard the
+// driver returns ErrNoPipeline.
+func TestGitHubLatestPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	if _, err := d.LatestPipeline(context.Background(), 7, "feature"); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
+// TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline is the issue-74 M2 pin for the
+// MR path: the PR resolves with a head sha, then the runs endpoint returns a null
+// entry. The nil-element guard returns ErrNoPipeline rather than a phantom zero-ID
+// pipeline (go-github's Get* accessors are nil-safe, so this path returns a bad
+// value rather than panicking as gitlab/forgejo would).
+func TestGitHubLatestMRPipelineNilRunMapsToErrNoPipeline(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 4, "state": "open",
+				"head": map[string]any{"sha": "headsha999"},
+			})
+		},
+		"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []any{nil}})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+	if _, err := d.LatestMRPipeline(context.Background(), 7, 4); !errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a one-element MR run list with a null entry must map to ErrNoPipeline (no panic), got %v", err)
+	}
+}
+
 func TestGitHubListPipelineJobs(t *testing.T) {
 	m := newMockGitHub(t, map[string]http.HandlerFunc{
 		"/repos/acme/widgets/actions/runs/900/jobs": func(w http.ResponseWriter, _ *http.Request) {
@@ -132,6 +175,37 @@ func TestGitHubJobLogTailFromEnd(t *testing.T) {
 	}
 	if !strings.Contains(tail, "failing tail line") {
 		t.Errorf("tail should carry the concluding lines: %q", tail)
+	}
+}
+
+// TestGitHubJobLogTailByteBoundsOversizedBlob is the issue-74 M1 regression pin for
+// GitHub, whose blob GET was ALREADY transfer-bounded (fetchJobLog reads through
+// io.LimitReader(maxTraceBytes+1)). A blob body LARGER than maxTraceBytes (16 MiB)
+// must trip the fail-closed ceiling and return an error with an empty tail: the
+// LimitReader stops the transfer, and the len>maxTraceBytes check errors rather than
+// returning the truncated body.
+func TestGitHubJobLogTailByteBoundsOversizedBlob(t *testing.T) {
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(strings.Repeat("A", maxTraceBytes+1024)))
+	}))
+	t.Cleanup(blob.Close)
+
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/actions/jobs/55/logs": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", blob.URL+"/log?token=presigned-secret")
+			w.WriteHeader(http.StatusFound)
+		},
+	})
+	d := newGitHubRawDriver(t, m, "ghp_classicTokenValue1234567890")
+	d.allowInsecureLogHost = true
+
+	tail, err := d.JobLogTail(context.Background(), 7, 55, 32*1024)
+	if err == nil {
+		t.Fatal("an oversized blob body must trip the ceiling error, got nil")
+	}
+	if tail != "" {
+		t.Fatalf("the ceiling error must return an empty tail, got %d bytes", len(tail))
 	}
 }
 

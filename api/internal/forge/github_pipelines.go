@@ -36,7 +36,12 @@ func (g *github) LatestPipeline(ctx context.Context, projectID int64, ref string
 	if err != nil {
 		return Pipeline{}, g.wrapErr("latest pipeline", err)
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *WorkflowRun that passes len==0. go-github's Get* accessors are nil-safe,
+	// so toGitHubPipeline would not panic here (unlike the gitlab/forgejo drivers) —
+	// it would return a phantom zero-ID Pipeline the poller then treats as real. Reject
+	// it as "no pipeline".
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil
@@ -68,7 +73,12 @@ func (g *github) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if err != nil {
 		return Pipeline{}, g.wrapErr("latest MR pipeline", err)
 	}
-	if runs == nil || len(runs.WorkflowRuns) == 0 {
+	// A hostile forge could return a null entry in workflow_runs, which decodes to
+	// a nil *WorkflowRun that passes len==0. go-github's Get* accessors are nil-safe,
+	// so toGitHubPipeline would not panic here (unlike the gitlab/forgejo drivers) —
+	// it would return a phantom zero-ID Pipeline the poller then treats as real. Reject
+	// it as "no pipeline".
+	if runs == nil || len(runs.WorkflowRuns) == 0 || runs.WorkflowRuns[0] == nil {
 		return Pipeline{}, ErrNoPipeline
 	}
 	return toGitHubPipeline(runs.WorkflowRuns[0]), nil
