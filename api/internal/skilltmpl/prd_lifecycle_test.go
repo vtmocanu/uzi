@@ -100,6 +100,8 @@ func TestPRDLifecycleBodyCarriesTheLoadBearingRules(t *testing.T) {
 		{"Decision 3: state honestly that this is prompt-level", "prompt-level instruction"},
 		{"Decision 5: no linked PRD is a no-op", "no-op"},
 		{"M4: declare the moved path", "prd_done_path"},
+		{"#257: sweep inbound links on archival", "git grep -lF"},
+		{"#257: sweep repoints to the done/ path", "prds/done/<file>.md"},
 	} {
 		if !strings.Contains(body, c.needle) {
 			t.Errorf("%s: expected the body to contain %q", c.what, c.needle)

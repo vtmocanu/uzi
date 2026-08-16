@@ -21022,3 +21022,29 @@ Builds on §534's `fail_origin`. A genuine completion (the worker opened the MR)
   gains a `status <> 'cancelled'` exclusion (§517) so a human-cancelled run never itself seeds auto-fix
   (it excludes cancelled *runs*, not branches — an older non-cancelled run on the same branch can still
   surface via DISTINCT ON).
+
+## 546. Issue #257 — archiving a PRD sweeps and repoints inbound relative links in the same commit
+
+The `prd-lifecycle` builtin skill's archive step (`git mv prds/<file>.md prds/done/`) now instructs the
+run to also repoint any relative markdown links that pointed at the old path, in the SAME commit that
+moves the file. Serves the same doc-integrity intent as the `check-docs` gate.
+
+- **Why.** Moving a PRD to `prds/done/` broke inbound relative links in files the archiving run never
+  otherwise touches (`docs/*.md`, `adr/*.md`, `ARCHITECTURE.md`, sibling PRDs). The `check-docs` gate
+  (`web/scripts/check-docs.mjs`, run in the web build / `validate:web`) then failed at merge time, on a
+  run whose actual change was unrelated to those files. Surfaced twice during the v0.21.0 (PRD #122)
+  landing — a move-only side effect that reddened CI after the fact.
+- **Mechanism (prose sweep step).** The instruction lives in the skill body,
+  `api/internal/skilltmpl/builtins/prd-lifecycle/SKILL.md` — the `go:embed`-shipped single source of
+  truth for this skill; there is deliberately no `.claude/skills` mirror to keep in sync. The step uses
+  `git grep -lF "prds/<file>.md"` (index-aware, literal-fixed) to find referencing files, then a literal
+  substitution `prds/<file>.md` → `prds/done/<file>.md`. Idempotent: an already-correct
+  `prds/done/<file>.md` reference does not contain the substring `prds/<file>.md`, so re-running the
+  sweep is a no-op.
+- **Reporting was NOT the gap; repoint was.** `check-docs.mjs` already reports ALL broken links in one
+  pass (accumulates into an `errors` array and exits once after printing every one), so the residual
+  problem was that nothing repointed the links, not that they were reported one-at-a-time. `check-docs`
+  itself is unchanged by this issue.
+- **Guard test.** `TestPRDLifecycleBodyCarriesTheLoadBearingRules` in
+  `api/internal/skilltmpl/prd_lifecycle_test.go` pins that the sweep instruction stays present in the
+  embedded skill body, so a future edit cannot silently drop it.

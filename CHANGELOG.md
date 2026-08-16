@@ -37,6 +37,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   of the final run status, so a run that opened an MR never displays
   "MR: none". (#329)
 
+- **Archiving a PRD to `prds/done/` no longer leaves broken inbound doc links
+  (#257).** The `prd-lifecycle` skill now tells a run that performs
+  `git mv prds/<file>.md prds/done/` to sweep the tree (`git grep -lF`) for
+  relative links to the old path and repoint them to the new location in the
+  same commit — so the archiving run fixes the links in files it never
+  otherwise touches, instead of failing the `check-docs` gate at merge time.
+  (`web/scripts/check-docs.mjs` already reports every broken link in one pass,
+  so the surviving gap was the repoint, not the reporting.) (#257)
+
 ## [0.39.0] - 2026-08-16
 
 ### Added
