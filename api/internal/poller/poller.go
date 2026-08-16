@@ -12,6 +12,7 @@ package poller
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -221,6 +222,19 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
+// guardPanic runs fn and converts a panic into a logged error, so one repo's
+// hostile-forge response (e.g. a nil-pointer panic that slips past a driver
+// guard) cannot crash the shared poller process — it degrades to that one
+// repo's sync being skipped this tick. The repo path is logged for diagnosis.
+func guardPanic(repo string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("poller: repo sync panicked", "repo", repo, "panic", rec, "stack", string(debug.Stack()))
+		}
+	}()
+	fn()
+}
+
 // tick syncs every enabled repo once, with bounded concurrency and a hard per-tick
 // deadline (tickBudget) so a dead or wedged forge can neither stall the cycle nor
 // let a tick run unbounded. Errors on one repo are logged and skipped so a single
@@ -260,7 +274,7 @@ func (e *Engine) tick(ctx context.Context) {
 		go func(r store.ListEnabledReposWithConnectionsRow, st *repoState) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			e.syncRepo(tickCtx, r, st)
+			guardPanic(r.PathWithNamespace, func() { e.syncRepo(tickCtx, r, st) })
 		}(r, e.states[r.ID])
 	}
 	wg.Wait()
