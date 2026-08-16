@@ -6,6 +6,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-08-16
+
+### Changed
+
+- **Findings now sits directly under Runs in the sidebar (`ad98e205`).** The
+  Findings nav item moved up in the Work group to sit immediately below Runs,
+  the run lane whose off-task findings it collects, instead of at the bottom of
+  the group after Chat. Presentation-only; the route and badge are unchanged.
+
 ## [0.40.0] - 2026-08-16
 
 ### Added
