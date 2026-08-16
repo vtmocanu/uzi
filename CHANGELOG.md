@@ -58,6 +58,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **The worker's message batcher no longer re-enters the PRD #108 no-backoff
+  retry storm when bisection abandons its first probe.** When the api
+  permanently rejected a batch (4xx poison) and the very first bisection probe
+  then hit a transient (5xx/timeout) or a 413, `bisect` handed the whole batch
+  back with nothing persisted, but `handleFailure`'s permanent arm still reset
+  `consecutiveFailures`/`failingSince` and told `doFlush` to keep going — so it
+  re-posted immediately with no backoff, and the `TRANSIENT_TRIP_MS` breaker
+  never accrued because `failingSince` was wiped every pass (and `close()` could
+  hang under a synchronously-resolving client). `bisect` now reports whether it
+  made progress (a sub-batch was persisted, or the poison was isolated and
+  tombstoned); a no-progress abandonment is treated as the transient failure it
+  is — backing off and keeping the breaker clock running — while only genuine
+  progress clears the streak.
 - **An idle backgrounded tab no longer keeps its session alive forever via the
   favicon poll (#331).** The tab-icon poll (`useFavicon`) fetches `listRuns`
   every ~20s even while hidden, and `RequireAuth`'s rolling refresh re-minted the
