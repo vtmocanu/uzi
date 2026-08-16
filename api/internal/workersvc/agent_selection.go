@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 // Per-run agent selection (PRD #37).
@@ -282,7 +282,7 @@ func encodeJSONArray[T any](items []T) ([]byte, error) {
 // API does not take that on trust.
 func hasUnsafeChar(s string) bool {
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+		if termsafe.Unsafe(r) {
 			return true
 		}
 	}

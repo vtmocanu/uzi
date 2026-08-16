@@ -28,7 +28,9 @@ type Client interface {
 	GetRun(ctx context.Context, id string) (apitypes.RunDTO, error)
 	// RunLogs returns a run's persisted messages after seq (0 = from the start);
 	// `uzi run logs` polls it with the highest seq seen (Decision: REST polling, not
-	// a WebSocket — PRD #64 Out of scope).
+	// a WebSocket — PRD #64 Out of scope). The live client pages the fetch internally
+	// (issue #160), transparently to callers, and is ALL-OR-NOTHING: it returns the
+	// complete history or an error, never a partial slice that looks complete.
 	RunLogs(ctx context.Context, id string, after int32) ([]apitypes.MessageDTO, error)
 	// RunReview returns the judge's review for a run, or nil when the run is visible
 	// but unjudged (the endpoint answers 200 {"review":null}). A run that is absent
@@ -311,6 +313,23 @@ var ErrNoDisposition = errors.New("no disposition to undo")
 // hostile endpoint cannot make the CLI allocate without bound. 32 MiB is far above
 // any real run-detail or message-history payload.
 const maxRespBytes = 32 << 20
+
+// logsPageSize bounds each /messages request RunLogs makes, so a large run's
+// history is fetched in fixed-size pages instead of one unbounded response that
+// could die mid-body (issue #160). Paging is transparent to callers: RunLogs
+// reassembles the full slice before returning, so the Client interface and every
+// caller see the same all-or-nothing "complete history or an error" contract.
+const logsPageSize = 200
+
+// maxLogsMessages is a hostile/compromised-server backstop for RunLogs: the loop
+// stops on an EMPTY page, so a server that always returns a full page with
+// strictly-increasing seqs never terminates and would grow the accumulator until
+// OOM. This caps the aggregate — the per-page 32 MiB LimitReader and 30s timeout
+// already bound each request, this bounds the whole fetch. It is sized ~1000x above
+// any real run (the largest observed in issue #160 was 887 messages), so it never
+// truncates a legitimate history — only a misbehaving server hits it. A var, not a
+// const, purely so the backstop test can lower it and restore it in a defer.
+var maxLogsMessages = 1_000_000
 
 // HTTPClient is the live API client. It talks only to leaf packages (apitypes +
 // net/http + stdlib), keeping cmd/uzi off the server stack.
@@ -618,15 +637,55 @@ func (c *HTTPClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, er
 	return env.Run, nil
 }
 
+// RunLogs fetches a run's messages after `after` in bounded pages (?after=&limit=)
+// and reassembles them, so a large history cannot die mid-body on one unbounded
+// request (issue #160). Paging is internal and transparent: callers still get one
+// complete slice or an error. The contract is ALL-OR-NOTHING — if any page fails,
+// everything accumulated so far is discarded and (nil, err) is returned, so a
+// caller never mistakes a partial history for a complete one.
+//
+// The loop stops ONLY on an empty page, never on a merely-short one: the server
+// clamps ?limit= to its own maxRunMessagesPage, so a short page can mean the server
+// capped the request below logsPageSize rather than "this is the last page". Treating
+// a short page as terminal would silently truncate the history yet return it with a
+// nil error — a partial that looks complete, which this contract forbids. Stopping on
+// empty is correct regardless of how the server clamps limit, at the cost of one extra
+// trailing (empty) request. maxLogsMessages is the backstop: a hostile server that
+// never returns an empty page cannot grow the accumulator without bound.
 func (c *HTTPClient) RunLogs(ctx context.Context, id string, after int32) ([]apitypes.MessageDTO, error) {
-	var env struct {
-		Messages []apitypes.MessageDTO `json:"messages"`
+	var all []apitypes.MessageDTO
+	seq := after
+	for {
+		var env struct {
+			Messages []apitypes.MessageDTO `json:"messages"`
+		}
+		path := fmt.Sprintf("/api/runs/%s/messages?after=%d&limit=%d", url.PathEscape(id), seq, logsPageSize)
+		if err := c.get(ctx, path, &env); err != nil {
+			// All-or-nothing: discard partial history so an error can never look
+			// like a complete fetch.
+			return nil, err
+		}
+		if len(env.Messages) == 0 {
+			// An empty page is the last page — robust to the server clamping ?limit=
+			// below logsPageSize, where a short page is NOT necessarily the end.
+			return all, nil
+		}
+		all = append(all, env.Messages...)
+		if len(all) > maxLogsMessages {
+			// Hostile/compromised-server backstop: a server that always returns a full
+			// page with strictly-increasing seqs never returns an empty page and keeps
+			// advancing. Abort all-or-nothing rather than accumulate toward OOM.
+			return nil, Exitf(ExitGeneric, "run logs: history exceeded %d messages; aborting", maxLogsMessages)
+		}
+		// Advance past the last message. On the real server seq is gapless and the
+		// query is seq > @after, so max seq is the last element's; the guard below
+		// only trips against a misbehaving server that would otherwise loop forever.
+		next := env.Messages[len(env.Messages)-1].Seq
+		if next <= seq {
+			return nil, Exitf(ExitGeneric, "run logs: server returned a page that did not advance past seq %d", seq)
+		}
+		seq = next
 	}
-	path := fmt.Sprintf("/api/runs/%s/messages?after=%d", url.PathEscape(id), after)
-	if err := c.get(ctx, path, &env); err != nil {
-		return nil, err
-	}
-	return env.Messages, nil
 }
 
 func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {

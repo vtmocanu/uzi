@@ -9,7 +9,7 @@ user-invocable: false
 
 `uzi` is the command-line control surface for the uzi factory. It talks to the
 same API the web UI does, so anything you can watch in a browser you can do
-headless: list runs, follow a run's log, approve or reject a plan gate, start a
+headless: list runs, follow a run's log, approve/reject/revise a plan gate, start a
 run on a PRD issue, read the judge's review, and (for admins) read factory-wide
 state.
 
@@ -118,6 +118,7 @@ uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
+uzi run revise <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run answer <run-id> [--message <text>]
@@ -216,6 +217,19 @@ uzi version
   rewrite an unrecognised status to `unknown`, but plain `run get`/`run list
   --json` pass it through verbatim, so this nine-value list is what you branch
   on.)
+
+  **Paging is internal and transparent; treat it as all-or-nothing.** A large
+  run's history is fetched in bounded pages under the hood (and gzipped on
+  the wire) and reassembled before anything is printed — you never pass a
+  page flag, and `--after` still just sets the starting sequence, not a page
+  boundary. If any page fetch fails, a one-shot `run logs` prints **nothing**
+  and exits non-zero instead of emitting a partial transcript (the guarantee
+  is per fetch; under `--follow`, batches already streamed stay printed, but a
+  failed poll still exits non-zero). So **empty stdout means "no messages" only
+  when the exit code is 0**; a non-zero exit means the fetch failed, and stdout
+  at that point is not a complete (or trustworthy) log. Gate on the exit code
+  before parsing NDJSON — do not infer "run has no messages" from empty output
+  alone.
 - `uzi run wait <run-id>` — block until the run reaches a state you can act on,
   the primitive for driving a gated run headless. With no `--until` it stops on
   any **actionable or terminal** state — `awaiting_approval` (the plan gate),
@@ -306,6 +320,13 @@ uzi version
     safe.
 - `uzi run reject <run-id> [--message <text>]` — reject the plan gate, optionally
   with a reason for the agent.
+- `uzi run revise <run-id> [--message <text>]` — send feedback to re-plan at the
+  approval gate WITHOUT stopping the run: the agent revises its plan from your notes
+  and returns to the gate for another decision (unlike `reject`, which ends the run).
+  Use it on a run parked at its `awaiting_approval` gate; needs a non-empty message
+  (pass `--message` or pipe it on stdin). Revisions are capped by the run's revision
+  limit; once it is exhausted — or the run has already finished — the server answers
+  409 (exit 5).
 - `uzi run cancel <run-id>` — cancel a run.
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
@@ -444,10 +465,12 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    milestones.
 3. **Wait for the gate.** `uzi run wait <run-id>` stops at `awaiting_approval` (or
    a terminal state). If it went terminal, report and stop.
-4. **Review the plan, then approve or reject.** Read the submitted plan from
-   `uzi run logs <run-id> --json` (the `submit_plan` message). Judge it as you
-   would any plan. Sound approves with `uzi run approve <run-id>`; not sound
-   rejects with `uzi run reject <run-id> -m "<specific reason>"`, then STOP.
+4. **Review the plan, then approve, revise, or reject.** Read the submitted plan
+   from `uzi run logs <run-id> --json` (the `submit_plan` message). Judge it as you
+   would any plan. Sound approves with `uzi run approve <run-id>`; salvageable but
+   off in places, `uzi run revise <run-id> -m "<what to change>"` sends it back to
+   re-plan without stopping the run (then wait for the gate again); not sound rejects
+   with `uzi run reject <run-id> -m "<specific reason>"`, then STOP.
 5. **Wait for the MR.** After approving, narrow past the gate you just cleared:
    `uzi run wait <run-id> --until completed,failed,cancelled`. A `failed` or
    `cancelled` result stops here; report it.

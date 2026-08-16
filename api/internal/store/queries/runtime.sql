@@ -1546,6 +1546,19 @@ FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
 
+-- name: ListRunMessagesAfterPage :many
+-- Bounded twin of ListRunMessagesAfter for the viewer/CLI paging path (issue #160):
+-- everything after a seq, in order, but @lim caps the page so a single response
+-- can't be unbounded. Authorization (owner-or-admin) is checked by the caller.
+-- Column order is IDENTICAL to ListRunMessagesAfter so the row stays
+-- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
+-- in the same order the ALTER TABLE adds them — see that query's note.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
+FROM run_messages
+WHERE run_id = @run_id AND seq > @after_seq
+ORDER BY seq ASC
+LIMIT @lim;
+
 -- Usage accounting (PRD #40) ------------------------------------------------
 
 -- name: UpsertRunUsage :exec

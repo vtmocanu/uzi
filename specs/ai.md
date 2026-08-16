@@ -263,6 +263,15 @@ issues the bot has rights to".
   (`redact.go`) scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` value from
   every returned error before it can reach a log or response (redaction unit test
   required and present).
+- **Pagination backstop** (`pagination.go`, PRD #338): every accumulating list
+  loop across all three drivers is bounded against a compromised/buggy forge that
+  returns a perpetually non-zero next page. Two caps — an **item cap** (bounds the
+  memory-growth vector) and a **page cap** (bounds the empty-page spin the item
+  cap would miss) — both **test-lowerable vars**, sized far above any real list.
+  On exceed the driver returns an **ERROR, not a partial slice**: a truncated
+  fetch with a nil error would let `forgesvc.FullSync` (§) treat it as an
+  authoritative short read and evict cached issues. Mirrors the CLI's `RunLogs` /
+  `maxLogsMessages` backstop.
 - **Forgejo** is now a **shipped second driver** (`forgejo.go`, PRD #65 — full
   detail §276), at full parity behind this same interface; no call site changed.
   - **CORRECTION (2026-07-17, PRD #65).** The note that stood here for months —
@@ -643,6 +652,14 @@ themselves sit with code)".
 - **Builtin lifecycle**: editable; **not deletable** (`DELETE` → 409); **Reset**
   (`POST /:id/reset`, builtins only, 400 on non-builtin) re-applies the embedded
   definition. Guarantees the core roles always exist for PRD #4.
+  - **Content-derived `customized` flag** (#339): `UpdateAgentTemplate` sets
+    `customized` from the submitted content, not a hardcoded `true` — a builtin row
+    whose body is byte-identical (`agenttmpl.SameContent`) to the shipped definition
+    is stored `customized=false`. Makes "save the shipped body" idempotent with
+    Reset, so `Reset → Save` no longer silently re-pins a builtin out of the
+    boot-time pristine refresh (`RefreshPristineBuiltin`). Every other write (a
+    genuine edit, or a non-builtin row with no shipped definition) still marks it
+    `customized=true`.
 
 ## 32. Renderer (template → Claude Code subagent Markdown)
 
@@ -923,8 +940,8 @@ messages / correct them" (the SPA consuming these is M5, but the endpoints ship 
 - **Runs**: `POST /api/repos/{id}/runs` (queue a run — repo owned + issue is a cached
   PRD issue **with a PRD link**; title snapshotted from cache, description from the
   request; duplicate active run → 409 via the unique index), `GET /api/runs/{id}`,
-  `GET /api/runs/{id}/messages` (replay after a seq), `POST /api/runs/{id}/inputs`
-  (submit steering).
+  `GET /api/runs/{id}/messages` (replay after a seq; gzip'd + opt-in bounded
+  `?limit=` — see §547), `POST /api/runs/{id}/inputs` (submit steering).
 - **No-live-poller server-side transition**: a `cancel` or `reject_plan` for a run
   with no live poller (still `queued`, or its worker gone stale) is applied
   **server-side** directly to `cancelled`/`failed` — the input is never stranded
@@ -9493,7 +9510,7 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
   re-suppressing a possibly-different concern. Cleaned only by the
   review-deletion cascade (`review_id ON DELETE CASCADE`).
 
-## 544. Issue #167 — deterministic net auto-dismisses judge recs targeting a denylisted credential-bearing CLI; a self-measuring `set_via='denied_cli'` provenance
+## 548. Issue #167 — deterministic net auto-dismisses judge recs targeting a denylisted credential-bearing CLI; a self-measuring `set_via='denied_cli'` provenance
 
 Extends the PRD #94 disposition design (§331–338) and mirrors PRD #98's
 `issue_close` provenance (§362). It is the DETERMINISTIC BACKSTOP behind MR
@@ -12518,7 +12535,7 @@ is entitled to make yet.
   avoided in `js-deps` (measured: the timeout kills from the worker uid, gets `EPERM`, and leaves the
   runner process alive past its cap).
 
-## 511. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
+## 549. Issue #293 (gate honesty) — the Bash `is_error` passthrough is a BOUNDARY not a bug; honest completion annotation rides `js_deps` (ANNOTATE); cross-component gates graceful-skip
 
 Delivers what §401 recorded as deferred (M4 gate honesty), in the reduced form the repo can honestly
 sign: annotate the never-ran case rather than reconcile declared gates. Serves the same human contract
@@ -21091,7 +21108,80 @@ moves the file. Serves the same doc-integrity intent as the `check-docs` gate.
   `api/internal/skilltmpl/prd_lifecycle_test.go` pins that the sweep instruction stays present in the
   embedded skill body, so a future edit cannot silently drop it.
 
-## 547. PRD #333 — Incidental Findings: a judge-shaped sibling backlog for off-task bugs in the user's code
+## 547. Issue #160 — large run history fetches whole-or-fails: gzip + opt-in bounded page + all-or-nothing CLI paging
+
+A large run's message history could not be fetched in one request, and the failure was silent (a
+truncated/failed fetch looked like an empty run). Fixed on `GET /api/runs/{id}/messages` (§42) plus the
+`uzi run logs` CLI, in three layers.
+
+- **Server gzip.** The endpoint is now gzip-compressed (chi `Compress` scoped to that route). Transparent
+  to the CLI and browsers via `Accept-Encoding` negotiation — no client change required.
+- **Opt-in bounded page.** The endpoint accepts an OPT-IN `?limit=<n>` returning a bounded page, clamped
+  to a server max of 1000; backed by a new `ListRunMessagesAfterPage` sqlc query. Absent `limit` keeps
+  the unbounded legacy path — the web SPA/replay relies on it, so this is non-breaking.
+- **All-or-nothing CLI paging.** `uzi run logs` (`HTTPClient.RunLogs`) fetches the history in bounded
+  `?after=&limit=` pages internally and reassembles them, returning the COMPLETE history or an error —
+  NEVER a partial. It terminates on an empty page (robust to server-side clamping) with a hostile-server
+  backstop cap, so a failed fetch prints nothing and exits non-zero and cannot be mistaken for an empty
+  run. The `run answer` path inherits this via the same client.
+## 550. Issue #334 — `resume_lineage_break` counter measures the run_usage resume-lineage undercount before committing to #332 Option B
+
+The dropped-resume → fresh-SDK-session path in `agent/src/runner.ts` (the ONLY path that breaks the
+§222/§223 `run_usage` resume lineage — a resolved resume never enters it) now tags a stable,
+low-cardinality signal `resume_lineage_break`, so the undercount's real firing rate is measured before
+paying for #332's deferred Option B (a `lineage_epoch` schema+protocol change).
+
+- **Two surfaces, both pre-existing emissions on that path (no new message, no noise):** the run-feed
+  `status` message payload carries `payload.event = "resume_lineage_break"` (free-form JSONB, per-run
+  queryable and cross-run aggregatable: `select count(*) from run_messages where payload->>'event' =
+  'resume_lineage_break'`), and the worker's structured warning log line (`agent/src/log.ts`, a
+  JSON-fields logger — not Go `slog`) gets the same stable key for worker-log aggregation.
+- **Why a payload field, not a new surface.** Chosen over (a) a new `MessageKind` — which would need an
+  API allowlist + web-renderer change — and over (b) any `run_usage`/fold/`run_usage_totals`-view/
+  `lineage_epoch` change, which IS #332 Option B. It rides the existing join-token AppendMessages POST,
+  so no new inbound endpoint. The signal doubles as a resume-reliability indicator (a high rate means
+  work-recovery fails more often than PRD #122 M8 intends). #332 Option B stays deferred until this
+  counter shows the lineage break is material.
+
+## 551. Issue #336 (#81 proposal #4) — the DETERMINISTIC guard behind M7a's prompt rule: high-confidence retry advice on a permanent policy/config-denied class is auto-downgraded to low
+
+§534 gave the judge a TRUSTED `failure_class` and a PROMPT rule telling the model NOT to recommend
+retry / exponential-backoff for the three permanent policy/config-denied classes. A prompt rule is
+advisory — the model can ignore it. This issue adds the deterministic backstop the rule lacked, in
+`agent/src/judge-runner.ts`, so a wrong retry recommendation is corrected in code regardless of what the
+model emitted.
+
+- **`calibrateReview(review, failureClass)` is a pure exported function run in `judge()` AFTER
+  `parseReview` and BEFORE the review is posted.** It only ever DOWNGRADES confidence, never raises it,
+  and never mutates its input (recs are mapped into new objects). It touches only the `confidence` and
+  `rationale` fields of the one rec it rewrites; no other field, and no other rec.
+- **Scope: high-confidence, retry-shaped recs on a permanent class only.** The three classes are
+  `provisioning_failed`, `credential_unavailable`, `guardrail_blocked`, mirrored in a TS
+  `POLICY_DENIED_FAILURE_CLASSES` set kept in HAND-SYNC with the server's `preStartInfraFailOrigins`
+  (`api/internal/workersvc/judge_enqueue.go`). When the reviewed run's trusted `failure_class` is one of
+  these AND a rec is BOTH `high` confidence AND retry-shaped, its confidence is lowered to `low` and a
+  deterministic marker is appended to its rationale (`Confidence auto-reduced to low: retry/backoff
+  advice contradicts the permanent \`<class>\` failure class.`). `medium`/`low`/`""` recs are untouched
+  (only-ever-downgrades + high-only, per the issue). No behaviour change when `failure_class` is null or a
+  transient class (`rate_limited`, `run_timeout`, `worker_lost`, `agent_failure`, …).
+- **"Retry-shaped" is textual over target + rationale, with a NEGATION GUARD.** The affirmative match is
+  `retry` / `backoff` / `re-run` / `run again` / `try again` / `requeue`; the guard is CLAUSE-SCOPED and
+  bidirectional — the combined text is split on sentence/segment boundaries (`.!?`, newline, `;`), and a
+  rec is retry-shaped only if at least one clause carries a retry term AND no negator. A negator sharing a
+  clause with the retry term suppresses that clause, on EITHER side of the term and at any distance, so both
+  a pre-posed "do not retry" and a post-posed "retrying will not help" are preserved. This deliberately
+  protects the false positive that matters: a genuinely correct "tell the agent NOT to retry" finding must
+  survive. Biased toward NOT firing: any negator in the retry term's clause suppresses it. (An earlier
+  directional-window design — negator within ~20 chars before the term — was superseded during
+  implementation because it buried post-posed negations; the shipped guard is clause-scoped.)
+- **The fallback (non-model) review path is unaffected** — it emits only `install_worker_tool` recs,
+  never retry-shaped ones, so the calibration is a no-op there.
+- **Out of scope (recorded as such):** no model-based verifier / second Anthropic call was added; the
+  computation of `failure_class` itself is unchanged; and the #81 proposal #4 item 2 stretch idea
+  (cap unconfirmable inferences at medium) was NOT implemented because it cannot be made non-heuristic
+  cheaply.
+
+## 552. PRD #333 — Incidental Findings: a judge-shaped sibling backlog for off-task bugs in the user's code
 
 Serves the PRD #333 goal: let an autonomous run flag a bug it noticed in the USER's code while working
 something else, dedup it across runs, and let the human gate every filing. Full rationale in the

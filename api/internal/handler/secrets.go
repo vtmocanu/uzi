@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
@@ -711,15 +712,15 @@ func validateSecretLabel(raw string) (string, error) {
 		return "", fmt.Errorf("label must be at most %d bytes", maxLabelBytes)
 	}
 	for _, r := range label {
-		if r == unicode.ReplacementChar || unicode.IsControl(r) {
-			return "", errors.New("label must not contain control characters")
-		}
 		if unicode.In(r, unicode.Cf) {
 			return "", errors.New("label must not contain invisible formatting characters " +
 				"(zero-width spaces and joiners, bidirectional overrides, the byte-order mark): " +
 				"they let two different tokens look identical, or make a label read as a different " +
 				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one " +
 				"of these characters, so use a plain name instead")
+		}
+		if r == unicode.ReplacementChar || termsafe.Unsafe(r) {
+			return "", errors.New("label must not contain control characters")
 		}
 	}
 	return label, nil

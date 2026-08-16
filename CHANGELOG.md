@@ -35,6 +35,18 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   read-only `web-ux` validator. It runs on `opus` and inherits the full
   toolset. Boot-seeded via `ReconcileBuiltinTemplates`; existing installs pick
   it up on the next boot. (#314)
+- **A stable `resume_lineage_break` tag now marks the one path that breaks
+  `run_usage` resume lineage (#334).** When a resume is dropped and the
+  runner starts a fresh SDK session because the claimed session's transcript
+  is not resolvable on this worker (`agent/src/runner.ts`), both the run-feed
+  status message and the worker's structured warning log now carry
+  `event: "resume_lineage_break"` — a resolved resume records nothing. This
+  is a measure-before-you-build instrument for #332: a maintainer can now run
+  `select count(*) from run_messages where payload->>'event' =
+  'resume_lineage_break'` to size how often the undercount actually happens
+  before deciding whether #332's deferred Option B (a `lineage_epoch`
+  schema+protocol change) is worth building. No change to `run_usage`, its
+  fold, the merge, or the totals view. (#334, #332)
 - **Role-aware in-app docs: admins now see the operator setup guides (#75).**
   The in-app `/docs` section gains an "Admin / operator" area alongside the
   existing user howtos, surfacing installation, configuration, OIDC/Keycloak,
@@ -64,6 +76,30 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **Resetting a builtin agent template to default and saving no longer
+  re-marks it customized (#339).** Pressing **Reset to default** and then
+  **Save changes** on a builtin agent template re-marked the row
+  `customized=true` even when the saved content was byte-for-byte the shipped
+  builtin, silently opting it out of the boot-time shipped-body auto-refresh
+  (`RefreshPristineBuiltin`), with no drift badge to reveal it (the badge
+  reflects content, not the flag). `UpdateAgentTemplate` now content-derives
+  the `customized` flag — a builtin whose submitted content matches the
+  shipped definition (per `agenttmpl.SameContent`) is stored
+  `customized=false`, making "save the shipped body" idempotent with Reset so
+  the row keeps tracking future shipped changes. (#339)
+- **The worker's message batcher no longer re-enters the PRD #108 no-backoff
+  retry storm when bisection abandons its first probe.** When the api
+  permanently rejected a batch (4xx poison) and the very first bisection probe
+  then hit a transient (5xx/timeout) or a 413, `bisect` handed the whole batch
+  back with nothing persisted, but `handleFailure`'s permanent arm still reset
+  `consecutiveFailures`/`failingSince` and told `doFlush` to keep going — so it
+  re-posted immediately with no backoff, and the `TRANSIENT_TRIP_MS` breaker
+  never accrued because `failingSince` was wiped every pass (and `close()` could
+  hang under a synchronously-resolving client). `bisect` now reports whether it
+  made progress (a sub-batch was persisted, or the poison was isolated and
+  tombstoned); a no-progress abandonment is treated as the transient failure it
+  is — backing off and keeping the breaker clock running — while only genuine
+  progress clears the streak.
 - **An idle backgrounded tab no longer keeps its session alive forever via the
   favicon poll (#331).** The tab-icon poll (`useFavicon`) fetches `listRuns`
   every ~20s even while hidden, and `RequireAuth`'s rolling refresh re-minted the
@@ -74,7 +110,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   requests; auth validation and CSRF are unchanged. Suppressing refresh can only
   make a session expire sooner, never later, so the client-sent marker is safe.
   (#331)
-
+- **`uzi run logs` no longer dies mid-body on a large run and prints an empty
+  result that looks like "no messages" (#160).** The viewer messages endpoint
+  (`GET /api/runs/{id}/messages`) now gzips its response and gained an opt-in
+  `?limit=` (clamped to 1000; omitting it is unchanged and unbounded, so the
+  web SPA sees no behavior change). `uzi run logs` fetches a run's history in
+  bounded `?after=&limit=` pages internally and reassembles them, and it is
+  now all-or-nothing: it prints the complete history or nothing at all, exiting
+  non-zero on any page failure — a failed fetch can no longer be mistaken for
+  a run with an empty log. Paging is entirely transparent; callers still pass
+  only `--after`/`--follow`, not a page size. (#160)
 - **`e2e/run-store-it.sh` no longer masquerades a Postgres-readiness timeout as
   a passing/skipped test run (#171).** The throwaway-Postgres wait was a
   hard-coded 30s; on a daemon busy with mutation containers it timed out and the
@@ -133,6 +178,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   element, and the poller's per-repo goroutine recovers any panic so one repo's
   hostile response degrades to skipping that repo's sync rather than crashing
   the api. (#74)
+
+- **Forge-driver pagination is now backstopped against an unbounded-loop DoS
+  (#338).** A semi-trusted (compromised or buggy) connected forge could return a
+  perpetually non-zero next page and drive any driver's paginating list call
+  (projects, labels, issues, label events, pipeline jobs) forever — either
+  growing the accumulator until the shared api OOMs, or spinning on empty pages
+  that never grow it. Every accumulating loop in the gitlab, forgejo and github
+  drivers now enforces two backstops: an item cap (bounds the memory-growth
+  vector) and a page cap (bounds the empty-page spin the item cap would miss).
+  On exceed the driver returns an ERROR, never a truncated slice — a partial
+  fetch that looked complete would let `forgesvc.FullSync` treat it as
+  authoritative and evict cached issues. Both caps are sized far above any real
+  forge list, so only a misbehaving forge hits them. Mirrors the CLI's existing
+  `RunLogs` / `maxLogsMessages` backstop. (#338)
 
 ## [0.39.0] - 2026-08-16
 

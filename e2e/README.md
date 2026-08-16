@@ -133,6 +133,29 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
     /api/me/cli-tokens`); `uzi run list --json` must parse and its run-id set must
     equal `GET /api/runs`'s, then `uzi run approve` drives a parked run to
     `completed` — so DTO/route drift in either consumer turns the run red.
+11. **Auto-stop of a persistence loop (PRD #108 M5, direct-to-API, last phase)**:
+    the real stub agent can't poison itself — it never emits a permanently-
+    unstorable payload, and its in-flight hold isn't abort-aware — so this phase
+    runs at end-of-file, after the agent container has already been `compose
+    stop`ped by the PRD #104 binding phase above, and mints a **synthetic
+    worker** that drives `/api/worker/*` directly with `curl` (the same
+    technique the PRD #104 phase uses), making it the queue's sole claimant. It
+    creates two runs, **A** (poison target) and **B** (peer), claims both,
+    drives them `claimed→running`, then on a ~3s cadence repeatedly POSTs a
+    permanently-unstorable message (`{"n":1e1000000}`, SQLSTATE 22003 →
+    `ErrUnstorableMessage`, HTTP 400) to A while sustaining B's successful
+    appends and the worker heartbeat. It asserts the whole journey: A flips
+    `health='looping'` with the persist-failing reason, then the sweeper
+    auto-stops it — `status='failed'` + `stop_kind='auto_stopped'` — while peer
+    B is unaffected (not failed, not auto-stopped). It then folds in the two
+    remedies `docs/run-auto-stopped.md` prints, proving each is followable end
+    to end via the real CLI: `uzi run get <id>` surfaces
+    `stop_kind=auto_stopped`, and `uzi worker list` shows the worker's VERSION
+    column (a printed instruction is otherwise an untested claim). **Stated
+    limit**: the phase is executor-independent (it never touches the stub or SDK
+    path) and runs ~135-165s of real sweep/escalation time, so — like the auto-stop feature it
+    exercises — it depends on a live peer run and a fresh worker heartbeat for
+    its whole duration.
 
 ## How the fakes are wired (no real GitLab, no live session)
 

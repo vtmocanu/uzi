@@ -1,4 +1,5 @@
 import type { WorkerClient } from "./client.js";
+import { RequestError } from "./client.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
@@ -84,6 +85,19 @@ export class Worker {
         });
         return;
       } catch (err) {
+        // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
+        // invalid): retrying can never clear it, so FAIL LOUD — throw so it propagates to
+        // main.ts's fatal handler (exit 1) and the pod surfaces the error, exactly like the
+        // toolchain preflight above. Every other error (network, timeout, 5xx, 408/429, any
+        // other status) keeps retrying with the capped backoff below.
+        if (err instanceof RequestError && (err.status === 401 || err.status === 403)) {
+          this.log.error("register REJECTED — permanent auth failure, refusing to retry", {
+            status: err.status,
+            reason:
+              "the worker join token was rejected as unauthorized/forbidden (rotated or invalid) — registration cannot succeed by retrying",
+          });
+          throw err;
+        }
         attempt++;
         const backoff = Math.min(this.config.pollIntervalMs * attempt, 30_000);
         this.log.warn("register failed, retrying", { attempt, backoff_ms: backoff, error: errMessage(err) });

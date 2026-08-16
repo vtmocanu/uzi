@@ -66,6 +66,16 @@ const VALID_CATEGORIES = new Set<ReviewRecommendation["category"]>([
 const VALID_VERDICTS = new Set(["ideal", "ok", "issues"]);
 const VALID_CONFIDENCE = new Set(["", "low", "medium", "high"]);
 
+// The permanent policy/config-denied failure classes. These mirror the server's
+// `preStartInfraFailOrigins` (api/internal/workersvc/judge_enqueue.go) — the block is
+// permanent until the configuration or policy is fixed, so retry/backoff advice against
+// such a run is wrong. Kept in sync with the Go source by hand (issue #336, #81 #4).
+const POLICY_DENIED_FAILURE_CLASSES = new Set([
+  "provisioning_failed",
+  "credential_unavailable",
+  "guardrail_blocked",
+]);
+
 // The agent label the judge stamps on its posted usage frame (PRD #69 M6). Inert to
 // foldRunUsage (it reads only `event` + `modelUsage`); a plain label for the pane.
 const JUDGE_AGENT = "judge";
@@ -245,7 +255,7 @@ export class JudgeRunner {
         claim.failure_class ?? null,
       );
       const { text, result } = await this.runModel(token, model, prompt);
-      return { review: parseReview(text, model), usageMessage: result };
+      return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage: result };
     } catch (err) {
       this.log.warn("judge model call failed; using deterministic fallback", {
         run_id: claim.run_id,
@@ -567,6 +577,71 @@ export function parseReview(text: string, model: string): ReviewRequest {
     status: "complete",
     recommendations,
   };
+}
+
+// A retry/backoff term: the affirmative advice we downgrade on a permanent failure
+// class. Grouped so the clause-scoped negation guard below can reuse the identical
+// vocabulary.
+const RETRY_TERM = "retr(?:y|ies|ying)|back\\s*off|backoff|re-?run|run\\s+again|try\\s+again|requeue";
+// Affirmative match: any retry term appears at all (case-insensitive). Also used per
+// clause by isRetryShaped.
+const RETRY_AFFIRMATIVE = new RegExp(RETRY_TERM, "i");
+// Negator vocabulary, as a single flat alternation (no quantifier over the group, so it
+// stays linear-time / ReDoS-free). Tested per clause with `.test()`, so it catches a
+// negator on EITHER side of the retry term ("do not retry", "retrying is not advisable")
+// and is window-independent. Catches: not, never, n't, avoid, do not, don't, stop,
+// shouldn't, should not, cannot, can't, without.
+const NEGATOR = new RegExp(
+  "\\bnot\\b|\\bnever\\b|n['’]t\\b|\\bavoid\\b|\\bdo\\s+not\\b|\\bdon['’]?t\\b|\\bstop\\b|\\bshould\\s*n['’]?t\\b|\\bcannot\\b|\\bcan['’]?t\\b|\\bwithout\\b",
+  "i",
+);
+
+/**
+ * True when a recommendation gives AFFIRMATIVE retry/backoff advice over its target +
+ * rationale. Fires on `retry`/`backoff`/`re-run`/`run again`/`try again`/`requeue`.
+ *
+ * The guard is CLAUSE-SCOPED and bidirectional: the combined text is split on
+ * sentence/segment boundaries (`.!?`, newline, `;`), and the rec is retry-shaped only if
+ * at least one clause carries a retry term AND no negator. If every clause that carries a
+ * retry term ALSO carries a negator, we return false (suppressed) — so a "do not retry"
+ * finding is preserved no matter which side of the term the negator sits on, and no matter
+ * how far it is from the term. Biased toward NOT firing on ambiguity: any negator sharing
+ * a clause with the retry term suppresses that clause.
+ */
+function isRetryShaped(rec: ReviewRecommendation): boolean {
+  const text = `${rec.target}\n${rec.rationale}`;
+  if (!RETRY_AFFIRMATIVE.test(text)) return false;
+  for (const clause of text.split(/[.!?\n;]+/)) {
+    if (RETRY_AFFIRMATIVE.test(clause) && !NEGATOR.test(clause)) return true;
+  }
+  return false;
+}
+
+/**
+ * Deterministic guard for the M7a prompt rule (issue #336, #81 proposal #4). The judge
+ * system prompt discourages retry/backoff advice when the run's failure class is one of
+ * the permanent policy/config-denied classes; this corrects the model if it emits such
+ * advice anyway. Only ever DOWNGRADES: a `high`-confidence, retry-shaped rec on a
+ * policy-denied class becomes `low` with a marker appended to its rationale. Never raises
+ * confidence, never touches `medium`/`low`/`""` recs, and never touches any field other
+ * than `confidence`/`rationale` on the one rec it rewrites. Pure: the input and its recs
+ * are never mutated.
+ */
+export function calibrateReview(review: ReviewRequest, failureClass: string | null): ReviewRequest {
+  if (failureClass === null || !POLICY_DENIED_FAILURE_CLASSES.has(failureClass)) return review;
+  const recommendations = review.recommendations.map((rec) => {
+    if (rec.confidence !== "high" || !isRetryShaped(rec)) return rec;
+    return {
+      ...rec,
+      confidence: "low" as const,
+      rationale:
+        rec.rationale +
+        "\n\n_(Confidence auto-reduced to low: retry/backoff advice contradicts the permanent `" +
+        failureClass +
+        "` failure class.)_",
+    };
+  });
+  return { ...review, recommendations };
 }
 
 // extractJsonObject pulls the first balanced {...} object out of the model text

@@ -184,7 +184,9 @@ func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
 		ListOptions: gh.ListOptions{PerPage: githubPerPage},
 	}
 	var out []Project
+	page := 0
 	for {
+		page++
 		repos, resp, err := g.client.Repositories.ListByAuthenticatedUser(ctx, opt)
 		if err != nil {
 			return nil, g.wrapErr("list projects", err)
@@ -203,8 +205,14 @@ func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
 				DefaultBranch:     r.GetDefaultBranch(),
 			})
 		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list projects", forgePaginationCapErr("item", maxForgeItems))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list projects", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -236,14 +244,22 @@ func (g *github) ListLabels(ctx context.Context, projectID int64) ([]Label, erro
 func (g *github) listRepoLabels(ctx context.Context, slug repoSlug) ([]*gh.Label, error) {
 	opt := &gh.ListOptions{PerPage: githubPerPage}
 	var out []*gh.Label
+	page := 0
 	for {
+		page++
 		labels, resp, err := g.client.Issues.ListLabels(ctx, slug.owner, slug.repo, opt)
 		if err != nil {
 			return nil, g.wrapErr("list labels", err)
 		}
 		out = append(out, labels...)
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list labels", forgePaginationCapErr("item", maxForgeItems))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list labels", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}
@@ -301,7 +317,9 @@ func (g *github) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 		opt.Since = *opts.UpdatedAfter
 	}
 	var out []Issue
+	page := 0
 	for {
+		page++
 		issues, resp, err := g.client.Issues.ListByRepo(ctx, slug.owner, slug.repo, opt)
 		if err != nil {
 			return nil, g.wrapErr("list issues", err)
@@ -320,8 +338,14 @@ func (g *github) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 				return out, nil
 			}
 		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list issues", forgePaginationCapErr("item", maxForgeItems))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list issues", forgePaginationCapErr("page", maxForgePages))
 		}
 		// IssueListByRepoOptions embeds both ListCursorOptions and ListOptions, so a
 		// bare opt.Page is ambiguous — qualify the integer-page field explicitly.
@@ -608,7 +632,9 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 	// skipped. Chronological (oldest first), matching the GitLab driver. Paginated.
 	opt := &gh.ListOptions{PerPage: githubPerPage}
 	var out []LabelEvent
+	page := 0
 	for {
+		page++
 		events, resp, err := g.client.Issues.ListIssueEvents(ctx, slug.owner, slug.repo, int(issueIID), opt)
 		if err != nil {
 			return nil, g.wrapErr("list issue label events", err)
@@ -639,8 +665,14 @@ func (g *github) ListIssueLabelEvents(ctx context.Context, projectID, issueIID i
 			}
 			out = append(out, ev)
 		}
+		if len(out) > maxForgeItems {
+			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("item", maxForgeItems))
+		}
 		if resp.NextPage == 0 {
 			break
+		}
+		if page >= maxForgePages {
+			return nil, g.wrapErr("list issue label events", forgePaginationCapErr("page", maxForgePages))
 		}
 		opt.Page = resp.NextPage
 	}

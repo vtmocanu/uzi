@@ -145,6 +145,41 @@ func TestWorkerSaveMemoryStripsControlChars(t *testing.T) {
 	}
 }
 
+func TestWorkerSaveMemoryStripsFormatChars(t *testing.T) {
+	// Pins issue #161's deliberate Cf convergence: sanitizeMemoryField now routes its
+	// unsafe-rune predicate through termsafe.Unsafe, so it ALSO strips Unicode format
+	// characters (Cf), not just controls. A bidi override (U+202E RIGHT-TO-LEFT
+	// OVERRIDE) that could visually reorder the stored note, and a ZWJ (U+200D) family
+	// emoji, must both be stripped server-side before storage — the title keeps no
+	// whitespace, the body keeps its real \n and \t. The family emoji degrades into its
+	// component glyphs (the accepted cost termsafe documents); U+202E vanishes entirely.
+	const (
+		rlo    = "\u202e"                                               // RIGHT-TO-LEFT OVERRIDE (Cf)
+		zwj    = "\u200d"                                               // ZERO WIDTH JOINER (Cf)
+		family = "\U0001f468" + zwj + "\U0001f469" + zwj + "\U0001f467" // the ZWJ sequence for the family emoji
+	)
+	st := &memoryStore{ownedRun: runWithRepo(uuid.New(), uuid.New())}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	reqBody, err := json.Marshal(map[string]string{
+		"title": "safe" + rlo + "name",
+		"body":  "line1\nline2\t" + family + "tail",
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	h.WorkerSaveMemory(rec, workerReq(http.MethodPost, string(reqBody), uuid.New()))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body %q", rec.Code, rec.Body.String())
+	}
+	if got, want := st.insertParams.Title, "safename"; got != want {
+		t.Errorf("stored title = %q, want %q (U+202E bidi override stripped)", got, want)
+	}
+	if got, want := st.insertParams.Body, "line1\nline2\t\U0001f468\U0001f469\U0001f467tail"; got != want {
+		t.Errorf("stored body = %q, want %q (real newline + tab kept, ZWJ stripped so the family emoji degrades to component glyphs)", got, want)
+	}
+}
+
 func TestWorkerSaveMemoryRejectsIdentityInBody(t *testing.T) {
 	// A body that tries to smuggle a user_id/repo_id must be rejected outright (the
 	// decoder forbids unknown fields), so identity can never be body-driven.

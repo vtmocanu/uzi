@@ -494,17 +494,18 @@ export class MessageBatcher {
    *
    * Returns the messages that still need delivering, in seq order.
    */
-  private async bisect(batch: Buffered[]): Promise<Buffered[]> {
+  private async bisect(batch: Buffered[]): Promise<{ remaining: Buffered[]; progressed: boolean }> {
     let lo = 0;
     let hi = batch.length;
     let posts = 0;
+    let progressed = false;
     while (hi - lo > 1) {
       if (posts >= MAX_BISECT_POSTS) {
         this.trip(
           `a poisoned message could not be isolated within ${MAX_BISECT_POSTS} posts`,
           batch[lo]!.msg.seq,
         );
-        return [];
+        return { remaining: [], progressed };
       }
       const mid = lo + Math.floor((hi - lo) / 2);
       const half = batch.slice(lo, mid);
@@ -515,11 +516,12 @@ export class MessageBatcher {
           half.map((b) => b.msg),
         );
         lo = mid; // confirmed clean by a 2xx
+        progressed = true; // a sub-batch was persisted
       } catch (err) {
         const verdict = classify(err);
         if (verdict === "fatal") {
           this.trip(`the api rejected the run's messages with ${errMessage(err)}`, batch[lo]!.msg.seq);
-          return [];
+          return { remaining: [], progressed };
         }
         if (verdict === "transient") {
           // The search cannot conclude anything from a transient failure. Abandon
@@ -530,7 +532,7 @@ export class MessageBatcher {
             run_id: this.runId,
             error: errMessage(err),
           });
-          return batch.slice(lo);
+          return { remaining: batch.slice(lo), progressed };
         }
         if (verdict === "oversize") {
           // A 413 is a SIZE signal, NOT evidence about the payload — so it must not
@@ -545,13 +547,13 @@ export class MessageBatcher {
             run_id: this.runId,
             error: errMessage(err),
           });
-          return batch.slice(lo);
+          return { remaining: batch.slice(lo), progressed };
         }
         // Permanent: the poison is on the left.
         hi = mid;
       }
     }
-    if (hi - lo < 1) return batch.slice(lo); // nothing left to isolate
+    if (hi - lo < 1) return { remaining: batch.slice(lo), progressed }; // nothing left to isolate
 
     // `batch[lo]` is the poison. Tombstone it under its OWN seq so the stream stays
     // contiguous, and post it alone.
@@ -566,16 +568,17 @@ export class MessageBatcher {
     });
     try {
       await this.client.postMessages(this.runId, [marker.msg]);
-      return batch.slice(lo + 1);
+      progressed = true; // the poison was isolated and tombstoned
+      return { remaining: batch.slice(lo + 1), progressed };
     } catch (err) {
       if (classify(err) === "transient") {
         // Keep the tombstone (not the original) queued: the payload is known bad.
-        return [marker, ...batch.slice(lo + 1)];
+        return { remaining: [marker, ...batch.slice(lo + 1)], progressed };
       }
       // A rejected TOMBSTONE is the only true drop, and it means something is wrong
       // beyond the payload — the marker is worker-minted ASCII.
       this.trip(`the api rejected even the worker's replacement marker for seq ${poison.msg.seq}`, poison.msg.seq);
-      return [];
+      return { remaining: [], progressed };
     }
   }
 
@@ -683,23 +686,42 @@ export class MessageBatcher {
         this.buffer = [tombstone(only, "message_dropped", "payload rejected by the api", this.redactText), ...this.buffer];
         return false;
       }
-      const remaining = await this.bisect(batch);
+      const { remaining, progressed } = await this.bisect(batch);
       this.buffer = remaining.concat(this.buffer);
+      if (this.tripped) return true;
+      if (!progressed) {
+        // bisect abandoned on its FIRST probe (a transient or a 413) with nothing
+        // persisted and nothing tombstoned. Treat it as the transient failure it is:
+        // back off and keep the sustained-failure breaker clock running. Resetting the
+        // accounting here — as the old code did — re-posted with no backoff and wiped
+        // failingSince, reopening the PRD #108 retry storm through the bisect door.
+        this.noteTransientFailure(batch.length, lastSeq, err);
+        return true;
+      }
+      // Real progress: a sub-batch was persisted, or the poison was isolated and
+      // tombstoned. Clear the streak and keep draining immediately.
       this.consecutiveFailures = 0;
       this.failingSince = undefined;
-      return this.tripped;
+      return false;
     }
 
     // Transient. Put the batch back at the head so order + gaplessness hold. The
     // whole buffer no longer rides on one request, so this re-buffer can no longer
     // grow a body across the server's cap — the next attempt re-splits.
     this.buffer = batch.concat(this.buffer);
+    this.noteTransientFailure(batch.length, lastSeq, err);
+    return true;
+  }
+
+  /** Count one transient / no-progress failure toward the backed-off retry and the
+   *  sustained-failure breaker. The caller has already re-buffered the batch. */
+  private noteTransientFailure(count: number, lastSeq: number, err: unknown): void {
     this.consecutiveFailures += 1;
     const now = Date.now();
     this.failingSince ??= now;
     this.log.warn("message batch flush failed, will retry", {
       run_id: this.runId,
-      count: batch.length,
+      count,
       consecutive_failures: this.consecutiveFailures,
       failing_for_ms: now - this.failingSince,
       error: errMessage(err),
@@ -710,7 +732,6 @@ export class MessageBatcher {
         lastSeq,
       );
     }
-    return true;
   }
 
   /** Stop accepting messages and drain the buffer with a few bounded retries. */
