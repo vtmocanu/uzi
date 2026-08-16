@@ -420,4 +420,37 @@ describe("MessageBatcher breaker (PRD #108 M3)", () => {
     assert.ok(warn, "a dropped error frame must be loud — it is the class this PRD exists to remove");
     assert.strictEqual(warn["kind"], "error");
   });
+
+  it("a permanent batch whose FIRST bisect probe hits a transient backs off, not a no-backoff storm (PRD #108)", async () => {
+    // PRD #108 no-backoff-storm regression. A 2-message batch (seq 1 clean, seq 2
+    // poison) draws a 400 as a whole, so the permanent arm bisects. bisect's first
+    // left-half probe [1] draws a 500 (transient): it makes NO progress and hands the
+    // whole batch back. The old permanent arm reset consecutiveFailures/failingSince
+    // and returned false, so doFlush re-posted immediately with no backoff — an
+    // unbounded loop that on the unfixed code runs straight to the 404 safety ceiling
+    // (posts ≈ 12 and/or the breaker trips). The fix treats a no-progress bisect as
+    // the transient failure it is: it backs off after the first abandon (posts == 2)
+    // and never trips. Deterministic and hang-proof — we assert IMMEDIATELY after
+    // flush() resolves, before the unref'd backoff timer can fire, and the 404 ceiling
+    // guarantees termination even on buggy code.
+    const { client, posts } = scriptedApi((msgs, postIndex) => {
+      if (postIndex >= 12) return 404; // safety ceiling so even the unfixed hot loop stops fast
+      const seqs = msgs.map((m) => m.seq);
+      if (seqs.length === 1 && seqs[0] === 1) return 500; // the first left-half probe: transient, no progress
+      if (seqs.includes(2)) return 400; // the poison makes the whole batch permanent
+      return undefined;
+    });
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    fill(batcher, 2); // seq 1 (clean) + seq 2 (poison)
+    await batcher.flush();
+
+    // No awaits between flush() resolving and these assertions: the backed-off retry
+    // timer is unref'd and cannot fire here.
+    assert.ok(
+      posts.length <= 3,
+      `no-backoff storm: expected <= 3 posts (fix does full batch + one probe = 2), saw ${posts.length}`,
+    );
+    assert.strictEqual(batcher.isTripped(), false, "a single no-progress bisect must back off, never trip");
+  });
 });
