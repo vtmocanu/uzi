@@ -113,6 +113,13 @@ Open **Settings → Notifications**:
 - The notify toggle is a per-user kill switch, on by default; turn it off to
   stop DMs without clearing the link.
 
+If this instance has no Slack configured yet, the card shows an info alert
+saying so instead of a silently-disabled form — notifications can't be
+delivered until an admin sets it up under **Admin Settings → Slack**. All the
+card's controls (notify toggle, override field, **Save override**, and
+**Send test DM**) are disabled in that state; you can't cause a stuck link by
+clicking ahead of the admin.
+
 ## Using it
 
 **Message format**: every DM is Block Kit, not plain text — a status line leads
